@@ -22,6 +22,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
     ContiguousAttentionKVCache,
+    WindowedAttentionKVCache,
 )
 
 _thread_local = threading.local()
@@ -34,8 +35,12 @@ class BatchedDecodeContext:
 
     batch_size: int
     seq_lens: list[int]  # per-request token count before the new token
-    # attention_layer_caches[attention_pool_idx][req_idx] = ContiguousAttentionKVCache
-    attention_layer_caches: list[list[ContiguousAttentionKVCache]]
+    # attention_layer_caches[attention_pool_idx][req_idx]. Windowed caches
+    # hold only trailing-window KV, so read them through write_token/get_kv,
+    # never by slicing .keys at an absolute offset.
+    attention_layer_caches: list[
+        list[ContiguousAttentionKVCache | WindowedAttentionKVCache]
+    ]
     attention_pool_index_by_layer: dict[int, int] = field(default_factory=dict)
 
     # Optional AOT kernel state. Keep kernel-specific fields out of the regular
@@ -122,9 +127,11 @@ class MLXAttentionWrapper(nn.Module):
     When ``BatchedDecodeContext`` is set, performs per-request RoPE,
     cache writes, and batched SDPA.  Otherwise delegates to inner module.
 
-    ``window_size`` marks a sliding-window layer: the pool keeps the full
-    KV history and the wrapper attends to the trailing window only, which
-    is numerically identical to a rotating cache.
+    ``window_size`` marks a sliding-window layer: the wrapper attends to
+    the trailing window of the cached keys only, which is numerically
+    identical to a rotating cache.  Both cache kinds keep KV in temporal
+    order and report absolute offsets, so the same trailing-window slice
+    works whether the cache holds full history or only the window.
     """
 
     def __init__(

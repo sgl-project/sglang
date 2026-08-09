@@ -145,6 +145,94 @@ class ContiguousAttentionKVCache:
         """Return valid K/V: (1, n_kv_heads, offset, head_dim)."""
         return self.keys[:, :, : self.offset, :], self.values[:, :, : self.offset, :]
 
+    def reset(self) -> None:
+        """Reset for reuse, keeping allocated buffers."""
+        self.offset = 0
+
+
+class WindowedAttentionKVCache:
+    """Sliding-window attention KV buffer for one request and one layer.
+
+    Holds the trailing ``window`` tokens plus the in-flight chunk, in
+    temporal order, instead of the full sequence.  ``offset`` stays
+    absolute (RoPE positions, decode bookkeeping); the dropped prefix
+    shows up only in the shorter arrays returned by
+    ``update_and_fetch``/``get_kv`` and in the mask offset ``make_mask``
+    clamps to, so mask width always equals returned key length.
+    """
+
+    __slots__ = ("keys", "values", "offset", "window", "_local")
+
+    def __init__(self, window: int):
+        self.window = window
+        self.keys: mx.array | None = None
+        self.values: mx.array | None = None
+        self.offset = 0  # absolute: every token ever written
+        self._local = 0  # tokens currently in the buffer
+
+    @property
+    def state(self):
+        """Arrays for ``mx.eval`` unpacking."""
+        if self.keys is None:
+            return ()
+        return (self.keys, self.values)
+
+    def reset(self) -> None:
+        """Reset for reuse, keeping allocated buffers."""
+        self.offset = 0
+        self._local = 0
+
+    def make_mask(self, N, return_array=False, window_size=None, **kwargs):
+        kept = min(self._local, self.window)
+        if window_size is None and self.offset > kept:
+            raise RuntimeError(
+                "WindowedAttentionKVCache holds only the trailing window and "
+                "cannot serve a full-context attention mask"
+            )
+        return make_attention_mask(
+            N, kept, return_array=return_array, window_size=window_size
+        )
+
+    def update_and_fetch(
+        self, keys: mx.array, values: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        """Append a chunk and return the kept trailing window plus the chunk.
+
+        The kept prefix is ``min(local, window)``, matching what
+        ``make_mask`` clamps to earlier in the same forward pass.
+        """
+        S = keys.shape[2]
+        kept = min(self._local, self.window)
+        capacity = self.window + max(S, self.window)
+        held = self.keys.shape[2] if self.keys is not None else 0
+        if self._local + S > held or held > capacity:
+            # Compact the trailing window into a right-sized buffer: this
+            # allocates on the first write, drops history when the buffer
+            # fills (amortised O(1) per decode token), and shrinks back to
+            # 2 * window once an oversized prefill chunk is behind us.
+            B, n_kv_heads, _, head_dim = keys.shape
+            new_k = mx.zeros((B, n_kv_heads, capacity, head_dim), dtype=keys.dtype)
+            new_v = mx.zeros((B, n_kv_heads, capacity, head_dim), dtype=keys.dtype)
+            if kept:
+                src = slice(self._local - kept, self._local)
+                new_k[:, :, :kept, :] = self.keys[:, :, src, :]
+                new_v[:, :, :kept, :] = self.values[:, :, src, :]
+            self.keys, self.values, self._local = new_k, new_v, kept
+        start, end = self._local - kept, self._local + S
+        self.keys[:, :, self._local : end, :] = keys
+        self.values[:, :, self._local : end, :] = values
+        self._local = end
+        self.offset += S
+        return self.keys[:, :, start:end, :], self.values[:, :, start:end, :]
+
+    def write_token(self, k: mx.array, v: mx.array) -> None:
+        """Write one token. k, v shape: (1, n_kv_heads, 1, head_dim)."""
+        self.update_and_fetch(k, v)
+
+    def get_kv(self) -> tuple[mx.array, mx.array]:
+        """Return buffered trailing K/V: (1, n_kv_heads, local, head_dim)."""
+        return self.keys[:, :, : self._local, :], self.values[:, :, : self._local, :]
+
 
 class PoolBackedAttentionKVCache:
     """Lazily gathers cached attention KV from the shared pool during forward.

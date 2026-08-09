@@ -4,18 +4,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import Any, Callable, Optional
 
 import mlx.core as mx
 
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
-        ContiguousAttentionKVCache,
-    )
 
 
 def _load_metal_rope_pool_fused():
@@ -219,7 +214,7 @@ class MlxAOTKernelContext:
         req_ids: list[str],
         req_pool_idx: dict[str, int],
         req_to_token_pool: Any | None,
-        layer_caches: list[list[ContiguousAttentionKVCache]],
+        layer_caches: list[list[Any]],  # only .offset is read (always absolute)
     ) -> MlxAOTKernelContext:
         """Build optional AOT context for one batched decode step."""
         if not aot_kernels.rope.enabled or kv_pool is None:
