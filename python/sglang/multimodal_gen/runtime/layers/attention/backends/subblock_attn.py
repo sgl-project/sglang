@@ -17,9 +17,12 @@ is configured through ``--attention-backend-config``::
     --attention-backend-config '{"sparsity": 0.75, "skip_first_steps": 10,
                                  "skip_first_layers": 0, "n_k": 4}'
 
-Requirements inherited from the kernel: SM100 (B200), bf16, head_dim 128. Any
-call that does not meet them -- including cross/refiner attention over short
-sequences -- runs dense instead, so selecting this backend is safe model-wide.
+Requirements inherited from the kernel: compute capability 10.0 (B200 / GB200
+class -- it is built for ``sm_100a``, which does not forward-run on 10.3 or
+12.x), bf16, head_dim 128. On such a GPU any call the kernel cannot serve --
+cross/refiner attention, short sequences, non-bf16 -- runs dense instead, so
+selecting this backend is safe model-wide. On any other GPU it raises rather
+than falling back; see the README.
 """
 
 from __future__ import annotations

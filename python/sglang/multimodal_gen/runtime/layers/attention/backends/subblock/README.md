@@ -11,12 +11,29 @@ sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
   --attention-backend-config '{"sparsity": 0.75, "n_k": 4}'
 ```
 
-Requirements come from the kernel: **SM100 (B200), bfloat16, head_dim 128**.
-Anything that does not meet them — cross attention, the token refiner, short
-sequences — silently runs dense, so selecting the backend is safe model-wide.
-
 Inline JSON gets mangled by `shlex.split`; pass a **file path** to
 `--attention-backend-config` if the shell eats the quotes.
+
+## What it runs on
+
+Everything below comes from `bsa_attn_blk64_fwd`, not from this backend.
+
+| | |
+| --- | --- |
+| GPU | **compute capability 10.0 only** — B200 / GB200 class. The kernel is built `-gencode=arch=compute_100a,code=sm_100a`, which is arch-specific and does not forward-run on 10.3 (B300 / GB300) or 12.x (RTX PRO 6000, RTX 50xx). |
+| dtype | bfloat16 |
+| head_dim | 128 |
+| attention | non-causal, one contiguous sequence per call |
+
+Within a supported GPU, anything the kernel cannot serve — cross attention, the
+token refiner, sequences under `min_seq_len`, non-bf16 activations, head_dim !=
+128 — silently runs dense, so the backend is safe to select model-wide.
+
+**On an unsupported GPU it is not a fallback, it is an error.** The kernel raises
+`RuntimeError: BSA blk64 only supports SM100` on the first sparse attention call.
+The startup resolver imports the entry point, which catches a missing or broken
+FlashInfer install, but the extension itself is built lazily inside that first
+call, so the device check does not happen until then.
 
 ## How the score works
 
