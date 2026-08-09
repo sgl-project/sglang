@@ -4,9 +4,10 @@ import atexit
 import os
 
 import pytest
-import sglang.srt.distributed.parallel_state as ps
 import torch
 import torch.distributed as dist
+
+import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.kernels.ops.kimi_k3 import (
