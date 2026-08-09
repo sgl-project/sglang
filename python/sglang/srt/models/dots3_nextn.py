@@ -136,7 +136,7 @@ class Dot3NoteModelNextN(nn.Module):
         return self.embed_tokens(input_ids.clamp(min=0, max=self.vocab_size - 1))
 
 
-class Dots3NoteOmniForCausalLMNextN(Dots3LanguageModelForCausalLM):
+class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
     """Full-sharing Dots3 MTP draft registered for NEXTN decoding."""
 
     def __init__(
@@ -158,7 +158,7 @@ class Dots3NoteOmniForCausalLMNextN(Dots3LanguageModelForCausalLM):
                 "g_proj",
             ]
         }
-        self.determine_num_fused_shared_experts("Dots3NoteOmniForCausalLMNextN")
+        self.determine_num_fused_shared_experts("Dots3NoteForCausalLMNextN")
 
         self.model = Dot3NoteModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -207,4 +207,4 @@ class Dots3NoteOmniForCausalLMNextN(Dots3LanguageModelForCausalLM):
         torch.cuda.synchronize()
 
 
-EntryClass = [Dots3NoteOmniForCausalLMNextN]
+EntryClass = [Dots3NoteForCausalLMNextN]

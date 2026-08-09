@@ -1843,7 +1843,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def determine_num_fused_shared_experts(
-        self, architecture: str = "Dots3NoteOmniForCausalLM"
+        self, architecture: str = "Dots3NoteForCausalLM"
     ):
         self.num_fused_shared_experts = 0
         if get_server_args().disable_shared_experts_fusion:
@@ -2349,7 +2349,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         # so this branch is dormant. When a future checkpoint
                         # diverges (independent fine-tune / different quantization /
                         # vocab compression), the override of set_embed_and_head in
-                        # Dots3NoteOmniForCausalLMNextN keeps this loaded value instead
+                        # Dots3NoteForCausalLMNextN keeps this loaded value instead
                         # of overwriting it with the target's. K-heads note: this
                         # routes every per-head head into the same lm_head slot —
                         # the last write wins. The current architecture has one
@@ -2557,12 +2557,12 @@ class Dots3LanguageModelForCausalLM(nn.Module):
     def set_embed_and_head(self, embed, head):
         # Destructive share-from-target for the main model. eagle_worker calls
         # this on the *draft* model right after both target and draft have
-        # loaded. For the main `Dots3NoteOmniForCausalLM` (used as the draft only in
+        # loaded. For the main `Dots3NoteForCausalLM` (used as the draft only in
         # the unusual case of a 1-layer target), the loaded weights are
         # discarded and replaced by the target's tensors — saves ~2× embed/head
         # memory and guarantees the draft scores in the same vocab space.
         #
-        # IMPORTANT: `Dots3NoteOmniForCausalLMNextN` overrides this method (see
+        # IMPORTANT: `Dots3NoteForCausalLMNextN` overrides this method (see
         # dots3_nextn.py) to make the share decision *per side* based on
         # whether the checkpoint actually wrote MTP-side embed / head weights.
         # If you change the behaviour here, update the override there too.
@@ -2824,8 +2824,8 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         )
 
 
-class Dots3NoteOmniForCausalLM(DotsNoteOmniForConditionalGeneration):
-    """dots.note.omni architecture exported by the flat checkpoint."""
+class Dots3NoteForCausalLM(DotsNoteOmniForConditionalGeneration):
+    """Canonical dots.note architecture exported by the flat checkpoint."""
 
 
-EntryClass = [Dots3NoteOmniForCausalLM]
+EntryClass = [Dots3NoteForCausalLM]

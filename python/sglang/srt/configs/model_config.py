@@ -116,8 +116,8 @@ def is_deepseek_dsa(config) -> bool:
             "GlmMoeDsaForCausalLMNextN",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
-            "Dots3NoteOmniForCausalLM",
-            "Dots3NoteOmniForCausalLMNextN",
+            "Dots3NoteForCausalLM",
+            "Dots3NoteForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -616,14 +616,14 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "Dots3NoteOmniForCausalLM"
-        ):
+        dots3_draft_arch = {
+            "Dots3NoteForCausalLM": "Dots3NoteForCausalLMNextN",
+        }.get(self.hf_config.architectures[0])
+        if is_draft_model and dots3_draft_arch is not None:
             # Dots3 uses one SWA-shaped MTP layer recursively for all NEXTN
             # proposal steps (full sharing). Rewrite the draft config before
             # model shapes and hybrid KV-cache geometry are derived.
-            self.hf_config.architectures[0] = "Dots3NoteOmniForCausalLMNextN"
+            self.hf_config.architectures[0] = dots3_draft_arch
             self.hf_text_config.num_nextn_predict_layers = 1
             self.hf_text_config.layer_types = ["sliding_attention"]
             self.hf_text_config.attention_gate_type = (
@@ -918,8 +918,8 @@ class ModelConfig:
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
-            or "Dots3NoteOmniForCausalLM" in self.hf_config.architectures
-            or "Dots3NoteOmniForCausalLMNextN" in self.hf_config.architectures
+            or "Dots3NoteForCausalLM" in self.hf_config.architectures
+            or "Dots3NoteForCausalLMNextN" in self.hf_config.architectures
             or "MistralLarge3ForCausalLM" in self.hf_config.architectures
             or (
                 "PixtralForConditionalGeneration" in self.hf_config.architectures
@@ -1919,7 +1919,7 @@ multimodal_model_archs = [
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
-    "Dots3NoteOmniForCausalLM",
+    "Dots3NoteForCausalLM",
     "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
     "NVILAForConditionalGeneration",
@@ -2147,8 +2147,8 @@ def get_hybrid_layer_ids(
         ]
     elif (
         "GptOssForCausalLM" in model_architectures
-        or "Dots3NoteOmniForCausalLM" in model_architectures
-        or "Dots3NoteOmniForCausalLMNextN" in model_architectures
+        or "Dots3NoteForCausalLM" in model_architectures
+        or "Dots3NoteForCausalLMNextN" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [

@@ -13,7 +13,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.dots3 import Dots3NoteOmniForCausalLM
+from sglang.srt.models.dots3 import Dots3NoteForCausalLM
 from sglang.srt.models.dots_omni_towers import (
     DotsNoteOmniImagePreprocessor,
     OmniAudioConfig,
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class DotsNoteOmniProcessor(BaseMultimodalProcessor):
     """Native image/audio processor for dots.note.omni."""
 
-    models = [Dots3NoteOmniForCausalLM]
+    models = [Dots3NoteForCausalLM]
     gpu_image_decode = False
 
     def __init__(self, hf_config, server_args, processor, transport_mode, **kwargs):
