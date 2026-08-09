@@ -230,16 +230,17 @@ class ContextParallelStrategy(ABC):
 
 
 def _is_dsa_active() -> bool:
-    from sglang.srt.runtime_context import get_parallel, get_server_args
-
-    # `_is_dsa_model_arch` is set nowhere in the tree, so this predicate is
-    # inert today (the getattr default makes it False). Kept verbatim rather
-    # than "fixed" here, because deciding what it should name is the CP path's
-    # call; the ratchet exempts it with that reason.
-    return bool(
-        get_parallel().enable_prefill_cp
-        and getattr(get_server_args(), "_is_dsa_model_arch", False)
-    )
+    # A placeholder from the CP strategy series (#27313): it was written as
+    # `getattr(server_args, "_is_dsa_model_arch", False)`, and that name has
+    # never existed on `ServerArgs`, so the default has always decided it. Spelled
+    # as the constant it evaluates to, because a dynamic read of a name nothing
+    # sets is invisible to the config census while looking like a live decision.
+    #
+    # Deciding what it *should* ask -- whether this process runs a DSA model
+    # arch, which is answerable from the model config -- is the CP path's call,
+    # and its only consumer (`ContextParallelStrategy.per_layer_attn_cp_comm`)
+    # has no readers yet.
+    return False
 
 
 _STRATEGY: Optional[ContextParallelStrategy] = None
