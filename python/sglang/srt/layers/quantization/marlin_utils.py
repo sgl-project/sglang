@@ -86,6 +86,11 @@ def query_marlin_supported_quant_types(
     include_fp_type: bool = True,
     device_capability: Optional[int] = None,
 ):
+    # The Marlin kernels are written in PTX, so a ROCm device reporting its gfx
+    # arch as e.g. (11, 5) must not be mistaken for an Ampere+ CUDA device.
+    if not _is_cuda:
+        return []
+
     if device_capability is None:
         major, minor = get_device_capability()
         capability = major * 10 + minor
