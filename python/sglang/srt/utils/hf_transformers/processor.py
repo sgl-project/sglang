@@ -188,7 +188,11 @@ def get_processor(
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
     if config.model_type not in {"llava", "clip"}:
-        kwargs["use_fast"] = use_fast
+        if "InternVL3_5" in tokenizer_name:
+            # This path loads a tokenizer rather than an image processor.
+            kwargs["use_fast"] = use_fast
+        elif use_fast is not None:
+            kwargs["backend"] = "torchvision" if use_fast else "pil"
     try:
         if "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(
@@ -223,7 +227,8 @@ def get_processor(
                 "Processor %s does not have a slow version. Automatically use fast version",
                 tokenizer_name,
             )
-            kwargs["use_fast"] = True
+            kwargs.pop("use_fast", None)
+            kwargs["backend"] = "torchvision"
             processor = AutoProcessor.from_pretrained(
                 tokenizer_name,
                 *args,
@@ -249,10 +254,10 @@ def get_processor(
         ):
             logger.info(
                 "AutoProcessor for %s rejected standard kwargs, "
-                "retrying without trust_remote_code/use_fast",
+                "retrying without trust_remote_code/backend",
                 tokenizer_name,
             )
-            kwargs.pop("use_fast", None)
+            kwargs.pop("backend", None)
             kwargs.pop("_from_auto", None)
             processor = AutoProcessor.from_pretrained(
                 tokenizer_name,
