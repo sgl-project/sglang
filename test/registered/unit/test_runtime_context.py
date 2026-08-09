@@ -391,6 +391,19 @@ class _FakeResolvedArgs:
     speculative_num_draft_tokens: A[int | None, Arg(help="d"), NS("spec")] = None
     speculative_adaptive: A[bool, Arg(help="a"), NS("spec")] = False
     speculative_adaptive_config: A[str | None, Arg(help="c"), NS("spec")] = None
+    load_format: A[str, Arg(help="lf"), NS("model")] = "auto"
+    remote_instance_weight_loader_backend: A[str, Arg(help="rb"), NS("model")] = "nccl"
+    remote_instance_weight_loader_start_seed_via_transfer_engine: A[
+        bool, Arg(help="rs"), NS("model")
+    ] = False
+    modelexpress_config: A[str | None, Arg(help="mx"), NS("model")] = None
+    disaggregation_mode: A[str, Arg(help="dm"), NS("disagg")] = "null"
+    max_running_requests: A[int | None, Arg(help="mrr"), NS("schedule")] = None
+    chunked_prefill_size: A[int, Arg(help="cps"), NS("schedule")] = -1
+    max_prefill_tokens: A[int, Arg(help="mpt"), NS("schedule")] = 16384
+    cuda_graph_config: A[object | None, Arg(help="cgc"), NS("exec.graph")] = None
+    tp_size: A[int, Arg(help="tp"), NS("parallel")] = 1
+    pp_size: A[int, Arg(help="pp"), NS("parallel")] = 1
     _resolved_overrides: list = dataclasses.field(default_factory=list)
 
 
@@ -1012,6 +1025,74 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                         ServerArgs.enable_mamba_extra_buffer_lazy(args),
                         mamba_extra_buffer_lazy_enabled(),
                     )
+
+    def test_activation_reserve_matches_the_member(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.runtime_context import pre_capture_activation_reserve_mb
+
+        graph = SimpleNamespace(decode=SimpleNamespace(max_bs=64))
+        cases = (
+            dict(disaggregation_mode="null", chunked_prefill_size=8192),
+            dict(disaggregation_mode="null", chunked_prefill_size=-1),
+            dict(
+                disaggregation_mode="null",
+                chunked_prefill_size=-1,
+                max_prefill_tokens=1024,
+            ),
+            dict(disaggregation_mode="decode", max_running_requests=32),
+            dict(disaggregation_mode="decode", max_running_requests=None),
+            dict(
+                disaggregation_mode="decode",
+                max_running_requests=None,
+                speculative_num_draft_tokens=4,
+            ),
+            dict(
+                disaggregation_mode="null",
+                chunked_prefill_size=8192,
+                tp_size=8,
+                pp_size=2,
+            ),
+        )
+        for case in cases:
+            for gpu_mem in (None, 20 * 1024, 80 * 1024):
+                with self.subTest(gpu_mem=gpu_mem, **case):
+                    args = _FakeResolvedArgs(cuda_graph_config=graph, **case)
+                    get_context().set_server_args(args)
+                    self.assertEqual(
+                        ServerArgs.pre_capture_activation_reserve_mb(args, gpu_mem),
+                        pre_capture_activation_reserve_mb(gpu_mem),
+                    )
+
+    def test_remote_instance_transfer_engine_matches_the_member(self):
+        from sglang.srt.runtime_context import remote_instance_transfer_engine_enabled
+
+        backends = ("nccl", "transfer_engine", "modelexpress")
+        transports = (None, '{"transport": "transfer_engine"}', '{"transport": "nixl"}')
+        for seed_via_te in (False, True):
+            for load_format in ("auto", "remote_instance"):
+                for backend in backends:
+                    for mx in transports:
+                        with self.subTest(
+                            seed=seed_via_te,
+                            load_format=load_format,
+                            backend=backend,
+                            modelexpress=mx,
+                        ):
+                            args = _FakeResolvedArgs(
+                                load_format=load_format,
+                                remote_instance_weight_loader_backend=backend,
+                                remote_instance_weight_loader_start_seed_via_transfer_engine=seed_via_te,
+                                modelexpress_config=mx,
+                            )
+                            get_context().set_server_args(args)
+                            for override in (None, "remote_instance", "auto"):
+                                self.assertEqual(
+                                    ServerArgs.remote_instance_weight_loader_use_transfer_engine(
+                                        args, override
+                                    ),
+                                    remote_instance_transfer_engine_enabled(override),
+                                )
 
     def test_attention_backends_match_the_member(self):
         from sglang.srt.runtime_context import attention_backends

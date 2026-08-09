@@ -180,6 +180,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     is_ep_joiner,
     is_ep_scale_joiner,
+    remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -561,7 +562,6 @@ class ModelRunner:
 
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
-            server_args=self.server_args,
             get_model=lambda: self.model,
             tp_rank=self.ps.tp_rank,
             gpu_id=self.gpu_id,
@@ -672,9 +672,7 @@ class ModelRunner:
         )
 
     def maybe_init_remote_instance_transfer_engine(self):
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine(
-            load_format=self.draft_load_format
-        ):
+        if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
             self.remote_instance_weight_transporter.init_engine()
 
     def maybe_init_expert_location_metadata(self):

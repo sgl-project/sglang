@@ -44,6 +44,7 @@ from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
+    remote_instance_transfer_engine_of,
     resolved_view,
 )
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
@@ -9474,20 +9475,7 @@ class ServerArgs:
     def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
-        # Use TransferEngine as seed backend.
-        if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
-            return True
-        # Use TransferEngine as client backend.
-        if (load_format or self.load_format) == "remote_instance" and (
-            self.remote_instance_weight_loader_backend == "transfer_engine"
-            or (
-                self.remote_instance_weight_loader_backend == "modelexpress"
-                and self.modelexpress_transport == "transfer_engine"
-            )
-        ):
-            return True
-        else:
-            return False
+        return remote_instance_transfer_engine_of(self, load_format)
 
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
