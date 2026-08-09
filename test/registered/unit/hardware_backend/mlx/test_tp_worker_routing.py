@@ -96,6 +96,7 @@ class _FakeRunner:
         self._req_caches[req_id] = [self._fake_cache_layer()]
         return SimpleNamespace(
             lazy_token=mx.array([0], dtype=mx.int32),
+            cache=self._req_caches[req_id],
             req_id=req_id,
             lazy_logprobs=None,
         )
@@ -151,17 +152,8 @@ class _FakeRunner:
     def collect_logprobs(self, lazy_logprobs):
         return None
 
-    def eval_prefill(self, pending):
+    def eval_pending(self, pending):
         pass
-
-    def eval_extend(self, pending):
-        pass
-
-    def eval_decode(self, pending):
-        pass
-
-    def request_cache_arrays(self, req_id):
-        return self.cache_state_arrays([self._req_caches[req_id]])
 
     @staticmethod
     def cache_state_arrays(caches):

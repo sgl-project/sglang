@@ -106,6 +106,7 @@ class MlxPendingExtend:
     """
 
     lazy_token: mx.array
+    cache: list[Any]
     req_id: str
     new_token_ids: list[int]
     new_synced_offset: int
@@ -455,19 +456,6 @@ class MlxModelRunner:
         return arrays
 
     @staticmethod
-    def _eval_with_cache(
-        token_result: mx.array,
-        cache: list[Any],
-        lazy_logprobs: MlxLazyLogprobs | None = None,
-    ) -> None:
-        """Evaluate token result and all cache buffers in one mx.eval call."""
-        mx.eval(
-            token_result,
-            *[s for c in cache for s in MlxModelRunner._cache_arrays(c)],
-            *lazy_logprob_arrays(lazy_logprobs),
-        )
-
-    @staticmethod
     def cache_state_arrays(caches: list[list[Any]]) -> list[mx.array]:
         """Flatten per-request cache lists (``caches[req][layer]``) to arrays.
 
@@ -758,7 +746,7 @@ class MlxModelRunner:
             req=req,
             needs_logits=needs_logits,
         )
-        self.eval_prefill(pending)
+        self.eval_pending(pending)
         return self.prefill_finalize(pending)
 
     def extend(
@@ -775,7 +763,7 @@ class MlxModelRunner:
         pending = self.extend_start(
             req_id, new_token_ids, new_slot_ids, needs_logits=needs_logits
         )
-        self.eval_extend(pending)
+        self.eval_pending(pending)
         return self.extend_finalize(pending)
 
     def _sync_new_kv_to_pool(
@@ -849,7 +837,7 @@ class MlxModelRunner:
         One-shot convenience wrapper; see :meth:`prefill`.
         """
         pending = self.decode_batch_start(req_ids)
-        self.eval_decode(pending)
+        self.eval_pending(pending)
         return self.decode_batch_finalize(pending)
 
     def prefill_start(
@@ -1069,6 +1057,7 @@ class MlxModelRunner:
 
         return MlxPendingExtend(
             lazy_token=lazy_token,
+            cache=cache,
             req_id=req_id,
             new_token_ids=list(new_token_ids),
             new_synced_offset=new_synced_offset,
@@ -1240,34 +1229,25 @@ class MlxModelRunner:
             token_ids_idx=[list(ids) if ids else [] for ids in spec.token_ids],
         )
 
-    def eval_prefill(self, pending: MlxPendingPrefill) -> None:
-        """Materialize a queued prefill: token, cache writes and logprobs."""
-        self._eval_with_cache(pending.lazy_token, pending.cache, pending.lazy_logprobs)
+    def eval_pending(
+        self, pending: MlxPendingPrefill | MlxPendingExtend | MlxPendingDecode
+    ) -> None:
+        """Materialize a queued forward: token(s), cache writes and logprobs.
 
-    def eval_extend(self, pending: MlxPendingExtend) -> None:
-        """Materialize a queued extend: token, cache writes and logprobs."""
-        self._eval_with_cache(
-            pending.lazy_token,
-            self._req_caches[pending.req_id],
-            pending.lazy_logprobs,
-        )
-
-    def eval_decode(self, pending: MlxPendingDecode) -> None:
-        """Materialize a queued decode step.
-
-        Evaluates ``lazy_tokens`` together with every affected cache buffer
-        so the attention write-then-read ordering is materialised in one
-        kernel submission.
+        One ``mx.eval`` for the whole pending, so the attention
+        write-then-read ordering is materialised in a single kernel
+        submission.  Prefill and extend carry one request's per-layer
+        cache; a decode carries one cache list per request.
         """
+        if isinstance(pending, MlxPendingDecode):
+            tokens, caches = pending.lazy_tokens, pending.caches
+        else:
+            tokens, caches = pending.lazy_token, [pending.cache]
         mx.eval(
-            pending.lazy_tokens,
-            *self.cache_state_arrays(pending.caches),
+            tokens,
+            *self.cache_state_arrays(caches),
             *lazy_logprob_arrays(pending.lazy_logprobs),
         )
-
-    def request_cache_arrays(self, req_id: str) -> list[mx.array]:
-        """Cache-state arrays of a committed request; safe for async_eval."""
-        return self.cache_state_arrays([self._req_caches[req_id]])
 
     @staticmethod
     def _dummy_next_token(hidden: mx.array) -> mx.array:

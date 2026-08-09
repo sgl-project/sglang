@@ -309,7 +309,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             new_slot_ids=[4],
             req_pool_idx=0,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         mx.eval(*runner._attention_kv_pool.all_buffers())
         runner.prefill_finalize(pending)
 
@@ -720,7 +720,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             new_slot_ids=[4],
             req_pool_idx=req.req_pool_idx,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         runner.prefill_finalize(pending)
 
         self.assertEqual(runner.model.seen_inputs, [[[13]]])
@@ -777,7 +777,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             req_pool_idx=req.req_pool_idx,
             req=req,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         runner.prefill_finalize(pending)
         tracked = [FakeNativeCache(), None]
         runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
@@ -839,7 +839,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             req_pool_idx=req.req_pool_idx,
             req=req,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         runner.prefill_finalize(pending)
         tracked = [FakeNativeCache(), None]
         runner._req_to_token_pool.auxiliary_state_pool.restore_cache(

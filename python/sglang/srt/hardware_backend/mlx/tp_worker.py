@@ -399,7 +399,7 @@ class MlxTpModelWorker(TpModelWorker):
                         logit_edit_row=edit_rows[req.rid] if edit_rows else None,
                         logprob_spec=self._logprob_spec_for(logprob_rows, [req.rid]),
                     )
-                    self._mlx_runner.eval_extend(pending_e)
+                    self._mlx_runner.eval_pending(pending_e)
                     next_token = self._mlx_runner.extend_finalize(pending_e)
                     self._collect_step_logprobs(
                         step_logprob_rows, pending_e.lazy_logprobs, [req.rid]
@@ -422,7 +422,7 @@ class MlxTpModelWorker(TpModelWorker):
                         logit_edit_row=edit_rows[req.rid] if edit_rows else None,
                         logprob_spec=self._logprob_spec_for(logprob_rows, [req.rid]),
                     )
-                    self._mlx_runner.eval_prefill(pending_p)
+                    self._mlx_runner.eval_pending(pending_p)
                     next_token = self._mlx_runner.prefill_finalize(pending_p)
                     self._collect_step_logprobs(
                         step_logprob_rows, pending_p.lazy_logprobs, [req.rid]
@@ -510,7 +510,7 @@ class MlxTpModelWorker(TpModelWorker):
             logprob_spec=self._logprob_spec_for(logprob_rows, req_ids),
             logits_hook=self._custom_logits_hook(batch) if allow_hook else None,
         )
-        self._mlx_runner.eval_decode(pending)
+        self._mlx_runner.eval_pending(pending)
         next_tokens = self._mlx_runner.decode_batch_finalize(pending)
         self._collect_step_logprobs(step_logprob_rows, pending.lazy_logprobs, req_ids)
         return next_tokens
@@ -674,12 +674,9 @@ class MlxTpModelWorker(TpModelWorker):
         else:
             lazy_stacked = None
 
-        for p in pending_prefills:
-            async_args.extend(self._mlx_runner.cache_state_arrays([p.cache]))
-            async_args.extend(lazy_logprob_arrays(p.lazy_logprobs))
-        for e in pending_extends:
-            async_args.extend(self._mlx_runner.request_cache_arrays(e.req_id))
-            async_args.extend(lazy_logprob_arrays(e.lazy_logprobs))
+        for pending in (*pending_prefills, *pending_extends):
+            async_args.extend(self._mlx_runner.cache_state_arrays([pending.cache]))
+            async_args.extend(lazy_logprob_arrays(pending.lazy_logprobs))
         if pending_mixed_decode is not None:
             async_args.append(pending_mixed_decode.lazy_tokens)
             async_args.extend(lazy_logprob_arrays(pending_mixed_decode.lazy_logprobs))
