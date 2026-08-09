@@ -235,15 +235,19 @@ class TestNormalizeDeepseekV4Compat(unittest.TestCase):
         normalize_deepseek_v4_compat(cfg)
         self.assertFalse(hasattr(cfg, "compress_ratios"))
 
-    def test_raises_clear_error_on_unknown_layer_type(self):
-        # An unknown ``layer_types`` entry (neither a compressed type in
-        # ``compress_rates`` nor the ``sliding_attention`` special case)
-        # should surface as a ValueError that names both the missing key and
-        # the available ones — not a bare KeyError from the list
-        # comprehension.
+    def test_unknown_layer_type_silently_falls_back_to_zero(self):
+        # Unknown ``layer_types`` entries fall back to ``0`` — the same
+        # encoding used for ``sliding_attention`` layers and every
+        # downstream reader already treats ``0`` as "not a compressed
+        # layer". Silent degradation is preferable to raising here: the
+        # crash would surface at config-load time on any upstream that
+        # adds a new layer type sglang has not yet been rebuilt for,
+        # even when the new type does not need any special handling.
+        # Matches the community consensus reached in
+        # vllm-project/vllm#43443 and sgl-project#34128.
         cfg = self._make_new_transformers_config([self._LT_CSA, "mystery_layer"])
-        with self.assertRaisesRegex(ValueError, r"mystery_layer.*compress_rates"):
-            normalize_deepseek_v4_compat(cfg)
+        normalize_deepseek_v4_compat(cfg)
+        self.assertEqual(cfg.compress_ratios, [4, 0])
 
     def test_no_op_when_only_one_of_the_new_fields_is_present(self):
         # When the loaded config is malformed or partially populated (e.g. a
@@ -255,6 +259,62 @@ class TestNormalizeDeepseekV4Compat(unittest.TestCase):
         # layer_types deliberately absent
         normalize_deepseek_v4_compat(cfg)
         self.assertFalse(hasattr(cfg, "compress_ratios"))
+
+    def test_no_op_when_compress_rates_is_not_a_dict(self):
+        # A misconfigured ``model_override_args={"compress_rates": [...]}``
+        # can hand the loader a list where a dict is expected. Fail loudly
+        # by falling through to a plain AttributeError downstream rather
+        # than reshaping garbage silently — an isinstance guard bounds the
+        # blast radius to config-load rather than the first attention
+        # layer's ``.get(...)`` call.
+        cfg = self._make_new_transformers_config([self._LT_CSA])
+        cfg.compress_rates = [4, 128]  # wrong shape
+        normalize_deepseek_v4_compat(cfg)
+        self.assertFalse(hasattr(cfg, "compress_ratios"))
+
+    def test_no_op_when_layer_types_is_a_string(self):
+        # Another common malformed-input shape: someone passes a single
+        # ``"compressed_sparse_attention"`` string instead of a list of
+        # them. ``for lt in layer_types`` would iterate characters and
+        # produce nonsense ratios. The isinstance guard keeps the helper
+        # a no-op so the downstream AttributeError is preserved as the
+        # diagnostic surface.
+        cfg = self._make_new_transformers_config(self._LT_CSA)  # not a list
+        normalize_deepseek_v4_compat(cfg)
+        self.assertFalse(hasattr(cfg, "compress_ratios"))
+
+    def test_length_matches_layer_types_not_num_hidden_layers(self):
+        # Contract: the rebuilt list is exactly as long as ``layer_types``.
+        # sglang downstream (``configs/model_config.py`` and
+        # ``models/deepseek_v4.py``) indexes it by layer id, so a shorter
+        # list surfaces as ``IndexError`` at the right site rather than
+        # this helper silently padding. Documented as a pinned contract
+        # so a future "pad to num_hidden_layers" refactor gets caught.
+        cfg = self._make_new_transformers_config([self._LT_CSA, self._LT_HCA])
+        normalize_deepseek_v4_compat(cfg)
+        self.assertEqual(len(cfg.compress_ratios), 2)
+
+    def test_empty_compress_rates_produces_zero_ratios(self):
+        # Degenerate but plausible config
+        # (``compress_rates={}``): every non-SWA layer degrades to 0.
+        # Downstream still gets a well-formed ``list[int]`` and reads
+        # ``4 in []`` / ``sum(r == 4)`` / ``[layer_id]`` without crashing.
+        cfg = self._make_new_transformers_config([self._LT_CSA, self._LT_HCA])
+        cfg.compress_rates = {}
+        normalize_deepseek_v4_compat(cfg)
+        self.assertEqual(cfg.compress_ratios, [0, 0])
+
+    def test_idempotent_across_repeated_calls(self):
+        # The loader may run through ``get_hf_text_config`` more than once
+        # for shared configs (multi-model launches, override paths). The
+        # second invocation must be a no-op on a config that already has
+        # the legacy list, and must not double-rebuild.
+        cfg = self._make_new_transformers_config([self._LT_HCA, self._LT_CSA])
+        normalize_deepseek_v4_compat(cfg)
+        first = cfg.compress_ratios
+        normalize_deepseek_v4_compat(cfg)
+        second = cfg.compress_ratios
+        self.assertIs(first, second)
 
 
 # ---------------------------------------------------------------------------
