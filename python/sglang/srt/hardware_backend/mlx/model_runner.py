@@ -179,17 +179,10 @@ class MlxModelRunner:
         self._req_synced_offset: dict[str, int] = {}
         # Number of req_to_token positions the scheduler has committed for each
         # request. Overlap-chained decode advances the private cache offset past
-        # this (it builds a step ahead of the scheduler writing the matching
-        # slot), so the pool sync must clamp to this bound instead of
-        # cache.offset. Advanced only on scheduler-built forwards (prefill,
-        # extend, decode_batch_start), never on decode_batch_start_chained.
+        # this, so the pool sync must clamp to this bound instead of cache.offset.
+        # Advanced only on scheduler-built forwards, never on decode_batch_start_chained.
         self._req_committed_len: dict[str, int] = {}
         # req_generation of each request's row at the time it was acquired.
-        # ReqToTokenPool bumps the generation whenever a freed row is realloc'd,
-        # so a mismatch means the row was reused by another request and must not
-        # be read for this req_id. Guards the retraction path, which frees the
-        # row without going through the pre-release hook. None when radix cache
-        # is disabled (no pool, no sync).
         self._req_row_generation: dict[str, int | None] = {}
 
         self._pool_size = self._compute_pool_size(pool_size)

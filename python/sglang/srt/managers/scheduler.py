@@ -3453,9 +3453,7 @@ class Scheduler(
             )
             # Retraction frees each request's row and KV slots without the finish
             # pre-release hook. Let the model worker drop any per-request runtime
-            # state now (getattr-guarded: only the MLX worker defines the hook),
-            # so a re-scheduled request routes as a fresh prefill and no later
-            # flush reads its freed row/slots.
+            # state now.
             prepare_retraction = getattr(self.tp_worker, "prepare_for_retraction", None)
             if callable(prepare_retraction):
                 for req in retracted_reqs:

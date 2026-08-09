@@ -1,34 +1,6 @@
 """Regression guard: MLX runner must never write a request's KV into pool
 slots it does not own — neither an uncommitted (chained-ahead) row tail nor a
 row/KV slot the scheduler freed and handed to another request.
-
-Background. :class:`MlxModelRunner` keeps a ``req_id -> req_pool_idx`` mapping
-and reads slot IDs out of ``req_to_token[req_pool_idx, synced:end]`` when
-flushing decode KV to the shared attention pool. Two independent failure modes
-were reported on this PR:
-
-1. **Uncommitted tail (chained decode).** ``end`` used to be ``cache.offset``,
-   the private-cache write cursor. Overlap-chained decode advances that cursor
-   for a step the scheduler has not yet committed to ``req_to_token``, so the
-   tail cells are the padding slot ``0`` (or, on a reused row, another
-   request's slots). Fix: clamp the read to the scheduler-committed length
-   (``_req_committed_len``).
-
-2. **Reused row (retraction).** Retraction frees the row via
-   ``release_kv_cache(..., is_insert=False)`` without the pre-release hook, so
-   the runner keeps the request with a stale ``req_pool_idx``. Before stale-rid
-   cleanup runs, a prefill/extend batch's ``flush_decode_kv_for_slots`` reads
-   the reused row and syncs the old tail into the new owner's slots. Fix: a
-   row-generation ownership check (``ReqToTokenPool.req_generation`` bumps on
-   realloc) rejects a reused row.
-
-These tests drive the **real** ``ReqToTokenPool`` and ``TokenToKVPoolAllocator``
-rather than hand-built fakes, so row/generation and KV-slot reuse follow the
-actual allocator semantics (a fake that hardcodes "reuse bumps the generation"
-cannot express the freed-slot / different-row case). Only the attention pool
-writer ``_sync_new_kv_to_pool`` is spied, to observe which slots a flush would
-touch without needing real KV arrays. Apple-Silicon / mlx gated because the
-module imports ``mlx.core`` at load.
 """
 
 from __future__ import annotations
