@@ -3,6 +3,7 @@ import torch
 
 from sglang.kernels.ops.diffusion.modulate_scale_shift import (
     can_use_modulate_scale_shift_cuda,
+    modulate_scale_shift,
     modulate_scale_shift_cuda,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -48,6 +49,7 @@ def test_modulate_scale_shift_guards_reject_fp32():
     x = torch.randn((1, 64, 64), device="cuda", dtype=torch.float32)
     row = torch.randn((1, 64), device="cuda", dtype=torch.float32)
     assert not can_use_modulate_scale_shift_cuda(x, row, row)
+    assert torch.equal(modulate_scale_shift(x, row, row), _eager(x, row, row))
 
 
 if __name__ == "__main__":
