@@ -1,6 +1,6 @@
 ---
 name: kl-consistency-test
-description: Write, calibrate, and debug the prefill-vs-decode logprob (KL) consistency tests in sglang -- what they detect (radix-cache and conv/mamba state-reuse bugs), why batch-invariance has to be settled before a threshold means anything, and how to localize a divergence to a single operator. Use when adding a KL test to a model, picking or defending a kl_div threshold, or investigating a KL number that is too high.
+description: Write, calibrate, and debug the prefill-vs-decode logprob (KL) consistency tests in sglang -- the two independent conditions a zero requires (every operator batch-invariant, and the two paths computing the same function), which helper separates them, how to pick a threshold once they hold, and how to localize a divergence to a single operator. Use when adding a KL test to a model, picking or defending a kl_div threshold, or investigating a KL number that is too high.
 ---
 
 # KL Consistency Tests
@@ -15,6 +15,31 @@ stale conv/mamba checkpoint, a SWA pool that evicted something it still needed.
 
 gsm8k passing says nothing about this. Accuracy is insensitive to a handful of
 corrupted tokens; the KL check is not.
+
+## Two independent conditions produce a zero
+
+Reaching bit-identity needs both, and they fail for unrelated reasons. Knowing which
+one a nonzero belongs to is most of the debugging.
+
+1. **Every operator on the path is batch-invariant.** A token's result must not
+   depend on how many tokens share its forward. Note this is a property *across* the
+   two paths, not a property of each: a kernel can be perfectly reproducible at M=1
+   and again at M=N while disagreeing between them, which is exactly what a
+   tile-size switch or a message-size-dependent reduction does.
+
+2. **The two paths compute the same function.** Decode's context and state at a
+   position must equal what a fresh prefill computes there -- the same KV set, the
+   same sliding window, the same conv/mamba state, a restored cache prefix that
+   reproduces a recomputed one. This is logic, not arithmetic, and it survives any
+   amount of numerical hygiene.
+
+The conditions are independent, and one measurement separates them: with (1)
+satisfied, `match` and `decode_cache_hit` read exactly 0 while `prefill_cache_hit`
+stays nonzero when a prefix restore is wrong. Same server, same prompts -- float
+noise cannot pick a code path, so a helper-specific divergence is (2).
+
+Order the work accordingly. Settle (1) first: until it holds, its noise is orders of
+magnitude above anything (2) produces and hides it completely.
 
 ## The three helpers differ in what touches the cache
 
@@ -47,7 +72,7 @@ tokens past a threshold, and the max -- rather than the mean.
 Generate past the sliding window if the model has one, so decode carries the window
 through the handover from prompt tokens to generated ones.
 
-## Determinism is not batch-invariance
+## Condition 1: determinism is not batch-invariance
 
 This distinction decides whether a threshold means anything.
 
@@ -61,9 +86,9 @@ the aten kernels for fixed-reduction versions and pins the NCCL algorithm and ch
 count -- but only for kernels it covers. Custom kernels that never reach an aten op
 are outside `batch_invariant_ops` and stay shape-dependent.
 
-The consequence: a nonzero KL under deterministic inference means some kernel on the
-path is still batch-dependent. Localize it (below) rather than widening the
-threshold.
+The consequence: a nonzero KL under deterministic inference that appears in every
+helper alike means some kernel on the path is still batch-dependent. Localize it
+(below) rather than widening the threshold.
 
 ### MoE amplifies this to a degree dense models do not
 
@@ -77,6 +102,30 @@ A dense model of comparable size shows the same root cause as ~1e-4. So a KL in 
 hundredths is not evidence of a worse bug on a MoE model -- it is the same class of
 numerical difference, amplified. Do not calibrate a MoE threshold by analogy to a
 dense one.
+
+## Condition 2: the two paths must compute the same function
+
+Once condition 1 holds, whatever remains is a state bug, and the helper it appears in
+names the path. A restore that does not reproduce a recomputed prefix shows up in
+`prefill_cache_hit` alone; the other two stay at exactly 0.
+
+What the signature looks like, and how to read it:
+
+- **Which sequences.** Divergence concentrated in a couple of requests out of a
+  batch, with the rest bit-identical, is a condition triggered by those requests --
+  not a systematic offset. Compare their prompt lengths, `cached_tokens`, and page
+  and checkpoint-interval remainders against the ones that pass.
+- **Where in the generation.** Contiguous from the first generated token means the
+  state was already wrong when generation began, so the fault is in the prefix
+  restore rather than in decode. Divergence starting mid-generation points instead at
+  something that happens during decode -- a window handover, a checkpoint rotation.
+- **Whether it is a race.** Re-run under different configurations that should not
+  matter (page size, TP degree, buffer strategy). Bit-identical numbers across them
+  mean a deterministic logic fault, which is far cheaper to chase than a race.
+
+Generate past the sliding window if the model has one: the handover from prompt
+tokens to generated ones inside the window is where eviction and checkpoint rotation
+actually run.
 
 ## Choosing a threshold
 
@@ -147,6 +196,13 @@ Two failure modes cost the most time, both avoidable:
   a generation twice and produced a plausible, wrong conclusion; another time a
   different `num_samples` silently selected a different prompt set through the
   `get_input_ids` cache key.
+
+The logprob arrays are indexed by absolute position: with `logprob_start_len=0`,
+`input_token_logprobs` carries one entry per input token, the first is `None`, and
+entry `k` scores `input_ids[k]`. The helpers slice the tail, which lands on the
+generated span; analysis that indexes absolutely has to agree with that. An
+off-by-one here reads a neighbouring token, whose logprob is usually close enough to
+look like a real signal.
 
 For an isolated claim, reduce to a standalone repro. A ten-line script calling the
 suspect op at M=1 and M=288 settles batch-invariance in seconds, and belongs in the
