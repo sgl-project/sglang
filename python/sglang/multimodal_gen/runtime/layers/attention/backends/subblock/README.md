@@ -61,16 +61,15 @@ own dense render, scored as cosine of the decoded video:
 | sparsity 0.75 | +0.008 | +2.1 | 10/15 |
 
 The margin shrinks as the budget loosens — at the shipped 118 of 590 blocks the
-rules mostly agree on what to keep — and it costs 0.5% of the denoise time. Nothing else in
-this family has separated from anything else: `n_k` in {1, 2, 4, 8} at sparsity
-0.75 came out within noise, and a temperature sweep of the sub-block reduction
-(whose T -> infinity limit is exactly `n_k=1`) was monotone with no interior
-optimum.
+rules mostly agree on what to keep — and it costs 0.5% of the denoise time.
+Nothing else in this family has separated from anything else: see `n_k` below,
+and a temperature sweep of the sub-block reduction (whose T -> infinity limit is
+exactly `n_k=1`) was monotone with no interior optimum.
 
-`SubBlockRouter.route` also accepts a `[H]` tensor as `topk` for a per-head
-budget — at a fixed mean sparsity that lifts 5th-percentile recall from .52 to
-.90, because diffuse heads stop being starved. The backend does not expose it
-yet; there is no per-head budget to feed it.
+The one idea measured here that beats any estimator upgrade is a **per-head
+budget**: at a fixed mean sparsity, spending more blocks on diffuse heads lifts
+5th-percentile mass recall from .52 to .90. It is not implemented — it needs a
+rule for setting the split, which nothing in the pipeline produces yet.
 
 ### Why the two schedule cutoffs are not symmetric
 
@@ -91,62 +90,82 @@ to 0. Do not lower `skip_first_steps` without looking at the output.
 
 ## Measured
 
-MiniMax-H3 t2va, 1344x768 / 5 s / 50 steps, 8x B200, Ulysses-8, bf16. Three
-prompts, one uncounted warm-up request per server, all three arms in one session
-on one node. n_k=4, sparsity 0.75 (148 of 590 key blocks per query block).
+MiniMax-H3 t2va, 1344x768 / 5 s / 50 steps, 8x B200, Ulysses-8, bf16, at the
+shipped defaults (sparsity 0.80, `n_q=n_k=4`, 118 of 590 key blocks per query
+block). Five prompts per arm, all arms in one session on one node, first
+(cold) sample of each arm dropped:
 
-| | DiT denoise | vs dense | end to end | vs dense |
-| --- | ---: | ---: | ---: | ---: |
-| dense (FlashAttention) | 21.48 s | 1.000x | 23.26 s | 1.000x |
-| SubBlock | 18.55 s | **1.158x** | 20.00 s | 1.163x |
-| SubBlock + [flashinfer#4397][fi] | 17.32 s | **1.240x** | 18.79 s | 1.238x |
+| | DiT denoise | vs dense |
+| --- | ---: | ---: |
+| dense (FlashAttention) | 18.295 s | 1.000x |
+| SubBlock | 15.536 s | **1.178x** |
+| SubBlock + [flashinfer#4397][fi] | 14.328 s | **1.277x** |
 
-Spread within an arm is under 0.07 s. End-to-end trails denoise slightly because
-VAE decode is a fixed ~1.5 s that the backend does not touch.
+Spread within an arm is under 0.07 s. End to end the ratio is slightly lower —
+VAE decode is a fixed ~1.5 s the backend does not touch.
 
 [flashinfer-ai/flashinfer#4397][fi] rebuilds the kernel's internal Q/K/V tile
 layout in one pass instead of three — `bsa_attn_blk64_fwd` was otherwise
 re-tiling every activation on every call. It is bit-identical (verified
-element-wise on captured H3 tensors) and **not required**: without it SubBlock
-still gives 1.158x, with it 1.240x, so the patch alone is worth 1.071x.
-
-Absolute times are node-specific — the same dense config measured 18.22 s on
-another B200 host and 21.48 s here. Only ratios measured in one session are
-comparable.
-
-Sparsity is the lever, not `n_k`: at 0.80 (118 of 590 blocks) the same sweep gave
-1.264x, while `n_k` moves the denoise time by 0.3% across its whole range
-(17.30 s at 1, 17.35 s at 8).
+element-wise on captured H3 tensors) and **not required**: the patch alone is
+worth 1.084x on top of the backend.
 
 [fi]: https://github.com/flashinfer-ai/flashinfer/pull/4397
 
-`n_k` also did not resolve as a quality knob end to end. A five-prompt ablation
-over `n_k` in {1, 2, 4, 8} — 1 being plain average pooling, plus a repeat of 4 as
-an in-session control — reproduces the same config to 0.0006 per clip, so the
-metric is precise, but the per-clip differences between arms are large and
-inconsistent in sign (`n_k=1` minus `n_k=4`: -0.031, +0.057, -0.008, -0.002,
--0.013). Paired over the five clips nothing separates from `n_k=4`: t = +0.05
-(n_k=1), -0.78 (n_k=2), -1.26 (n_k=8).
+Sparsity is the speed lever and it saturates. Same methodology, `n_q=n_k=4`,
+stock FlashInfer:
 
-So the +.0142 recall the sub-block score gains over average pooling at 0.9
-sparsity is real at the tensor level and does not show up in the pixels at 0.75 —
-at least not above what five prompts can resolve. `n_k=4` is the default on the
-recall table and on cost, not on a measured end-to-end win.
+| | blocks kept | denoise | vs dense |
+| --- | ---: | ---: | ---: |
+| dense | 590/590 | 18.294 s | 1.000x |
+| sparsity 0.75 | 148/590 | 16.105 s | 1.136x |
+| sparsity 0.80 | 118/590 | 15.527 s | **1.178x** |
+| sparsity 0.85 | 89/590 | 15.112 s | 1.211x |
+
+Cutting the budget a further 40% past 0.80 buys 6%, and 0.85 was the worst arm
+on cosine-vs-dense on both clips rendered across all three grades, so the
+default takes the knee. `n_k` moves the denoise time by 0.3% across its whole
+range (17.30 s at 1, 17.35 s at 8) — it is a quality knob, not a speed one.
 
 **The speedup is bounded by sequence length, not by the method.** The same
 config measured 1.13x at 37.7k tokens, 1.20x at 52k and 1.47x at 96k: the
-backend only touches attention, and attention's share of the DiT grows with S. Treat
-1.2x as the 768p/5 s number, not the ceiling.
+backend only touches attention, and attention's share of the DiT grows with S.
+Treat 1.2x as the 768p/5 s number, not the ceiling.
+
+Peak memory is unchanged (99,356 vs 99,358 MiB/GPU): block sparsity saves
+compute, not activations, and the `[B,H,Gq,Gk]` score matrix is ~20 MB at
+S=37.7k.
+
+Absolute times are node-specific — the same dense config measured 21.48 s on
+another B200 host. Only ratios measured in one session are comparable.
+
+### What `n_k` did *not* resolve
+
+A five-prompt ablation over `n_k` in {1, 2, 4, 8} — 1 being plain average
+pooling, plus a repeat of 4 as an in-session control — reproduces the same
+config to 0.0006 per clip, so the metric is precise, but the per-clip
+differences between arms are large and inconsistent in sign (`n_k=1` minus
+`n_k=4`: -0.031, +0.057, -0.008, -0.002, -0.013). Paired over the five clips
+nothing separates from `n_k=4`: t = +0.05 (n_k=1), -0.78 (n_k=2), -1.26
+(n_k=8). The +.0142 recall the sub-block score gains over average pooling at
+0.9 sparsity is real at the tensor level and does not show up in the pixels at
+the shipped budget. `n_k=4` is the default on the recall table and on cost.
 
 ## Known limitation: long-range mass
 
 At sparsity 0.75 the router keeps 82.6% of the true softmax mass, and **97% of
 what it drops lies beyond 8 key blocks**. The near field survives intact; the
-far field loses a sixth. On a prompt that asks for three cats this reproducibly
-renders four — a duplicated adjacent object is what a long-range deficit looks
-like, and the count returns only once recall reaches ~0.97 (sparsity 0.40),
-which is already slower than dense. Raising the budget is not the lever; raising
-*long-range* recall at a fixed budget would be.
+far field loses a sixth.
+
+What that looks like in the pixels, on the one clip where it was chased: a
+prompt asking for three cats rendered four, in both of two independent runs
+where dense rendered three, and the count came back only once recall reached
+~0.97 (sparsity 0.40) — a budget already slower than dense. Duplicating an
+adjacent object is what a long-range deficit looks like. Treat it as a lead,
+not a settled result: a later sweep of the same clip at 0.75/0.80/0.85, one
+render per grade, did not reproduce the extra cat, and object counts move
+between server launches at a fixed seed. Raising the budget is not the lever;
+raising *long-range* recall at a fixed budget would be.
 
 An attention sink (first 16 blocks always kept) and a forced diagonal were both
 tried at fixed budget and rejected: the diagonal changed relative L2 by 0.2%,
