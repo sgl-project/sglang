@@ -4,10 +4,9 @@ import atexit
 import os
 
 import pytest
+import sglang.srt.distributed.parallel_state as ps
 import torch
 import torch.distributed as dist
-
-import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.kernels.ops.kimi_k3 import (
@@ -273,7 +272,8 @@ def test_gemm_all_reduce():
 
 
 @torch.inference_mode()
-def test_attention_residual_direct_all_gather():
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_attention_residual_direct_all_gather(with_residual: bool):
     _require_sm100()
     comm = _init_comm()
     rank, local_tokens, num_bank_rows = dist.get_rank(), 2, 3
@@ -299,9 +299,11 @@ def test_attention_residual_direct_all_gather():
     output_weight = torch.linspace(
         1.25, 0.75, _HIDDEN_SIZE, device=_device(), dtype=torch.bfloat16
     )
+    residual = torch.randn_like(prefix, generator=generator) if with_residual else None
+    expected_prefix = prefix if residual is None else prefix.add(residual)
     local_reference = torch.empty_like(prefix)
     attn_res.attn_res_fused_tma(
-        prefix,
+        expected_prefix,
         bank.clone(),
         combine_weight,
         output_weight,
@@ -323,9 +325,10 @@ def test_attention_residual_direct_all_gather():
     )
 
     output, handle, multicast_ptr = _symmetric_tensor(tuple(full_reference.shape))
+    prefix_out = prefix.clone()
     attn_res.attn_res_fused_direct_ag(
         comm.world_size,
-        prefix,
+        prefix_out,
         bank,
         combine_weight,
         output_weight,
@@ -334,9 +337,44 @@ def test_attention_residual_direct_all_gather():
         1e-6,
         output_mc_ptr=multicast_ptr,
         max_blocks=4,
+        write_prefix=with_residual,
+        residual=residual,
+        prefix_out=prefix_out,
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(output, full_reference, rtol=2e-2, atol=3e-2)
+    torch.testing.assert_close(prefix_out, expected_prefix, rtol=0, atol=0)
+    if with_residual:
+        torch.testing.assert_close(
+            bank[:, num_bank_rows], expected_prefix, rtol=0, atol=0
+        )
+        prefix_out.copy_(prefix)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            attn_res.attn_res_fused_direct_ag(
+                comm.world_size,
+                prefix_out,
+                bank,
+                combine_weight,
+                output_weight,
+                output,
+                num_bank_rows,
+                1e-6,
+                output_mc_ptr=multicast_ptr,
+                max_blocks=4,
+                write_prefix=True,
+                residual=residual,
+                prefix_out=prefix_out,
+            )
+        for _ in range(2):
+            prefix_out.copy_(prefix)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output, full_reference, rtol=2e-2, atol=3e-2)
+            torch.testing.assert_close(prefix_out, expected_prefix, rtol=0, atol=0)
+            torch.testing.assert_close(
+                bank[:, num_bank_rows], expected_prefix, rtol=0, atol=0
+            )
     assert handle is not None
 
 

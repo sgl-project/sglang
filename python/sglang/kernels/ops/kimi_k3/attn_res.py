@@ -190,10 +190,12 @@ def attn_res_fused_tma(
     )
 
 
-@register_custom_op(mutates_args=["bank", "out"])
+@register_custom_op(mutates_args=["bank", "out", "prefix_out"])
 def _attn_res_fused_direct_ag_op(
     world_size: int,
     prefix_sum: torch.Tensor,
+    residual: torch.Tensor | None,
+    prefix_out: torch.Tensor,
     bank: torch.Tensor,
     cw: torch.Tensor,
     ow: torch.Tensor,
@@ -210,6 +212,8 @@ def _attn_res_fused_direct_ag_op(
     _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_direct_ag(
         _COMM_MAP[world_size],
         prefix_sum,
+        residual,
+        prefix_out,
         bank,
         cw,
         ow,
@@ -236,6 +240,8 @@ def attn_res_fused_direct_ag(
     output_mc_ptr: int,
     max_blocks: int = 128,
     write_prefix: bool = False,
+    residual: torch.Tensor | None = None,
+    prefix_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fuse local attention-residual aggregation with direct multicast AG.
 
@@ -243,9 +249,14 @@ def attn_res_fused_direct_ag(
     aggregates its local token shard and multicast-stores normalized vectors
     directly from consumer registers into that rank's slice on every peer.
     """
+    if residual is not None and prefix_out is None:
+        raise ValueError("attn_res_fused_direct_ag requires prefix_out with residual")
+    materialized_prefix = prefix_sum if prefix_out is None else prefix_out
     _attn_res_fused_direct_ag_op(
         world_size,
         prefix_sum,
+        residual,
+        materialized_prefix,
         bank,
         cw,
         ow,
