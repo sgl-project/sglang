@@ -31,11 +31,8 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 
 
 def gpu_mm_preprocess_enabled() -> bool:
-    """Whether the GPU image-preprocessing fast path may be used; the
-    PIL/CPU reference path (the checkpoint's own HF processor) runs otherwise."""
-    return (
-        torch.cuda.is_available() and not envs.SGLANG_USE_PIL_MM_PREPROCESS.get()
-    )
+    """GPU fast path allowed? Otherwise the PIL/CPU reference path runs."""
+    return torch.cuda.is_available() and not envs.SGLANG_USE_PIL_MM_PREPROCESS.get()
 
 
 def navit_resize_config(

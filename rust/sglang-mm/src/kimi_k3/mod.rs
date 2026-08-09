@@ -1,20 +1,9 @@
 //! Kimi-K3 image preprocessing, bit-exact against the checkpoint's PIL/numpy
-//! reference (`kimi_k3_vision_processing.py` + `media_utils.py` with
-//! `transparent_bg_fill_stage == "after_resize"`):
-//!
-//! 1. PIL `Image.resize(..., BICUBIC)` in the image's own mode — RGBA keeps
-//!    its alpha through the resize.
-//! 2. `fill_transparent_bg_with`: composite the resized RGBA onto the
-//!    configured background in f32, truncating back to u8 like
-//!    `np.ndarray.astype(np.uint8)`.
-//! 3. Zero-pad bottom/right so both sides divide the patch size.
-//! 4. `normalize`: `(x / 255.0).astype(f32); x -= mean; x *= 1/std` — numpy
-//!    computes the in-place ops through f64 and casts back, reproduced here in
-//!    a per-channel 256-entry LUT.
-//! 5. `navit_patchify`: reshape to `(n_patches, 3, ps, ps)` f32, C-order.
-//!
-//! Sizing (`navit_resize_config`) and prompt handling stay in Python; this
-//! module turns one decoded u8 image into the model-ready patch buffer.
+//! reference (`kimi_k3_vision_processing.py`, fill stage `"after_resize"`):
+//! PIL BICUBIC resize (RGBA keeps alpha) -> f32 background composite with
+//! `astype(u8)` truncation -> zero-pad -> normalize (numpy's f64-through
+//! in-place ops, as per-channel LUTs) -> NaViT patchify to
+//! `(n_patches, 3, ps, ps)` f32. Sizing and prompt handling stay in Python.
 
 use crate::common::par;
 use crate::common::resize::{self, Filter, Resample};
@@ -57,10 +46,9 @@ impl Background {
     }
 }
 
-/// Composite a flat HWC RGBA buffer onto `bg`, reproducing
-/// `fill_transparent_bg_with`'s numpy math exactly: f32 alpha blend, then
-/// `astype(np.uint8)` truncation. `bg == None` reproduces `Image.convert("RGB")`
-/// on an RGBA image, which simply drops the alpha channel.
+/// Composite a flat HWC RGBA buffer onto `bg`: f32 alpha blend, then
+/// `astype(np.uint8)` truncation. `bg == None` = `Image.convert("RGB")`,
+/// which just drops the alpha channel.
 pub fn composite_rgba(rgba: &[u8], h: usize, w: usize, bg: Option<Background>) -> Vec<u8> {
     let mut out = vec![0u8; h * w * 3];
     par::for_chunks_mut(&mut out, w * 3, |y, row| {
@@ -83,9 +71,8 @@ pub fn composite_rgba(rgba: &[u8], h: usize, w: usize, bg: Option<Background>) -
     out
 }
 
-/// Per-channel u8 -> normalized-f32 table reproducing `media_utils.normalize`:
-/// `(x / 255.0).astype(np.float32)` then in-place `-= mean`, `*= 1/std` (numpy
-/// runs the f32 (x) f64-scalar in-place ops through f64 and casts back).
+/// u8 -> normalized f32 table for `media_utils.normalize`: numpy runs the
+/// in-place f32 (x) f64-scalar ops through f64 and casts back each step.
 fn norm_lut(mean: f64, std: f64) -> [f32; 256] {
     let std_inv = 1.0 / std;
     core::array::from_fn(|v| {
@@ -102,9 +89,8 @@ pub struct PreprocessOutput {
     pub grid_thw: [i64; 3],
 }
 
-/// The full post-decode Kimi-K3 image pipeline (steps 1-5 above) for one
-/// decoded u8 image of `channels` 3 (RGB) or 4 (RGBA, composited onto `bg`
-/// after the resize).
+/// The full post-decode pipeline for one u8 image of `channels` 3 (RGB) or
+/// 4 (RGBA, composited onto `bg` after the resize).
 #[allow(clippy::too_many_arguments)]
 pub fn preprocess_image(
     src: &[u8],
@@ -194,6 +180,9 @@ mod python {
     /// `(pattern, square_size, square_on_top_left, white_value, gray_value)`
     /// mirroring `TransparentBgConfig`; only chessboard reads the last four.
     type PyBg = (String, usize, bool, u8, u8);
+
+    /// Flattened patch buffer plus its `(t, h, w)` grid.
+    type PyPatches<'py> = (Bound<'py, PyArray1<f32>>, (i64, i64, i64));
 
     fn parse_bg(bg: Option<PyBg>) -> PyResult<Option<Background>> {
         let Some((pattern, square_size, square_on_top_left, white_value, gray_value)) = bg else {
@@ -292,7 +281,7 @@ mod python {
         mean: (f64, f64, f64),
         std: (f64, f64, f64),
         bg: Option<PyBg>,
-    ) -> PyResult<(Bound<'py, PyArray1<f32>>, (i64, i64, i64))> {
+    ) -> PyResult<PyPatches<'py>> {
         let bg = parse_bg(bg)?;
         let (data, h, w, c) = contiguous(&arr)?;
         let out = py

@@ -217,8 +217,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             result = self._rust_call(text, images, original_input_ids)
             if result is not None:
                 return result
-            # An image mode outside the Rust pipeline's bit-exact scope
-            # (palette/CMYK/...): the PIL reference handles the request.
+            # Image mode outside the Rust pipeline's bit-exact scope.
             return self._cpu_call(text, images, original_input_ids, **kwargs)
         if images and gpu_mm_preprocess_enabled():
             return self._gpu_call(text, images, original_input_ids)
@@ -244,9 +243,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         return resize_configs, image_sizes
 
     def _rust_call(self, text, images, original_input_ids=None):
-        """Preprocess via the Rust sglang-mm pipeline (bit-exact with the PIL
-        reference); ``None`` means an image is outside its scope and the
-        caller must take the PIL path instead."""
+        """Preprocess via Rust sglang-mm; ``None`` = out of scope, use PIL."""
         from sglang.srt.multimodal.kimi_k3_rust import rust_preprocess_images
 
         input_text = text[0] if isinstance(text, list) else text
@@ -336,9 +333,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
 
 class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK3ForConditionalGeneration]
-    # The Rust pipeline consumes decoded PIL images, so nvJPEG CUDA decode is
-    # incompatible with it (class attribute: read once at import, after the
-    # launch environment is set).
+    # The Rust pipeline consumes decoded PIL images, not nvJPEG CUDA tensors.
     gpu_image_decode = not envs.SGLANG_KIMI_K3_RS_MM_PREPROCESS.get()
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True

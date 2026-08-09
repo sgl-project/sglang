@@ -1,17 +1,10 @@
 """Rust-accelerated Kimi-K3 image preprocessing (sglang-mm's ``kimi_k3`` module).
 
 Library mode, like Inkling: the Python TokenizerManager keeps orchestrating
-(decode, NaViT sizing, prompt expansion) and each decoded image's
-resize -> transparent-bg composite -> normalize -> patchify runs in Rust,
-bit-exact against the checkpoint's PIL/numpy reference
-(``kimi_k3_vision_processing.py`` with ``transparent_bg_fill_stage ==
-"after_resize"``).
-
-The reference resizes each image in its *own* PIL mode and only converts
-after the resize, so an input image is handed to Rust only when an
-equivalent pre-converted RGB/RGBA array exists; anything else (palette
-images, which PIL resizes with NEAREST; CMYK; bilevel; ...) reports "no
-effective array" and the caller falls back to the PIL path for the request.
+(decode, NaViT sizing, prompt expansion); resize -> transparent-bg composite ->
+normalize -> patchify runs in Rust, bit-exact against the checkpoint's
+PIL/numpy reference. Images whose PIL mode has no bit-exact Rust equivalent
+report ``None`` and the caller falls back to the PIL path.
 """
 
 from __future__ import annotations
@@ -50,20 +43,15 @@ def bg_tuple(
 
 
 def to_effective_array(image) -> Optional[np.ndarray]:
-    """The u8 HWC array whose Rust pipeline output is bit-identical to the
-    reference's resize-in-original-mode semantics, or ``None`` when no such
-    array exists.
+    """The u8 HWC array matching the reference's resize-in-original-mode
+    semantics, or ``None`` when no such array exists.
 
-    * RGB passes through — including RGB images carrying a stray
-      ``"transparency"`` info key, which ``fill_transparent_bg_with`` returns
-      untouched before it ever inspects the alpha bands.
-    * L converts to RGB up front: the conversion replicates the single channel
-      and PIL's resize convolves channels independently, so convert-then-resize
-      equals the reference's resize-then-convert.
-    * RGBA / LA convert to RGBA up front, by the same per-channel argument.
-    * Everything else has no equivalent array: PIL forces NEAREST resampling
-      for palette ("P"/"1") modes, and CMYK-family conversions do not commute
-      with the resize.
+    The reference converts modes only *after* the resize, so pre-converting is
+    valid exactly when it commutes with PIL's per-channel resize: RGB passes
+    through (even with a stray ``"transparency"`` info key, which the
+    reference ignores on RGB), L/LA/RGBA convert by channel replication.
+    Palette modes (PIL forces NEAREST) and CMYK-family conversions don't
+    commute — no equivalent array.
     """
     if not isinstance(image, Image.Image):
         return None
@@ -90,10 +78,9 @@ def rust_preprocess_images(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Run the Rust pipeline over a request's images.
 
-    Returns ``(pixel_values, grid_thws)`` matching the PIL path's schema —
-    f32 ``(sum_patches, 3, ps, ps)`` and int64 ``(n_images, 3)`` — or ``None``
-    when any image has no effective array (the caller falls back to PIL for
-    the whole request so every image of a request takes one path).
+    Returns ``(pixel_values, grid_thws)`` in the PIL path's schema, or
+    ``None`` when any image has no effective array (the whole request then
+    falls back to PIL so all its images take one path).
     """
     arrays = []
     for image in images:

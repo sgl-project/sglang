@@ -977,8 +977,7 @@ class Envs:
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
-    # Select the PIL/CPU reference image preprocessing over the GPU fast paths
-    # (nvJPEG decode + GPU resize/normalize) — for accuracy baselines.
+    # Select the PIL/CPU reference image preprocessing over the GPU fast paths.
     SGLANG_USE_PIL_MM_PREPROCESS = EnvBool(False)
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
@@ -986,9 +985,8 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
-    # Preprocess Kimi-K3 images with the Rust sglang-mm pipeline (library mode,
-    # like SGLANG_INKLING_RS_MM_PREPROCESS): bit-exact against the checkpoint's
-    # PIL reference and used from the Python tokenizer manager.
+    # Preprocess Kimi-K3 images with the Rust sglang-mm pipeline (library
+    # mode, like SGLANG_INKLING_RS_MM_PREPROCESS; bit-exact with PIL).
     SGLANG_KIMI_K3_RS_MM_PREPROCESS = EnvBool(False)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;

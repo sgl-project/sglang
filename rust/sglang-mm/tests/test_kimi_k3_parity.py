@@ -1,15 +1,9 @@
 """Bit-exact parity: Rust Kimi-K3 preprocessing vs the checkpoint's PIL path.
 
-The PIL reference below is a line-for-line transcription of the checkpoint's
-``media_utils.py`` / ``kimi_k3_vision_processing.py`` (fill stage
-``"after_resize"``), so every assertion pins the Rust pipeline to the exact
-numpy/PIL semantics the ``SGLANG_USE_PIL_MM_PREPROCESS`` path executes:
-
-* load       — ``to_effective_array`` vs the mode PIL hands the reference,
-* resize     — ``resize_bicubic`` vs ``Image.resize(..., BICUBIC)`` per mode,
-* composite  — ``fill_transparent_bg`` vs ``fill_transparent_bg_with``,
-* end-to-end — ``preprocess`` vs resize+composite+pad+normalize+patchify,
-  compared with ``assert_array_equal`` on the f32 tensors (no tolerance).
+The reference below transcribes the checkpoint's ``media_utils.py`` (fill
+stage ``"after_resize"``). Each stage — load/mode canonicalization, resize,
+composite — and the end-to-end f32 tensors are compared with
+``assert_array_equal`` (no tolerance).
 """
 
 import io
