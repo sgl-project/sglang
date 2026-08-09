@@ -30,6 +30,7 @@ from sglang.srt.models.inkling_common.norm import RMSNorm
 from sglang.srt.models.inkling_common.sconv import SconvType, ShortConvolution
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_exec,
     get_model,
     get_parallel,
@@ -735,7 +736,8 @@ class InklingAttention(nn.Module):
 
         apply_log_scaling = log_scaling_tau is not None and not self.is_local
 
-        attention_backend = get_exec().kernel.attention_backend
+        # The decode half: this is the fused decode path.
+        _, attention_backend = attention_backends()
         assert attention_backend in ("fa4", "triton")
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.

@@ -69,6 +69,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_exec,
     get_forward,
     get_parallel,
@@ -419,9 +420,13 @@ class GptOssAttention(nn.Module):
         )
 
         # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
-        # others can use bfloat16
-        attn_backend = get_exec().kernel.attention_backend
-        sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
+        # others can use bfloat16. The pair, not the base field: this weight is
+        # allocated once and both phases read it, so a config that runs
+        # trtllm_mha in either phase needs float32 (`--decode-attention-backend
+        # trtllm_mha` with the base field unset is such a config).
+        sinks_dtype = (
+            torch.float32 if "trtllm_mha" in attention_backends() else torch.bfloat16
+        )
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
         )
