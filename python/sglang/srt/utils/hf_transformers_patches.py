@@ -109,6 +109,9 @@ def normalize_deepseek_v4_compat(config) -> None:
 
     if getattr(config, "model_type", None) != "deepseek_v4":
         return
+
+    _flatten_deepseek_v4_rope(config)
+
     # ``hasattr`` alone is not enough here: some configs may carry an
     # explicit ``compress_ratios = None``, which would short-circuit the
     # rebuild and hand downstream a ``None`` that then explodes at
@@ -139,6 +142,44 @@ def normalize_deepseek_v4_compat(config) -> None:
         return rates.get(lt, 0)
 
     config.compress_ratios = [_legacy_ratio(lt) for lt in layer_types]
+
+
+def _flatten_deepseek_v4_rope(config) -> None:
+    """Flatten upstream V4's nested ``rope_parameters`` into the flat shape
+    sglang's DSv4 attention expects.
+
+    Upstream ``DeepseekV4Config.__post_init__`` reshapes ``rope_parameters``
+    into ``{"main": {...yarn params...}, "compress": {...compress yarn...}}``.
+    sglang consumes it as a flat dict — ``get_rope_config()`` returns the
+    top-level dict, and ``deepseek_v4.py::MqaAttentionBase.__init__`` reads
+    ``scaling["original_max_position_embeddings"]``, ``scaling.get("factor")``,
+    ``scaling.get("beta_fast" / "beta_slow")``, all of which upstream nests
+    under ``main``. A nested config would otherwise silently degrade yarn to
+    the ``.get(..., 1.0)`` defaults.
+
+    Prefer the ``main`` branch (the standard-attention rope; ``compress`` is
+    for CSA / HCA layers, whose base is already ``config.compress_rope_theta``
+    handled separately downstream). Lift ``rope_theta`` in if it is missing so
+    ``get_rope_config()`` — which reads ``rp["rope_theta"]`` when
+    ``rope_parameters`` is non-None — succeeds. Setting ``config.rope_scaling``
+    also updates ``config.rope_parameters`` via ``PretrainedConfig``'s
+    bidirectional alias, so both attributes agree on the flat shape after
+    this normalizer runs.
+    """
+
+    rp = getattr(config, "rope_parameters", None)
+    if not isinstance(rp, dict):
+        return
+    main = rp.get("main")
+    compress = rp.get("compress")
+    if not (isinstance(main, dict) and isinstance(compress, dict)):
+        return
+    flat = dict(main)
+    if "rope_theta" not in flat:
+        flat["rope_theta"] = getattr(config, "rope_theta", 10000)
+    # PretrainedConfig aliases rope_parameters <-> rope_scaling, so this
+    # single set covers both attribute paths downstream.
+    config.rope_scaling = flat
 
 
 def normalize_rope_scaling_compat(config) -> None:
