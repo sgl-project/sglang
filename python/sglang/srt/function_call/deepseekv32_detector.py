@@ -2,6 +2,7 @@ import json
 import logging
 import re
 
+from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -179,7 +180,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         parameters[param_name] = _partial_json_loads(
                             param_value, Allow.ALL
                         )[0]
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, MalformedJSON):
                         parameters[param_name] = param_value.strip()
 
         return json.dumps(parameters, ensure_ascii=False)
@@ -259,6 +260,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
         all_calls: list[ToolCallItem] = []
+        # Emit any prose that appears before the first DSML marker as
+        # normal_text (Bug #31786 — preamble was silently dropped).
+        # Only emitted when we actually found a tool call; otherwise the
+        # buffer may contain a partial DSML prefix that needs more chunks.
+        preamble = ""
+
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -280,6 +287,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
+                    # Compute preamble: prose before the first DSML marker
+                    # (Bug #31786 — was silently dropped).
+                    dsml_start = invoke_match.start()
+                    # Walk back to include the wrapper tag if present
+                    bot_pos = current_text.rfind(self.bot_token, 0, dsml_start)
+                    if bot_pos != -1:
+                        dsml_start = bot_pos
+                    preamble = current_text[:dsml_start].rstrip("\n")
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -355,11 +370,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text=preamble, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            # Clear buffer to prevent re-processing the same errored content
+            # on every subsequent call (Bug #32332).
+            self._buffer = ""
+            return StreamingParseResult(normal_text=preamble)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
