@@ -480,6 +480,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=self.forward_mode,
+            ragged_verify_layout=None,
             input_ids=buffers.input_ids[:num_tokens],
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,

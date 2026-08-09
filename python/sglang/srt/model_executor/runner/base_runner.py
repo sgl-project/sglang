@@ -185,6 +185,7 @@ def _allocate_decode_buffers(
     return SimpleNamespace(
         input_ids=input_ids,
         input_embeds=input_embeds,
+        ragged_verify_layout=None,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens_cpu,

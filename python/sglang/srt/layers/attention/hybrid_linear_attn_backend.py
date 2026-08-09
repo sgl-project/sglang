@@ -25,8 +25,14 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_server_args,
+    get_spec,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
@@ -41,6 +47,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -179,7 +186,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 # skip mamba metadata.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
-                ragged_layout = forward_batch.spec_info.ragged_verify_layout
+                ragged_layout = resolve_ragged_verify_layout(forward_batch)
                 if ragged_layout is not None:
                     # Compact ragged verify: variable per-request verify lens.
                     query_start_loc = ragged_layout.qo_indptr_device
@@ -252,6 +259,7 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.req_pool_indices,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            resolve_ragged_verify_layout(forward_batch),
             forward_batch.seq_lens_cpu if not in_capture else None,
             num_padding=(
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
@@ -485,18 +493,18 @@ class MambaAttnBackendBase(AttentionBackend):
         req_pool_indices: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        ragged_verify_layout=None,
     ):
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            ragged_layout = (
-                spec_info.ragged_verify_layout if spec_info is not None else None
-            )
-            if ragged_layout is not None:
+            if ragged_verify_layout is not None:
                 # Ragged capture: qsl from the runner's synthetic layout.
-                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+                self.query_start_loc_list[bs - 1].copy_(
+                    ragged_verify_layout.qo_indptr_device
+                )
             else:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -547,6 +555,7 @@ class MambaAttnBackendBase(AttentionBackend):
         req_pool_indices: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        ragged_verify_layout,
         seq_lens_cpu: Optional[torch.Tensor],
         num_padding: Optional[int] = None,
         in_capture: bool = False,
@@ -667,18 +676,17 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            ragged_layout = (
-                spec_info.ragged_verify_layout if spec_info is not None else None
-            )
-            if ragged_layout is not None:
+            if ragged_verify_layout is not None:
                 # Mamba kernels index dense [bs, N] scratch, so they need the
                 # capped variant (see padded_to_bucket). Padding rows carry
                 # mamba slot -1 and are skipped.
-                if ragged_layout.bs != bs or ragged_layout.cap is None:
-                    ragged_layout = ragged_layout.padded_to_bucket(
-                        padded_bs=bs, cap=spec_info.draft_token_num
+                if ragged_verify_layout.bs != bs or ragged_verify_layout.cap is None:
+                    ragged_verify_layout = ragged_verify_layout.padded_to_bucket(
+                        padded_bs=bs, cap=self.num_draft_tokens
                     )
-                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+                self.query_start_loc_list[bs - 1].copy_(
+                    ragged_verify_layout.qo_indptr_device
+                )
             elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -854,6 +862,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch.req_pool_indices,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            resolve_ragged_verify_layout(forward_batch),
             forward_batch.seq_lens_cpu if not in_capture else None,
             num_padding=(
                 0 if in_capture else getattr(forward_batch, "num_padding", None)

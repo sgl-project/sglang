@@ -552,6 +552,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info,
         device: torch.device,
+        ragged_verify_layout=None,
     ) -> TRTLLMMHAMetadata:
         """Create TRTLLMMHAMetadata with pre-allocated buffer slice refs, stored in the dict."""
         metadata = TRTLLMMHAMetadata()
@@ -610,9 +611,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
                 : bs + 1
             ]
-            metadata.is_ragged_verify = (
-                spec_info is not None and spec_info.ragged_verify_layout is not None
-            )
+            metadata.is_ragged_verify = ragged_verify_layout is not None
             metadata.max_seq_len_q = (
                 self.speculative_num_draft_tokens
                 if metadata.is_ragged_verify
@@ -682,6 +681,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
+        ragged_verify_layout=None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -719,7 +719,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
-            if spec_info is not None and spec_info.ragged_verify_layout is not None:
+            if ragged_verify_layout is not None:
                 # Ragged verify: the per-request k-extension is not a
                 # uniform scalar seqlen_offset, so the fused kernel cannot
                 # rebuild this metadata. It is written eagerly on every
@@ -850,7 +850,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if in_capture:
             num_tokens = forward_batch.positions.numel()
             self._build_cuda_graph_metadata(
-                bs, num_tokens, forward_mode, spec_info, forward_batch.seq_lens.device
+                bs,
+                num_tokens,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens.device,
+                ragged_verify_layout=resolve_ragged_verify_layout(forward_batch),
             )
 
         if forward_mode.is_decode_or_idle():
@@ -924,6 +929,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
+            ragged_verify_layout=resolve_ragged_verify_layout(forward_batch),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

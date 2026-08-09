@@ -336,6 +336,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             input_ids=getattr(forward_batch, "input_ids", None),
             req_pool_indices=forward_batch.req_pool_indices[:bs],
             seq_lens=forward_batch.seq_lens[:bs],

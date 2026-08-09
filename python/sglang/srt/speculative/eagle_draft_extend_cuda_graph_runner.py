@@ -574,6 +574,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=self.forward_mode,
+            ragged_verify_layout=None,
             input_ids=getattr(forward_batch, "input_ids", None),
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
