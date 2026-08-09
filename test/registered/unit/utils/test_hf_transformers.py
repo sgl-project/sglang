@@ -316,6 +316,58 @@ class TestNormalizeDeepseekV4Compat(unittest.TestCase):
         second = cfg.compress_ratios
         self.assertIs(first, second)
 
+    def test_flattens_nested_rope_parameters(self):
+        # Real upstream V4 checkpoints ship ``rope_parameters`` as
+        # ``{"main": {yarn params}, "compress": {compress yarn params}}``.
+        # sglang's DSv4 attention (``deepseek_v4.py::MqaAttentionBase``)
+        # reads ``scaling["original_max_position_embeddings"]`` and
+        # ``scaling.get("factor")`` off the top level, so leaving the
+        # nested structure in place would silently degrade yarn to the
+        # defaults (``factor=1.0``, missing ``original_max_position_embeddings``
+        # → KeyError). Flatten to the ``main`` branch and lift a
+        # ``rope_theta`` in so ``get_rope_config`` succeeds too. Same
+        # class of gap as the one Codex flagged post-135f36d5.
+        cfg = self._make_new_transformers_config([self._LT_CSA])
+        cfg.rope_parameters = {
+            "main": {
+                "rope_type": "yarn",
+                "factor": 40,
+                "original_max_position_embeddings": 4096,
+                "beta_fast": 32,
+                "beta_slow": 1,
+            },
+            "compress": {
+                "rope_type": "yarn",
+                "rope_theta": 160000,
+                "factor": 16,
+                "attention_factor": 1.0,
+            },
+        }
+        normalize_deepseek_v4_compat(cfg)
+        self.assertEqual(cfg.rope_scaling.get("factor"), 40)
+        self.assertEqual(cfg.rope_scaling.get("original_max_position_embeddings"), 4096)
+        self.assertEqual(cfg.rope_scaling.get("beta_fast"), 32)
+        self.assertIn("rope_theta", cfg.rope_scaling)
+        # Nested keys are gone; downstream ``scaling.get(...)`` no longer hits
+        # the sub-dict fallback.
+        self.assertNotIsInstance(cfg.rope_scaling.get("main"), dict)
+
+    def test_flat_rope_parameters_untouched(self):
+        # Configs that already ship a flat rope layout (older transformers
+        # or hand-written ``rope_scaling``) must pass through unchanged —
+        # the nested-detection guard is explicit about requiring both
+        # ``main`` and ``compress`` sub-dicts.
+        cfg = self._make_new_transformers_config([self._LT_CSA])
+        flat = {
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 4096,
+        }
+        cfg.rope_scaling = dict(flat)
+        normalize_deepseek_v4_compat(cfg)
+        for k, v in flat.items():
+            self.assertEqual(cfg.rope_scaling.get(k), v)
+
 
 # ---------------------------------------------------------------------------
 # get_rope_config
