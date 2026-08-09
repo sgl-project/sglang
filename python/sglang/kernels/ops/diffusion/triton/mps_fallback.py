@@ -18,8 +18,12 @@ from torch import Tensor
 from sglang.srt.utils.tensor_bridge import mlx_to_torch, torch_to_mlx, use_mlx
 
 from .torch_fallback import (
-    apply_rotary_embedding_native,
-    fuse_scale_shift_kernel_native,
+    apply_rotary_embedding_native as apply_rotary_embedding_native,
+)
+from .torch_fallback import (
+    fuse_scale_shift_kernel_native as fuse_scale_shift_kernel_native,
+)
+from .torch_fallback import (
     norm_infer_native,
     rms_norm_fn_native,
     triton_one_pass_rms_norm_native,
@@ -29,13 +33,6 @@ _use_mlx = use_mlx()
 
 if _use_mlx:
     import mlx.core as mx
-
-# use the common torch native version form torch_fallback
-fuse_scale_shift_kernel_native = fuse_scale_shift_kernel_native
-apply_rotary_embedding_native = apply_rotary_embedding_native
-norm_infer_native = norm_infer_native
-triton_one_pass_rms_norm_native = triton_one_pass_rms_norm_native
-rms_norm_fn_native = rms_norm_fn_native
 
 # MLX-accelerated norm ops (1.4x–2.9x faster than torch native on MPS)
 # Uses mx.fast.rms_norm / mx.fast.layer_norm — single fused Metal kernels

@@ -48,14 +48,14 @@ def test_fused_equals_separate(T, N1, N2, K):
     x = torch.randn(T, K, dtype=torch.bfloat16, device=dev)
 
     s1p, s2p = _pack_weight_scale(s1), _pack_weight_scale(s2)
-    out1 = mxfp8_linear(x, w1, s1p, weight_scale_fallback=s1)
-    out2 = mxfp8_linear(x, w2, s2p, weight_scale_fallback=s2)
+    out1 = mxfp8_linear(x, w1, s1p)
+    out2 = mxfp8_linear(x, w2, s2p)
     ref = torch.cat([out1, out2], dim=-1)
 
     w = torch.cat([w1, w2], dim=0).contiguous()
     s = torch.cat([s1, s2], dim=0).contiguous()
     sp = _pack_weight_scale(s)
-    fused = mxfp8_linear(x, w, sp, weight_scale_fallback=s)
+    fused = mxfp8_linear(x, w, sp)
 
     assert fused.shape == ref.shape
     assert torch.equal(
