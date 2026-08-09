@@ -143,6 +143,26 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 
 logger = init_logger(__name__)
 
+_QUALITY_FUSION_HANDLERS: tuple[
+    tuple[str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
+] = (
+    (
+        "fused linear+GELU (cublasLt epilogue)",
+        mount_fused_linear_gelu,
+        unmount_fused_linear_gelu,
+    ),
+    (
+        "fused LN+modulate (affine folding)",
+        mount_fused_ln_modulate,
+        unmount_fused_ln_modulate,
+    ),
+    (
+        "fused gate RMSNorm (BF16-native Triton)",
+        mount_fused_gate_rmsnorm,
+        unmount_fused_gate_rmsnorm,
+    ),
+)
+
 
 def _ensure_tensor_model_output(model_output):
     sample = getattr(model_output, "sample", None)
@@ -233,8 +253,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
-        # quality="high" fusion state: whether the cublasLt linear+GELU and
-        # fused gate-RMSNorm sites are currently mounted on the transformers.
+        # Whether request-scoped quality="high" fusions are currently mounted.
         self._quality_fusions_mounted = False
         self._torch_compile_registry = CompiledModuleRegistry()
         # Breakable CUDA graph runners, one per transformer module (lazy).
@@ -465,44 +484,28 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
         """Mount/unmount the ``quality="high"`` fusions for this batch.
 
-        The cublasLt linear+GELU epilogue and the fused gate-RMSNorm Triton
-        kernels are numerically equivalent only at half-precision rounding
-        level (not bit-exact), so they are mounted for ``quality="high"``
-        requests and unmounted otherwise -- the ``"lossless"`` default runs
-        the unmodified reference path bit-for-bit. ``quality`` participates
-        in the dynamic-batch signature, so a worker batch is uniform in
-        ``quality`` and this process-wide transition is safe at the batch
-        boundary. Mounting is all-or-nothing per transformer and per fusion
-        family (any ineligible marked site keeps the whole transformer on
-        that family's reference path); models without marked sites are
-        no-ops.
+        These fusions are numerically equivalent only at half-precision
+        rounding level (not bit-exact), so they are mounted for
+        ``quality="high"`` requests and unmounted otherwise. The
+        ``"lossless"`` default runs the reference path bit-for-bit. ``quality``
+        participates in the dynamic-batch signature, making this transition
+        safe at the batch boundary. Mounting is all-or-nothing per transformer
+        and fusion family; models without marked sites are no-ops.
         """
         want = getattr(batch.sampling_params, "quality", "lossless") == "high"
         if want == self._quality_fusions_mounted:
             return
-        mounted_gelu = False
-        mounted_gate_norm = False
-        mounted_ln_modulate = False
+        mounted_fusions: set[str] = set()
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            if want:
-                mounted_gelu |= mount_fused_linear_gelu(transformer)
-                mounted_gate_norm |= mount_fused_gate_rmsnorm(transformer)
-                mounted_ln_modulate |= mount_fused_ln_modulate(transformer)
-            else:
-                unmount_fused_linear_gelu(transformer)
-                unmount_fused_gate_rmsnorm(transformer)
-                unmount_fused_ln_modulate(transformer)
+            for description, mount, unmount in _QUALITY_FUSION_HANDLERS:
+                if want:
+                    if mount(transformer):
+                        mounted_fusions.add(description)
+                else:
+                    unmount(transformer)
         self._quality_fusions_mounted = want
-        if want and mounted_gelu:
-            logger.info(
-                "Mounted fused linear+GELU (cublasLt epilogue) for quality=high"
-            )
-        if want and mounted_ln_modulate:
-            logger.info("Mounted fused LN+modulate (affine folding) for quality=high")
-        if want and mounted_gate_norm:
-            logger.info(
-                "Mounted fused gate RMSNorm (Z-Image Triton suite) for quality=high"
-            )
+        for description in sorted(mounted_fusions):
+            logger.info("Mounted %s for quality=high", description)
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
