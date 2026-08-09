@@ -397,9 +397,6 @@ class ModelRunner:
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
 
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
-
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
