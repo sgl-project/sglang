@@ -14,6 +14,7 @@ class ParallelState:
     attn_tp_size: int
     attn_cp_rank: int
     attn_cp_size: int
+    attn_dcp_rank: int
     attn_dcp_size: int
     attn_dp_rank: int
     attn_dp_size: int
@@ -22,10 +23,6 @@ class ParallelState:
     moe_dp_rank: Optional[int]
     moe_dp_size: int
     gpu_id: int
-
-    @property
-    def attn_dcp_rank(self) -> int:
-        return self.tp_rank % self.attn_dcp_size
 
     @staticmethod
     def trivial(**overrides: Optional[int]) -> "ParallelState":
@@ -40,6 +37,7 @@ class ParallelState:
             attn_tp_size=1,
             attn_cp_rank=0,
             attn_cp_size=1,
+            attn_dcp_rank=0,
             attn_dcp_size=1,
             attn_dp_rank=0,
             attn_dp_size=1,
@@ -51,3 +49,7 @@ class ParallelState:
         )
         kwargs.update(overrides)
         return ParallelState(**kwargs)
+
+
+def compute_dcp_rank(*, tp_rank: int, dcp_size: int) -> int:
+    return tp_rank % dcp_size

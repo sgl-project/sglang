@@ -93,7 +93,10 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.parallel_state_wrapper import (
+    ParallelState,
+    compute_dcp_rank,
+)
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -460,13 +463,16 @@ class Scheduler(
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=server_args.attn_cp_size,
+            attn_dcp_rank=compute_dcp_rank(
+                tp_rank=tp_rank, dcp_size=server_args.dcp_size
+            ),
+            attn_dcp_size=server_args.dcp_size,
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
             moe_ep_size=server_args.ep_size,
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=server_args.moe_dp_size,
-            attn_dcp_size=server_args.dcp_size,
             gpu_id=gpu_id,
         )
 
