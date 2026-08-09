@@ -1434,6 +1434,35 @@ def remote_instance_transfer_engine_enabled(load_format: str | None = None) -> b
     return remote_instance_transfer_engine_of(get_model(), load_format)
 
 
+def max_prefill_buffer_tokens() -> int:
+    """The prefill-buffer ceiling: ``chunked_prefill_size``, except PP dynamic
+    chunking can grow chunks toward ``max_prefill_tokens`` and probe at 1.25x.
+
+    Every input is a published leaf (``schedule`` plus the configured PP size),
+    so this derives from the bags and follows a post-publish override;
+    ``ServerArgs.max_prefill_buffer_tokens`` is the pre-publish equivalent and
+    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
+    """
+    import math
+
+    schedule = get_schedule()
+    chunked = (
+        schedule.chunked_prefill_size
+        if schedule.chunked_prefill_size and schedule.chunked_prefill_size > 0
+        else 0
+    )
+    tokens = chunked
+    if (
+        schedule.enable_dynamic_chunking
+        and _configured_parallel("pp_size") > 1
+        and chunked
+    ):
+        tokens = max(
+            tokens, schedule.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
+        )
+    return tokens
+
+
 def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
     """The activation working-set reserve held back before cuda-graph capture.
 
