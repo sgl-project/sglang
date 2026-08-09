@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -105,7 +106,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         # Gathered-buffer modes size the DP logprob buffers for every draft
         # window row and therefore cannot narrow the lm_head input to one row.
-        self.prune_draft_extend_logits = not self.require_gathered_buffer
+        self.prune_draft_extend_logits = (
+            envs.SGLANG_OPT_PRUNE_EAGLE_DRAFT_EXTEND_LM_HEAD.get()
+            and not self.require_gathered_buffer
+        )
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -131,7 +135,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_hidden_mode = (
             CaptureHiddenMode.NULL
             if self.eagle_worker.speculative_algorithm.is_standalone()
-            else CaptureHiddenMode.FULL
+            else (
+                CaptureHiddenMode.FULL
+                if self.prune_draft_extend_logits
+                else CaptureHiddenMode.LAST
+            )
         )
 
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)

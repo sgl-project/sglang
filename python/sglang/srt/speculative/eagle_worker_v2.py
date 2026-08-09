@@ -196,7 +196,10 @@ def _use_aiter_draft_topk1(
 
 def _prune_draft_extend_logits(server_args: ServerArgs) -> bool:
     """Whether draft-extend may project only its selected row per request."""
-    return not require_gathered_buffer(server_args)
+    return (
+        envs.SGLANG_OPT_PRUNE_EAGLE_DRAFT_EXTEND_LM_HEAD.get()
+        and not require_gathered_buffer(server_args)
+    )
 
 
 logger = logging.getLogger(__name__)
