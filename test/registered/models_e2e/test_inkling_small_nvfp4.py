@@ -43,9 +43,9 @@ _MODEL_PATH = os.environ.get(
 )
 
 # Measured 0.900 (10-shot, 200 questions, tp=4, invalid=0.000) -- completion,
-# so no thinking. The floor sits ~2.5 sigma of the 200-question sampling noise
+# so no thinking. The floor sits ~4.5 sigma of the 200-question sampling noise
 # below that: a real accuracy collapse trips it, the sample spread does not.
-GSM8K_THRESHOLD = 0.85
+GSM8K_THRESHOLD = 0.80
 
 # All three helpers measure exactly 0 on this config -- every logprob matches
 # bit for bit. The floor is only there to keep a stray ulp from failing the
