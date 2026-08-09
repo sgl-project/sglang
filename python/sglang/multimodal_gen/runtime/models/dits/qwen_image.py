@@ -16,6 +16,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     can_fuse_linear_gelu,
+    fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
@@ -39,6 +40,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     DynamicVarlenMaskMeta,
     USPAttention,
     build_varlen_mask_meta,
+    build_varlen_mask_meta_from_ranges,
 )
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.fused_scale_shift_gate import (
@@ -863,9 +865,7 @@ class QwenImageGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
-            self.proj, hidden_states
-        ):
+        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -1565,6 +1565,26 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 # once, so build varlen metadata replay-locally from the current
                 # static mask instead of closing over stale cu_seqlens/indices.
                 block_attention_kwargs["attn_mask_meta"] = DynamicVarlenMaskMeta()
+            elif (
+                txt_seq_lens is not None
+                and len(txt_seq_lens) == batch_size
+                and all(0 <= n <= encoder_hidden_states.shape[1] for n in txt_seq_lens)
+            ):
+                # txt_seq_lens already carries each row's valid text prefix
+                # (the mask is built from it), so the varlen metadata can be
+                # assembled host-side; the mask-based builder costs a GPU
+                # nonzero plus a device sync on every denoising step.
+                txt_len = encoder_hidden_states.shape[1]
+                block_attention_kwargs["attn_mask_meta"] = (
+                    build_varlen_mask_meta_from_ranges(
+                        [
+                            [(0, int(n)), (txt_len, txt_len + image_seq_len)]
+                            for n in txt_seq_lens
+                        ],
+                        max_seqlen=txt_len + image_seq_len,
+                        device=hidden_states.device,
+                    )
+                )
             else:
                 # Precompute varlen metadata once per request so every block
                 # reuses the same cu_seqlens / indices instead of rebuilding.

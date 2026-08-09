@@ -59,6 +59,11 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import (
+    cp_materialize_global_token_order,
+    cp_round_robin_input_ids_v2,
+    is_cp_v2_active,
+)
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -84,6 +89,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale,
 )
@@ -1141,9 +1147,8 @@ class MQALayer(MqaAttentionBase):
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
+                kv = cp_materialize_global_token_order(
                     kv.contiguous(),
-                    self.cp_size,
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
@@ -1192,9 +1197,8 @@ class MQALayer(MqaAttentionBase):
                     # unified_kv + DSA CP: the 2-source prefill path needs the
                     # FULL current-chunk KV (extend source + ring write), so
                     # all-gather the per-rank bf16 KV across the CP group.
-                    kv = cp_all_gather_rerange_output(
+                    kv = cp_materialize_global_token_order(
                         kv.contiguous(),
-                        self.cp_size,
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
@@ -1202,9 +1206,8 @@ class MQALayer(MqaAttentionBase):
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
+                kv = cp_materialize_global_token_order(
                     kv.contiguous(),
-                    self.cp_size,
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
@@ -2437,8 +2440,13 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
@@ -2462,11 +2470,16 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if dsa_use_prefill_cp(forward_batch):
-            if self.pp_group.is_first_rank:
-                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
-            input_ids = cp_round_robin_input_ids(input_ids)
+        if use_prefill_cp:
+            if cp_v2_active:
+                input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
+            else:
+                if self.pp_group.is_first_rank:
+                    hidden_states = cp_split_and_rebuild_data(
+                        forward_batch, hidden_states
+                    )
+                positions = cp_split_and_rebuild_position(forward_batch, positions)
+                input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
@@ -2474,7 +2487,7 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
         capture_dspark = self.dspark_layers_to_capture is not None
-        if capture_dspark and dsa_use_prefill_cp(forward_batch):
+        if capture_dspark and use_prefill_cp:
             raise NotImplementedError(
                 "DSpark aux hidden-state capture is not supported together with "
                 "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
@@ -2529,7 +2542,7 @@ class DeepseekV4Model(nn.Module):
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
+        if self.pp_group.is_last_rank and use_prefill_cp and not cp_v2_active:
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
@@ -2637,35 +2650,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """V4 only fuses when explicitly asked to, and then the checkpoint must
+        carry exactly one shared expert. Asked by the loader before any layer is
+        built."""
+        if not get_exec().moe.enforce_shared_experts_fusion:
+            return "Config does not support fused shared expert(s)."
+        if hf_config.n_shared_experts != 1:
+            raise ValueError(
+                "DeepSeek V4 shared-experts fusion expects exactly one shared "
+                f"expert, but got n_shared_experts={hf_config.n_shared_experts}."
+            )
+        return None
+
     def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0
-        if get_exec().moe.disable_shared_experts_fusion:
-            return
-
-        disable_reason = None
-        if get_exec().moe.enforce_shared_experts_fusion:
-            if self.config.n_shared_experts != 1:
-                raise ValueError(
-                    "DeepSeek V4 shared-experts fusion expects exactly one shared "
-                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
-                )
-        else:
-            disable_reason = "Config does not support fused shared expert(s)."
-
-        if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "DeepseekV4ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
+        # The decision was installed by the loader; this only reads it.
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
 
     @torch.no_grad()
     def forward(
