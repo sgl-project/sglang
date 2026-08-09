@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch import Tensor
+
 from sglang.multimodal_gen.configs.models.dits.krea2 import Krea2DitConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
@@ -34,7 +36,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from torch import Tensor
 
 logger = init_logger(__name__)
 
@@ -267,9 +268,9 @@ class Attention(nn.Module):
         # Parameter names match the released checkpoint (to_q/to_k/to_v/to_gate,
         # norm_q/norm_k, to_out.0) so the checkpoint loads with an identity mapping.
         tp = get_tp_world_size()
-        assert self.heads % tp == 0 and self.kvheads % tp == 0, (
-            f"heads={self.heads}, kvheads={self.kvheads} must be divisible by tp={tp}"
-        )
+        assert (
+            self.heads % tp == 0 and self.kvheads % tp == 0
+        ), f"heads={self.heads}, kvheads={self.kvheads} must be divisible by tp={tp}"
         self.local_heads = self.heads // tp
         self.local_kvheads = self.kvheads // tp
 
