@@ -729,8 +729,8 @@ def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
     ):
         overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
         logger.info(
-            "Use flashinfer_trtllm_routed as MoE runner backend on SM100 "
-            "for MiniMax-M2 with modelopt_fp4."
+            "Use flashinfer_trtllm_routed as MoE runner backend on SM10X "
+            "for MiniMaxM2ForCausalLM with modelopt_fp4."
         )
     return overrides
 
