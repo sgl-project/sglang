@@ -1380,7 +1380,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # default the load format to the server_args
         if obj.load_format is None:
-            obj.load_format = self.server_args.load_format
+            if getattr(obj, "update_speculative_draft", False):
+                obj.load_format = (
+                    self.server_args.speculative_draft_load_format
+                    or self.server_args.load_format
+                )
+            else:
+                obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
         if obj.abort_all_requests:
@@ -1418,7 +1424,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
             if result.success:
-                self._update_model_path_info(obj.model_path, obj.load_format)
+                if getattr(obj, "update_speculative_draft", False):
+                    self.server_args.speculative_draft_model_path = obj.model_path
+                    self.server_args.speculative_draft_load_format = obj.load_format
+                else:
+                    self._update_model_path_info(obj.model_path, obj.load_format)
             return result.success, result.message, result.num_paused_requests
         else:  # self.server_args.dp_size > 1
             self.model_update_tmp = []
@@ -1426,7 +1436,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             all_success = all([r.success for r in result])
             if all_success is True:
-                self._update_model_path_info(obj.model_path, obj.load_format)
+                if getattr(obj, "update_speculative_draft", False):
+                    self.server_args.speculative_draft_model_path = obj.model_path
+                    self.server_args.speculative_draft_load_format = obj.load_format
+                else:
+                    self._update_model_path_info(obj.model_path, obj.load_format)
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
@@ -1892,6 +1906,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["spec_accept_token_num"] = accepted_tokens
                 meta_info["spec_draft_token_num"] = total_draft_tokens
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+                # Per-step verify window: rect width L (draft_token_num), or packed cl[i].
+                if (
+                    hasattr(recv_obj, "spec_proposed_tokens")
+                    and len(recv_obj.spec_proposed_tokens) > i
+                ):
+                    meta_info["spec_verify_len"] = (
+                        recv_obj.spec_proposed_tokens[i] / recv_obj.spec_verify_ct[i]
+                    )
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (

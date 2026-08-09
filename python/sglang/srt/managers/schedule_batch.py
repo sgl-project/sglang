@@ -749,6 +749,10 @@ class Req(ReqDllmMixin):
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
+        # The number of tokens actually proposed to the target model across all verify steps.
+        # Differs from spec_verify_ct * block_size with adaptive verification.
+        self.spec_proposed_tokens = 0
+
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
@@ -1810,6 +1814,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         len_per_topk = server_args.speculative_num_steps or 1
         spec_topk = server_args.speculative_eagle_topk or 1
         spec_tokens = server_args.speculative_num_draft_tokens
+
+        # Dynamic verify len (packed): target KV pool only needs sum(cl) ≈ EMA*bs slots
+        # per verify step (draft uses a separate KV pool). Use EMA for accurate budget.
+        if getattr(server_args, "dflash_dynamic_verify_len", False) and spec_tokens:
+            from sglang.srt.speculative.dflash_utils import get_dflash_verify_ema
+            ema = get_dflash_verify_ema()
+            if 0 < ema < spec_tokens:
+                spec_tokens = ema
 
         if page_size > 1 and spec_topk > 1:
             # last partial page and ceil alignment

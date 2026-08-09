@@ -28,6 +28,7 @@ class GenerationBatchResult:
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_accepted_tokens: int = 0
     accept_length_per_req_cpu: Optional[List[int]] = None
+    candidate_len_per_req_cpu: Optional[List[int]] = None  # actual verify window per req (None = full block_size)
     can_run_cuda_graph: bool = False
 
     # For output processing

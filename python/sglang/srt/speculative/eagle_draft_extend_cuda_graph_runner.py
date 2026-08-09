@@ -264,6 +264,8 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.graphs[self.bs].replay()
 
     def capture(self):
+        # Shared CudaGraphRunner.capture() checks _dflash_multi_ntpb for DFlash only.
+        self._dflash_multi_ntpb = False
         CudaGraphRunner.capture(self)
 
     def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):

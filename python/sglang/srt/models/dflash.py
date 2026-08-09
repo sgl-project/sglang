@@ -34,6 +34,28 @@ from sglang.srt.speculative.dflash_utils import (
 logger = logging.getLogger(__name__)
 
 
+class ThreshHeadTwoModel(nn.Module):
+    """Predict per-block adaptive length from draft hidden states.
+
+    Mean-pooled and last-position features are concatenated and passed through
+    a two-layer residual bottleneck. The sigmoid output represents the length
+    ratio for the current draft block.
+    """
+
+    def __init__(self, hidden_size: int, bottleneck_dim: int = 256):
+        super().__init__()
+        self.down = nn.Linear(hidden_size * 2, bottleneck_dim)
+        self.res = nn.Sequential(nn.Linear(bottleneck_dim, bottleneck_dim), nn.SiLU())
+        self.out = nn.Linear(bottleneck_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [bs, block_size, hidden_size] -> [bs, 1]."""
+        feat = torch.cat([x.mean(dim=-2), x[:, -1]], dim=-1)  # [bs, 2*hidden_size]
+        h = nn.functional.silu(self.down(feat))  # [bs, bottleneck_dim]
+        h = h + self.res(h)  # residual
+        return torch.sigmoid(self.out(h))  # [bs, 1]
+
+
 class DFlashAttention(nn.Module):
     def __init__(self, config, layer_id: int) -> None:
         super().__init__()
@@ -291,6 +313,16 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+
+        dflash_cfg = getattr(config, "dflash_config", {}) or {}
+        self.use_thresh_head_two_model = dflash_cfg.get(
+            "use_thresh_head_two_model", False
+        )
+        if self.use_thresh_head_two_model:
+            th_bottleneck = dflash_cfg.get("thresh_head_bottleneck_dim", 256)
+            self.thresh_head_two_model = ThreshHeadTwoModel(hidden_size, th_bottleneck)
+
+        self.thresh_head_direct_len = dflash_cfg.get("thresh_head_direct_len", False)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""

@@ -488,6 +488,11 @@ class ServerArgs:
     speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    prob_head_candidate_len_min: int = 2
+    thresh_head_threshold_rate: float = 1.0
+    dflash_dynamic_verify_len: bool = False
+    dflash_dynamic_verify_ema_alpha: float = 0.3
+    dflash_hard_clip_scale: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -755,6 +760,7 @@ class ServerArgs:
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
+        self._gpu_mem = gpu_mem
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
@@ -2794,9 +2800,37 @@ class ServerArgs:
                     )
 
             if self.max_running_requests is None:
-                self.max_running_requests = 48
+                base_max = 48
+                if self.dflash_dynamic_verify_len:
+                    gpu_mem = getattr(self, "_gpu_mem", None)
+                    if gpu_mem is not None and gpu_mem >= 120 * 1024:
+                        # Large-memory GPUs (L20 140GB, H200 141GB, etc.)
+                        base_max *= 3  # 144
+                    elif gpu_mem is not None and gpu_mem >= 70 * 1024:
+                        # Mid-high memory GPUs (A100/A800 80GB)
+                        base_max *= 2  # 96
+                    else:
+                        raise ValueError(
+                            "GPU memory is not large enough for DFLASH + adaptive "
+                            "length head. Please consider using another GPU type."
+                        )
+                self.max_running_requests = base_max
                 logger.warning(
-                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                    "Max running requests is reset to %d for speculative decoding. "
+                    "You can override this by explicitly setting --max-running-requests.",
+                    base_max,
+                )
+
+            if (
+                self.max_running_requests is not None
+                and int(self.max_running_requests) <= 48
+                and self.dflash_dynamic_verify_len
+            ):
+                self.dflash_dynamic_verify_len = False
+                logger.warning(
+                    "DFLASH dynamic verify len is disabled because max_running_requests=%d <= 48; "
+                    "dynamic verify len is not recommended at low concurrency.",
+                    int(self.max_running_requests),
                 )
 
             if (
@@ -4520,6 +4554,39 @@ class ServerArgs:
             "local cache (paged backends may retain up to one extra page on the left "
             "for alignment). Default is full context.",
             default=ServerArgs.speculative_dflash_draft_window_size,
+        )
+        parser.add_argument(
+            "--prob-head-candidate-len-min",
+            type=int,
+            help="AdaFlash adaptive length head: minimum candidate length. Default 2.",
+            default=ServerArgs.prob_head_candidate_len_min,
+        )
+        parser.add_argument(
+            "--thresh-head-threshold-rate",
+            type=float,
+            help="DFlash adaptive length head: scale factor applied to the "
+            "predicted length ratio. Default 1.0.",
+            default=ServerArgs.thresh_head_threshold_rate,
+        )
+        parser.add_argument(
+            "--dflash-dynamic-verify-len",
+            action="store_true",
+            default=ServerArgs.dflash_dynamic_verify_len,
+            help="Enable per-request variable-length verify: pack tokens to "
+            "sum(candidate_lens), reducing target compute without truncation.",
+        )
+        parser.add_argument(
+            "--dflash-dynamic-verify-ema-alpha",
+            type=float,
+            default=ServerArgs.dflash_dynamic_verify_ema_alpha,
+            help="EMA smoothing factor for dynamic verify ntpb (0-1). Default 0.3.",
+        )
+        parser.add_argument(
+            "--dflash-hard-clip-scale",
+            type=float,
+            default=ServerArgs.dflash_hard_clip_scale,
+            help="Scale factor for the hard-clip mean (>1.0 compensates for "
+            "asymmetric clipping loss). Default 1.0.",
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

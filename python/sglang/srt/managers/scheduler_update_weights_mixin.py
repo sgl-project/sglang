@@ -47,7 +47,18 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
     ):
         """In-place update of the weights from disk."""
-        success, message = self.tp_worker.update_weights_from_disk(recv_req)
+        if getattr(recv_req, "update_speculative_draft", False):
+            dw = self.draft_worker
+            if dw is None or not hasattr(dw, "update_weights_from_disk"):
+                msg = (
+                    "update_speculative_draft requires a draft worker that supports "
+                    "update_weights_from_disk."
+                )
+                logger.error(msg)
+                return UpdateWeightFromDiskReqOutput(False, msg, 0)
+            success, message = dw.update_weights_from_disk(recv_req)
+        else:
+            success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
             if recv_req.flush_cache:
                 flush_cache_success = self.flush_cache()

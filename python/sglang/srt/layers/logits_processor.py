@@ -71,6 +71,11 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # When aux multi-layer features are concatenated into ``hidden_states`` above,
+    # this holds the final-layer hidden at each token for lm_head / teacher KD.
+    teacher_hidden_states: Optional[torch.Tensor] = None
+    # Final layer before aux concat overwrites (prob-head / acceptance labels).
+    last_hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -324,15 +329,22 @@ class LogitsProcessor(nn.Module):
             logits_metadata,
         )
 
-        hidden_states_to_store = self._get_hidden_states_to_store(
-            hidden_states,
-            hidden_states_before_norm,
-            aux_hidden_states,
-            pruned_states,
-            pruned_states_before_norm,
-            aux_pruned_states,
-            sample_indices,
-            logits_metadata,
+        hidden_states_to_store, last_hidden_states_to_store = (
+            self._get_hidden_states_to_store(
+                hidden_states,
+                hidden_states_before_norm,
+                aux_hidden_states,
+                pruned_states,
+                pruned_states_before_norm,
+                aux_pruned_states,
+                sample_indices,
+                logits_metadata,
+            )
+        )
+        # Draft training may store concatenated aux in hidden_states_to_store;
+        # teacher KD still needs last-layer vectors for lm_head.
+        teacher_hidden_states_full = (
+            hidden_states.detach() if aux_hidden_states is not None else None
         )
         del hidden_states
 
@@ -347,6 +359,8 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                teacher_hidden_states=teacher_hidden_states_full,
+                last_hidden_states=last_hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
@@ -388,6 +402,8 @@ class LogitsProcessor(nn.Module):
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            teacher_hidden_states=teacher_hidden_states_full,
+            last_hidden_states=last_hidden_states_to_store,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
@@ -544,14 +560,16 @@ class LogitsProcessor(nn.Module):
         aux_pruned_states: Optional[List[torch.Tensor]],
         sample_indices: Optional[torch.Tensor],
         logits_metadata: LogitsMetadata,
-    ) -> Optional[torch.Tensor]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         hidden_states_to_store: Optional[torch.Tensor] = None
         hidden_states_to_store_before_norm: Optional[torch.Tensor] = None
+        last_hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
                     aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
                     hidden_states_to_store = aux_hidden_states
+                    last_hidden_states_to_store = hidden_states
                 else:
                     hidden_states_to_store = hidden_states
                 hidden_states_to_store_before_norm = hidden_states_before_norm
@@ -585,7 +603,7 @@ class LogitsProcessor(nn.Module):
             # prefer to return it.
             hidden_states_to_store = hidden_states_to_store_before_norm
 
-        return hidden_states_to_store
+        return hidden_states_to_store, last_hidden_states_to_store
 
     def _expand_metadata_for_logprobs(
         self, logits_metadata: LogitsMetadata, device: torch.device

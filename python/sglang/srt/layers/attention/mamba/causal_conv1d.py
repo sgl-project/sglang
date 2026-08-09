@@ -10,6 +10,10 @@ import torch
 
 from .causal_conv1d_triton import PAD_SLOT_ID
 
+from .causal_conv1d_triton import (
+    causal_conv1d_update_varlen as causal_conv1d_update_varlen,
+)
+
 try:
     from sgl_kernel import causal_conv1d_fwd
     from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel

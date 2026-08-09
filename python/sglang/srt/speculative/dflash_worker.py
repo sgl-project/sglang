@@ -1,15 +1,20 @@
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import Optional, Union
 
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.managers.io_struct import (
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.common import get_last_loc
+from sglang.srt.mem_cache.common import evict_from_tree_cache, get_last_loc
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -26,14 +31,55 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
+    set_dflash_verify_ema_alpha,
+    update_dflash_verify_ema,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+
+# Adaptive-length head CUDA stream cache (one per device).
+_adaptive_length_streams: dict[int, torch.cuda.Stream] = {}
+
+
+def _get_adaptive_length_stream(device: torch.device) -> torch.cuda.Stream:
+    dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+    if dev_idx not in _adaptive_length_streams:
+        with torch.cuda.device(dev_idx):
+            _adaptive_length_streams[dev_idx] = torch.cuda.Stream(device=dev_idx)
+    return _adaptive_length_streams[dev_idx]
+
+
+def _thresh_direct_candidate_lens(
+    thresholds: torch.Tensor,
+    threshold_rate: float,
+    len_min: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Compute candidate lengths from direct length ratios."""
+    return (thresholds.squeeze(-1) * block_size * threshold_rate).round().clamp(
+        len_min,
+        block_size,
+    ).to(torch.int32)
+
+
+_compiled_thresh_direct_fn = None
+
+
+def _get_compiled_thresh_direct_fn():
+    global _compiled_thresh_direct_fn
+    if _compiled_thresh_direct_fn is None:
+        _compiled_thresh_direct_fn = torch.compile(
+            _thresh_direct_candidate_lens,
+            mode="max-autotune-no-cudagraphs",
+            dynamic=True,
+        )
+    return _compiled_thresh_direct_fn
 
 
 def _get_fused_kv_materialize_helper():
@@ -73,6 +119,7 @@ class DFlashWorker:
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
+        self.tp_size = server_args.tp_size
         self.draft_window_size: Optional[int] = (
             int(server_args.speculative_dflash_draft_window_size)
             if server_args.speculative_dflash_draft_window_size is not None
@@ -168,6 +215,83 @@ class DFlashWorker:
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        if self.page_size == 1:
+            self._draft_need_per_req = self.block_size
+        else:
+            self._draft_need_per_req = self.block_size + self.page_size
+
+        self.use_thresh_head_two_model = getattr(
+            self.draft_model, "use_thresh_head_two_model", False
+        )
+        if self.use_thresh_head_two_model and not getattr(
+            self.draft_model, "thresh_head_direct_len", False
+        ):
+            raise ValueError(
+                "AdaFlash serving requires dflash_config.thresh_head_direct_len=true."
+            )
+        self.candidate_len_min = getattr(
+            server_args, "prob_head_candidate_len_min", 2
+        )
+        self.thresh_head_threshold_rate = getattr(
+            server_args, "thresh_head_threshold_rate", 1.0
+        )
+
+        # Dynamic verify len: pack only candidate_lens[i] tokens per request,
+        # reducing total tokens from bs*max(cl) to sum(candidate_lens).
+        self.dynamic_verify_len = getattr(
+            server_args, "dflash_dynamic_verify_len", False
+        )
+        self.hard_clip_scale = float(
+            getattr(server_args, "dflash_hard_clip_scale", 1.0)
+        )
+        if self.dynamic_verify_len:
+            alpha = getattr(server_args, "dflash_dynamic_verify_ema_alpha", 0.3)
+            set_dflash_verify_ema_alpha(alpha)
+            if self.use_thresh_head_two_model and self.tp_rank == 0:
+                logger.info(
+                    "AdaFlash adaptive length head enabled (two_model, direct_len, parallel). "
+                    "candidate_len_min=%d, threshold_rate=%.2f",
+                    self.candidate_len_min,
+                    self.thresh_head_threshold_rate,
+                )
+        elif self.use_thresh_head_two_model:
+            # Plain DFlash path: fixed block_size verify; ignore thresh_head weights.
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH dflash_dynamic_verify_len=0: ignoring thresh_head; "
+                    "using fixed verify window block_size=%d (same as plain DFlash).",
+                    self.block_size,
+                )
+            self.use_thresh_head_two_model = False
+
+        # Hybrid/Mamba models (Qwen3.5) use rectangular verify layout;
+        # standard transformers (Qwen3-8B/Coder) use packed verify layout.
+        self._use_rect_verify = hasattr(
+            self.target_worker.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
+        )
+        # Qwen3 packed dynamic verify disables CUDA graph. When the running decode
+        # batch is small (bs <= 16 by default), rect fixed block_size verify is faster.
+        self._packed_min_bs = int(os.environ.get("DFLASH_PACKED_MIN_BS", "16"))
+        if (
+            self.dynamic_verify_len
+            and not self._use_rect_verify
+            and self.tp_rank == 0
+        ):
+            logger.info(
+                "DFLASH Qwen3 dynamic verify: packed sum(cl) when bs > %d, "
+                "else rect fixed block_size=%d (CUDA graph).",
+                self._packed_min_bs,
+                self.block_size,
+            )
+        if self.dynamic_verify_len and self._use_rect_verify and self.tp_rank == 0:
+            logger.info(
+                "DFLASH Qwen3.5 dynamic verify: hard-clip L=round(mean(cl)*%.2f) when bs > %d, "
+                "else full block_size=%d.",
+                self.hard_clip_scale,
+                self._packed_min_bs,
+                self.block_size,
+            )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -175,6 +299,7 @@ class DFlashWorker:
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
+
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -329,6 +454,14 @@ class DFlashWorker:
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        return self.draft_worker.update_weights_from_disk(recv_req)
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        # Route tensor updates to the draft TpModelWorker (not target via __getattr__).
+        monkey_patch_torch_reductions()
+        return self.draft_worker.update_weights_from_tensor(recv_req)
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker.
@@ -547,8 +680,8 @@ class DFlashWorker:
             or not hasattr(lm_head, "shard_indices")
         ):
             raise RuntimeError(
-                "DFLASH requires the target model to expose a vocab-parallel `lm_head` with `weight` and "
-                "`shard_indices` attributes."
+                "DFLASH requires the target model to expose a vocab-parallel "
+                "`lm_head` with `weight` and `shard_indices` attributes."
             )
 
         # --- 2) Draft a non-causal block with the draft model.
@@ -589,6 +722,8 @@ class DFlashWorker:
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
+        evict_from_tree_cache(batch.tree_cache, bs * self._draft_need_per_req)
+
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
             if self.page_size == 1:
@@ -659,20 +794,146 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
+        candidate_lens = None
+        if self.use_thresh_head_two_model:
+            draft_hs = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
+            adaptive_stream = _get_adaptive_length_stream(self.device)
+            main_stream = torch.cuda.current_stream(self.device)
+            adaptive_stream.wait_stream(main_stream)
+
+            if self.tp_rank == 0:
+                with torch.cuda.stream(adaptive_stream):
+                    with torch.no_grad():
+                        length_ratios = self.draft_model.thresh_head_two_model(
+                            draft_hidden
+                        )
+                        candidate_lens = _get_compiled_thresh_direct_fn()(
+                            length_ratios,
+                            self.thresh_head_threshold_rate,
+                            self.candidate_len_min,
+                            self.block_size,
+                        )
+
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hs,
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
+
+            main_stream.wait_stream(adaptive_stream)
+            if self.tp_size > 1:
+                if self.tp_rank != 0:
+                    candidate_lens = torch.empty(
+                        (bs,), dtype=torch.int32, device=self.device
+                    )
+                get_tp_group().broadcast(candidate_lens, src=0)
+        else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
         positions = positions_2d.reshape(-1)
 
+        # --- Dynamic verify len ---
+        effective_block = self.block_size
+        use_packed_dynamic = False
+        verify_tokens = None
+        verify_positions = None
+
+        # Verify-budget guard for Qwen3 per-request candidate_lens paths.
+        if (
+            self.dynamic_verify_len
+            and candidate_lens is not None
+            and not self._use_rect_verify
+        ):
+            use_packed_dynamic = bs > self._packed_min_bs
+            total_verify = (
+                int(candidate_lens.sum().item())
+                if use_packed_dynamic
+                else bs * self.block_size
+            )
+            avail = batch.token_to_kv_pool_allocator.available_size()
+            if total_verify > avail:
+                evict_from_tree_cache(batch.tree_cache, total_verify)
+                avail = batch.token_to_kv_pool_allocator.available_size()
+            if total_verify > avail:
+                max_per_req = max(1, avail // bs)
+                candidate_lens = torch.clamp(candidate_lens, max=max_per_req)
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "DFLASH verify-budget clamp: clamped candidate_lens to "
+                        "max=%d per req (avail=%d, need=%d)",
+                        max_per_req,
+                        avail,
+                        total_verify,
+                    )
+
+        if self.dynamic_verify_len and candidate_lens is not None:
+            if self._use_rect_verify:
+                # Qwen3.5/GDN: hard-clip uniform L from batch mean (CUDA-graph friendly).
+                # Small running batch: skip clip, use full block_size (stable graph / less straggler).
+                mean_cl_gpu = candidate_lens.float().mean()
+                if bs <= self._packed_min_bs:
+                    effective_block = self.block_size
+                else:
+                    effective_block = max(
+                        1,
+                        min(
+                            int(
+                                (mean_cl_gpu * self.hard_clip_scale).round().item()
+                            ),
+                            self.block_size,
+                        ),
+                    )
+                update_dflash_verify_ema(effective_block)
+                candidate_lens = None
+            else:
+                # Qwen3 standard transformer: packed sum(cl) or small-bs rect fixed.
+                cl = candidate_lens
+                mean_cl = float(cl.float().mean().item())
+                update_dflash_verify_ema(math.ceil(mean_cl))
+                use_packed_dynamic = bs > self._packed_min_bs
+                if use_packed_dynamic:
+                    max_cl = int(cl.max().item())
+                    effective_block = max_cl
+                    arange = torch.arange(
+                        self.block_size, device=self.device, dtype=torch.int32
+                    )
+                    mask = arange[None, :] < cl[:, None]  # [bs, block_size]
+                    verify_tokens = draft_tokens[mask]  # [sum_cl] packed
+                    verify_positions = positions_2d[mask]  # [sum_cl] packed
+                else:
+                    effective_block = self.block_size
+                    verify_tokens = draft_tokens.reshape(-1)
+                    verify_positions = positions
+        if verify_tokens is None:
+            if effective_block < self.block_size:
+                verify_tokens = (
+                    draft_tokens[:, :effective_block].contiguous().reshape(-1)
+                )
+                verify_positions = (
+                    positions_2d[:, :effective_block].contiguous().reshape(-1)
+                )
+            else:
+                verify_tokens = draft_tokens.reshape(-1)
+                verify_positions = positions
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
+            draft_token=verify_tokens,
+            positions=verify_positions,
+            draft_token_num=effective_block,
+            candidate_lens=candidate_lens,
         )
+        if use_packed_dynamic:
+            verify_input._packed = True
+            verify_input._max_cl = int(candidate_lens.max().item())
+        elif (
+            not self._use_rect_verify
+            and self.dynamic_verify_len
+            and candidate_lens is not None
+        ):
+            verify_input._packed = False
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
         )
@@ -1335,6 +1596,7 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1360,10 +1622,18 @@ class DFlashWorker:
             )
             self._logged_first_verify = True
 
+        # Track the actual verify window per request. In hard-clip mode the
+        # shared rectangular width is stored in draft_token_num.
+        if verify_input.candidate_lens is not None:
+            candidate_len_per_req_cpu = verify_input.candidate_lens.tolist()
+        else:
+            candidate_len_per_req_cpu = [verify_input.draft_token_num] * len(accept_length_per_req_cpu)
+
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=new_verified_id,
             num_accepted_tokens=num_accepted_tokens,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
+            candidate_len_per_req_cpu=candidate_len_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )

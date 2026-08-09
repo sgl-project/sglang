@@ -338,6 +338,11 @@ class SchedulerOutputProcessorMixin:
             accepted_draft_tokens = result.accept_length_per_req_cpu[i]
             req.spec_accepted_tokens += accepted_draft_tokens
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
+            # Accumulate the actual adaptive verification window.
+            if result.candidate_len_per_req_cpu is not None:
+                req.spec_proposed_tokens += result.candidate_len_per_req_cpu[i]
+            else:
+                req.spec_proposed_tokens += self.draft_worker.speculative_num_draft_tokens
 
         return predict_tokens
 
@@ -875,6 +880,7 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         spec_acceptance_histogram = []
+        spec_proposed_tokens = []
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
@@ -993,6 +999,7 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
+                    spec_proposed_tokens.append(req.spec_proposed_tokens)
 
                 if return_logprob:
                     if (
@@ -1097,6 +1104,7 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
                     spec_acceptance_histogram=spec_acceptance_histogram,
+                    spec_proposed_tokens=spec_proposed_tokens,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,

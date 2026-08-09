@@ -167,10 +167,28 @@ class DFlashVerifyInput(SpecInput):
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
 
+    # Per-request candidate lengths for variable-length verification.
+    # When None, all requests use draft_token_num. Shape: [bs] int32.
+    candidate_lens: torch.Tensor | None = None
+
+    # True when tokens are packed (variable-length) rather than rectangular.
+    _packed: bool = False
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
+        # Detect packed layout: token count equals sum(cl) and width is max(cl).
+        # Rect layout uses bs*L tokens with L possibly < max(cl); do not treat as packed.
+        if self.candidate_lens is not None:
+            max_cl = int(self.candidate_lens.max().item())
+            sum_cl = int(self.candidate_lens.sum().item())
+            if (
+                self.draft_token_num < max_cl
+                and self.draft_token.numel() == sum_cl
+            ):
+                self._packed = True
+                self._max_cl = max_cl
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -187,31 +205,59 @@ class DFlashVerifyInput(SpecInput):
 
         batch.input_ids = self.draft_token
 
-        if page_size == 1:
-            batch.out_cache_loc = alloc_token_slots(
-                batch.tree_cache, len(batch.input_ids)
-            )
-            end_offset = batch.seq_lens + self.draft_token_num
+        # Packed layout: alloc bs*ntpb slots but assign only candidate_lens per request.
+        if self._packed:
+            cl = self.candidate_lens
+            end_offset = batch.seq_lens + cl
+            if page_size == 1:
+                batch.out_cache_loc = alloc_token_slots(
+                    batch.tree_cache, len(batch.input_ids)
+                )
+            else:
+                prefix_lens = batch.seq_lens
+                prefix_lens_cpu = batch.seq_lens_cpu
+                end_offset_cpu = prefix_lens_cpu + cl.cpu()
+                last_loc = get_last_loc(
+                    batch.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    prefix_lens,
+                )
+                batch.out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                )
+                self.last_loc = last_loc
         else:
-            prefix_lens = batch.seq_lens
-            prefix_lens_cpu = batch.seq_lens_cpu
-            end_offset = prefix_lens + self.draft_token_num
-            end_offset_cpu = prefix_lens_cpu + self.draft_token_num
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                prefix_lens,
-            )
-            batch.out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                prefix_lens,
-                prefix_lens_cpu,
-                end_offset,
-                end_offset_cpu,
-                last_loc,
-                len(batch.input_ids),
-            )
-            self.last_loc = last_loc
+            if page_size == 1:
+                batch.out_cache_loc = alloc_token_slots(
+                    batch.tree_cache, len(batch.input_ids)
+                )
+                end_offset = batch.seq_lens + self.draft_token_num
+            else:
+                prefix_lens = batch.seq_lens
+                prefix_lens_cpu = batch.seq_lens_cpu
+                end_offset = prefix_lens + self.draft_token_num
+                end_offset_cpu = prefix_lens_cpu + self.draft_token_num
+                last_loc = get_last_loc(
+                    batch.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    prefix_lens,
+                )
+                batch.out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                )
+                self.last_loc = last_loc
 
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
@@ -231,19 +277,30 @@ class DFlashVerifyInput(SpecInput):
             raise ValueError(
                 f"DFLASH draft_token_num must be positive, got {self.draft_token_num}."
             )
+
+        # Packed: per-request variable q_len; rectangular: uniform q_len.
         mask_chunks: List[torch.Tensor] = []
-        q_len = int(self.draft_token_num)
-        q_idx = torch.arange(q_len, device=batch.device, dtype=torch.int32).unsqueeze(1)
-        for prefix_len in batch.seq_lens_cpu.tolist():
-            prefix_len_i = int(prefix_len)
-            kv_len = prefix_len_i + q_len
-            k_idx = torch.arange(
-                kv_len, device=batch.device, dtype=torch.int32
-            ).unsqueeze(0)
-            # Allow attending to the full prefix and to tokens up to (and including) the
-            # current query position within the verify block (standard causal masking).
-            allow = k_idx <= (prefix_len_i + q_idx)
-            mask_chunks.append(allow.flatten())
+        if self._packed:
+            cl_cpu = self.candidate_lens.cpu().tolist()
+            for prefix_len, q_len_i in zip(batch.seq_lens_cpu.tolist(), cl_cpu):
+                prefix_len_i = int(prefix_len)
+                q_len_i = int(q_len_i)
+                kv_len = prefix_len_i + q_len_i
+                q_idx = torch.arange(q_len_i, device=batch.device, dtype=torch.int32).unsqueeze(1)
+                k_idx = torch.arange(kv_len, device=batch.device, dtype=torch.int32).unsqueeze(0)
+                allow = k_idx <= (prefix_len_i + q_idx)
+                mask_chunks.append(allow.flatten())
+        else:
+            q_len = int(self.draft_token_num)
+            q_idx = torch.arange(q_len, device=batch.device, dtype=torch.int32).unsqueeze(1)
+            for prefix_len in batch.seq_lens_cpu.tolist():
+                prefix_len_i = int(prefix_len)
+                kv_len = prefix_len_i + q_len
+                k_idx = torch.arange(
+                    kv_len, device=batch.device, dtype=torch.int32
+                ).unsqueeze(0)
+                allow = k_idx <= (prefix_len_i + q_idx)
+                mask_chunks.append(allow.flatten())
         self.custom_mask = (
             torch.cat(mask_chunks, dim=0)
             if mask_chunks
@@ -260,20 +317,28 @@ class DFlashVerifyInput(SpecInput):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
 
-        qo_indptr = torch.arange(
-            0,
-            (bs + 1) * self.draft_token_num,
-            step=self.draft_token_num,
-            dtype=torch.int32,
-            device=device,
-        )
+        if self._packed:
+            cl = self.candidate_lens  # [bs] int32
+            qo_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            qo_indptr[1:] = cl.cumsum(0)
+            paged_kernel_lens = paged_kernel_lens + cl
+            new_kv_total = int(cl.sum().item())
+        else:
+            qo_indptr = torch.arange(
+                0,
+                (bs + 1) * self.draft_token_num,
+                step=self.draft_token_num,
+                dtype=torch.int32,
+                device=device,
+            )
+            paged_kernel_lens = paged_kernel_lens + self.draft_token_num
+            new_kv_total = self.draft_token_num * bs
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * bs,
+            paged_kernel_lens_sum + new_kv_total,
             dtype=torch.int32,
             device=device,
         )
@@ -288,12 +353,17 @@ class DFlashVerifyInput(SpecInput):
         )
         mask = self.custom_mask
         if mask is not None:
-            mask_numel = (
-                paged_kernel_lens_sum * self.draft_token_num
-                + (self.draft_token_num**2) * bs
-            )
+            if self._packed:
+                cl_long = cl.long()
+                mask_numel = int(
+                    (paged_kernel_lens.long() * cl_long).sum().item()
+                )
+            else:
+                mask_numel = (
+                    paged_kernel_lens_sum * self.draft_token_num
+                    + (self.draft_token_num**2) * bs
+                )
             if mask.numel() < mask_numel:
-                # FIXME(attn): temporary fix for custom mask padding with cuda graph
                 mask = torch.cat(
                     [
                         mask,
@@ -308,6 +378,55 @@ class DFlashVerifyInput(SpecInput):
                 )
                 self.custom_mask = mask
         return kv_indices, cum_kv_seq_len, qo_indptr, mask
+
+    def _unpack_to_rect(
+        self,
+        bs: int,
+        device: torch.device,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+    ):
+        """Convert packed [bs*ntpb] layout to rectangular [bs*max_cl] for acceptance."""
+        cl = self.candidate_lens
+        sum_cl = int(cl.sum().item())
+        max_cl = self._max_cl
+        arange = torch.arange(max_cl, device=device)
+        valid = arange[None, :] < cl[:, None]  # [bs, max_cl]
+
+        # Scatter packed draft tokens → rectangular
+        rect = self.draft_token.new_zeros(bs, max_cl)
+        rect[valid] = self.draft_token[:sum_cl]
+        self.draft_token = rect.reshape(-1)
+
+        # Scatter packed logits → rectangular
+        logits = logits_output.next_token_logits
+        V = logits.shape[-1]
+        rect_l = logits.new_zeros(bs, max_cl, V)
+        rect_l[valid] = logits[:sum_cl]
+        logits_output.next_token_logits = rect_l.reshape(bs * max_cl, V)
+
+        # Scatter packed hidden states → rectangular
+        if logits_output.hidden_states is not None:
+            hidden = logits_output.hidden_states
+            H = hidden.shape[-1]
+            rect_h = hidden.new_zeros(bs, max_cl, H)
+            rect_h[valid] = hidden[:sum_cl]
+            logits_output.hidden_states = rect_h.reshape(bs * max_cl, H)
+
+        # Scatter out_cache_loc: free padding slots, place real slots in rectangular.
+        real_locs = batch.out_cache_loc[:sum_cl]
+        padding_locs = batch.out_cache_loc[sum_cl:]
+        if padding_locs.numel() > 0:
+            batch.token_to_kv_pool_allocator.free(padding_locs)
+        rect_c = real_locs.new_zeros(bs, max_cl)
+        rect_c[valid] = real_locs
+        batch.out_cache_loc = rect_c.reshape(-1)
+
+        # Switch to rectangular mode
+        self.draft_token_num = max_cl
+        self.num_tokens_per_batch = max_cl
+        self._packed = False
+        self._valid_mask = valid  # for KV cleanup to skip padding positions
 
     def verify(
         self,
@@ -330,6 +449,12 @@ class DFlashVerifyInput(SpecInput):
 
         bs = batch.batch_size()
         device = logits_output.next_token_logits.device
+
+        # Unpack from packed layout [bs*ntpb] to rectangular [bs*max_cl] so all
+        # downstream acceptance/cleanup code works unchanged.
+        was_packed = self._packed
+        if self._packed:
+            self._unpack_to_rect(bs, device, batch, logits_output)
 
         sampling_info = batch.sampling_info
         if sampling_info is not None:
@@ -381,11 +506,28 @@ class DFlashVerifyInput(SpecInput):
         commit_lens_cpu: List[int] = []
         new_verified_list: List[int] = []
 
+        # Pre-compute per-request candidate len caps if adaptive length is enabled
+        candidate_lens_cpu = None
+        if self.candidate_lens is not None:
+            candidate_lens_cpu = self.candidate_lens.cpu().tolist()
+
         for i, req in enumerate(batch.reqs):
             acc_len = int(packed[i, max_acc].item())
-            proposed = packed[i, :acc_len].tolist() + [
-                int(packed[i, max_acc + 1].item())
-            ]
+
+            # Cap acceptance at candidate_len - 1 when adaptive verification is enabled
+            if candidate_lens_cpu is not None:
+                max_accept = max(0, int(candidate_lens_cpu[i]) - 1)
+                if acc_len > max_accept:
+                    # When acc_len > max_accept, position max_accept was accepted, so
+                    # candidates[i, max_accept+1] == target_predict[i, max_accept] — use it as bonus.
+                    acc_len = max_accept
+                    bonus_token = int(packed[i, max_accept].item()) if max_accept < max_acc else int(packed[i, max_acc + 1].item())
+                else:
+                    bonus_token = int(packed[i, max_acc + 1].item())
+            else:
+                bonus_token = int(packed[i, max_acc + 1].item())
+
+            proposed = packed[i, :acc_len].tolist() + [bonus_token]
 
             appended = 0
             for token_id in proposed:
@@ -413,6 +555,15 @@ class DFlashVerifyInput(SpecInput):
             accept_length_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+            # Avg Verify Len: packed → per-request cl[i]; rect dynamic → shared L
+            # (draft_token_num). Must use was_packed: _unpack_to_rect clears _packed.
+            if candidate_lens_cpu is not None:
+                if was_packed:
+                    req.spec_proposed_tokens += candidate_lens_cpu[i]
+                else:
+                    req.spec_proposed_tokens += self.draft_token_num
+            else:
+                req.spec_proposed_tokens += self.draft_token_num
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_verified_id = torch.tensor(
@@ -420,14 +571,21 @@ class DFlashVerifyInput(SpecInput):
         )
 
         # Free uncommitted KV cache slots and compact out_cache_loc.
+        # _valid_mask is set by _unpack_to_rect for packed layout (marks real vs padding).
+        valid_mask = getattr(self, "_valid_mask", None)  # [bs, draft_token_num] or None
         if page_size == 1:
             out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
             keep_mask = (
                 torch.arange(self.draft_token_num, device=device)[None, :]
                 < commit_lens[:, None]
             )
-            batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
-            batch.out_cache_loc = out_cache_loc[keep_mask]
+            if valid_mask is not None:
+                # Only free real (allocated) positions that are not committed.
+                batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask & valid_mask])
+                batch.out_cache_loc = out_cache_loc[keep_mask & valid_mask]
+            else:
+                batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
+                batch.out_cache_loc = out_cache_loc[keep_mask]
         else:
             out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
             row_offsets = torch.arange(self.draft_token_num, device=device)[None, :]
@@ -438,9 +596,13 @@ class DFlashVerifyInput(SpecInput):
                 page_size=page_size,
             )
             free_mask = row_offsets >= keep_slots[:, None]
+            if valid_mask is not None:
+                free_mask = free_mask & valid_mask
             batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
 
             keep_mask = row_offsets < commit_lens[:, None]
+            if valid_mask is not None:
+                keep_mask = keep_mask & valid_mask
             batch.out_cache_loc = out_cache_loc[keep_mask]
 
         # Update req-level KV cache accounting.

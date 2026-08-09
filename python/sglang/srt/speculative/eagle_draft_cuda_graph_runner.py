@@ -210,6 +210,10 @@ class EAGLEDraftCudaGraphRunner:
         self.graphs[self.bs].replay()
 
     def capture(self):
+        # CudaGraphRunner.capture() is shared with DFlash target verify, which may
+        # capture extra per-ntpb sub-graphs when _dflash_multi_ntpb is True. EAGLE
+        # draft only needs the standard bs x topk graphs.
+        self._dflash_multi_ntpb = False
         CudaGraphRunner.capture(self)
 
     def capture_one_batch_size(

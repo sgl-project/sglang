@@ -151,6 +151,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            # GDN fused projections
+            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvz.", "in_proj_z.", 3),
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
         ]
 
         # Params for MoE experts (non-fused/fused)

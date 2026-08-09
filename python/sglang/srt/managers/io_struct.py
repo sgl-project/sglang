@@ -91,6 +91,9 @@ class SpeculativeDecodingMetricsMixin:
     # Empty list [] when speculative decoding is disabled.
     spec_acceptance_histogram: List[List[int]]
 
+    # Proposed tokens: sum of the actual verify window over all verify steps.
+    spec_proposed_tokens: List[int] = field(default_factory=list, kw_only=True)
+
 
 # Parameters for a session
 @dataclass
@@ -1302,6 +1305,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     flush_cache: bool = True
     # Tensor metadata
     manifest: Optional[Dict[str, Any]] = None
+    # If True, reload weights only for the speculative draft worker (base unchanged).
+    update_speculative_draft: bool = False
 
 
 @dataclass

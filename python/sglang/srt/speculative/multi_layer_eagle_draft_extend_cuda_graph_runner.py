@@ -287,6 +287,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         self.graphs[self.bs].replay()
 
     def capture(self):
+        # Shared CudaGraphRunner.capture() checks _dflash_multi_ntpb for DFlash only.
+        self._dflash_multi_ntpb = False
         CudaGraphRunner.capture(self)
 
     def get_forward_batch(self, bs: int) -> ForwardBatch:

@@ -977,6 +977,466 @@ def _causal_conv1d_update_kernel(
             )
 
 
+@triton.jit()
+def _causal_conv1d_update_varlen_kernel(
+    # Pointers to matrices
+    x_ptr,  # (dim, total_tokens) packed
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,
+    conv_state_indices_ptr,
+    query_start_loc_ptr,  # (batch+1,) cumulative boundaries
+    intermediate_conv_window_ptr,
+    intermediate_state_indices_ptr,
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    retrieve_parent_token_ptr,
+    o_ptr,  # (dim, total_tokens) packed
+    # Matrix dimensions
+    batch: int,
+    dim: tl.constexpr,
+    max_seqlen: tl.constexpr,  # for NP2 sizing only
+    state_len: tl.constexpr,
+    num_cache_lines: tl.constexpr,
+    # Strides (packed: stride_x_dim, stride_x_token)
+    stride_x_dim: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_conv_state_seq: tl.constexpr,
+    stride_conv_state_dim: tl.constexpr,
+    stride_conv_state_tok: tl.constexpr,
+    stride_inter_seq: tl.constexpr,
+    stride_inter_step: tl.constexpr,
+    stride_inter_dim: tl.constexpr,
+    stride_inter_win: tl.constexpr,
+    stride_intermediate_state_indices: tl.constexpr,
+    stride_retrieve_next_token_seq: tl.constexpr,
+    stride_retrieve_next_token_token: tl.constexpr,
+    stride_retrieve_next_sibling_seq: tl.constexpr,
+    stride_retrieve_next_sibling_token: tl.constexpr,
+    stride_retrieve_parent_token_seq: tl.constexpr,
+    stride_retrieve_parent_token_token: tl.constexpr,
+    stride_o_dim: tl.constexpr,
+    stride_o_token: tl.constexpr,
+    # others
+    pad_slot_id: tl.constexpr,
+    # Meta-parameters
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    NP2_SEQLEN: tl.constexpr,
+    NP2_STATELEN: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SAVE_INTERMEDIATE: tl.constexpr,
+    HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+):
+    # Per-request processing with runtime variable length
+    idx_seq = tl.program_id(0)
+    if idx_seq >= batch:
+        return
+
+    # [BLOCK_N,] elements along the feature-dimension (channel)
+    idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Load per-request boundaries from query_start_loc
+    bos = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+    eos = tl.load(query_start_loc_ptr + idx_seq + 1).to(tl.int64)
+    seqlen = eos - bos  # runtime per-request length
+
+    # Get conv state batch coordinate
+    conv_state_batch_coord = tl.load(conv_state_indices_ptr + idx_seq).to(tl.int64)
+    if conv_state_batch_coord == pad_slot_id:
+        return
+
+    if SAVE_INTERMEDIATE:
+        intermediate_state_batch_coord = tl.load(
+            intermediate_state_indices_ptr + idx_seq * stride_intermediate_state_indices
+        ).to(tl.int64)
+
+    # STEP 1: READ init_state data from conv_state
+    conv_states_base = (
+        conv_state_ptr
+        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)
+    )
+    mask_w = idx_feats < dim
+
+    prior_tokens = conv_states_base
+    if KERNEL_WIDTH >= 2:
+        col0 = tl.load(prior_tokens, mask_w, 0.0)
+    if KERNEL_WIDTH >= 3:
+        col1 = tl.load(prior_tokens + 1 * stride_conv_state_tok, mask_w, 0.0)
+    if KERNEL_WIDTH >= 4:
+        col2 = tl.load(prior_tokens + 2 * stride_conv_state_tok, mask_w, 0.0)
+
+    # STEP 2: Update conv_state with new tokens (shift left + append new)
+    # For packed layout: load from x at packed offsets bos:eos
+    idx_tokens_state = tl.arange(0, NP2_STATELEN)  # [NP2_STATELEN]
+
+    # Shift existing state left by seqlen positions
+    conv_state_ptrs_source = (
+        conv_state_ptr
+        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)[None, :]
+        + ((idx_tokens_state + seqlen) * stride_conv_state_tok)[:, None]
+    )
+    mask_shift = (
+        (conv_state_batch_coord < num_cache_lines)
+        & ((idx_tokens_state + seqlen) < state_len)[:, None]
+        & (idx_feats < dim)[None, :]
+    )
+    conv_state = tl.load(conv_state_ptrs_source, mask_shift, other=0.0)
+
+    VAL = state_len - seqlen
+    # Load new tokens from packed x: offset by bos
+    x_ptrs = (
+        x_ptr
+        + ((bos + idx_tokens_state - VAL) * stride_x_token)[:, None]
+        + (idx_feats * stride_x_dim)[None, :]
+    )
+    mask_x = (
+        (idx_tokens_state - VAL >= 0)[:, None]
+        & (idx_tokens_state - VAL < seqlen)[:, None]
+        & (idx_feats < dim)[None, :]
+    )
+    loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+    tl.debug_barrier()
+
+    new_conv_state = tl.where(mask_shift, conv_state, loaded_x)
+
+    # Store updated conv_state
+    conv_state_ptrs_target = (
+        conv_states_base + (idx_tokens_state * stride_conv_state_tok)[:, None]
+    )
+    mask_store = (idx_tokens_state < state_len)[:, None] & (idx_feats < dim)[None, :]
+    tl.store(conv_state_ptrs_target, new_conv_state, mask_store)
+
+    # STEP 3: init accumulator
+    if HAS_BIAS:
+        bias = bias_ptr + idx_feats
+        mask_bias = idx_feats < dim
+        acc_preload = tl.load(bias, mask=mask_bias, other=0.0).to(tl.float32)
+    else:
+        acc_preload = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    # STEP 4: PRE-LOAD WEIGHTS
+    if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+        idx_tokens_tree = tl.arange(0, NP2_SEQLEN)
+        mask_retrieve = idx_tokens_tree < seqlen
+        retrieve_next_token_base = (
+            retrieve_next_token_ptr
+            + (idx_seq * stride_retrieve_next_token_seq)
+            + idx_tokens_tree * stride_retrieve_next_token_token
+        )
+        retrieve_next_tokens = tl.load(retrieve_next_token_base, mask_retrieve)
+        retrieve_next_sibling_base = (
+            retrieve_next_sibling_ptr
+            + (idx_seq * stride_retrieve_next_sibling_seq)
+            + idx_tokens_tree * stride_retrieve_next_sibling_token
+        )
+        retrieve_next_siblings = tl.load(retrieve_next_sibling_base, mask_retrieve)
+        parent_idx_tokens = tl.zeros((NP2_SEQLEN,), dtype=tl.int32)
+
+    w_base = w_ptr + (idx_feats * stride_w_dim)
+    mask_w = idx_feats < dim
+    if KERNEL_WIDTH >= 2:
+        w_col0 = tl.load(w_base + (0 * stride_w_width), mask_w, other=0.0)
+        w_col1 = tl.load(w_base + (1 * stride_w_width), mask_w, other=0.0)
+    if KERNEL_WIDTH >= 3:
+        w_col2 = tl.load(w_base + (2 * stride_w_width), mask_w, other=0.0)
+    if KERNEL_WIDTH >= 4:
+        w_col3 = tl.load(w_base + (3 * stride_w_width), mask_w, other=0.0)
+
+    x_base_1d = x_ptr + bos * stride_x_token + idx_feats * stride_x_dim
+    mask_x_1d = idx_feats < dim
+
+    # STEP 5: compute each token using TRUE dynamic loop (seqlen is runtime)
+    # This works the same way as _causal_conv1d_fwd_kernel's range(segment_len)
+    for idx_token in range(seqlen):
+        acc = acc_preload
+
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+            # Tree attention logic (same as original)
+            retrieve_next_token_idx = tl.sum(
+                tl.where(idx_tokens_tree == idx_token, retrieve_next_tokens, 0)
+            )
+            if retrieve_next_token_idx != -1:
+                parent_idx_tokens = tl.where(
+                    idx_tokens_tree == retrieve_next_token_idx,
+                    idx_token,
+                    parent_idx_tokens,
+                )
+            retrieve_sibling_token_idx = tl.sum(
+                tl.where(idx_tokens_tree == idx_token, retrieve_next_siblings, 0)
+            )
+            if retrieve_sibling_token_idx != -1:
+                parent_idx_token = tl.sum(
+                    tl.where(idx_tokens_tree == idx_token, parent_idx_tokens, 0)
+                )
+                parent_idx_tokens = tl.where(
+                    idx_tokens_tree == retrieve_sibling_token_idx,
+                    parent_idx_token,
+                    parent_idx_tokens,
+                )
+
+            _idx_token = idx_token
+            x_ptrs_1d = x_base_1d + _idx_token * stride_x_token
+            matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+
+            for j in tl.static_range(KERNEL_WIDTH):
+                if KERNEL_WIDTH == 2:
+                    matrix_w = w_col1 if j == 0 else w_col0
+                elif KERNEL_WIDTH == 3:
+                    if j == 0:
+                        matrix_w = w_col2
+                    elif j == 1:
+                        matrix_w = w_col1
+                    else:
+                        matrix_w = w_col0
+                elif KERNEL_WIDTH == 4:
+                    if j == 0:
+                        matrix_w = w_col3
+                    elif j == 1:
+                        matrix_w = w_col2
+                    elif j == 2:
+                        matrix_w = w_col1
+                    else:
+                        matrix_w = w_col0
+
+                if SAVE_INTERMEDIATE:
+                    base_ptr = (
+                        intermediate_conv_window_ptr
+                        + intermediate_state_batch_coord * stride_inter_seq
+                        + idx_token * stride_inter_step
+                        + idx_feats * stride_inter_dim
+                    )
+                    if KERNEL_WIDTH - j - 2 >= 0:
+                        tl.store(
+                            base_ptr + (KERNEL_WIDTH - j - 2) * stride_inter_win,
+                            matrix_x,
+                            mask=mask_w,
+                        )
+
+                acc += matrix_x * matrix_w
+
+                if _idx_token > 0:
+                    _idx_token = tl.sum(
+                        tl.where(idx_tokens_tree == _idx_token, parent_idx_tokens, 0)
+                    )
+                    x_ptrs_1d = x_base_1d + _idx_token * stride_x_token
+                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                else:
+                    if KERNEL_WIDTH == 2:
+                        if _idx_token == 0:
+                            matrix_x = col0
+                    elif KERNEL_WIDTH == 3:
+                        if _idx_token == 0:
+                            matrix_x = col1
+                        else:
+                            matrix_x = col0
+                    elif KERNEL_WIDTH == 4:
+                        if _idx_token == 0:
+                            matrix_x = col2
+                        elif _idx_token == -1:
+                            matrix_x = col1
+                        else:
+                            matrix_x = col0
+                    _idx_token = _idx_token - 1
+        else:
+            # Standard causal convolution
+            matrix_w = w_col0
+            matrix_x = col0
+
+            for j in tl.static_range(KERNEL_WIDTH):
+                if KERNEL_WIDTH == 2:
+                    if j == 1:
+                        matrix_w = w_col1
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                elif KERNEL_WIDTH == 3:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                elif KERNEL_WIDTH == 4:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        matrix_x = col2
+                    elif j == 3:
+                        matrix_w = w_col3
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+
+                acc += matrix_x * matrix_w
+
+            if KERNEL_WIDTH == 2:
+                col0 = matrix_x
+            elif KERNEL_WIDTH == 3:
+                col0 = col1
+                col1 = matrix_x
+            elif KERNEL_WIDTH == 4:
+                col0 = col1
+                col1 = col2
+                col2 = matrix_x
+
+            if SAVE_INTERMEDIATE:
+                base_ptr = (
+                    intermediate_conv_window_ptr
+                    + intermediate_state_batch_coord * stride_inter_seq
+                    + idx_token * stride_inter_step
+                    + idx_feats * stride_inter_dim
+                )
+                if KERNEL_WIDTH >= 2:
+                    tl.store(base_ptr + 0 * stride_inter_win, col0, mask=mask_w)
+                if KERNEL_WIDTH >= 3:
+                    tl.store(base_ptr + 1 * stride_inter_win, col1, mask=mask_w)
+                if KERNEL_WIDTH >= 4:
+                    tl.store(base_ptr + 2 * stride_inter_win, col2, mask=mask_w)
+
+        if SILU_ACTIVATION:
+            acc = acc / (1 + tl.exp(-acc))
+
+        # Store output at packed offset: bos + idx_token
+        o_ptrs = o_ptr + (bos + idx_token) * stride_o_token + (idx_feats * stride_o_dim)
+        mask_1d = (idx_feats < dim)
+        tl.store(o_ptrs, acc, mask=mask_1d)
+
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+            tl.store(
+                retrieve_parent_token_ptr
+                + idx_seq * stride_retrieve_parent_token_seq
+                + idx_tokens_tree * stride_retrieve_parent_token_token,
+                parent_idx_tokens,
+                mask=mask_retrieve,
+            )
+
+
+def causal_conv1d_update_varlen(
+    x: torch.Tensor,  # (dim, total_tokens) packed
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    activation: Union[bool, str, None] = None,
+    query_start_loc: Optional[torch.Tensor] = None,
+    conv_state_indices: Optional[torch.Tensor] = None,
+    intermediate_conv_window: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
+    retrieve_next_token: Optional[torch.Tensor] = None,
+    retrieve_next_sibling: Optional[torch.Tensor] = None,
+    retrieve_parent_token: Optional[torch.Tensor] = None,
+    pad_slot_id: int = PAD_SLOT_ID,
+):
+    """Varlen conv1d update for packed tokens with per-request variable length.
+
+    x: (dim, total_tokens) packed flat
+    conv_state: (num_cache_lines, dim, state_len)
+    weight: (dim, width)
+    query_start_loc: (batch+1,) int32 cumulative boundaries
+    """
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    elif activation is not None:
+        assert activation in ["silu", "swish"]
+
+    assert x.dim() == 2, "x must be (dim, total_tokens)"
+    assert query_start_loc is not None, "query_start_loc required for varlen"
+
+    dim, total_tokens = x.shape
+    _, width = weight.shape
+    num_cache_lines, _, state_len = conv_state.size()
+    batch = query_start_loc.size(0) - 1
+
+    # Compute max_seqlen from query_start_loc
+    seq_lens = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int32)
+    max_seqlen = int(seq_lens.max().item())
+
+    out = torch.empty_like(x)
+
+    stride_x_dim, stride_x_token = x.stride()
+    stride_w_dim, stride_w_width = weight.stride()
+    stride_o_dim, stride_o_token = out.stride()
+    stride_conv_state_seq, stride_conv_state_dim, stride_conv_state_tok = conv_state.stride()
+
+    stride_intermediate_state_indices = (
+        intermediate_state_indices.stride(0) if intermediate_state_indices is not None else 0
+    )
+
+    np2_seqlen = triton.next_power_of_2(max_seqlen)
+    np2_statelen = triton.next_power_of_2(state_len)
+
+    # Prepare intermediate buffer strides
+    if intermediate_conv_window is not None:
+        stride_inter_seq, stride_inter_step, stride_inter_dim, stride_inter_win = (
+            intermediate_conv_window.stride(0),
+            intermediate_conv_window.stride(1),
+            intermediate_conv_window.stride(2),
+            intermediate_conv_window.stride(3),
+        )
+    else:
+        stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
+
+    # Prepare tree attention strides
+    if retrieve_next_token is not None:
+        stride_retrieve_next_token_seq, stride_retrieve_next_token_token = (
+            retrieve_next_token.stride(0), retrieve_next_token.stride(1)
+        )
+    else:
+        stride_retrieve_next_token_seq = stride_retrieve_next_token_token = 0
+
+    if retrieve_next_sibling is not None:
+        stride_retrieve_next_sibling_seq, stride_retrieve_next_sibling_token = (
+            retrieve_next_sibling.stride(0), retrieve_next_sibling.stride(1)
+        )
+    else:
+        stride_retrieve_next_sibling_seq = stride_retrieve_next_sibling_token = 0
+
+    if retrieve_parent_token is not None:
+        stride_retrieve_parent_token_seq, stride_retrieve_parent_token_token = (
+            retrieve_parent_token.stride(0), retrieve_parent_token.stride(1)
+        )
+    else:
+        stride_retrieve_parent_token_seq = stride_retrieve_parent_token_token = 0
+
+    def grid(META):
+        return (batch, triton.cdiv(dim, META["BLOCK_N"]))
+
+    _causal_conv1d_update_varlen_kernel[grid](
+        x, weight, bias, conv_state,
+        conv_state_indices, query_start_loc,
+        intermediate_conv_window if intermediate_conv_window is not None else x,
+        intermediate_state_indices,
+        retrieve_next_token, retrieve_next_sibling, retrieve_parent_token,
+        out,
+        batch, dim, max_seqlen, state_len, num_cache_lines,
+        stride_x_dim, stride_x_token,
+        stride_w_dim, stride_w_width,
+        stride_conv_state_seq, stride_conv_state_dim, stride_conv_state_tok,
+        stride_inter_seq, stride_inter_step, stride_inter_dim, stride_inter_win,
+        stride_intermediate_state_indices,
+        stride_retrieve_next_token_seq, stride_retrieve_next_token_token,
+        stride_retrieve_next_sibling_seq, stride_retrieve_next_sibling_token,
+        stride_retrieve_parent_token_seq, stride_retrieve_parent_token_token,
+        stride_o_dim, stride_o_token,
+        pad_slot_id,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        NP2_SEQLEN=np2_seqlen,
+        NP2_STATELEN=np2_statelen,
+        BLOCK_N=256,
+        SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+    )
+    return out
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,

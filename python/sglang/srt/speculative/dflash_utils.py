@@ -14,6 +14,28 @@ from sglang.srt.utils import is_cuda
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
+# --- Dynamic verify-len EMA: tracks ceil(mean(candidate_lens)) for scheduler ---
+_dflash_verify_ema: float = 0.0
+_dflash_verify_ema_alpha: float = 0.3
+
+
+def get_dflash_verify_ema() -> int:
+    return int(_dflash_verify_ema + 0.999) if _dflash_verify_ema > 0 else 0
+
+
+def update_dflash_verify_ema(ntpb: int) -> None:
+    global _dflash_verify_ema
+    a = _dflash_verify_ema_alpha
+    if _dflash_verify_ema <= 0:
+        _dflash_verify_ema = float(ntpb)
+    else:
+        _dflash_verify_ema += a * (ntpb - _dflash_verify_ema)
+
+
+def set_dflash_verify_ema_alpha(alpha: float) -> None:
+    global _dflash_verify_ema_alpha
+    _dflash_verify_ema_alpha = alpha
+
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(

@@ -863,6 +863,7 @@ class Engine(EngineBase):
         self,
         model_path: str,
         load_format: Optional[str] = None,
+        update_speculative_draft: bool = False,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
@@ -873,6 +874,7 @@ class Engine(EngineBase):
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
             load_format=load_format,
+            update_speculative_draft=update_speculative_draft,
         )
 
         return self.loop.run_until_complete(

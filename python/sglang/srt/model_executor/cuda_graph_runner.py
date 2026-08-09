@@ -485,6 +485,14 @@ class CudaGraphRunner:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
+        # DFLASH variable verify_len: pre-capture graphs for ntpb = 1..block_size
+        # so that any effective_block has a matching CUDA graph (no eager fallback).
+        self._dflash_multi_ntpb = (
+            model_runner.spec_algorithm.is_dflash()
+            and not model_runner.is_draft_worker
+            and self.num_tokens_per_bs > 1
+        )
+
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
@@ -588,15 +596,25 @@ class CudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def _get_effective_ntpb(self, forward_batch: ForwardBatch) -> int:
+        """For DFLASH multi-ntpb, derive actual tokens-per-batch-element from input."""
+        if self._dflash_multi_ntpb and forward_batch.batch_size > 0:
+            return forward_batch.input_ids.numel() // forward_batch.batch_size
+        return self.num_tokens_per_bs
+
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
+            if (
+                self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
-                else max(forward_batch.global_num_tokens_cpu)
-            )
+            ):
+                effective_ntpb = self._get_effective_ntpb(forward_batch)
+                cuda_graph_bs = (
+                    max(forward_batch.global_num_tokens_cpu) // effective_ntpb
+                )
+            else:
+                cuda_graph_bs = max(forward_batch.global_num_tokens_cpu)
         else:
             cuda_graph_bs = forward_batch.batch_size
 
@@ -648,12 +666,29 @@ class CudaGraphRunner:
             else True
         )
 
+        # DFLASH variable verify_len: all ntpb graphs pre-captured, always supported
+        is_token_count_supported = True
+        if not self._dflash_multi_ntpb and (
+            self.model_runner.spec_algorithm.is_dflash()
+            and not self.model_runner.is_draft_worker
+        ):
+            is_token_count_supported = (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+
+        # Packed TARGET_VERIFY: variable total query tokens (sum(cl) ≠ bs*ntpb).
+        # Cannot use CUDA graph; fall back to eager (init_forward_metadata).
+        if getattr(getattr(forward_batch, "spec_info", None), "_packed", False):
+            is_token_count_supported = False
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_token_count_supported
         )
 
     def _init_profile_context_and_memory_record(self):
@@ -723,6 +758,27 @@ class CudaGraphRunner:
                     self.graphs[key] = graph
                     self.output_buffers[key] = output_buffers
 
+                # DFLASH variable verify_len: capture graphs for ntpb = 1..block_size-1
+                if self._dflash_multi_ntpb:
+                    for ntpb in range(1, self.num_tokens_per_bs):
+                        logger.debug(f"Capturing DFlash sub-graph: {bs=}, {ntpb=}")
+                        with patch_model(
+                            self.model_runner.model,
+                            False,
+                            num_tokens=bs * ntpb,
+                            tp_group=self.model_runner.tp_group,
+                        ) as fwd:
+                            g, ob = self.capture_one_batch_size(
+                                bs, fwd, stream_idx, num_tokens_per_bs=ntpb
+                            )
+                            k = (
+                                (bs, ntpb)
+                                if stream_idx is None
+                                else f"{stream_idx}_{bs}_{ntpb}"
+                            )
+                            self.graphs[k] = g
+                            self.output_buffers[k] = ob
+
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -761,12 +817,21 @@ class CudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        num_tokens_per_bs: Optional[int] = None,
     ):
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
-        num_tokens = bs * self.num_tokens_per_bs
+        ntpb = (
+            num_tokens_per_bs
+            if num_tokens_per_bs is not None
+            else self.num_tokens_per_bs
+        )
+        num_tokens = bs * ntpb
 
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
@@ -824,7 +889,7 @@ class CudaGraphRunner:
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(num_tokens)
+        spec_info = self.get_spec_info(num_tokens, draft_token_num=ntpb)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
@@ -995,18 +1060,21 @@ class CudaGraphRunner:
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        effective_ntpb = self._get_effective_ntpb(forward_batch)
+        raw_num_token = raw_bs * effective_ntpb
+        self._replay_ntpb = effective_ntpb
 
         # Pad
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-            max_batch_size = (
-                max_num_tokens / self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
+            if (
+                self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
-                else max_num_tokens
-            )
+            ):
+                max_batch_size = max_num_tokens / effective_ntpb
+            else:
+                max_batch_size = max_num_tokens
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
@@ -1019,7 +1087,7 @@ class CudaGraphRunner:
             bs=bs,
             seq_len_fill_value=self.seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
-            num_tokens_per_bs=self.num_tokens_per_bs,
+            num_tokens_per_bs=effective_ntpb,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(
                 self.model_runner.server_args
@@ -1087,11 +1155,14 @@ class CudaGraphRunner:
                     forward_batch.input_embeds
                 )
 
-        # Replay
+        # Replay: select graph by (bs, ntpb) for DFLASH variable verify_len
+        ntpb = getattr(self, "_replay_ntpb", self.num_tokens_per_bs)
+        use_sub_graph = self._dflash_multi_ntpb and ntpb < self.num_tokens_per_bs
         if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{self.bs}"
+            si = get_current_stream_idx()
+            graph_key = f"{si}_{self.bs}_{ntpb}" if use_sub_graph else f"{si}_{self.bs}"
         else:
-            graph_key = self.bs
+            graph_key = (self.bs, ntpb) if use_sub_graph else self.bs
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
@@ -1119,13 +1190,23 @@ class CudaGraphRunner:
                     if output.hidden_states is not None
                     else None
                 ),
+                teacher_hidden_states=(
+                    output.teacher_hidden_states[: self.raw_num_token]
+                    if getattr(output, "teacher_hidden_states", None) is not None
+                    else None
+                ),
+                last_hidden_states=(
+                    output.last_hidden_states[: self.raw_num_token]
+                    if getattr(output, "last_hidden_states", None) is not None
+                    else None
+                ),
                 customized_info=output.customized_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
-    def get_spec_info(self, num_tokens: int):
+    def get_spec_info(self, num_tokens: int, draft_token_num: Optional[int] = None):
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()
@@ -1162,10 +1243,14 @@ class CudaGraphRunner:
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
+            dtn = (
+                draft_token_num
+                or self.model_runner.server_args.speculative_num_draft_tokens
+            )
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=dtn,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)

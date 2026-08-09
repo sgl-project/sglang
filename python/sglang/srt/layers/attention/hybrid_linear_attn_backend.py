@@ -139,6 +139,7 @@ class MambaAttnBackendBase(AttentionBackend):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
+        self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
@@ -177,15 +178,22 @@ class MambaAttnBackendBase(AttentionBackend):
                 # the draft model, so mamba metadata can be skipped.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
-                query_start_loc = torch.arange(
-                    0,
-                    forward_batch.input_ids.shape[0] + 1,
-                    step=forward_batch.spec_info.draft_token_num,
-                    dtype=torch.int32,
-                    device=forward_batch.input_ids.device,
-                )
+                spec_info = forward_batch.spec_info
+                if getattr(spec_info, "_packed", False) and spec_info.candidate_lens is not None:
+                    cl = spec_info.candidate_lens.to(torch.int32)
+                    bs_v = cl.shape[0]
+                    query_start_loc = torch.zeros(bs_v + 1, dtype=torch.int32, device=cl.device)
+                    query_start_loc[1:] = cl.cumsum(0)
+                else:
+                    query_start_loc = torch.arange(
+                        0,
+                        forward_batch.input_ids.shape[0] + 1,
+                        step=spec_info.draft_token_num,
+                        dtype=torch.int32,
+                        device=forward_batch.input_ids.device,
+                    )
 
-                if forward_batch.spec_info.topk > 1:
+                if self.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
                     retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
                     # retrieve_next_token is None during dummy run so skip tensor creation
@@ -217,6 +225,11 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 
+        has_mamba_track_mask = bool(
+            forward_batch.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask.any()
+        )
+
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
@@ -228,6 +241,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            has_mamba_track_mask=has_mamba_track_mask,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -467,16 +481,27 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-            )
+            dtn = spec_info.draft_token_num if spec_info is not None else 1
+            if dtn == self.cached_cuda_graph_verify_query_start_loc[1].item():
+                # Fast path: draft_token_num matches the cached version
+                self.query_start_loc_list[bs - 1].copy_(
+                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                )
+            else:
+                # draft_token_num differs (e.g. DFLASH multi-ntpb); compute on the fly
+                self.query_start_loc_list[bs - 1].copy_(
+                    torch.arange(
+                        0, bs * dtn + 1, step=dtn,
+                        dtype=torch.int32, device=self.device,
+                    )
+                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and spec_info.topk > 1:
+        if forward_mode.is_target_verify() and self.topk > 1:
             # They are None during cuda graph capture so skip the copy_...
             # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrive_next_token)
             # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrive_next_sibling)
@@ -522,22 +547,27 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            if num_padding == 0:
+            dtn = spec_info.draft_token_num if spec_info is not None else 1
+            if num_padding == 0 and dtn == self.cached_cuda_graph_verify_query_start_loc[1].item():
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
             else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
+                self.query_start_loc_list[bs - 1][: bs + 1].copy_(
+                    torch.arange(
+                        0, bs * dtn + 1, step=dtn,
+                        dtype=torch.int32, device=self.device,
+                    )
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    (bs - num_padding) * spec_info.draft_token_num
-                )
+                if num_padding > 0:
+                    self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
+                        (bs - num_padding) * dtn
+                    )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and spec_info.topk > 1:
+        if forward_mode.is_target_verify() and self.topk > 1:
             bs_without_pad = spec_info.retrive_next_token.shape[0]
             self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
                 spec_info.retrive_next_token
@@ -613,10 +643,7 @@ class MambaAttnBackendBase(AttentionBackend):
         Note: Conv state tracking for extend is handled separately via gather operations
         using indices computed by `_init_track_conv_indices`.
         """
-        if (
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        ):
+        if forward_metadata.has_mamba_track_mask:
             h = h.squeeze(0)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:

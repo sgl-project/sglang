@@ -493,30 +493,48 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
-                metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + self.speculative_num_draft_tokens
-                ).to(torch.int32)
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item()
-                    + self.speculative_num_draft_tokens
-                )
-                metadata.cu_seqlens_q = torch.arange(
-                    0,
-                    batch_size * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(
-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                    ),
-                    (1, 0),
-                )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
+                spec_info = forward_batch.spec_info
+                if getattr(spec_info, "_packed", False) and spec_info.candidate_lens is not None:
+                    # Packed (continuous batching): variable cu_seqlens_q per request.
+                    # cu_seqlens_q = cumsum(cl); total query tokens = sum(cl) ≤ bs*max_cl.
+                    cl = spec_info.candidate_lens.to(torch.int32)
+                    dtn = int(cl.max().item())  # = spec_info.draft_token_num
+                    metadata.cache_seqlens_int32 = (forward_batch.seq_lens + cl).to(torch.int32)
+                    metadata.max_seq_len_q = dtn
+                    metadata.max_seq_len_k = int(forward_batch.seq_lens_cpu.max().item()) + dtn
+                    metadata.cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+                    metadata.cu_seqlens_q[1:] = cl.cumsum(0)
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
+                    )
+                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
+                else:
+                    metadata.cache_seqlens_int32 = (
+                        forward_batch.seq_lens + self.speculative_num_draft_tokens
+                    ).to(torch.int32)
+                    metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                    metadata.max_seq_len_k = (
+                        forward_batch.seq_lens_cpu.max().item()
+                        + self.speculative_num_draft_tokens
+                    )
+                    metadata.cu_seqlens_q = torch.arange(
+                        0,
+                        batch_size * self.speculative_num_draft_tokens + 1,
+                        self.speculative_num_draft_tokens,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        ),
+                        (1, 0),
+                    )
+                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
 
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
             else:
@@ -1738,22 +1756,24 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
+                # Use actual draft_token_num from spec_info for variable verify_len (DFlash sub-graphs).
+                dtn = (
+                    spec_info.draft_token_num
+                    if (spec_info and getattr(spec_info, "draft_token_num", None))
+                    else self.speculative_num_draft_tokens
+                )
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
-                )
+                metadata.cache_seqlens_int32.copy_((seq_lens + dtn))
 
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = (
-                    seq_lens.max().item() + self.speculative_num_draft_tokens
-                )
+                metadata.max_seq_len_q = dtn
+                metadata.max_seq_len_k = seq_lens.max().item() + dtn
 
                 metadata.cu_seqlens_q = torch.arange(
                     0,
-                    bs * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
+                    bs * dtn + 1,
+                    dtn,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -1764,7 +1784,10 @@ class FlashAttentionBackend(AttentionBackend):
 
                 metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
 
-                self.target_verify_metadata[bs] = metadata
+                # Store by (bs, dtn) to keep each sub-graph's cu_seqlens_q alive (prevents
+                # dangling GPU pointers after overwriting target_verify_metadata[bs]).
+                key = bs if dtn == self.speculative_num_draft_tokens else (bs, dtn)
+                self.target_verify_metadata[key] = metadata
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
@@ -1988,14 +2011,17 @@ class FlashAttentionBackend(AttentionBackend):
                 )
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
-                metadata = self.target_verify_metadata[bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
+                # Use actual draft_token_num for variable verify_len (DFlash sub-graphs).
+                dtn = (
+                    spec_info.draft_token_num
+                    if (spec_info and getattr(spec_info, "draft_token_num", None))
+                    else self.speculative_num_draft_tokens
                 )
+                key = bs if dtn == self.speculative_num_draft_tokens else (bs, dtn)
+                metadata = self.target_verify_metadata[key]
+                metadata.cache_seqlens_int32.copy_((seq_lens + dtn))
 
-                metadata.max_seq_len_k = (
-                    seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-                )
+                metadata.max_seq_len_k = seq_lens_cpu.max().item() + dtn
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
