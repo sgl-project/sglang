@@ -1,5 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
 """Fused sub-block score kernel: bf16 GEMM + segmented log-sum-exp in one pass.
 
     score[i, j] = log2 sum_{b < n_k} 2 ** ( qbar_i . kbar_{j,b} )

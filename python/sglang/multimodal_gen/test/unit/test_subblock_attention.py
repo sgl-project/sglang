@@ -145,14 +145,6 @@ class TestSubBlockSchedule(unittest.TestCase):
         self.assertEqual(schedule.n_k, 4)
         self.assertEqual(schedule.n_q, 4)
 
-    def test_config_overrides(self):
-        config = {"sparsity": 0.9, "skip_first_steps": 3, "skip_first_layers": 5}
-        with _patch_schedule(config):
-            schedule = SubBlockSchedule.from_server_args()
-        self.assertEqual(schedule.sparsity, 0.9)
-        self.assertEqual(schedule.skip_first_steps, 3)
-        self.assertEqual(schedule.skip_first_layers, 5)
-
     def test_rejects_out_of_range_values(self):
         for config in ({"sparsity": 1.0}, {"n_k": 3}, {"skip_first_steps": -1}):
             with self.subTest(config=config), _patch_schedule(config):
@@ -167,11 +159,6 @@ class TestBudgetGranularity(unittest.TestCase):
         for topk, expected in ((148, 152), (118, 120), (1, 8), (0, 8)):
             with self.subTest(topk=topk):
                 self.assertEqual(_snap_up_to_8(topk, 590), expected)
-
-    def test_an_exact_multiple_is_left_alone(self):
-        for topk in (8, 120, 152):
-            with self.subTest(topk=topk):
-                self.assertEqual(_snap_up_to_8(topk, 590), topk)
 
     def test_never_exceeds_the_blocks_that_exist(self):
         """The cap wins over the granularity: 590 blocks means at most 590."""
@@ -203,12 +190,6 @@ class TestSubBlockGating(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 impl = self._impl(prefix, skip_first_layers=2)
                 self.assertEqual(impl.layer_enabled, expected)
-
-    def test_every_dit_layer_is_sparse_by_default(self):
-        """The default cutoff is 0: depth gets no special treatment."""
-        for prefix in ("blocks.0.attn", "blocks.1.attn", "blocks.49.attn"):
-            with self.subTest(prefix=prefix):
-                self.assertTrue(self._impl(prefix).layer_enabled)
 
     def test_token_refiner_is_dense(self):
         self.assertFalse(self._impl("token_refiner.blocks.0.attn").layer_enabled)

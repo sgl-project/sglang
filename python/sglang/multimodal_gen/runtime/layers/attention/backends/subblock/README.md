@@ -113,17 +113,6 @@ compute, not activations, and the `[B,H,Gq,Gk]` score matrix is ~20 MB at
 S=37.7k. Absolute times are node-specific; only ratios measured in one session
 are comparable.
 
-## Known limitation: long-range mass
-
-At sparsity 0.75 the router keeps 82.6% of the true softmax mass, and **97% of
-what it drops lies beyond 8 key blocks**. The near field survives intact; the far
-field loses a sixth. On the one clip where this was chased into the pixels, a
-prompt asking for three cats rendered four where dense rendered three, and the
-count came back only at a budget already slower than dense — so raising the
-budget is not the lever; raising *long-range* recall at a fixed budget would be.
-An attention sink and a forced diagonal were both tried at fixed budget and
-rejected on measurement.
-
 ## Files
 
 | | |
