@@ -1876,7 +1876,7 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
-        if self.server_args.mm_feature_transport == "cuda_vmm":
+        if get_mm().mm_feature_transport == "cuda_vmm":
             for recv_req in recv_reqs:
                 self._materialize_cuda_vmm_inputs(recv_req)
 
