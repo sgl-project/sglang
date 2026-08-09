@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
@@ -236,7 +237,6 @@ class SchedulerMetricsCollectorContext:
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
-
     def __init__(
         self,
         labels: Dict[str, str],
@@ -1619,6 +1619,16 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Number of requests aborted.",
             labelnames=labels.keys(),
         )
+        self.num_abort_signals_total = Counter(
+            name="sglang:num_abort_signals_total",
+            documentation="Number of abort signals dispatched by reason.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        self.request_outcomes_total = Counter(
+            name="sglang:request_outcomes_total",
+            documentation="Number of terminal request outcomes by outcome and reason.",
+            labelnames=list(labels.keys()) + ["is_streaming", "outcome", "reason"],
+        )
 
         if bucket_time_to_first_token is None:
             bucket_time_to_first_token = [
@@ -1748,6 +1758,8 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         cached_tokens_details: Optional[Dict[str, Any]] = None,
         spec_verify_ct: int = 0,
         is_streaming: bool = False,
+        *,
+        finish_reason: Mapping[str, Any],
     ):
         stream_labels = {
             **labels,
@@ -1784,6 +1796,21 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
 
         self.num_requests_total.labels(**stream_labels).inc(1)
+        finish_type = finish_reason["type"]
+        if finish_type == "abort":
+            self.observe_one_request_outcome(
+                labels,
+                is_streaming=is_streaming,
+                outcome="aborted",
+                reason=finish_reason["reason"],
+            )
+        else:
+            self.observe_one_request_outcome(
+                labels,
+                is_streaming=is_streaming,
+                outcome="completed",
+                reason=finish_type,
+            )
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**stream_labels).observe(
@@ -1834,8 +1861,27 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 his._buckets[i].inc(num_new_tokens)
                 break
 
-    def observe_one_aborted_request(self, labels: Dict[str, str]):
+    def observe_one_aborted_request(self, labels: Dict[str, str], reason: AbortReason):
         self.num_aborted_requests_total.labels(**labels).inc(1)
+        self.observe_one_abort_signal(labels, reason)
+
+    def observe_one_abort_signal(self, labels: Dict[str, str], reason: AbortReason):
+        self.num_abort_signals_total.labels(**labels, reason=reason.value).inc(1)
+
+    def observe_one_request_outcome(
+        self,
+        labels: Dict[str, str],
+        *,
+        is_streaming: bool,
+        outcome: str,
+        reason: str,
+    ):
+        self.request_outcomes_total.labels(
+            **labels,
+            is_streaming="true" if is_streaming else "false",
+            outcome=outcome,
+            reason=reason,
+        ).inc(1)
 
 
 @dataclass

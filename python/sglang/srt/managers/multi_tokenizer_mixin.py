@@ -37,6 +37,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -696,7 +697,10 @@ class TokenizerWorker(TokenizerManager):
         if obj.mode == "abort":
             # Abort polling: only the originator checks its own lock state
             while True:
-                self.abort_request(abort_all=True)
+                self.abort_request(
+                    abort_all=True,
+                    reason=AbortReason.PAUSE_GENERATION,
+                )
                 is_locked = await self.model_update_lock.is_locked()
                 if not is_locked:
                     break

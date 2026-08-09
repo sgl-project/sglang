@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -447,7 +448,10 @@ class TokenizerControlMixin:
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
+            self.abort_request(
+                abort_all=True,
+                reason=AbortReason.WEIGHT_UPDATE,
+            )
 
         # Hold is_pause_cond while updating to prevent unpause from racing.
         async with self.is_pause_cond:
@@ -505,7 +509,10 @@ class TokenizerControlMixin:
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
         if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
+            self.abort_request(
+                abort_all=True,
+                reason=AbortReason.WEIGHT_UPDATE,
+            )
 
         obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
             obj.serialized_named_tensors

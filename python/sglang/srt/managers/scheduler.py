@@ -104,6 +104,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -276,7 +277,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, get_parallel, publish
+from sglang.srt.runtime_context import get_context, publish
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -1597,7 +1598,9 @@ class Scheduler(
         for req in running_batch.reqs:
             if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
                 req.to_finish = FINISH_ABORT(
-                    "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
+                    "Request running timeout reached.",
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    reason=AbortReason.RUNNING_TIMEOUT,
                 )
 
     def get_init_info(self) -> Dict[str, Any]:
@@ -2418,7 +2421,12 @@ class Scheduler(
                         recv_req.time_stats.trace_ctx.abort(
                             abort_info={"reason": error_msg}
                         )
-                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    prepare_abort(
+                        req,
+                        error_msg,
+                        status_code=HTTPStatus.BAD_REQUEST,
+                        reason=AbortReason.INVALID_REQUEST,
+                    )
                     self.output_streamer.stream_output([req], req.return_logprob)
                     return
 
@@ -2703,8 +2711,10 @@ class Scheduler(
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": "Using priority is disabled for this server. Please send a new request without a priority.",
+                    "reason": AbortReason.PRIORITY_DISABLED.value,
                 },
                 rid=req.rid,
+                abort_reason=AbortReason.PRIORITY_DISABLED,
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
@@ -2722,6 +2732,7 @@ class Scheduler(
         # Reject the incoming request by default.
         req_to_abort = recv_req
         message = "The request queue is full."
+        abort_reason = AbortReason.QUEUE_FULL
         if self.enable_priority_scheduling:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
@@ -2745,6 +2756,7 @@ class Scheduler(
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
+                abort_reason = AbortReason.PRIORITY_PREEMPTED
 
         self.ipc_channels.send_to_tokenizer.send_output(
             AbortReq(
@@ -2752,8 +2764,10 @@ class Scheduler(
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": message,
+                    "reason": abort_reason.value,
                 },
                 rid=req_to_abort.rid,
+                abort_reason=abort_reason,
             ),
             req_to_abort,
         )
@@ -2778,8 +2792,10 @@ class Scheduler(
                             "type": "abort",
                             "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                             "message": "Request waiting timeout reached.",
+                            "reason": AbortReason.WAITING_TIMEOUT.value,
                         },
                         rid=req.rid,
+                        abort_reason=AbortReason.WAITING_TIMEOUT,
                     ),
                     req,
                 )
@@ -2886,9 +2902,10 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
-        req = self._pending_chunked_abort_req
-        if req is None:
+        pending_abort = self._pending_chunked_abort_req
+        if pending_abort is None:
             return
+        req, abort_reason = pending_abort
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
@@ -2896,7 +2913,7 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
             return
 
-        prepare_abort(req, "Aborted")
+        prepare_abort(req, "Aborted", reason=abort_reason)
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2911,7 +2928,9 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(rid=req.rid, abort_reason=abort_reason), req
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -3476,6 +3495,7 @@ class Scheduler(
                     AbortReq(
                         finished_reason=abort_reason.to_json(),
                         rid=req.rid,
+                        abort_reason=abort_reason.reason,
                     ),
                     req,
                 )
@@ -4375,9 +4395,13 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        assert recv_req.abort_reason is not None
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
-                self._pending_chunked_abort_req = chunked_req
+                self._pending_chunked_abort_req = (
+                    chunked_req,
+                    recv_req.abort_reason,
+                )
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
@@ -4395,7 +4419,9 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(rid=req.rid, abort_reason=recv_req.abort_reason), req
+            )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -4428,7 +4454,7 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(rid=req.rid), req
+                    AbortReq(rid=req.rid, abort_reason=recv_req.abort_reason), req
                 )
                 if (
                     req.req_pool_idx is not None
@@ -4455,7 +4481,11 @@ class Scheduler(
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
                     if self.ps.pp_size > 1:
-                        prepare_abort(req, "Aborted by AbortReq.")
+                        prepare_abort(
+                            req,
+                            "Aborted by AbortReq.",
+                            reason=recv_req.abort_reason,
+                        )
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
@@ -4471,7 +4501,11 @@ class Scheduler(
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
                     if self.ps.pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                        prepare_abort(
+                            decode_req.req,
+                            "Aborted by AbortReq.",
+                            reason=recv_req.abort_reason,
+                        )
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
@@ -4487,7 +4521,11 @@ class Scheduler(
                         assert hasattr(decode_req, "kv_cache_cpu")
                         del decode_req.kv_cache_cpu
                         self.ipc_channels.send_to_tokenizer.send_output(
-                            AbortReq(rid=decode_req.rid), decode_req
+                            AbortReq(
+                                rid=decode_req.rid,
+                                abort_reason=recv_req.abort_reason,
+                            ),
+                            decode_req,
                         )
                     else:
                         remaining_retracted.append(decode_req)
@@ -4508,7 +4546,7 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                req.to_finish = FINISH_ABORT(reason=recv_req.abort_reason)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

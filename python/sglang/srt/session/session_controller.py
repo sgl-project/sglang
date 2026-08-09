@@ -18,6 +18,7 @@ import uuid
 from array import array
 from typing import TYPE_CHECKING, Dict, Optional
 
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
@@ -56,12 +57,12 @@ class SessionReqNode:
             req_node.clear(req_dict)
 
         if self.req.finished_reason is None:
-            self.req.to_finish = FINISH_ABORT()
+            self.req.to_finish = FINISH_ABORT(reason=AbortReason.SESSION_CLEANUP)
         del req_dict[self.req.rid]
 
     def abort(self):
         if self.req.finished_reason is None:
-            self.req.to_finish = FINISH_ABORT()
+            self.req.to_finish = FINISH_ABORT(reason=AbortReason.SESSION_CLEANUP)
 
     def __str__(self):
         return self._str_helper(self.req.rid)

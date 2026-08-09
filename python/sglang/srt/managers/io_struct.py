@@ -52,6 +52,7 @@ from pydantic import PlainValidator
 
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -1928,6 +1929,9 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    # Set by internal callers before this request is sent over IPC. The HTTP
+    # /abort_request payload leaves it unset and the endpoint supplies the reason.
+    abort_reason: Optional[AbortReason] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

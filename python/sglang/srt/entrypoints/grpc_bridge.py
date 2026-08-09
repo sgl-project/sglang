@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from pydantic import ValidationError
 
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -106,12 +107,12 @@ class RuntimeHandle:
     def _is_closed_status(status) -> bool:
         return status is not None and status == type(status).Closed
 
-    def _abort_request_id(self, rid) -> None:
+    def _abort_request_id(self, rid, reason: AbortReason) -> None:
         if isinstance(rid, list):
             for single_rid in rid:
-                self.tokenizer_manager.abort_request(rid=single_rid)
+                self.tokenizer_manager.abort_request(rid=single_rid, reason=reason)
         else:
-            self.tokenizer_manager.abort_request(rid=rid)
+            self.tokenizer_manager.abort_request(rid=rid, reason=reason)
 
     async def _send_with_backpressure(
         self,
@@ -139,7 +140,10 @@ class RuntimeHandle:
             )
         except asyncio.TimeoutError:
             if timeout_abort_rid is not None:
-                self._abort_request_id(timeout_abort_rid)
+                self._abort_request_id(
+                    timeout_abort_rid,
+                    AbortReason.GRPC_BACKPRESSURE_TIMEOUT,
+                )
                 logger.warning(
                     "gRPC chunk backpressure wait timed out after %ss; aborted request",
                     self._BACKPRESSURE_TIMEOUT_S,
@@ -371,7 +375,11 @@ class RuntimeHandle:
             running_loop = None
 
         if running_loop is loop:
-            self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
+            self.tokenizer_manager.abort_request(
+                rid=rid,
+                abort_all=abort_all,
+                reason=AbortReason.GRPC_ABORT,
+            )
             return
 
         future = asyncio.run_coroutine_threadsafe(
@@ -391,7 +399,11 @@ class RuntimeHandle:
             )
 
     async def _abort_async(self, rid: str, abort_all: bool) -> None:
-        self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
+        self.tokenizer_manager.abort_request(
+            rid=rid,
+            abort_all=abort_all,
+            reason=AbortReason.GRPC_ABORT,
+        )
 
     def get_model_info(self) -> str:
         model_config = self.tokenizer_manager.model_config
@@ -535,9 +547,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,

@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -1722,7 +1723,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    self.abort_request(obj.rid)
+                    self.abort_request(
+                        obj.rid,
+                        reason=AbortReason.HTTP_CLIENT_DISCONNECT_WAITING,
+                    )
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
@@ -1803,7 +1807,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
+                    self.abort_request(
+                        obj.rid,
+                        reason=AbortReason.HTTP_CLIENT_DISCONNECT_RUNNING,
+                    )
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
@@ -1969,7 +1976,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self,
+        rid: str = "",
+        abort_all: bool = False,
+        *,
+        reason: AbortReason = AbortReason.HTTP_ABORT_REQUEST,
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
@@ -2006,11 +2019,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             target_rids = (rid,)
 
         for target_rid in target_rids:
-            self._dispatch_to_scheduler(AbortReq(rid=target_rid, abort_all=abort_all))
+            self._dispatch_to_scheduler(
+                AbortReq(
+                    rid=target_rid,
+                    abort_all=abort_all,
+                    abort_reason=reason,
+                )
+            )
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
-                self.metrics_collector.labels
+                self.metrics_collector.labels,
+                reason,
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
@@ -2022,7 +2042,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
                     # TODO: maybe make it async instead of fire-and-forget
-                    self.abort_request(abort_all=True)
+                    self.abort_request(
+                        abort_all=True,
+                        reason=AbortReason.PAUSE_GENERATION,
+                    )
                     is_locked = await self.model_update_lock.is_locked()
                     if not is_locked:
                         break
@@ -2046,7 +2069,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
         if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
+            self.abort_request(
+                abort_all=True,
+                reason=AbortReason.WEIGHT_UPDATE,
+            )
 
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
@@ -2056,9 +2082,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
         async with lock_context:
-            success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
-            )
+            (
+                success,
+                message,
+                num_paused_requests,
+            ) = await self._wait_for_model_update_from_disk(obj)
 
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
@@ -2178,10 +2206,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async def abort_request():
             await asyncio.sleep(2)
             if obj.is_single:
-                self.abort_request(obj.rid)
+                self.abort_request(
+                    obj.rid,
+                    reason=AbortReason.HTTP_CLIENT_DISCONNECT_STREAM,
+                )
             else:
                 for rid in obj.rid:
-                    self.abort_request(rid)
+                    self.abort_request(
+                        rid,
+                        reason=AbortReason.HTTP_CLIENT_DISCONNECT_STREAM,
+                    )
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -2591,8 +2625,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         # shared batch-output loop; degrade to nested instead.
                         state.input_top_logprobs_flat_fields = None
                         logger.error(
-                            "Falling back to nested input top logprobs for "
-                            "rid=%s: %s",
+                            "Falling back to nested input top logprobs for rid=%s: %s",
                             meta_info.get("id"),
                             e,
                         )
@@ -2867,6 +2900,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.sampling_params.get("structural_tag", None)
         )
 
+    def _request_metric_labels(self, state: ReqState) -> Dict[str, str]:
+        labels = dict(self.metrics_collector.labels)
+        custom_labels = getattr(state.obj, "custom_labels", None)
+        if custom_labels:
+            labels.update(custom_labels)
+        if self.enable_priority_scheduling:
+            priority = getattr(state.obj, "priority", None)
+            if priority is not None:
+                labels["priority"] = str(priority)
+        return labels
+
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
@@ -2874,14 +2918,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else 0
         )
 
-        custom_labels = getattr(state.obj, "custom_labels", None)
-        labels = dict(self.metrics_collector.labels)
-        if custom_labels:
-            labels.update(custom_labels)
-        if self.enable_priority_scheduling:
-            priority = getattr(state.obj, "priority", None)
-            if priority is not None:
-                labels["priority"] = str(priority)
+        labels = self._request_metric_labels(state)
         if (
             not state.ttft_observed
             and self.disaggregation_mode != DisaggregationMode.PREFILL
@@ -2905,6 +2942,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
+            finish_reason = recv_obj.finished_reasons[i]
+            assert finish_reason is not None
             # Get detailed cache breakdown if available
             cached_tokens_details = None
             if (
@@ -2931,6 +2970,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 cached_tokens_details,
                 spec_verify_ct=spec_verify_ct,
                 is_streaming=getattr(state.obj, "stream", False),
+                finish_reason=finish_reason,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
@@ -3066,7 +3106,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 filename = os.path.join(
                     self.crash_dump_folder,
                     hostname,
-                    f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+                    f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl",
                 )
                 os.makedirs(os.path.dirname(filename), exist_ok=True)
 
@@ -3201,6 +3241,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "type": "abort",
             "message": abort_message,
         }
+        if recv_obj.abort_reason is not None:
+            finish_reason["reason"] = recv_obj.abort_reason.value
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
         meta_info = {
@@ -3229,6 +3271,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+        if self.enable_metrics and state.obj.log_metrics:
+            assert recv_obj.abort_reason is not None
+            self.metrics_collector.observe_one_request_outcome(
+                self._request_metric_labels(state),
+                is_streaming=is_stream,
+                outcome="aborted",
+                reason=recv_obj.abort_reason.value,
+            )
         self._remove_req_state(recv_obj.rid)
 
         state.out_list.append(out)
@@ -3563,12 +3613,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for target_rid in target_rids:
                 try:
                     self._dispatch_to_scheduler(
-                        AbortReq(rid=target_rid, abort_all=False)
+                        AbortReq(
+                            rid=target_rid,
+                            abort_all=False,
+                            abort_reason=AbortReason.REQUEST_CLEANUP,
+                        )
                     )
+                    if self.enable_metrics:
+                        self.metrics_collector.observe_one_abort_signal(
+                            self.metrics_collector.labels,
+                            AbortReason.REQUEST_CLEANUP,
+                        )
                 except Exception:
                     logger.exception(
                         "Failed to abort request rid=%s",
                         target_rid,
+                    )
+                state = self.rid_to_state[target_rid]
+                if self.enable_metrics and state.obj.log_metrics:
+                    self.metrics_collector.observe_one_request_outcome(
+                        self._request_metric_labels(state),
+                        is_streaming=getattr(state.obj, "stream", False),
+                        outcome="aborted",
+                        reason=AbortReason.REQUEST_CLEANUP.value,
                     )
             for child_rid in child_rids:
                 self._remove_req_state(child_rid, lifecycle_id)

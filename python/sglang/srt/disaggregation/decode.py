@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -660,7 +661,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if input_len > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {self.max_total_num_tokens}"
             logger.error(message)
-            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            prepare_abort(
+                req,
+                message,
+                status_code=HTTPStatus.BAD_REQUEST,
+                reason=AbortReason.INVALID_REQUEST,
+            )
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         if self._uses_swa_tail_prealloc():
@@ -672,7 +678,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     f"decode preallocation: {swa_required} > {swa_capacity}"
                 )
                 logger.error(message)
-                prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+                prepare_abort(
+                    req,
+                    message,
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    reason=AbortReason.INVALID_REQUEST,
+                )
                 self.scheduler.output_streamer.stream_output([req], req.return_logprob)
                 return True
         return False
@@ -802,6 +813,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req,
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    reason=AbortReason.DISAGGREGATION_ERROR,
                 )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
@@ -1837,6 +1849,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "Metadata unexpectedly not ready after readiness gate "
                 "(bootstrap_room=0)",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                reason=AbortReason.DISAGGREGATION_ERROR,
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
@@ -1856,6 +1869,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 decode_req.req,
                 "Metadata corruption detected - bootstrap_room mismatch",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                reason=AbortReason.DISAGGREGATION_ERROR,
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
@@ -2032,6 +2046,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.req,
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    reason=AbortReason.DISAGGREGATION_ERROR,
                 )
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],

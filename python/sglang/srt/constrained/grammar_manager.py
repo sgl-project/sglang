@@ -14,6 +14,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.managers.abort_reason import AbortReason
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -107,12 +108,16 @@ class GrammarManager:
         return data
 
     def abort_requests(self, recv_req: AbortReq):
+        assert recv_req.abort_reason is not None
         for req in self.grammar_queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
+                req.set_finish_with_abort(
+                    "Aborted by AbortReq.",
+                    reason=recv_req.abort_reason,
+                )
 
     def _get_request_thinking_budget(self, req: Req) -> int | None:
         custom_params = req.sampling_params.custom_params
@@ -139,7 +144,10 @@ class GrammarManager:
         ):
             if self.grammar_backend is None:
                 error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
-                req.set_finish_with_abort(error_msg)
+                req.set_finish_with_abort(
+                    error_msg,
+                    reason=AbortReason.GRAMMAR_ERROR,
+                )
             else:
                 if req.sampling_params.json_schema is not None:
                     key = ("json", req.sampling_params.json_schema)
@@ -165,7 +173,10 @@ class GrammarManager:
                         error_msg = (
                             f"Failed to compile {key[0]} grammar: {value.error_message}"
                         )
-                        req.set_finish_with_abort(error_msg)
+                        req.set_finish_with_abort(
+                            error_msg,
+                            reason=AbortReason.GRAMMAR_ERROR,
+                        )
                     else:
                         self._apply_request_reasoning_budget(req)
         elif self._enable_strict_thinking:
@@ -287,7 +298,10 @@ class GrammarManager:
             self._apply_request_reasoning_budget(req)
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
-                req.set_finish_with_abort(error_msg)
+                req.set_finish_with_abort(
+                    error_msg,
+                    reason=AbortReason.GRAMMAR_ERROR,
+                )
 
         # Return failed requests
         for i in synced_failed_req_idxs:
@@ -300,7 +314,10 @@ class GrammarManager:
                 req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
             )
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
-            req.set_finish_with_abort(error_msg)
+            req.set_finish_with_abort(
+                error_msg,
+                reason=AbortReason.GRAMMAR_ERROR,
+            )
 
         # Remove finished requests from grammar_queue
         self.grammar_queue = [

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -21,7 +22,6 @@ if TYPE_CHECKING:
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
-
     def prepare_for_prebuilt(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
@@ -135,7 +135,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     # handles the release via update_finish_state -> release_kv_cache in one place.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
                     req.to_finish = FINISH_ABORT(
-                        error_message, HTTPStatus.INTERNAL_SERVER_ERROR
+                        error_message,
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        reason=AbortReason.GRAMMAR_ERROR,
                     )
                 req.grammar.finished = req.finished()
         last_tokens_tensor = torch.tensor(
