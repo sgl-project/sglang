@@ -3901,14 +3901,20 @@ def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
-def spec_decode_alloc_len_per_request(server_args) -> int:
+def spec_decode_alloc_len_per_request(
+    *,
+    page_size,
+    speculative_num_steps,
+    speculative_eagle_topk,
+    speculative_num_draft_tokens,
+) -> int:
     """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
-    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned.
+    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned. A pure
+    function of the resolved values its one caller reads off the bags.
     """
-    page_size = server_args.page_size
-    len_per_topk = server_args.speculative_num_steps or 1
-    spec_topk = server_args.speculative_eagle_topk or 1
-    spec_tokens = server_args.speculative_num_draft_tokens or 1
+    len_per_topk = speculative_num_steps or 1
+    spec_topk = speculative_eagle_topk or 1
+    spec_tokens = speculative_num_draft_tokens or 1
 
     if page_size > 1 and spec_topk > 1:
         # last partial page and ceil alignment

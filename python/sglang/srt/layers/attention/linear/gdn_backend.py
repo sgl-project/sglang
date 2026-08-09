@@ -18,6 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
@@ -64,23 +65,22 @@ elif is_cpu():
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     """FlashInfer for the narrow SM100 GDN prefill domain we validated, else None."""
-    args = model_runner.server_args
     if (
-        args.linear_attn_prefill_backend is not None
-        or args.linear_attn_backend != "triton"
-        or args.enable_page_major_kv_layout
+        get_exec().mamba.linear_attn_prefill_backend is not None
+        or get_exec().mamba.linear_attn_backend != "triton"
+        or get_memory().enable_page_major_kv_layout
         or not is_cuda()
         or torch.cuda.get_device_capability()[0] != 10
     ):
         return None
 
     cuda_version = torch.version.cuda
-    chunk_size = args.chunked_prefill_size
+    chunk_size = get_schedule().chunked_prefill_size
     config = hybrid_gdn_config(model_runner.model_config)
     if (
         cuda_version is None
         or int(cuda_version.split(".", 1)[0]) < 13
-        or args.enable_dynamic_chunking
+        or get_schedule().enable_dynamic_chunking
         or chunk_size is None
         or not 1 <= chunk_size <= 8192
         or getattr(config, "linear_key_head_dim", None) != 128
