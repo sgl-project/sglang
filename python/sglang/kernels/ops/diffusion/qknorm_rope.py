@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+_SUPPORTED_CACHE_DTYPES = (*_SUPPORTED_DTYPES, torch.float32)
+
 
 @cache_once
 def _jit_qknorm_rope_module(
@@ -26,8 +29,18 @@ def _jit_qknorm_rope_module(
     rope_dim: int,
     is_neox: bool,
     dtype: torch.dtype,
+    cache_dtype: torch.dtype,
+    round_norm_before_rope: bool,
 ) -> Module:
-    args = make_cpp_args(head_dim, rope_dim, is_neox, is_arch_support_pdl(), dtype)
+    args = make_cpp_args(
+        head_dim,
+        rope_dim,
+        is_neox,
+        is_arch_support_pdl(),
+        dtype,
+        cache_dtype,
+        round_norm_before_rope,
+    )
     return load_jit(
         "qknorm_rope",
         *args,
@@ -43,7 +56,16 @@ def can_use_fused_inplace_qknorm_rope(
     rope_dim: int,
     is_neox: bool,
     dtype: torch.dtype,
+    cache_dtype: torch.dtype = torch.float32,
+    round_norm_before_rope: bool = False,
 ) -> bool:
+    if dtype not in _SUPPORTED_DTYPES or cache_dtype not in _SUPPORTED_CACHE_DTYPES:
+        logger.warning(
+            "Unsupported dtype pair (%s, %s) for JIT fused QKNorm+RoPE",
+            dtype,
+            cache_dtype,
+        )
+        return False
     if head_dim not in (64, 128, 256):
         logger.warning(f"Unsupported head_dim={head_dim} for JIT fused QKNorm+RoPE")
         return False
@@ -62,15 +84,29 @@ def can_use_fused_inplace_qknorm_rope(
         return False
     if is_neox:
         rotary_lanes = rope_dim // elems_per_thread
-        if rotary_lanes < 2 or rotary_lanes & (rotary_lanes - 1):
+        if rotary_lanes < 2 or rotary_lanes % 2:
             logger.warning(
-                "rope_dim=%s yields invalid rotary_lanes=%s for neox fused QKNorm+RoPE; rotary lane count must be a power of 2",
+                "rope_dim=%s yields invalid rotary_lanes=%s for neox fused QKNorm+RoPE; rotary lane count must be even",
                 rope_dim,
                 rotary_lanes,
             )
             return False
+    if round_norm_before_rope and cache_dtype != dtype:
+        logger.warning(
+            "Exact fused QKNorm+RoPE requires cache dtype %s to match activation dtype %s",
+            cache_dtype,
+            dtype,
+        )
+        return False
     try:
-        _jit_qknorm_rope_module(head_dim, rope_dim, is_neox, dtype)
+        _jit_qknorm_rope_module(
+            head_dim,
+            rope_dim,
+            is_neox,
+            dtype,
+            cache_dtype,
+            round_norm_before_rope,
+        )
         return True
     except Exception as e:
         logger.warning(f"Failed to load JIT fused QKNorm+RoPE kernel: {e}")
@@ -90,8 +126,16 @@ def fused_inplace_qknorm_rope(
     eps: float = 1e-6,
     head_dim: int = 0,
     rope_dim: int = 0,
+    round_norm_before_rope: bool = False,
 ) -> None:
     head_dim = head_dim or q.size(-1)
     rope_dim = rope_dim or cos_sin_cache.size(-1)
-    module = _jit_qknorm_rope_module(head_dim, rope_dim, is_neox, q.dtype)
+    module = _jit_qknorm_rope_module(
+        head_dim,
+        rope_dim,
+        is_neox,
+        q.dtype,
+        cos_sin_cache.dtype,
+        round_norm_before_rope,
+    )
     module.qknorm_rope(q, k, q_weight, k_weight, cos_sin_cache, positions, eps)

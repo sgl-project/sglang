@@ -7,7 +7,7 @@
 # You may obtain a copy of the License at
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
-"""CuTe DSL TGV BF16 GEMM (low-latency Blackwell GEMM, SM100/SM103 only).
+"""CuTe DSL TGV BF16 GEMM (low-latency SM10x GEMM).
 
 Computes ``out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N])`` for bf16 inputs,
 fp32 accumulation, bf16 output. The kernel writes M-contiguous output, so the
@@ -39,7 +39,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils import get_device_sm
+from sglang.srt.utils import is_sm100_supported
 from sglang.srt.utils.common import direct_register_custom_op
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
@@ -119,8 +119,10 @@ class TgvGemmCuteExtKernel:
         pdl_launch: Optional[bool] = None,
         pdl_count: int = -1,
         has_bias: bool = False,
+        out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     ):
         self.acc_dtype = acc_dtype
+        self.out_dtype = out_dtype
         self.cta_m = cta_m
         self.cta_n = cta_n
         self.cta_k = cta_k
@@ -164,6 +166,7 @@ class TgvGemmCuteExtKernel:
             f"TgvGemmCuteExtKernel_cta{self.cta_m}x{self.cta_n}x{self.cta_k}"
             f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
             f"_bias{int(self.has_bias)}"
+            f"_out{self.out_dtype.__name__.lower()}"
         )
 
     @cute.experimental.jit
@@ -995,6 +998,11 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
 }
 
+_TORCH_TO_CUTLASS_OUT_DTYPE = {
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
+
 # Per-process cache mapping (dtype, config…) → compiled cute_ext callable.
 # We need to construct concrete cute.Tensors once and reuse the resulting
 # compiled function across all live calls; a fresh build per call would
@@ -1029,7 +1037,12 @@ def _make_layout_tensor(
 
 
 def _make_compile_repr_tensors(
-    dtype: torch.dtype, has_bias: bool, a_leading: int, b_leading: int, c_leading: int
+    dtype: torch.dtype,
+    c_dtype: torch.dtype,
+    has_bias: bool,
+    a_leading: int,
+    b_leading: int,
+    c_leading: int,
 ):
     """Build representative tensors with strides matching the requested
     leading-dim pattern. After the A↔B swap, the cute_ext kernel sees:
@@ -1051,7 +1064,7 @@ def _make_compile_repr_tensors(
         (L, K, M), dtype, b_leading
     )  # kernel B shape (L, K, M_pt)
     C_t = _make_layout_tensor(
-        (L, N, M), dtype, c_leading
+        (L, N, M), c_dtype, c_leading
     )  # kernel C shape (L, N_pt, M_pt)
 
     a_ = from_dlpack(A_t, assumed_align=32).mark_layout_dynamic(leading_dim=a_leading)
@@ -1071,6 +1084,7 @@ def _make_compile_repr_tensors(
 
 def _get_compiled_cute_ext_kernel(
     dtype: torch.dtype,
+    c_dtype: torch.dtype,
     cta_m: int,
     cta_n: int,
     cta_k: int,
@@ -1091,6 +1105,7 @@ def _get_compiled_cute_ext_kernel(
     """
     key = (
         dtype,
+        c_dtype,
         cta_m,
         cta_n,
         cta_k,
@@ -1110,6 +1125,11 @@ def _get_compiled_cute_ext_kernel(
         raise ValueError(
             f"TGV cute_ext backend supports {list(_TORCH_TO_CUTLASS_DTYPE)}; got {dtype}."
         )
+    if c_dtype not in _TORCH_TO_CUTLASS_OUT_DTYPE:
+        raise ValueError(
+            f"TGV cute_ext output supports {list(_TORCH_TO_CUTLASS_OUT_DTYPE)}; "
+            f"got {c_dtype}."
+        )
 
     gemm = TgvGemmCuteExtKernel(
         acc_dtype=cutlass.Float32,
@@ -1120,10 +1140,12 @@ def _get_compiled_cute_ext_kernel(
         use_2cta=use_2cta,
         use_pdl=use_pdl,
         has_bias=has_bias,
+        out_dtype=_TORCH_TO_CUTLASS_OUT_DTYPE[c_dtype],
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
         dtype,
+        c_dtype,
         has_bias,
         a_leading,
         b_leading,
@@ -1205,7 +1227,9 @@ def _to_cute_swap(
     M_ce = c_swap.shape[1]  # == PyTorch N
     N_ce = c_swap.shape[2]  # == PyTorch M
     bias_3d = bias_pt.as_strided(size=(L, M_ce, N_ce), stride=(0, 1, 0))
-    bias_ = from_dlpack(bias_3d, assumed_align=2).mark_layout_dynamic(leading_dim=1)
+    bias_ = from_dlpack(bias_3d.detach(), assumed_align=2).mark_layout_dynamic(
+        leading_dim=1
+    )
     return a_, b_, c_, bias_, layout
 
 
@@ -1241,6 +1265,7 @@ def _run_tgv(
 
     compiled = _get_compiled_cute_ext_kernel(
         dtype=a.dtype,
+        c_dtype=out.dtype,
         cta_m=cta_m,
         cta_n=cta_n,
         cta_k=_TGV_CUTE_EXT_CTA_K,
@@ -1294,12 +1319,39 @@ def _pick_tactic(m: int, n: int, k: int) -> int:
     return best
 
 
+# Kimi-K3 per-rank dense-GEMM shapes (TP8). They sit in this heuristic's
+# unmeasured region (hidden=7168 inputs fail k > 6144; o_proj-style k=1536
+# fails k < 2048), but TGV wins 1.04-2.43x on every one of them on GB300
+# (L2-defeating weight rotation + CUDA-graph timing; serving A/B confirmed
+# e2e with GSM8K parity). kv_a (n=576) loses (0.84x) and stays out. Gated to
+# small decode batches; larger m stays on the measured heuristic below.
+_K3_TGV_WIN_SHAPES = frozenset(
+    {
+        (6144, 7168),  # KDA fused qkvg
+        (6016, 7168),  # merged MoE front (gate_up | router | latent down)
+        (7168, 1536),  # KDA / MLA o_proj
+        (1536, 7168),  # MLA q_a / shared gate_up
+        (2304, 1536),  # MLA q_b
+        (3584, 7168),  # MoE latent down (unfused fallback)
+        (7168, 3584),  # MoE latent up
+        (7168, 768),  # shared down
+    }
+)
+
+
 def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
     graph capture (cold L2). Conservative: ties and unmeasured regions fall
     back to cuBLAS."""
+    if m <= 0:
+        # Empty batch: DP-attention idle groups run a 0-token dummy forward to
+        # keep the mlp-sync lockstep. A 0-CTA TGV grid is a driver-level
+        # CUDA_ERROR_INVALID_VALUE, so leave empty inputs to cuBLAS.
+        return False
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
+    if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
+        return True
     if n < 1024 or k < 2048 or k > 6144:
         return False
     ragged = m % 16 != 0
@@ -1325,14 +1377,18 @@ def _tgv_bf16_gemm_run(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    if get_device_sm() not in (100, 103):
-        raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
+    if not is_sm100_supported():
+        raise RuntimeError("cutedsl_bf16_gemm requires an SM10x GPU")
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
     assert x.stride(-1) == 1, "x must be K-major [M, K]"
     assert weight.stride(-1) == 1, "weight must be K-major [N, K]"
     out = torch.empty(
         (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
     )
+    if x.shape[0] == 0:
+        # Match cuBLAS/F.linear semantics for empty batches; a 0-CTA launch
+        # would fail with CUDA_ERROR_INVALID_VALUE.
+        return out
     return _run_tgv(
         x,
         weight.t(),
@@ -1343,6 +1399,33 @@ def _tgv_bf16_gemm_run(
     )
 
 
+def _tgv_bf16_gemm_out_run(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> None:
+    if not is_sm100_supported():
+        raise RuntimeError("cutedsl_bf16_gemm requires an SM10x GPU")
+    assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+    assert out.dtype in (torch.bfloat16, torch.float32) and out.device == x.device
+    assert x.ndim == 2 and weight.ndim == 2 and out.ndim == 2
+    assert x.stride(-1) == 1, "x must be K-major [M, K]"
+    assert weight.stride(-1) == 1, "weight must be K-major [N, K]"
+    assert out.is_contiguous() and out.shape == (x.shape[0], weight.shape[0])
+    if x.shape[0] == 0:
+        return None
+    _run_tgv(
+        x,
+        weight.t(),
+        bias,
+        out,
+        pdl=True,
+        tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
+    )
+    return None
+
+
 def _tgv_bf16_gemm_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1351,11 +1434,27 @@ def _tgv_bf16_gemm_fake(
     return x.new_empty((x.shape[0], weight.shape[0]))
 
 
+def _tgv_bf16_gemm_out_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> None:
+    return None
+
+
 direct_register_custom_op(
     op_name="cutedsl_tgv_bf16_gemm",
     op_func=_tgv_bf16_gemm_run,
     mutates_args=[],
     fake_impl=_tgv_bf16_gemm_fake,
+)
+
+direct_register_custom_op(
+    op_name="cutedsl_tgv_bf16_gemm_out",
+    op_func=_tgv_bf16_gemm_out_run,
+    mutates_args=["out"],
+    fake_impl=_tgv_bf16_gemm_out_fake,
 )
 
 
@@ -1367,3 +1466,15 @@ def cutedsl_bf16_gemm(
 ) -> torch.Tensor:
     """out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N]), all bf16, fp32 accum."""
     return torch.ops.sglang.cutedsl_tgv_bf16_gemm(x, weight, bias)
+
+
+@debug_kernel_api
+def cutedsl_bf16_gemm_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Write the BF16 GEMM directly into a caller-owned contiguous tensor."""
+    torch.ops.sglang.cutedsl_tgv_bf16_gemm_out(x, weight, out, bias)
+    return out

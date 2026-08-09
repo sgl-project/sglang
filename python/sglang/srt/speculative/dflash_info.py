@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -44,9 +43,6 @@ class DFlashVerifyInput(SpecInput):
     num_tokens_per_req: int = -1
 
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
-
-    # Stamped by generate_token_bitmask during verify, read back to apply the mask.
-    grammar: Optional[BaseGrammarObject] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -109,6 +105,9 @@ class DFlashVerifyInput(SpecInput):
         bs = len(req_pool_indices)
 
         layout = self.ragged_verify_layout
+        if layout is not None and layout.bs != bs:
+            # Graph replay pads the batch to the captured slots; match it.
+            layout = layout.padded_to_bucket(padded_bs=bs)
 
         if layout is None:
             qo_indptr = torch.arange(
