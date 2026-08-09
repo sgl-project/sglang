@@ -119,7 +119,7 @@ def _triton_wan_rmsnorm_silu_cuda(
     block_c = triton.next_power_of_2(channels)
     num_warps = 1 if block_c <= 64 else 4 if block_c <= 512 else 8
 
-    with torch.cuda.device(x.device):
+    with torch.get_device_module().device(x.device):
         _wan_rmsnorm_silu_kernel[(bsz * t_size * h_size * w_size,)](
             x,
             gamma,
@@ -161,6 +161,7 @@ def can_use_wan_rmsnorm_silu(
         and not x.requires_grad
         and x.dtype in _SUPPORTED_DTYPES
         and x.ndim == 5
+        and x.numel() > 0
         and 0 < x.shape[1] <= _MAX_CHANNELS
         and x.is_contiguous(memory_format=torch.channels_last_3d)
         and _affine_supported(x, gamma)

@@ -511,10 +511,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len = result.prefix_len
 
-        # Use the out-of-place values copy so the allocator can safely defer or group
-        # this free after req_to_token is overwritten below.
         self.token_to_kv_pool_allocator.free_segment(
-            values[req.cache_protected_len : new_prefix_len],
+            kv_indices[req.cache_protected_len : new_prefix_len],
             start_pos=req.cache_protected_len,
         )
 

@@ -397,9 +397,6 @@ class ModelRunner:
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
 
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
-
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
@@ -2043,9 +2040,12 @@ class ModelRunner:
         load_config: LoadConfig,
     ) -> None:
         self.model = new_model
-        get_context().override(
-            "model_runner.update_model_fields",
-            model_path=model_path,
-            load_format=load_format,
-        )
+        # The record says what model this PROCESS serves; a draft's weight
+        # update is not that (its own state is on the runner).
+        if not self.is_draft_worker:
+            get_context().override(
+                "model_runner.update_model_fields",
+                model_path=model_path,
+                load_format=load_format,
+            )
         self.load_config = load_config
