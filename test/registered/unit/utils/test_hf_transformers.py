@@ -167,35 +167,49 @@ class TestNormalizeDeepseekV4Compat(unittest.TestCase):
     ``layer_types: list[str]``. sglang readers still index ``compress_ratios``
     by layer id (e.g. ``config.compress_ratios[layer_id]`` in
     ``models/deepseek_v4.py``), so the loader must rebuild a per-layer list
-    from the two new fields. A naive rename-only backfill would give
-    downstream a dict and swap the original AttributeError for a KeyError."""
+    from the two new fields. Upstream encodes sliding-attention layers as
+    ``0`` in the legacy list; ``compress_rates`` does not carry an entry for
+    them, so the rebuild has to special-case that layer type instead of
+    indexing the dict blindly."""
 
     _LT_CSA = "compressed_sparse_attention"
     _LT_HCA = "heavily_compressed_attention"
+    _LT_SWA = "sliding_attention"
 
-    def _make_new_transformers_config(self):
+    def _make_new_transformers_config(self, layer_types):
         cfg = PretrainedConfig()
         cfg.model_type = "deepseek_v4"
         cfg.compress_rates = {self._LT_CSA: 4, self._LT_HCA: 128}
-        cfg.layer_types = [self._LT_HCA, self._LT_CSA, self._LT_HCA]
+        cfg.layer_types = layer_types
         return cfg
 
     def test_expands_compress_rates_dict_by_layer_types(self):
-        cfg = self._make_new_transformers_config()
+        cfg = self._make_new_transformers_config([self._LT_HCA, self._LT_CSA, self._LT_HCA])
         normalize_deepseek_v4_compat(cfg)
-        # Legacy shape: list[int] indexable by layer id, values from the dict
-        # resolved via layer_types.
+        # Legacy shape: list[int] indexable by layer id, values resolved via
+        # ``compress_rates`` for compressed types.
         self.assertEqual(cfg.compress_ratios, [128, 4, 128])
         self.assertEqual(cfg.compress_ratios[0], 128)  # ``config.compress_ratios[layer_id]`` works
+
+    def test_sliding_attention_layers_emit_legacy_zero(self):
+        # Real DeepSeek V4 schedules interleave sliding-window layers with
+        # compressed ones. ``compress_rates`` has no entry for
+        # ``sliding_attention`` — the rebuild must emit ``0`` for those
+        # slots (upstream's legacy encoding) rather than raising.
+        cfg = self._make_new_transformers_config(
+            [self._LT_SWA, self._LT_HCA, self._LT_SWA, self._LT_CSA]
+        )
+        normalize_deepseek_v4_compat(cfg)
+        self.assertEqual(cfg.compress_ratios, [0, 128, 0, 4])
 
     def test_preserves_existing_legacy_list(self):
         # Older-transformers config already carries the legacy list; the
         # helper must not clobber it.
         cfg = PretrainedConfig()
         cfg.model_type = "deepseek_v4"
-        cfg.compress_ratios = [128, 4]
+        cfg.compress_ratios = [0, 128, 4]
         normalize_deepseek_v4_compat(cfg)
-        self.assertEqual(cfg.compress_ratios, [128, 4])
+        self.assertEqual(cfg.compress_ratios, [0, 128, 4])
 
     def test_no_op_for_non_deepseek_v4_model_type(self):
         # Negative-branch contract: unrelated model types with coincidentally
@@ -210,15 +224,12 @@ class TestNormalizeDeepseekV4Compat(unittest.TestCase):
         self.assertFalse(hasattr(cfg, "compress_ratios"))
 
     def test_raises_clear_error_on_unknown_layer_type(self):
-        # An unknown ``layer_types`` entry would surface as a bare
-        # ``KeyError: '<layer-type>'`` from the list-comprehension. Wrap it in
-        # a ValueError that names both the missing key and the available
-        # ones, so downstream operators can diagnose a config drift without
-        # reading the stack.
-        cfg = PretrainedConfig()
-        cfg.model_type = "deepseek_v4"
-        cfg.compress_rates = {self._LT_CSA: 4}
-        cfg.layer_types = [self._LT_CSA, "mystery_layer"]
+        # An unknown ``layer_types`` entry (neither a compressed type in
+        # ``compress_rates`` nor the ``sliding_attention`` special case)
+        # should surface as a ValueError that names both the missing key and
+        # the available ones — not a bare KeyError from the list
+        # comprehension.
+        cfg = self._make_new_transformers_config([self._LT_CSA, "mystery_layer"])
         with self.assertRaisesRegex(ValueError, r"mystery_layer.*compress_rates"):
             normalize_deepseek_v4_compat(cfg)
 
