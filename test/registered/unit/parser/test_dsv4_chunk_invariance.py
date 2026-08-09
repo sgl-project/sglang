@@ -272,13 +272,10 @@ class TestMTPScenario(unittest.TestCase):
     def _baseline_reference(self):
         # The intended stream output: char-by-char feeding of the same stream
         # (stream_reasoning=False is chunk-invariant, so larger batches SHALL
-        # reproduce this exactly).  Strip think_start from reasoning because
-        # stream_reasoning=False keeps it in the buffer while stream_reasoning=True
-        # strips it incrementally — both are correct, just different representations.
         r, n = _feed_streaming(
             _make_detector(stream_reasoning=False), self._MTP, chunk_size=1
         )
-        return r.replace(THINK_START, ""), n
+        return r, n
 
     def test_mtp_batch_streams_matches_non_streaming(self):
         """stream_reasoning=True (BUG #2): 2-3-token batches cross the
@@ -300,9 +297,7 @@ class TestMTPScenario(unittest.TestCase):
                 _make_detector(stream_reasoning=False), self._MTP, cs
             )
             ref_r, ref_n = self._baseline_reference()
-            # stream_reasoning=False retains think_start in the buffer;
-            # normalize both sides for comparison.
-            self.assertEqual(reasoning.replace(THINK_START, ""), ref_r)
+            self.assertEqual(reasoning, ref_r)
             self.assertEqual(normal, ref_n)
 
 

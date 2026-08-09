@@ -194,6 +194,7 @@ class BaseReasoningFormatDetector:
         # Strip `<think>` token if present
         if not self.stripped_think_start and think_start_text in current_text:
             current_text = current_text.replace(think_start_text, "", 1)
+            self._buffer = current_text
             self.stripped_think_start = True
             self._in_reasoning = True
 
