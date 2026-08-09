@@ -150,9 +150,7 @@ IMAGES = {
     "rgb_huge_downscale": noise_rgb(9000, 4000, seed=4),  # trips the patch limits
     "rgba_gradient": gradient_rgba(400, 300),
     "rgba_odd": gradient_rgba(37, 53, seed=5),
-    "la": Image.fromarray(
-        _rng(6).randint(0, 256, (120, 80, 2), dtype=np.uint8), "LA"
-    ),
+    "la": Image.fromarray(_rng(6).randint(0, 256, (120, 80, 2), dtype=np.uint8), "LA"),
     "l": Image.fromarray(_rng(7).randint(0, 256, (90, 70), dtype=np.uint8), "L"),
 }
 

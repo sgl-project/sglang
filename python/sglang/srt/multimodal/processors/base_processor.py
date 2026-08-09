@@ -663,8 +663,7 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 gpu_image_decode = (
-                    cls.gpu_image_decode
-                    and not envs.SGLANG_USE_PIL_MM_PREPROCESS.get()
+                    cls.gpu_image_decode and not envs.SGLANG_USE_PIL_MM_PREPROCESS.get()
                 )
                 img, _ = load_image(data, gpu_image_decode)
                 if isinstance(img, torch.Tensor):
