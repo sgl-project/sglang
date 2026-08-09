@@ -39,7 +39,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadBoundary,
+)
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -500,6 +503,12 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
+
+    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
+        # Breakable-graph verify rereads shared state across segments.
+        if forward_mode.is_target_verify():
+            return SharedReadBoundary.POST_REPLAY
+        return super().shared_read_boundary(forward_mode)
 
     def __init__(
         self,

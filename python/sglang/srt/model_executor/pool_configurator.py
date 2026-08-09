@@ -196,6 +196,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
+        dcp_size = get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
             from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -289,8 +290,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes
         else:
+            n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (
-                model_config.get_num_kv_heads(tp_size)
+                n
                 * (model_config.head_dim + model_config.v_head_dim)
                 * effective_num_layers
                 * kv_size
@@ -299,7 +301,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
-                n = model_config.get_num_kv_heads(tp_size)
                 k = model_config.head_dim
                 cell_size = (cell_size // 2) + (
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
@@ -308,7 +309,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size += n * k * 2 * kv_size
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
-                n = model_config.get_num_kv_heads(tp_size)
                 cell_size += (
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
