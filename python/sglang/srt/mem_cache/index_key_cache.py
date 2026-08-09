@@ -44,12 +44,23 @@ class IndexKeyCache:
         del self.buffer
 
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
-        if tgt_loc.numel() == 0:
+        buffers = [buf for buf in self.buffer if buf.shape[0] > 0]
+        if not buffers or tgt_loc.numel() == 0:
             return
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
-        for index_k in self.buffer:
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+
+        scratch = torch.empty(
+            (tgt_loc.numel(), self.pool.index_head_dim + 4),
+            dtype=torch.uint8,
+            device=tgt_loc.device,
+        )
+        for index_k in buffers:
+            index_buf_accessor.MoveKAndS.execute(
+                self.pool,
+                index_k,
+                tgt_loc=tgt_loc,
+                src_loc=src_loc,
+                scratch=scratch,
+            )
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:

@@ -78,15 +78,6 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         super().clear()
         del self.remote_buffer
 
-    def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
-        if tgt_loc.numel() == 0:
-            return
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
-        for index_k in self.buffer:
-            if index_k.shape[0] != 0:
-                index_k[tgt_loc_flat] = index_k[src_loc_flat]
-
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:
             self.pool.layer_transfer_counter.wait_until(
