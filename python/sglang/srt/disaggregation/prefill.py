@@ -99,6 +99,18 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
+def _transfer_start_layer(*, pool, hf_text_config) -> int:
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if not isinstance(pool, HybridLinearKVPool):
+        return pool.start_layer
+    return sum(
+        1
+        for layer_id in hf_text_config.full_attention_layer_ids
+        if layer_id < pool.start_layer
+    )
+
+
 def maybe_release_metadata_buffer(
     req: Req, allocator: ReqToMetadataIdxAllocator
 ) -> None:
@@ -212,7 +224,10 @@ class PrefillBootstrapQueue:
                 self.token_to_kv_pool.start_layer,
             )
             if layer_shard_enabled
-            else self.token_to_kv_pool.start_layer
+            else _transfer_start_layer(
+                pool=self.token_to_kv_pool,
+                hf_text_config=self.scheduler.model_config.hf_text_config,
+            )
         )
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
