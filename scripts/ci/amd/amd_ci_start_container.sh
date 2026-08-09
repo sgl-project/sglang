@@ -28,7 +28,9 @@ LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-CUSTOM_IMAGE=""
+# Inherited from the environment so a workflow can pin every job to one image
+# without editing each call site; --custom-image still overrides it.
+CUSTOM_IMAGE="${CUSTOM_IMAGE:-}"
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
 

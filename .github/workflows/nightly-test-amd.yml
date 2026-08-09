@@ -121,6 +121,8 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+  # Validation branch: pin every job to one image instead of the nightly lookup.
+  CUSTOM_IMAGE: rocm/sgl-dev:v0.5.13.post1-ubuntu24.04-py3.14-rocm7.14
 
 concurrency:
   # When called via workflow_call with ref set, use a unique group per caller run to avoid
