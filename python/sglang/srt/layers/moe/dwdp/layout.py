@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.moe.dwdp.vmm import align_down, align_up
+from sglang.srt.cuda_vmm_utils import align_down, align_up
 
 # one (start, end_capped) expert range per peer DWDP rank
 PeerRanges = List[Tuple[int, int]]
