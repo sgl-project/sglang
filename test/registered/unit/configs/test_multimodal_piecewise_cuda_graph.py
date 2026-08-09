@@ -92,12 +92,14 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
         disable_if_incompatible.assert_called_once()
 
-    def test_trtllm_mla_stays_on_breakable_and_is_disabled_by_compatibility(self):
+    def test_trtllm_mla_stays_on_breakable(self):
         args = ServerArgs(model_path="dummy")
-        # The MLA rule reads hf_config to exempt DSA models, so the stub needs
-        # an architecture that is MLA but not DSA.
+        # trtllm_mla skips the tc_piecewise upgrade and keeps breakable, which
+        # now serves MLA by falling back to the flashinfer MLA impl for extend.
         args.model_config = SimpleNamespace(
             is_multimodal_piecewise_cuda_graph_supported=True,
+            is_multimodal=False,
+            is_multimodal_breakable_cuda_graph_supported=False,
             hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
         )
         args.cuda_graph_config = CudaGraphConfig(
@@ -115,7 +117,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         ):
             args._apply_cuda_graph_compatibility()
 
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
 
     def test_explicit_tc_piecewise_overrides_trtllm_mla_default(self):
         args = ServerArgs(model_path="dummy")
