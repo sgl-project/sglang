@@ -186,8 +186,9 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
                 return FakeImage()
 
         class FakeDecodeParams:
-            def __init__(self, *, sample_format):
+            def __init__(self, *, sample_format, apply_exif_orientation):
                 self.sample_format = sample_format
+                self.apply_exif_orientation = apply_exif_orientation
 
         fake_codec = SimpleNamespace(
             DecodeParams=FakeDecodeParams,
@@ -216,6 +217,7 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         self.assertEqual(decoder.kwargs["max_num_cpu_threads"], 1)
         self.assertIn(":fancy_upsampling=1", decoder.kwargs["options"])
         self.assertIs(pool._decode_params.sample_format, fake_format)
+        self.assertFalse(pool._decode_params.apply_exif_orientation)
 
 
 if __name__ == "__main__":

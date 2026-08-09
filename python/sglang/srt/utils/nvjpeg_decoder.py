@@ -22,7 +22,8 @@ class _NvJpegDecoderPool:
         self._nvimgcodec = nvimgcodec
         self._device_id = device_id
         self._decode_params = nvimgcodec.DecodeParams(
-            sample_format=nvimgcodec.SampleFormat.P_RGB
+            sample_format=nvimgcodec.SampleFormat.P_RGB,
+            apply_exif_orientation=False,
         )
         self._decoders = queue.LifoQueue(maxsize=_DECODER_POOL_SIZE)
         self._created = 0
