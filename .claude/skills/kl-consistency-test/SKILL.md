@@ -183,6 +183,33 @@ Getting this wrong once produced a confident, entirely wrong root cause.
 Read the result as: the first layer where a module's **inputs are bit-identical and
 its output is not** is the operator. Everything after it inherits.
 
+## When the divergence needs a CUDA graph
+
+A divergence that only appears with a captured graph defeats both usual probes, and the
+failure is silent in each case:
+
+- The **dumper's hooks do not run during replay** — the graph replays kernels, not Python.
+  Disabling the graph to collect a dump also removes the divergence, so a clean layer-by-layer
+  diff means nothing. Confirm the bug still reproduces under the exact flags you dump with.
+- **Anything that syncs to host dies during capture** (`.item()`, `float()`, `.tolist()`).
+  Guard probes with `torch.cuda.is_current_stream_capturing()` or the server will not boot.
+- **The Python wrapper around a captured kernel is not called at replay.** Instrumenting it
+  logs only the phases that stayed eager. Read that as evidence, not as a broken probe: it
+  means the kernel runs with the arguments bound at capture, so any tensor handed in fresh
+  per replay is invisible to it — a bug shape in its own right.
+
+What works instead is to probe **the state that gets reused**, outside the graph: at the
+moment a request donates its checkpoint, log the slot id, the length it claims to have
+checkpointed at, and `abs().max()` over the stored state. Run it twice with the graph on and
+off and diff per slot. A handful of slots whose content differs, with claimed lengths matching
+the prefixes of the requests that go wrong, localizes the write in one round — where a dozen
+ablations only bound the trigger.
+
+**Make the probe prove it fired.** A probe on a code path that is not taken prints nothing,
+which is indistinguishable from "measured, no difference". Assert a minimum hit count, or log
+unconditionally at entry. Instrument the single choke point every caller reaches rather than
+one call site.
+
 ## Confirm the mechanism, do not infer it
 
 Two failure modes cost the most time, both avoidable:
@@ -207,3 +234,9 @@ look like a real signal.
 For an isolated claim, reduce to a standalone repro. A ten-line script calling the
 suspect op at M=1 and M=288 settles batch-invariance in seconds, and belongs in the
 PR ahead of any end-to-end number.
+
+Reading code to find a suspect is the slowest of these. One investigation refuted eight
+successive code-derived hypotheses, each internally consistent, before a direct measurement of
+the reused state found the defect in a single round. Prefer, in order: a single-variable A/B
+that isolates the trigger, asking what the wrong output is the *correct* answer to, probing the
+reused state itself, and only then reading for a mechanism to explain what was measured.
