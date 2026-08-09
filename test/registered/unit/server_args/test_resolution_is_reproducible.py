@@ -371,5 +371,54 @@ class TestResolutionIsReproducible(CustomTestCase):
         self.assertEqual(getattr(first, "_resolved_overrides", None), first_provenance)
 
 
+class TestTheResolutionSeamHasOneCaller(CustomTestCase):
+    """The pipeline is entered from exactly one place.
+
+    Step 12 moves the call from ``__post_init__`` to ``publish`` so the record
+    stays raw; that is a one-line move only while the seam has a single caller.
+    A second entry point would also mean resolution could run twice on one
+    instance, which the strict ``__setattr__`` guard turns into an
+    ``AttributeError`` rather than a silent re-resolve.
+    """
+
+    def test_only_post_init_runs_the_pipeline(self):
+        import ast
+        import inspect
+        from pathlib import Path
+
+        import sglang
+
+        package_root = Path(next(iter(sglang.__path__)))
+        callers = []
+        for path in sorted(package_root.rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:
+                continue
+            enclosing = {}
+            for node in ast.walk(tree):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        enclosing[id(child)] = node.name
+                    else:
+                        enclosing[id(child)] = enclosing.get(id(node))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_run_resolution_pipeline"
+                ):
+                    where = enclosing.get(id(node))
+                    if where != "__post_init__":
+                        rel = path.relative_to(package_root).as_posix()
+                        callers.append(f"{rel}:{node.lineno} (in {where}())")
+        self.assertEqual(
+            [],
+            callers,
+            "the resolution pipeline is entered outside __post_init__:\n"
+            + "\n".join(callers),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
