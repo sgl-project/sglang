@@ -151,19 +151,7 @@ if _is_cuda:
 
 
 def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
-    group = get_attn_tp_group()
-    if group.world_size == 1:
-        return
-
-    if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
-        if group.pynccl_comm is None:
-            raise RuntimeError(
-                "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
-            )
-        with group.pynccl_comm.change_state(enable=True):
-            group.pynccl_comm.broadcast(topk_indices, src=0)
-    else:
-        group.broadcast(topk_indices, src=0)
+    get_attn_tp_group().broadcast_capture_safe(topk_indices, src=0)
 
 
 def _broadcast_indexer_topk_from_rank0(

@@ -22,6 +22,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
@@ -183,6 +184,22 @@ def _init_cpu_threads_env(
         )
 
 
+def _needs_attn_tp_pynccl(server_args: ServerArgs) -> bool:
+    graph_config = server_args.cuda_graph_config
+    decode_graph_enabled = graph_config.decode.backend != Backend.DISABLED
+    supports_pynccl_graph = current_platform.is_cuda() or current_platform.is_rocm()
+    algo = (server_args.speculative_algorithm or "").upper()
+    return supports_pynccl_graph and (
+        (algo == "DSPARK" and server_args.enable_dp_attention and decode_graph_enabled)
+        or (
+            envs.SGLANG_DSA_TOPK_BROADCAST.get()
+            and (
+                decode_graph_enabled or graph_config.prefill.backend != Backend.DISABLED
+            )
+        )
+    )
+
+
 def _init_parallel_groups(
     *,
     backend: str,
@@ -232,6 +249,7 @@ def _init_parallel_groups(
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,
         max_world_size=server_args.max_ep_size,
+        use_attn_tp_pynccl=_needs_attn_tp_pynccl(server_args),
     )
     initialize_dp_attention(
         server_args=server_args,
