@@ -86,7 +86,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -1659,6 +1659,52 @@ def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -
     return False
 
 
+def _get_exif_orientation(image_bytes: bytes) -> int:
+    """Return the EXIF orientation tag value (1-8) from raw image bytes.
+
+    Returns 1 (no rotation) when the image has no EXIF data, no orientation
+    tag, a value outside the valid 1-8 range, or malformed/missing EXIF.
+    This function never raises — EXIF parsing failure degrades to "no
+    rotation".
+    """
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            exif = img.getexif()
+            if exif is None:
+                return 1
+            orientation = exif.get(0x0112, 1)  # tag 274 = Orientation
+            if orientation not in (1, 2, 3, 4, 5, 6, 7, 8):
+                return 1
+            return orientation
+    except Exception:
+        return 1
+
+
+def _safe_exif_transpose(image: Image.Image) -> Image.Image:
+    """Apply EXIF orientation to a PIL Image, never raising.
+
+    Wraps ``PIL.ImageOps.exif_transpose`` so that malformed EXIF metadata
+    does not turn a decodable image into an exception. If the transpose
+    fails for any reason, the original image is returned unrotated.
+
+    Short-circuits when no EXIF orientation tag is present (or it is 1)
+    to avoid the unnecessary full-image copy that ``exif_transpose``
+    performs even when no transform is needed. This preserves the lazy
+    behaviour of ``Image.open`` for unrotated images, including
+    multi-frame formats like animated GIF/WebP.
+    """
+    try:
+        exif = image.getexif()
+        if exif is None:
+            return image
+        orientation = exif.get(0x0112, 1)  # tag 274 = Orientation
+        if orientation not in (2, 3, 4, 5, 6, 7, 8):
+            return image
+        return ImageOps.exif_transpose(image)
+    except Exception:
+        return image
+
+
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
@@ -1672,15 +1718,24 @@ def _load_image(
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
-        try:
-            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
-            return image_tensor
-        except Exception as e:
-            logger.warning(
-                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
-            )
-    return Image.open(BytesIO(image_bytes))
+        # nvJPEG returns raw sensor pixels without applying the EXIF orientation
+        # tag. When a non-trivial orientation is present, fall through to the PIL
+        # path which can apply exif_transpose, so the model sees the same pixels a
+        # human viewer sees. The header-only Image.open inside _get_exif_orientation
+        # is lazy and cheap, so this only adds overhead for rotated photos.
+        orientation = _get_exif_orientation(image_bytes)
+        if orientation == 1:
+            try:
+                encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+                image_tensor = decode_jpeg(encoded_image, device="cuda")
+                return image_tensor
+            except Exception as e:
+                logger.warning(
+                    f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
+                )
+    image = Image.open(BytesIO(image_bytes))
+    image = _safe_exif_transpose(image)
+    return image
 
 
 def load_image(
@@ -1697,7 +1752,7 @@ def load_image(
     image = None
     image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
-        image = image_file
+        image = _safe_exif_transpose(image_file)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
         image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
