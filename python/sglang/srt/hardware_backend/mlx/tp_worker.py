@@ -127,12 +127,53 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_active_rids |= current_rids
 
     def prepare_for_kv_cache_release(self, req) -> None:
-        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        """Snapshot MLX auxiliary state at the scheduler's radix insert point.
+
+        This is the pre-release hook: it runs while ``req.req_pool_idx`` still
+        maps to this request, immediately before the scheduler frees the row.
+        It is therefore the last safe point to read the row, so it is also where
+        the final decode-KV flush happens (:meth:`sync_and_release_request`).
+        Later stale-rid cleanup only discards state and never re-reads the row.
+        """
         if self._mlx_runner.has_request(req.rid):
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
             req.mamba_last_track_seqlen = None
+            self._mlx_runner.sync_and_release_request(req.rid)
+
+    def prepare_for_retraction(self, req) -> None:
+        """Drop MLX runner state when the scheduler retracts (or OOM-aborts) a request.
+
+        Retraction frees the request's row and KV slots via
+        ``release_kv_cache(..., is_insert=False)`` — *without* the finish
+        pre-release hook — and the request goes back to the waiting queue to
+        restart from scratch. Dropping its runner state now guarantees:
+
+        * a re-scheduled request is routed as a fresh ``"prefill"``
+          (``has_request`` is False), so it re-reads its cached prefix from the
+          pool instead of extending a now-invalid private cache; and
+        * no later ``flush_decode_kv_for_slots`` reads its freed row or recycled
+          KV slots (the row-generation check only catches a *reused* row, not a
+          freed one whose KV slots were handed to a different-row request).
+
+        ``remove_request`` is a pure discard — it never syncs, which is correct
+        because the retracted request's KV slots are already freed.
+        """
+        self._mlx_runner.remove_request(req.rid)
+
+    def _gather_prefill_prefix_slots(self, reqs) -> set[int]:
+        """Union of prefix slot IDs for reqs that will start a fresh prefill.
+
+        Only prefill-routed reqs read their prefix from the pool, so only their
+        prefix slots must be current before pool-backed attention runs. Matches
+        the ``"prefill"`` condition in :meth:`_route_extend_request`.
+        """
+        needed_slots: set[int] = set()
+        for req in reqs:
+            if not self._mlx_runner.has_request(req.rid):
+                needed_slots.update(req.prefix_indices.tolist())
+        return needed_slots
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
@@ -178,8 +219,12 @@ class MlxTpModelWorker(TpModelWorker):
 
         if forward_mode.is_extend():
             # Ensure pool is up-to-date before pool-backed attention reads it
-            # for prefix-cached prefills.  Only runs on extend batches.
-            self._mlx_runner.flush_all_decode_kv()
+            # for prefix-cached prefills. Only flush decode KV for the slots
+            # this batch's prefills will actually read. Only runs on extend
+            # batches.
+            self._mlx_runner.flush_decode_kv_for_slots(
+                self._gather_prefill_prefix_slots(reqs)
+            )
             input_ids_cpu = batch.input_ids.cpu().tolist()
             out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
             extend_seq_lens = batch.extend_lens
@@ -303,10 +348,12 @@ class MlxTpModelWorker(TpModelWorker):
             return pending_decode.lazy_tokens, [], [], pending_decode, "decode"
 
         if forward_mode.is_extend():
-            # TODO (changminbark): Implement per-batch flushing using prefix_slot_ids
-            # Ensure the pool is up-to-date before pool-backed attention
-            # reads it for prefix-cached prefills. Mirror the sync path.
-            self._mlx_runner.flush_all_decode_kv()
+            # Ensure the pool is up-to-date before pool-backed attention reads
+            # it for prefix-cached prefills, flushing only the decode KV for the
+            # slots this batch's prefills will read. Mirror the sync path.
+            self._mlx_runner.flush_decode_kv_for_slots(
+                self._gather_prefill_prefix_slots(reqs)
+            )
             return self._async_extend_batch(batch)
 
         raise ValueError(

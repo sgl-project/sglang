@@ -3451,6 +3451,15 @@ class Scheduler(
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
+            # Retraction frees each request's row and KV slots without the finish
+            # pre-release hook. Let the model worker drop any per-request runtime
+            # state now.
+            prepare_retraction = getattr(self.tp_worker, "prepare_for_retraction", None)
+            if callable(prepare_retraction):
+                for req in retracted_reqs:
+                    prepare_retraction(req)
+                for req in reqs_to_abort:
+                    prepare_retraction(req)
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
