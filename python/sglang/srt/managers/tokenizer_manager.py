@@ -808,7 +808,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
-        except Exception:
+        except BaseException:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
