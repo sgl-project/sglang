@@ -3494,6 +3494,20 @@ class Scheduler(
             and last_batch
             and last_batch.forward_mode.is_extend()
         ):
+            if getattr(self, "result_queue", None):
+                # Abort can arrive while the final prefill result is still delayed.
+                # Keep that request out of optimistic decode; the result processor
+                # will consume the pending finish and release its resources.
+                chunked_req_to_exclude.update(
+                    req
+                    for req in last_batch.reqs
+                    if req.to_finish is not None
+                    and (
+                        not last_batch.decoding_reqs
+                        or req not in last_batch.decoding_reqs
+                    )
+                )
+
             if last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.

@@ -299,6 +299,9 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                drop_prefill_result = req.to_finish is not None and (
+                    not batch.decoding_reqs or req not in batch.decoding_reqs
+                )
                 if (
                     batch.return_hidden_states
                     and logits_output.hidden_states is not None
@@ -312,6 +315,7 @@ class SchedulerBatchResultProcessor:
                         extend_input_len=extend_input_len_per_req[i],
                         store=(
                             not req.finished()
+                            and not drop_prefill_result
                             and not req.is_retracted
                             and req.inflight_middle_chunks <= 0
                         ),
@@ -334,12 +338,15 @@ class SchedulerBatchResultProcessor:
                         self.beam_coordinator.commit_prefill(
                             req, up_to_tick=batch.forward_iter
                         )
+                    elif drop_prefill_result:
+                        # Abort won the race with this delayed prefill result.
+                        # Finish and clean up without committing the sampled token
+                        # or any metadata derived from it.
+                        req.update_finish_state(new_accepted_len=0)
                     else:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
-
                         self._maybe_update_reasoning_tokens(req, next_token_id)
-
                         req.update_finish_state()
                     # A mixed spec tail committed its pending bonus token; advance
                     # so the next spec prepare_for_decode reserves from the right base.
@@ -360,7 +367,8 @@ class SchedulerBatchResultProcessor:
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
-                    self._maybe_collect_customized_info(i, req, logits_output)
+                    if not drop_prefill_result:
+                        self._maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
                         logprob_pt = self._apply_prefill_logprobs(
@@ -371,12 +379,13 @@ class SchedulerBatchResultProcessor:
                             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
+                            attach_return_values=not drop_prefill_result,
                         )
 
-                    if req.return_sampling_mask:
+                    if not drop_prefill_result and req.return_sampling_mask:
                         self.add_sampling_mask_return_values(i, req, logits_output)
 
-                    if req.grammar is not None:
+                    if not drop_prefill_result and req.grammar is not None:
                         self._apply_prefill_grammar(
                             req=req,
                             next_token_id=next_token_id,
@@ -520,6 +529,7 @@ class SchedulerBatchResultProcessor:
         extend_logprob_start_len_per_req: Optional[List[int]],
         next_token_ids: List[int],
         logprob_pt: int,
+        attach_return_values: bool = True,
     ) -> int:
         assert extend_logprob_start_len_per_req is not None
         assert extend_input_len_per_req is not None
@@ -532,7 +542,7 @@ class SchedulerBatchResultProcessor:
             extend_logprob_start_len,
         )
 
-        if req.return_logprob:
+        if attach_return_values and req.return_logprob:
             self.logprob_result_processor.add_logprob_return_values(
                 i,
                 req,
@@ -844,10 +854,14 @@ class SchedulerBatchResultProcessor:
             # Extend: advance over the single token each completed-prefill req emitted
             # (mirrors process_batch_result_prefill's per-req token indexing).
             for i, req in enumerate(batch.reqs):
+                drop_prefill_result = req.to_finish is not None and (
+                    not batch.decoding_reqs or req not in batch.decoding_reqs
+                )
                 if (
                     req.grammar is None
                     or req.is_retracted
                     or req.finished()
+                    or drop_prefill_result
                     or req.inflight_middle_chunks > 0
                 ):
                     continue
