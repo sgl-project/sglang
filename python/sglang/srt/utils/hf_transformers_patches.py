@@ -124,17 +124,19 @@ def normalize_deepseek_v4_compat(config) -> None:
         return
 
     def _legacy_ratio(lt: str) -> int:
-        # Sliding-attention layers have no compression rate upstream; encode
-        # them as ``0`` to preserve the legacy shape.
+        # ``sliding_attention`` layers are absent from ``compress_rates`` by
+        # design (SWA has no compression rate) — encode them as ``0`` to
+        # preserve the legacy shape. Any other layer type that the loaded
+        # ``compress_rates`` does not name falls back to ``0`` too: the
+        # downstream sglang readers (``sum(r == 4)``, ``4 in ...`` /
+        # ``128 in ...``, and per-layer indexing) all treat ``0`` as a
+        # non-compressed layer, so a silently unknown type degrades to
+        # "run as an uncompressed layer" rather than crashing config load.
+        # This matches the community consensus reached in vLLM's harden
+        # pass (vllm-project/vllm#43443).
         if lt == "sliding_attention":
             return 0
-        try:
-            return rates[lt]
-        except KeyError:
-            raise ValueError(
-                f"DeepseekV4Config layer_type {lt!r} has no entry in "
-                f"compress_rates {sorted(rates)}"
-            ) from None
+        return rates.get(lt, 0)
 
     config.compress_ratios = [_legacy_ratio(lt) for lt in layer_types]
 
