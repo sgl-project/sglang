@@ -260,7 +260,14 @@ jobs:
   # Consolidate performance metrics from all jobs
   consolidate-metrics:
     if: github.repository == 'sgl-project/sglang' && always()
+    # Every scheduled stage uploads metrics now, so all of them must finish
+    # before the download step globs `*metrics-*`.
     needs:
+      - nightly-1-gpu-large
+      - nightly-2-gpu-large
+      - nightly-4-gpu-h100
+      - nightly-4-gpu-b200
+      - nightly-4-gpu-gb300
       - nightly-8-gpu-h200
       - nightly-8-gpu-b200
     runs-on: ubuntu-latest

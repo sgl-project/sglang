@@ -83,7 +83,15 @@ env:
   SGLANG_ENABLE_ASYNC_ASSERT: ${{ startsWith(inputs.self_name, 'base-a') && 'false' || 'true' }}
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.scheduled && '1' || '' }}
+  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.scheduled && '1' || '0' }}
+  # is_h200_system() (test_utils.py) raises the server-launch ceiling from 600s
+  # to 3600s. Only the scheduled 8-gpu-h200 suites load models that need it;
+  # per-commit stages keep the short ceiling so a hung launch fails fast.
+  IS_H200: ${{ (inputs.scheduled && inputs.runner_config == '8-gpu-h200') && '1' || '0' }}
+  # Scheduled suites pull hundreds of GB of checkpoints; the hub's 10s etag
+  # default times out on a cold cache.
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -197,6 +205,9 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
           RUNNER_LABELS: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
           GPU_CONFIG: ${{ inputs.runner_config }}
+          # Read only by test_runai_model_loader.py (nightly 1-gpu); inert elsewhere.
+          # Left unconditional because an `env:` key cannot be omitted, and an empty
+          # value would reach the runai streamer as a malformed limit.
           RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd test

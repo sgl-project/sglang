@@ -137,15 +137,18 @@ def _repo_relative_path(p: str) -> str:
     return p[idx + len(marker) :] if idx >= 0 else p
 
 
-# The floor covers a test that is normally quick but occasionally crawls, which
-# the multiplier alone cannot: test_encoder_dp runs 200-426s across five nightly
-# runs and once took over 1185s, while 1.5 * its est_time is only 765s.
-DERIVED_TIMEOUT_FLOOR = 1800.0
+# Slow-run variance is largely additive (cold HF cache, slow server launch), so
+# the multiplier alone under-provisions at both ends: test_encoder_dp runs
+# 200-426s but once took over 1185s against a 1.5x budget of 765s, and
+# test_lora_deepseek_v3_base_logprob_diff (est 1800) landed on exactly 1.5 * est.
+# Every file gets the same absolute slack on top of the proportional one.
+DERIVED_TIMEOUT_SLACK = 1800.0
 DERIVED_TIMEOUT_FACTOR = 1.5
 
 
 def derive_timeout_per_file(est_time: float) -> float:
-    return max(float(est_time) * DERIVED_TIMEOUT_FACTOR, DERIVED_TIMEOUT_FLOOR)
+    est = float(est_time)
+    return max(est * DERIVED_TIMEOUT_FACTOR, est + DERIVED_TIMEOUT_SLACK)
 
 
 def run_unittest_files(
