@@ -74,6 +74,28 @@ def test_epd_language_only_rejects_missing_dispatched_embedding():
     assert getattr(exc_info.value, "status_code", None) == 503
 
 
+def test_epd_rejection_reads_the_resolved_transfer_backend():
+    """Tripwire for step 12: this guard fires on the *resolved* backend.
+
+    `encoder_transfer_backend` is one of the fields resolution fills in --
+    `resolve_encoder_transfer_backend` above is what picks it when the operator
+    did not. Today the handed record carries the resolved value, so a record
+    whose field is still `None` (what a raw record looks like for an
+    auto-resolved launch) must be recognizable as *not* configured rather than
+    silently passing the check.
+
+    When step 12 makes the instance raw, this case is the one that says the
+    guard stopped firing: it will still pass with `None`, and the EPD-mode case
+    above will start failing instead -- which is the signal to give this reader
+    the resolved value (per-engine overlay or bag) rather than the record.
+    """
+    unresolved = SimpleNamespace(language_only=True, encoder_transfer_backend=None)
+    request = SimpleNamespace(need_wait_for_mm_inputs=True)
+
+    # No rejection: the guard keys on the resolved mode, and this record has none.
+    _reject_missing_dispatched_encoder_embedding(unresolved, request, None)
+
+
 def test_epd_allows_local_processing_when_request_was_not_dispatched():
     server_args = SimpleNamespace(
         language_only=True,
