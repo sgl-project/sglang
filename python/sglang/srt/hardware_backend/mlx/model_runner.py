@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 import psutil
 from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
@@ -57,6 +58,18 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     set_context,
     uses_sliding_window_attention,
 )
+from sglang.srt.hardware_backend.mlx.sampling import (
+    GREEDY_PARAMS,
+    MlxLazyLogprobs,
+    MlxLogprobSpec,
+    MlxSamplingParams,
+    MlxStepLogprobs,
+    all_greedy,
+    compute_logprobs,
+    lazy_logprob_arrays,
+    sample_tokens,
+    sanitize_logits,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_server_args
 
@@ -79,6 +92,7 @@ class MlxPendingPrefill:
     full_token_ids: list[int]
     req_pool_idx: int
     synced_offset: int
+    lazy_logprobs: MlxLazyLogprobs | None = None
 
 
 @dataclass
@@ -95,6 +109,7 @@ class MlxPendingExtend:
     req_id: str
     new_token_ids: list[int]
     new_synced_offset: int
+    lazy_logprobs: MlxLazyLogprobs | None = None
 
 
 @dataclass
@@ -111,6 +126,13 @@ class MlxPendingDecode:
     lazy_tokens: mx.array
     req_ids: list[str]
     caches: list[list[Any]]
+    lazy_logprobs: MlxLazyLogprobs | None = None
+    # Carried so a chained step recomputes the same logprob request.
+    logprob_spec: MlxLogprobSpec | None = None
+    # Carried so chained steps keep applying static logit_bias rows.
+    # Never holds a grammar mask on the chained path: grammar batches are
+    # not chain_safe, so their pendings never become a chain root.
+    edit_rows: mx.array | None = None
 
 
 _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
@@ -124,9 +146,13 @@ _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
 
-    # Headless trunk, resolved in _load_model. The class default covers unit
-    # tests that build runners via object.__new__ without loading a model.
+    # Class defaults cover unit tests that build runners via object.__new__
+    # without running __init__/_load_model, which set the real values.
+    # ``_trunk`` is the headless trunk, resolved in _load_model.
     _trunk = None
+    _enable_sampling = False
+    _sanitize_nan = False
+    _deterministic_seeding = False
 
     def __init__(
         self,
@@ -136,12 +162,27 @@ class MlxModelRunner:
         pool_size: int | None = None,
         mem_fraction_static: float = 0.8,
         quantization: str | None = None,
+        enable_sampling: bool = False,
+        sampling_rng_seed: int = 0,
+        deterministic_seeding: bool = False,
     ):
         self.model_path = model_path
         self.trust_remote_code = trust_remote_code
         self.model = None
         self.disable_radix_cache = disable_radix_cache
         self._mem_fraction_static = mem_fraction_static
+        self._enable_sampling = enable_sampling
+        # --enable-deterministic-inference parity: seed every row (the
+        # sampling module's DEFAULT_SAMPLING_SEED when the request has no
+        # sampling_seed), like the pytorch backend.
+        self._deterministic_seeding = deterministic_seeding
+        self._sanitize_nan = envs.SGLANG_SANITIZE_NAN_LOGITS.get()
+        # RNG state for unseeded sampled rows; split at every sampling
+        # graph build, so runs are reproducible given the same seed and
+        # request schedule.
+        self._rng_key: mx.array | None = (
+            mx.random.key(sampling_rng_seed) if enable_sampling else None
+        )
         # Counter used to trigger periodic mx.clear_cache() calls.
         self._decode_step_ct: int = 0
         self._clear_steps = envs.SGLANG_MLX_CLEAR_CACHE_STEPS.get()
@@ -195,6 +236,7 @@ class MlxModelRunner:
 
         self._req_caches: dict[str, list[Any]] = {}
         self._req_token_ids: dict[str, list[int]] = {}
+        self._req_sampling: dict[str, MlxSamplingParams] = {}
         # Reusable cache lists, for models without auxiliary layer state.
         self._cache_pool: list[list[Any]] = []
 
@@ -413,11 +455,16 @@ class MlxModelRunner:
         return arrays
 
     @staticmethod
-    def _eval_with_cache(token_result: mx.array, cache: list[Any]) -> None:
+    def _eval_with_cache(
+        token_result: mx.array,
+        cache: list[Any],
+        lazy_logprobs: MlxLazyLogprobs | None = None,
+    ) -> None:
         """Evaluate token result and all cache buffers in one mx.eval call."""
         mx.eval(
             token_result,
             *[s for c in cache for s in MlxModelRunner._cache_arrays(c)],
+            *lazy_logprob_arrays(lazy_logprobs),
         )
 
     @staticmethod
@@ -694,7 +741,12 @@ class MlxModelRunner:
         req: Any | None = None,
         needs_logits: bool = True,
     ) -> int:
-        """Prefill a request.  Returns next_token_id."""
+        """Prefill a request.  Returns next_token_id.
+
+        One-shot convenience wrapper around ``prefill_start`` /
+        ``prefill_finalize``; logit edits and logprobs are only available
+        through that lazy surface.
+        """
         pending = self.prefill_start(
             req_id=req_id,
             new_token_ids=new_token_ids,
@@ -705,7 +757,7 @@ class MlxModelRunner:
             req=req,
             needs_logits=needs_logits,
         )
-        self._eval_with_cache(pending.lazy_token, pending.cache)
+        self.eval_prefill(pending)
         return self.prefill_finalize(pending)
 
     def extend(
@@ -715,11 +767,14 @@ class MlxModelRunner:
         new_slot_ids: list[int],
         needs_logits: bool = True,
     ) -> int:
-        """Continue prefill for a chunked request.  Returns next_token_id."""
+        """Continue prefill for a chunked request.  Returns next_token_id.
+
+        One-shot convenience wrapper; see :meth:`prefill`.
+        """
         pending = self.extend_start(
             req_id, new_token_ids, new_slot_ids, needs_logits=needs_logits
         )
-        self._eval_with_cache(pending.lazy_token, self._req_caches[req_id])
+        self.eval_extend(pending)
         return self.extend_finalize(pending)
 
     def _sync_new_kv_to_pool(
@@ -787,17 +842,13 @@ class MlxModelRunner:
         for req_id in list(self._req_caches.keys()):
             self._sync_decode_kv_to_pool(req_id)
 
-    def decode_batch(
-        self,
-        req_ids: list[str],
-    ) -> list[int]:
-        """Decode one token per request."""
+    def decode_batch(self, req_ids: list[str]) -> list[int]:
+        """Decode one token per request.
+
+        One-shot convenience wrapper; see :meth:`prefill`.
+        """
         pending = self.decode_batch_start(req_ids)
-        # Evaluate lazy_tokens together with every affected cache buffer so
-        # the attention write-then-read ordering is materialised in one
-        # kernel submission.
-        cache_arrays = self._cache_state_arrays(pending.caches)
-        mx.eval(pending.lazy_tokens, *cache_arrays)
+        self.eval_decode(pending)
         return self.decode_batch_finalize(pending)
 
     def prefill_start(
@@ -810,6 +861,8 @@ class MlxModelRunner:
         req_pool_idx: int,
         req: Any | None = None,
         needs_logits: bool = True,
+        logit_edit_row: mx.array | None = None,
+        logprob_spec: MlxLogprobSpec | None = None,
     ) -> MlxPendingPrefill:
         """Queue a prefill forward pass without evaluating.
 
@@ -824,11 +877,21 @@ class MlxModelRunner:
         prefix_len = len(prefix_slot_ids)
         if req is not None:
             req.mamba_last_track_seqlen = None
+        if self._enable_sampling:
+            self._req_sampling[req_id] = (
+                MlxSamplingParams.from_req(
+                    req, deterministic_seeding=self._deterministic_seeding
+                )
+                if req is not None
+                else GREEDY_PARAMS
+            )
 
         if self.disable_radix_cache:
             cache = self._acquire_cache()
             input_ids = mx.array([new_token_ids], dtype=mx.int32)
-            lazy_token = self._forward_lazy_token(input_ids, cache, needs_logits)
+            lazy_token, lazy_logprobs = self._forward_lazy_token(
+                input_ids, cache, needs_logits, req_id, logit_edit_row, logprob_spec
+            )
             return MlxPendingPrefill(
                 lazy_token=lazy_token,
                 cache=cache,
@@ -836,6 +899,7 @@ class MlxModelRunner:
                 full_token_ids=list(full_token_ids),
                 req_pool_idx=req_pool_idx,
                 synced_offset=0,
+                lazy_logprobs=lazy_logprobs,
             )
 
         assert (
@@ -882,7 +946,9 @@ class MlxModelRunner:
                 # allocated attention KV below.
                 cache = self._acquire_cache()
                 input_ids = mx.array([full_token_ids or new_token_ids], dtype=mx.int32)
-                lazy_token = self._forward_lazy_token(input_ids, cache, needs_logits)
+                lazy_token, lazy_logprobs = self._forward_lazy_token(
+                    input_ids, cache, needs_logits, req_id, logit_edit_row, logprob_spec
+                )
                 if new_slot_ids:
                     self._sync_new_kv_to_pool(cache, prefix_len, new_slot_ids)
                 return MlxPendingPrefill(
@@ -892,6 +958,7 @@ class MlxModelRunner:
                     full_token_ids=list(full_token_ids),
                     req_pool_idx=req_pool_idx,
                     synced_offset=prefix_len + len(new_slot_ids),
+                    lazy_logprobs=lazy_logprobs,
                 )
         else:
             cache = self._acquire_cache()
@@ -923,7 +990,9 @@ class MlxModelRunner:
                 c.offset = max(c.offset - 1, 0)
 
         input_ids = mx.array([extend_tokens], dtype=mx.int32)
-        lazy_token = self._forward_lazy_token(input_ids, cache, needs_logits)
+        lazy_token, lazy_logprobs = self._forward_lazy_token(
+            input_ids, cache, needs_logits, req_id, logit_edit_row, logprob_spec
+        )
 
         if track_len is not None and track_len == prefix_len + new_token_count:
             self._store_tracked_auxiliary_state(req, cache, track_len)
@@ -944,6 +1013,7 @@ class MlxModelRunner:
             full_token_ids=list(full_token_ids),
             req_pool_idx=req_pool_idx,
             synced_offset=prefix_len + len(new_slot_ids),
+            lazy_logprobs=lazy_logprobs,
         )
 
     def prefill_finalize(self, pending: MlxPendingPrefill) -> int:
@@ -969,6 +1039,8 @@ class MlxModelRunner:
         new_token_ids: list[int],
         new_slot_ids: list[int],
         needs_logits: bool = True,
+        logit_edit_row: mx.array | None = None,
+        logprob_spec: MlxLogprobSpec | None = None,
     ) -> MlxPendingExtend:
         """Queue chunked-prefill continuation without evaluating.
 
@@ -983,7 +1055,9 @@ class MlxModelRunner:
         cache = self._req_caches[req_id]
 
         input_ids = mx.array([new_token_ids], dtype=mx.int32)
-        lazy_token = self._forward_lazy_token(input_ids, cache, needs_logits)
+        lazy_token, lazy_logprobs = self._forward_lazy_token(
+            input_ids, cache, needs_logits, req_id, logit_edit_row, logprob_spec
+        )
 
         if not self.disable_radix_cache and new_slot_ids:
             synced = self._req_synced_offset[req_id]
@@ -997,6 +1071,7 @@ class MlxModelRunner:
             req_id=req_id,
             new_token_ids=list(new_token_ids),
             new_synced_offset=new_synced_offset,
+            lazy_logprobs=lazy_logprobs,
         )
 
     def extend_finalize(self, pending: MlxPendingExtend) -> int:
@@ -1032,19 +1107,166 @@ class MlxModelRunner:
         return self._trunk(input_ids, cache=cache)
 
     def _forward_lazy_token(
-        self, input_ids: mx.array, cache: list[Any], needs_logits: bool
-    ) -> mx.array:
-        """Forward one chunk, returning the lazy next-token array.
+        self,
+        input_ids: mx.array,
+        cache: list[Any],
+        needs_logits: bool,
+        req_id: str,
+        logit_edit_row: mx.array | None = None,
+        logprob_spec: MlxLogprobSpec | None = None,
+    ) -> tuple[mx.array, MlxLazyLogprobs | None]:
+        """Forward one chunk, returning (lazy next-token, lazy logprobs).
 
         Skips the logit head for discarded-output chunks when possible.
         """
         if not needs_logits:
             hidden = self._trunk_forward(input_ids, cache)
             if hidden is not None:
-                return self._dummy_next_token(hidden)
+                return self._dummy_next_token(hidden), None
+            # Headless trunk unavailable: run the full model, but keep the
+            # discarded token on argmax — sampling here would consume RNG
+            # state and make final output depend on prefill chunking.
+            model_output = self.model(input_ids, cache=cache)
+            logits = self._extract_logits(model_output)
+            return mx.argmax(logits[:, -1, :], axis=-1), None
         model_output = self.model(input_ids, cache=cache)
         logits = self._extract_logits(model_output)
-        return mx.argmax(logits[:, -1, :], axis=-1)
+        edits = logit_edit_row[None, :] if logit_edit_row is not None else None
+        return self._select_tokens_with_logprobs(
+            logits[:, -1, :], [req_id], [cache], edits, logprob_spec
+        )
+
+    def _select_tokens(
+        self,
+        last_logits: mx.array,
+        req_ids: list[str],
+        caches: list[list[Any]],
+        edit_rows: mx.array | None = None,
+    ) -> mx.array:
+        tokens, _ = self._select_tokens_with_logprobs(
+            last_logits, req_ids, caches, edit_rows, None
+        )
+        return tokens
+
+    def _select_tokens_with_logprobs(
+        self,
+        last_logits: mx.array,
+        req_ids: list[str],
+        caches: list[list[Any]],
+        edit_rows: mx.array | None,
+        logprob_spec: MlxLogprobSpec | None,
+    ) -> tuple[mx.array, MlxLazyLogprobs | None]:
+        """Pick one token per row of ``last_logits`` — lazily, inside the graph.
+
+        Greedy behavior (sampling disabled, or every row greedy with no
+        logit edits) is exactly the pre-sampling ``mx.argmax`` and consumes
+        no RNG state.  ``edit_rows`` is the worker's pre-combined additive
+        [B, vocab] array (grammar mask + logit_bias), applied before token
+        selection and logprobs, mirroring the CUDA
+        ``ModelRunner._preprocess_logits`` order.  Positions for seeded rows
+        come from the attention cache offsets, which the just-built forward
+        has already advanced past the token being sampled — the same
+        ``seq_len - 1`` the pytorch path feeds its sampler.  They are
+        build-time Python ints, so this is chained-decode safe.
+        """
+        if not self._enable_sampling:
+            return mx.argmax(last_logits, axis=-1), None
+        params = [self._req_sampling[rid] for rid in req_ids]
+        edited = self._edited_logits(last_logits, edit_rows)
+        if all_greedy(params):
+            tokens = mx.argmax(edited, axis=-1)
+        else:
+            positions = [self._first_attention_cache(c).offset - 1 for c in caches]
+            self._rng_key, key = mx.random.split(self._rng_key)
+            tokens = sample_tokens(
+                last_logits=edited, params=params, positions=positions, key=key
+            )
+        lazy_logprobs = (
+            compute_logprobs(
+                last_logits=edited, params=params, tokens=tokens, spec=logprob_spec
+            )
+            if logprob_spec is not None
+            else None
+        )
+        return tokens, lazy_logprobs
+
+    def _edited_logits(
+        self, last_logits: mx.array, edit_rows: mx.array | None
+    ) -> mx.array:
+        """Apply the additive logit edits and env-gated NaN sanitization."""
+        edited = last_logits
+        if edit_rows is not None:
+            edited = edited.astype(mx.float32) + edit_rows
+        if self._sanitize_nan:
+            edited = sanitize_logits(edited.astype(mx.float32))
+        return edited
+
+    def _run_logits_hook(self, last_logits: mx.array, logits_hook) -> mx.array:
+        """Materialize logits and let the worker edit them on the CPU.
+
+        Used for custom logit processors (arbitrary torch callables) — the
+        one edit that cannot be expressed lazily.  Synchronizes the graph;
+        callers gate this to fresh, pure-decode launches, so the chained
+        overlap pipeline never pays for it.
+        """
+        logits32 = last_logits.astype(mx.float32)
+        mx.eval(logits32)
+        return mx.array(logits_hook(np.array(logits32)))
+
+    def collect_logprobs(
+        self, lazy_logprobs: MlxLazyLogprobs | None
+    ) -> MlxStepLogprobs | None:
+        """Materialize one step's lazy logprob arrays into Python lists."""
+        if lazy_logprobs is None:
+            return None
+        mx.eval(*lazy_logprob_arrays(lazy_logprobs))
+        spec = lazy_logprobs.spec
+        if lazy_logprobs.top_val is not None:
+            all_val = lazy_logprobs.top_val.tolist()
+            all_idx = lazy_logprobs.top_idx.tolist()
+            top_val = [all_val[i][:k] for i, k in enumerate(spec.top_ks)]
+            top_idx = [all_idx[i][:k] for i, k in enumerate(spec.top_ks)]
+        else:
+            top_val = [[] for _ in spec.top_ks]
+            top_idx = [[] for _ in spec.top_ks]
+        return MlxStepLogprobs(
+            chosen=lazy_logprobs.chosen.tolist(),
+            top_val=top_val,
+            top_idx=top_idx,
+            token_ids_val=[
+                a.tolist() if a is not None else [] for a in lazy_logprobs.token_ids_val
+            ],
+            token_ids_idx=[list(ids) if ids else [] for ids in spec.token_ids],
+        )
+
+    def eval_prefill(self, pending: MlxPendingPrefill) -> None:
+        """Materialize a queued prefill: token, cache writes and logprobs."""
+        self._eval_with_cache(pending.lazy_token, pending.cache, pending.lazy_logprobs)
+
+    def eval_extend(self, pending: MlxPendingExtend) -> None:
+        """Materialize a queued extend: token, cache writes and logprobs."""
+        self._eval_with_cache(
+            pending.lazy_token,
+            self._req_caches[pending.req_id],
+            pending.lazy_logprobs,
+        )
+
+    def eval_decode(self, pending: MlxPendingDecode) -> None:
+        """Materialize a queued decode step.
+
+        Evaluates ``lazy_tokens`` together with every affected cache buffer
+        so the attention write-then-read ordering is materialised in one
+        kernel submission.
+        """
+        mx.eval(
+            pending.lazy_tokens,
+            *self._cache_state_arrays(pending.caches),
+            *lazy_logprob_arrays(pending.lazy_logprobs),
+        )
+
+    def request_cache_arrays(self, req_id: str) -> list[mx.array]:
+        """Cache-state arrays of a committed request; safe for async_eval."""
+        return [s for c in self._req_caches[req_id] for s in self._cache_arrays(c)]
 
     @staticmethod
     def _dummy_next_token(hidden: mx.array) -> mx.array:
@@ -1078,7 +1300,7 @@ class MlxModelRunner:
         batched_input: mx.array,
         req_ids: list[str],
     ) -> mx.array:
-        """Layer-by-layer hybrid decode for attention plus auxiliary state.
+        """Layer-by-layer hybrid decode; returns [B, vocab] last-token logits.
 
         Attention layers run with batched hidden states via
         ``BatchedDecodeContext``. Auxiliary layers run batched when their
@@ -1113,7 +1335,7 @@ class MlxModelRunner:
 
         hidden_states = self._model_norm(hidden_states)
         logits = self._extract_logits(self._model_lm_head(hidden_states))
-        return mx.argmax(logits[:, -1, :], axis=-1)
+        return logits[:, -1, :]
 
     def _decode_auxiliary_layer(
         self,
@@ -1249,15 +1471,15 @@ class MlxModelRunner:
         caches: list[list[Any]],
         input_ids_by_request: list[mx.array],
     ) -> mx.array:
-        lazy_token_list = []
+        lazy_logits_list = []
         for input_ids, cache in zip(input_ids_by_request, caches):
             model_output = self.model(input_ids, cache=cache)
             logits = self._extract_logits(model_output)
-            lazy_token_list.append(mx.argmax(logits[:, -1, :], axis=-1))
+            lazy_logits_list.append(logits[:, -1, :])
         return (
-            lazy_token_list[0]
-            if len(lazy_token_list) == 1
-            else mx.concatenate(lazy_token_list, axis=0)
+            lazy_logits_list[0]
+            if len(lazy_logits_list) == 1
+            else mx.concatenate(lazy_logits_list, axis=0)
         )
 
     def _decode_with_batched_attention(
@@ -1277,7 +1499,7 @@ class MlxModelRunner:
             ]
             model_output = self.model(batched_input, cache=shim_cache)
             logits = self._extract_logits(model_output)
-            return mx.argmax(logits[:, -1, :], axis=-1)
+            return logits[:, -1, :]
         finally:
             clear_context()
 
@@ -1301,7 +1523,13 @@ class MlxModelRunner:
             full_kv_pool_index_by_layer=self._cache_layout.full_kv_pool_index_by_layer,
         )
 
-    def decode_batch_start(self, req_ids: list[str]) -> MlxPendingDecode:
+    def decode_batch_start(
+        self,
+        req_ids: list[str],
+        edit_rows: mx.array | None = None,
+        logprob_spec: MlxLogprobSpec | None = None,
+        logits_hook=None,
+    ) -> MlxPendingDecode:
         """Queue a decode forward pass without evaluating.
 
         The caller is responsible for calling ``mx.async_eval`` on the
@@ -1313,18 +1541,31 @@ class MlxModelRunner:
         batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
 
         if self._cache_layout.has_auxiliary_state:
-            lazy_tokens = self._decode_with_hybrid_batching(
+            last_logits = self._decode_with_hybrid_batching(
                 caches, batched_input, list(req_ids)
             )
         else:
-            lazy_tokens = self._decode_with_batched_attention(
+            last_logits = self._decode_with_batched_attention(
                 caches, batched_input, list(req_ids)
             )
 
+        if logits_hook is not None:
+            # CUDA edit order: grammar mask + logit_bias first, custom
+            # processors second, sanitization last (inside selection).
+            if edit_rows is not None:
+                last_logits = last_logits.astype(mx.float32) + edit_rows
+                edit_rows = None
+            last_logits = self._run_logits_hook(last_logits, logits_hook)
+        lazy_tokens, lazy_logprobs = self._select_tokens_with_logprobs(
+            last_logits, list(req_ids), caches, edit_rows, logprob_spec
+        )
         return MlxPendingDecode(
             lazy_tokens=lazy_tokens,
             req_ids=list(req_ids),
             caches=caches,
+            lazy_logprobs=lazy_logprobs,
+            logprob_spec=logprob_spec,
+            edit_rows=edit_rows,
         )
 
     def decode_batch_start_chained(
@@ -1358,18 +1599,24 @@ class MlxModelRunner:
         # be written at in step N+1 (and equivalently the RoPE offset).
         batched_input = prev.lazy_tokens[:, None]
         if self._cache_layout.has_auxiliary_state:
-            lazy_tokens = self._decode_with_hybrid_batching(
+            last_logits = self._decode_with_hybrid_batching(
                 caches, batched_input, prev.req_ids
             )
         else:
-            lazy_tokens = self._decode_with_batched_attention(
+            last_logits = self._decode_with_batched_attention(
                 caches, batched_input, prev.req_ids
             )
 
+        lazy_tokens, lazy_logprobs = self._select_tokens_with_logprobs(
+            last_logits, prev.req_ids, caches, prev.edit_rows, prev.logprob_spec
+        )
         return MlxPendingDecode(
             lazy_tokens=lazy_tokens,
             req_ids=prev.req_ids,
             caches=caches,
+            lazy_logprobs=lazy_logprobs,
+            logprob_spec=prev.logprob_spec,
+            edit_rows=prev.edit_rows,
         )
 
     def decode_batch_finalize(
@@ -1409,6 +1656,7 @@ class MlxModelRunner:
             self._sync_decode_kv_to_pool(req_id)
 
         self._req_token_ids.pop(req_id, None)
+        self._req_sampling.pop(req_id, None)
         cache = self._req_caches.pop(req_id, None)
         if cache is not None:
             self._release_cache(cache)
@@ -1418,6 +1666,7 @@ class MlxModelRunner:
     def clear(self):
         """Clear all request states."""
         self._req_token_ids.clear()
+        self._req_sampling.clear()
         for cache in self._req_caches.values():
             self._release_cache(cache)
         self._req_caches.clear()

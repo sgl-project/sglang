@@ -23,6 +23,11 @@ from sglang.srt.hardware_backend.mlx.model_runner import (
     MlxPendingExtend,
     MlxPendingPrefill,
 )
+from sglang.srt.hardware_backend.mlx.sampling import (
+    MlxLogprobSpec,
+    MlxStepLogprobs,
+    lazy_logprob_arrays,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -31,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.runtime_context import get_device, get_exec
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +64,11 @@ class MlxTpModelWorker(TpModelWorker):
             disable_radix_cache=self.server_args.disable_radix_cache,
             mem_fraction_static=self.server_args.mem_fraction_static,
             quantization=self.server_args.quantization,
+            enable_sampling=get_device().mlx_enable_sampling,
+            sampling_rng_seed=get_device().random_seed,
+            deterministic_seeding=(
+                get_exec().deterministic.enable_deterministic_inference
+            ),
         )
         if self.server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = self.server_args.max_total_tokens
@@ -169,10 +180,173 @@ class MlxTpModelWorker(TpModelWorker):
             return True
         return req.extend_range.end >= len(req.full_untruncated_fill_ids)
 
+    @staticmethod
+    def _sampling_active(batch: ScheduleBatch) -> bool:
+        return get_device().mlx_enable_sampling and batch.sampling_info is not None
+
+    def _build_logit_edit_rows(
+        self, batch: ScheduleBatch
+    ) -> dict[str, mx.array] | None:
+        """Pre-combine grammar vocab masks and logit_bias into one additive
+        [vocab] float32 row per request, ready to enter the lazy graph.
+
+        Grammar FSM state is current at every fresh launch — the previous
+        token was finalized before this batch was scheduled — so the mask
+        is knowable at graph-build time with no device sync.  The
+        scheduler never chains grammar batches
+        (:attr:`MlxPendingJob.chain_safe`), so a chained step never needs
+        a stale mask.  Mask application reuses the grammar backend's own
+        ``apply_vocab_mask`` on a zeros tensor, which keeps this
+        backend-agnostic (xgrammar / llguidance / outlines).
+        """
+        if not self._sampling_active(batch):
+            return None
+        sinfo = batch.sampling_info
+        # Mirror ForwardBatch.init_new's grammars population — the MLX paths
+        # never build a ForwardBatch, so without this the list stays None
+        # even when requests carry live grammar objects.
+        sinfo.grammars = (
+            [req.grammar for req in batch.reqs] if batch.has_grammar else None
+        )
+        has_grammar = bool(sinfo.grammars)
+        if not has_grammar and sinfo.logit_bias is None:
+            return None
+        combined = torch.zeros(len(batch.reqs), sinfo.vocab_size, dtype=torch.float32)
+        if has_grammar:
+            sinfo.update_regex_vocab_mask()
+            if sinfo.grammar_mask is not None:
+                grammar_mask = sinfo.grammar_mask
+                grammar_mask.grammar.apply_vocab_mask(
+                    logits=combined,
+                    vocab_mask=grammar_mask.vocab_mask.to("cpu"),
+                )
+                # Release promptly; mirrors the VRAM-leak note in the CUDA
+                # ModelRunner._preprocess_logits.
+                sinfo.grammar_mask = None
+        if sinfo.logit_bias is not None:
+            combined += sinfo.logit_bias.to("cpu")
+        rows = mx.array(combined.numpy())
+        return {req.rid: rows[i] for i, req in enumerate(batch.reqs)}
+
+    def _logprob_rows(
+        self, batch: ScheduleBatch
+    ) -> dict[str, tuple[int, tuple[int, ...] | None]] | None:
+        """Per-request (top_logprobs_num, token_ids) for logprob output."""
+        if not self._sampling_active(batch) or not batch.return_logprob:
+            return None
+        tops = batch.top_logprobs_nums or [0] * len(batch.reqs)
+        tids = batch.token_ids_logprobs or [None] * len(batch.reqs)
+        rows = {}
+        for req, top_k, token_ids in zip(batch.reqs, tops, tids):
+            if req.return_logprob:
+                rows[req.rid] = (
+                    int(top_k or 0),
+                    tuple(token_ids) if token_ids else None,
+                )
+        return rows or None
+
+    @staticmethod
+    def _logprob_spec_for(
+        rows: dict[str, tuple[int, tuple[int, ...] | None]] | None,
+        rids: list[str],
+    ) -> MlxLogprobSpec | None:
+        if rows is None or not any(rid in rows for rid in rids):
+            return None
+        return MlxLogprobSpec(
+            top_ks=tuple(rows.get(rid, (0, None))[0] for rid in rids),
+            token_ids=tuple(rows.get(rid, (0, None))[1] for rid in rids),
+        )
+
+    def _custom_logits_hook(self, batch: ScheduleBatch):
+        """CPU edit hook for custom logit processors, or None.
+
+        Only built for fresh pure-decode launches; the runner materializes
+        the logits for the hook, so these batches never chain.
+        """
+        if not (
+            self._sampling_active(batch)
+            and batch.sampling_info.has_custom_logit_processor
+        ):
+            return None
+        sinfo = batch.sampling_info
+
+        def hook(logits_np):
+            from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+            # torch.from_numpy shares memory with logits_np, so the
+            # processors' in-place edits land in the returned array.
+            logits_t = torch.from_numpy(logits_np)
+            apply_custom_logit_processor(logits_t, sinfo)
+            return logits_np
+
+        return hook
+
+    @staticmethod
+    def _assemble_logprob_output(step_rows: dict[str, tuple], reqs: list):
+        """Batch-ordered LogitsProcessorOutput from per-request logprob rows.
+
+        Field shapes follow what ``move_logprobs_to_cpu`` and
+        ``add_logprob_return_values`` consume: tensors for values the
+        scheduler ``.tolist()``s, plain lists for token-id indices.
+        """
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        chosen, top_val, top_idx, tid_val, tid_idx = [], [], [], [], []
+        for req in reqs:
+            row = step_rows.get(req.rid)
+            if row is None:
+                row = (0.0, [], [], [], [])
+            chosen.append(row[0])
+            top_val.append(torch.tensor(row[1], dtype=torch.float32))
+            top_idx.append(torch.tensor(row[2], dtype=torch.long))
+            tid_val.append(torch.tensor(row[3], dtype=torch.float32))
+            tid_idx.append(list(row[4]))
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            next_token_logprobs=torch.tensor(chosen, dtype=torch.float32),
+            next_token_top_logprobs_val=top_val,
+            next_token_top_logprobs_idx=top_idx,
+            next_token_token_ids_logprobs_val=tid_val,
+            next_token_token_ids_logprobs_idx=tid_idx,
+        )
+
+    @staticmethod
+    def _step_logprob_rows(
+        step: Optional[MlxStepLogprobs], rids: list[str]
+    ) -> dict[str, tuple]:
+        """Split a step's batch logprobs into per-request rows."""
+        if step is None:
+            return {}
+        return {
+            rid: (
+                step.chosen[i],
+                step.top_val[i],
+                step.top_idx[i],
+                step.token_ids_val[i],
+                step.token_ids_idx[i],
+            )
+            for i, rid in enumerate(rids)
+        }
+
+    def _collect_step_logprobs(
+        self,
+        step_rows: dict[str, tuple],
+        lazy_logprobs,
+        rids: list[str],
+    ) -> None:
+        """Materialize one pending's lazy logprobs into ``step_rows``."""
+        step = self._mlx_runner.collect_logprobs(lazy_logprobs)
+        step_rows.update(self._step_logprob_rows(step, rids))
+
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
-        """Run forward pass through the MLX model runner (greedy only)."""
+        """Run forward pass through the MLX model runner.
+
+        Token selection (greedy, or in-graph sampling when
+        ``--mlx-enable-sampling`` is set) happens inside the runner's
+        lazy graph; this method only routes requests.
+        """
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         forward_mode = batch.forward_mode
@@ -187,6 +361,9 @@ class MlxTpModelWorker(TpModelWorker):
         self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
 
         next_token_ids_list: list[int] = []
+        edit_rows = self._build_logit_edit_rows(batch)
+        logprob_rows = self._logprob_rows(batch)
+        step_logprob_rows: dict[str, tuple] = {}
 
         if forward_mode.is_extend():
             # Ensure pool is up-to-date before pool-backed attention reads it
@@ -214,11 +391,18 @@ class MlxTpModelWorker(TpModelWorker):
 
                 route = self._route_extend_request(req.rid, decoding_rids)
                 if route == "continuation":
-                    next_token = self._mlx_runner.extend(
-                        req.rid,
-                        req_token_ids,
-                        req_new_slots,
+                    pending_e = self._mlx_runner.extend_start(
+                        req_id=req.rid,
+                        new_token_ids=req_token_ids,
+                        new_slot_ids=req_new_slots,
                         needs_logits=self._chunk_needs_logits(req),
+                        logit_edit_row=edit_rows[req.rid] if edit_rows else None,
+                        logprob_spec=self._logprob_spec_for(logprob_rows, [req.rid]),
+                    )
+                    self._mlx_runner.eval_extend(pending_e)
+                    next_token = self._mlx_runner.extend_finalize(pending_e)
+                    self._collect_step_logprobs(
+                        step_logprob_rows, pending_e.lazy_logprobs, [req.rid]
                     )
                     extend_rids.append((req.rid, next_token))
                 elif route == "decode":
@@ -226,7 +410,7 @@ class MlxTpModelWorker(TpModelWorker):
                 else:  # "prefill"
                     prefix_slot_ids = req.prefix_indices.tolist()
                     full_token_ids = list(req.get_fill_ids())
-                    next_token = self._mlx_runner.prefill(
+                    pending_p = self._mlx_runner.prefill_start(
                         req_id=req.rid,
                         new_token_ids=req_token_ids,
                         full_token_ids=full_token_ids,
@@ -235,13 +419,31 @@ class MlxTpModelWorker(TpModelWorker):
                         req_pool_idx=req.req_pool_idx,
                         req=req,
                         needs_logits=self._chunk_needs_logits(req),
+                        logit_edit_row=edit_rows[req.rid] if edit_rows else None,
+                        logprob_spec=self._logprob_spec_for(logprob_rows, [req.rid]),
+                    )
+                    self._mlx_runner.eval_prefill(pending_p)
+                    next_token = self._mlx_runner.prefill_finalize(pending_p)
+                    self._collect_step_logprobs(
+                        step_logprob_rows, pending_p.lazy_logprobs, [req.rid]
                     )
                     prefill_rids.append((req.rid, next_token))
 
             # Batch decode all existing requests at once
             if decode_rids:
-                decode_results = self._mlx_runner.decode_batch(decode_rids)
-                decode_map = dict(zip(decode_rids, decode_results))
+                decode_map = dict(
+                    zip(
+                        decode_rids,
+                        self._sync_decode(
+                            batch,
+                            decode_rids,
+                            edit_rows,
+                            logprob_rows,
+                            step_logprob_rows,
+                            allow_hook=False,
+                        ),
+                    )
+                )
             else:
                 decode_map = {}
 
@@ -258,7 +460,14 @@ class MlxTpModelWorker(TpModelWorker):
 
         elif forward_mode.is_decode():
             req_ids = [req.rid for req in reqs]
-            next_token_ids_list = self._mlx_runner.decode_batch(req_ids)
+            next_token_ids_list = self._sync_decode(
+                batch,
+                req_ids,
+                edit_rows,
+                logprob_rows,
+                step_logprob_rows,
+                allow_hook=True,
+            )
 
         else:
             raise ValueError(
@@ -269,11 +478,51 @@ class MlxTpModelWorker(TpModelWorker):
             next_token_ids_list, dtype=torch.long, device="cpu"
         )
 
+        logits_output = (
+            self._assemble_logprob_output(step_logprob_rows, reqs)
+            if step_logprob_rows
+            else LogitsProcessorOutput(next_token_logits=None)
+        )
         return GenerationBatchResult(
-            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            logits_output=logits_output,
             next_token_ids=next_token_ids,
             can_run_cuda_graph=False,
         )
+
+    def _sync_decode(
+        self,
+        batch: ScheduleBatch,
+        req_ids: list[str],
+        edit_rows: dict[str, mx.array] | None,
+        logprob_rows: dict[str, tuple[int, tuple[int, ...] | None]] | None,
+        step_logprob_rows: dict[str, tuple],
+        allow_hook: bool,
+    ) -> list[int]:
+        """Synchronous decode step with logit edits and logprob collection.
+
+        ``allow_hook`` is False for decode rows mixed into an extend batch:
+        ``apply_custom_logit_processor`` asserts its logits rows match the
+        full ``sampling_info``, which only holds for pure-decode batches.
+        """
+        pending = self._mlx_runner.decode_batch_start(
+            req_ids,
+            edit_rows=self._stacked_edit_rows(edit_rows, req_ids),
+            logprob_spec=self._logprob_spec_for(logprob_rows, req_ids),
+            logits_hook=self._custom_logits_hook(batch) if allow_hook else None,
+        )
+        self._mlx_runner.eval_decode(pending)
+        next_tokens = self._mlx_runner.decode_batch_finalize(pending)
+        self._collect_step_logprobs(step_logprob_rows, pending.lazy_logprobs, req_ids)
+        return next_tokens
+
+    @staticmethod
+    def _stacked_edit_rows(
+        edit_rows: dict[str, mx.array] | None, req_ids: list[str]
+    ) -> Optional[mx.array]:
+        """Stack the per-request additive edit rows for a decode sub-batch."""
+        if not edit_rows:
+            return None
+        return mx.stack([edit_rows[rid] for rid in req_ids])
 
     def async_forward_batch_generation_mlx(self, batch: ScheduleBatch) -> tuple[
         Union[mx.array, None],
@@ -314,8 +563,18 @@ class MlxTpModelWorker(TpModelWorker):
 
         if forward_mode.is_decode():
             req_ids = [req.rid for req in reqs]
-            pending_decode = self._mlx_runner.decode_batch_start(req_ids)
-            mx.async_eval(pending_decode.lazy_tokens)
+            pending_decode = self._mlx_runner.decode_batch_start(
+                req_ids,
+                edit_rows=self._stacked_edit_rows(
+                    self._build_logit_edit_rows(batch), req_ids
+                ),
+                logprob_spec=self._logprob_spec_for(self._logprob_rows(batch), req_ids),
+                logits_hook=self._custom_logits_hook(batch),
+            )
+            mx.async_eval(
+                pending_decode.lazy_tokens,
+                *lazy_logprob_arrays(pending_decode.lazy_logprobs),
+            )
             return pending_decode.lazy_tokens, [], [], pending_decode, "decode"
 
         if forward_mode.is_extend():
@@ -341,6 +600,8 @@ class MlxTpModelWorker(TpModelWorker):
         input_ids_cpu = batch.input_ids.cpu().tolist()
         out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
         extend_seq_lens = batch.extend_lens
+        edit_rows = self._build_logit_edit_rows(batch)
+        logprob_rows = self._logprob_rows(batch)
 
         offset = 0
         slot_offset = 0
@@ -366,6 +627,8 @@ class MlxTpModelWorker(TpModelWorker):
                         new_token_ids=req_token_ids,
                         new_slot_ids=req_new_slots,
                         needs_logits=self._chunk_needs_logits(req),
+                        logit_edit_row=edit_rows[req.rid] if edit_rows else None,
+                        logprob_spec=self._logprob_spec_for(logprob_rows, [req.rid]),
                     )
                 )
             elif route == "decode":
@@ -383,13 +646,17 @@ class MlxTpModelWorker(TpModelWorker):
                         req_pool_idx=req.req_pool_idx,
                         req=req,
                         needs_logits=self._chunk_needs_logits(req),
+                        logit_edit_row=edit_rows[req.rid] if edit_rows else None,
+                        logprob_spec=self._logprob_spec_for(logprob_rows, [req.rid]),
                     )
                 )
 
         pending_mixed_decode: Optional[MlxPendingDecode] = None
         if mixed_decode_rids:
             pending_mixed_decode = self._mlx_runner.decode_batch_start(
-                mixed_decode_rids
+                mixed_decode_rids,
+                edit_rows=self._stacked_edit_rows(edit_rows, mixed_decode_rids),
+                logprob_spec=self._logprob_spec_for(logprob_rows, mixed_decode_rids),
             )
 
         # Stack lazy tokens so the caller has a single handle to evaluate
@@ -409,10 +676,13 @@ class MlxTpModelWorker(TpModelWorker):
 
         for p in pending_prefills:
             async_args.extend(self._cache_state(p.cache))
+            async_args.extend(lazy_logprob_arrays(p.lazy_logprobs))
         for e in pending_extends:
-            async_args.extend(self._cache_state(self._mlx_runner._req_caches[e.req_id]))
+            async_args.extend(self._mlx_runner.request_cache_arrays(e.req_id))
+            async_args.extend(lazy_logprob_arrays(e.lazy_logprobs))
         if pending_mixed_decode is not None:
             async_args.append(pending_mixed_decode.lazy_tokens)
+            async_args.extend(lazy_logprob_arrays(pending_mixed_decode.lazy_logprobs))
             for c_list in pending_mixed_decode.caches:
                 async_args.extend(self._cache_state(c_list))
 
@@ -504,9 +774,14 @@ class MlxTpModelWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
 
+        step_logprob_rows: dict[str, tuple] = {}
+
         if mode == "decode":
             assert decode is not None
             next_tokens_list = self._mlx_runner.decode_batch_finalize(decode)
+            self._collect_step_logprobs(
+                step_logprob_rows, decode.lazy_logprobs, decode.req_ids
+            )
 
         elif mode == "extend":
             prefill_map: dict[str, int] = {}
@@ -514,11 +789,17 @@ class MlxTpModelWorker(TpModelWorker):
                 prefill_map[pending_p.req_id] = self._mlx_runner.prefill_finalize(
                     pending_p
                 )
+                self._collect_step_logprobs(
+                    step_logprob_rows, pending_p.lazy_logprobs, [pending_p.req_id]
+                )
 
             extend_map: dict[str, int] = {}
             for pending_e in extends:
                 extend_map[pending_e.req_id] = self._mlx_runner.extend_finalize(
                     pending_e
+                )
+                self._collect_step_logprobs(
+                    step_logprob_rows, pending_e.lazy_logprobs, [pending_e.req_id]
                 )
 
             decode_map: dict[str, int] = {}
@@ -527,6 +808,9 @@ class MlxTpModelWorker(TpModelWorker):
                 decode_map = {
                     rid: tok for rid, tok in zip(decode.req_ids, mixed_tokens)
                 }
+                self._collect_step_logprobs(
+                    step_logprob_rows, decode.lazy_logprobs, decode.req_ids
+                )
 
             next_tokens_list = []
             for req in reqs:
@@ -541,8 +825,13 @@ class MlxTpModelWorker(TpModelWorker):
             raise ValueError(f"Unknown MLX async mode: {mode}")
 
         next_token_ids = torch.tensor(next_tokens_list, dtype=torch.long, device="cpu")
+        logits_output = (
+            self._assemble_logprob_output(step_logprob_rows, reqs)
+            if step_logprob_rows
+            else LogitsProcessorOutput(next_token_logits=None)
+        )
         return GenerationBatchResult(
-            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            logits_output=logits_output,
             next_token_ids=next_token_ids,
             can_run_cuda_graph=False,
         )

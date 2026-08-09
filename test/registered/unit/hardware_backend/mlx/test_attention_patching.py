@@ -350,7 +350,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
                     calls.append(
                         (len(caches), batched_input.tolist(), list(helper_req_ids))
                     )
-                    return mx.array(list(range(len(caches))), dtype=mx.int32)
+                    # Last-token logits whose argmax is the row index.
+                    return mx.eye(len(caches), 8, dtype=mx.float32)
 
                 def fail_native(*args, **kwargs):
                     raise AssertionError("dense decode should use batched attention")
@@ -386,7 +387,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         def fake_batched(caches, batched_input, helper_req_ids):
             calls.append((len(caches), batched_input.tolist(), list(helper_req_ids)))
-            return mx.array([8], dtype=mx.int32)
+            # Last-token logits whose argmax is token 8.
+            return mx.arange(9, dtype=mx.float32)[None, :]
 
         def fail_native(*args, **kwargs):
             raise AssertionError("dense chained decode should use batched attention")
@@ -502,11 +504,12 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             ]
         ]
 
-        lazy_tokens = runner._decode_with_batched_attention(
+        lazy_logits = runner._decode_with_batched_attention(
             cache,
             mx.array([[7]], dtype=mx.int32),
             ["r0"],
         )
+        lazy_tokens = mx.argmax(lazy_logits, axis=-1)
         mx.eval(lazy_tokens, *MlxModelRunner._cache_state_arrays(cache))
 
         self.assertEqual(lazy_tokens.tolist(), [0])
@@ -578,7 +581,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         def fake_hybrid(caches, batched_input, helper_req_ids):
             calls.append((len(caches), batched_input.tolist(), list(helper_req_ids)))
-            return mx.array([4, 5], dtype=mx.int32)
+            # Last-token logits whose argmax is 4 for row 0, 5 for row 1.
+            return mx.eye(8, dtype=mx.float32)[4:6]
 
         def fail_batched(*args, **kwargs):
             raise AssertionError(

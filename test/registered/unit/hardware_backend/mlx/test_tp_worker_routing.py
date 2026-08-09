@@ -35,7 +35,9 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.test_utils import CustomTestCase
 
 # CPU marker is AST-parsed "this test exists"; actual CPU-side execution is
 # gated by the @skipUnless guard below. MLX marker runs for real on the MLX
@@ -49,7 +51,8 @@ _SKIP_REASON = "Apple-Silicon-only (tp_worker imports mlx.core at module load)"
 
 
 class _FakeRunner:
-    """Records which routing path each request took (sync + async surfaces)."""
+    """Records which routing path each request took (both worker paths
+    drive the runner through the same start/finalize surface)."""
 
     def __init__(self, known_rids):
         self._known = set(known_rids)
@@ -76,41 +79,26 @@ class _FakeRunner:
 
         return SimpleNamespace(state=[mx.array([0.0], dtype=mx.float32)])
 
-    # --- sync surface ---
-    def extend(self, rid, new_token_ids, new_slot_ids, needs_logits=True):
-        self.calls.append(("extend", rid))
-        self.logits_flags[("extend", rid)] = needs_logits
-        self._counter += 1
-        return 1000 + self._counter
-
-    def decode_batch(self, rids):
-        for rid in rids:
-            self.calls.append(("decode", rid))
-        return [2000 + i for i in range(len(rids))]
-
-    def prefill(
+    # --- start/finalize surface (shared by the sync and async worker paths) ---
+    def extend_start(
         self,
         req_id,
         new_token_ids,
-        full_token_ids,
-        prefix_slot_ids,
         new_slot_ids,
-        req_pool_idx,
-        req=None,
         needs_logits=True,
+        logit_edit_row=None,
+        logprob_spec=None,
     ):
-        self.calls.append(("prefill", req_id))
-        self.logits_flags[("prefill", req_id)] = needs_logits
-        return 3000
-
-    # --- async surface ---
-    def extend_start(self, req_id, new_token_ids, new_slot_ids, needs_logits=True):
         import mlx.core as mx
 
         self.calls.append(("extend_start", req_id))
         self.logits_flags[("extend_start", req_id)] = needs_logits
         self._req_caches[req_id] = [self._fake_cache_layer()]
-        return SimpleNamespace(lazy_token=mx.array([0], dtype=mx.int32), req_id=req_id)
+        return SimpleNamespace(
+            lazy_token=mx.array([0], dtype=mx.int32),
+            req_id=req_id,
+            lazy_logprobs=None,
+        )
 
     def prefill_start(
         self,
@@ -122,6 +110,8 @@ class _FakeRunner:
         req_pool_idx,
         req=None,
         needs_logits=True,
+        logit_edit_row=None,
+        logprob_spec=None,
     ):
         import mlx.core as mx
 
@@ -131,9 +121,12 @@ class _FakeRunner:
             lazy_token=mx.array([0], dtype=mx.int32),
             cache=[self._fake_cache_layer()],
             req_id=req_id,
+            lazy_logprobs=None,
         )
 
-    def decode_batch_start(self, rids):
+    def decode_batch_start(
+        self, rids, edit_rows=None, logprob_spec=None, logits_hook=None
+    ):
         import mlx.core as mx
 
         for rid in rids:
@@ -142,7 +135,33 @@ class _FakeRunner:
             lazy_tokens=mx.array([0] * len(rids), dtype=mx.int32),
             caches=[[self._fake_cache_layer()] for _ in rids],
             req_ids=list(rids),
+            lazy_logprobs=None,
         )
+
+    def prefill_finalize(self, pending):
+        return 3000
+
+    def extend_finalize(self, pending):
+        self._counter += 1
+        return 1000 + self._counter
+
+    def decode_batch_finalize(self, pending):
+        return [2000 + i for i in range(len(pending.req_ids))]
+
+    def collect_logprobs(self, lazy_logprobs):
+        return None
+
+    def eval_prefill(self, pending):
+        pass
+
+    def eval_extend(self, pending):
+        pass
+
+    def eval_decode(self, pending):
+        pass
+
+    def request_cache_arrays(self, req_id):
+        return []
 
 
 class _FakeReq:
@@ -168,14 +187,25 @@ class _FakeBatch:
         self.reqs = reqs
         self.extend_lens = list(extend_lens)
         self.decoding_reqs = decoding_reqs
+        self.sampling_info = None
+        self.return_logprob = False
         # Arbitrary but correctly-sized token / slot arrays.
         self.input_ids = torch.arange(total, dtype=torch.long)
         self.out_cache_loc = torch.arange(total, dtype=torch.long)
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestMlxExtendRouting(unittest.TestCase):
+class TestMlxExtendRouting(CustomTestCase):
     """Routing contract for MlxTpModelWorker: shared helper + sync + async."""
+
+    @classmethod
+    def setUpClass(cls):
+        # The worker reads --mlx-enable-sampling off the device config bag,
+        # which fails closed before a publish. Routing itself is orthogonal
+        # to sampling, so pin it off for the whole case.
+        cls._config = get_context().override_server_args(mlx_enable_sampling=False)
+        cls._config.install()
+        cls.addClassCleanup(cls._config.restore)
 
     @staticmethod
     def _worker(known_rids):
@@ -214,9 +244,9 @@ class TestMlxExtendRouting(unittest.TestCase):
     def test_sync_one_token_continuation_routes_to_extend(self):
         """THE REGRESSION (sync): a 1-token continuation must extend, not decode."""
         runner = self._run_sync([_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND)
-        self.assertEqual(runner.ops_for("r1"), ["extend"])
+        self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         # Untruncated (extend_range None) => final chunk => logits required.
-        self.assertIs(runner.logits_flags[("extend", "r1")], True)
+        self.assertIs(runner.logits_flags[("extend_start", "r1")], True)
 
     def test_sync_non_final_chunk_skips_logits(self):
         """Head-skip derivation: a scheduler-truncated chunk (extend_range.end
@@ -228,14 +258,14 @@ class TestMlxExtendRouting(unittest.TestCase):
         req.full_untruncated_fill_ids = list(range(8))
         req.extend_range = SimpleNamespace(start=0, end=4)  # 4 < 8: non-final
         runner = self._run_sync([req], [4], {"r1"}, None, ForwardMode.EXTEND)
-        self.assertEqual(runner.ops_for("r1"), ["extend"])
-        self.assertIs(runner.logits_flags[("extend", "r1")], False)
+        self.assertEqual(runner.ops_for("r1"), ["extend_start"])
+        self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
 
     def test_sync_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")
         runner = self._run_sync([p, d], [4, 1], {"d1"}, [d], ForwardMode.MIXED)
-        self.assertEqual(runner.ops_for("p1"), ["prefill"])
-        self.assertEqual(runner.ops_for("d1"), ["decode"])
+        self.assertEqual(runner.ops_for("p1"), ["prefill_start"])
+        self.assertEqual(runner.ops_for("d1"), ["decode_start"])
 
     # ---------- async path: _async_extend_batch ----------
 

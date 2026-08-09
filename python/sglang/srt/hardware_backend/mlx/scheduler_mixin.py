@@ -23,6 +23,7 @@ import mlx.core as mx
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import DynamicGradMode
 
 logger = logging.getLogger(__name__)
@@ -80,10 +81,36 @@ class MlxPendingJob:
     batch_copy: ScheduleBatch
     schedule_batch: ScheduleBatch
     reqs: List[Req]
+    # False when the batch needs per-step CPU logit state (grammar vocab
+    # masks / custom logit processors under --mlx-enable-sampling): step
+    # N+1's mask needs token N materialized, so such batches must launch
+    # fresh every step instead of chaining.
+    chain_safe: bool = True
+    # Captured at launch when batch.return_logprob, exactly like
+    # Scheduler.run_batch does for the CUDA paths (the live values mutate
+    # before output processing).
+    extend_input_len_per_req: Optional[List[int]] = None
+    extend_logprob_start_len_per_req: Optional[List[int]] = None
 
 
 class SchedulerMlxOverlapMixin:
     """Mixin that adds MLX overlap scheduling to :class:`Scheduler`."""
+
+    def _mlx_batch_chain_safe(self: Scheduler, batch: ScheduleBatch) -> bool:
+        """False when per-step CPU logit state forbids chained decode.
+
+        Grammar vocab masks and custom logit processors depend on the
+        previous token being materialized; a chained step is built before
+        that, so those batches launch fresh every step.
+        """
+        if not get_device().mlx_enable_sampling:
+            return True
+        sampling_info = batch.sampling_info
+        if sampling_info is None:
+            return True
+        # batch.has_grammar, not sampling_info.grammars: the latter is only
+        # populated at forward launch (see _build_logit_edit_rows).
+        return not (batch.has_grammar or sampling_info.has_custom_logit_processor)
 
     def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
         # Account for this completed forward step. The standard scheduler does
@@ -102,6 +129,10 @@ class SchedulerMlxOverlapMixin:
             pending.decode,
             pending.mode,
             pending.reqs,
+        )
+        result.extend_input_len_per_req = pending.extend_input_len_per_req
+        result.extend_logprob_start_len_per_req = (
+            pending.extend_logprob_start_len_per_req
         )
         if result.next_token_ids is not None:
             pending.batch_copy.input_ids = result.next_token_ids
@@ -163,6 +194,15 @@ class SchedulerMlxOverlapMixin:
             lazy_tokens, prefills, extends, decode, mode = (
                 self.tp_worker.async_forward_batch_generation_mlx(batch)
             )
+            extend_input_len_per_req = None
+            extend_logprob_start_len_per_req = None
+            if batch.return_logprob:
+                # Mirror Scheduler.run_batch's launch-time copy.
+                extend_input_len_per_req = [
+                    req.extend_range.length if req.extend_range is not None else 0
+                    for req in batch.reqs
+                ]
+                extend_logprob_start_len_per_req = batch.extend_logprob_start_lens
             return MlxPendingJob(
                 lazy_tokens=lazy_tokens,
                 prefills=prefills,
@@ -172,6 +212,9 @@ class SchedulerMlxOverlapMixin:
                 batch_copy=batch.copy(),
                 schedule_batch=batch,
                 reqs=list(batch.reqs),
+                chain_safe=self._mlx_batch_chain_safe(batch),
+                extend_input_len_per_req=extend_input_len_per_req,
+                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             )
 
         def _launch_chained(prev: MlxPendingJob) -> MlxPendingJob:
@@ -191,6 +234,9 @@ class SchedulerMlxOverlapMixin:
                 batch_copy=prev.batch_copy.copy(),
                 schedule_batch=prev.schedule_batch,
                 reqs=prev.reqs,
+                chain_safe=prev.chain_safe,
+                extend_input_len_per_req=prev.extend_input_len_per_req,
+                extend_logprob_start_len_per_req=prev.extend_logprob_start_len_per_req,
             )
 
         while True:
@@ -205,6 +251,7 @@ class SchedulerMlxOverlapMixin:
                 pending_curr is not None
                 and pending_curr.mode == "decode"
                 and pending_curr.decode is not None
+                and pending_curr.chain_safe
                 and not self.waiting_queue
             )
             if can_chain and pending_next is None:
