@@ -214,7 +214,10 @@ class MlxAOTKernelContext:
         req_ids: list[str],
         req_pool_idx: dict[str, int],
         req_to_token_pool: Any | None,
-        layer_caches: list[list[Any]],  # only .offset is read (always absolute)
+        # Only .offset is read (absolute on every cache kind) and the slot
+        # lookup is layer-agnostic; the wrapper gates the fused pool scatter
+        # to full-attention layers.
+        layer_caches: list[list[Any]],
     ) -> MlxAOTKernelContext:
         """Build optional AOT context for one batched decode step."""
         if not aot_kernels.rope.enabled or kv_pool is None:

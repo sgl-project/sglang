@@ -5,10 +5,15 @@ scheduler (``TokenToKVPoolAllocator`` / ``RadixCache``).  This runner
 reads cached attention KV from ``MlxAttentionKVPool``, restores any
 native auxiliary layer state, runs the forward pass, and writes the new
 cache state back.  Each request keeps model-shaped cache entries:
-attention layers use ``ContiguousAttentionKVCache`` (or
-``WindowedAttentionKVCache`` for sliding-window layers on the
-``disable_radix_cache`` path) and auxiliary layers use native
-``mlx-lm`` cache objects.
+full-attention layers use ``ContiguousAttentionKVCache``, sliding-window
+layers use a fixed-size ``WindowedAttentionKVCache`` on both KV paths,
+and auxiliary layers use native ``mlx-lm`` cache objects.
+
+The shared pool stores full-attention layers only, so no cross-request
+SWA prefix KV exists: a radix prefix hit on a sliding-window model
+recomputes the whole prefix (a trailing-band rebuild is inexact because
+window receptive fields chain backwards through layers).  The
+scheduler's slot bookkeeping is untouched.
 
 The module also exposes a lazy-eval (`*_start` / `*_finalize`) surface
 used by the MLX overlap scheduler to pipeline CPU bookkeeping with
@@ -119,10 +124,6 @@ _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
 
-    # Default for instances built without __init__ (unit tests use
-    # object.__new__); never mutated.
-    _layer_window_sizes: dict[int, int | None] = {}
-
     def __init__(
         self,
         model_path: str,
@@ -161,6 +162,8 @@ class MlxModelRunner:
         self._cache_layout = MlxModelCacheLayout.from_attention_discovery(
             layer_list,
             attn_attrs,
+            # Per-layer sliding windows (container convention, e.g. gpt-oss).
+            layer_window_sizes=get_layer_window_sizes(self.model),
         )
         if self._cache_layout.num_attention_layers == 0:
             raise RuntimeError("MLX model has no supported attention layers")
@@ -170,22 +173,26 @@ class MlxModelRunner:
             raise RuntimeError(
                 "MLX models with auxiliary cache state require model.make_cache()."
             )
+        if (
+            self._cache_layout.has_auxiliary_state
+            and self._cache_layout.has_sliding_window_layers
+        ):
+            # Auxiliary-state restore assumes a prefix hit runs only the new
+            # tokens; an SWA prefix hit recomputes the prefix on a fresh cache.
+            raise NotImplementedError(
+                "MLX runner does not support models with both auxiliary "
+                "cache state and sliding-window attention layers."
+            )
         if self._cache_layout.has_auxiliary_state:
             self._model_embed, self._model_norm, self._model_lm_head = (
                 self._extract_model_components()
             )
         self._max_seq_len = 4096  # doubles on overflow
 
-        # Per-layer sliding windows (container convention, e.g. gpt-oss).
-        # Per-request path only: the radix path slices caches at absolute
-        # offsets to fill the pool, which windowed storage cannot serve.
-        self._layer_window_sizes: dict[int, int | None] = (
-            get_layer_window_sizes(self.model) if self.disable_radix_cache else {}
-        )
-
         self._req_caches: dict[str, list[Any]] = {}
         self._req_token_ids: dict[str, list[int]] = {}
-        self._cache_pool: list[list[Any]] = []  # reusable full-attention caches
+        # Reusable cache lists, for models without auxiliary layer state.
+        self._cache_pool: list[list[Any]] = []
 
         self._attention_kv_pool: MlxAttentionKVPool | None = None
         self._req_to_token_pool: ReqToTokenPool | None = None
@@ -219,7 +226,7 @@ class MlxModelRunner:
         """Create a model-shaped cache list with attention KV adapters."""
         cache = self._new_cache_skeleton()
         for layer_idx in self._cache_layout.attention_layer_indices:
-            window = self._layer_window_sizes.get(layer_idx)
+            window = self._cache_layout.window_size(layer_idx)
             cache[layer_idx] = (
                 WindowedAttentionKVCache(window)
                 if window is not None
@@ -353,13 +360,18 @@ class MlxModelRunner:
     def _cache_with_pool_backed_attention(
         self, prefix_slot_ids: list[int], prefix_len: int
     ) -> list[Any]:
+        """Build a prefill cache list gathering *prefix_len* pool tokens.
+
+        Only reachable without sliding-window layers (SWA prefix hits
+        recompute instead), so every attention layer here is pool-backed.
+        """
         assert self._attention_kv_pool is not None
         slot_ids_mx = mx.array(prefix_slot_ids, dtype=mx.int32)
         cache = self._new_cache_skeleton()
         for layer_idx in self._cache_layout.attention_layer_indices:
             cache[layer_idx] = PoolBackedAttentionKVCache(
                 self._attention_kv_pool,
-                self._cache_layout.attention_pool_index(layer_idx),
+                self._cache_layout.full_kv_pool_index(layer_idx),
                 slot_ids_mx,
                 prefix_len,
             )
@@ -512,11 +524,13 @@ class MlxModelRunner:
     ) -> tuple[int, int, mx.Dtype]:
         layer = self._cache_layout.layers[layer_idx]
         sample_attn = self._attention_module_for_layer(layer_idx)
-        if uses_sliding_window_attention(layer, sample_attn):
+        unsized_window = self._cache_layout.window_size(layer_idx) is None
+        if unsized_window and uses_sliding_window_attention(layer, sample_attn):
             raise NotImplementedError(
-                "MLX radix attention KV pool does not support sliding-window "
-                f"attention yet at layer {layer_idx}. Sliding-window KV needs "
-                "per-layer/window-aware pools."
+                f"Attention layer {layer_idx} declares sliding-window "
+                "attention but the model exposes no per-layer window map "
+                "(container `layer_types` plus a scalar window), so the MLX "
+                "KV cache cannot bound its sliding-window KV."
             )
         n_kv_heads = get_num_kv_heads(sample_attn)
         if n_kv_heads is None:
@@ -546,7 +560,11 @@ class MlxModelRunner:
         return n_kv_heads, head_dim, dtype
 
     def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
-        """Return the uniform attention KV config used by the shared MLX pool."""
+        """Return the uniform KV config shared by every attention layer.
+
+        Sizes the shared pool and the AOT kernels; sliding-window layers
+        must match the same shape because they share the decode kernels.
+        """
         if self._cache_layout.num_attention_layers == 0:
             raise RuntimeError(
                 "Cannot determine attention config: no attention module found"
@@ -557,12 +575,11 @@ class MlxModelRunner:
             config = self._attention_kv_config_for_layer(layer_idx)
             if config != first_config:
                 raise NotImplementedError(
-                    "MLX radix attention KV pool requires uniform softmax-attention "
+                    "MLX attention KV caching requires uniform softmax-attention "
                     "KV shape across layers. "
                     f"Layer {first_layer_idx} has {first_config}, "
                     f"but layer {layer_idx} has {config}. "
-                    "Heterogeneous attention KV or sliding-window KV needs "
-                    "per-layer pools."
+                    "Heterogeneous attention KV needs per-layer pools."
                 )
         return first_config
 
@@ -571,7 +588,13 @@ class MlxModelRunner:
         if explicit_size is not None:
             return explicit_size
         n_kv_heads, head_dim, dtype = self._get_attn_config()
-        num_layers = self._cache_layout.num_attention_layers
+        # Only full-attention layers occupy pool slots. All-SWA models have no
+        # pool at all and fall back to the all-layer formula purely to keep the
+        # scheduler's token budget finite.
+        num_layers = (
+            self._cache_layout.num_full_attention_layers
+            or self._cache_layout.num_attention_layers
+        )
         sys_available = psutil.virtual_memory().available
         mlx_limit = mx.device_info().get(
             "max_recommended_working_set_size",
@@ -616,15 +639,22 @@ class MlxModelRunner:
         )
 
     def init_cache_pools(self, req_to_token_pool: ReqToTokenPool | None) -> None:
-        """Create attention KV pool (+1 for padding slot 0)."""
+        """Create the full-attention KV pool (+1 for padding slot 0)."""
         self._req_to_token_pool = req_to_token_pool
         if self.disable_radix_cache:
+            return
+        num_pool_layers = self._cache_layout.num_full_attention_layers
+        if num_pool_layers == 0:
+            logger.info(
+                "All attention layers use sliding windows; skipping the "
+                "shared attention KV pool (windowed per-request caches only)."
+            )
             return
         n_kv_heads, head_dim, dtype = self._get_attn_config()
         # +1 for padding slot 0
         self._attention_kv_pool = MlxAttentionKVPool(
             pool_size=self._pool_size + 1,
-            num_layers=self._cache_layout.num_attention_layers,
+            num_layers=num_pool_layers,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             dtype=dtype,
@@ -632,7 +662,9 @@ class MlxModelRunner:
         logger.info(
             f"Attention KV pool initialized: pool_size={self._pool_size} "
             f"(buffer size {self._pool_size + 1} incl. padding slot 0), "
-            f"{self._cache_layout.num_attention_layers} attention layers, "
+            f"{num_pool_layers} full-attention layers "
+            f"({len(self._cache_layout.swa_attention_layer_indices)} "
+            "sliding-window layers stay per-request), "
             f"{n_kv_heads} kv_heads, {head_dim} head_dim"
         )
 
@@ -676,9 +708,15 @@ class MlxModelRunner:
         cache_start: int,
         slot_ids: list[int],
     ) -> None:
-        """Sync attention KV from contiguous cache to pool at the given slots."""
+        """Sync full-attention KV from contiguous caches to the pool slots.
+
+        Sliding-window layers are skipped: they keep no pool KV, and their
+        buffers are window-local so the absolute slicing below would not
+        apply to them anyway.
+        """
         if not slot_ids or self._attention_kv_pool is None:
             return
+        full_layer_indices = self._cache_layout.full_attention_layer_indices
         end = cache_start + len(slot_ids)
         slot_ids_mx = mx.array(slot_ids, dtype=mx.int32)
         # TODO: Standardize ContiguousAttentionKVCache size to avoid transpose
@@ -686,13 +724,13 @@ class MlxModelRunner:
         k_all = mx.stack(
             [
                 cache[layer_idx].keys[0, :, cache_start:end, :].transpose(1, 0, 2)
-                for layer_idx in self._cache_layout.attention_layer_indices
+                for layer_idx in full_layer_indices
             ]
         )
         v_all = mx.stack(
             [
                 cache[layer_idx].values[0, :, cache_start:end, :].transpose(1, 0, 2)
-                for layer_idx in self._cache_layout.attention_layer_indices
+                for layer_idx in full_layer_indices
             ]
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
@@ -778,7 +816,10 @@ class MlxModelRunner:
                 synced_offset=0,
             )
 
-        assert self._attention_kv_pool is not None
+        assert (
+            self._attention_kv_pool is not None
+            or self._cache_layout.num_full_attention_layers == 0
+        )
 
         new_token_count = len(new_token_ids)
         track_len = self._select_auxiliary_state_track_len(
@@ -788,8 +829,22 @@ class MlxModelRunner:
             req=req,
         )
 
-        if prefix_len > 0:
-            cache = self._cache_with_pool_backed_attention(prefix_slot_ids, prefix_len)
+        # Sliding-window layers keep no pool KV, so a prefix hit has nothing to
+        # gather and re-runs the prefix. A trailing-band rebuild would not be
+        # exact: each rebuilt position needs its own window of exact hidden
+        # states, and that dependency chains back through every layer. Only the
+        # run is clamped -- slot ids and synced offsets stay unclamped.
+        if prefix_len > 0 and self._cache_layout.has_sliding_window_layers:
+            trusted_prefix_len = 0
+            run_token_ids = list(full_token_ids[:prefix_len]) + new_token_ids
+        else:
+            trusted_prefix_len = prefix_len
+            run_token_ids = new_token_ids
+
+        if trusted_prefix_len > 0:
+            cache = self._cache_with_pool_backed_attention(
+                prefix_slot_ids[:trusted_prefix_len], trusted_prefix_len
+            )
             pool_backed_attention = True
             restored_auxiliary_state = (
                 not self._cache_layout.has_auxiliary_state
@@ -822,9 +877,11 @@ class MlxModelRunner:
             cache = self._acquire_cache()
             pool_backed_attention = False
 
-        if new_token_count > 0:
+        if run_token_ids:
             track_new_count = track_len - prefix_len if track_len is not None else None
             if track_new_count is not None and 0 < track_new_count < new_token_count:
+                # aux + SWA is rejected at init, so run_token_ids is
+                # new_token_ids on this branch.
                 input_ids = mx.array([new_token_ids[:track_new_count]], dtype=mx.int32)
                 self.model(input_ids, cache=cache)
                 self._store_tracked_auxiliary_state(req, cache, track_len)
@@ -833,9 +890,11 @@ class MlxModelRunner:
                     pool_backed_attention = False
                 extend_tokens = new_token_ids[track_new_count:]
             else:
-                extend_tokens = new_token_ids
+                extend_tokens = run_token_ids
         else:
-            # Full cache hit - rerun last token to get next-token logits
+            # Full cache hit - rerun last token to get next-token logits.
+            # Unreachable with SWA layers: a prefix rebuild always leaves run
+            # tokens whose final logits already predict the next token.
             extend_tokens = full_token_ids[-1:]
             for c in cache:
                 c.offset = max(c.offset - 1, 0)
@@ -1174,6 +1233,7 @@ class MlxModelRunner:
             attention_pool_index_by_layer=(
                 self._cache_layout.attention_pool_index_by_layer
             ),
+            full_kv_pool_index_by_layer=self._cache_layout.full_kv_pool_index_by_layer,
         )
 
     def decode_batch_start(self, req_ids: list[str]) -> MlxPendingDecode:

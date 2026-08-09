@@ -6,6 +6,10 @@ replaces: the cache arrays against a ``ContiguousAttentionKVCache`` trailing
 slice, the container forward against full-history caches, and
 ``MLXAttentionWrapper`` batched decode against the same wrapper driven by
 full-history caches.
+
+Sliding-window layers use this storage on both KV paths; how it composes
+with the shared pool and radix prefix hits is pinned in
+test_swa_radix_pool.py.
 """
 
 from __future__ import annotations
@@ -257,9 +261,8 @@ class TestModelRunnerCacheWiring(CustomTestCase):
         layers, attrs = find_attention_layers(_tiny_gpt_oss_model())
         runner = MlxModelRunner.__new__(MlxModelRunner)
         runner._cache_layout = MlxModelCacheLayout.from_attention_discovery(
-            layers, attrs
+            layers, attrs, layer_window_sizes=window_map
         )
-        runner._layer_window_sizes = window_map
         runner._max_seq_len = 4096
         runner._cache_pool = []
         return runner
@@ -278,8 +281,8 @@ class TestModelRunnerCacheWiring(CustomTestCase):
         )
         self.assertEqual(cache[0].window, WINDOW)
 
-        # Radix/pool path: __init__ leaves the map empty so pool-backed
-        # conversions keep absolute slicing intact.
+        # Models without container windows have an empty map, so every
+        # attention layer keeps a contiguous full-history cache.
         for c in self._stub_runner({})._new_native_cache():
             self.assertIsInstance(c, ContiguousAttentionKVCache)
 

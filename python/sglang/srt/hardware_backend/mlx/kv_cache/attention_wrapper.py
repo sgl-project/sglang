@@ -35,13 +35,15 @@ class BatchedDecodeContext:
 
     batch_size: int
     seq_lens: list[int]  # per-request token count before the new token
-    # attention_layer_caches[attention_pool_idx][req_idx]. Windowed caches
-    # hold only trailing-window KV, so read them through write_token/get_kv,
-    # never by slicing .keys at an absolute offset.
+    # attention_layer_caches[cache_idx][req_idx], dense over attention layers.
+    # Windowed caches hold only trailing-window KV, so read them through
+    # write_token/get_kv, never by slicing .keys at an absolute offset.
     attention_layer_caches: list[
         list[ContiguousAttentionKVCache | WindowedAttentionKVCache]
     ]
     attention_pool_index_by_layer: dict[int, int] = field(default_factory=dict)
+    # Dense index into the shared pool's buffers; full-attention layers only.
+    full_kv_pool_index_by_layer: dict[int, int] = field(default_factory=dict)
 
     # Optional AOT kernel state. Keep kernel-specific fields out of the regular
     # MLX decode path so future AOT kernels can be added without growing this
@@ -69,6 +71,15 @@ class BatchedDecodeContext:
             self.attention_pool_index_by_layer = {
                 idx: idx for idx in range(len(self.attention_layer_caches))
             }
+        if self.aot.rope is not None and not self.full_kv_pool_index_by_layer:
+            # No silent default here: the fused scatter addresses pool buffers
+            # by full-attention index, so falling back to the cache index would
+            # write the wrong buffer whenever sliding-window layers are
+            # interleaved. A model with a pool always has full layers to index.
+            raise ValueError(
+                "BatchedDecodeContext requires full_kv_pool_index_by_layer "
+                "when the fused AOT RoPE + pool-scatter kernel is active"
+            )
 
     @classmethod
     def from_decode(
@@ -82,6 +93,7 @@ class BatchedDecodeContext:
         req_to_token_pool: Any | None,
         attention_layer_indices: list[int] | None = None,
         attention_pool_index_by_layer: dict[int, int] | None = None,
+        full_kv_pool_index_by_layer: dict[int, int] | None = None,
     ) -> BatchedDecodeContext:
         batch_size = len(req_ids)
         if attention_layer_indices is None:
@@ -98,6 +110,7 @@ class BatchedDecodeContext:
             seq_lens=seq_lens,
             attention_layer_caches=attention_layer_caches,
             attention_pool_index_by_layer=attention_pool_index_by_layer or {},
+            full_kv_pool_index_by_layer=full_kv_pool_index_by_layer or {},
             aot=MlxAOTKernelContext.from_decode(
                 aot_kernels=aot_kernels,
                 kv_pool=kv_pool,
@@ -206,26 +219,28 @@ class MLXAttentionWrapper(nn.Module):
 
         # Vectorized RoPE with per-batch offsets (cached on the context).
         offsets = ctx.offsets
-        attention_pool_idx = ctx.attention_pool_index_by_layer[layer_idx]
+        cache_idx = ctx.attention_pool_index_by_layer[layer_idx]
+        window = self._window_size
 
-        if ctx.aot.rope is not None:
-            # AOT path: real .metallib RoPE + fused KV pool scatter.
+        if ctx.aot.rope is not None and window is None:
+            # AOT path: real .metallib RoPE + fused scatter into this layer's
+            # pool buffer.
             queries, keys = self._rope_custom_aot(
                 queries,
                 keys,
                 values,
                 offsets,
-                attention_pool_idx,
+                ctx.full_kv_pool_index_by_layer[layer_idx],
                 ctx.aot.rope,
             )
         else:
-            # Fallback: MLX's built-in mx.fast.rope (used when the AOT kernel
-            # isn't built or the model uses an unsupported RoPE variant).
+            # Fallback: MLX's built-in mx.fast.rope. Used when the AOT kernel
+            # isn't built, the model uses an unsupported RoPE variant, or the
+            # layer is sliding-window (windowed KV never enters the pool).
             queries = inner.rope(queries, offset=offsets)
             keys = inner.rope(keys, offset=offsets)
 
-        layer_caches = ctx.attention_layer_caches[attention_pool_idx]
-        window = self._window_size
+        layer_caches = ctx.attention_layer_caches[cache_idx]
         if window is None:
             pad_sizes = ctx.pad_sizes
         else:
@@ -305,14 +320,14 @@ class MLXAttentionWrapper(nn.Module):
         keys: mx.array,
         values: mx.array,
         positions: mx.array,
-        attention_pool_idx: int,
+        full_pool_idx: int,
         rope_ctx: MlxAOTRoPEContext,
     ) -> tuple[mx.array, mx.array]:
         """AOT path: rotate Q/K and scatter K/V into the shared pool.
 
         The kernel call does RoPE on Q/K and scatters
-        rotated K + (untouched) V into ``kv_pool`` at ``new_token_slots``
-        for ``layer_idx``.
+        rotated K + (untouched) V into ``kv_pool`` buffer ``full_pool_idx``
+        at ``new_token_slots``.
 
         If ``new_token_slots`` is None, slot=-1 sentinel is used (no pool
         write, RoPE-only mode). Returns rotated (queries, keys) in the
@@ -329,8 +344,8 @@ class MLXAttentionWrapper(nn.Module):
         else:
             slots = rope_ctx.new_token_slots.astype(mx.int32)
 
-        k_pool = rope_ctx.kv_pool.k_buffer[attention_pool_idx]
-        v_pool = rope_ctx.kv_pool.v_buffer[attention_pool_idx]
+        k_pool = rope_ctx.kv_pool.k_buffer[full_pool_idx]
+        v_pool = rope_ctx.kv_pool.v_buffer[full_pool_idx]
 
         q_rot, k_rot, k_pool_new, v_pool_new = rope_ctx.kernel.rope_pool_fused(
             q_flat,
@@ -346,8 +361,8 @@ class MLXAttentionWrapper(nn.Module):
             rope_base=rope_ctx.kernel.base,
         )
         # Rebind pool buffers (zero-copy donation result).
-        rope_ctx.kv_pool.k_buffer[attention_pool_idx] = k_pool_new
-        rope_ctx.kv_pool.v_buffer[attention_pool_idx] = v_pool_new
+        rope_ctx.kv_pool.k_buffer[full_pool_idx] = k_pool_new
+        rope_ctx.kv_pool.v_buffer[full_pool_idx] = v_pool_new
 
         # (B, n_heads, head_dim) -> (B, n_heads, 1, head_dim) for SDPA path
         return q_rot[:, :, None, :], k_rot[:, :, None, :]
