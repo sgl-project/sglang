@@ -86,7 +86,6 @@ class TestDSV4ToolStartToken(unittest.TestCase):
     routing.
     """
 
-    @unittest.expectedFailure
     def test_tool_start_token_is_set(self):
         """tool_start_token SHALL be set to '<｜DSML｜' so DSML blocks route to
         the tool call parser instead of staying in reasoning_content."""
@@ -94,7 +93,6 @@ class TestDSV4ToolStartToken(unittest.TestCase):
         self.assertIsNotNone(detector.tool_start_token)
         self.assertEqual(detector.tool_start_token, TOOL_START)
 
-    @unittest.expectedFailure
     def test_dsml_block_routes_to_normal_not_reasoning(self):
         """When the model emits reasoning then a DSML tool call (without an
         explicit think_end_token), the DSML block SHALL appear in normal_text
@@ -105,7 +103,6 @@ class TestDSV4ToolStartToken(unittest.TestCase):
         self.assertIn(TOOL_START, normal)
         self.assertNotIn(DSML_OPEN, reasoning)
 
-    @unittest.expectedFailure
     def test_joint_reasoning_then_tool_call_streaming(self):
         """End-to-end: reasoning parser routes DSML to tool parser, tool parser
         extracts the call."""
@@ -131,7 +128,6 @@ class TestDSV4ChunkBoundaryBUG2(unittest.TestCase):
     vulnerable base implementation.
     """
 
-    @unittest.expectedFailure
     def test_think_end_split_across_chunks_stream_reasoning(self):
         """With stream_reasoning=True and chunk_size > 1, a think_end_token
         split across chunk boundaries SHALL still be detected."""
@@ -151,7 +147,6 @@ class TestDSV4ChunkBoundaryBUG2(unittest.TestCase):
         # Normal text SHALL appear
         self.assertIn("normal text", r2.normal_text)
 
-    @unittest.expectedFailure
     def test_chunk_size_invariance_stream_reasoning(self):
         """Same input at different chunk sizes SHALL produce identical output."""
         source = f"{THINK_START}reasoning{THINK_END}normal answer"
@@ -182,7 +177,6 @@ class TestDSV4MultiThinkBlockBUG4(unittest.TestCase):
     of starting a new reasoning block.
     """
 
-    @unittest.expectedFailure
     def test_multi_think_block_cycling(self):
         """reasoning → think_end → content → think_start → reasoning → think_end → content
         SHALL produce two reasoning blocks and two normal blocks."""
@@ -212,7 +206,6 @@ class TestDSV4NonStreamingToolRouting(unittest.TestCase):
     """Non-streaming path: verify DSML block routing with and without
     tool_start_token fix."""
 
-    @unittest.expectedFailure
     def test_non_streaming_dsml_routes_to_normal(self):
         """In non-streaming mode, DSML tool call SHALL appear in normal_text
         (not reasoning_content) so the tool call parser can detect it."""
@@ -234,7 +227,6 @@ class TestDSV4NonStreamingToolRouting(unittest.TestCase):
 class TestDSV4ArgumentAssertions(unittest.TestCase):
     """Verify tool call arguments are correctly parsed when the fix is applied."""
 
-    @unittest.expectedFailure
     def test_tool_call_arguments_parsed(self):
         """When DSML routes to tool parser, arguments SHALL be correctly
         extracted as JSON."""

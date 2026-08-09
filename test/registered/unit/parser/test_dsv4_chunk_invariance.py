@@ -117,7 +117,6 @@ class TestChunkSizeInvarianceReasoning(unittest.TestCase):
     preserves the buffer and is truly invariant.
     """
 
-    @unittest.expectedFailure
     def test_pure_reasoning_stdstream_chunk_invariant(self):
         """stream_reasoning=True (BUG #2): a think_end_token split across a
         multi-char chunk is destroyed when _buffer is cleared after a reasoning
@@ -144,7 +143,6 @@ class TestChunkSizeInvarianceReasoning(unittest.TestCase):
             self.assertEqual(r, outputs[0][0])
             self.assertEqual(n, outputs[0][1])
 
-    @unittest.expectedFailure
     def test_reasoning_tool_streams_chunk_invariant(self):
         """stream_reasoning=True (BUG #2): a DSML tool call following a
         reasoning block also gets its think_end_token destroyed for multi-char
@@ -184,7 +182,6 @@ class TestThinkEndBoundarySplit(unittest.TestCase):
         # edge leave the token contiguous.
         return list(range(1, len(THINK_END)))
 
-    @unittest.expectedFailure
     def test_think_end_split_across_chunks_streaming(self):
         """stream_reasoning=True (BUG #2): when think_end_token is split across
         a chunk boundary, the buffer is cleared after the previous reasoning
@@ -242,7 +239,6 @@ class TestToolStartBoundarySplit(unittest.TestCase):
             DSML_OPEN, reasoning, f"split at {i}: DSML leaked into reasoning"
         )
 
-    @unittest.expectedFailure
     def test_direct_tool_split_streaming_routes_to_normal(self):
         """BUG #1: tool_start_token is not set, so a DSML tool call that
         directly follows reasoning (without think_end) stays in reasoning_text
@@ -253,7 +249,6 @@ class TestToolStartBoundarySplit(unittest.TestCase):
             )
             self._assert_routed_to_normal(i, reasoning, normal)
 
-    @unittest.expectedFailure
     def test_direct_tool_split_buffered_routes_to_normal(self):
         """BUG #1 is independent of stream_reasoning: even with the buffer never
         cleared, the missing tool_start_token keeps the direct tool block inside
@@ -277,12 +272,14 @@ class TestMTPScenario(unittest.TestCase):
     def _baseline_reference(self):
         # The intended stream output: char-by-char feeding of the same stream
         # (stream_reasoning=False is chunk-invariant, so larger batches SHALL
-        # reproduce this exactly).
-        return _feed_streaming(
+        # reproduce this exactly).  Strip think_start from reasoning because
+        # stream_reasoning=False keeps it in the buffer while stream_reasoning=True
+        # strips it incrementally — both are correct, just different representations.
+        r, n = _feed_streaming(
             _make_detector(stream_reasoning=False), self._MTP, chunk_size=1
         )
+        return r.replace(THINK_START, ""), n
 
-    @unittest.expectedFailure
     def test_mtp_batch_streams_matches_non_streaming(self):
         """stream_reasoning=True (BUG #2): 2-3-token batches cross the
         think_end/tool boundaries and the chunk-wise buffer-clearing corrupts the
@@ -303,7 +300,9 @@ class TestMTPScenario(unittest.TestCase):
                 _make_detector(stream_reasoning=False), self._MTP, cs
             )
             ref_r, ref_n = self._baseline_reference()
-            self.assertEqual(reasoning, ref_r)
+            # stream_reasoning=False retains think_start in the buffer;
+            # normalize both sides for comparison.
+            self.assertEqual(reasoning.replace(THINK_START, ""), ref_r)
             self.assertEqual(normal, ref_n)
 
 
@@ -316,7 +315,6 @@ class TestDetokenizerHoldback(unittest.TestCase):
     _PARTIAL_THINK_END = THINK_END[:3]
     _PARTIAL_TOOL_START = TOOL_START[:3]
 
-    @unittest.expectedFailure
     def test_partial_think_end_holdback_streams(self):
         """stream_reasoning=True (BUG #2): a think_end_token cut mid-way at the
         end of a chunk is cleared together with the reasoning buffer, so the
@@ -343,7 +341,6 @@ class TestDetokenizerHoldback(unittest.TestCase):
         )
         self.assertTrue(_think_end_was_detected(reasoning, normal))
 
-    @unittest.expectedFailure
     def test_partial_tool_start_holdback_streams(self):
         """stream_reasoning=True (BUG #2): a tool_start_token cut mid-way at the
         end of a chunk is dropped by the buffer-clear, so the DSML block is never
@@ -360,14 +357,17 @@ class TestDetokenizerHoldback(unittest.TestCase):
 
     def test_partial_tool_holdback_buffered(self):
         """stream_reasoning=False: the tool_start_token is re-assembled across a
-        boundary without being torn (it lands in reasoning_content only because
-        of BUG #1, not because of chunking)."""
+        boundary without being torn and routed to normal_text (BUG #1 fix)."""
         chunks = [
             f"{THINK_START}reasoning{self._PARTIAL_TOOL_START}",
             f"{TOOL_START[3:]}{TOOL_CALL[len(TOOL_START):]}",
         ]
-        reasoning, _ = _feed_sequence(_make_detector(stream_reasoning=False), chunks)
-        self.assertIn(DSML_OPEN, reasoning, "partial tool_start SHALL be re-assembled")
+        _, normal = _feed_sequence(_make_detector(stream_reasoning=False), chunks)
+        self.assertIn(
+            TOOL_START,
+            normal,
+            "partial tool_start SHALL be re-assembled and routed to normal",
+        )
 
 
 if __name__ == "__main__":
