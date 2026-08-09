@@ -1,0 +1,153 @@
+---
+name: kl-consistency-test
+description: Write, calibrate, and debug the prefill-vs-decode logprob (KL) consistency tests in sglang -- what they detect (radix-cache and conv/mamba state-reuse bugs), why batch-invariance has to be settled before a threshold means anything, and how to localize a divergence to a single operator. Use when adding a KL test to a model, picking or defending a kl_div threshold, or investigating a KL number that is too high.
+---
+
+# KL Consistency Tests
+
+## What the test is for
+
+`kl_test_utils` scores the same token twice -- once as a prefill input logprob, once
+as a decode output logprob -- and compares. The two paths run different kernels over
+different shapes, so agreement is a statement about **state**, not about answer
+quality: it catches a radix-cache prefix that does not reproduce a fresh prefill, a
+stale conv/mamba checkpoint, a SWA pool that evicted something it still needed.
+
+gsm8k passing says nothing about this. Accuracy is insensitive to a handful of
+corrupted tokens; the KL check is not.
+
+## The three helpers differ in what touches the cache
+
+`KLDivergenceMixin` runs the last two. Pick deliberately -- they are not
+interchangeable, and only the cache-hit pair exercises prefix reuse.
+
+| Helper | Cache involvement |
+|---|---|
+| `..._match_helper` | both sides flush; **no cache at all** |
+| `..._match_prefill_cache_hit_helper` | prompt is prefilled once to warm the cache, then the generation prefill restores from it |
+| `..._match_decode_cache_hit_helper` | decode side runs on a warmed cache |
+
+A divergence confined to one helper is diagnostic. `match` clean but
+`prefill_cache_hit` dirty means the restore path is wrong, not the arithmetic --
+float noise does not pick a code path.
+
+## Run it the way CI runs it
+
+`KLDivergenceMixin` defaults: `max_samples=32`, `max_new_tokens=512`. Do not
+characterize with fewer.
+
+`avg_kl_div` is the k3 estimator, `exp(logr) - 1 - logr`, applied to the sampled
+token's logprob. It is exponentially sensitive to the tail, so the mean is carried by
+a handful of tokens. At 4 samples the same config measured 0.049 to 0.158 -- a 3x
+spread that invalidates any A/B comparison drawn from it.
+
+When characterizing rather than gating, report tail statistics -- the fraction of
+tokens past a threshold, and the max -- rather than the mean.
+
+Generate past the sliding window if the model has one, so decode carries the window
+through the handover from prompt tokens to generated ones.
+
+## Determinism is not batch-invariance
+
+This distinction decides whether a threshold means anything.
+
+- **Deterministic**: same input, same shape, same result on every run.
+- **Batch-invariant**: a token's result does not depend on how many other tokens
+  share its batch.
+
+The KL check compares a prefill of thousands of tokens against decode steps of one,
+so it measures the second. `--enable-deterministic-inference` buys both -- it swaps
+the aten kernels for fixed-reduction versions and pins the NCCL algorithm and channel
+count -- but only for kernels it covers. Custom kernels that never reach an aten op
+are outside `batch_invariant_ops` and stay shape-dependent.
+
+The consequence: a nonzero KL under deterministic inference means some kernel on the
+path is still batch-dependent. Localize it (below) rather than widening the
+threshold.
+
+### MoE amplifies this to a degree dense models do not
+
+Top-k routing is a discrete decision over near-tied scores. A 1e-8 difference in gate
+weights flips which experts a token is routed to, the outputs diverge completely, and
+42 layers compound it. Measured on one MoE checkpoint: a gate GEMM that switched
+tiling between M=8 and M=16 produced a 1.6e-5 logits difference, which became 20-37
+nat on individual high-confidence tokens and a KL of 0.177.
+
+A dense model of comparable size shows the same root cause as ~1e-4. So a KL in the
+hundredths is not evidence of a worse bug on a MoE model -- it is the same class of
+numerical difference, amplified. Do not calibrate a MoE threshold by analogy to a
+dense one.
+
+## Choosing a threshold
+
+Once every kernel on the path is batch-invariant, prefill and decode agree **bit for
+bit** and the honest assertion is a stray-ulp floor, not a tolerance:
+
+```python
+KL_DIV_THRESHOLD = 1e-9   # measured 0; anything a state bug produces is orders above
+```
+
+A loose threshold tolerates float noise and small logic errors alike, which is how a
+state-reuse bug hides. Prefer running the KL case on its own deterministic server and
+asserting near-zero, and keep the accuracy case on the production numerics -- one
+server cannot serve both.
+
+Thresholds are per `(model, tp)`. A value calibrated at tp=1 does not transfer: tp=1
+has no all-reduce, so it never exercises the source that dominates at tp>1.
+
+## Localizing a divergence
+
+Ablations answer "does it change" but never "where". The forward-hook dumper points
+at the operator directly, and has done so reliably: run it once and read off the
+first layer whose output differs while its inputs are bit-identical.
+
+```bash
+DUMPER_ENABLE=0 DUMPER_SERVER_PORT=reuse DUMPER_NON_INTRUSIVE_MODE=all \
+DUMPER_DIR=/path/to/dumps python3 -m sglang.launch_server ... \
+  --disable-cuda-graph --disable-prefill-cuda-graph
+curl -X POST localhost:PORT/dumper/configure -d '{"enable": true, "exp_name": "dec"}'
+```
+
+Five settings that are each required, and each fails silently if wrong:
+
+- `DUMPER_ENABLE=0` **plus** `DUMPER_SERVER_PORT=reuse`. The port sentinel makes
+  `may_enable` true so the hooks register, while `enable=0` keeps warmup from
+  dumping. Enabling at boot dumps every warmup prefill -- that is how a run wrote
+  1.8T and filled a shared disk. Add a watchdog that kills the run below a free-space
+  floor.
+- `DUMPER_NON_INTRUSIVE_MODE=all`. The default `core` writes only `positions`,
+  `seq_lens`, `req_pool_indices`, `input_ids`, `rids` -- no module tensors, and no
+  error to tell you.
+- `DUMPER_SERVER_PORT=reuse` is a literal sentinel, not a port number; the
+  `/dumper/{method}` route only registers for that exact value.
+- `--disable-prefill-cuda-graph` on top of `--disable-cuda-graph`. Some models
+  default prefill onto a CUDA graph, and Python forward hooks do not run inside a
+  replay -- the prefill pass then dumps the embedding and nothing else.
+- Prefer `dumper.py` over `--debug-tensor-dump-*`: the latter asserts on a top-level
+  module named `model`, which multimodal wrappers do not have.
+
+**Prove the alignment before reading any diff.** Decode pass `k` and prefill row
+`plen + k` consume the same token, so the embedding output must be bit-identical. If
+it is not, the rows are misaligned and every downstream number is meaningless.
+Getting this wrong once produced a confident, entirely wrong root cause.
+
+Read the result as: the first layer where a module's **inputs are bit-identical and
+its output is not** is the operator. Everything after it inherits.
+
+## Confirm the mechanism, do not infer it
+
+Two failure modes cost the most time, both avoidable:
+
+- **A flag that changes nothing.** Bit-identical results before and after a toggle
+  mean the flag did not take effect -- a dispatch guarded on a hidden condition, a
+  path never taken for that config. Check the guard before concluding the component
+  is innocent.
+- **A harness that measures something else.** Capture through the helper's own
+  functions rather than reconstructing its inputs. Reconstructing them once appended
+  a generation twice and produced a plausible, wrong conclusion; another time a
+  different `num_samples` silently selected a different prompt set through the
+  `get_input_ids` cache key.
+
+For an isolated claim, reduce to a standalone repro. A ten-line script calling the
+suspect op at M=1 and M=288 settles batch-invariance in seconds, and belongs in the
+PR ahead of any end-to-end number.
