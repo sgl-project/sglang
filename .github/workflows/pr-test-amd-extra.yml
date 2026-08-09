@@ -53,7 +53,8 @@ on:
         description: 'Continue on error (do not fail the workflow on test failures)'
         required: false
         type: boolean
-        default: false
+        # Validation branch: never stop a sweep at the first failing test file.
+        default: true
   workflow_call:
     inputs:
       ref:
