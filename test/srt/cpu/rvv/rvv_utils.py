@@ -1,6 +1,17 @@
 import importlib.util
 
 import torch
+import torch.nn.functional as F
+
+
+def SiluAndMul(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    return F.silu(x[..., :d]) * x[..., d:]
+
+
+def GeluAndMul(x: torch.Tensor, approximate="tanh") -> torch.Tensor:
+    d = x.shape[-1] // 2
+    return F.gelu(x[..., :d], approximate=approximate) * x[..., d:]
 
 
 def has_sgl_kernel_op(op_name: str) -> bool:

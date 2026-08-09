@@ -2,13 +2,18 @@
 
 import itertools
 import unittest
-from test.registered.cpu.utils import GeluAndMul, SiluAndMul
 
 import torch
 
 from sglang.test.test_utils import CustomTestCase
 
-from .rvv_utils import has_sgl_kernel_op, helper_non_contiguous, precision
+from .rvv_utils import (
+    GeluAndMul,
+    SiluAndMul,
+    has_sgl_kernel_op,
+    helper_non_contiguous,
+    precision,
+)
 
 torch.manual_seed(1234)
 
