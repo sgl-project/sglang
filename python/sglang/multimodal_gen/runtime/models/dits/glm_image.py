@@ -20,13 +20,11 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     can_fuse_linear_gelu,
+    fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
-from sglang.kernels.ops.diffusion.residual_gate_add import (
-    can_use_residual_gate_add_cuda,
-    residual_gate_add_cuda,
-)
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
     can_use_fused_layernorm_modulate,
     can_use_fused_qk_head_layernorm,
@@ -79,7 +77,6 @@ _GLM_FUSED_LN_MOD_DISABLED = False
 _GLM_FUSED_LN_MOD_VERIFIED = False
 _GLM_FUSED_QK_LN_DISABLED = False
 _GLM_FUSED_QK_LN_VERIFIED = False
-_GLM_RESIDUAL_GATE_CUDA_DISABLED = False
 
 
 def _eager_ln_modulate(
@@ -187,34 +184,6 @@ def _glm_qk_layernorm(
             return q_ref, k_ref
 
     return norm_q(query).to(dtype=dtype), norm_k(key).to(dtype=dtype)
-
-
-def _glm_residual_gate_add(
-    residual: torch.Tensor,
-    update: torch.Tensor,
-    gate: torch.Tensor,
-) -> torch.Tensor:
-    """Single-kernel ``residual + gate * update``, bit-exact vs the eager pair.
-
-    Half dtypes only: for fp32 the kernel would contract to an fma (one
-    rounding) and stop being bit-exact.
-    """
-    global _GLM_RESIDUAL_GATE_CUDA_DISABLED
-
-    if (
-        not _GLM_RESIDUAL_GATE_CUDA_DISABLED
-        and residual.dtype in (torch.float16, torch.bfloat16)
-        and can_use_residual_gate_add_cuda(residual, update, gate)
-    ):
-        try:
-            return residual_gate_add_cuda(residual, update, gate)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling GLM residual-gate CUDA fast path: {exc}")
-            _GLM_RESIDUAL_GATE_CUDA_DISABLED = True
-
-    return residual + gate * update
 
 
 class GlmImageLayerKVCache:
@@ -491,9 +460,7 @@ class GlmImageGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
-            self.proj, hidden_states
-        ):
+        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -837,10 +804,10 @@ class GlmImageTransformerBlock(nn.Module):
 
         ff_output = self.ff(norm_hidden_states)
         ff_output_context = self.ff(norm_encoder_hidden_states)
-        hidden_states = _glm_residual_gate_add(
+        hidden_states = residual_gate_add(
             hidden_states, ff_output, gate_mlp.unsqueeze(1)
         )
-        encoder_hidden_states = _glm_residual_gate_add(
+        encoder_hidden_states = residual_gate_add(
             encoder_hidden_states, ff_output_context, c_gate_mlp.unsqueeze(1)
         )
 

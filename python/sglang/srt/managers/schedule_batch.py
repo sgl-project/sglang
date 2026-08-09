@@ -2073,6 +2073,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
+    mamba_track_mask_next_cpu: Optional[List[bool]] = None  # shape: [b]
+    mamba_decode_batch_idx_cpu: Optional[List[int]] = None  # shape: [b]
     # Lazy + spec: this iteration's per-req scatter positions
     # (see mamba_lazy_spec_prepare).
     mamba_lazy_spec_track_positions_cpu: Optional[List[int]] = None  # shape: [b]
@@ -3013,6 +3016,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
             from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
 
+            self.mamba_track_mask_cpu = None
+            self.mamba_track_mask_next_cpu = None
+            self.mamba_decode_batch_idx_cpu = None
             spec_prepare_for_decode(self)
             return
 
@@ -3063,11 +3069,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 
+            track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
+            track_mask_cpu = track_remainders_cpu == 0
+            self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+            self.mamba_track_mask_next_cpu = (
+                (track_remainders_cpu == mamba_track_interval - 1).tolist()
+                if self.enable_overlap
+                else None
+            )
+            # ScheduleBatch.copy() snapshots the list of requests, but the Req
+            # objects remain shared. The next overlapped decode can therefore
+            # advance their counters before this batch's result is processed.
+            self.mamba_decode_batch_idx_cpu = [
+                req.decode_batch_idx for req in self.reqs
+            ]
             # async H2D
-            self.mamba_track_mask = (
-                (self.seq_lens_cpu % mamba_track_interval == 0)
-                .pin_memory()
-                .to(device=self.device, non_blocking=True)
+            self.mamba_track_mask = track_mask_cpu.pin_memory().to(
+                device=self.device, non_blocking=True
             )
 
     def filter_batch(
@@ -3129,6 +3147,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_mask_cpu = None
+        self.mamba_track_mask_next_cpu = None
+        self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
@@ -3189,6 +3210,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_mask_cpu = None
+        self.mamba_track_mask_next_cpu = None
+        self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums = self.top_logprobs_nums + other.top_logprobs_nums
@@ -3247,6 +3271,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_mask_cpu=self.mamba_track_mask_cpu,
+            mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,
+            mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,
             mamba_lazy_spec_track_positions_cpu=self.mamba_lazy_spec_track_positions_cpu,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
