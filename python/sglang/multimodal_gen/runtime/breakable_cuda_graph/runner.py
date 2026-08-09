@@ -315,7 +315,17 @@ class BaseBreakableCudaGraphRunner:
             if not self.capture(**kwargs):
                 return self.transformer(**kwargs)
             entry = self.entries[key]
-        return self.replay(entry, kwargs)
+        try:
+            return self.replay(entry, kwargs)
+        except Exception as e:  # noqa: BLE001 — never break generation on replay
+            logger.warning(
+                "[Diffusion BCG] replay failed for signature %s (%s); "
+                "dropping all graphs and permanently running eager.",
+                _signature_summary(key),
+                e,
+            )
+            self.reset(disabled_reason=f"replay failed: {e}")
+            return self.transformer(**kwargs)
 
     def _log_signature_miss(self, key: tuple) -> None:
         """One-shot diagnostic: serving signature missed every captured graph."""
