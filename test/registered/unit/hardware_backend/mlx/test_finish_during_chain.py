@@ -1,36 +1,11 @@
-"""Adversarial regression guard for the Codex P1 comment on PR #33874.
+"""Finish during chain regression guards for the MLX overlap loop (PR #33874).
 
-PR #33874 makes ``_launch_chained`` (``hardware_backend/mlx/scheduler_mixin.py``)
-call ``ScheduleBatch.prepare_for_decode()`` once per chained continuation. The
-Codex review raised a P1: ``_launch_chained`` commits a chained step's
-position (real ``req_to_token`` slot, advanced ``kv_committed_len`` /
-``seq_lens``) BEFORE ``pending_curr`` is finalized, so a request that
-finishes at step N (its actual last forwarded token) still has step N+1
-committed underneath it. If the finish path's radix insert then used that
-over-committed length as its bound, it would cache a position whose KV was
-never legitimately produced for that request's real continuation.
-
-This module drives the real ``event_loop_overlap_mlx`` against real
-``ScheduleBatch``/``Req``/``ReqToTokenPool``/``TokenToKVPoolAllocator``/
-``RadixCache`` objects (mocking only the MLX model-forward boundary via
-``tp_worker.*``, same harness discipline as ``test_chained_decode_accounting.py``)
-to settle the claim empirically instead of by inspection alone.
-
-Triage result (see issues/33874/reports/codex-p1-triage.md for the full
-trace): the over-commit itself is real (confirmed below: ``kv_committed_len``
-ends up one past ``len(output_ids)``), but ``RadixCache.cache_finished_req``
-(``mem_cache/radix_cache.py``) derives its insert key from
-``req.origin_input_ids + req.output_ids`` and only *then* bounds it by
-``kv_len_to_handle`` -- a Python list slice past the list's real length is a
-no-op, not an out-of-bounds read -- so the over-committed position is never
-inserted into radix regardless of how far ``kv_committed_len`` overshot. The
-P1 as Codex framed it (radix serves KV that was never produced) does not
-reproduce. What the same over-commit *does* cause is a narrower, previously
-unflagged defect: the one over-committed token-pool slot is neither inserted
-nor freed, so it permanently leaks from the allocator. That leak is recorded
-here as a documented, separate, pre-existing-shape hazard (see
-``test_documents_leaked_kv_slot_on_finish_during_chain`` below) — it is not
-part of Codex's P1 claim and this module does not attempt to fix it.
+A request that finishes at step N while _launch_chained has prepared step N+1
+ends with kv_committed_len one past len(output_ids). These tests pin the
+consequences: the phantom position never enters the radix key, since
+cache_finished_req bounds by the token list rather than kv_committed_len; a
+reused row does not expose the old owner's entries; and the phantom slot
+currently leaks, documented below and tracked separately.
 """
 
 from __future__ import annotations
@@ -417,16 +392,10 @@ class TestFinishDuringChainRegressionGuard(CustomTestCase):
     def test_row_reuse_does_not_corrupt_the_new_owner_at_the_scheduler_level(
         self,
     ):
-        """req_a's row frees on finish; admit a third request onto it and
-        confirm the new owner's own committed range is exactly its own --
-        req_a's leftover slot ids do not leak into req_c's serving range.
-
-        This checks the scheduler-side (req_to_token / radix) half of the
-        row-reuse concern the Codex comment raised. It does not exercise
-        MlxModelRunner._sync_decode_kv_to_pool / remove_request (the
-        deferred MLX-native KV copy) -- see the triage report's C4 section:
-        that mechanism is real but pre-existing and tracked separately
-        (#30147), not introduced by this PR, and out of this test's scope.
+        """The freed row's new owner sees only its own committed range: req_a's
+        leftover slot ids and radix entries do not reach req_c. The deferred
+        MLX KV sync half of the row reuse concern is out of scope here,
+        tracked in #30147.
         """
         rtp, allocator, tree_cache, req_a, req_b, idx_a, idx_b = (
             self._drive_finish_during_chain(req_slots=2)
@@ -450,22 +419,11 @@ class TestFinishDuringChainRegressionGuard(CustomTestCase):
         self.assertEqual(len(set(row_c_committed) & set(row_b_committed)), 0)
 
     def test_documents_leaked_kv_slot_on_finish_during_chain(self):
-        """NOT part of the Codex P1 claim (which was about radix serving
-        unforwarded KV, refuted above). Separate, narrower finding from the
-        same trace: the one over-committed token-pool slot from
-        `_launch_chained`'s prepare_for_decode() is excluded from both the
-        radix insert (good -- see above) and release_kv_cache's
-        overallocation-release path, because `req.kv.kv_allocated_len` was
-        advanced in lockstep with `kv_committed_len` by the same
-        prepare_for_decode() call (`mem_cache/allocation.py`
-        `alloc_for_decode`), so `_release_overallocated_kv_indices` sees
-        `start_p == end_p` and frees nothing. The slot is allocated forever.
-
-        This is a pre-existing-shape hazard (mainline's non-chained overlap
-        decode has the structurally identical one-step-ahead allocation;
-        see the triage report's pivotal-question trace) made newly reachable
-        here because chained steps now draw real slots at all. Recorded,
-        not fixed, per the triage guardrails.
+        """Documents the leak, separate from the P1 claim: the over committed
+        slot is excluded from the radix insert and from
+        _release_overallocated_kv_indices, because kv_allocated_len advanced
+        in lockstep with kv_committed_len, so start_p == end_p and nothing
+        frees it. Flip the final assert to assertIn once the leak is fixed.
         """
         rtp, allocator, tree_cache, req_a, req_b, idx_a, idx_b = (
             self._drive_finish_during_chain()
