@@ -8,10 +8,10 @@ from functools import lru_cache
 
 import torch
 
-# A decoder retains roughly 15-25 MiB of device-side scratch space. Four
+# A decoder retains roughly 15-25 MiB of device-side scratch space. Two
 # decoders are enough to overlap JPEG decode without mirroring the much larger
 # I/O thread count into HBM usage.
-_DECODER_POOL_SIZE = 4
+_DECODER_POOL_SIZE = 2
 _DECODER_OPTIONS = ":num_cuda_streams=1 :fancy_upsampling=1"
 
 
