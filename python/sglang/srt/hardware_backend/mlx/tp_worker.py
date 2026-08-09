@@ -36,7 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_device, get_exec
+from sglang.srt.runtime_context import get_device
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +64,11 @@ class MlxTpModelWorker(TpModelWorker):
             disable_radix_cache=self.server_args.disable_radix_cache,
             mem_fraction_static=self.server_args.mem_fraction_static,
             quantization=self.server_args.quantization,
-            enable_sampling=get_device().mlx_enable_sampling,
-            sampling_rng_seed=get_device().random_seed,
-            deterministic_seeding=(
-                get_exec().deterministic.enable_deterministic_inference
-            ),
+            # server_args, not the runtime-context bags: worker init runs
+            # before the "device" / "exec" namespaces are published.
+            enable_sampling=self.server_args.mlx_enable_sampling,
+            sampling_rng_seed=self.server_args.random_seed,
+            deterministic_seeding=(self.server_args.enable_deterministic_inference),
         )
         if self.server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = self.server_args.max_total_tokens
