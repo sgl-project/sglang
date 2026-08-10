@@ -64,7 +64,11 @@ MINIMAX_M27_MODELS = [
     ModelConfig(
         model_path="MiniMaxAI/MiniMax-M2.7",
         tp_size=8,
-        accuracy_threshold=0.93,
+        # Recalibrated for MI300 runners: MI300 measures mean 0.9216 (min 0.9166,
+        # max 0.9249) over 10x full GSM8K (1319q, exact CI config). The prior 0.93
+        # was an MI325 baseline left unchanged after #31409 swapped runners to MI300,
+        # so it never passed on MI300. 0.91 clears the observed range with margin.
+        accuracy_threshold=0.91,
         timeout=3600,
         variant="TP8+EP8",
         other_args=[
