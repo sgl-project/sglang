@@ -3,7 +3,6 @@ from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from sgl_kernel_npu.activation.situ import situ
 
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
@@ -96,6 +95,9 @@ class NPUSitu(BaseActivation):
         beta: float = 4.0,
         linear_beta: Optional[float] = 25.0,
     ):
+        from sgl_kernel_npu.activation.situ import situ
+
+        self.situ = situ
         self.need_quant = need_quant
         self.beta = float(beta)
         self.linear_beta = None if linear_beta is None else float(linear_beta)
@@ -106,7 +108,7 @@ class NPUSitu(BaseActivation):
         group_list: torch.Tensor,
         group_list_type: int,
     ):
-        return situ(
+        return self.situ(
             hidden_states,
             group_list,
             group_list_type,
