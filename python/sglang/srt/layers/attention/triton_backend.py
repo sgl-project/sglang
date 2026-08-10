@@ -203,7 +203,7 @@ class TritonAttnBackend(AttentionBackend):
             // get_parallel().attn_tp_size
         ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
@@ -1527,9 +1527,19 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
         )
 
-        # Current chunk K/V is still local before masked cache write, so it can
-        # use the original extend kernel's current-token stage directly.
+        # Select the replicated K/V heads matching this rank's Q shard.
         if k.numel() > 0:
+            if layer.tp_k_head_num > 1:
+                kv_head_start = (
+                    group.rank_in_group * layer.tp_k_head_num // group.world_size
+                )
+                kv_head_end = max(
+                    (group.rank_in_group + 1) * layer.tp_k_head_num // group.world_size,
+                    kv_head_start + 1,
+                )
+                k = k[:, kv_head_start:kv_head_end]
+                v = v[:, kv_head_start:kv_head_end]
+
             empty_kv_indptr = torch.zeros_like(kv_indptr)
             self.extend_attention_fwd(
                 q_local,

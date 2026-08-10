@@ -56,7 +56,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.runtime.utils.vision import load_video
+from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -129,8 +129,8 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
         target_h, target_w = batch.height, batch.width
 
-        if isinstance(image_path, str) and image_path:
-            image = PIL.Image.open(image_path).convert("RGB")
+        if image_path is not None:
+            image = load_image(image_path)
             image = _resize_crop_pil(image, target_w, target_h)
             batch.preprocessed_image = _pil_to_normalized_tensor(image).unsqueeze(0)
             self.log_info(f"Preprocessed conditioning image to {target_w}x{target_h}")
@@ -440,9 +440,9 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
 
-        is_video_gen = batch.data_type == DataType.VIDEO
-        has_image_cond = batch.preprocessed_image is not None and is_video_gen
-        has_video_cond = batch.preprocessed_video is not None and is_video_gen
+        uses_visual_latents = batch.data_type in (DataType.VIDEO, DataType.ACTION)
+        has_image_cond = batch.preprocessed_image is not None and uses_visual_latents
+        has_video_cond = batch.preprocessed_video is not None and uses_visual_latents
 
         if has_image_cond or has_video_cond:
             vae_dtype = next(self.vae.parameters()).dtype
@@ -1387,6 +1387,56 @@ class Cosmos3DecodingStage(PipelineStage):
             OutputBatch,
         )
 
+        action_pred = None
+        if getattr(batch, "action_latents", None) is not None:
+            raw_action_dim = batch.extra.get("raw_action_dim")
+            action_pred = batch.action_latents.float().cpu()
+            if raw_action_dim is not None:
+                action_pred = action_pred[:, :, :raw_action_dim]
+            stats_path = getattr(batch.sampling_params, "action_stats_path", None)
+            if stats_path is not None:
+                method = getattr(
+                    batch.sampling_params, "action_normalization", "quantile"
+                )
+                action_pred = denormalize_action(
+                    action_pred, method, load_action_stats(stats_path)
+                )
+            self.log_info(f"Action predictions shape: {tuple(action_pred.shape)}")
+
+        action_domain_ids = batch.extra.get("action_domain_ids")
+        action_domain_id = (
+            int(action_domain_ids[0].item()) if action_domain_ids is not None else None
+        )
+        action_metadata = {
+            "action_mode": getattr(batch.sampling_params, "action_mode", None),
+            "action_domain_id": action_domain_id,
+            "action_raw_action_dim": (
+                batch.extra.get("raw_action_dim")
+                if getattr(batch, "extra", None)
+                else None
+            ),
+        }
+        if batch.data_type == DataType.ACTION:
+            if action_pred is None:
+                raise RuntimeError("Cosmos3 action request produced no action tensor")
+            payload = {
+                "request_id": batch.request_id,
+                "actions": action_pred[0].numpy(),
+                "action_mode": action_metadata["action_mode"],
+                "domain_id": action_metadata["action_domain_id"],
+                "raw_action_dim": action_metadata["action_raw_action_dim"],
+                "parameters": {
+                    "num_inference_steps": batch.num_inference_steps,
+                    "num_frames": batch.num_frames,
+                },
+            }
+            return OutputBatch(
+                output=[payload],
+                action_pred=action_pred,
+                metrics=batch.metrics if hasattr(batch, "metrics") else None,
+                **action_metadata,
+            )
+
         is_image_gen = batch.data_type == DataType.IMAGE
         self.log_info(
             "Decoding latents to image..."
@@ -1438,33 +1488,11 @@ class Cosmos3DecodingStage(PipelineStage):
                 f"Decoded audio tensor shape: {tuple(audio.shape)} @ {audio_sample_rate} Hz"
             )
 
-        action_pred = None
-        if getattr(batch, "action_latents", None) is not None:
-            raw_action_dim = batch.extra.get("raw_action_dim")
-            action_pred = batch.action_latents.float().cpu()
-            if raw_action_dim is not None:
-                action_pred = action_pred[:, :, :raw_action_dim]
-            stats_path = getattr(batch.sampling_params, "action_stats_path", None)
-            if stats_path is not None:
-                method = getattr(
-                    batch.sampling_params, "action_normalization", "quantile"
-                )
-                action_pred = denormalize_action(
-                    action_pred, method, load_action_stats(stats_path)
-                )
-            self.log_info(f"Action predictions shape: {tuple(action_pred.shape)}")
-
         return OutputBatch(
             output=output,
             audio=audio,
             audio_sample_rate=audio_sample_rate,
             action_pred=action_pred,
-            action_mode=getattr(batch.sampling_params, "action_mode", None),
-            action_domain_id=getattr(batch.sampling_params, "domain_id", None),
-            action_raw_action_dim=(
-                batch.extra.get("raw_action_dim")
-                if getattr(batch, "extra", None)
-                else None
-            ),
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
+            **action_metadata,
         )

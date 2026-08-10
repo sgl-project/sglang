@@ -1,10 +1,10 @@
-"""Quality-gated fused RMSNorm modulate/gate sites (Z-Image Triton suite reuse).
+"""Quality-gated fused RMSNorm modulate/gate sites.
 
 Adaln-style DiT blocks (Ideogram 4) spend four elementwise chains per block on
 modulate/gate around each RMSNorm: ``RMSNorm(x) * scale`` before
-attention/FFN and ``x + tanh(gate) * RMSNorm(out)`` after. The Z-Image
-bf16-native Triton kernels
-(:mod:`sglang.kernels.ops.diffusion.triton.zimage_native_norm`) fuse each
+attention/FFN and ``x + tanh(gate) * RMSNorm(out)`` after. Shared BF16-native
+Triton kernels
+(:mod:`sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm`) fuse each
 chain into a single kernel (RMSNorm + tanh + mul + add in one pass).
 
 Z-Image mounts those kernels unconditionally because they reproduce its own
@@ -24,16 +24,23 @@ every site on that transformer stays on the reference path.
 from __future__ import annotations
 
 import logging
-from typing import Iterator
+from importlib import import_module
 
 import torch
 import torch.nn as nn
+
+from sglang.kernels.ops.diffusion.quality_gate import QualityGatedFusion
 
 logger = logging.getLogger(__name__)
 
 # Attributes of the site protocol (set by ``mark_fused_gate_rmsnorm_site``).
 _SITE_NORM_ATTRS = "_sgl_fused_gate_rmsnorm_norm_attrs"
 _SITE_ENABLED_ATTR = "_sgl_fused_gate_rmsnorm_enabled"
+_FUSION = QualityGatedFusion(
+    name="fused gate RMSNorm",
+    marker_attr=_SITE_NORM_ATTRS,
+    enabled_attr=_SITE_ENABLED_ATTR,
+)
 
 # The Triton kernels mask a single block over the hidden dim.
 _MAX_HIDDEN_SIZE = 8192
@@ -43,11 +50,11 @@ def fused_rmsnorm_scale(
     x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, eps: float
 ) -> torch.Tensor | None:
     """``RMSNorm(x, weight, eps) * scale`` in one Triton kernel (or None)."""
-    from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
-        zimage_rmsnorm_scale,
+    from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
+        rmsnorm_scale,
     )
 
-    return zimage_rmsnorm_scale(x, weight, scale, eps)
+    return rmsnorm_scale(x, weight, scale, eps)
 
 
 def fused_rmsnorm_tanh_residual(
@@ -58,20 +65,20 @@ def fused_rmsnorm_tanh_residual(
     eps: float,
 ) -> torch.Tensor | None:
     """``residual + tanh(gate) * RMSNorm(x, weight, eps)`` fused (or None)."""
-    from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
-        zimage_rmsnorm_tanh_residual,
+    from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
+        rmsnorm_tanh_residual,
     )
 
-    return zimage_rmsnorm_tanh_residual(x, gate, residual, weight, eps)
+    return rmsnorm_tanh_residual(x, gate, residual, weight, eps)
 
 
 def _static_reject_reason(site: nn.Module) -> str | None:
     """Why ``site`` may never use the fused kernels, or None if it may."""
     try:
-        import triton  # type: ignore # noqa: F401
+        import_module("triton")
     except ImportError:
         return "triton unavailable"
-    for attr in getattr(site, _SITE_NORM_ATTRS, ()):
+    for attr in _FUSION.metadata(site, ()):
         norm = getattr(site, attr, None)
         weight = getattr(norm, "weight", None)
         if weight is None or weight.dim() != 1:
@@ -92,15 +99,12 @@ def mark_fused_gate_rmsnorm_site(module: nn.Module, norm_attrs: tuple[str, ...])
     keep the reference path bit-exact until :func:`mount_fused_gate_rmsnorm`
     enables it.
     """
-    setattr(module, _SITE_NORM_ATTRS, tuple(norm_attrs))
-    setattr(module, _SITE_ENABLED_ATTR, False)
+    _FUSION.mark(module, tuple(norm_attrs))
 
 
-def iter_fused_gate_rmsnorm_sites(root: nn.Module) -> Iterator[nn.Module]:
-    """Yield every marked site under ``root`` (including ``root``)."""
-    for module in root.modules():
-        if getattr(module, _SITE_NORM_ATTRS, None) is not None:
-            yield module
+def fused_gate_rmsnorm_active(module: nn.Module) -> bool:
+    """Whether the quality-gated fused path is mounted on ``module``."""
+    return _FUSION.is_enabled(module)
 
 
 def mount_fused_gate_rmsnorm(root: nn.Module) -> bool:
@@ -110,26 +114,9 @@ def mount_fused_gate_rmsnorm(root: nn.Module) -> bool:
     left (or reset) on the reference path and False is returned. Returns False
     as well when ``root`` has no marked sites.
     """
-    sites = list(iter_fused_gate_rmsnorm_sites(root))
-    if not sites:
-        return False
-    for site in sites:
-        reason = _static_reject_reason(site)
-        if reason is not None:
-            unmount_fused_gate_rmsnorm(root)
-            logger.info(
-                "fused gate RMSNorm: %s site failed static guards (%s); "
-                "keeping the whole model on the reference path",
-                type(site).__name__,
-                reason,
-            )
-            return False
-    for site in sites:
-        setattr(site, _SITE_ENABLED_ATTR, True)
-    return True
+    return _FUSION.mount(root, reject_reason=_static_reject_reason, logger=logger)
 
 
 def unmount_fused_gate_rmsnorm(root: nn.Module) -> None:
     """Reset every marked site under ``root`` to the bit-exact reference path."""
-    for site in iter_fused_gate_rmsnorm_sites(root):
-        setattr(site, _SITE_ENABLED_ATTR, False)
+    _FUSION.unmount(root)
