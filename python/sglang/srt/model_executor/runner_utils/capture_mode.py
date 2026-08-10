@@ -35,10 +35,11 @@ is_capture_mode = False
 # None = not dual, "lora" = capturing lora variant, "nolora" = capturing nolora variant.
 _capture_lora_variant: Optional[str] = None
 
-# When capturing dual DSA decode graphs (Design A dense/sparse), tracks which
-# variant is being captured. Read by the DSA indexer's capture-time skip-logits
-# branch to force k-only ("dense") vs full indexer ("sparse").
-# None = not dual-capturing (M2a static-env fallback applies).
+# When capturing dual DSA decode graphs (dense/sparse), tracks which variant is
+# being captured. Read by the DSA indexer's capture-time skip-logits branch to
+# force k-only ("dense") vs full indexer ("sparse").
+# None = not dual-capturing; the indexer then bakes in the full-indexer path,
+# which is correct for any kv_len.
 _capture_dsa_variant: Optional[str] = None
 
 

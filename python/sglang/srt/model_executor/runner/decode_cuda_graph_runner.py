@@ -231,7 +231,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.server_args.enable_profile_cuda_graph
         )
 
-        # --- DSA dense-decode dual-graph (Design A) --------------------
+        # --- DSA dense-decode dual-graph -------------------------------
         # Capture a "dense" (k-only, skip-indexer) and a "sparse" (full indexer)
         # decode graph per bs bucket, and dispatch on max_kv_len vs index_topk at
         # replay. Auto-enabled for DSA models (index_topk present in the HF
@@ -254,10 +254,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         hf_config = model_runner.model_config.hf_config
         if is_hip() and is_deepseek_dsa(hf_config):
             self.dsa_index_topk = get_dsa_index_topk(hf_config)
-        self.dsa_dual_graph = self.dsa_index_topk is not None
-        if self.dsa_dual_graph:
+            self.dsa_dual_graph = True
             logger.info(
-                "[dense-decode] Design A dual-graph enabled: capturing "
+                "[dense-decode] DSA dual-graph enabled: capturing "
                 "dense (k-only) + sparse (full indexer) decode graphs; "
                 "dispatch on max_kv_len vs index_topk=%d.",
                 self.dsa_index_topk,
@@ -484,8 +483,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return num_tokens if self.ragged_verify_mode else bs
 
     def _resolve_dsa_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
-        """Design A host dispatch: pick which pre-captured DSA decode graph to
-        replay from the batch-max kv_len. If any request has kv_len > index_topk
+        """Host dispatch: pick which pre-captured DSA decode graph to replay
+        from the batch-max kv_len. If any request has kv_len > index_topk
         the dense (k-only) graph would be wrong for it, so the whole batch uses
         the sparse (full indexer) graph. Returns None when dual-graph is off."""
         if not getattr(self, "dsa_dual_graph", False):
@@ -920,7 +919,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
-        # Design A: capture a dense (k-only) and a sparse (full indexer) graph
+        # DSA: capture a dense (k-only) and a sparse (full indexer) graph
         # per bs bucket. Order: dense first so its (smaller) capture-time peak
         # runs while the shared pool is fresh; sparse's peak subsumes it.
         # getattr default: subclasses like EAGLEDraftCudaGraphRunner reuse this

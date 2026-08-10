@@ -394,11 +394,12 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         # topk_transform(dummy_logits) already yields the correct "select-all"
         # (physical page-slot) indices. Skipping the logits path is safe here.
         #
-        # Prefill/extend: original fast path.
-        # Decode: NEW. Only enabled in eager (Milestone 1). Under a captured decode
-        # cuda graph the chosen branch is frozen at capture time and would replay
-        # incorrectly for kv_len > index_topk, so decode skip is gated off during
-        # capture and handled separately by graph-variant / eager-fallback (M2).
+        # Prefill/extend: original fast path, all platforms.
+        # Decode: new here, and ROCm-only for now (see the _is_hip gate below).
+        # Under a captured decode cuda graph the chosen branch is frozen at
+        # capture time and would replay incorrectly for kv_len > index_topk, so
+        # the decode skip is not decided per-step during capture; it is driven by
+        # which graph variant is being captured instead.
         fb = forward_batch
 
         # Prefill/extend: original per-step gate (host sync on seq_lens_cpu is fine).
@@ -425,10 +426,10 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
                 # host sync would break capture). The chosen branch is instead
                 # driven by which graph variant is being captured.
                 #
-                # Design A (dual graph): the decode runner captures a "dense"
-                # (k-only) and a "sparse" (full indexer) graph per bs bucket and
-                # dispatches on max_kv_len at replay. The capture-variant signal
-                # tells us which one to bake in.
+                # The decode runner captures a "dense" (k-only) and a "sparse"
+                # (full indexer) graph per bs bucket and dispatches on max_kv_len
+                # at replay. The capture-variant signal tells us which one to
+                # bake in.
                 from sglang.srt.model_executor.runner_utils.capture_mode import (
                     get_capture_dsa_variant,
                 )
