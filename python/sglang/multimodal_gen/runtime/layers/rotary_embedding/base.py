@@ -34,6 +34,7 @@ class RotaryEmbedding(CustomOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self.use_precomputed_cache = use_precomputed_cache
 
         if use_precomputed_cache:
             cache = self._compute_cos_sin_cache()
@@ -80,7 +81,7 @@ class RotaryEmbedding(CustomOp):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        if hasattr(self, "cos_sin_cache") or query.dim() == 3 or key.dim() == 3:
+        if self.use_precomputed_cache or query.dim() == 3 or key.dim() == 3:
             return self.forward_native(
                 query=query,
                 key=key,
@@ -157,6 +158,10 @@ class RotaryEmbedding(CustomOp):
                 **kwargs,
             )
 
+        raise ValueError(
+            "No valid inputs (complex_freqs, cos/sin, or cos_sin_cache) for interleaved RoPE."
+        )
+
     def forward_cuda(
         self,
         positions: Optional[torch.Tensor] = None,
@@ -173,7 +178,7 @@ class RotaryEmbedding(CustomOp):
 
         can_use_cuda = (
             (cos_sin_cache is not None or cos is not None and sin is not None)
-            and not hasattr(self, "cos_sin_cache")
+            and not self.use_precomputed_cache
             and query.dim() == 4
             and key.dim() == 4
         )
@@ -240,7 +245,7 @@ class RotaryEmbedding(CustomOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
 
-        if hasattr(self, "cos_sin_cache"):
+        if self.use_precomputed_cache:
             if offsets is not None:
                 positions = positions + offsets
             positions = positions.flatten()
