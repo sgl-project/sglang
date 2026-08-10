@@ -229,10 +229,10 @@ install_gdrcopy() {
 }
 
 clean_site_packages() {
-    # The torch compilation cache is deliberately NOT wiped here. Its entries are
-    # content-hash addressed, so a stale one is never reused, and hosts that pack
-    # several runners onto one box share the cache dir through a single mount -
-    # wiping it unlinks files a concurrent job is compiling against right now.
+    # The torch compilation cache is deliberately NOT wiped here: entries are
+    # content-hash addressed so stale ones are never reused, and hosts packing
+    # several runners share one cache mount - a wipe unlinks files a concurrent
+    # job is compiling against.
 
     # Remove broken dist-info directories (missing METADATA per PEP 376)
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
