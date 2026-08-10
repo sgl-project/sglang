@@ -363,7 +363,14 @@ class Lfm2Detector(BaseFormatDetector):
         Reuses pattern from PythonicDetector.
         """
         if isinstance(val, ast.Constant):
-            return val.value
+            if val.value is None or isinstance(val.value, (str, int, float)):
+                return val.value
+            # bytes/Ellipsis/complex have no JSON form; raising ValueError
+            # here lets the per-call handler skip this call instead of a
+            # TypeError inside json.dumps dropping every sibling call.
+            raise ValueError(
+                f"Constant has no JSON representation: {type(val.value).__name__}"
+            )
         elif isinstance(val, ast.Dict):
             return {
                 self._get_parameter_value(k): self._get_parameter_value(v)

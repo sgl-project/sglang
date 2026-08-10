@@ -4155,6 +4155,20 @@ class TestLfm2Detector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["query"], "hello")
 
+    def test_bytes_argument_skips_only_that_call(self):
+        """A bytes argument passed _get_parameter_value (it is an
+        ast.Constant) and only failed later as TypeError inside json.dumps,
+        which escaped the per-call handler and dropped every sibling call in
+        the block."""
+        text = (
+            "<|tool_call_start|>[get_weather(city='SF'), search(query=b'z')]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
     def test_streaming_recovers_multiline(self):
         """Streaming buffers the block and delegates to detect_and_parse;
         an incremental rewrite of the streaming path would bypass the
