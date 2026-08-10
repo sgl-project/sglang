@@ -870,6 +870,22 @@ def eagle_sample(
             spec_steps=verify_input.max_tree_depth - 1,
         )
 
+    if _is_hip:
+        # Sync the verify decision across TP ranks: ROCm always takes the greedy branch above
+        # (`_is_hip` is in its condition), whose per-rank argmax can pick different tokens when
+        # the AMD all-reduce feeding the logits is not bitwise identical. Ranks then accept a
+        # different number of drafts and the next TP collective deadlocks. Broadcast from rank 0
+        # to ensure consistency; the sampling branch above already does this for CUDA.
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
+
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
