@@ -3064,6 +3064,26 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
 
+    def preprocess_mm_for_encoder(
+        self,
+        mm_data,
+        modality,
+        config,
+        *,
+        image_processor=None,
+    ):
+        """Prepare per-image raw inputs for owner-side EPD preprocessing."""
+        if modality != Modality.IMAGE:
+            raise ValueError("Kimi-K3 encoder mode supports image input only")
+        if image_processor is None:
+            raise ValueError("Kimi-K3 encoder preprocessing needs an image processor")
+
+        from sglang.srt.multimodal.kimi_k3_image_processing import (
+            prepare_kimi_k3_encoder_inputs,
+        )
+
+        return prepare_kimi_k3_encoder_inputs(mm_data, image_processor)
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype

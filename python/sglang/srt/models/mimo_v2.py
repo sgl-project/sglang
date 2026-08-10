@@ -1244,7 +1244,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def preprocess_mm_for_encoder(self, mm_data, modality, config):
+    def preprocess_mm_for_encoder(
+        self, mm_data, modality, config, *, image_processor=None
+    ):
         if self._encoder_processor is None:
             from sglang.srt.multimodal.processors.mimo_v2 import MiMoProcessor
 

@@ -22,11 +22,19 @@ from sglang.srt.disaggregation.encode_receiver import (
     _select_mm_processor_prompt,
 )
 from sglang.srt.disaggregation.encode_server import MMEncoder, _get_mm_grid_dim
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.multimodal.encoder_preprocessing import (
+    EncoderPreprocessOutput,
+    get_encoder_preprocessed_items,
+)
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    DEFERRED_PREPROCESSING_KEY,
+    prepare_kimi_k3_encoder_inputs,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import resolve_encoder_transfer_backend
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -138,6 +146,69 @@ def test_kimi_k3_encoder_passes_media_dicts_to_image_processor():
     assert kwargs == {"return_tensors": "pt"}
 
 
+def _kimi_k3_image_processor():
+    return SimpleNamespace(
+        media_proc_cfg={
+            "patch_size": 2,
+            "merge_kernel_size": 2,
+            "in_patch_limit": 1024,
+            "patch_limit_on_one_side": 64,
+            "fixed_output_tokens": None,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "transparent_bg_config": {"type": "white"},
+        }
+    )
+
+
+def test_kimi_k3_epd_preprocess_preserves_raw_per_image_items():
+    first = Image.new("RGB", (8, 6), color=(1, 2, 3))
+    second = Image.new("RGB", (5, 9), color=(4, 5, 6))
+
+    output = prepare_kimi_k3_encoder_inputs(
+        [
+            {"type": "image", "image": first},
+            {"type": "image", "image": second},
+        ],
+        _kimi_k3_image_processor(),
+    )
+
+    items = get_encoder_preprocessed_items(output)
+    assert isinstance(output, EncoderPreprocessOutput)
+    assert len(items) == 2
+    assert output["original_image_sizes"] == [[8, 6], [5, 9]]
+    assert output["grid_thws"].tolist() == [[1, 4, 4], [1, 6, 4]]
+    for item, size in zip(items, ((6, 8), (9, 5))):
+        assert item.modality == Modality.IMAGE
+        assert item.feature.dtype == torch.uint8
+        assert item.feature.shape == (3, *size)
+        deferred = item.model_specific_data[DEFERRED_PREPROCESSING_KEY]
+        assert deferred["image_mean"] == [0.5, 0.5, 0.5]
+        assert deferred["image_std"] == [0.5, 0.5, 0.5]
+
+
+def test_kimi_k3_epd_model_preprocessor_receives_image_processor():
+    image = Image.new("RGB", (8, 6), color=(1, 2, 3))
+    image_processor = _kimi_k3_image_processor()
+    calls = []
+
+    def model_preprocessor(mm_data, modality, config, *, image_processor=None):
+        calls.append((mm_data, modality, config, image_processor))
+        return prepare_kimi_k3_encoder_inputs(mm_data, image_processor)
+
+    encoder = _encoder()
+    encoder.image_processor = image_processor
+    encoder.vision_config = {"image": {"return_tensors": "pt"}}
+    encoder._flatten_and_load_images = AsyncMock(return_value=[image])
+
+    output = asyncio.run(encoder._process_image_items([image], model_preprocessor))
+
+    assert len(calls) == 1
+    assert calls[0][0][0] == {"type": "image", "image": image}
+    assert calls[0][1:] == (Modality.IMAGE, encoder.vision_config, image_processor)
+    assert len(get_encoder_preprocessed_items(output)) == 1
+
+
 @pytest.mark.parametrize(
     ("use_image_processor_gpu", "expected_decode_mode"),
     [(False, False), (True, "nvjpeg_fancy")],
@@ -231,6 +302,67 @@ def test_kimi_k3_encoder_splits_cross_request_batch_into_single_grid_items():
 
     assert [embedding.shape[0] for embedding in output] == [2, 1, 2]
     torch.testing.assert_close(torch.cat(output), embeddings)
+
+
+def test_encoder_preprocessed_items_follow_dp_owner_selection_order():
+    encoder = _encoder()
+    grid_thws = torch.tensor([[1, 2, 2], [1, 2, 4], [1, 4, 2]])
+    items = [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.full((3, i + 2, i + 3), i, dtype=torch.uint8),
+            model_specific_data={"grid_thws": grid_thws[i : i + 1]},
+        )
+        for i in range(3)
+    ]
+    mm_inputs = EncoderPreprocessOutput(
+        {"pixel_values": [item.feature for item in items], "grid_thws": grid_thws},
+        mm_items=items,
+    )
+    embeddings = torch.arange(4, dtype=torch.float32).reshape(4, 1)
+    captured = {}
+
+    def get_feature_fn(selected_items):
+        captured["items"] = selected_items
+        return embeddings
+
+    output = encoder._encode_missing(
+        mm_inputs["pixel_values"],
+        mm_inputs,
+        indices=[2, 0],
+        modality=Modality.IMAGE,
+        get_feature_fn=get_feature_fn,
+        grid_thw=grid_thws,
+        keep_on_gpu=True,
+    )
+
+    assert captured["items"] == [items[2], items[0]]
+    assert [part.shape[0] for part in output] == [2, 1]
+    torch.testing.assert_close(torch.cat(output), embeddings[:3])
+
+
+def test_encoder_preprocessed_items_hash_individually():
+    encoder = _encoder()
+    grid_thws = torch.tensor([[1, 2, 2], [1, 2, 4]])
+    items = [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.full((3, 2, 2), value, dtype=torch.uint8),
+            model_specific_data={"grid_thws": grid_thws[i : i + 1]},
+        )
+        for i, value in enumerate((17, 29))
+    ]
+    mm_inputs = EncoderPreprocessOutput(
+        {"pixel_values": [item.feature for item in items], "grid_thws": grid_thws},
+        mm_items=items,
+    )
+
+    hashes = encoder._calculate_hashes_from_features(
+        mm_inputs["pixel_values"], grid_thws, Modality.IMAGE, mm_inputs
+    )
+
+    assert hashes == [item.hash for item in items]
+    assert hashes[0] != hashes[1]
 
 
 def test_kimi_k3_encoder_only_wrapper_guards_language_tower_hooks():
