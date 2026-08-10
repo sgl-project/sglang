@@ -116,10 +116,6 @@ def _load_moe_backend_enum():
     tree = ast.parse(MOE_UTILS_PATH.read_text())
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
     backend = classes["MoeRunnerBackend"]
-    # The `is_*()` predicates live on a plain base class in the same module
-    # (`_MoeRunnerBackendPredicates`), shared with the extension-supplied
-    # `RegisteredMoeRunnerBackend`. Exec any such in-module base first so the
-    # enum's own ClassDef can resolve its bases; `Enum` comes from `namespace`.
     body = [
         classes[base.id]
         for base in backend.bases
