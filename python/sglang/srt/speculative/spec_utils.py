@@ -118,6 +118,22 @@ def resolve_num_tokens_per_req(
     if phase == "target_verify":
         if num_draft_tokens is None:
             num_draft_tokens = spec.speculative_num_draft_tokens
+        if is_draft_worker:
+            # Custom algorithms may identify as DSpark while overriding the
+            # width hook below. Only the builtin owns this checkpoint-derived
+            # config-bag convention; plugins must retain their override.
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            if spec_algorithm is SpeculativeAlgorithm.DSPARK:
+                # DeepSpec runs a gamma-wide draft forward; speculators carries
+                # a separate conditioning anchor in slot 0 and therefore runs
+                # the full gamma + 1 verify window. Keep both outcomes in this
+                # resolver: the algorithm hook cannot see the checkpoint flag.
+                return (
+                    num_draft_tokens
+                    if spec.speculative_dspark_bonus_anchor
+                    else num_draft_tokens - 1
+                )
         return spec_algorithm.get_num_tokens_per_req_for_target_verify(
             num_draft_tokens, is_draft_worker
         )

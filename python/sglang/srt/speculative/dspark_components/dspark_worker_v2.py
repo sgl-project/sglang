@@ -154,6 +154,38 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
+        # speculators-trained checkpoints use a gamma+1-wide draft block
+        # (anchor is a separate bonus/conditioning token) instead of
+        # DeepSpec's gamma-wide anchor-first block -- see the docstring on
+        # DSparkDraftConfig.speculators_convention (dspark_config.py) and on
+        # DraftBlockProposer (dspark_draft.py). Threaded through to both the
+        # eager (DraftBlockProposer) and CUDA-graph-folded (DsparkDraftSampler)
+        # draft-sampling paths below.
+        self._bonus_anchor = runtime_config.speculators_convention
+        # The same fact is resolved twice by design: here from the draft config
+        # this worker actually loaded, and at startup onto ServerArgs (see
+        # _handle_dspark) because that is the only copy the CUDA-graph capture
+        # width can see. If they ever disagree the graph is captured at the
+        # wrong width, which surfaces far away as a draft-sampler ValueError
+        # during capture or a permanently eager draft forward. Fail here
+        # instead: this runs before init_attention_backends/init_cuda_graphs.
+        startup_bonus_anchor = bool(self.server_args.speculative_dspark_bonus_anchor)
+        if startup_bonus_anchor != bool(self._bonus_anchor):
+            raise ValueError(
+                "DSpark draft block layout was resolved inconsistently: the "
+                f"draft checkpoint says bonus_anchor={bool(self._bonus_anchor)} "
+                f"but startup resolution produced {startup_bonus_anchor}. The "
+                "CUDA-graph capture width is derived from the startup value, so "
+                "continuing would capture a mis-sized draft graph. Check that "
+                "--speculative-draft-model-path points at the checkpoint whose "
+                "config was read at startup."
+            )
+        if self.ps.tp_rank == 0 and self._bonus_anchor:
+            logger.info(
+                "DSpark draft checkpoint uses the speculators bonus-anchor "
+                "convention (gamma+1-wide draft block, anchor excluded from "
+                "sampling)."
+            )
 
         if self.ps.tp_rank == 0:
             logger.info(
@@ -171,8 +203,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
         )
+        # This spec-info width drives the draft attention backend's qo_indptr.
+        # Keep downstream verification at gamma real predictions, but include
+        # the conditioning-only anchor in the draft forward's attention width
+        # for speculators checkpoints.
+        draft_attention_width = self.gamma + int(self._bonus_anchor)
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.gamma), device=self.device
+            draft_token_num=int(draft_attention_width), device=self.device
         )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
@@ -229,6 +266,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
+            bonus_anchor=self._bonus_anchor,
         )
         self._verify_epilogue = None
         if (
@@ -398,6 +436,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            bonus_anchor=self._bonus_anchor,
         )
 
     def clear_cache_pool(self):

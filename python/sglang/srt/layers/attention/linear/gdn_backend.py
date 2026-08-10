@@ -13,6 +13,8 @@ from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    gather_ragged_verify_from_dense,
+    scatter_ragged_verify_to_dense,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -350,6 +352,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # ReplaySSM verification still assumes a rectangular token layout.
+        # Keep graph-enabled ragged verification scoped to the path validated here.
+        self.supports_ragged_verify_graph = not (
+            model_runner.server_args.enable_linear_replayssm
+            or model_runner.server_args.enable_linear_replayssm_spec
+        )
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -552,11 +560,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
             state_cache_indices = cache_indices
 
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
+            ragged_layout = forward_batch.spec_info.ragged_verify_layout
+            if ragged_layout is None:
+                batch_size = seq_len // draft_token_num
+                dense_token_indices = None
+                mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
+            else:
+                # Conv update and its per-step scratch require a dense
+                # [bs, draft_token_num] layout. Scatter packed ragged tokens to
+                # their step slots, then gather only real tokens back. Any graph
+                # tier leftovers share one value-irrelevant ghost row.
+                batch_size = query_start_loc.shape[0] - 1
+                mixed_qkv_dense, dense_token_indices = scatter_ragged_verify_to_dense(
+                    mixed_qkv,
+                    query_start_loc=query_start_loc,
+                    draft_token_num=draft_token_num,
+                )
+
+            mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -570,7 +592,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            if dense_token_indices is None:
+                mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(
+                    batch_size * draft_token_num, -1
+                )
+            else:
+                mixed_qkv = gather_ragged_verify_from_dense(
+                    mixed_qkv_processed.transpose(1, 2),
+                    dense_token_indices=dense_token_indices,
+                )
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:

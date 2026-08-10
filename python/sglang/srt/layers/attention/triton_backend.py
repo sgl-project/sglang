@@ -128,6 +128,7 @@ class TritonAttnBackend(AttentionBackend):
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
+    supports_ragged_verify_graph: bool = True
 
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -517,13 +518,25 @@ class TritonAttnBackend(AttentionBackend):
         ):
             num_draft_tokens = int(spec_info.draft_token_num)
         qo_indptr = self.qo_indptr[: bs + 1]
-        qo_indptr[: bs + 1] = torch.arange(
-            0,
-            (1 + bs) * num_draft_tokens,
-            step=num_draft_tokens,
-            dtype=torch.int32,
-            device=self.device,
+        ragged_layout = (
+            spec_info.ragged_verify_layout if spec_info is not None else None
         )
+        if ragged_layout is None:
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * num_draft_tokens,
+                step=num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            verify_lens = num_draft_tokens
+        else:
+            if ragged_layout.bs != bs or ragged_layout.cap is None:
+                ragged_layout = ragged_layout.padded_to_bucket(
+                    padded_bs=bs, cap=num_draft_tokens
+                )
+            qo_indptr.copy_(ragged_layout.qo_indptr_device)
+            verify_lens = ragged_layout.verify_lens
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
@@ -557,7 +570,7 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
         else:
             custom_mask = None
-        seq_mask_len = num_draft_tokens * (seq_lens + num_draft_tokens)
+        seq_mask_len = verify_lens * (seq_lens + verify_lens)
         mask_indptr = self.mask_indptr[: bs + 1]
         mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
@@ -858,13 +871,21 @@ class TritonAttnBackend(AttentionBackend):
                 and getattr(spec_info, "draft_token_num", None) is not None
             ):
                 num_draft_tokens = int(spec_info.draft_token_num)
-            qo_indptr = torch.arange(
-                0,
-                (1 + bs) * num_draft_tokens,
-                step=num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
+            ragged_layout = (
+                spec_info.ragged_verify_layout if spec_info is not None else None
             )
+            if ragged_layout is None:
+                qo_indptr = torch.arange(
+                    0,
+                    (1 + bs) * num_draft_tokens,
+                    step=num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            else:
+                # Packed compact verify has variable query lengths; a uniform
+                # [0, N, 2N, ...] indptr can point past the packed q/k/v tensors.
+                qo_indptr = ragged_layout.qo_indptr_device
             # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:

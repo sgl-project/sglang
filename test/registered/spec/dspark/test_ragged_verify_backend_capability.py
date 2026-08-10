@@ -28,15 +28,31 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
         from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
         from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 
         for backend in (
             TRTLLMHAAttnBackend,
             DeepseekV4AttnBackend,
             FlashAttentionBackend,
+            TritonAttnBackend,
+            KDAAttnBackend,
         ):
             with self.subTest(backend=backend.__name__):
                 self.assertTrue(backend.supports_ragged_verify_graph)
+
+    def test_gdn_capability_stays_instance_conditional(self):
+        """GDN is the one ragged-capable backend whose answer depends on
+        server_args (ReplaySSM keeps the graph path off), so it is derived per
+        instance in __init__. Promoting it to an unconditional class attribute
+        would silently enable ragged graphs for the ReplaySSM configuration,
+        which no other test covers; the class must keep inheriting the
+        conservative base default."""
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+        self.assertNotIn("supports_ragged_verify_graph", GDNAttnBackend.__dict__)
+        self.assertFalse(GDNAttnBackend.supports_ragged_verify_graph)
 
 
 if __name__ == "__main__":

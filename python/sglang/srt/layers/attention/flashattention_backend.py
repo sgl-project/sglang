@@ -820,8 +820,10 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
-                ragged_layout = getattr(
-                    forward_batch.spec_info, "ragged_verify_layout", None
+                ragged_layout = (
+                    forward_batch.spec_info.ragged_verify_layout
+                    if forward_batch.spec_info is not None
+                    else None
                 )
                 if ragged_layout is not None:
                     geometry = build_ragged_target_verify_geometry(
@@ -2877,7 +2879,9 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
-                ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+                ragged_layout = (
+                    spec_info.ragged_verify_layout if spec_info is not None else None
+                )
                 if ragged_layout is not None:
                     padded = ragged_layout.padded_to_bucket(padded_bs=bs)
                     geometry = build_ragged_target_verify_geometry(

@@ -2122,6 +2122,10 @@ class ServerArgs:
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
         NS("spec"),
     ] = None
+    # Resolved from the draft checkpoint in _handle_dspark, not user-facing.
+    # __post_init__ projects it into the spec config bag before any scheduler
+    # process is forked, so every rank and CUDA-graph capture sees the same layout.
+    speculative_dspark_bonus_anchor: A[bool, Arg(no_cli=True), NS("spec")] = False
     speculative_dspark_sps_table_path: A[
         Optional[str],
         "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "

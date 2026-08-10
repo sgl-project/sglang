@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -58,6 +59,48 @@ class TestTargetCheckpointBundlesDsparkDraft(CustomTestCase):
 
 
 class TestDsparkDraftPathDefaulting(CustomTestCase):
+    @patch(
+        "sglang.srt.speculative.dspark_components.dspark_config.read_draft_checkpoint_config"
+    )
+    def test_draft_config_is_read_once_for_gamma_and_layout(self, read_config):
+        read_config.return_value = SimpleNamespace(
+            resolve_gamma=lambda *, default=None: 7,
+            speculators_convention=True,
+        )
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.speculative_draft_model_path = "local-dspark-draft"
+        server_args.speculative_dspark_block_size = None
+        server_args.speculative_num_draft_tokens = None
+
+        _handle_dspark(server_args)
+
+        read_config.assert_called_once_with(server_args=server_args)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 8)
+        self.assertTrue(server_args.speculative_dspark_bonus_anchor)
+
+    @patch(
+        "sglang.srt.speculative.dspark_components.dspark_config.read_draft_checkpoint_config"
+    )
+    def test_explicit_gamma_still_reads_layout_once(self, read_config):
+        read_config.return_value = SimpleNamespace(
+            resolve_gamma=lambda *, default=None: 999,
+            speculators_convention=True,
+        )
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.speculative_draft_model_path = "local-dspark-draft"
+        server_args.speculative_dspark_block_size = 7
+        server_args.speculative_num_draft_tokens = None
+
+        _handle_dspark(server_args)
+
+        read_config.assert_called_once_with(server_args=server_args)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 8)
+        self.assertTrue(server_args.speculative_dspark_bonus_anchor)
+
     def test_bundled_checkpoint_defaults_draft_path_to_model_path(self):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()

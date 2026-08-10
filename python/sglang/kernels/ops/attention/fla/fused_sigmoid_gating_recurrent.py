@@ -197,7 +197,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        # Match the production packed-decode path and fused_gdn_gating:
+        # sigmoid is materialized in the activation dtype before the FP32
+        # recurrent update. Keeping beta in FP32 here makes target-verify state
+        # drift from ordinary decode after every accepted token.
+        b_beta = (1.0 / (1.0 + tl.exp(-b_b))).to(b.dtype.element_ty).to(tl.float32)
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --

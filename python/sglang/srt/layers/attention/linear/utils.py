@@ -99,6 +99,72 @@ def resolve_linear_attn_backends(
     return backends
 
 
+def ragged_verify_dense_scatter_indices(
+    *,
+    query_start_loc,
+    seq_len: int,
+    draft_token_num: int,
+):
+    """Dense [bs, draft_token_num] slot index per packed ragged-verify token.
+
+    Rows never exceed draft_token_num under either layout variant (cap for
+    graph replay, planner construction for eager -- see
+    RaggedVerifyLayout.padded_to_bucket), so in-row offsets stay in-row;
+    tokens past the layout's coverage collapse into one ghost row at index
+    bs * draft_token_num.
+    """
+    import torch
+
+    batch_size = query_start_loc.shape[0] - 1
+    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
+    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
+    return (
+        token_slots * draft_token_num
+        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
+    ).clamp_(max=batch_size * draft_token_num)
+
+
+def scatter_ragged_verify_to_dense(
+    values,
+    *,
+    query_start_loc,
+    draft_token_num: int,
+):
+    """Scatter packed ragged rows into ``[bs, draft_token_num, ...]``.
+
+    Graph-tier leftovers map to one extra ghost row. The returned dense tensor
+    excludes that row; callers retain the indices to gather processed values
+    back to the original packed order.
+    """
+    batch_size = query_start_loc.shape[0] - 1
+    num_dense_tokens = batch_size * draft_token_num
+    dense_token_indices = ragged_verify_dense_scatter_indices(
+        query_start_loc=query_start_loc,
+        seq_len=values.shape[0],
+        draft_token_num=draft_token_num,
+    )
+    dense_with_ghost = values.new_zeros((num_dense_tokens + 1, *values.shape[1:]))
+    dense_with_ghost.index_copy_(0, dense_token_indices, values)
+    dense = dense_with_ghost[:num_dense_tokens].view(
+        batch_size, draft_token_num, *values.shape[1:]
+    )
+    return dense, dense_token_indices
+
+
+def gather_ragged_verify_from_dense(dense_values, *, dense_token_indices):
+    """Gather processed dense rows back to their packed ragged order.
+
+    Appending a zero ghost row keeps uncovered graph-tier tokens finite while
+    preserving the same discard semantics as the scatter step.
+    """
+    flat_values = dense_values.reshape(-1, *dense_values.shape[2:])
+    flat_with_ghost = flat_values.new_zeros(
+        (flat_values.shape[0] + 1, *flat_values.shape[1:])
+    )
+    flat_with_ghost[:-1].copy_(flat_values)
+    return flat_with_ghost[dense_token_indices]
+
+
 def build_verify_intermediate_state_indices(
     pool_size: int, server_args: ServerArgs, device
 ):
