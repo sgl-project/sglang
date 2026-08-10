@@ -74,6 +74,7 @@ class _MockTokenizerManager:
         self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
         self.served_model_name = "test-model"
+        self._config_updates = []
 
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
@@ -108,6 +109,13 @@ class _MockTokenizerManager:
 
         self.generate_request = Mock(return_value=_mock_generate())
         self.create_abort_task = Mock()
+
+    def config_value(self, name: str):
+        """The manager's overlay accessor: no control-plane update recorded."""
+        for _source, fields in reversed(self._config_updates):
+            if name in fields:
+                return fields[name]
+        return getattr(self.server_args, name)
 
 
 class _MockTemplateManager:
@@ -147,6 +155,35 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    def test_parsers_follow_the_control_plane_overlay(self):
+        """Template detection records the parsers on the manager, not on its
+        ServerArgs — the instance keeps what the launcher passed."""
+        self.tm.server_args.tool_call_parser = "auto"
+        self.tm.server_args.reasoning_parser = "auto"
+        self.tm._config_updates.append(
+            (
+                "template-detection",
+                {"tool_call_parser": "qwen25", "reasoning_parser": None},
+            )
+        )
+
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+
+        self.assertEqual(chat.tool_call_parser, "qwen25")
+        self.assertIsNone(chat.reasoning_parser)
+        self.assertEqual(self.tm.server_args.tool_call_parser, "auto")
+
+    def test_the_xgrammar_gate_follows_the_overlay(self):
+        """A detected `reasoning_parser` must gate xgrammar, not the seed's "auto"."""
+        self.tm.server_args.reasoning_parser = "auto"
+        self.tm._config_updates.append(
+            ("template-detection", {"reasoning_parser": "qwen3"})
+        )
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.assertEqual(chat.reasoning_parser, "qwen3")
+        # the gate reads the same value the parser was built from
+        self.assertIsNotNone(chat.reasoning_parser)
 
     def test_text_only_model_rejects_media_before_generation(self):
         media_parts = {
@@ -3016,6 +3053,26 @@ class InklingReasoningEffortTest(unittest.TestCase):
                     get()
         finally:
             env.clear()
+
+    def test_thinking_disabled_maps_to_no_thinking_effort(self):
+        """Bug regression: Inkling is an always-on parser, so Anthropic
+        thinking={"type": "disabled"} was rejected outright even though effort
+        "none" (0.0) expresses exactly that."""
+        serving = object.__new__(OpenAIServingChat)
+        serving.reasoning_parser = "inkling"
+        serving.template_manager = Mock(reasoning_config=None)
+        serving._reasoning_detector = Mock(reasoning_default="always")
+        request = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        serving.apply_reasoning_enabled(request, False)
+        self.assertEqual(request.reasoning_effort, "none")
+
+        # Enabling leaves an effort set via output_config.effort alone.
+        request.reasoning_effort = "low"
+        serving.apply_reasoning_enabled(request, True)
+        self.assertEqual(request.reasoning_effort, "low")
 
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
