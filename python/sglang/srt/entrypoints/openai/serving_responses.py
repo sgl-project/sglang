@@ -569,7 +569,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
-            stream=request.stream,
+            stream=request.stream if request.stream is not None else False,
             tools=chat_tools or None,
             tool_choice=(
                 self._chat_tool_choice(request.effective_tool_choice())
