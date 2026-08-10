@@ -730,9 +730,7 @@ class TestLoraReleaseOnAbort(CustomTestCase):
         }
 
         async def drive():
-            abort_out = await tm._handle_abort_finish_reason(
-                out, state, is_stream=True
-            )
+            abort_out = await tm._handle_abort_finish_reason(out, state, is_stream=True)
             self.assertIsNotNone(abort_out)
             await asyncio.sleep(0)
 
