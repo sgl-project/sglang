@@ -15,25 +15,10 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.runtime_context import get_context  # noqa: E402
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
-
-
-import pytest as _pytest_defer
-
-_DEFER_REASON = (
-    "Temporarily skipped during the ServerArgs config-namespace migration; "
-    "re-enabled once the runtime-config accessor API stabilizes."
-)
-pytestmark = _pytest_defer.mark.skip(reason=_DEFER_REASON)
-
-
-def setUpModule():
-    import unittest
-
-    raise unittest.SkipTest(_DEFER_REASON)
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -119,6 +104,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
     def _new_queue(self, decode_reqs, *, low_priority_values_first: bool = False):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
         queue.queue = list(decode_reqs)
         queue.pending_reqs = []
         queue.retracted_queue = []
@@ -441,9 +427,8 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         scheduler.enable_overlap = False
         scheduler.spec_algorithm = MagicMock()
         scheduler.max_running_requests = 1
-        scheduler.server_args = SimpleNamespace(
-            disaggregation_decode_enable_radix_cache=False
-        )
+        # Passed whole into the (mocked) batch's process_prebuilt; never read.
+        scheduler.server_args = SimpleNamespace()
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()
         scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
@@ -451,10 +436,14 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         )
 
         new_batch = MagicMock()
+        # get_new_prebuilt_batch reads the published disagg config
+        # (disaggregation_decode_enable_radix_cache).
         with patch(
             "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
             return_value=new_batch,
-        ) as init_new:
+        ) as init_new, get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=False
+        ):
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch
             )

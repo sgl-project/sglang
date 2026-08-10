@@ -5,12 +5,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import dataclasses
+import json
 import os
+import shutil
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups.arg_utils import A, Arg
+from sglang.srt.arg_groups.arg_utils import NS, A, Arg
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
@@ -20,8 +23,10 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
     get_server_args,
+    max_speculative_num_draft_tokens,
     reset_context,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 _PS = "sglang.srt.distributed.parallel_state"
@@ -215,8 +220,10 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         self.assertIs(get_server_args(), sentinel)
         self.assertIs(get_context().server_args, sentinel)
 
-    def test_tokenizer_alias_is_same_function(self):
-        self.assertIs(
+    def test_tokenizer_alias_is_distinct_role_shim(self):
+        # Deliberately NOT an alias: the two legacy setters publish with
+        # different process roles (scheduler vs tokenizer).
+        self.assertIsNot(
             server_args_module.set_global_server_args_for_tokenizer,
             server_args_module.set_global_server_args_for_scheduler,
         )
@@ -258,9 +265,9 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         # unnamed fields keep their dataclass defaults
         self.assertEqual(published.tp_size, 1)
 
-    def test_fields_carry_provenance(self):
-        published = get_context().override_server_args(tp_size=4).install()
-        self.assertIn(("test-override", {"tp_size": 4}), published._runtime_mutations)
+    def test_unknown_fields_are_rejected(self):
+        with self.assertRaises(ValueError):
+            get_context().override_server_args(not_a_config_field=1).install()
 
     def test_restore_reinstates_previous_publish(self):
         previous = object()
@@ -296,12 +303,11 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
 
     def test_installed_config_arms_the_strict_guard(self):
         # The published dummy must behave like a resolved config: bare writes
-        # raise under the strict harness; override() stays the entry point.
+        # raise.
         published = get_context().override_server_args(tp_size=2).install()
         with self.assertRaises(AttributeError):
             published.tp_size = 4
-        published.override(source="test", tp_size=4)
-        self.assertEqual(published.tp_size, 4)
+        self.assertEqual(published.tp_size, 2)
 
     def test_restore_resets_the_capture_seed(self):
         # install() seeds flags.capture from the published dummy; restore()
@@ -373,8 +379,18 @@ class TestFlagsTier(_IsolatedServerArgs):
 class _FakeResolvedArgs:
     """Publishable fixture with a resolvable whitelist (real flat leaves)."""
 
-    page_size: A[int | None, Arg(help="p", resolvable=True)] = None
-    sampling_backend: A[str | None, Arg(help="s", resolvable=True)] = None
+    page_size: A[int | None, Arg(help="p", resolvable=True), NS("schedule")] = None
+    sampling_backend: A[
+        str | None, Arg(help="s", resolvable=True), NS("exec.kernel")
+    ] = None
+    attention_backend: A[str | None, Arg(help="ab"), NS("exec.kernel")] = None
+    prefill_attention_backend: A[str | None, Arg(help="pab"), NS("exec.kernel")] = None
+    decode_attention_backend: A[str | None, Arg(help="dab"), NS("exec.kernel")] = None
+    disable_radix_cache: A[bool, Arg(help="drc"), NS("memory")] = False
+    mamba_radix_cache_strategy: A[str, Arg(help="mrcs"), NS("exec.mamba")] = "auto"
+    speculative_num_draft_tokens: A[int | None, Arg(help="d"), NS("spec")] = None
+    speculative_adaptive: A[bool, Arg(help="a"), NS("spec")] = False
+    speculative_adaptive_config: A[str | None, Arg(help="c"), NS("spec")] = None
     _resolved_overrides: list = dataclasses.field(default_factory=list)
 
 
@@ -399,6 +415,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             tbo_token_distribution_threshold=0.48,
             disable_flashinfer_cutlass_moe_fp4_allgather=False,
             quantization=None,
+            disable_shared_experts_fusion=False,
         )
         defaults.update(kw)
         initialize_moe_config(SimpleNamespace(**defaults))
@@ -755,6 +772,33 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertEqual(probe(torch.zeros(())).item(), 28)
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
+    def test_parallel_config_leaves_trace_under_torch_compile(self):
+        # Regression: parallel config leaves resolve through
+        # ``ParallelContext.__getattr__`` (the bag fallback), and gate helpers
+        # such as ``enable_moe_dense_fully_dp()`` read them inside compiled
+        # model forwards — the fallback body must stay dynamo-traceable
+        # (``object.__getattribute__`` graph-breaks). fullgraph=True turns any
+        # graph break back into a failure.
+        import torch
+
+        from sglang.srt.runtime_context import get_parallel
+
+        reset_context()
+        with get_context().override_server_args(moe_dense_tp_size=1, dwdp_size=4):
+
+            @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+            def probe(x):
+                par = get_parallel()
+                if par.enable_prefill_context_parallel:
+                    x = x + 1
+                if par.moe_dense_tp_size == 1:
+                    x = x + 2
+                if par.dwdp_size > 1:
+                    x = x + 4
+                return x
+
+            self.assertEqual(probe(torch.zeros(())).item(), 6)
+
     def test_graph_visible_flags_are_process_visible_across_threads(self):
         # Documented divergence from the contextvar-backed flags: plain slots
         # are process-global (the storage form these flags had before the
@@ -894,6 +938,23 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertTrue(fwd.flashinfer_trtllm_bypass)
         self.assertFalse(fwd.flashinfer_trtllm_bypass)
 
+    def test_dp_reduce_scatterv_requires_single_rank_attention_dp_shards(self):
+        from sglang.srt.layers.moe.utils import should_use_dp_reduce_scatterv
+
+        reset_context()
+        with patch(
+            "sglang.srt.layers.moe.utils.is_dp_attention_enabled",
+            return_value=True,
+        ):
+            # The optimized path is valid when the collective group and the
+            # variable-split list have the same number of entries.
+            with get_parallel().override(tp_size=8, attn_dp_size=8, moe_ep_size=8):
+                self.assertTrue(should_use_dp_reduce_scatterv())
+
+            # Otherwise the standard all-reduce plus scatter path must be used.
+            with get_parallel().override(tp_size=8, attn_dp_size=2, moe_ep_size=2):
+                self.assertFalse(should_use_dp_reduce_scatterv())
+
 
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
@@ -916,33 +977,180 @@ class TestPublishLifecycle(_IsolatedServerArgs):
         get_context().set_server_args(object())
         self.assertFalse(get_flags().capture.enable_torch_compile)
 
-    def test_declare_load_time_override_writes_through(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
 
-        args = self._publish(page_size=1)
-        declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(args.page_size, 64)
+class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
+    """One definition per predicate, checked rather than asserted in prose.
 
-    def test_declare_load_time_override_validates_whitelist(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
+    Each of these exists twice by construction -- once over a config-shaped
+    object (the resolution pipeline's `*_of` helper, which `ServerArgs`
+    delegates to) and once over the published bags. The pair must agree on
+    every input, or a decision made before publish differs from the same
+    decision made after it.
+    """
 
-        args = self._publish(page_size=1)
-        with self.assertRaises(ValueError):
-            declare_load_time_override("bad", {"nope": 1})
-        self.assertEqual(args.page_size, 1)
+    _STRATEGIES = ("auto", "no_buffer", "extra_buffer", "extra_buffer_lazy")
 
-    def test_declare_load_time_override_records_provenance(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
+    def test_mamba_extra_buffer_matches_the_member(self):
+        from sglang.srt.runtime_context import (
+            mamba_extra_buffer_enabled,
+            mamba_extra_buffer_lazy_enabled,
+        )
+
+        for disable_radix_cache in (False, True):
+            for strategy in self._STRATEGIES:
+                with self.subTest(radix=disable_radix_cache, strategy=strategy):
+                    args = _FakeResolvedArgs(
+                        disable_radix_cache=disable_radix_cache,
+                        mamba_radix_cache_strategy=strategy,
+                    )
+                    get_context().set_server_args(args)
+                    self.assertEqual(
+                        ServerArgs.enable_mamba_extra_buffer(args),
+                        mamba_extra_buffer_enabled(),
+                    )
+                    self.assertEqual(
+                        ServerArgs.enable_mamba_extra_buffer_lazy(args),
+                        mamba_extra_buffer_lazy_enabled(),
+                    )
+
+    def test_attention_backends_match_the_member(self):
+        from sglang.srt.runtime_context import attention_backends
+
+        backends = (None, "fa3", "triton")
+        for base in backends:
+            for prefill in backends:
+                for decode in backends:
+                    with self.subTest(base=base, prefill=prefill, decode=decode):
+                        args = _FakeResolvedArgs(
+                            attention_backend=base,
+                            prefill_attention_backend=prefill,
+                            decode_attention_backend=decode,
+                        )
+                        get_context().set_server_args(args)
+                        self.assertEqual(
+                            ServerArgs.get_attention_backends(args),
+                            attention_backends(),
+                        )
+
+
+class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
+    """The adaptive draft-token bound is memoized on the config path, so the
+    memo has to end with the publication it was computed under.
+
+    Without that, a process that republishes with the same adaptive-config path
+    -- the file having been rewritten in between -- keeps the previous bound and
+    under-allocates the draft-token buffers sized from it.
+    """
+
+    def _write_config(self, steps):
+        path = os.path.join(tempfile.mkdtemp(prefix="adaptive_cfg_"), "adaptive.json")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), ignore_errors=True)
+        with open(path, "w") as handle:
+            json.dump({"1": {"candidate_steps": steps}}, handle)
+        return path
+
+    def test_republishing_recomputes_the_bound(self):
+        path = self._write_config([2])
+        get_context().set_server_args(
+            _FakeResolvedArgs(
+                speculative_num_draft_tokens=3,
+                speculative_adaptive=True,
+                speculative_adaptive_config=path,
+            )
+        )
+        self.assertEqual(max_speculative_num_draft_tokens(), 3)
+
+        with open(path, "w") as handle:
+            json.dump({"1": {"candidate_steps": [4]}}, handle)
+        # Same path, new contents: the memo must not survive the republish.
+        get_context().set_server_args(
+            _FakeResolvedArgs(
+                speculative_num_draft_tokens=3,
+                speculative_adaptive=True,
+                speculative_adaptive_config=path,
+            )
+        )
+        self.assertEqual(max_speculative_num_draft_tokens(), 5)
+
+    def test_reset_clears_the_bound(self):
+        path = self._write_config([2])
+        get_context().set_server_args(
+            _FakeResolvedArgs(
+                speculative_num_draft_tokens=3,
+                speculative_adaptive=True,
+                speculative_adaptive_config=path,
+            )
+        )
+        self.assertEqual(max_speculative_num_draft_tokens(), 3)
+        reset_context()
+        with open(path, "w") as handle:
+            json.dump({"1": {"candidate_steps": [6]}}, handle)
+        get_context().set_server_args(
+            _FakeResolvedArgs(
+                speculative_num_draft_tokens=3,
+                speculative_adaptive=True,
+                speculative_adaptive_config=path,
+            )
+        )
+        self.assertEqual(max_speculative_num_draft_tokens(), 7)
+
+
+class TestNamedAccessorsCallWhatTheyWrap(CustomTestCase):
+    """A named accessor must *call* a member that is a method.
+
+    `return get_server_args().x` hands back a bound method when `x` is defined
+    with `def`; the failure then lands far away, in whatever arithmetic the
+    caller does with it. Checked statically so accessors that need a real model
+    config are covered too.
+    """
+
+    def test_accessors_that_wrap_methods_call_them(self):
+        import ast
+        import functools
+        import inspect
+
+        import sglang.srt.runtime_context as rc
         from sglang.srt.server_args import ServerArgs
 
-        class _Args(_FakeResolvedArgs):
-            override = ServerArgs.override
-
-        args = _Args(page_size=1)
-        get_context().set_server_args(args)
-        declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(args.page_size, 64)
-        self.assertIn(("model.load_time", {"page_size": 64}), args._resolved_overrides)
+        tree = ast.parse(inspect.getsource(rc))
+        wrong = []
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for inner in ast.walk(node):
+                if not (isinstance(inner, ast.Return) and inner.value is not None):
+                    continue
+                value = inner.value
+                called = isinstance(value, ast.Call)
+                target = value.func if called else value
+                if not (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Call)
+                    and isinstance(target.value.func, ast.Name)
+                    and target.value.func.id == "get_server_args"
+                ):
+                    continue
+                member = getattr(ServerArgs, target.attr, None)
+                # A `property` / `functools.cached_property` member is already
+                # evaluated by the attribute access, so it is named here to keep
+                # the failure message from calling it "not a method" -- the fix
+                # for those is the opposite one.
+                kind = (
+                    "a property"
+                    if isinstance(member, (property, functools.cached_property))
+                    else "not a method"
+                )
+                if inspect.isfunction(member) and not called:
+                    wrong.append(
+                        f"{node.name}(): returns ServerArgs.{target.attr} without "
+                        "calling it, so callers get a bound method"
+                    )
+                if not inspect.isfunction(member) and called:
+                    wrong.append(
+                        f"{node.name}(): calls ServerArgs.{target.attr}, which is "
+                        f"{kind} -- the attribute access already produced the value"
+                    )
+        self.assertEqual([], wrong, "\n".join(wrong))
 
 
 if __name__ == "__main__":

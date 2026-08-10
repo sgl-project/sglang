@@ -8,6 +8,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerManager,
     get_generate_fn,
@@ -23,7 +24,10 @@ from sglang.multimodal_gen.test.test_utils import (
 
 
 def _all_cases() -> list[DiffusionTestCase]:
-    import sglang.multimodal_gen.test.server.testcase_configs as cfg
+    if current_platform.is_npu():
+        import sglang.multimodal_gen.test.server.ascend.testcase_configs_npu as cfg
+    else:
+        import sglang.multimodal_gen.test.server.testcase_configs as cfg
 
     cases: list[DiffusionTestCase] = []
     for _, v in inspect.getmembers(cfg):
@@ -68,8 +72,8 @@ def _build_server_extra_args(case: DiffusionTestCase) -> str:
     if server_args.lora_path:
         a += f" --lora-path {server_args.lora_path}"
 
-    # default warmup
-    a += " --warmup"
+    # request-based warmup keeps the first measured generation out of the baseline
+    a += " --warmup-mode request"
 
     for extra_arg in server_args.extras:
         a += f" {extra_arg}"

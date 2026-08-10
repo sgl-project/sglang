@@ -6,17 +6,11 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import (
-    get_sp_parallel_rank,
     get_sp_world_size,
     get_tp_world_size,
-    sequence_model_parallel_all_gather,
-)
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_ring_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
-    UlyssesAttention,
     USPAttention,
     build_varlen_mask_meta_from_lengths,
     build_varlen_mask_meta_from_ranges,
@@ -89,11 +83,11 @@ def zimage_rmsnorm_tanh_mul_add(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
-            zimage_rmsnorm_tanh_residual,
+        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
+            rmsnorm_tanh_residual,
         )
 
-        y = zimage_rmsnorm_tanh_residual(
+        y = rmsnorm_tanh_residual(
             x,
             gate,
             residual,
@@ -112,11 +106,11 @@ def zimage_rmsnorm_scale(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
-            zimage_rmsnorm_scale as fused_zimage_rmsnorm_scale,
+        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
+            rmsnorm_scale,
         )
 
-        y = fused_zimage_rmsnorm_scale(
+        y = rmsnorm_scale(
             x,
             norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
             scale,
@@ -127,12 +121,36 @@ def zimage_rmsnorm_scale(
     return norm(x) * scale
 
 
-class SelectFirstElement(nn.Module):
-    def __init__(self):
-        super().__init__()
+def zimage_native_qk_rmsnorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    norm_q: ZImageRMSNorm,
+    norm_k: ZImageRMSNorm,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Fused per-head ZImageRMSNorm for q/k, bit-exact vs the eager fallback.
 
-    def forward(self, x):
-        return x[0]
+    Replaces `apply_qk_norm`'s eager chain (`q_norm(q.reshape(-1, head_dim))`)
+    with one Triton launch per tensor that reads the strided fused-qkv slices
+    directly. Returns contiguous (q, k) or None when unsupported.
+    """
+    from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
+        can_use_qk_rmsnorm_native,
+        zimage_qk_rmsnorm_native,
+    )
+
+    q_weight = norm_q.weight.data
+    k_weight = norm_k.weight.data
+    if not (
+        can_use_qk_rmsnorm_native(q, q_weight, head_dim)
+        and can_use_qk_rmsnorm_native(k, k_weight, head_dim)
+    ):
+        return None
+    q_out = zimage_qk_rmsnorm_native(q, q_weight, norm_q.variance_epsilon)
+    k_out = zimage_qk_rmsnorm_native(k, k_weight, norm_k.variance_epsilon)
+    if q_out is None or k_out is None:
+        return None
+    return q_out, k_out
 
 
 class TimestepEmbedder(nn.Module):
@@ -312,13 +330,6 @@ class ZImageAttention(nn.Module):
             softmax_scale=None,
             causal=False,
         )
-        self.ulysses_attn = UlyssesAttention(
-            num_heads=self.local_num_heads,
-            head_size=self.head_dim,
-            num_kv_heads=self.local_num_kv_heads,
-            softmax_scale=None,
-            causal=False,
-        )
 
     def forward(
         self,
@@ -332,6 +343,15 @@ class ZImageAttention(nn.Module):
         num_replicated_suffix: int = 0,
         skip_sequence_parallel_override: bool = False,
     ):
+        # The fused native qk-norm kernel reads the strided fused-qkv slices
+        # directly and writes contiguous outputs, so q/k materialization is
+        # deferred to it on the main (rope-cache) path.
+        try_native_qk_norm = (
+            self.qk_norm
+            and rope_cos_sin_cache is not None
+            and self.enable_zimage_qk_fusion
+            and not torch.compiler.is_compiling()
+        )
         if self.use_fused_qkv:
             qkv, _ = self.to_qkv(hidden_states)
             q, k, v = qkv.split(
@@ -342,8 +362,9 @@ class ZImageAttention(nn.Module):
                 ],
                 dim=-1,
             )
-            q = q.contiguous()
-            k = k.contiguous()
+            if not try_native_qk_norm:
+                q = q.contiguous()
+                k = k.contiguous()
             v = v.contiguous()
         else:
             q, _ = self.to_q(hidden_states)
@@ -355,17 +376,37 @@ class ZImageAttention(nn.Module):
 
         if rope_cos_sin_cache is not None:
             if self.qk_norm:
-                q, k = apply_qk_norm_with_optional_rope(
-                    q=q,
-                    k=k,
-                    q_norm=self.norm_q,
-                    k_norm=self.norm_k,
-                    head_dim=self.head_dim,
-                    cos_sin_cache=rope_cos_sin_cache,
-                    is_neox=False,
-                    positions=rope_positions,
-                    allow_inplace=False,
-                )
+                fused_qk = None
+                if try_native_qk_norm:
+                    fused_qk = zimage_native_qk_rmsnorm(
+                        q, k, self.norm_q, self.norm_k, self.head_dim
+                    )
+                if fused_qk is not None:
+                    q, k = fused_qk
+                    # positions=None is handled identically to the eager
+                    # fallback (arange over seqlen, repeated across batch).
+                    q, k = apply_flashinfer_rope_qk_inplace(
+                        q,
+                        k,
+                        rope_cos_sin_cache,
+                        head_size=self.head_dim,
+                        is_neox=False,
+                        positions=rope_positions,
+                    )
+                else:
+                    q = q.contiguous()
+                    k = k.contiguous()
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        cos_sin_cache=rope_cos_sin_cache,
+                        is_neox=False,
+                        positions=rope_positions,
+                        allow_inplace=False,
+                    )
             else:
                 q, k = apply_flashinfer_rope_qk_inplace(
                     q,
@@ -449,45 +490,16 @@ class ZImageAttention(nn.Module):
                 allow_inplace=self.enable_zimage_qk_fusion,
             )
 
-        if (
-            num_replicated_suffix > 0
-            and get_sp_world_size() > 1
-            and get_ring_parallel_world_size() == 1
-        ):
-            # the cap (last num_replicated_suffix tokens), as condition, should be replicated
-            q_shard, q_rep = (
-                q[:, :-num_replicated_suffix],
-                q[:, -num_replicated_suffix:],
-            )
-            k_shard, k_rep = (
-                k[:, :-num_replicated_suffix],
-                k[:, -num_replicated_suffix:],
-            )
-            v_shard, v_rep = (
-                v[:, :-num_replicated_suffix],
-                v[:, -num_replicated_suffix:],
-            )
-            hidden_states, hidden_states_rep = self.ulysses_attn(
-                q_shard,
-                k_shard,
-                v_shard,
-                replicated_q=q_rep,
-                replicated_k=k_rep,
-                replicated_v=v_rep,
-            )
-            assert hidden_states_rep is not None
-            hidden_states = torch.cat([hidden_states, hidden_states_rep], dim=1)
-        else:
-            hidden_states = self.attn(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                attn_mask_meta=attn_mask_meta,
-                num_replicated_prefix=num_replicated_prefix,
-                num_replicated_suffix=num_replicated_suffix,
-                skip_sequence_parallel_override=skip_sequence_parallel_override,
-            )
+        hidden_states = self.attn(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
+            num_replicated_suffix=num_replicated_suffix,
+            skip_sequence_parallel_override=skip_sequence_parallel_override,
+        )
         hidden_states = hidden_states.flatten(2)
 
         hidden_states, _ = self.to_out[0](hidden_states)
@@ -754,8 +766,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
-    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
-
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         ZImageDitConfig().arch_config.reverse_param_names_mapping
@@ -1560,16 +1570,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
 
         cap_seq_len = cap_feats.shape[1]
-        use_full_unified_sequence = (
-            get_sp_world_size() > 1 and get_ring_parallel_world_size() > 1
-        )
-        x_local_seq_len = x.shape[1]
-        if use_full_unified_sequence:
-            x = sequence_model_parallel_all_gather(x.contiguous(), dim=1)
-            x_freqs_cis = (
-                sequence_model_parallel_all_gather(x_freqs_cis[0].contiguous(), dim=0),
-                sequence_model_parallel_all_gather(x_freqs_cis[1].contiguous(), dim=0),
-            )
         unified = torch.cat([x, cap_feats], dim=1)
         unified_freqs_cis = (
             torch.cat([x_freqs_cis[0], cap_freqs_cis[0]], dim=-2),
@@ -1585,7 +1585,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         unified_rope_cos_sin_cache, unified_rope_positions = self._get_rope_cache(
             "_cached_unified_rope_cache", unified_freqs_cis
         )
-        num_replicated_suffix = cap_seq_len if not use_full_unified_sequence else 0
+        num_replicated_suffix = cap_seq_len
 
         for layer in self.layers:
             unified = layer(
@@ -1597,17 +1597,11 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 attn_mask=unified_attn_mask,
                 attn_mask_meta=unified_attn_mask_meta,
                 num_replicated_suffix=num_replicated_suffix,
-                skip_sequence_parallel_override=use_full_unified_sequence,
             )
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
         )
-        if use_full_unified_sequence:
-            sp_rank = get_sp_parallel_rank()
-            start = sp_rank * x_local_seq_len
-            end = start + x_local_seq_len
-            unified = unified[:, start:end]
         x = list(unified.unbind(dim=0))
         x = self.unpatchify(x, x_size, patch_size, f_patch_size)
 

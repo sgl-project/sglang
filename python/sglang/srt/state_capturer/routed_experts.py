@@ -12,7 +12,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 
@@ -35,15 +39,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         max_running_requests: int,
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
-        server_args = get_server_args()
-        if not server_args.enable_return_routed_experts:
+        if not get_exec().features.enable_return_routed_experts:
             return None
-        if not server_args.disable_shared_experts_fusion and hasattr(
-            model, "num_fused_shared_experts"
-        ):
-            num_fused_shared_experts = model.num_fused_shared_experts
-        else:
-            num_fused_shared_experts = 0
+        # The model's own attribute is the baked decision (0 when its gate
+        # disabled fusion); the ACTIVE flag can be holding another runner's.
+        num_fused_shared_experts = getattr(model, "num_fused_shared_experts", 0)
         return RoutedExpertsCapturer(
             model_config,
             num_tokens=num_tokens,
@@ -64,15 +64,14 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         topk_size = model_config.hf_text_config.num_experts_per_tok
         num_layers = model_config.hf_text_config.num_hidden_layers
 
-        server_args = get_server_args()
         # Scale by dp_size so the buffer covers the full DP-concatenated batch.
         # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
         # and otherwise overflows on dp_rank > 0 when max_running_requests >
         # chunked_prefill_size.
         # FIXME: spec decoding's num_verify_tokens is still not accounted for.
         max_batch_size = max(
-            server_args.chunked_prefill_size * server_args.dp_size,
-            max_running_requests * server_args.dp_size,
+            get_schedule().chunked_prefill_size * get_parallel().dp_size,
+            max_running_requests * get_parallel().dp_size,
         )
 
         super().__init__(

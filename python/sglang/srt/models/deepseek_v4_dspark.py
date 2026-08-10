@@ -9,6 +9,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    is_unified_kv_triton,
+)
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    BuildStepLocal,
+    CommitKvProj,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
@@ -26,7 +33,7 @@ from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
     MqaAttentionBase,
-    _dequant_fp8_wo_a,
+    _dequant_fp8_wo_a_streaming,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -40,20 +47,21 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
 )
-from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
-    BuildStepLocal,
-    CommitKvProj,
-)
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix, is_blackwell_supported
-from sglang.srt.utils.async_probe import maybe_detect_in_closed_range
+from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
+
+# DSpark confidence is a per-token score that must stay in [0, 1].
+_CONFIDENCE = Invariant(
+    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
+)
 
 
 def apply_rotary_emb(
@@ -121,17 +129,6 @@ class DSparkAttention(MqaAttentionBase):
         kv, _ = self.wkv(x)
         return kv
 
-    def _local_attn_sink(self) -> torch.Tensor:
-        if self.attn_tp_size == 1:
-            return self.attn_sink
-        if self._attn_sink_local is None:
-            rank = self.attn_tp_rank
-            num_heads = self.n_local_heads
-            sink = self.attn_sink.new_zeros(max(num_heads, _PAD_NUM_HEADS))
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
-            self._attn_sink_local = sink
-        return self._attn_sink_local
-
     def _store_block_kv(
         self,
         *,
@@ -141,6 +138,20 @@ class DSparkAttention(MqaAttentionBase):
         attn_backend,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
+        if is_unified_kv_triton():
+            # unified_kv: SWA K lives in the shared bf16 ring (swa_kv_pool is
+            # None). Use the unified ring write target -- get_unified_swa_loc
+            # recomputes it from live positions for multi-step draft decode.
+            pool.set_unified_key_buffer_radix_fused_norm_rope(
+                layer_id=self.layer_id,
+                swa_loc=attn_backend.get_unified_swa_loc(forward_batch),
+                kv=kv,
+                kv_weight=self.kv_norm.weight.data,
+                eps=self.eps,
+                freqs_cis=self.freqs_cis,
+                positions=positions,
+            )
+            return
         pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
             swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
@@ -536,7 +547,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.input_layernorm(x)
-        x = self.self_attn(positions, x, forward_batch)
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(positions, x, forward_batch)
         x = self._hc_post_block(x, residual, post, comb)
 
         residual = x
@@ -665,9 +677,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
         )
+        # Under unified_kv the swa_kv_pool is None; the caller passes a unified
+        # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
+        # store just needs to target the bf16 ring instead of the fp8 flashmla
+        # buffer. Same swa_loc/positions contract either way.
+        store_kv = (
+            pool.set_unified_key_buffer_radix_fused_norm_rope
+            if is_unified_kv_triton()
+            else pool.set_swa_key_buffer_radix_fused_norm_rope
+        )
         for stage, kv in zip(self.stages, kvs):
             attn = stage.self_attn
-            pool.set_swa_key_buffer_radix_fused_norm_rope(
+            store_kv(
                 layer_id=attn.layer_id,
                 swa_loc=swa_loc,
                 kv=kv,
@@ -759,18 +780,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_embed_stack = None
         confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
         confidence = confidence_head.apply_sts(confidence_raw)
-        maybe_detect_in_closed_range(
-            confidence, 0.0, 1.0, "DSpark confidence must lie in [0, 1]."
-        )
+        expect(_CONFIDENCE, confidence)
         return confidence
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 
-        weights = list(weights)
-        if any(name.endswith(".wo_a.scale") for name, _ in weights):
-            weights = list(_dequant_fp8_wo_a(weights))
+        weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE

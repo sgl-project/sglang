@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
-namespace {
+namespace sglang {
 
 struct GatherScatterParams {
   const void* __restrict__ hidden;     // [T, D], channel-contiguous
@@ -106,4 +106,4 @@ struct GatherScatterSconvKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
