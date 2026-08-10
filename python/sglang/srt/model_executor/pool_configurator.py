@@ -182,6 +182,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
                     * get_parallel().attn_dcp_size,
+                    draft_cell_size_per_token=(
+                        kvc.spec_aux_config.dflash_draft_kv_bytes_per_token or None
+                    ),
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
@@ -412,6 +415,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 self._draft_swa_full_layers_num = banded_depths
                 self._draft_full_layers_num = draft_layers - banded_depths
 
+        # DFLASH/DSPARK draft KV pool: a flat bytes/token term.
+        self._draft_kv_per_token = 0
+        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+            draft_kv_per_token = kvc.spec_aux_config.dflash_draft_kv_bytes_per_token
+            if draft_kv_per_token is not None and int(draft_kv_per_token) > 0:
+                self._draft_kv_per_token = int(draft_kv_per_token)
+
         # Bytes per token of max_total_num_tokens.
         #
         # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
@@ -426,6 +436,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 self._swa_per_token * self._swa_layers_num
                 + self._full_per_token * self._draft_full_layers_num
                 + self._swa_per_token * self._draft_swa_full_layers_num
+                + self._draft_kv_per_token
             )
         else:
             self._cell_size = (
@@ -435,6 +446,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
+                + self._draft_kv_per_token
             )
 
     def _solve_pool_sizes(
