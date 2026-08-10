@@ -3155,10 +3155,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
         if self.server_args.tokenizer_worker_num == 1:
-            with self.soft_watchdog.disable():
-                shutdown_scheduler_and_child_processes(
-                    lambda: self._dispatch_to_scheduler(ShutdownReq())
-                )
+            # Do not disable the soft watchdog here: handle_loop already holds
+            # that context while parked on recv, and disable() is not reentrant.
+            shutdown_scheduler_and_child_processes(
+                lambda: self._dispatch_to_scheduler(ShutdownReq())
+            )
 
         # SystemExit is absorbed by the task wrapper.
         os._exit(0)
