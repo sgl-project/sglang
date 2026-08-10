@@ -9,7 +9,6 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
@@ -66,38 +65,20 @@ def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
 
 
-def compute_dflash_draft_kv_cell_size_per_token(
+def dflash_draft_cell_size_per_token(
     *,
-    draft_model_config,
-    kv_cache_dtype,
+    draft_model_config: Any,
     draft_num_layers: int,
+    draft_kv_cache_dtype: torch.dtype,
     tp_size: int,
 ) -> int:
-    """Per-token KV bytes for a DFLASH/DSPARK draft runner's own KV pool.
-
-    The draft allocates a KV pool sized by the target's max_total_num_tokens,
-    so the target profile must reserve the draft's *actual* per-token KV cost,
-    which can differ from the target's (e.g. an MLA-latent target paired with a
-    full per-head K/V draft). DFLASH/DSPARK drafts are full-attention blocks, so
-    the caller supplies the already-resolved draft layer count. Mirrors the
-    MLA-vs-full branch of DefaultPoolConfigurator._compute_cell_size.
-
-    Unlike ``_compute_cell_size`` this does not add fp4 scale buffers or DSA
-    indexer overhead; DFLASH/DSPARK drafts do not use those today.
-    """
-    kv_size = torch._utils._element_size(kv_cache_dtype)
-    if draft_model_config.attention_arch == AttentionArch.MLA:
-        return int(
-            (draft_model_config.kv_lora_rank + draft_model_config.qk_rope_head_dim)
-            * int(draft_num_layers)
-            * kv_size
-        )
-    return int(
-        draft_model_config.get_num_kv_heads(tp_size)
-        * (draft_model_config.head_dim + draft_model_config.v_head_dim)
-        * int(draft_num_layers)
-        * kv_size
-    )
+    """Exact bytes/token of the DFLASH draft KV pool."""
+    if draft_num_layers <= 0:
+        return 0
+    num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
+    kv_dim_per_head = draft_model_config.head_dim + draft_model_config.v_head_dim
+    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
+    return int(num_kv_heads * kv_dim_per_head * int(draft_num_layers) * dtype_size)
 
 
 def scale_kv_cell_size_per_token_for_dflash(

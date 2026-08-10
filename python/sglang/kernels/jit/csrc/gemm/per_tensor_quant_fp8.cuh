@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 constexpr size_t kBlockSize = 256;
 
@@ -159,4 +159,4 @@ void per_tensor_absmax_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView outp
       DType>(input, output_s, output_s);
 }
 
-}  // namespace
+}  // namespace sglang

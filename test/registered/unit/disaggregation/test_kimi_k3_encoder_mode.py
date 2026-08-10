@@ -6,7 +6,7 @@ import time
 from array import array
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import torch
@@ -136,6 +136,27 @@ def test_kimi_k3_encoder_passes_media_dicts_to_image_processor():
     assert images[0]["type"] == "image"
     assert images[0]["image"] is image
     assert kwargs == {"return_tensors": "pt"}
+
+
+@pytest.mark.parametrize(
+    ("use_image_processor_gpu", "expected_decode_mode"),
+    [(False, False), (True, "nvjpeg_fancy")],
+)
+def test_kimi_k3_epd_selects_matching_jpeg_decode_mode(
+    use_image_processor_gpu, expected_decode_mode
+):
+    expected = torch.zeros((3, 2, 3), dtype=torch.uint8)
+    encoder = _encoder()
+    encoder.use_image_processor_gpu = use_image_processor_gpu
+
+    with patch(
+        "sglang.srt.disaggregation.encode_server.load_image",
+        return_value=(expected, None),
+    ) as load:
+        output = encoder._load_single_item(b"jpeg", Modality.IMAGE)
+
+    assert output is expected
+    load.assert_called_once_with(b"jpeg", expected_decode_mode)
 
 
 def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():

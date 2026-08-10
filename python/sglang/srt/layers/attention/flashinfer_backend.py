@@ -364,7 +364,7 @@ class FlashInferAttnBackend(AttentionBackend):
             num_attention_heads=model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size,
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
         )
         self.max_context_len = model_runner.model_config.context_len
@@ -1408,6 +1408,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
                 )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
@@ -1505,7 +1508,7 @@ class FlashInferIndicesUpdaterDecode:
             // get_parallel().attn_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
@@ -1777,7 +1780,7 @@ class FlashInferIndicesUpdaterPrefill:
             // get_parallel().attn_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype

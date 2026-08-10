@@ -29,7 +29,7 @@ if _is_hip:
     )
 
 
-class DeepseekMLARocmForwardMixin:
+class DeepseekMLAFusedRopeRocmForwardMixin:
 
     def init_mla_fused_rope_rocm_forward(self: DeepseekV2AttentionMLA):
         self.rocm_fused_decode_mla = get_bool_env_var(
