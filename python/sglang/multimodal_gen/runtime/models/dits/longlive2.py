@@ -5,7 +5,10 @@ import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import BlockMask
 
-from sglang.multimodal_gen.configs.models.dits.longlive2 import LongLive2VideoConfig
+from sglang.multimodal_gen.configs.models.dits.longlive2 import (
+    LongLive2ArchConfig,
+    LongLive2VideoConfig,
+)
 from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
@@ -151,12 +154,15 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
         return hidden_states
 
 
+_ARCH_DEFAULTS = LongLive2ArchConfig()
+
+
 class LongLive2Transformer3DModel(CausalWanTransformer3DModel):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
-    param_names_mapping = LongLive2VideoConfig().param_names_mapping
-    reverse_param_names_mapping = LongLive2VideoConfig().reverse_param_names_mapping
-    lora_param_names_mapping = LongLive2VideoConfig().lora_param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
+    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
     def __init__(
         self,

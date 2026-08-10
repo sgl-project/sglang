@@ -14,7 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
+from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
+    Cosmos3VideoArchConfig,
+    Cosmos3VideoConfig,
+)
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
@@ -913,6 +916,9 @@ class Cosmos3LanguageModel(nn.Module):
 # -----------------------------------------------------------------------------
 
 
+_ARCH_DEFAULTS = Cosmos3VideoArchConfig()
+
+
 class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
     """Cosmos3 Omni transformer.
 
@@ -923,11 +929,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = [is_cosmos_layer]
     _compile_conditions = [is_cosmos_layer]
-    param_names_mapping = Cosmos3VideoConfig().arch_config.param_names_mapping
-    reverse_param_names_mapping = (
-        Cosmos3VideoConfig().arch_config.reverse_param_names_mapping
-    )
-    lora_param_names_mapping = Cosmos3VideoConfig().arch_config.lora_param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
+    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
     def __init__(
         self,

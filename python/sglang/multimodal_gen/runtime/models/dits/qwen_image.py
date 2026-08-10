@@ -20,7 +20,10 @@ from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
-from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.configs.models.dits.qwenimage import (
+    QwenImageArchConfig,
+    QwenImageDitConfig,
+)
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -1328,6 +1331,9 @@ def to_hashable(obj):
     return obj
 
 
+_ARCH_DEFAULTS = QwenImageArchConfig()
+
+
 class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Qwen.
@@ -1339,7 +1345,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
-    param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     _fsdp_shard_conditions = [is_transformer_block]
 
     @classmethod

@@ -11,6 +11,7 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
+    LingBotVideoMoEArchConfig,
     LingBotVideoMoEConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
@@ -344,15 +345,18 @@ class LingBotVideoBlock(nn.Module):
         return x
 
 
+_ARCH_DEFAULTS = LingBotVideoMoEArchConfig()
+
+
 class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _no_split_modules = ("LingBotVideoBlock",)
     _keep_in_fp32_modules = tuple(LINGBOT_VIDEO_FP32_MODULES)
 
     _fsdp_shard_conditions = [is_lingbot_block]
     _compile_conditions = [is_lingbot_block]
-    param_names_mapping = LingBotVideoMoEConfig().param_names_mapping
-    reverse_param_names_mapping = LingBotVideoMoEConfig().reverse_param_names_mapping
-    lora_param_names_mapping = LingBotVideoMoEConfig().lora_param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
+    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
     def to(self, *args, **kwargs):
         # _parse_to is private but the only exact parser for .to() overloads.

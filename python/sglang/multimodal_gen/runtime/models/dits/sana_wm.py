@@ -6,7 +6,10 @@ from typing import Callable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
+from sglang.multimodal_gen.configs.models.dits.sana_wm import (
+    SanaWMArchConfig,
+    SanaWMConfig,
+)
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_blocks_or_transformer_blocks,
 )
@@ -330,6 +333,9 @@ class SanaWMBlock(nn.Module):
         return x, kv_cache
 
 
+_ARCH_DEFAULTS = SanaWMArchConfig()
+
+
 class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """SANA-WM 2.6B TI2V world model.
 
@@ -349,8 +355,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
     _compile_conditions = [is_blocks_or_transformer_blocks]
-    param_names_mapping = SanaWMConfig().param_names_mapping
-    reverse_param_names_mapping = SanaWMConfig().reverse_param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping: dict = {}
 
     def __init__(self, config: SanaWMConfig, hf_config=None, **kwargs) -> None:

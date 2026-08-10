@@ -27,6 +27,7 @@ from sglang.kernels.ops.diffusion.triton.rmsnorm_scale_shift_bitexact import (
     fused_scale_residual_rmsnorm_scale_shift_bitexact,
 )
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
+    ErnieImageArchConfig,
     ErnieImageDitConfig,
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_layer
@@ -408,6 +409,9 @@ def _apply_rotary_bshd(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     return torch.cat((x_rot, x_pass), dim=-1)
 
 
+_ARCH_DEFAULTS = ErnieImageArchConfig()
+
+
 class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """ErnieImage DiT: Single-stream transformer with Shared AdaLN."""
 
@@ -417,7 +421,7 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
 
     _fsdp_shard_conditions = [is_layer]
     _compile_conditions = []
-    param_names_mapping = ErnieImageDitConfig().arch_config.param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(

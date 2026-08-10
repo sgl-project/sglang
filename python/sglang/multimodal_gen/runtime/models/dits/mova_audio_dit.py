@@ -12,7 +12,10 @@ import torch.nn as nn
 from einops import rearrange
 from torch.distributed.tensor import DTensor
 
-from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
+from sglang.multimodal_gen.configs.models.dits.mova_audio import (
+    MOVAAudioArchConfig,
+    MOVAAudioConfig,
+)
 from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -87,12 +90,15 @@ class Conv1dLocalIsland(nn.Conv1d):
             return super().forward(input)
 
 
+_ARCH_DEFAULTS = MOVAAudioArchConfig()
+
+
 class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
-    param_names_mapping = MOVAAudioConfig().param_names_mapping
-    reverse_param_names_mapping = MOVAAudioConfig().reverse_param_names_mapping
-    lora_param_names_mapping = MOVAAudioConfig().lora_param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
+    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
     def __init__(
         self,

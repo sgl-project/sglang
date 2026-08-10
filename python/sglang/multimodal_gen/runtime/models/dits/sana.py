@@ -10,7 +10,7 @@ from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
     fused_layernorm_modulate_raw,
     is_plain_layer_norm,
 )
-from sglang.multimodal_gen.configs.models.dits.sana import SanaConfig
+from sglang.multimodal_gen.configs.models.dits.sana import SanaArchConfig, SanaConfig
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
@@ -387,6 +387,9 @@ class SanaTransformerBlock(nn.Module):
         return hidden_states
 
 
+_ARCH_DEFAULTS = SanaArchConfig()
+
+
 class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = [
@@ -395,7 +398,7 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _compile_conditions = [
         lambda n, m: isinstance(m, SanaTransformerBlock),
     ]
-    param_names_mapping = SanaConfig().arch_config.param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(self, config: SanaConfig, hf_config=None, **kwargs):

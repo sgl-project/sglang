@@ -21,7 +21,7 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
+from sglang.multimodal_gen.configs.models.dits.flux import FluxArchConfig, FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_world_size,
@@ -906,6 +906,9 @@ class Flux2PosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
+_ARCH_DEFAULTS = FluxArchConfig()
+
+
 class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux 2.
@@ -914,7 +917,7 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     """
 
-    param_names_mapping = FluxConfig().arch_config.param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
     # FLUX.2 stays closer to the official diffusers output with Torch SDPA.
     # The generic FA path still produces a measurable image-level drift here.

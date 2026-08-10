@@ -47,7 +47,7 @@ from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
     fused_layernorm_modulate,
     is_plain_layer_norm,
 )
-from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
+from sglang.multimodal_gen.configs.models.dits.flux import FluxArchConfig, FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_world_size,
@@ -1154,6 +1154,9 @@ class FluxPosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
+_ARCH_DEFAULTS = FluxArchConfig()
+
+
 class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux.
@@ -1161,7 +1164,7 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
 
-    param_names_mapping = FluxConfig().arch_config.param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:

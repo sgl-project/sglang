@@ -12,7 +12,10 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.configs.models.dits import LingBotWorldVideoConfig
+from sglang.multimodal_gen.configs.models.dits.lingbot_world import (
+    LingBotWorldArchConfig,
+    LingBotWorldVideoConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -579,12 +582,15 @@ class LingBotWorldTransformerBlock(nn.Module):
         return hidden_states.to(orig_dtype)
 
 
+_ARCH_DEFAULTS = LingBotWorldArchConfig()
+
+
 class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_lingbot_block]
     _compile_conditions = [is_lingbot_block]
-    param_names_mapping = LingBotWorldVideoConfig().param_names_mapping
-    reverse_param_names_mapping = LingBotWorldVideoConfig().reverse_param_names_mapping
-    lora_param_names_mapping = LingBotWorldVideoConfig().lora_param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
+    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
     def __init__(
         self,
@@ -1138,9 +1144,9 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
 class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
     _fsdp_shard_conditions = [is_lingbot_block]
     _compile_conditions = [is_lingbot_block]
-    param_names_mapping = LingBotWorldVideoConfig().param_names_mapping
-    reverse_param_names_mapping = LingBotWorldVideoConfig().reverse_param_names_mapping
-    lora_param_names_mapping = LingBotWorldVideoConfig().lora_param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
+    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
     def __init__(
         self,

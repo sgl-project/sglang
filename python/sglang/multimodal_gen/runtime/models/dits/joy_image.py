@@ -8,7 +8,10 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
+from sglang.multimodal_gen.configs.models.dits.joy_image import (
+    JoyImageArchConfig,
+    JoyImageDiTConfig,
+)
 from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -342,6 +345,9 @@ class MMDoubleStreamBlock(nn.Module):
         return img, txt
 
 
+_ARCH_DEFAULTS = JoyImageArchConfig()
+
+
 class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     JoyImage Transformer 3D Model for image generation.
@@ -351,9 +357,9 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _fsdp_shard_conditions = [is_blocks_or_double_blocks]
     _compile_conditions = [is_blocks_or_double_blocks]
-    param_names_mapping = JoyImageDiTConfig().param_names_mapping
-    reverse_param_names_mapping = JoyImageDiTConfig().reverse_param_names_mapping
-    lora_param_names_mapping = JoyImageDiTConfig().lora_param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
+    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
     def __init__(
         self,

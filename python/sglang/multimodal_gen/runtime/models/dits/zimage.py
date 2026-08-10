@@ -4,7 +4,10 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+from sglang.multimodal_gen.configs.models.dits.zimage import (
+    ZImageArchConfig,
+    ZImageDitConfig,
+)
 from sglang.multimodal_gen.configs.models.fsdp import is_zimage_layer
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
@@ -763,14 +766,15 @@ class RopeEmbedder:
         return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
 
 
+_ARCH_DEFAULTS = ZImageArchConfig()
+
+
 class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = [is_zimage_layer]
-    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
-    reverse_param_names_mapping = (
-        ZImageDitConfig().arch_config.reverse_param_names_mapping
-    )
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
 
     # Maps fused runtime layer names to their checkpoint shard names.
     # Used by is_layer_skipped() to correctly handle --quantization-ignored-layers

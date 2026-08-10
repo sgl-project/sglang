@@ -13,7 +13,10 @@ from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
     fused_rmsnorm_tanh_residual,
     mark_fused_gate_rmsnorm_site,
 )
-from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
+from sglang.multimodal_gen.configs.models.dits.ideogram import (
+    Ideogram4DiTArchConfig,
+    Ideogram4DiTConfig,
+)
 from sglang.multimodal_gen.configs.models.fsdp import is_layer
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -496,6 +499,9 @@ class Ideogram4FinalLayer(nn.Module):
         return self.linear(self.norm_final(x) * scale)
 
 
+_ARCH_DEFAULTS = Ideogram4DiTArchConfig()
+
+
 class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["Ideogram4TransformerBlock"]
     layer_names = ["layers"]
@@ -505,7 +511,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
     }
-    param_names_mapping = Ideogram4DiTConfig().arch_config.param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(

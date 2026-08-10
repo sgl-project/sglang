@@ -16,7 +16,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
+from sglang.multimodal_gen.configs.models.dits.helios import (
+    HeliosArchConfig,
+    HeliosConfig,
+)
 from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -552,6 +555,9 @@ class HeliosTransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+_ARCH_DEFAULTS = HeliosArchConfig()
+
+
 class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     Helios Transformer 3D model for video generation.
@@ -562,9 +568,9 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
-    param_names_mapping = HeliosConfig().param_names_mapping
-    reverse_param_names_mapping = HeliosConfig().reverse_param_names_mapping
-    lora_param_names_mapping = HeliosConfig().lora_param_names_mapping
+    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
+    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
     def __init__(
         self,
