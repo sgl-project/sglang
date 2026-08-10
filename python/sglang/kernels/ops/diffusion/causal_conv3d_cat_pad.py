@@ -24,8 +24,7 @@ def _jit_causal_conv3d_cat_pad_module(dtype: torch.dtype) -> Module:
         cuda_wrappers=[
             (
                 "causal_conv3d_cat_pad",
-                "sglang_causal_conv3d_cat_pad::"
-                f"CausalConv3dCatPadKernel<{args}>::run",
+                "causal_conv3d_cat_pad::" f"CausalConv3dCatPadKernel<{args}>::run",
             )
         ],
     )
