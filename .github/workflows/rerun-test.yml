@@ -52,11 +52,31 @@ on:
         type: string
         default: ""
 
+# Mirrors _pr-test-stage.yml's env. A rerun that does not reproduce the stage
+# environment cannot validate a fix: the same file can pass here and keep
+# failing in CI, or the reverse. Values that the stage derives from its suite
+# are taken at their widest here, so a green rerun is trustworthy for every
+# suite the file is registered on.
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_ENABLE_ASYNC_ASSERT: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  NCCL_NVLS_ENABLE: "0"
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
+  # The stage sets this only for scheduled suites. A file registered on both a
+  # per-commit and a nightly suite collapses to one rerun, so run the full grid
+  # unconditionally -- it is the superset of both.
+  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+  # Hardware fact, not a suite property: raises the server-launch ceiling from
+  # 600s to 3600s (is_h200_system in test_utils.py).
+  IS_H200: ${{ inputs.runs_on == '8-gpu-h200' && '1' || '0' }}
+  # Deliberately absent: SGLANG_PRECISION_*. test_nightly_precision_regression
+  # pushes to the shared baseline dataset on every run, pass or fail, so handing
+  # a rerun the write token would let an ad-hoc dispatch become everyone's next
+  # comparison baseline. That test is nightly-only; a rerun fails fast on the
+  # missing SGLANG_PRECISION_HF_REPO instead.
 
 permissions:
   actions: write
