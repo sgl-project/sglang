@@ -23,17 +23,13 @@ def make_attention_mask(N, offset, return_array=False, window_size=None):
     """
     if window_size is not None and offset + N > window_size:
         return create_causal_mask(N, offset, window_size=window_size)
-    # Either no window, or a window that cannot bind.  The lowest query
-    # position is ``offset``, so ``offset + N <= window_size`` means every
-    # causally visible key is inside the band and the banded mask is
-    # elementwise identical to a plain causal one -- the shortcut mlx_lm's own
-    # RotatingKVCache.make_mask takes, and these shims stand in for exactly
-    # that cache on sliding layers.  Worth the branch because a materialised
-    # mask forces mx.fast.scaled_dot_product_attention off its fused causal
-    # path: ~2x slower per layer, plus an N x (offset + N) allocation.
-    # It also survives a window-bounded store: offset + N <= window_size
-    # implies N + window_size - 1 >= offset + N, so no keys are dropped and
-    # the mask width still matches the returned key length.
+    # Either no window, or a window that cannot bind: the lowest query position
+    # is ``offset``, so ``offset + N <= window_size`` puts every causally
+    # visible key inside the band and the banded mask is elementwise identical
+    # to a plain causal one (the same shortcut mlx_lm's RotatingKVCache takes).
+    # Worth the branch because a materialised mask forces
+    # mx.fast.scaled_dot_product_attention off its fused causal path: ~2x
+    # slower per layer, plus an N x (offset + N) allocation.
     if N == 1:
         return None
     if return_array:
@@ -156,8 +152,7 @@ class ContiguousAttentionKVCache:
         """Return valid K/V: (1, n_kv_heads, min(offset, window), head_dim).
 
         ``window`` keeps only the trailing window a sliding-window layer can
-        attend to.  Slicing here rather than slicing the full history and then
-        slicing again costs one op instead of two per request per layer.
+        attend to; slicing it here costs one op instead of two.
         """
         start = 0 if window is None else max(0, self.offset - window)
         return (
@@ -209,11 +204,10 @@ class WindowedAttentionKVCache:
                 "WindowedAttentionKVCache holds only the trailing window and "
                 "cannot serve a full-context attention mask"
             )
-        # No N == 1 shortcut here, tempting as it looks: mlx_lm's banded mask is
+        # No N == 1 shortcut here: mlx_lm's banded mask is
         # ``linds < rinds + window_size`` (strict), so a window of W admits
-        # exactly W keys.  Once ``kept == window`` this buffer returns W + 1 of
-        # them -- the trailing window plus the token just written -- and the
-        # oldest must still be masked out.
+        # exactly W keys, while this buffer returns W + 1 once ``kept ==
+        # window`` -- the trailing window plus the token just written.
         return make_attention_mask(
             N, kept, return_array=return_array, window_size=window_size
         )
@@ -221,9 +215,8 @@ class WindowedAttentionKVCache:
     def _append(self, keys: mx.array, values: mx.array) -> tuple[int, int]:
         """Append a chunk in place; return the (start, end) span it serves.
 
-        Split out from ``update_and_fetch`` so the decode path can skip
-        building the two return slices, which its caller discards in
-        favour of ``get_kv``.
+        Split out of ``update_and_fetch`` so the decode path can skip building
+        the two return slices, which it discards in favour of ``get_kv``.
         """
         S = keys.shape[2]
         kept = min(self._local, self.window)

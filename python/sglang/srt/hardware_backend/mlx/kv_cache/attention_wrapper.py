@@ -57,10 +57,9 @@ class BatchedDecodeContext:
     needs_padding: bool = field(init=False)
     pad_sizes: list[int] = field(init=False)
     positions: Optional[mx.array] = field(init=False)
-    # Padding metadata memo, keyed by window size.  It depends only on
-    # ``seq_lens`` and the window, so every layer sharing a window reuses one
-    # entry instead of rebuilding it (gpt-oss decodes 24 attention layers per
-    # step, in two window classes).
+    # Padding metadata memo, keyed by window size: it depends only on
+    # ``seq_lens`` and the window, so every layer sharing a window reuses
+    # one entry instead of rebuilding it.
     _padding_by_window: dict = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -77,10 +76,9 @@ class BatchedDecodeContext:
                 idx: idx for idx in range(len(self.attention_layer_caches))
             }
         if self.aot.rope is not None and not self.full_kv_pool_index_by_layer:
-            # No silent default here: the fused scatter addresses pool buffers
-            # by full-attention index, so falling back to the cache index would
-            # write the wrong buffer whenever sliding-window layers are
-            # interleaved. A model with a pool always has full layers to index.
+            # The fused scatter addresses pool buffers by full-attention index;
+            # defaulting to the cache index would write the wrong buffer
+            # whenever sliding-window layers are interleaved.
             raise ValueError(
                 "BatchedDecodeContext requires full_kv_pool_index_by_layer "
                 "when the fused AOT RoPE + pool-scatter kernel is active"
@@ -99,7 +97,6 @@ class BatchedDecodeContext:
 
         The mask is boolean (``True`` keeps the key), broadcast-shaped
         ``(B, 1, 1, width)``, and ``None`` when no request needs padding.
-        Cached per window: all layers in the step share one build.
         """
         cached = self._padding_by_window.get(window, None)
         if cached is not None:
@@ -144,10 +141,8 @@ class BatchedDecodeContext:
         batch_size = len(req_ids)
         if attention_layer_indices is None:
             attention_layer_indices = list(range(len(caches[0])))
-        # One arbitrary attention layer speaks for the whole step: every
-        # attention cache's ``offset`` is the ABSOLUTE sequence position, so
-        # they all agree even though a windowed cache stores far fewer
-        # tokens than that (see the class docstring's read-through rule).
+        # Any attention layer will do: ``offset`` is the ABSOLUTE sequence
+        # position on every cache, even a windowed one storing far fewer tokens.
         seq_lens = [
             caches[i][attention_layer_indices[0]].offset for i in range(batch_size)
         ]
