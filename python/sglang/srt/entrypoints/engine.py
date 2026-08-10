@@ -1191,26 +1191,32 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 
-        # Wait for the model to finish loading
-        scheduler_init_result.wait_for_ready()
+        startup_complete = False
+        try:
+            # Wait for the model to finish loading
+            scheduler_init_result.wait_for_ready()
 
-        cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
+            cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
 
-        # Get back some info from scheduler to tokenizer_manager
-        tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][
-            "max_req_input_len"
-        ]
+            # Get back some info from scheduler to tokenizer_manager
+            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
+                0
+            ]["max_req_input_len"]
 
-        # Set up subprocess liveness watchdog to detect crashes
-        # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
-        processes = list(scheduler_procs or [])
-        names = [f"scheduler_{i}" for i in range(len(processes))]
-        processes.extend(detoken_procs)
-        names.extend(detoken_names)
-        subprocess_watchdog = SubprocessWatchdog(
-            processes=processes, process_names=names
-        )
-        subprocess_watchdog.start()
+            # Set up subprocess liveness watchdog to detect crashes
+            # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
+            processes = list(scheduler_procs or [])
+            names = [f"scheduler_{i}" for i in range(len(processes))]
+            processes.extend(detoken_procs)
+            names.extend(detoken_names)
+            subprocess_watchdog = SubprocessWatchdog(
+                processes=processes, process_names=names
+            )
+            subprocess_watchdog.start()
+            startup_complete = True
+        finally:
+            if not startup_complete and isinstance(tokenizer_manager, TokenizerManager):
+                tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
         return (
             tokenizer_manager,
@@ -1225,26 +1231,30 @@ class Engine(EngineScoreMixin, EngineBase):
         """Shutdown the engine; block until the scheduler subprocess releases
         its GPU context so the caller can immediately reallocate on the same
         device."""
-        if (
-            self.tokenizer_manager is not None
-            and self.tokenizer_manager._subprocess_watchdog is not None
-        ):
-            self.tokenizer_manager._subprocess_watchdog.stop()
+        try:
+            if (
+                self.tokenizer_manager is not None
+                and self.tokenizer_manager._subprocess_watchdog is not None
+            ):
+                self.tokenizer_manager._subprocess_watchdog.stop()
 
-        send_to_rpc = getattr(self, "send_to_rpc", None)
-        if send_to_rpc is not None:
-            send_to_rpc.close(linger=0)
-            self.send_to_rpc = None
+            send_to_rpc = getattr(self, "send_to_rpc", None)
+            if send_to_rpc is not None:
+                send_to_rpc.close(linger=0)
+                self.send_to_rpc = None
 
-        # Gracefully stop weight cache daemons *before* the blanket
-        # kill_process_tree below, so their SIGTERM handlers can unlink the
-        # .sock/.ready files instead of being SIGKILLed and leaving stale state.
-        daemon_procs = getattr(self, "_weight_cache_daemon_procs", None)
-        if daemon_procs:
-            self._terminate_weight_cache_daemons(daemon_procs)
-            self._weight_cache_daemon_procs = []
+            # Gracefully stop weight cache daemons *before* the blanket
+            # kill_process_tree below, so their SIGTERM handlers can unlink the
+            # .sock/.ready files instead of being SIGKILLed and leaving stale state.
+            daemon_procs = getattr(self, "_weight_cache_daemon_procs", None)
+            if daemon_procs:
+                self._terminate_weight_cache_daemons(daemon_procs)
+                self._weight_cache_daemon_procs = []
 
-        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+            kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+        finally:
+            if isinstance(self.tokenizer_manager, TokenizerManager):
+                self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
     def __enter__(self):
         return self

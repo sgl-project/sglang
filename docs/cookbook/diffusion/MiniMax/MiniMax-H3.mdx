@@ -65,7 +65,8 @@ behavior such as Cache-DiT is documented separately below.
 
 **Deployment Profile** exposes resident and FSDP placement on B200, B300,
 H200, and H100. Resident is the latency-oriented default; FSDP reduces DiT
-weight residency at the cost of per-block parameter collectives. **Online
+weight residency at the cost of per-block parameter collectives. On H200 it
+also selects the verified 2-node cross-node topology. **Online
 Quantization** appears only on B200 and B300. AMD keeps its resident AITER
 recipe, while RTX 5090 uses its dedicated layerwise-offload profile.
 
@@ -564,7 +565,8 @@ listed hardware and topology; it is not inherited by a similar GPU family.
 
 | Feature | Validation status | Notes |
 | --- | --- | --- |
-| Ulysses sequence parallelism | Verified: 8× B200, 4× H200, 4× H100, and Ulysses1/2/4/8 on MI300X and MI355X | Use `--ulysses-degree`; Ring is not compatible with H3's packed multi-segment attention. |
+| Ulysses sequence parallelism | Verified: 8× B200, 4× H200, 4× H100, and Ulysses1/2/4/8 on MI300X and MI355X | Use `--ulysses-degree`. Combine with Ring for cross-node scaling; see the next row. |
+| Ring sequence parallelism (cross-node) | Verified: 2 nodes of 8× H200 each (Ulysses8 × Ring2) | Use `--ring-degree` together with `--nnodes`/`--node-rank`/`--dist-init-addr`. Ring shards the sequence across nodes while Ulysses shards heads within a node; H3's packed multi-segment attention only supports Ring across the node boundary, not within a single node's Ulysses group. Requires `--encoder-parallel replicate` — `auto`'s fold decision is not node-boundary aware. See the benchmark section below. |
 | SageAttention | Supported | Use `--attention-backend sage_attn` to select the native packed varlen path; install the SageAttention dependency first. |
 | Tensor parallelism | Verified: B200 TP2 + Ulysses4; H100 TP2 + Ulysses2 and TP4 + Ulysses1 | `--tp-size` may be combined with Ulysses when the TP-local head count remains divisible by the Ulysses degree. On 4×H100, TP2 + Ulysses2 is the measured speed default. |
 | FSDP inference | Verified: 4× B200 and 4× H100 + Ulysses4 | Preserves H3's mixed BF16/FP32 parameter policy. B200 completed the exact eager comparison; H100 completed consecutive real requests at about 57 GB peak memory per GPU. |
@@ -673,7 +675,7 @@ the configurations with collected measurements:
 | --- | --- | --- |
 | B300 | 8× Ulysses8 resident | 8× FSDP + Ulysses8; the 8-GPU sweep is not a minimum-GPU claim. |
 | B200 | 8× Ulysses8 resident | 4× FSDP + Ulysses4 |
-| H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4; 4× TP2 + Ulysses2 |
+| H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4; 4× TP2 + Ulysses2; 2 nodes × 8× Ulysses8×Ring2 cross-node |
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
 | RTX 5090 | 2× TP2 + layerwise offload | — |
@@ -778,6 +780,72 @@ TP2 + Ulysses2 shards the DiT weights and holds peak memory about 30 GB per
 GPU lower, which is why it remains the 80 GB H100 recipe. Matching the warmup
 request to the served resolution removes the cold first-request cost on both
 topologies (about 10 s end-to-end on this workload).
+
+### H200 cross-node scaling
+
+Long references and long durations grow the packed sequence length, and
+Ulysses alone cannot scale sequence parallelism past the GPU count of one
+node without either violating head-count divisibility or exposing
+all-to-all traffic across the slower inter-node link. H3 combines
+node-local Ulysses with cross-node Ring: Ring's point-to-point KV rotation
+is designed to overlap with attention compute, which fits a slower
+cross-node link better than an all-to-all does.
+
+**Hardware.** 2 nodes × 8× NVIDIA H200 SXM, same cluster, InfiniBand
+between nodes.
+
+**Serve command.** The cross-node cell the picker emits for H200, run
+identically on both nodes with `--node-rank` set to 0 and 1:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --num-gpus 16 \
+  --nnodes 2 \
+  --node-rank {{NODE_RANK}} \
+  --dist-init-addr {{NODE0_IP}}:20000 \
+  --sp-degree 16 \
+  --ulysses-degree 8 \
+  --ring-degree 2 \
+  --encoder-parallel replicate \
+  --performance-mode speed \
+  --host 0.0.0.0 \
+  --port 30010
+```
+
+**What was measured.** A controlled denoise-stage comparison on identical
+hardware: 8× H200 single-node (Ulysses8, no Ring) versus the same 16-GPU
+cross-node command above (Ulysses8 × Ring2), holding prompt, seed, and
+step count fixed:
+
+| Task | Single-node (Ulysses8) | Cross-node (Ulysses8 × Ring2) | Change |
+| --- | ---: | ---: | ---: |
+| T2VA denoise/step | 0.749 s | 0.477 s | −36.3% |
+| Ref2VA/V2V denoise/step | 2.572 s | 1.494 s | −41.9% |
+
+The gain grows with sequence length because Ring's per-hop communication
+cost stays roughly constant while attention compute grows quadratically
+with sequence length, so V2V's longer packed sequence benefits more than
+T2VA's shorter one. With the point-to-point KV rotation pipelined against
+attention compute, one V2V request's full denoise stage completed in
+68.1–68.3 seconds versus 128.6 seconds on the single-node 8-GPU baseline
+(−47.0%), with byte-identical output to the unpipelined cross-node path.
+
+Cross-node determinism was confirmed separately: the same request run
+twice against the same cross-node deployment produced byte-identical
+output. A cross-node run's output is not expected to bit-match a
+single-node run of the same prompt and seed — Ring's online-softmax merge
+across hops accumulates floating-point operations in a different order
+than single-node attention, which is an expected source of bit-level
+difference, not a correctness regression.
+
+<Warning>
+`--encoder-parallel auto`'s fold decision is not yet node-boundary aware
+and attempts to fold the text encoder across nodes, which crashes the
+Ref2VA reference-conditioned encoder. Always pass
+`--encoder-parallel replicate` explicitly for cross-node H3 deployments.
+</Warning>
 
 ### H100 topology comparison
 

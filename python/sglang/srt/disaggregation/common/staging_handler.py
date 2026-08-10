@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import struct
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -531,31 +530,6 @@ class StagingTransferInfo:
         self.offsets[idx] = offset
         self.rounds[idx] = rnd
         self.ends[idx] = end
-
-
-@dataclasses.dataclass
-class StagingRegisterInfo:
-    """Staging buffer registration info attached to a KVArgsRegisterInfo."""
-
-    base_ptr: int = 0
-    total_size: int = 0
-
-    @classmethod
-    def from_zmq_fields(
-        cls, msg: list, msg_start_offset: int
-    ) -> Optional[StagingRegisterInfo]:
-        i = msg_start_offset
-        base_ptr = (
-            struct.unpack("Q", msg[i])[0] if len(msg) > i and len(msg[i]) == 8 else 0
-        )
-        total_size = (
-            int(msg[i + 1].decode("ascii"))
-            if len(msg) > i + 1 and len(msg[i + 1]) > 0
-            else 0
-        )
-        if base_ptr == 0 and total_size == 0:
-            return None
-        return cls(base_ptr=base_ptr, total_size=total_size)
 
 
 class PrefillStagingStrategy:

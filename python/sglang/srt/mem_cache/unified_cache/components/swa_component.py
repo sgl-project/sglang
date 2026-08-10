@@ -76,6 +76,9 @@ class SWAComponent(TreeComponent):
 
     component_type = ComponentType.SWA
 
+    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        return False
+
     def reset_session_state(self) -> None:
         super().reset_session_state()
         self._session_leaf_covered_len = {}

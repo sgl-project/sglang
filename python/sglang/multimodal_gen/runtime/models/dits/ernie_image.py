@@ -19,10 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
-from sglang.kernels.ops.diffusion.residual_gate_add import (
-    can_use_residual_gate_add_cuda,
-    residual_gate_add_cuda,
-)
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.kernels.ops.diffusion.triton.rmsnorm_scale_shift_bitexact import (
     can_use_fused_rmsnorm_scale_shift,
     can_use_fused_scale_residual_rmsnorm_scale_shift,
@@ -53,37 +50,6 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-_ERNIE_RESIDUAL_GATE_CUDA_DISABLED = False
-
-
-def _ernie_residual_gate_add(
-    residual: torch.Tensor,
-    update: torch.Tensor,
-    gate: torch.Tensor,
-) -> torch.Tensor:
-    """Single-kernel ``residual + gate * update``, bit-exact vs the eager pair.
-
-    Restricted to half dtypes: there the kernel reproduces the eager pair's
-    two-step rounding exactly (verified by ``torch.equal``), while for fp32 it
-    would contract to an fma (one rounding) and stop being bit-exact.
-    """
-    global _ERNIE_RESIDUAL_GATE_CUDA_DISABLED
-
-    if (
-        not _ERNIE_RESIDUAL_GATE_CUDA_DISABLED
-        and residual.dtype in (torch.float16, torch.bfloat16)
-        and can_use_residual_gate_add_cuda(residual, update, gate)
-    ):
-        try:
-            return residual_gate_add_cuda(residual, update, gate)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling ERNIE residual-gate CUDA fast path: {exc}")
-            _ERNIE_RESIDUAL_GATE_CUDA_DISABLED = True
-
-    return residual + gate * update
 
 
 _ERNIE_FUSED_NORM_DISABLED = False
@@ -197,7 +163,7 @@ def _ernie_gated_norm_scale_shift(
             _ERNIE_FUSED_GATED_NORM_DISABLED = True
             return ref, res_ref
 
-    res = _ernie_residual_gate_add(residual, update, gate)
+    res = residual_gate_add(residual, update, gate)
     return _eager_norm_scale_shift(norm, res, scale, shift), res
 
 
@@ -421,7 +387,7 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         x, residual = _ernie_gated_norm_scale_shift(
             self.adaLN_mlp_ln, residual, attn_out, gate_msa, scale_mlp, shift_mlp
         )
-        x = _ernie_residual_gate_add(residual, self.mlp(x), gate_mlp)
+        x = residual_gate_add(residual, self.mlp(x), gate_mlp)
 
         return x
 

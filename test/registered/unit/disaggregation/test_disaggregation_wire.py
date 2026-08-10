@@ -1,3 +1,4 @@
+import struct
 import threading
 import unittest
 from types import SimpleNamespace
@@ -17,7 +18,10 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo as MooncakeKVArgsRegisterInfo,
+    MooncakeKVManager,
+)
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
@@ -36,6 +40,35 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_mooncake_registration_staging_fields(self):
+        msg = [
+            b"room",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            struct.pack("Q", 0x1000),
+            struct.pack("Q", 0x2000),
+            b"",
+            b"0",
+            b"1",
+            b"128",
+            b"",
+            b"",
+            b"",
+            b"",
+            struct.pack("Q", 0x3000),
+            b"4096",
+            b"4",
+            b"2",
+        ]
+
+        info = MooncakeKVArgsRegisterInfo.from_zmq(msg)
+
+        self.assertEqual(info.staging_base_ptr, 0x3000)
+        self.assertEqual(info.staging_total_size, 4096)
+        self.assertEqual(info.dst_dcp_size, 4)
+        self.assertEqual(info.dst_dcp_rank, 2)
+
     def test_int_lists_roundtrip(self):
         cases = [
             ("Q", [[1, 2, 3], [4]]),
@@ -283,7 +316,6 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             enable_multi_layer_eagle=False,
             disaggregation_mode="decode",
             enable_hisparse=False,
-            dcp_size=1,
         )
 
         with envs.SGLANG_DSA_FUSE_TOPK.override(True), patch(
