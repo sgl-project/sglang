@@ -56,7 +56,7 @@ register_kernel(
     KernelSpec(
         op="quantization.per_token_group_quant",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.quantization._jit_per_token_group_quant:per_token_group_quant",
+        target="sglang.kernels.ops.quantization.per_token_group_quant:per_token_group_quant",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn", "int8"),
@@ -67,7 +67,7 @@ register_kernel(
                 "layouts, optional fused silu_and_mul and masked EP-MoE schedule"
             ),
         ),
-        description="Unified per-token-group quantization (sglang.jit_kernel).",
+        description="Unified per-token-group quantization (sglang.kernels.jit).",
     )
 )
 
@@ -172,7 +172,6 @@ _TRITON_KERNELS = [
     ("fp8_kernel", "sglang_per_token_quant_fp8"),
     ("fp8_kernel", "static_quant_fp8"),
     ("fp8_kernel", "w8a8_block_fp8_matmul"),
-    ("fp8_kernel", "mxfp8_block_scaled_matmul_triton"),
     ("fp8_kernel", "per_tensor_quant_mla_fp8"),
     ("fp8_kernel", "per_token_group_quant_mla_deep_gemm_masked_fp8"),
     ("fp8_kernel", "per_token_group_quant_fp8_hopper_moe_mn_major"),

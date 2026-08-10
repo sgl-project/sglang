@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
+from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -292,14 +293,23 @@ class RuntimeHandle:
 
     async def _run_generate(self, obj, chunk_callback, stream: bool, request):
         ready_event = None
+        gen = None
         try:
-            ready_event = self._install_on_ready(chunk_callback) if stream else None
+            ready_event = self._install_on_ready(chunk_callback)
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
+                completed_choices = set()
+                expected_choices = obj.batch_size * obj.parallel_sample_num
                 async for chunk in gen:
-                    finished = (
+                    choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
+                    if choice_finished:
+                        choice_id = chunk.get(
+                            "index", chunk.get("meta_info", {}).get("id")
+                        )
+                        completed_choices.add(choice_id)
+                    finished = len(completed_choices) >= expected_choices
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,
@@ -313,15 +323,26 @@ class RuntimeHandle:
                 self._safe_callback(chunk_callback, {}, finished=True)
             else:
                 result = await gen.__anext__()
-                self._safe_callback(chunk_callback, result, finished=True)
+                chunks = result if isinstance(result, list) else [result]
+                for index, chunk in enumerate(chunks):
+                    keep_going = await self._send_with_backpressure(
+                        chunk_callback,
+                        ready_event,
+                        chunk,
+                        finished=index == len(chunks) - 1,
+                        timeout_abort_rid=obj.rid,
+                    )
+                    if not keep_going:
+                        return
         except StopAsyncIteration:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
             self._send_native_error(chunk_callback, str(e))
         finally:
-            if stream:
-                self._uninstall_on_ready(chunk_callback)
+            if gen is not None:
+                await gen.aclose()
+            self._uninstall_on_ready(chunk_callback)
 
     async def _run_embed(self, obj, chunk_callback, request):
         try:
@@ -376,16 +397,25 @@ class RuntimeHandle:
         model_config = self.tokenizer_manager.model_config
         result = {
             "model_path": self.tokenizer_manager.model_path,
-            "tokenizer_path": self.server_args.tokenizer_path,
+            "tokenizer_path": self.tokenizer_manager.server_args.tokenizer_path,
             "is_generation": self.tokenizer_manager.is_generation,
-            "weight_version": self.server_args.weight_version,
+            "weight_version": self.tokenizer_manager.config_value("weight_version"),
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
+        embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+        if embedding_model_spec is not None:
+            result["embedding"] = resolved_embedding_plan(
+                embedding_model_spec,
+                server_args=self.server_args,
+                model_config=model_config,
+            )
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dataclasses.asdict(self.server_args)
+        result: Dict[str, Any] = self.tokenizer_manager.resolved_config_dict(
+            dataclasses.asdict(self.tokenizer_manager.server_args)
+        )
         result.update(self.scheduler_info)
         return json.dumps(msgspec_to_builtins(result), default=str)
 
@@ -424,7 +454,7 @@ class RuntimeHandle:
                 "max_model_len": self.tokenizer_manager.model_config.context_len,
             }
         ]
-        if self.server_args.enable_lora and hasattr(
+        if self.tokenizer_manager.server_args.enable_lora and hasattr(
             self.tokenizer_manager, "lora_registry"
         ):
             lora_registry = self.tokenizer_manager.lora_registry
