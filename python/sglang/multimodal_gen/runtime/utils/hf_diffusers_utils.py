@@ -856,8 +856,6 @@ def maybe_download_model(
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
         if not force_diffusers_model:
-            # Not a repo id, so the download block below cannot re-fetch it. The
-            # probe-stub guard lives in the cache-first branch.
             return model_name_or_path
         if is_lora or _verify_diffusers_model_complete(model_name_or_path):
             if not is_lora:
