@@ -64,7 +64,12 @@ points cannot silently diverge.
 | Adding a variant of an existing model that shares most logic | **Modular** — reuse existing stages, customize via PipelineConfig callbacks |
 | A specific pre-processing step needs special parallelism or profiling isolation | **Modular** — extract that step as a dedicated stage |
 
-**Key principle (both styles)**: The stage(s) before `DenoisingStage` must produce a `Req` batch object with all the standard tensor fields that `DenoisingStage` expects (latents, timesteps, prompt_embeds, etc.). As long as this contract is met, the pipeline remains composable regardless of which style you use.
+**Key principle (standard-denoise styles)**: For Hybrid and Modular pipelines,
+the stage(s) before `DenoisingStage` must produce a `Req` batch object with all
+the standard tensor fields that `DenoisingStage` expects (latents, timesteps,
+prompt embeds, and model-specific conditioning). Native task-contract pipelines
+may own a different denoise/decode contract; keep that divergence explicit and
+covered by request-contract tests.
 
 ---
 
@@ -115,7 +120,7 @@ Once you have the reference code, study it thoroughly:
 **Before creating any new files, check whether an existing pipeline or stage can be reused or extended.** Only create new pipelines/stages when the existing ones would require extensive modifications or when no similar implementation exists.
 
 Specifically:
-1. **Compare the new model's architecture against existing pipelines** before creating files. Current native families include MiniMax-H3, LTX-2/2.3, HunyuanVideo/FastHunyuan, Wan/FastWan/TurboWan/LingBot World, MOVA, FLUX/FLUX.2/Klein, Z-Image, Qwen-Image/edit/layered, GLM-Image, SD3, Hunyuan3D, Helios, Cosmos3, SANA/SANA-WM, FireRed, ERNIE-Image, JoyAI, and Ideogram4. If the new model shares most of its structure with an existing one (e.g., same text encoders, similar latent format, compatible denoising loop), prefer:
+1. **Compare the new model's architecture against existing pipelines** before creating files. Current native families include MiniMax-H3, Krea-2, LTX-2/2.3, HunyuanVideo/FastHunyuan, Wan/FastWan/TurboWan/LingBot World/LingBot Video MoE, MOVA, FLUX/FLUX.2/Klein, Z-Image, Qwen-Image/edit/layered, GLM-Image, SD3, Hunyuan3D, Helios, Cosmos3, SANA/SANA-WM, FireRed, ERNIE-Image, JoyAI, and Ideogram4. If the new model shares most of its structure with an existing one (e.g., same text encoders, similar latent format, compatible denoising loop), prefer:
    - Adding a new config variant to the existing pipeline rather than creating a new pipeline class
    - Reusing the existing `BeforeDenoisingStage` with minor parameter differences
    - Using `add_standard_t2i_stages()` / `add_standard_ti2i_stages()` / `add_standard_ti2v_stages()` if the model fits standard patterns
@@ -582,6 +587,7 @@ After implementation, **you must verify that the generated output is not noise**
 | Hunyuan3D | `runtime/pipelines/hunyuan3d_pipeline.py` | `stages/model_specific_stages/hunyuan3d/` | `configs/pipeline_configs/hunyuan3d.py` |
 | SANA-WM | `runtime/pipelines/sana_wm_pipeline.py`, `sana_wm_realtime_pipeline.py` | `stages/model_specific_stages/sana_wm/` | `configs/pipeline_configs/sana_wm.py` |
 | LingBot World realtime | `runtime/pipelines/lingbot_world_causal_dmd_pipeline.py` | `stages/model_specific_stages/lingbot_world/` | `configs/pipeline_configs/lingbot_world.py` |
+| Krea-2 | `runtime/pipelines/krea2.py` | `stages/model_specific_stages/krea2.py` | `configs/pipeline_configs/krea2.py` |
 
 ### Modular Style (when standard stages fit well)
 
@@ -599,6 +605,7 @@ After implementation, **you must verify that the generated output is not noise**
 | Helios | `runtime/pipelines/helios_pipeline.py` | Video pipeline family with custom denoising and decoding stages |
 | FireRed/JoyAI image edit | `runtime/pipelines/qwen_image.py`, `runtime/pipelines/joy_image.py` | FireRed reuses Qwen edit-plus config; JoyAI has its own edit pipeline |
 | Wan | `runtime/pipelines/wan_pipeline.py` | Uses `add_standard_ti2v_stages()` |
+| LingBot Video MoE 30B | `runtime/pipelines/lingbot_video_moe.py` | Uses a model-specific structured-JSON text-encoding stage, then standard latent/timestep preparation, denoising, and decoding |
 
 ### Native Task-Contract Style (coupled multimodal requests)
 
@@ -612,7 +619,7 @@ After implementation, **you must verify that the generated output is not noise**
 
 Before submitting, verify:
 
-**Common (both styles):**
+**Common (all styles):**
 - [ ] **Pipeline file** exists at `runtime/pipelines/{model_name}.py` with `EntryClass`
 - [ ] **PipelineConfig** at `configs/pipeline_configs/{model_name}.py`
 - [ ] **SamplingParams** at `configs/sample/{model_name}.py`

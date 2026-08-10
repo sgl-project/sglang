@@ -222,13 +222,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        torch.get_device_module().set_device(self.local_rank)
-        intra_op_threads = _worker_cpu_intra_op_threads(self.server_args.num_gpus)
+        current_platform.set_device(current_platform.get_device(self.local_rank))
+        # num_gpus is the total world size across every node; the co-located,
+        # CPU-contending worker count on THIS host is num_gpus // nnodes.
+        local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
+        intra_op_threads = _worker_cpu_intra_op_threads(local_num_gpus)
         if intra_op_threads is not None:
             torch.set_num_threads(intra_op_threads)
-        # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.master_port)
+        # Set environment variables for distributed initialization. Single
+        # node rendezvous stays on loopback; cross-node rendezvous must use
+        # an address every node can reach, so --dist-init-addr takes over.
+        if self.server_args.nnodes > 1:
+            rendezvous_addr = NetworkAddress.parse(self.server_args.dist_init_addr)
+        else:
+            rendezvous_addr = NetworkAddress("127.0.0.1", self.master_port)
+        os.environ["MASTER_ADDR"] = rendezvous_addr.host
+        os.environ["MASTER_PORT"] = str(rendezvous_addr.port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
@@ -241,11 +250,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
-            distributed_init_method=NetworkAddress(
-                "127.0.0.1", self.master_port
-            ).to_tcp(),
+            distributed_init_method=rendezvous_addr.to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
+
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.server_args import ServerArgs as SrtServerArgs
+
+        if get_context()._server_args is None:
+            get_context().set_server_args(SrtServerArgs(model_path="dummy"))
 
         # set proc title
         if model_parallel_is_initialized():

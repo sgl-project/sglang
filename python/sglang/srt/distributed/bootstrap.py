@@ -93,7 +93,7 @@ def init_torch_distributed(
             attn_cp_size=ps.attn_cp_size,
             moe_ep_size=ps.moe_ep_size,
             moe_dp_size=ps.moe_dp_size,
-            dcp_size=ps.dcp_size,
+            dcp_size=ps.attn_dcp_size,
         )
 
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
