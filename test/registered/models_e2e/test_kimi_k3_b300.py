@@ -1,7 +1,8 @@
 """B300 per-commit CI coverage for Kimi-K3 serving recipes.
 
 Runs the Low Latency DSPARK recipe and the Balanced DCP/HiCache recipe on
-eight B300 GPUs. Each server must preserve basic model quality on GSM8K.
+eight B300 GPUs. Each server must preserve basic model quality on GSM8K, and
+the Low Latency recipe must also preserve single-request decode performance.
 """
 
 import unittest
@@ -9,6 +10,7 @@ import unittest
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -33,11 +35,20 @@ def _stop_server(process):
         _wait_for_gpu_idle_in_ci(timeout=GPU_IDLE_TIMEOUT)
 
 
-class TestKimiK3B300LowLatency(GSM8KMixin, CustomTestCase):
+class TestKimiK3B300LowLatency(GSM8KMixin, SpecDecodingMixin, CustomTestCase):
     """TP8 Low Latency recipe with DSPARK linear ReplaySSM speculation."""
 
     gsm8k_score_threshold = 0.95
     gsm8k_num_examples = 200
+    # Gated on GSM8K rather than on test_bs_1_speed below: a 200-question
+    # average holds steady when a numerics change moves where the single
+    # greedy prompt hits EOS.
+    gsm8k_accept_length_thres = 4.5
+    # Both scale with how far that one greedy prompt runs, and speed is
+    # end-to-end, so launch and TTFT are amortized over the output -- it sits
+    # well below the steady decode rate the server logs. Coarse guards only.
+    accept_length_thres = 4.0
+    bs_1_speed_thres = 300
 
     @classmethod
     def setUpClass(cls):
