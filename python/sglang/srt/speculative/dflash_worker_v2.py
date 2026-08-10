@@ -17,6 +17,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -171,6 +172,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.ps = ps
@@ -1381,10 +1384,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DFLASH speculative decoding does not support return_logprob yet."
-            )
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -1426,7 +1425,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH prefill expected out_cache_loc, but got None."
                 )
             positions, _ = compute_position(
-                self.model_runner.server_args.attention_backend,
+                self.model_runner.prefill_attention_backend_str,
                 draft_seq_lens,
                 ctx_lens,
                 int(sum(batch.extend_lens)),
@@ -1833,6 +1832,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
 
+        if batch.return_logprob:
+            output_indices = torch.arange(
+                bs * block_size, dtype=torch.int64, device=device
+            ).view(bs, block_size)
+            compute_spec_v2_logprobs(
+                batch,
+                logits_output,
+                out_tokens.reshape(-1),
+                output_indices,
+                block_size - 1,
+            )
+
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1880,4 +1891,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
+            routed_experts_output=target_out.routed_experts_output,
+            indexer_topk_output=target_out.indexer_topk_output,
         )

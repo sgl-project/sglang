@@ -33,7 +33,9 @@ import triton
 from torch.profiler import record_function
 
 from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
+from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.page_major import (
     build_dense_mla_views,
     build_page_major_mamba_views,
@@ -258,7 +260,16 @@ class UnifiedKVPool:
             self._raw = torch.empty(
                 total_bytes + view_tail_pad_bytes, dtype=torch.uint8, device=device
             )
-        self._raw.zero_()  # unset slots must read as zeros (matches non-shared)
+        if envs.SGLANG_DEBUG_POISON_POOL.get():
+            # Debug: bf16-NaN-fill so NaN-unsafe reads of never-written bytes
+            # fail deterministically.
+            self._raw.view(torch.int16).fill_(0x7FC1)
+            logger.warning(
+                "[unified-memory-pool] POISONED: pool filled with bf16-NaN "
+                "patterns (SGLANG_DEBUG_POISON_POOL)"
+            )
+        else:
+            self._raw.zero_()  # unset slots must read as zeros (matches non-shared)
 
         self._max_slots: Dict[str, int] = {}
         self._anchor_bytes: Dict[str, int] = {}
@@ -671,6 +682,16 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
             )
             env[tgt_pages] = env[src_pages]
 
+    def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
+        """Zero whole page envelopes (PHYSICAL page ids) on allocator
+        hand-out."""
+        zero_pages(
+            self._unified_buffer._raw,
+            phys_pages,
+            self._num_pages,
+            self._page_bytes,
+        )
+
 
 class UnifiedMambaPool(MambaPool):
     """Mamba state pool whose conv/temporal state are strided views into a `UnifiedKVPool`.
@@ -710,13 +731,14 @@ class UnifiedMambaPool(MambaPool):
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
         self.num_mamba_layers = spec.layer_num
-        # GDN/KDA ReplaySSM unsupported; replicate parent's disabled-state attrs so
-        # paths guarded by `replayssm_write_pos is not None` don't AttributeError.
+        # GDN/KDA ReplaySSM / spec unsupported; replicate parent's disabled-state
+        # attrs so unconditional reads (e.g. `replayssm_cache_base is not None` in
+        # the req-slot alloc path) and `... is not None` guards don't AttributeError.
         self.enable_linear_replayssm = False
         self.linear_replayssm_cache_len = 16
         self.replayssm_write_pos = None
         self.replayssm_is_kda = False
-        self.enable_gdn_replayssm_spec = False
+        self.enable_linear_replayssm_spec = False
         self.replayssm_spec_fold = False
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None
@@ -941,10 +963,10 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
-        enable_gdn_replayssm_spec: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
-        # linear_replayssm_cache_len / enable_gdn_replayssm_spec: accepted to match
+        # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal
         # state are fixed-shape views (replayssm/spec are gated off under unified).
         assert mamba_size == self._shared_mamba_size, (

@@ -11,6 +11,25 @@ import triton
 import triton.language as tl
 
 
+def _require_entry_contiguous_dst(
+    dst: torch.Tensor, entry_start_dim: int, fn_name: str
+) -> None:
+    """dst layout contract: the kernels index through the real layer/slot
+    strides (int64) plus a FLAT element offset within one (layer, slot)
+    entry — layer/slot strides may be arbitrary (envelope-strided unified
+    pool views), but the trailing entry dims must be contiguous.
+    """
+    expected = 1
+    for i in range(dst.ndim - 1, entry_start_dim - 1, -1):
+        if dst.shape[i] != 1 and dst.stride(i) != expected:
+            raise ValueError(
+                f"{fn_name}: dst entry dims (dims {entry_start_dim}.."
+                f"{dst.ndim - 1}) must be contiguous; got "
+                f"shape={tuple(dst.shape)} strides={tuple(dst.stride())}"
+            )
+        expected *= dst.shape[i]
+
+
 @triton.jit
 def track_mamba_state_if_needed_kernel(
     conv_states_ptr,
@@ -271,9 +290,7 @@ def fused_mamba_state_scatter_with_mask(
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
 
-    # Ensure tensors are contiguous
-    if not dst.is_contiguous():
-        raise ValueError("dst tensor must be contiguous")
+    _require_entry_contiguous_dst(dst, 2, "fused_mamba_state_scatter_with_mask")
     if not src.is_contiguous():
         raise ValueError("src tensor must be contiguous")
 
@@ -420,12 +437,10 @@ def fused_conv_window_scatter_with_mask(
     src_step_size = src.shape[2]
     dst_req_size = dst.shape[1]
 
-    # `dst` stays contiguous; `src` is an intentionally non-contiguous (overlapping)
-    # view, so we do NOT assert src contiguity here (unlike the dense scatter).
-    if not dst.is_contiguous():
-        raise ValueError(
-            "dst tensor in fused_conv_window_scatter_with_mask must be contiguous"
-        )
+    # `src` is an intentionally non-contiguous (overlapping) view indexed per
+    # dim through its real strides, so we do NOT assert src contiguity here
+    # (unlike the dense scatter).
+    _require_entry_contiguous_dst(dst, 2, "fused_conv_window_scatter_with_mask")
 
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()

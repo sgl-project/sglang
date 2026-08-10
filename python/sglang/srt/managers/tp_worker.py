@@ -46,6 +46,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.graph_memory_usage import (
+    merge_graph_memory_usage,
+    merge_graph_time_usage,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import get_exec, get_model, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
@@ -96,6 +100,23 @@ class BaseTpWorker(ABC):
             self.model_runner.full_max_total_num_tokens,
             self.model_runner.swa_max_total_num_tokens,
         )
+
+    @property
+    def graph_memory_usage(self) -> dict[str, float]:
+        runners = self.model_runner_list or [self.model_runner]
+        return merge_graph_memory_usage(
+            *(runner.graph_memory_usage for runner in runners)
+        )
+
+    @property
+    def graph_time_usage(self) -> dict[str, float]:
+        runners = self.model_runner_list or [self.model_runner]
+        return merge_graph_time_usage(*(runner.graph_time_usage for runner in runners))
+
+    @property
+    def weight_load_time(self) -> float:
+        runners = self.model_runner_list or [self.model_runner]
+        return sum(runner.weight_load_time for runner in runners)
 
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
@@ -289,6 +310,7 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
+        draft_attention_backend: Optional[str] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -304,6 +326,8 @@ class TpModelWorker(BaseTpWorker):
         # Draft worker: target's effective context length; the draft runs at
         # absolute target positions. None keeps server_args.context_length.
         self.context_length = context_length
+        # Draft worker: the attention backend the algorithm resolved for it.
+        self.draft_attention_backend = draft_attention_backend
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -385,7 +409,8 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens - 1,
+            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
+            - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
@@ -436,6 +461,7 @@ class TpModelWorker(BaseTpWorker):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
+            draft_attention_backend=self.draft_attention_backend,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
 
@@ -456,6 +482,7 @@ class TpModelWorker(BaseTpWorker):
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     memory_pool_config=self.memory_pool_config,
+                    draft_attention_backend=self.draft_attention_backend,
                     draft_model_idx=i,
                 )
             )
@@ -485,7 +512,8 @@ class TpModelWorker(BaseTpWorker):
     def get_worker_info(self):
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens - 1,
+            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
+            - 1,
         )
         return (
             self.model_runner.max_total_num_tokens,

@@ -1,0 +1,109 @@
+"""Native driver error paths: out-of-scope and malformed inputs are rejected.
+
+Covers ``process`` in ``rust/sglang-mm/src/driver.rs`` (via the
+``_core.qwen_vl.process_native_mm`` binding). The wire-payload parsing that
+feeds this driver (modality/shape rejection) lives in ``sglang-server``'s
+message layer and is tested with the integration PR.
+
+There is no Python fallback path, so the server rejects every driver error
+back to the client as a 400; the message must say why (placeholder mismatch,
+undecodable image, missing prompt). This pins that contract for each
+rejection class.
+"""
+
+import io
+import sys
+import unittest
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _mm_rust_utils import (  # noqa: E402
+    IMAGE_TOKEN_ID,
+    PROCESSOR_CONFIGS,
+    VISION_END_ID,
+    VISION_START_ID,
+    image_bytes,
+    load_core,
+    spec_json,
+)
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+QWEN_CORE = getattr(load_core(), "qwen_vl", None)
+SPEC = spec_json(PROCESSOR_CONFIGS["qwen2_5_vl"])
+IMAGE_IDS = [7, VISION_START_ID, IMAGE_TOKEN_ID, VISION_END_ID, 8]
+
+
+def gif_bytes():
+    buffer = io.BytesIO()
+    Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8)).save(buffer, format="GIF")
+    return buffer.getvalue()
+
+
+@unittest.skipUnless(
+    QWEN_CORE and hasattr(QWEN_CORE, "process_native_mm"),
+    "sglang-mm native Qwen driver not built",
+)
+class TestNativeDriverErrorPaths(CustomTestCase):
+    def assert_rejected(self, input_ids, images, pattern, spec=SPEC):
+        with self.assertRaisesRegex(ValueError, pattern):
+            QWEN_CORE.process_native_mm(input_ids, images, spec)
+
+    def test_degenerate_geometry_rejected_not_panicked(self):
+        """A thin image against a tight ``max_pixels`` floors a side of the
+        smart_resize target to 0. That used to panic on a worker thread inside
+        the resize coefficient math; a Rust panic surfaces as ``PanicException``
+        (a ``BaseException``), not ``ValueError``, so this asserts the request
+        is rejected cleanly rather than crashing the pipeline."""
+        config = dict(PROCESSOR_CONFIGS["qwen2_5_vl"], min_pixels=3136, max_pixels=3136)
+        self.assert_rejected(
+            IMAGE_IDS,
+            [image_bytes(2000, 10)],
+            "smart_resize",
+            spec=spec_json(config),
+        )
+
+    def test_placeholder_count_mismatches_rejected(self):
+        cases = {
+            "no placeholder": ([7, 8], [image_bytes(80, 80)]),
+            "more images": (IMAGE_IDS, [image_bytes(80, 80), image_bytes(88, 80, 1)]),
+            "more placeholders": (IMAGE_IDS + IMAGE_IDS, [image_bytes(80, 80)]),
+        }
+        for name, (ids, images) in cases.items():
+            with self.subTest(case=name):
+                self.assert_rejected(ids, images, "placeholder")
+
+    def test_undecodable_images_rejected(self):
+        # Corrupt bytes are outside the native decoder's scope; the server
+        # rejects them as a 400.
+        self.assert_rejected(IMAGE_IDS, [b"junk"], "decode")
+
+    def test_gif_serves_through_the_pipeline(self):
+        """GIF moved from rejected to served when the pure-Rust webp/gif/bmp
+        decoders were enabled; this pins the accept side of that contract flip
+        (the reject side used to be asserted here and broke in CI)."""
+        _, _, grids, _, offsets, _, _ = QWEN_CORE.process_native_mm(
+            IMAGE_IDS, [gif_bytes()], SPEC
+        )
+        self.assertEqual(len(grids), 1)
+        self.assertEqual(len(offsets), 1)
+
+    def test_missing_text_and_input_ids_rejected(self):
+        for input_ids in (None, []):
+            with self.subTest(input_ids=input_ids):
+                self.assert_rejected(
+                    input_ids, [image_bytes(80, 80)], "without text or input_ids"
+                )
+
+    def test_image_free_request_rejected(self):
+        self.assert_rejected(IMAGE_IDS, [], "image sources")
+
+
+if __name__ == "__main__":
+    unittest.main()

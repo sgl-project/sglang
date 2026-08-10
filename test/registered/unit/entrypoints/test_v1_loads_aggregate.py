@@ -58,8 +58,21 @@ class _FakeTokenizerManager(TokenizerControlMixin):
 class _FakeHttpTokenizerManager:
     metrics_collector = None
 
-    def __init__(self, loads):
+    def __init__(
+        self,
+        loads,
+        tp_size=1,
+        dp_size=1,
+        pp_size=1,
+        enable_dp_attention=False,
+    ):
         self.loads = loads
+        self.server_args = SimpleNamespace(
+            tp_size=tp_size,
+            dp_size=dp_size,
+            pp_size=pp_size,
+            enable_dp_attention=enable_dp_attention,
+        )
 
     async def get_loads(self, include=None, dp_rank=None):
         results = []
@@ -94,16 +107,29 @@ class TestLoadsResponse(CustomTestCase):
 
 
 class TestLoadsAcceleratorField(CustomTestCase):
-    def test_accelerator_reported_in_json(self):
+    def test_accelerator_metadata_reported_in_json(self):
         """Guards the response contract: the JSON envelope carries an
-        "accelerator" field with the detected device name."""
-        manager = _FakeHttpTokenizerManager([LoadSnapshot(dp_rank=0)])
+        accelerator name and the accelerator count for each DP rank."""
+        manager = _FakeHttpTokenizerManager([LoadSnapshot(dp_rank=0)], tp_size=16)
 
         with mock.patch.object(
             v1_loads, "_accelerator_name", return_value="NVIDIA GB300"
         ):
             response = asyncio.run(get_loads(tokenizer_manager=manager))
             self.assertEqual(response["accelerator"], "NVIDIA GB300")
+            self.assertEqual(response["num_accelerators"], 16)
+
+    def test_dp_attention_reports_accelerators_per_dp_rank(self):
+        manager = _FakeHttpTokenizerManager(
+            [LoadSnapshot(dp_rank=rank) for rank in range(8)],
+            tp_size=8,
+            dp_size=8,
+            enable_dp_attention=True,
+        )
+
+        response = asyncio.run(get_loads(tokenizer_manager=manager))
+
+        self.assertEqual(response["num_accelerators"], 1)
 
 
 class TestGetLoads(CustomTestCase):
