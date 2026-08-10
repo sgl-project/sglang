@@ -58,6 +58,10 @@ _SEMAPHORE_BYTES = 128
 _MAX_GRAPH_INPUTS = 131072
 # resolved once at import time; explicit constructor sizes take precedence
 _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
+# forced per-direction workspace sizes; highest priority, override both the
+# tuned config and explicit constructor sizes (None = not forced)
+_FORCE_PULL_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB.get()
+_FORCE_PUSH_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
 
 
 class _PullMode(enum.Enum):
@@ -109,6 +113,10 @@ class CustomAllReduceV2:
                               the tuned size and ``max_size``.
         :param max_push_size: explicit per-buffer push workspace size;
                               overrides both the tuned size and ``max_size``.
+
+        ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB`` /
+        ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`` take the highest
+        priority and override all of the size parameters above.
         """
         self.disabled = True
         if not can_use_custom_all_reduce_v2(group=group, device=device):
@@ -123,6 +131,25 @@ class CustomAllReduceV2:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
             max_push_size = min(base_config.max_push_bytes, max_size)
+        if _FORCE_PULL_SIZE_KB is not None:
+            max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
+        if _FORCE_PUSH_SIZE_KB is not None:
+            max_push_size = int(_FORCE_PUSH_SIZE_KB) * 1024
+
+        def force_thresholds(heuristic):
+            # forced sizes bypass the tuned NCCL-crossover heuristics: lift
+            # each direction's ceiling to the forced workspace capacity (the
+            # clip() below only ever lowers thresholds)
+            if _FORCE_PULL_SIZE_KB is not None:
+                heuristic = heuristic._replace(two_shot_pull_threshold=max_pull_size)
+            if _FORCE_PUSH_SIZE_KB is not None:
+                heuristic = heuristic._replace(one_shot_push_threshold=max_push_size)
+            return heuristic
+
+        base_config = base_config._replace(
+            graph=force_thresholds(base_config.graph),
+            eager=force_thresholds(base_config.eager),
+        )
         # a minimal workspace keeps the Communicator valid even when a caller
         # only uses one direction (e.g. push-only fused qk-norm instances)
         self.max_pull_size = _ceil_align(max(max_pull_size, _ALIGN_BYTES), _ALIGN_BYTES)
@@ -138,8 +165,12 @@ class CustomAllReduceV2:
             max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
         self.override_algo: Optional[AllReduceAlgo] = None
-        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-
+        # On a multi-node (MNNVL) group the symm-mem workspace plane works
+        # across nodes, but graph zero-copy input registration (cudaIpc /
+        # node-local VMM remap) does not — force eager pull inside graphs.
+        is_multinode = not all(in_the_same_node_as(group, source_rank=0))
+        tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
         # device-side pointer table: one row of world_size pointers per
         # graph-captured all-reduce input
         self.graph_params = torch.zeros(
@@ -342,7 +373,7 @@ class CustomAllReduceV2:
             yield
             return
         try:
-            self._graph_mode_allowed = not self.tms_cudagraph
+            self._graph_mode_allowed = self._is_graph_mode_supported
             yield
         finally:
             self._graph_mode_allowed = False
@@ -426,6 +457,22 @@ def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
 ) -> bool:
+    # Multi-node (MNNVL): the node-local NVLink/P2P topology checks below
+    # are meaningless across nodes; the torch symm-mem rendezvous (fabric
+    # handles) is the real capability gate there.
+    if envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get() and not all(
+        in_the_same_node_as(group, source_rank=0)
+    ):
+        world_size = dist.get_world_size(group=group)
+        if world_size in range(2, 9):
+            logger.warning(
+                "CustomAllReduceV2 enabled on a multi-node group "
+                "(world_size=%d); graph zero-copy is disabled.",
+                world_size,
+            )
+            return True
+        return False
+
     supported = list(range(2, 17))
     if dist.get_world_size(group=group) not in supported:
         return False

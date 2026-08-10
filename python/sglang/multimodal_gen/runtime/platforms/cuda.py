@@ -151,7 +151,26 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
     def resolve(cls, platform) -> str | AttentionBackendEnum:
         try:
             from sageattention import sageattn  # noqa: F401
+        except ImportError as e:
+            logger.info(e)
+            logger.info(
+                "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
+            )
+            return AttentionBackendEnum.FA
 
+        if platform.is_hopper():
+            try:
+                # fixed SM90 bindings retain the fake implementation under its own name
+                from sageattention.sm90_compile import (  # noqa: F401
+                    qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_fake_impl,
+                )
+            except ImportError:
+                logger.warning(
+                    "Installed Sage Attention is missing the SM90 binding fix. Falling back to Flash Attention. Reinstall with `pip install --force-reinstall git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`."
+                )
+                return AttentionBackendEnum.FA
+
+        try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (  # noqa: F401
                 SageAttentionBackend,
             )
@@ -160,7 +179,7 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
         except ImportError as e:
             logger.info(e)
             logger.info(
-                "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
+                "Sage Attention backend failed to import. Falling back to Flash Attention."
             )
             return AttentionBackendEnum.FA
 
@@ -236,6 +255,30 @@ class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
             ) from e
 
 
+class _SolAttnBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SOL_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from sol_attn import sol_attn  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn import (  # noqa: F401
+                SolAttnBackend,
+            )
+
+            return (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn."
+                "SolAttnBackend"
+            )
+        except ImportError as e:
+            logger.error("Failed to import Sol-Attn backend: %s", str(e))
+            raise ImportError(
+                "Sol-Attn backend is not installed. Install it with "
+                "`pip install git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends`."
+            ) from e
+
+
 class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.VMOBA_ATTN
 
@@ -293,6 +336,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SageAttention3BackendResolver,
         _VideoSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
+        _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
@@ -519,6 +563,17 @@ class CudaPlatformBase(Platform):
     ) -> str:
         if selected_backend is None:
             target_backend = cls._resolve_default_attn_backend()
+            if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():
+                # cuDNN SDPA is 1.25-1.5x faster than the FA4 CuTe kernels on
+                # sm_100 for dense diffusion attention; DYNAMIC_CUDNN_SDPA
+                # keeps FA as the fallback for causal/unsupported shapes and
+                # cuDNN runtime errors.
+                fa_cls_str = cls._resolve_flash_attention_backend_cls_str(
+                    target_backend, head_size, dtype
+                )
+                if fa_cls_str == _SDPA_BACKEND_CLS_STR:
+                    return fa_cls_str
+                return _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR
         else:
             resolver = _CUDA_ATTENTION_BACKEND_RESOLVERS.get(selected_backend)
             if resolver is None:
@@ -536,6 +591,34 @@ class CudaPlatformBase(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+
+    @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan VAE decoder
+        fast paths.
+
+        Requests with quality == "high" run the fast paths; the "lossless"
+        default runs the original module path bit-for-bit. See
+        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
+        """
+        try:
+            from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
+                maybe_optimize_autoencoder_kl,
+                maybe_optimize_flux2_vae,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
+                maybe_optimize_wan_vae,
+            )
+
+            vae = maybe_optimize_flux2_vae(vae)
+            vae = maybe_optimize_autoencoder_kl(vae)
+            vae = maybe_optimize_wan_vae(vae)
+        except Exception:
+            logger.warning(
+                "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",
+                exc_info=True,
+            )
+        return vae
 
 
 # NVML utils

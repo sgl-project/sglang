@@ -466,6 +466,7 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.req_to_decode_prefix_len = {room: 4}
         mgr.enable_staging = False
         mgr._staging_ctx = None
+        mgr._staging_outstanding = defaultdict(int)
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1

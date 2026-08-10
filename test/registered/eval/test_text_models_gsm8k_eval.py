@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 # downloading on cache miss. Use a longer timeout than the default 600s.
 NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 
-register_cuda_ci(est_time=3600, suite="nightly-eval-text-2-gpu", nightly=True)
+register_cuda_ci(est_time=2880, stage="nightly", runner_config="2-gpu-large")
 
 MODEL_SCORE_THRESHOLDS = {
     # sgl-eval (zero-shot chat, \boxed{}, math_verify grading). Thresholds are

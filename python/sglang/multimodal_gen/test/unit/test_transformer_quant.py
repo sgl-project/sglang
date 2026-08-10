@@ -57,9 +57,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    _default_quantized_attention_backend,
     _warn_if_expected_param_dtype_missing,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    TransformerQuantLoadSpec,
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
     _needs_device_weight_postprocess,
@@ -69,6 +71,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
     get_quant_config,
@@ -119,6 +122,40 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
+
+    def test_modelopt_fp4_uses_fa_by_default_on_blackwell(self):
+        quant_spec = TransformerQuantLoadSpec([], _FakeQuantConfig(), None, None)
+        server_args = SimpleNamespace(attention_backend=None)
+
+        with (
+            patch.object(
+                transformer_loader.current_platform, "is_blackwell", return_value=True
+            ),
+            patch.object(
+                transformer_loader,
+                "get_global_forced_attn_backend",
+                return_value=None,
+            ),
+            patch.object(
+                transformer_loader,
+                "get_component_forced_attn_backend",
+                return_value=None,
+            ),
+        ):
+            backend = _default_quantized_attention_backend(quant_spec, server_args)
+
+        self.assertEqual(backend, AttentionBackendEnum.FA)
+
+    def test_modelopt_fp4_preserves_explicit_attention_backend(self):
+        quant_spec = TransformerQuantLoadSpec([], _FakeQuantConfig(), None, None)
+        server_args = SimpleNamespace(attention_backend="dynamic_cudnn_sdpa")
+
+        with patch.object(
+            transformer_loader.current_platform, "is_blackwell", return_value=True
+        ):
+            backend = _default_quantized_attention_backend(quant_spec, server_args)
+
+        self.assertIsNone(backend)
 
     def test_resolve_transformer_safetensors_to_load_uses_single_override_file(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:

@@ -408,6 +408,14 @@ class PipelineConfig:
         """Return whether dynamic batches should run as grouped Req lists."""
         return False
 
+    def supports_sequential_dit_inference(self):
+        """Return whether batched AR is followed by per-request DiT inference."""
+        return False
+
+    def supports_sequential_multi_output_inference(self):
+        """Return whether one request's outputs run through DiT/VAE sequentially."""
+        return False
+
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.
 

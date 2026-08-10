@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include <string>
 
-namespace {
+namespace sglang {
 
 #ifdef USE_ROCM
 constexpr int WARP_SIZE = 64;
@@ -670,4 +670,4 @@ void load_cache_to_device_buffer(
   }
 }
 
-}  // namespace
+}  // namespace sglang

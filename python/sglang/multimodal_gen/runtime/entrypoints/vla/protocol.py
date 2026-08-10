@@ -172,6 +172,7 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
                 "sp_degree": server_args.sp_degree,
                 "ulysses_degree": server_args.ulysses_degree,
                 "ring_degree": server_args.ring_degree,
+                "kv_gather_degree": server_args.kv_gather_degree,
                 "prefix_strategy": pipeline_config.prefix_parallel_strategy,
                 "action_strategy": pipeline_config.action_parallel_strategy,
                 "layout_version": pipeline_config.parallel_layout_version,
