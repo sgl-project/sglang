@@ -461,7 +461,10 @@ class SchedulerMetricsReporter:
             return 0.0, 0.0, 0.0
 
         # Causal prefill token-context product.
-        context_product = tokens * (tokens + 1) / 2.0
+        context_product = sum(
+            c * p + c * (c + 1) / 2.0
+            for c, p in zip(batch.extend_lens, batch.prefix_lens)
+        )
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * context_product

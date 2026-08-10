@@ -14,6 +14,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_ps(**overrides) -> ParallelState:
@@ -397,6 +398,52 @@ class TestIdleMetrics(unittest.TestCase):
         self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
         self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
         self.assertEqual(self.published_occupancies, [])
+
+
+class TestEstimatedPrefillPerf(CustomTestCase):
+    """Causal pair count behind ``est. prefill TFLOPS/s`` and ``estimated_flops``."""
+
+    def setUp(self):
+        self.scheduler = types.SimpleNamespace()
+        self.scheduler.waiting_queue = []
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.reporter = _make_reporter(self, self.scheduler)
+        # One unit per query-key pair and nothing else, so the returned FLOPs
+        # are exactly the attention pair count.
+        self.reporter._linear_flops_per_token = 0.0
+        self.reporter._attn_dot_flops_coeff = 1.0
+        self.reporter._weight_read_bytes_per_token = 0.0
+        self.reporter._qkv_act_bytes_per_token = 0.0
+        self.reporter._prefill_attn_act_read_per_token = 0.0
+        self.reporter._kv_cache_bytes_per_token = 0.0
+        self.reporter._ffn_act_bytes_per_token = 0.0
+
+    def _pair_count(self, extend_lens, prefix_lens):
+        batch = types.SimpleNamespace(extend_lens=extend_lens, prefix_lens=prefix_lens)
+        flops, _, _ = self.reporter._estimate_prefill_perf(batch)
+        return flops
+
+    def test_chunk_is_charged_for_its_cached_prefix(self):
+        """A chunk resumed on a cached prefix must be charged for reading it.
+
+        Every token of a new chunk attends to all tokens already in the KV
+        cache, so a 4-token chunk sitting at prefix 3 costs 4*3 pairs against
+        the prefix plus 4*5/2 pairs within the chunk. Scoring the chunk as a
+        fresh 4-token sequence drops the prefix term, and the shortfall grows
+        with the prefix length.
+        """
+        self.assertEqual(self._pair_count([4], [3]), 4 * 3 + 4 * 5 / 2)
+
+    def test_requests_in_one_batch_do_not_attend_to_each_other(self):
+        """Requests batched together must be counted as separate sequences.
+
+        A token only attends within its own request, so two 100-token prefills
+        cost 2 * (100*101/2) pairs. Scoring the batch as one 200-token sequence
+        (200*201/2) charges pairs between requests that never attend to each
+        other. This holds with no prefix at all, so it is a defect distinct
+        from the missing prefix term above.
+        """
+        self.assertEqual(self._pair_count([100, 100], [0, 0]), 2 * (100 * 101 / 2))
 
 
 if __name__ == "__main__":
