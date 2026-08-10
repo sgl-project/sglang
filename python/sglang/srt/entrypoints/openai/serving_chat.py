@@ -24,7 +24,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageGenericParam,
     ChatCompletionRequest,
@@ -194,6 +194,7 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     _default_sampling_params_logged = False
+    _KIMI_K3_GENERATION_STUB_TOKENS = 3
 
     def __init__(
         self,
@@ -202,8 +203,8 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-        self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self.tool_call_parser = self.tokenizer_manager.config_value("tool_call_parser")
+        self.reasoning_parser = self.tokenizer_manager.config_value("reasoning_parser")
         self.default_chat_template_kwargs = (
             self.tokenizer_manager.server_args.default_chat_template_kwargs or {}
         )
@@ -252,6 +253,17 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
+        self._dsv4_reasoning_effort_profile = (
+            chat_encoding.resolve_dsv4_reasoning_effort_profile(
+                model_path=self.tokenizer_manager.model_path,
+                revision=self.tokenizer_manager.server_args.revision,
+                override=self.tokenizer_manager.model_config.hf_config.to_dict().get(
+                    chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
+                ),
+            )
+            if self.chat_encoding_spec == "dsv4"
+            else None
+        )
 
         # Resolve the env-configured Inkling effort default once: the env var is
         # frozen for the server's lifetime, and a misconfigured value should
@@ -338,11 +350,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         Override in subclass to add custom encoding specs.
         """
-        from sglang.srt.entrypoints.openai.chat_encoding import (
-            resolve_chat_encoding_spec,
-        )
-
-        return resolve_chat_encoding_spec(
+        return chat_encoding.resolve_chat_encoding_spec(
             hf_config=self.tokenizer_manager.model_config.hf_config,
             tokenizer=self.tokenizer_manager.tokenizer,
             tool_call_parser=self.tool_call_parser,
@@ -649,6 +657,14 @@ class OpenAIServingChat(OpenAIServingBase):
         return UsageProcessor._details_if_cached(
             content["meta_info"].get("cached_tokens", 0)
         )
+
+    def _reported_prompt_tokens(self, meta_info: Dict[str, Any]) -> int:
+        prompt_tokens = meta_info.get("prompt_tokens", 0)
+        if self.chat_encoding_spec == "kimi_k3":
+            # K3's three-token assistant generation stub is model input, but the
+            # reference API excludes it from billed/reported prompt tokens.
+            prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
+        return prompt_tokens
 
     async def _generate_stream_content(
         self,
@@ -1033,9 +1049,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
         # when --reasoning-parser is configured, so builtin xgrammar
         # tags must describe only the post-reasoning tool-call suffix.
-        xgrammar_reasoning = thinking_mode and (
-            self.tokenizer_manager.server_args.reasoning_parser is None
-        )
+        xgrammar_reasoning = thinking_mode and (self.reasoning_parser is None)
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
@@ -1207,16 +1221,18 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Default encoding (dsv4/dsv32)
             if self.chat_encoding_spec == "dsv4":
-                # V4 encoder only accepts "max" / "high" / None.
-                # OpenAI protocol defaults to "medium" which V4 rejects; drop it.
-                # Fallback: if request didn't set it, try env SGLANG_DSV4_REASONING_EFFORT.
                 effort_source = request.reasoning_effort
                 if effort_source is None:
                     env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
                     if env_val:
                         effort_source = env_val
+                reasoning_effort_profile = self._dsv4_reasoning_effort_profile
+                assert reasoning_effort_profile is not None
+                accepted_efforts = encoding_dsv4.REASONING_EFFORT_PROFILES[
+                    reasoning_effort_profile
+                ]
                 v4_reasoning_effort = (
-                    effort_source if effort_source in ("max", "high") else None
+                    effort_source if effort_source in accepted_efforts else None
                 )
                 if request.task is not None:
                     encoding_dsv4.attach_task_to_last_user_message(
@@ -1226,6 +1242,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     messages,
                     thinking_mode=thinking_mode,
                     reasoning_effort=v4_reasoning_effort,
+                    reasoning_effort_profile=reasoning_effort_profile,
                 )
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
             else:
@@ -1493,7 +1510,9 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 index = content.get("index", 0)
 
-                prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
+                prompt_tokens[index] = self._reported_prompt_tokens(
+                    content["meta_info"]
+                )
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
                 )
@@ -1720,6 +1739,20 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
+        if self.chat_encoding_spec == "kimi_k3":
+            ret = [
+                {
+                    **item,
+                    "meta_info": {
+                        **item["meta_info"],
+                        "prompt_tokens": self._reported_prompt_tokens(
+                            item["meta_info"]
+                        ),
+                    },
+                }
+                for item in ret
+            ]
+
         choices = []
 
         # Build sglext at response level (from first ret_item, as these are per-request)
@@ -2187,6 +2220,12 @@ class OpenAIServingChat(OpenAIServingBase):
             request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
+        if self.reasoning_parser == "inkling":
+            # Effort-conditioned, not toggled: "none" (0.0) is the off switch.
+            if not enabled:
+                request.reasoning_effort = "none"
+                return
+
         config = self.template_manager.reasoning_config
         is_mistral = (config is not None and config.special_case == "mistral") or (
             config is None and self._reasoning_default_mode() == "mistral"
@@ -2378,7 +2417,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
-                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
                 reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
@@ -2431,7 +2470,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
-                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
                 reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(

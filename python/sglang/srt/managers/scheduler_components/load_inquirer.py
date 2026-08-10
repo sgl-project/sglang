@@ -136,7 +136,7 @@ class SchedulerLoadInquirer:
                 kv_cache_gb=round(
                     self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 3
                 ),
-                graph_gb=round(self.tp_worker.model_runner.graph_mem_usage, 3),
+                graph_gb=round(sum(self.tp_worker.graph_memory_usage.values()), 3),
                 token_capacity=int(self.max_total_num_tokens),
             )
         except (AttributeError, TypeError) as e:

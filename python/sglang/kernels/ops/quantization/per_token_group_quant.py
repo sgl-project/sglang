@@ -16,7 +16,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float16)
+_SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 _SUPPORTED_OUTPUT_DTYPES = (torch.float8_e4m3fn, torch.int8)
 _SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
 

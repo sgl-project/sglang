@@ -7,7 +7,10 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.multimodal_gen.configs.models import DiTConfig
+from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+
+# NOTE: SpectrumMixin lives in runtime.cache.spectrum
+from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
 
 # NOTE: TeaCacheContext and TeaCacheMixin have been moved to
 # sglang.multimodal_gen.runtime.cache.teacache
@@ -46,7 +49,10 @@ class BaseDiT(nn.Module, ABC):
 
     def __init__(self, config: DiTConfig, hf_config: dict[str, Any], **kwargs) -> None:
         super().__init__()
-        self.config = config
+        # runtime models expose checkpoint architecture through `config`; load
+        # settings such as the model prefix stay separate
+        self.config: DiTArchConfig = config.arch_config
+        self.prefix = config.prefix
         self.hf_config = hf_config
         if not self.supported_attention_backends:
             raise ValueError(
@@ -87,11 +93,13 @@ class BaseDiT(nn.Module, ABC):
         return next(self.parameters()).device
 
 
-class CachableDiT(TeaCacheMixin, BaseDiT):
+class CachableDiT(SpectrumMixin, TeaCacheMixin, BaseDiT):
     """
-    An intermediate base class that adds TeaCache optimization functionality to DiT models.
+    Base class for DiT models that support inference-time cache accelerators.
 
-    Inherits TeaCacheMixin for cache logic and BaseDiT for core DiT functionality.
+    Inherits ``SpectrumMixin`` (Chebyshev step skipping) and ``TeaCacheMixin``
+    (temporal L1 similarity caching) plus ``BaseDiT`` core functionality.
+
     """
 
     # These are required class attributes that should be overridden by concrete implementations
@@ -110,6 +118,7 @@ class CachableDiT(TeaCacheMixin, BaseDiT):
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)
+        self._init_spectrum_state()
         self._init_teacache_state()
 
     @classmethod

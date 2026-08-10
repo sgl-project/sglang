@@ -288,13 +288,14 @@ class NemotronHMultiTokenPredictor(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings(input_ids)
 
+        hidden_states = forward_batch.spec_info.hidden_states
         residual = None
 
         for i in range(self.pattern_len):
@@ -352,11 +353,9 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = forward_batch.spec_info.hidden_states
-
         hidden_states = self.model(
             input_ids,
-            hidden_states,
+            positions,
             forward_batch,
             input_embeds,
         )
