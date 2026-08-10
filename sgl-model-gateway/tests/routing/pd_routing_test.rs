@@ -3,7 +3,7 @@
 //! Tests for prefill-decode disaggregation routing mode.
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
@@ -83,6 +83,61 @@ mod pd_routing_tests {
                 "PD mode request should succeed"
             );
         }
+
+        ctx.shutdown().await;
+    }
+
+    /// A one-token P/D request must return the token sampled by prefill.
+    /// Decode receives that token through the KV handoff and has no second
+    /// token to stream, so blindly forwarding only decode yields metadata and
+    /// [DONE] with empty content.
+    #[tokio::test]
+    async fn test_pd_streaming_one_token_returns_prefill_content() {
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![("http://127.0.0.1:19804".to_string(), None)],
+                vec!["http://127.0.0.1:19805".to_string()],
+            )
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3804)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::prefill(19804),
+                TestWorkerConfig::decode(19805),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "one token"}],
+            "max_tokens": 1,
+            "stream": true
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("prefill-handoff-token"), "response: {body}");
+        assert!(body.contains("[DONE]"), "response: {body}");
 
         ctx.shutdown().await;
     }

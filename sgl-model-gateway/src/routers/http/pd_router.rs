@@ -67,6 +67,10 @@ struct PDRequestContext<'a> {
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
+    /// SGLang prefill produces the handoff token. When the client requests
+    /// exactly one token, decode has no additional content to emit, so the
+    /// prefill response is the authoritative client response.
+    return_prefill_response: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
@@ -658,6 +662,13 @@ impl PDRouter {
             (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        // The ordinary streaming path attaches guards to the returned body.
+        // The one-token path buffers both tiny upstream responses before it
+        // returns, so keep its load accounted for during that buffering here.
+        let _single_token_prefill_guard = (context.is_stream && context.return_prefill_response)
+            .then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+        let _single_token_decode_guard = (context.is_stream && context.return_prefill_response)
+            .then(|| WorkerLoadGuard::new(decode.clone(), headers));
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -823,6 +834,12 @@ impl PDRouter {
                     return response;
                 }
 
+                if context.return_prefill_response {
+                    return self
+                        .process_single_token_response(prefill_result, res, prefill, decode)
+                        .await;
+                }
+
                 // Process prefill response
                 let prefill_body = if context.return_logprob {
                     match self
@@ -934,6 +951,92 @@ impl PDRouter {
                 let mut response = error::bad_gateway(
                     "decode_server_error",
                     format!("Decode server error: {}", e),
+                );
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                response
+            }
+        }
+    }
+
+    /// Return the prefill response for a one-token P/D request.
+    ///
+    /// The prefill engine samples and transfers the first token. The decode
+    /// engine starts after that handoff, so a request capped at one token has
+    /// no decode-side content. Both upstream responses are fully consumed
+    /// before returning so worker load and circuit-breaker outcomes remain
+    /// accurate and neither side is cancelled mid-transfer.
+    async fn process_single_token_response(
+        &self,
+        prefill_result: Result<reqwest::Response, reqwest::Error>,
+        decode_response: reqwest::Response,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    ) -> Response {
+        let prefill_response = match prefill_result {
+            Ok(response) => response,
+            Err(error) => {
+                prefill.record_outcome(false);
+                decode.record_outcome(true);
+                let mut response = error::bad_gateway(
+                    "prefill_server_error",
+                    format!("Prefill server error: {error}"),
+                );
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                return response;
+            }
+        };
+
+        let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if !prefill_status.is_success() {
+            let (prefill_result, decode_body) = tokio::join!(
+                self.process_prefill_response(Ok(prefill_response), prefill.url(), false,),
+                decode_response.bytes()
+            );
+            prefill.record_outcome(prefill_status.is_client_error());
+            decode.record_outcome(decode_body.is_ok());
+
+            let mut response = match prefill_result {
+                Err(response) => response,
+                Ok(_) => error::bad_gateway(
+                    "prefill_server_error",
+                    "Prefill reported failure but returned a success response".to_string(),
+                ),
+            };
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return response;
+        }
+
+        let response_headers = header_utils::preserve_response_headers(prefill_response.headers());
+        let (prefill_body, decode_body) =
+            tokio::join!(prefill_response.bytes(), decode_response.bytes());
+
+        match (prefill_body, decode_body) {
+            (Ok(body), Ok(_)) => {
+                prefill.record_outcome(true);
+                decode.record_outcome(true);
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = prefill_status;
+                *response.headers_mut() = response_headers;
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                response
+            }
+            (Err(error), decode_body) => {
+                prefill.record_outcome(false);
+                decode.record_outcome(decode_body.is_ok());
+                let mut response = error::bad_gateway(
+                    "prefill_read_failed",
+                    format!("Failed to read one-token prefill response: {error}"),
+                );
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                response
+            }
+            (Ok(_), Err(error)) => {
+                prefill.record_outcome(true);
+                decode.record_outcome(false);
+                let mut response = error::bad_gateway(
+                    "decode_read_failed",
+                    format!("Failed to drain one-token decode response: {error}"),
                 );
                 response.extensions_mut().insert(BreakerOutcomesRecorded);
                 response
@@ -1581,6 +1684,11 @@ impl RouterTrait for PDRouter {
             batch_size,
             is_stream,
             return_logprob,
+            return_prefill_response: body
+                .sampling_params
+                .as_ref()
+                .and_then(|params| params.max_new_tokens)
+                == Some(1),
             request_text,
             model_id,
             headers: headers.cloned(),
@@ -1606,12 +1714,15 @@ impl RouterTrait for PDRouter {
 
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
+        #[allow(deprecated)]
+        let return_prefill_response = body.max_completion_tokens.or(body.max_tokens) == Some(1);
 
         let context = PDRequestContext {
             route: "/v1/chat/completions",
             batch_size,
             is_stream,
             return_logprob,
+            return_prefill_response,
             request_text,
             model_id,
             headers: headers.cloned(),
@@ -1646,6 +1757,7 @@ impl RouterTrait for PDRouter {
             batch_size,
             is_stream,
             return_logprob,
+            return_prefill_response: body.max_tokens == Some(1),
             request_text,
             model_id,
             headers: headers.cloned(),
@@ -1672,6 +1784,7 @@ impl RouterTrait for PDRouter {
             batch_size: None,
             is_stream: false,
             return_logprob: false,
+            return_prefill_response: false,
             request_text: req_text,
             model_id,
             headers: headers.cloned(),
