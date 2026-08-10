@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.multimodal_gen.configs.models import DiTConfig
+from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 # NOTE: SpectrumMixin lives in runtime.cache.spectrum
 from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
@@ -49,7 +49,10 @@ class BaseDiT(nn.Module, ABC):
 
     def __init__(self, config: DiTConfig, hf_config: dict[str, Any], **kwargs) -> None:
         super().__init__()
-        self.config = config
+        # runtime models expose checkpoint architecture through `config`; load
+        # settings such as the model prefix stay separate
+        self.config: DiTArchConfig = config.arch_config
+        self.prefix = config.prefix
         self.hf_config = hf_config
         if not self.supported_attention_backends:
             raise ValueError(

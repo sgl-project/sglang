@@ -57,7 +57,6 @@ class TestQwen3NextLazyExtraBufferLargePage(
 class TestQwen3NextLazyExtraBufferAllocFail(KLDivergenceMixin, DefaultServerBase):
     model = QWEN3_NEXT_MODEL
     cache_chunk_size = 64
-    gsm8k_accuracy_thres = 0.93
     kl_div_thres = 0.002
     other_args = _make_args(page_size=1, track_interval=2)
 
@@ -79,7 +78,6 @@ class TestQwen3NextLazyExtraBufferLargePageAllocFail(
 ):
     model = QWEN3_NEXT_MODEL
     cache_chunk_size = 64
-    gsm8k_accuracy_thres = 0.93
     kl_div_thres = 0.002
     other_args = _make_args(page_size=2, track_interval=2)
 

@@ -114,7 +114,7 @@ docker build \
     --build-arg CUDA_TAG="${CUDA_TAG}" \
     --build-arg PYTHON_TAG="${PYTHON_TAG}" \
     --build-arg ARCHITECTURE="${ARCHITECTURE}" \
-    --build-arg TORCH_VERSION="${TORCH_VERSION:-2.11.0}" \
+    --build-arg TORCH_VERSION="${TORCH_VERSION:-2.13.0}" \
     --tag "${IMAGE_TAG}" \
     --network=host \
     "${REPOSITORY_ROOT}/docker"

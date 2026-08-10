@@ -665,7 +665,11 @@ def _expected_nightly_cli_args(case: dict) -> dict[str, str]:
     serve_args = shlex.split(case["frameworks"]["sglang"].get("serve_args", ""))
     parsed_serve_args = _parse_cli_args(serve_args)
     for flag, value in parsed_serve_args.items():
-        if flag in {"enable-torch-compile", "warmup-mode"}:
+        # Nightly's comparison driver still owns its legacy ``--warmup``
+        # switch.  It is not a valid ``sglang generate`` flag after the
+        # warmup-mode migration, so exclude both spellings from preset drift
+        # validation.
+        if flag in {"enable-torch-compile", "warmup", "warmup-mode"}:
             continue
         expected[flag] = _normalize_cli_value(value)
 
@@ -834,6 +838,11 @@ def run_benchmark_once(
 
     env = os.environ.copy()
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    # Perf dumps are consumed as stage-attributed denoise measurements.  Drain
+    # the device queue at stage boundaries so asynchronous denoise work cannot
+    # leak into a later stage (most visibly DecodingStage).  An explicit 0 in
+    # the caller's environment still opts out for e2e-only experiments.
+    env.setdefault("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "1")
     cfg = MODELS[model_key]
     for key, value in cfg.get("env", {}).items():
         env.setdefault(key, str(value))

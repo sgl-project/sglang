@@ -8,6 +8,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerManager,
     get_generate_fn,
@@ -23,7 +24,10 @@ from sglang.multimodal_gen.test.test_utils import (
 
 
 def _all_cases() -> list[DiffusionTestCase]:
-    import sglang.multimodal_gen.test.server.testcase_configs as cfg
+    if current_platform.is_npu():
+        import sglang.multimodal_gen.test.server.ascend.testcase_configs_npu as cfg
+    else:
+        import sglang.multimodal_gen.test.server.testcase_configs as cfg
 
     cases: list[DiffusionTestCase] = []
     for _, v in inspect.getmembers(cfg):
