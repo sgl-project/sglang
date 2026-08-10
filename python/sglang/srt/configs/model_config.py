@@ -244,9 +244,6 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
-REQUANTIZATION_METHODS = ["quark_mxfp4"]
-
-
 class ModelConfig:
     def __init__(
         self,
