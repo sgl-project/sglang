@@ -115,6 +115,27 @@ class RotaryEmbedding(CustomOp):
                 _apply_rotary_emb_complex(key, complex_freqs),
             )
 
+        can_derive_complex_from_cos_sin = (
+            complex_freqs is None
+            and cos is not None
+            and sin is not None
+            and not self.is_neox_style
+            and self.rotary_dim == self.head_size
+            and cos.shape[0] == seq_len
+        )
+        if can_derive_complex_from_cos_sin:
+            # Interleaved (non-neox) rotation has no fused NPU kernel (always
+            # falls back to several elementwise ops in apply_rotary_embedding);
+            # the complex-multiply form is mathematically equivalent for this
+            # pairing convention and needs fewer kernel launches.
+            derived_complex_freqs = torch.complex(
+                cos.to(torch.float32), sin.to(torch.float32)
+            ).unsqueeze(-2)
+            return (
+                _apply_rotary_emb_complex(query, derived_complex_freqs),
+                _apply_rotary_emb_complex(key, derived_complex_freqs),
+            )
+
         if cos is not None and sin is not None:
             q_flat = query.reshape(total_tokens, num_heads, self.head_size)
             q_rot = q_flat[..., : self.rotary_dim]
@@ -254,6 +275,33 @@ class RotaryEmbedding(CustomOp):
             cos, sin = cos_sin.chunk(2, dim=-1)
         else:
             num_tokens = query.shape[:-2].numel()
+
+        can_derive_complex_from_cos_sin = (
+            not self.use_precomputed_cache
+            and complex_freqs is None
+            and cos is not None
+            and sin is not None
+            and not self.is_neox_style
+            and query.dim() == 4
+            and key.dim() == 4
+            and self.rotary_dim == self.head_size
+            and cos.shape[0] == query.shape[1]
+        )
+        if can_derive_complex_from_cos_sin:
+            # Interleaved (non-neox) rotation has no fused kernel on native
+            # backends (CPU/MPS/etc. always fall back to several elementwise
+            # ops in apply_rotary_embedding); the complex-multiply form is
+            # mathematically equivalent for this pairing convention and needs
+            # fewer kernel launches. CUDA already has a fused Triton kernel
+            # for this case and keeps using the cos/sin path below.
+            derived_complex_freqs = torch.complex(
+                cos.to(torch.float32), sin.to(torch.float32)
+            ).unsqueeze(-2)
+            return (
+                _apply_rotary_emb_complex(query, derived_complex_freqs),
+                _apply_rotary_emb_complex(key, derived_complex_freqs),
+            )
+
         if cos is not None and sin is not None:
             q_shape = query.shape
             q_flat = query.reshape(num_tokens, -1, self.head_size)
