@@ -7,14 +7,17 @@ pause/resume path on XPU -- the same backend SGLang's ``release_memory_occupatio
 The tests are skipped unless:
   * torch XPU is available, and
   * ``torch_memory_saver`` is installed with its XPU backend, built from source
-    against the local oneAPI (see docs/platforms/xpu.md):
+    against the local oneAPI (see docs_new/docs/hardware-platforms/xpu.mdx).
+    Pinned to the commit that merged XPU support; the PyPI wheel predates it:
       TMS_PLATFORM=xpu pip install --no-build-isolation \\
-          git+https://github.com/fzyzcjy/torch_memory_saver.git
+          git+https://github.com/fzyzcjy/torch_memory_saver.git@990ec133b7b178ca4e30fe7aaac921d3701bcb3a
 
-Physical-memory release is verified via the saver's sysman-backed
-``tms_xpu_device_free_bytes``; note that ``torch.xpu.memory_allocated()`` is the
-allocator's bookkeeping and does NOT reflect pages released by
-``zeVirtualMemUnmap``, so it must not be used for these assertions.
+Physical-memory release is verified via the saver's driver-independent
+``tms_xpu_committed_bytes`` (physical bytes it holds ACTIVE on a device, which
+pause() releases and resume() re-commits). Neither sysman free-bytes
+(``tms_xpu_device_free_bytes`` / ``torch.xpu.mem_get_info``) nor
+``torch.xpu.memory_allocated()`` is used: the former is frozen on newer Intel
+drivers and the latter is allocator bookkeeping that ignores ``zeVirtualMemUnmap``.
 """
 
 import unittest
@@ -57,15 +60,15 @@ if _XPU_OK:
 _GIB = 1024**3
 # 1 GiB tensor: large enough that a real physical release is unmistakable.
 _N_FP32 = 256 * 1024 * 1024
-# How much memory we expect a 1 GiB region to free, with slack for alignment.
-_FREE_THRESHOLD_GIB = 0.8
+# How much committed memory a 1 GiB region should drop on pause, with alignment slack.
+_RELEASE_THRESHOLD_GIB = 0.8
 
 
 @unittest.skipUnless(
     _XPU_OK,
     "Requires torch XPU and torch_memory_saver with its XPU backend "
-    "(TMS_PLATFORM=xpu pip install --no-build-isolation "
-    "git+https://github.com/fzyzcjy/torch_memory_saver.git).",
+    "(TMS_PLATFORM=xpu pip install --no-build-isolation git+https://"
+    "github.com/fzyzcjy/torch_memory_saver.git@990ec133b7b178ca4e30fe7aaac921d3701bcb3a).",
 )
 class TestXpuMemorySaver(unittest.TestCase):
     @classmethod
@@ -94,9 +97,11 @@ class TestXpuMemorySaver(unittest.TestCase):
             pass
         torch.xpu.synchronize()
 
-    def _free_gib(self):
+    def _committed_gib(self):
+        # Physical bytes the saver holds ACTIVE on this device. Driver-independent
+        # (unlike frozen sysman free-bytes); drops on pause(), restored on resume().
         torch.xpu.synchronize()
-        return self._cdll.tms_xpu_device_free_bytes(self.device_index) / _GIB
+        return self._cdll.tms_xpu_committed_bytes(self.device_index) / _GIB
 
     # ------------------------------------------------------------------ basics
     def test_pause_releases_and_resume_restores(self):
@@ -113,21 +118,21 @@ class TestXpuMemorySaver(unittest.TestCase):
             t = torch.ones(_N_FP32, dtype=torch.float32, device=self.device)
         torch.xpu.synchronize()
         self.assertEqual(float(t[0]), 1.0)
-        free_after_alloc = self._free_gib()
+        committed_after_alloc = self._committed_gib()
 
         adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
-        free_after_pause = self._free_gib()
+        committed_after_pause = self._committed_gib()
         self.assertGreater(
-            free_after_pause - free_after_alloc,
-            _FREE_THRESHOLD_GIB,
+            committed_after_alloc - committed_after_pause,
+            _RELEASE_THRESHOLD_GIB,
             "pause should release ~1 GiB of physical device memory",
         )
 
         adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
-        free_after_resume = self._free_gib()
+        committed_after_resume = self._committed_gib()
         self.assertGreater(
-            free_after_pause - free_after_resume,
-            _FREE_THRESHOLD_GIB,
+            committed_after_resume - committed_after_pause,
+            _RELEASE_THRESHOLD_GIB,
             "resume should re-commit ~1 GiB of physical device memory",
         )
 
@@ -192,12 +197,12 @@ class TestXpuMemorySaver(unittest.TestCase):
         self.assertEqual(float(kv[-1]), 4.0)
 
         # Now pause the matching tag and confirm it frees real memory.
-        free_before_kv = self._free_gib()
+        committed_before_kv = self._committed_gib()
         xpu_memory_saver.pause(GPU_MEMORY_TYPE_KV_CACHE)
-        free_after_kv = self._free_gib()
+        committed_after_kv = self._committed_gib()
         self.assertGreater(
-            free_after_kv - free_before_kv,
-            _FREE_THRESHOLD_GIB,
+            committed_before_kv - committed_after_kv,
+            _RELEASE_THRESHOLD_GIB,
             "pausing the matching tag should release ~1 GiB",
         )
 
@@ -247,14 +252,14 @@ class TestXpuMemorySaver(unittest.TestCase):
         with xpu_memory_saver.region(tag=GPU_MEMORY_TYPE_WEIGHTS):
             wt = torch.ones(_N_FP32, dtype=torch.float32, device=self.device)
         torch.xpu.synchronize()
-        free_alloc = self._free_gib()
+        committed_alloc = self._committed_gib()
 
         # None == all tags: should free both regions (~2 GiB).
         xpu_memory_saver.pause(None)
-        free_pause = self._free_gib()
+        committed_pause = self._committed_gib()
         self.assertGreater(
-            free_pause - free_alloc,
-            2 * _FREE_THRESHOLD_GIB,
+            committed_alloc - committed_pause,
+            2 * _RELEASE_THRESHOLD_GIB,
             "pause(None) should release every region (~2 GiB)",
         )
 
@@ -276,13 +281,13 @@ class TestXpuMemorySaver(unittest.TestCase):
 
         # resume while already active -> no-op
         xpu_memory_saver.resume(GPU_MEMORY_TYPE_KV_CACHE)
-        free_active = self._free_gib()
+        committed_active = self._committed_gib()
 
         xpu_memory_saver.pause(GPU_MEMORY_TYPE_KV_CACHE)
         # pause again while already paused -> no-op (no extra free, no crash)
         xpu_memory_saver.pause(GPU_MEMORY_TYPE_KV_CACHE)
-        free_paused = self._free_gib()
-        self.assertGreater(free_paused - free_active, _FREE_THRESHOLD_GIB)
+        committed_paused = self._committed_gib()
+        self.assertGreater(committed_active - committed_paused, _RELEASE_THRESHOLD_GIB)
 
         xpu_memory_saver.resume(GPU_MEMORY_TYPE_KV_CACHE)
         xpu_memory_saver.resume(GPU_MEMORY_TYPE_KV_CACHE)  # second resume -> no-op
@@ -303,12 +308,12 @@ class TestXpuMemorySaver(unittest.TestCase):
                     )
                 )
         torch.xpu.synchronize()
-        free_alloc = self._free_gib()
+        committed_alloc = self._committed_gib()
 
         xpu_memory_saver.pause(GPU_MEMORY_TYPE_KV_CACHE)
-        free_pause = self._free_gib()
+        committed_pause = self._committed_gib()
         # 3 x 0.5 GiB = ~1.5 GiB.
-        self.assertGreater(free_pause - free_alloc, _FREE_THRESHOLD_GIB)
+        self.assertGreater(committed_alloc - committed_pause, _RELEASE_THRESHOLD_GIB)
 
         xpu_memory_saver.resume(GPU_MEMORY_TYPE_KV_CACHE)
         for v, t in zip((1.0, 2.0, 3.0), tensors):
