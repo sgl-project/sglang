@@ -4169,6 +4169,18 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
 
+    def test_non_finite_number_never_emits_invalid_json(self):
+        """The literal 1e999 overflows to float inf, and json.dumps rendered
+        it as Infinity — parameters that no JSON parser accepts. The call
+        must be skipped instead; every emitted parameters string must be
+        valid JSON."""
+        text = "<|tool_call_start|>[search(query='x', limit=1e999)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        for call in result.calls:
+            json.loads(call.parameters)
+        self.assertEqual(result.calls, [])
+
     def test_streaming_recovers_multiline(self):
         """Streaming buffers the block and delegates to detect_and_parse;
         an incremental rewrite of the streaming path would bypass the
