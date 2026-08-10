@@ -68,11 +68,15 @@ def is_attention_module(module: Any) -> bool:
     )
 
 
+def language_model_container(model: Any) -> Any:
+    """The mlx-lm container carrying the layer list and model-level config."""
+    root = getattr(model, "language_model", model)
+    return getattr(root, "model", root)
+
+
 def get_container_window_size(model: Any) -> int | None:
     """The container-level scalar sliding window, if the model declares one."""
-    root = getattr(model, "language_model", model)
-    container = getattr(root, "model", root)
-    return first_present_attr(container, WINDOW_SIZE_ATTRS)
+    return first_present_attr(language_model_container(model), WINDOW_SIZE_ATTRS)
 
 
 def get_layer_window_sizes(model: Any) -> dict[int, int | None]:
@@ -84,10 +88,9 @@ def get_layer_window_sizes(model: Any) -> dict[int, int | None]:
     ``{layer_idx: window or None}``, or ``{}`` when the model does not
     follow the convention.
     """
-    root = getattr(model, "language_model", model)
-    container = getattr(root, "model", root)
+    container = language_model_container(model)
     layer_types = getattr(container, "layer_types", None)
-    window_size = get_container_window_size(model)
+    window_size = first_present_attr(container, WINDOW_SIZE_ATTRS)
     if not layer_types or window_size is None:
         return {}
     return {
