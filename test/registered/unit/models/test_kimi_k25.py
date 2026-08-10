@@ -39,7 +39,7 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
@@ -317,7 +317,11 @@ def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
     tower = _MoonViT3dTower()
     pixel_values = torch.randn(4, 2)
 
-    with get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0):
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
+    with get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    ):
         output = run_dp_sharded_mrope_vision_model(
             tower, pixel_values, [[1, 2, 2]], rope_type="rope_2d_packed"
         )
@@ -331,7 +335,11 @@ def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
     pixel_values = torch.randn(4, 2)
     loader = Mock(return_value=pixel_values)
 
-    with get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0):
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
+    with get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    ):
         output = run_dp_sharded_mrope_vision_model(
             tower,
             None,
@@ -479,11 +487,10 @@ def test_kimi_non_dp_keeps_grid_thws_on_the_host():
     model.mm_projector = _IdentityProjector()
     items = [_image_item(torch.randn(4, 2), [[1, 2, 2]])]
 
-    with get_parallel().override(
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
+    with get_context().override_server_args(tp_size=1), get_parallel().override(
         tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-    ), patch(
-        "sglang.srt.models.kimi_k25.get_server_args",
-        return_value=SimpleNamespace(tp_size=1),
     ):
         model.get_image_feature(items)
 
@@ -522,6 +529,28 @@ def test_kimi_lazy_ipc_feature_acknowledges_all_tp_consumers():
     item.reconstruct(0, ipc_consumer_count=8)
 
     proxy.reconstruct_on_target_device.assert_called_once_with(0, consumer_count=8)
+
+
+def test_kimi_lazy_vmm_feature_uses_proxy_consumer_count():
+    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+    proxy.consumer_count = 2
+    proxy.reconstruct_on_target_device = Mock(return_value=torch.randn(1, 2))
+    item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+
+    item.reconstruct(0, ipc_consumer_count=8)
+
+    proxy.reconstruct_on_target_device.assert_called_once_with(0, consumer_count=2)
+
+
+def test_kimi_lazy_vmm_cache_hit_uses_proxy_consumer_count():
+    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+    proxy.consumer_count = 2
+    proxy.acknowledge_consumption = Mock()
+    item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+
+    item.acknowledge_deferred_cuda_ipc_feature(consumer_count=8)
+
+    proxy.acknowledge_consumption.assert_called_once_with(2)
 
 
 class _Tokenizer:
@@ -658,6 +687,138 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
     )
 
 
+def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
+    from sglang.srt.multimodal.kimi_k3_image_processing import (
+        DEFERRED_PREPROCESSING_KEY,
+    )
+
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.mm_feature_transport = "cpu"
+    processor.use_cuda_ipc = False
+    processor._processor = SimpleNamespace(
+        _patch_size=2,
+        prepare_deferred=Mock(
+            return_value=(
+                torch.tensor([[1, 99, 99, 2, 99, 3]]),
+                [
+                    {
+                        "num_tokens": 2,
+                        "new_width": 4,
+                        "new_height": 2,
+                        "pad_width": 0,
+                        "pad_height": 2,
+                    },
+                    {
+                        "num_tokens": 1,
+                        "new_width": 2,
+                        "new_height": 2,
+                        "pad_width": 2,
+                        "pad_height": 2,
+                    },
+                ],
+                {
+                    "image_mean": [0.5, 0.5, 0.5],
+                    "image_std": [0.5, 0.5, 0.5],
+                    "transparent_bg_config": None,
+                },
+            )
+        ),
+    )
+    images = [
+        torch.arange(3 * 2 * 4, dtype=torch.uint8).reshape(3, 2, 4),
+        torch.arange(3 * 2 * 2, dtype=torch.uint8).reshape(3, 2, 2),
+    ]
+    base_output = SimpleNamespace(
+        input_text="prompt", images=images, input_ids=[1, 99, 2, 99, 3]
+    )
+
+    output = processor._build_deferred_output(base_output)
+
+    assert output.input_ids == [1, 99, 99, 2, 99, 3]
+    assert [item.offsets for item in output.mm_items] == [[(1, 2)], [(4, 4)]]
+    assert [item.feature.dtype for item in output.mm_items] == [
+        torch.uint8,
+        torch.uint8,
+    ]
+    assert [item.feature.shape for item in output.mm_items] == [
+        torch.Size([3, 2, 4]),
+        torch.Size([3, 2, 2]),
+    ]
+    assert [item.image_grid_thw.tolist() for item in output.mm_items] == [
+        [[1, 2, 2]],
+        [[1, 2, 2]],
+    ]
+    assert all(item.hash is not None for item in output.mm_items)
+    assert all(item.pad_value is not None for item in output.mm_items)
+    assert all(
+        DEFERRED_PREPROCESSING_KEY in item.model_specific_data
+        for item in output.mm_items
+    )
+
+
+@pytest.mark.parametrize(
+    ("image_shape", "in_patch_limit", "expected"),
+    [((3, 32, 32), 65536, True), ((3, 1024, 1024), 1, False)],
+)
+def test_kimi_k3_defers_only_when_raw_transport_is_smaller(
+    image_shape, in_patch_limit, expected
+):
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
+    processor._processor = SimpleNamespace(
+        _patch_size=14,
+        _merge_kernel_size=2,
+        _in_patch_limit=in_patch_limit,
+        _patch_limit_on_one_side=512,
+        _fixed_output_tokens=None,
+    )
+    image = torch.zeros(image_shape, dtype=torch.uint8)
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert processor._should_defer_gpu_preprocessing([image]) is expected
+
+
+def test_kimi_k3_does_not_defer_non_uint8_tensor_preprocessing():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert not processor._should_defer_gpu_preprocessing(
+            [torch.zeros((3, 32, 32), dtype=torch.float32)]
+        )
+
+
+def test_kimi_k3_does_not_defer_empty_image_batch():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert not processor._should_defer_gpu_preprocessing([])
+
+
+def test_kimi_k3_eager_preprocessing_preserves_float_tensor_support():
+    from sglang.srt.multimodal.processors.kimi_k3 import _k3_to_cuda_chw
+
+    image = torch.zeros((1, 4, 4), dtype=torch.float32)
+    with patch.object(torch.Tensor, "cuda", lambda self: self):
+        output = _k3_to_cuda_chw(image)
+
+    assert output.dtype == torch.float32
+    assert output.shape == (3, 4, 4)
+
+
+@pytest.mark.parametrize("transport", ["cuda_ipc", "fabric"])
+def test_kimi_k3_keeps_gpu_transport_preprocessing_eager(transport):
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = transport
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert not processor._should_defer_gpu_preprocessing(
+            [torch.zeros((3, 32, 32), dtype=torch.uint8)]
+        )
+
+
 def test_kimi_k3_rejects_silently_dropped_images():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = Mock()
@@ -675,7 +836,10 @@ def test_kimi_k3_rejects_silently_dropped_images():
 
 def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
     processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.mm_feature_transport = "cuda_ipc"
+    processor.use_cuda_ipc = True
     processor.fast_load_mm_data = AsyncMock(
         return_value=SimpleNamespace(
             images=[object(), object()], input_ids=[1, 99, 2, 99, 3]

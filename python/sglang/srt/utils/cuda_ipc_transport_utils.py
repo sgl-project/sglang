@@ -9,7 +9,9 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+)
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
@@ -130,7 +132,7 @@ class MmItemMemoryChunk:
 
     def try_to_recycle(self) -> bool:
         try:
-            tp_num = get_server_args().tp_size
+            tp_num = configured_tp_size()
         except Exception:
             logger.info(
                 "server_args has not been published yet, skip this turn's recycle"

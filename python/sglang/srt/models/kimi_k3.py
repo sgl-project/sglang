@@ -104,8 +104,19 @@ from sglang.srt.models.kimi_k3_vl import (
 )
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    DEFERRED_PREPROCESSING_KEY,
+    fill_transparent_bg,
+    normalization_tensors,
+    to_chw_uint8,
+)
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+    get_exec,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import is_blackwell_supported, is_hip, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -137,11 +148,16 @@ def _k3_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
     through UnquantizedLinearMethod. The fused MoE front and the deferred
     shared down GEMM call torch directly on raw merged weights, so the
     --bf16-gemm-backend cutedsl selection would silently skip them."""
+    if out is None and out_dtype is not None and out_dtype != x.dtype:
+        out = torch.empty(
+            (x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device
+        )
     if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
@@ -155,15 +171,11 @@ def _k3_bf16_gemm(
             if use_cutedsl_bf16_gemm(x.shape[0], weight.shape[0], weight.shape[1]):
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
-                if out.is_contiguous():
-                    # TGV stores straight into caller memory (same entry the
-                    # UnquantizedLinearMethod out-buffer path uses); no
-                    # staging tensor + copy.
-                    return cutedsl_bf16_gemm_out(x, weight, out)
-                out.copy_(cutedsl_bf16_gemm(x, weight))
-                return out
+                return cutedsl_bf16_gemm_out(x, weight, out)
     if out is None:
         return torch.nn.functional.linear(x, weight)
+    if out.dtype != x.dtype:
+        return torch.mm(x, weight.t(), out=out, out_dtype=out.dtype)
     return torch.mm(x, weight.t(), out=out)
 
 
@@ -478,14 +490,6 @@ class KimiK3MoE(nn.Module):
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = _a2a_backend.is_megamoe() or _a2a_backend.is_deepep()
 
-        # The flashinfer_mxfp4 (trtllm-gen) runner quantizes routed_input with
-        # the strided-input JIT group quant (_use_jit_mxfp8_quant in mxfp4.py),
-        # so the fused-front split view can be consumed as is; other runners
-        # (e.g. marlin) require a dense buffer.
-        self._moe_front_needs_contiguous = (
-            not get_moe_runner_backend().is_flashinfer_mxfp4()
-        )
-
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
         # MoE op and fuse it into the push all-reduce's staging pass
         # (k3_ar_fusion.finalize_all_reduce_push_norm): the rank-local latent
@@ -628,6 +632,7 @@ class KimiK3MoE(nn.Module):
         # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
+            "_front_fp32",
             "_routing_contract_ok",
             "_ep_front_eligible",
         ):
@@ -652,6 +657,19 @@ class KimiK3MoE(nn.Module):
             and get_moe_a2a_backend().is_none()
             and self.shared_experts.down_proj.weight.dtype
             in (torch.bfloat16, torch.float16)
+        )
+
+    @cached_property
+    def _front_fp32(self) -> bool:
+        """Emit the merged front in fp32 so the router reads exact logits.
+
+        The situ activation and the flashinfer_mxfp4 quantizer read the fp32
+        slices directly. Every other runner takes routed_input rounded back to
+        bf16 in _forward_fused, which is bit-identical to the bf16 front."""
+        return (
+            not _is_hip
+            and self._eligible_for_fused_front
+            and self._front_w.dtype == torch.bfloat16
         )
 
     def _forward_mega_experts(
@@ -972,6 +990,28 @@ class KimiK3MoE(nn.Module):
         return out if prefix_sum is None else out + prefix_sum
 
     @cached_property
+    def _moe_front_needs_dense_bf16(self) -> bool:
+        """Whether routed_input must be repaired into a dense bf16 buffer.
+
+        Only the SM100 trtllm-gen mxfp4 runner reads the front slice as it
+        comes: its group quant (route_quant_fused / per_token_group_quant)
+        takes both a strided row and an fp32 row. The SM90/SM120 cutlass mxfp4
+        kernels return from apply() before that quant, and precision="bf16"
+        skips it as well, so those keep the bf16 contract even though the
+        runner backend is the same."""
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        method = self.experts.quant_method
+        return not (
+            isinstance(method, Mxfp4MoEMethod)
+            and method.use_flashinfer
+            and not method.use_marlin
+            and method._fi_kernel == "trtllm_sm100"
+            and method.flashinfer_mxfp4_moe_precision == "default"
+            and method.hidden_size == self.moe_hidden_size
+        )
+
+    @cached_property
     def _route_quant_fuse_eligible(self) -> bool:
         """Whether to stage routed_input for the fused route+pack+quant launch
         (route_quant_handoff). Only the trtllm-gen SiTU runner with mxfp8
@@ -1051,14 +1091,20 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(hidden_states, self._front_w)
+        fused = _k3_bf16_gemm(
+            hidden_states,
+            self._front_w,
+            out_dtype=torch.float32 if self._front_fp32 else None,
+        )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if num_tokens > 1 and self._moe_front_needs_contiguous:
-            routed_input = routed_input.contiguous()
+        if self._moe_front_needs_dense_bf16:
+            # off an fp32 front the cast allocates the dense buffer, so the
+            # contiguous() behind it is free; off a bf16 front it is the copy
+            routed_input = routed_input.to(hidden_states.dtype).contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
@@ -2933,6 +2979,8 @@ class KimiK3LinearForCausalLM(nn.Module):
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
+    supports_cuda_vmm_feature_transport = True
+
     # Raw HF checkpoint prefixes, before hf_to_sglang_mapper is applied.
     encoder_only_safetensors_weight_prefixes = (
         "vision_tower.",
@@ -3038,40 +3086,62 @@ class KimiK3ForConditionalGeneration(nn.Module):
         grid_thw_list = grid_thws_host.tolist()
 
         def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
-            """Materialize features for the images assigned to this rank.
-
-            K3 vision is image-wise data-parallel, so each image is consumed
-            by exactly one TP rank. Deferred CUDA-IPC proxies are
-            reconstructed here, after the assignment is known, so an image
-            crosses the tokenizer/scheduler boundary once instead of once
-            per rank; CPU-transport features likewise only pay their H2D
-            copy on the owner rank. The consumer count matches
-            MmItemMemoryPool.try_to_recycle(), which waits for the server TP
-            size rather than the attention subgroup size.
-            """
-            parallel = get_parallel()
-            server_args = get_server_args()
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
+            """Materialize only the images assigned to this vision-DP rank."""
+            # Same source as MmItemMemoryPool.try_to_recycle(), which waits on
+            # configured_tp_size(): the live world size agrees once dist is up,
+            # but a refcount that disagrees with the waiter would strand items.
+            ipc_consumer_count = max(configured_tp_size(), 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
 
-            features = []
+            selected_items = []
             for image_index in image_indices:
                 item = items[image_index]
                 if device.type == "cuda":
                     item.reconstruct(
                         device_index, ipc_consumer_count=ipc_consumer_count
                     )
-                feature = item.feature
-                if not isinstance(feature, torch.Tensor):
+                selected_items.append(item)
+
+            deferred = [
+                item.model_specific_data.get(DEFERRED_PREPROCESSING_KEY)
+                for item in selected_items
+            ]
+            if any(config is not None for config in deferred):
+                if not all(config is not None for config in deferred):
+                    raise ValueError(
+                        "Kimi-K3 cannot mix deferred and preprocessed image features"
+                    )
+                from sglang.srt.multimodal.processors.kimi_k25 import (
+                    _gpu_preprocess_images,
+                )
+
+                first_config = deferred[0]
+                image_scale, image_bias = normalization_tensors(
+                    first_config["image_mean"], first_config["image_std"], device
+                )
+                pixel_values, _ = _gpu_preprocess_images(
+                    [item.feature for item in selected_items],
+                    [config["resize_config"] for config in deferred],
+                    image_scale,
+                    image_bias,
+                    self.vision_tower.patch_size,
+                    to_chw=lambda image: to_chw_uint8(image, device=device),
+                    post_resize=lambda x: fill_transparent_bg(
+                        x, first_config["transparent_bg_config"]
+                    ),
+                )
+                return pixel_values.to(dtype=target_dtype)
+
+            features = []
+            for item in selected_items:
+                if not isinstance(item.feature, torch.Tensor):
                     raise TypeError(
                         "Kimi-K3 image feature must be a torch.Tensor, "
-                        f"got {type(feature)}"
+                        f"got {type(item.feature)}"
                     )
-                features.append(feature)
+                features.append(item.feature)
             return materialize_multimodal_features(
                 features, device=device, dtype=target_dtype
             )
