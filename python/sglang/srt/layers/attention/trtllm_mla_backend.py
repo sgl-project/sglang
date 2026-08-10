@@ -52,6 +52,9 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -566,8 +569,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
-            self.disable_chunked_prefix_cache and has_prefix
-        ) or is_in_tc_piecewise_cuda_graph()
+            (self.disable_chunked_prefix_cache and has_prefix)
+            or is_in_tc_piecewise_cuda_graph()
+            or is_in_breakable_cuda_graph()
+        )
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(
                 forward_batch, disable_flashinfer_ragged=True
@@ -615,9 +620,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Unified pool: precompute the DENSE KV write loc into the capture-stable
         # buffer (both capture and each replay-prep run this out of the graph),
-        # so the in-graph set_mla_kv_buffer writes a dense loc without capturing a
-        # translate. Only decode writes KV under unified (spec is gated off).
-        if self._unified_mla and forward_mode.is_decode_or_idle():
+        # so the in-graph set_mla_kv_buffer writes a dense loc without capturing
+        # a translate.
+        if self._unified_mla and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        ):
             out_cache_loc = forward_batch.out_cache_loc
             n = out_cache_loc.shape[0]
             dst = self.cuda_graph_out_cache_loc_dense[:n]
@@ -647,11 +654,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
             # when chunked prefix cache is disabled.
-            # Also fallback to flashinfer MLA backend when in piecewise cuda graph, since it only supports MLA forward mode.
+            # Also fallback to flashinfer MLA backend under a captured prefill graph
             has_prefix = any(forward_batch.extend_prefix_lens_cpu)
             fallback_to_flashinfer_impl = (
-                self.disable_chunked_prefix_cache and has_prefix
-            ) or is_in_tc_piecewise_cuda_graph()
+                (self.disable_chunked_prefix_cache and has_prefix)
+                or is_in_tc_piecewise_cuda_graph()
+                or is_in_breakable_cuda_graph()
+            )
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 
@@ -1236,9 +1245,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
-            )
+            if self._decode_dense_loc is not None:
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
+                )
+            else:
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
 
         # TODO refactor to avoid code duplication
         # Prepare query tensor inline

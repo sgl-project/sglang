@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -42,6 +44,14 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         if hasattr(cls, "_scheduler_logger") and hasattr(cls, "_old_level"):
             cls._scheduler_logger.setLevel(cls._old_level)
 
+    def setUp(self):
+        # The scheduler scales the budget by the live DCP size
+        # (`get_parallel().attn_dcp_size`), so the double states a topology
+        # rather than publishing a config it does not otherwise need.
+        cm = get_parallel().override(attn_dcp_size=1)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
     def _new_scheduler(
         self,
         max_req_len: int = 128,
@@ -52,7 +62,6 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
-        scheduler.server_args = SimpleNamespace(dcp_size=1)
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         return scheduler
 
