@@ -80,16 +80,24 @@ def build_draft_tp_worker(
             server_args=server_args, algo_label=algo_label
         )
     )
-    draft_worker = TpModelWorker(
-        server_args=server_args,
-        gpu_id=gpu_id,
-        ps=ps,
-        nccl_port=nccl_port,
-        is_draft_worker=True,
-        # The draft runs at absolute target positions.
-        context_length=target_model_config.context_len,
-        draft_attention_backend=draft_backend,
-    )
+    from sglang.srt.layers.moe.utils import draft_model_build_scope
+
+    # The draft's model construction runs its own MoE gates; the scope routes
+    # their fusion decision to the speculative leaf and gives the target its
+    # ACTIVE value back. It deliberately does not swap runner_backend: these
+    # workers run the draft outside speculative_moe_backend_context, so a
+    # construction-only swap would build and execute under different backends.
+    with draft_model_build_scope():
+        draft_worker = TpModelWorker(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            ps=ps,
+            nccl_port=nccl_port,
+            is_draft_worker=True,
+            # The draft runs at absolute target positions.
+            context_length=target_model_config.context_len,
+            draft_attention_backend=draft_backend,
+        )
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner

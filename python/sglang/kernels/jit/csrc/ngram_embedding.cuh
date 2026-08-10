@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <type_traits>
 
+namespace sglang {
+
 namespace device::ngram_embedding {
 
 constexpr int kDecodeBlockSize = 256;
@@ -198,8 +200,6 @@ __global__ void UpdateTokenTableDecodeKernel(
 }
 
 }  // namespace device::ngram_embedding
-
-namespace {
 
 struct NgramEmbeddingKernel {
   static void compute_n_gram_ids(
@@ -504,4 +504,4 @@ struct NgramEmbeddingKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
