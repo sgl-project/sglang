@@ -24,6 +24,7 @@ inherited from the H=8192 measurements and are therefore approximate elsewhere.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -165,8 +166,9 @@ def _measured_ll_all_reduce(tp_size: int, hidden_size: int):
 
     if hidden_size != 6144 or tp_size not in (4, 8):
         return None
+    ept = int(os.environ.get("SGLANG_TEST_CUTEDSL_LL_AR_EPT", "4"))
     return LLAllReduceTuning(
-        publish_elements_per_thread=4,
+        publish_elements_per_thread=ept,
         publish_threads=128,
         collective=LLCollectiveTuning(cluster_size=8, rank_lanes=1, threads=128),
     )
@@ -216,10 +218,11 @@ def _build_config(tp_size: int, hidden_size: int, top_k: int, dtype: torch.dtype
     # because each rank publishes a smaller slice.
     finalize_bounds = (7, 52, 703, None) if wide_tp else (23, 48, 703, None)
     all_reduce_bounds = (5, 512, 959, None) if wide_tp else (15, 256, 1024, None)
-    measured = _MEASURED_BOUNDS.get((tp_size, hidden_size))
+    stock = os.environ.get("SGLANG_TEST_CUTEDSL_STOCK") == "1"
+    measured = None if stock else _MEASURED_BOUNDS.get((tp_size, hidden_size))
     if measured is not None:
         finalize_bounds, all_reduce_bounds = measured
-    measured_ll_ar = _measured_ll_all_reduce(tp_size, hidden_size)
+    measured_ll_ar = None if stock else _measured_ll_all_reduce(tp_size, hidden_size)
     if measured_ll_ar is not None:
         ll_all_reduce = measured_ll_ar
 
