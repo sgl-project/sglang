@@ -33,7 +33,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
+# TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA.
+FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
 
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
