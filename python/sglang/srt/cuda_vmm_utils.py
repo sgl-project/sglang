@@ -278,6 +278,18 @@ def make_device_allocation_prop(
         handle_types = get_device_allocation_handle_type(device_id)
     elif handle_types is None:
         handle_types = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
+    elif not isinstance(handle_types, int):
+        raise ValueError("handle_types must be 'auto', an integer, or None")
+
+    handle_types = int(handle_types)
+    valid_handle_types = {
+        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE),
+        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
+        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC),
+    }
+    if handle_types not in valid_handle_types:
+        raise ValueError(f"invalid CUDA handle-type value: {handle_types}")
+
     prop = drv.CUmemAllocationProp()
     prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
     prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
