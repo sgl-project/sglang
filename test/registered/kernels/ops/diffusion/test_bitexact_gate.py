@@ -52,6 +52,19 @@ def test_bitexact_gate_per_signature_tracks_each_sig():
     assert gate.verified_sigs == {("a",), ("b",)}
 
 
+def test_bitexact_gate_skips_first_sight_during_graph_capture(monkeypatch):
+    # Negative-branch contract: an unverified gate must not attempt first-sight
+    # verification inside CUDA graph capture — the eager-reference host sync
+    # would abort the capture (and BCG would permanently block the signature).
+    gate = BitExactFusionGate("capture")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert not gate.can_attempt_once()
+    # A verified gate replays the fused kernel alone, which is capture-safe.
+    gate.mark_verified()
+    assert gate.can_attempt_once()
+
+
 def test_tensors_equal_supports_sequences():
     assert tensors_equal(
         (torch.tensor([1.0]), torch.tensor([2.0])),

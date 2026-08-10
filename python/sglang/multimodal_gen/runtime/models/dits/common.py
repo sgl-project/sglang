@@ -37,9 +37,12 @@ def get_qkv_projections(
     """Shared fused/unfused QKV (+ optional added-KV) projection helper.
 
     Used by FLUX / FLUX.2 / Qwen-Image attention blocks that expose the same
-    ``to_qkv`` / ``to_added_qkv`` packing flags.
+    ``to_qkv`` / ``to_added_qkv`` packing flags. ``use_fused_qkv`` is always
+    set by those blocks' constructors, and ``use_fused_added_qkv`` whenever
+    ``added_kv_proj_dim`` is not ``None`` — direct attribute access so a
+    renamed flag fails loudly instead of silently unfusing.
     """
-    if getattr(attn, "use_fused_qkv", False):
+    if attn.use_fused_qkv:
         qkv, _ = attn.to_qkv(hidden_states)
         query, key, value = [t.contiguous() for t in qkv.chunk(3, dim=-1)]
     else:
@@ -49,7 +52,7 @@ def get_qkv_projections(
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if getattr(attn, "use_fused_added_qkv", False):
+        if attn.use_fused_added_qkv:
             added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
             encoder_query, encoder_key, encoder_value = [
                 t.contiguous() for t in added_qkv.chunk(3, dim=-1)

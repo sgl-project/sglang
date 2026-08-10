@@ -21,6 +21,12 @@ class BitExactFusionGate:
       fused path for every later call (GLM / Ernie).
     * **per-signature**: each distinct ``sig`` is verified independently
       (FLUX / Sana), matching aten LayerNorm dispatch that can vary by shape.
+
+    The first-sight check runs the eager reference chain plus a host sync, so
+    it must never happen inside ``torch.compile`` tracing or CUDA graph
+    capture. Once-for-all callers get both guards from
+    :meth:`can_attempt_once`; per-signature callers must keep their own
+    compile/capture checks next to the signature lookup (see FLUX / Sana).
     """
 
     __slots__ = ("name", "disabled", "_verified", "verified_sigs")
@@ -59,8 +65,15 @@ class BitExactFusionGate:
             return False
         if self._verified:
             return True
-        # First-sight verify needs a host sync; skip inside compile tracing.
-        return not torch.compiler.is_compiling()
+        # First-sight verify runs the eager reference chain and a host sync:
+        # attempt neither inside compile tracing nor CUDA graph capture (the
+        # sync would abort the capture; BCG then blocks the signature). Once
+        # verified, the fused kernel runs alone and is compile/capture-safe.
+        if torch.compiler.is_compiling():
+            return False
+        return not (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
 
     def on_exception(
         self,
