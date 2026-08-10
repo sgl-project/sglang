@@ -76,14 +76,32 @@ class TestConfigBags(CustomTestCase):
         with self.assertRaises(ValueError):
             rc.get_memory()
 
-    def test_bag_values_match_server_args(self):
+    def test_the_bags_carry_what_resolution_produced(self):
+        """The projection is faithful: each leaf is the *resolved* value.
+
+        Today that is also the field on the record, because construction
+        resolves in place. Step 12 keeps the record at the user's raw input, and
+        then this is the half that stays true -- the bag is what resolution
+        produced -- while `bag == field` becomes false by design for every field
+        resolution fills in. Written against the resolved projection for that
+        reason, not against the record.
+        """
         sa = self._publish()
-        self.assertEqual(rc.get_exec().moe.moe_runner_backend, sa.moe_runner_backend)
-        self.assertEqual(rc.get_exec().kernel.attention_backend, sa.attention_backend)
-        self.assertEqual(rc.get_memory().hicache_ratio, sa.hicache_ratio)
+        resolved = rc.get_context().resolved_server_args_dict()
+        for accessor, leaf in (
+            (lambda: rc.get_exec().moe.moe_runner_backend, "moe_runner_backend"),
+            (lambda: rc.get_exec().kernel.attention_backend, "attention_backend"),
+            (lambda: rc.get_memory().hicache_ratio, "hicache_ratio"),
+            (lambda: rc.get_schedule().page_size, "page_size"),
+            (lambda: rc.get_serving().host, "host"),
+            (lambda: rc.get_model().model_path, "model_path"),
+        ):
+            with self.subTest(leaf=leaf):
+                self.assertEqual(accessor(), resolved[leaf])
+        # And the record agrees today, which is what step 12 changes: when this
+        # assertion starts failing for a resolution-written leaf, the flip
+        # landed and the bag is the only place the effective value lives.
         self.assertEqual(rc.get_schedule().page_size, sa.page_size)
-        self.assertEqual(rc.get_serving().host, sa.host)
-        self.assertEqual(rc.get_model().model_path, sa.model_path)
 
     def test_all_accessors_and_exec_subgroups(self):
         self._publish()
