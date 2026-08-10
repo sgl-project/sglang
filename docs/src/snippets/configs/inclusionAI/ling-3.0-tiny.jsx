@@ -70,11 +70,6 @@ sgl-eval run gsm8k \\
   },
 
   playgroundFeatures: {
-    attention: {
-      knobs: [
-        { id: "tp", label: "TP", values: [null, 1, 2, 4] },
-      ],
-    },
     parsers: {
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser deepseek-r1" },
