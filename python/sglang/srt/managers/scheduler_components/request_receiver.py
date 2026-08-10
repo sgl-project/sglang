@@ -27,7 +27,7 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -151,7 +151,7 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
-        if self.server_args.enable_dp_attention:
+        if get_parallel().enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
@@ -180,8 +180,8 @@ class SchedulerRequestReceiver:
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
             _local_ctrl = (
-                self.server_args.enable_dp_attention_local_control_broadcast
-                or self.server_args.is_ep_scale_joiner
+                get_parallel().enable_dp_attention_local_control_broadcast
+                or is_ep_scale_joiner()
             )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
@@ -258,7 +258,7 @@ class SchedulerRequestReceiver:
                 # peer ranks may still be unpickling ShmPointerMMData
                 # (-> shm_open).  Synchronize the same CPU groups that carried
                 # SHM-backed work requests before materialize() unlinks them.
-                if self.server_args.enable_dp_attention:
+                if get_parallel().enable_dp_attention:
                     if self.ps.attn_tp_size > 1:
                         barrier(group=self.attn_tp_cpu_group)
                     if self.ps.attn_cp_size > 1:

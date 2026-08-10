@@ -27,7 +27,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
@@ -445,7 +444,6 @@ class MambaMixer2(torch.nn.Module):
         output: Optional[torch.Tensor] = None,
         layer_cache: MambaPool.State,
         metadata: Mamba2Metadata,
-        forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
     ):
@@ -564,14 +562,13 @@ class MambaMixer2(torch.nn.Module):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
+            # Runs once per mamba layer
             if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
+                metadata.has_mamba_track_mask
                 and metadata.track_conv_indices is not None
             ):
                 x_to_track = x[:, metadata.track_conv_indices].transpose(0, 1)
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_state[forward_batch.mamba_track_indices[mask_indices]] = x_to_track
+                conv_state[metadata.conv_states_mask_indices] = x_to_track
             ccfn = (
                 causal_conv1d_fn
                 if not use_triton_causal_conv

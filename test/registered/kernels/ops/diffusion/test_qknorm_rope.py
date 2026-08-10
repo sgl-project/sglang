@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=44, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(est_time=176, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=220, stage="nightly", runner_config="1-gpu-large")
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -84,6 +84,17 @@ def fused_qknorm_rope(
     )
 
 
+def test_qknorm_rope_rejects_unsupported_dtypes() -> None:
+    from sglang.kernels.ops.diffusion.qknorm_rope import (
+        can_use_fused_inplace_qknorm_rope,
+    )
+
+    assert not can_use_fused_inplace_qknorm_rope(128, 128, False, torch.float32)
+    assert not can_use_fused_inplace_qknorm_rope(
+        128, 128, False, torch.bfloat16, torch.float64
+    )
+
+
 BS_LIST = [2**n for n in range(13)]
 BS_LIST += [x + 1 for x in BS_LIST]
 BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 129, 257, 2049, 4097])
@@ -122,7 +133,7 @@ def test_qknorm_rope(
         if is_neox:
             elems_per_thread = head_dim // 32
             rotary_lanes = rope_dim // elems_per_thread
-            if rotary_lanes < 2 or rotary_lanes & (rotary_lanes - 1):
+            if rotary_lanes < 2 or rotary_lanes % 2:
                 continue
 
         q = torch.randn(batch_size, num_heads, head_dim, device=DEVICE, dtype=DTYPE)
@@ -148,6 +159,84 @@ def test_qknorm_rope(
         # which differs from the fused path by about one BF16 rounding step on H200.
         triton.testing.assert_close(q_ref, q_fused, atol=ATOL, rtol=RTOL)
         triton.testing.assert_close(k_ref, k_fused, atol=ATOL, rtol=RTOL)
+
+
+def test_qknorm_rope_preserves_split_bf16_rounding() -> None:
+    from sgl_kernel import rotary_embedding
+
+    from sglang.kernels.ops.diffusion.qknorm_rope import (
+        fused_inplace_qknorm_rope,
+    )
+    from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+
+    num_tokens, num_heads, head_dim, rope_dim = 257, 28, 128, 96
+    inner_dim = num_heads * head_dim
+    qkv = torch.randn(
+        num_tokens,
+        3 * inner_dim,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=torch.int64)
+    cos_sin_cache = create_cos_sin_cache(rope_dim, num_tokens).to(DTYPE)
+
+    qkv_ref, qkv_fused = qkv.clone(), qkv.clone()
+    q_ref, k_ref, _ = qkv_ref.split(inner_dim, dim=-1)
+    q_fused, k_fused, _ = qkv_fused.split(inner_dim, dim=-1)
+    q_ref = q_ref.view(num_tokens, num_heads, head_dim)
+    k_ref = k_ref.view(num_tokens, num_heads, head_dim)
+    q_fused = q_fused.view(num_tokens, num_heads, head_dim)
+    k_fused = k_fused.view(num_tokens, num_heads, head_dim)
+
+    fused_inplace_qknorm(q_ref, k_ref, q_weight, k_weight, eps=1e-5)
+    rotary_embedding(
+        positions,
+        q_ref.view(num_tokens, -1),
+        k_ref.view(num_tokens, -1),
+        head_dim,
+        cos_sin_cache,
+        True,
+    )
+    fused_inplace_qknorm_rope(
+        q_fused,
+        k_fused,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox=True,
+        eps=1e-5,
+        rope_dim=rope_dim,
+        round_norm_before_rope=True,
+    )
+
+    assert torch.equal(q_ref, q_fused)
+    assert torch.equal(k_ref, k_fused)
+
+
+def test_qknorm_rope_accepts_empty_token_dimension() -> None:
+    from sglang.kernels.ops.diffusion.qknorm_rope import fused_inplace_qknorm_rope
+
+    num_heads, head_dim = 8, 128
+    q = torch.empty(0, num_heads, head_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.empty_like(q)
+    weight = torch.ones(head_dim, device=DEVICE, dtype=DTYPE)
+    cache = create_cos_sin_cache(head_dim, 1)
+    positions = torch.empty(0, device=DEVICE, dtype=torch.int64)
+
+    fused_inplace_qknorm_rope(
+        q,
+        k,
+        weight,
+        weight,
+        cache,
+        positions,
+        is_neox=False,
+        rope_dim=head_dim,
+    )
+    assert q.numel() == k.numel() == 0
 
 
 if __name__ == "__main__":
