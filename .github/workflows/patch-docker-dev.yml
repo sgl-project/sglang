@@ -34,17 +34,34 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Pull base image and extract commit
+      - name: Pull base image and preserve original
         run: |
           IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
-          docker pull "${IMAGE}"
-          if BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
+          BASE_IMAGE="${IMAGE}-base"
+
+          # Try to pull the -base tag first (preserved from a previous patch run)
+          if docker pull "${BASE_IMAGE}" 2>/dev/null; then
+            echo "Found preserved base image: ${BASE_IMAGE}"
+            echo "Patching from clean base (not the previously-patched image)"
+            PATCH_FROM="${BASE_IMAGE}"
+          else
+            echo "No -base tag found — this is the first patch run for this image"
+            docker pull "${IMAGE}"
+            # Preserve the original as -base before we overwrite it
+            docker tag "${IMAGE}" "${BASE_IMAGE}"
+            docker push "${BASE_IMAGE}"
+            echo "Preserved original as ${BASE_IMAGE}"
+            PATCH_FROM="${IMAGE}"
+          fi
+
+          if BASE_SHA=$(docker run --rm --entrypoint git "${PATCH_FROM}" -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
             echo "Image built from commit: ${BASE_SHA}"
           else
             BASE_SHA=""
             echo "::warning::Image has no .git directory — cannot extract base commit"
           fi
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
+          echo "PATCH_FROM=${PATCH_FROM}" >> "$GITHUB_ENV"
 
       - name: Generate patches
         run: |
@@ -84,16 +101,27 @@ jobs:
         run: |
           IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
 
+          HAS_GIT="false"
+          if [ -n "${BASE_SHA}" ]; then
+            HAS_GIT="true"
+          fi
+
           cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
           ARG BASE_IMAGE
+          ARG HAS_GIT=false
           FROM ${BASE_IMAGE}
+          ARG HAS_GIT
           COPY *.patch /tmp/patches/
           RUN cd /sgl-workspace/sglang \
               && for p in /tmp/patches/*.patch; do \
                    if [ ! -s "${p}" ]; then \
                      echo "Skipping ${p} (empty)"; \
+                   elif [ "${HAS_GIT}" = "true" ]; then \
+                     echo "Applying ${p} (git apply --3way)..." \
+                     && git apply --3way < "${p}" \
+                     || { echo "ERROR: Failed to apply ${p}"; exit 1; }; \
                    else \
-                     echo "Applying ${p}..." \
+                     echo "Applying ${p} (patch fallback, no .git)..." \
                      && patch -p1 --fuzz=2 --no-backup-if-mismatch -f < "${p}" \
                      || { echo "ERROR: Failed to apply ${p}"; exit 1; }; \
                    fi; \
@@ -103,7 +131,8 @@ jobs:
 
           docker build \
             --no-cache \
-            --build-arg BASE_IMAGE="${IMAGE}" \
+            --build-arg BASE_IMAGE="${PATCH_FROM}" \
+            --build-arg HAS_GIT="${HAS_GIT}" \
             -t "${IMAGE}" \
             /tmp/patch-ctx/
 
@@ -114,5 +143,6 @@ jobs:
           docker push "${IMAGE}"
 
           echo "### Patched \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Base image:** \`${PATCH_FROM}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Source:** ${{ inputs.pr_numbers && format('PRs: {0}', inputs.pr_numbers) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"
