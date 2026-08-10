@@ -254,6 +254,19 @@ class ReqState:
     prompt_token_ids: Optional[List[int]] = None
 
 
+def _echo_start_weight_version(meta_info: Dict[Any, Any], state: ReqState) -> None:
+    """Echo back the caller-declared start weight version, when there is one.
+
+    ``meta_info["weight_version"]`` is the version at emission, so the pair gives
+    the caller the span a long request generated across. Omitted when undeclared.
+    """
+    if not isinstance(state.obj, GenerateReqInput):
+        return
+    if state.obj.start_weight_version is None:
+        return
+    meta_info["start_weight_version"] = state.obj.start_weight_version
+
+
 def _slice_streaming_output_meta_info(
     meta_info: Dict[Any, Any],
     last_output_offset: int,
@@ -1225,6 +1238,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
+                start_weight_version=obj.start_weight_version,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
@@ -2009,6 +2023,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "weight_version": self.server_args.weight_version,
                 "num_retractions": recv_obj.retraction_counts[i],
             }
+            _echo_start_weight_version(meta_info, state)
 
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
@@ -2885,6 +2900,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "weight_version": self.server_args.weight_version,
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
+        _echo_start_weight_version(meta_info, state)
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(

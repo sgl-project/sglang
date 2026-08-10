@@ -267,6 +267,10 @@ class GenerateReqInput:
 
     # Priority for the request
     priority: Optional[int] = None
+    # Weight version this request starts generating under, caller-declared: the
+    # server stores and echoes it but never derives it. An int, unlike the
+    # free-form ``ServerArgs.weight_version``, so a threshold can order it.
+    start_weight_version: Optional[int] = None
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -851,6 +855,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Priority for the request
     priority: Optional[int] = None
+
+    # Caller-declared start weight version; see GenerateReqInput.
+    start_weight_version: Optional[int] = None
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
@@ -1514,6 +1521,22 @@ class PauseGenerationReqInput(BaseReq, kw_only=True):
     """
 
     mode: Literal["abort", "retract", "in_place"] = "abort"
+    # Abort requests whose caller-declared start_weight_version is strictly below
+    # this instead of keeping them across the update; `mode` still decides what
+    # happens to the rest. See GenerateReqInput.start_weight_version.
+    abort_below_start_weight_version: Optional[int] = None
+
+    def __post_init__(self):
+        # The threshold decides who survives the pause, so it needs a mode that
+        # keeps survivors at all. 'abort' keeps nothing.
+        if (
+            self.abort_below_start_weight_version is not None
+            and self.mode == "abort"
+        ):
+            raise ValueError(
+                "abort_below_start_weight_version is meaningless with "
+                "mode='abort', which aborts every request already."
+            )
 
 
 class ContinueGenerationReqInput(BaseReq, kw_only=True):

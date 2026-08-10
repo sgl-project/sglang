@@ -305,6 +305,18 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def _is_stale_start_version(req, stale_below) -> bool:
+    """Whether a request declared a start version strictly below the threshold.
+
+    A request that declared none is never stale: an unknown version cannot be
+    evaluated, and guessing is worse than keeping the request."""
+    return (
+        stale_below is not None
+        and req.start_weight_version is not None
+        and req.start_weight_version < stale_below
+    )
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -2147,6 +2159,7 @@ class Scheduler(
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
+                start_weight_version=recv_req.start_weight_version,
                 metrics_collector=(
                     self.metrics_collector
                     if self.metrics_reporter.enable_metrics
@@ -4186,6 +4199,21 @@ class Scheduler(
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
 
+    def _abort_stale_in_flight(self, stale_below: int) -> None:
+        """Finish in-flight requests that started too far back to be worth keeping.
+
+        Used by the in_place pause, which keeps its KV cache and so has nothing to
+        split at re-queue time; marking to_finish is the same route abort_request
+        takes for a running request."""
+        if self.ps.pp_size == 1:
+            batches = [self.running_batch, self.last_batch]
+        else:
+            batches = [*self.running_mbs, *self.mbs]
+        for req in {r for b in batches if b is not None for r in b.reqs}:
+            if not req.finished() and _is_stale_start_version(req, stale_below):
+                logger.debug(f"Abort stale in-flight request on pause. {req.rid=}")
+                req.to_finish = FINISH_ABORT()
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
         # PD disaggregation: `retract` has no decode-to-prefill rebootstrap path,
@@ -4212,6 +4240,8 @@ class Scheduler(
             # chunked_req cleanup, and overlap result processing through
             # the standard code paths. This avoids duplicating batch
             # manipulation logic and the accounting bugs that come with it.
+            if recv_req.abort_below_start_weight_version is not None:
+                self._abort_stale_in_flight(recv_req.abort_below_start_weight_version)
             return
 
         if self.enable_overlap and self.last_batch:
@@ -4257,7 +4287,19 @@ class Scheduler(
                 offload_kv=False,
             )
         self.running_batch.reqs = []
+        stale_below = recv_req.abort_below_start_weight_version
         for req in retract_reqs:
+            if _is_stale_start_version(req, stale_below):
+                # Retracted requests are re-prefilled on resume, so one already
+                # too stale to train on would pay a full recompute just to be
+                # discarded. retract_all above released its KV, so finishing it
+                # here is only the echo the waiting-queue abort path sends.
+                logger.debug(f"Abort stale request on pause. {req.rid=}")
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid, abort_message="Aborted by pause_generation"),
+                    req,
+                )
+                continue
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()

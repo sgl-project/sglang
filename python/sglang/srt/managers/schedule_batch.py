@@ -747,6 +747,7 @@ class Req(ReqDllmMixin):
         disagg_prefill_dp_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
+        start_weight_version: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
@@ -864,6 +865,8 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        # Caller-declared; never derived. See GenerateReqInput.
+        self.start_weight_version = start_weight_version
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -1615,6 +1618,9 @@ class Req(ReqDllmMixin):
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,
             "priority": self.priority,
+            # Kept through the rebootstrap: without it a retracted request loses
+            # its version and goes invisible to the pause threshold.
+            "start_weight_version": self.start_weight_version,
             "extra_key": self.extra_key,
             "routing_key": self.routing_key,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
