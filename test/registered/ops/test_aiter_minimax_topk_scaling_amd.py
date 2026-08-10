@@ -44,9 +44,7 @@ def test_aiter_minimax_topk_applies_routed_scaling_once(monkeypatch):
     monkeypatch.setattr(
         minimax_m3, "get_moe_impl_class", lambda quant_config: _FakeExperts
     )
-    monkeypatch.setattr(
-        minimax_m3, "is_shared_experts_fusion_disabled", lambda: True
-    )
+    monkeypatch.setattr(minimax_m3, "is_shared_experts_fusion_disabled", lambda: True)
     monkeypatch.setattr(
         minimax_m3,
         "get_moe_a2a_backend",
@@ -69,9 +67,7 @@ def test_aiter_minimax_topk_applies_routed_scaling_once(monkeypatch):
         swiglu_limit=7.0,
     )
     device = torch.device("cuda")
-    moe = minimax_m3.MiniMaxM3MoE(
-        config, layer_id=0, quant_config=object()
-    ).to(device)
+    moe = minimax_m3.MiniMaxM3MoE(config, layer_id=0, quant_config=object()).to(device)
     topk_config = moe.topk.topk_config
 
     routing_logits = torch.tensor(

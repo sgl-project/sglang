@@ -115,10 +115,7 @@ def should_run_flashinfer_autotune(
     fp8_gemm_needs_autotune = (
         fp8_gemm_backend.is_flashinfer_cutlass()
         or fp8_gemm_backend.is_flashinfer_cutedsl()
-        or (
-            model_uses_modelopt_fp8
-            and (is_sm100_supported() or is_sm120_supported())
-        )
+        or (model_uses_modelopt_fp8 and (is_sm100_supported() or is_sm120_supported()))
     )
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
