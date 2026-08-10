@@ -85,11 +85,6 @@ class Cosmos3SamplingParams(SamplingParams):
                     "'policy', 'forward_dynamics', or 'inverse_dynamics'."
                 )
             action_output = self.action_mode != "forward_dynamics"
-            if action_output and self.output_file_name is None:
-                # Base visual adjustment derives a filename by JSON-encoding all
-                # fields. In-memory observation images are intentionally not
-                # serializable and action output never needs a visual filename.
-                self.output_file_name = "action.json"
 
         super()._adjust(server_args)
 
@@ -104,6 +99,10 @@ class Cosmos3SamplingParams(SamplingParams):
             self.output_compression = 0
 
     def _set_output_file_name(self) -> None:
+        # Action outputs never need a visual filename. This also avoids hashing
+        # in-memory observation images while base visual adjustment is running.
+        if self.action_mode in ("policy", "inverse_dynamics"):
+            return
         # The pipeline config's ``task_type=TI2V`` drives ``data_type`` to
         # VIDEO, but a single-frame request is a T2I and must pick the IMAGE
         # extension. Flip before the base derives the file name.
