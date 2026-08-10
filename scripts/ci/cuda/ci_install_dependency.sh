@@ -413,7 +413,7 @@ uninstall_stale_flashinfer() {
 
 install_pytorch_stack() {
     PYTORCH_SPECS=()
-    for package in torch torchaudio torchvision torchao torchcodec; do
+    for package in torch torchaudio torchvision torchcodec; do
         spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
         if [ -n "$spec" ]; then
             PYTORCH_SPECS+=("$spec")

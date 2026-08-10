@@ -914,9 +914,6 @@ class LayeredModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-
-        torchao_config = get_exec().graph.torchao_config
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
@@ -957,17 +954,9 @@ class LayeredModelLoader(DefaultModelLoader):
                     fqn_path,
                     weights,
                 )
-                # Quantize weights if applicable
-                if torchao_config and "proj" in fqn_path:
-                    # Note: `None` here is needed to indicate no filter, see
-                    # `apply_torchao_config_to_model` for details.
-                    apply_torchao_config_to_model(module, torchao_config, None)
 
             # Start calling on root module
             fill_module(model, [], weights)
-
-        if torchao_config:
-            model.torchao_applied = True
 
         return model.eval()
 
