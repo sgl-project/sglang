@@ -1264,7 +1264,7 @@ class MQALayer(MqaAttentionBase):
                 self.compressor,
             )
 
-        if kv_handle is not None:
+        if _is_hip and kv_handle is not None:
             kv = cp_all_gather_rerange_finish(kv_handle)
 
         return q, kv
@@ -2244,6 +2244,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.hidden_states_mlp_output = hidden
 
     def _cp_tbo_launch(self, state, x, key, out_rows, collective):
+        assert _is_hip, "CP+TBO MoE overlap is HIP-only"
         x = x.contiguous()
         sub = state.tbo_subbatch_index
         out = get_tbo_persistent_buffer(
@@ -2579,6 +2580,8 @@ class DeepseekV4Model(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        assert _is_hip, "CP+TBO prefill path is HIP-only"
+
         from sglang.srt.batch_overlap.operations import execute_overlapped_operations
         from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
         from sglang.srt.batch_overlap.two_batch_overlap import (
