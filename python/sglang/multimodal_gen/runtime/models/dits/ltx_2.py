@@ -28,6 +28,9 @@ from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
 )
 from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig, LTX2Config
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_blocks_or_transformer_blocks,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
@@ -1504,9 +1507,8 @@ class LTX2TransformerBlock(nn.Module):
 
 
 class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = LTX2ArchConfig()._fsdp_shard_conditions
-    _compile_conditions = LTX2ArchConfig()._compile_conditions
-    _supported_attention_backends = LTX2ArchConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
+    _compile_conditions = [is_blocks_or_transformer_blocks]
     param_names_mapping = LTX2ArchConfig().param_names_mapping
     reverse_param_names_mapping = LTX2ArchConfig().reverse_param_names_mapping
     lora_param_names_mapping = LTX2ArchConfig().lora_param_names_mapping

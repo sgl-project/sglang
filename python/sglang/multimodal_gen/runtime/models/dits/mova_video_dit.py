@@ -14,6 +14,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 
@@ -417,9 +418,8 @@ class Conv3dLocalIsland(nn.Conv3d):
 
 
 class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = MOVAVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVAVideoConfig()._compile_conditions
-    _supported_attention_backends = MOVAVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = MOVAVideoConfig().param_names_mapping
     reverse_param_names_mapping = MOVAVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVAVideoConfig().lora_param_names_mapping

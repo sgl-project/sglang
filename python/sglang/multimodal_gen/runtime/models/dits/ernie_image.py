@@ -29,6 +29,7 @@ from sglang.kernels.ops.diffusion.triton.rmsnorm_scale_shift_bitexact import (
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
     ErnieImageDitConfig,
 )
+from sglang.multimodal_gen.configs.models.fsdp import is_layer
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
@@ -414,7 +415,7 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
     _no_split_modules = ["ErnieImageSharedAdaLNBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
 
-    _fsdp_shard_conditions = ErnieImageDitConfig().arch_config._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_layer]
     _compile_conditions = []
     param_names_mapping = ErnieImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = {}

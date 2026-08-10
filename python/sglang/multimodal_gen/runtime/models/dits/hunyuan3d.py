@@ -501,7 +501,7 @@ class Hunyuan3D2DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         qkv_bias = arch.qkv_bias
         time_factor = arch.time_factor
         guidance_embed = arch.guidance_embed
-        supported_attention_backends = arch._supported_attention_backends
+        supported_attention_backends = self._supported_attention_backends
 
         self.in_channels = in_channels
         self.context_in_dim = context_in_dim
