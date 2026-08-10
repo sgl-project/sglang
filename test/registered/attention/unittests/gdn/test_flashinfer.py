@@ -30,8 +30,8 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_gdn_split_op_extend_case,
 )
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-large")
 
 _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
 _sm_major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0

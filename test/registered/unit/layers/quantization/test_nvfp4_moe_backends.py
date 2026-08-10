@@ -23,7 +23,7 @@ from sglang.test.quant_ref_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 E, H, I, TOPK, M = 8, 1024, 1024, 2, 32
 

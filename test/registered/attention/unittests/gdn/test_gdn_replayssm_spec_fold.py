@@ -20,7 +20,7 @@ from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 
 B, T = 3, 4
 H, HV = 4, 8

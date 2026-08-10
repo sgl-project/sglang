@@ -31,7 +31,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import resolve_encoder_transfer_backend
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 def test_kimi_k3_encoder_transfer_backend_auto_avoids_tp_fanout():

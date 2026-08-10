@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, stage="base-c", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=753, stage="base-c", runner_config="8-gpu-b300")
 
 MODEL_PATH = (
     "/data/radixark/model-cache/hub/models--moonshotai--Kimi-K3/"
