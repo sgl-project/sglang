@@ -1,6 +1,6 @@
 ---
 title: Nemotron3.5-Lightning
-description: "Deploy NVIDIA Nemotron 3.5 Lightning with SGLang — NVFP4 hybrid Mamba + MoE serving on a single B200 or H100, with MTP / DFlash / DSpark speculative decoding, reasoning, tool calling, and a tunable thinking budget."
+description: "Deploy NVIDIA Nemotron 3.5 Lightning with SGLang — NVFP4 hybrid Mamba + MoE serving on a single H100 or DGX Spark, with MTP / DFlash / DSpark speculative decoding, reasoning, tool calling, and a tunable thinking budget."
 tag: NEW
 ---
 
@@ -29,7 +29,7 @@ Then run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:nightly-dev-20260719-99f5a6f4
+docker pull lmsysorg/sglang:dev-nemotron3-5-lighting
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -40,7 +40,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware + recipe to generate the launch command. Both **B200** and **H100** publish four single-GPU NVFP4 operating points: **Balanced** (no speculation) plus the three validated speculative decoders — **MTP**, **DFlash**, and **DSpark**. Use the Playground below to explore knobs beyond them.
+Pick your hardware + recipe to generate the launch command. Both **H100** and **DGX Spark** publish four single-GPU NVFP4 operating points: **Balanced** (no speculation) plus the three validated speculative decoders — **MTP**, **DFlash**, and **DSpark**. Use the Playground below to explore knobs beyond them.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/nvidia/nemotron-3.5-lightning.jsx";
@@ -58,7 +58,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**NVIDIA Nemotron 3.5 Lightning** is a 30B-A3B hybrid reasoning LLM that interleaves Mamba sequence-modeling layers with Mixture-of-Experts feed-forward layers and standard self-attention, rather than a uniform "attention + MLP" transformer stack. It ships a post-training-quantized **NVFP4** checkpoint that serves on a **single B200 or H100 80GB** at TP=1, and supports thinking-on / thinking-off modes plus structured tool calling.
+**NVIDIA Nemotron 3.5 Lightning** is a 30B-A3B hybrid reasoning LLM that interleaves Mamba sequence-modeling layers with Mixture-of-Experts feed-forward layers and standard self-attention, rather than a uniform "attention + MLP" transformer stack. It ships a post-training-quantized **NVFP4** checkpoint that serves on a **single H100 80GB or DGX Spark** at TP=1, and supports thinking-on / thinking-off modes plus structured tool calling.
 
 The model is published as two checkpoints, plus two standalone speculative draft models:
 
@@ -110,7 +110,7 @@ MTP needs no separate download — the draft head is embedded in the target chec
 
 - **DSpark requires `SGLANG_RAGGED_VERIFY_MODE=static` in the environment.** Without it, the ragged verification path picks its own mode and `--speculative-dspark-block-size` is not honored. The Deploy panel emits this as an inline environment variable on the DSpark cells.
 
-- **Platform backends differ.** B200 runs flashinfer attention *and* flashinfer Mamba with `--mamba-radix-cache-strategy no_buffer`, stochastic Mamba-cache rounding, and overlap scheduling off; H100 uses the platform-default attention path with `extra_buffer`. Don't cross-apply these — the Deploy panel already picks the right set per platform.
+- **Platform backends differ.** H100 uses the platform-default attention path; DGX Spark pins `--attention-backend flashinfer` with the Triton Mamba backend and caps the decode CUDA-graph batch at 4 rather than 16. Both share `--mamba-radix-cache-strategy extra_buffer`. Don't cross-apply these — the Deploy panel already picks the right set per platform.
 
 ## 3. Advanced Usage
 

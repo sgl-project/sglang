@@ -5,9 +5,8 @@
 export const config = {
   modelName: "Nemotron 3.5 Lightning",
 
-  // Two validated single-GPU platforms. B200 publishes the TP1/EP1 profile;
-  // the four-GPU TP4/EP4 profile is reachable through the Playground TP knob.
-  supportedHardware: ["b200", "h100"],
+  // Two validated single-GPU platforms, both at TP1/EP1.
+  supportedHardware: ["h100", "dgx-spark"],
 
   variants: [{ id: "default", label: "Default" }],
 
@@ -62,8 +61,10 @@ sgl-eval run gsm8k \\
   accuracyLabels: [["gsm8k_pct", "GSM8K", "%"]],
 
   dockerImages: {
-    b200: "lmsysorg/sglang:nightly-dev-20260719-99f5a6f4",
-    h100: "lmsysorg/sglang:nightly-dev-20260719-99f5a6f4",
+    // Multi-arch index (amd64 + arm64), so one tag covers H100 and GB10.
+    // Equivalent to dev-cu13-nemotron3-5-lighting.
+    h100:        "lmsysorg/sglang:dev-nemotron3-5-lighting",
+    "dgx-spark": "lmsysorg/sglang:dev-nemotron3-5-lighting",
   },
 
   github: {
@@ -73,8 +74,6 @@ sgl-eval run gsm8k \\
   playgroundFeatures: {
     attention: {
       knobs: [
-        // TP4/EP4 is the validated four-B200 profile; pair it with
-        // --max-total-tokens 524288 and --chunked-prefill-size 16384.
         { id: "tp", label: "TP", values: [null, 1, 2, 4, 8] },
       ],
     },
@@ -238,11 +237,12 @@ sgl-eval run gsm8k \\
       ],
     },
 
-    // ==== NVIDIA Blackwell (SM100) + NVFP4, single GPU ====
-    // flashinfer Mamba with no_buffer radix caching and stochastic cache
-    // rounding; overlap scheduling is off on this platform.
+    // ==== NVIDIA DGX Spark (GB10 / SM121) + NVFP4, single GPU ====
+    // 128GB coherent unified memory. Same profile as H100 apart from
+    // flashinfer attention, the Triton Mamba backend, and a decode
+    // CUDA-graph batch cap of 4 rather than 16.
     {
-      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -250,25 +250,23 @@ sgl-eval run gsm8k \\
         "--enable-metrics",
         "--context-length 28672",
         "--attention-backend flashinfer",
-        "--mamba-backend flashinfer",
+        "--mamba-backend triton",
         "--mamba-ssm-dtype float16",
-        "--mamba-radix-cache-strategy no_buffer",
-        "--enable-mamba-cache-stochastic-rounding",
-        "--mamba-cache-philox-rounds 5",
-        "--disable-overlap-schedule",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--mem-fraction-static 0.85",
         "--max-total-tokens 32768",
         "--max-prefill-tokens 10240",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs-decode 16",
+        "--cuda-graph-max-bs-decode 4",
         "--reasoning-parser nemotron_3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
+    // MTP: draft head embedded in the target checkpoint.
     {
-      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -276,17 +274,14 @@ sgl-eval run gsm8k \\
         "--enable-metrics",
         "--context-length 28672",
         "--attention-backend flashinfer",
-        "--mamba-backend flashinfer",
+        "--mamba-backend triton",
         "--mamba-ssm-dtype float16",
-        "--mamba-radix-cache-strategy no_buffer",
-        "--enable-mamba-cache-stochastic-rounding",
-        "--mamba-cache-philox-rounds 5",
-        "--disable-overlap-schedule",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--mem-fraction-static 0.85",
         "--max-total-tokens 32768",
         "--max-prefill-tokens 10240",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs-decode 16",
+        "--cuda-graph-max-bs-decode 4",
         "--speculative-algorithm EAGLE",
         "--speculative-draft-model-path {{MODEL_NAME}}",
         "--speculative-num-steps 5",
@@ -300,8 +295,9 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
+    // DFlash: separate draft model; depth five -> block/verify width six.
     {
-      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dflash", nodes: "single" },
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "dflash", nodes: "single" },
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -309,17 +305,14 @@ sgl-eval run gsm8k \\
         "--enable-metrics",
         "--context-length 28672",
         "--attention-backend flashinfer",
-        "--mamba-backend flashinfer",
+        "--mamba-backend triton",
         "--mamba-ssm-dtype float16",
-        "--mamba-radix-cache-strategy no_buffer",
-        "--enable-mamba-cache-stochastic-rounding",
-        "--mamba-cache-philox-rounds 5",
-        "--disable-overlap-schedule",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--mem-fraction-static 0.85",
         "--max-total-tokens 32768",
         "--max-prefill-tokens 10240",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs-decode 16",
+        "--cuda-graph-max-bs-decode 4",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path nvidia/nemotron-3.5-dflash-w4a16-preview",
         "--speculative-dflash-block-size 6",
@@ -331,8 +324,9 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
+    // DSpark: separate draft model; gamma seven -> verify width eight.
     {
-      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
       env: [
         "SGLANG_RAGGED_VERIFY_MODE=static",
       ],
@@ -342,17 +336,14 @@ sgl-eval run gsm8k \\
         "--enable-metrics",
         "--context-length 28672",
         "--attention-backend flashinfer",
-        "--mamba-backend flashinfer",
+        "--mamba-backend triton",
         "--mamba-ssm-dtype float16",
-        "--mamba-radix-cache-strategy no_buffer",
-        "--enable-mamba-cache-stochastic-rounding",
-        "--mamba-cache-philox-rounds 5",
-        "--disable-overlap-schedule",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--mem-fraction-static 0.85",
         "--max-total-tokens 32768",
         "--max-prefill-tokens 10240",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs-decode 16",
+        "--cuda-graph-max-bs-decode 4",
         "--speculative-algorithm DSPARK",
         "--speculative-draft-model-path nvidia/nemotron-3.5-dspark-w4a16-preview",
         "--speculative-dspark-block-size 7",
@@ -364,6 +355,5 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
-
   ],
 };

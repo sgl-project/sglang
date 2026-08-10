@@ -6,8 +6,8 @@ export const benchmarks = [
   { match: { hw: "h100", variant: "default", quant: "nvfp4", strategy: "dflash",   nodes: "single" } },
   { match: { hw: "h100", variant: "default", quant: "nvfp4", strategy: "dspark",   nodes: "single" } },
 
-  { match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "mtp",      nodes: "single" } },
-  { match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dflash",   nodes: "single" } },
-  { match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dspark",   nodes: "single" } },
+  { match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "mtp",      nodes: "single" } },
+  { match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "dflash",   nodes: "single" } },
+  { match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "dspark",   nodes: "single" } },
 ];
