@@ -22,7 +22,7 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
-    dflash_draft_kv_bytes_per_token: int | None = None
+    dflash_draft_cell_size_per_token: int | None = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -165,7 +165,7 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
-        config.dflash_draft_kv_bytes_per_token = _resolve_dflash_draft_kv_bytes(
+        config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_kv_bytes(
             server_args=server_args,
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
@@ -185,7 +185,7 @@ def _resolve_dflash_draft_kv_bytes(
     leaving callers on layer-count scaling.
     """
     from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
-    from sglang.srt.speculative.dflash_utils import dflash_draft_kv_bytes_per_token
+    from sglang.srt.speculative.dflash_utils import dflash_draft_cell_size_per_token
 
     try:
         _, draft_kv_cache_dtype = configure_kv_cache_dtype(
@@ -198,7 +198,7 @@ def _resolve_dflash_draft_kv_bytes(
                 server_args.speculative_draft_attention_backend
             ),
         )
-        return dflash_draft_kv_bytes_per_token(
+        return dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,

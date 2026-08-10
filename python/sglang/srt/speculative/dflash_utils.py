@@ -65,7 +65,7 @@ def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
 
 
-def dflash_draft_kv_bytes_per_token(
+def dflash_draft_cell_size_per_token(
     *,
     draft_model_config: Any,
     draft_num_layers: int,
@@ -75,10 +75,10 @@ def dflash_draft_kv_bytes_per_token(
     """Exact bytes/token of the DFLASH draft KV pool."""
     if draft_num_layers <= 0:
         return 0
-    kv_heads = draft_model_config.get_num_kv_heads(tp_size)
-    head_dims = draft_model_config.head_dim + draft_model_config.v_head_dim
-    kv_size = torch._utils._element_size(draft_kv_cache_dtype)
-    return int(kv_heads * head_dims * int(draft_num_layers) * kv_size)
+    num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
+    kv_dim_per_head = draft_model_config.head_dim + draft_model_config.v_head_dim
+    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
+    return int(num_kv_heads * kv_dim_per_head * int(draft_num_layers) * dtype_size)
 
 
 def scale_kv_cell_size_per_token_for_dflash(

@@ -183,7 +183,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_num_layers=int(draft_num_layers)
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=(
-                        kvc.spec_aux_config.dflash_draft_kv_bytes_per_token or None
+                        kvc.spec_aux_config.dflash_draft_cell_size_per_token or None
                     ),
                 )
 
@@ -418,7 +418,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # DFLASH/DSPARK draft KV pool: a flat bytes/token term.
         self._draft_kv_per_token = 0
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
-            draft_kv_per_token = kvc.spec_aux_config.dflash_draft_kv_bytes_per_token
+            draft_kv_per_token = kvc.spec_aux_config.dflash_draft_cell_size_per_token
             if draft_kv_per_token is not None and int(draft_kv_per_token) > 0:
                 self._draft_kv_per_token = int(draft_kv_per_token)
 

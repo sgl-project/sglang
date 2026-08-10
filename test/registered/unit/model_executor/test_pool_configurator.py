@@ -652,7 +652,7 @@ class TestDflashDraftKvBudget(unittest.TestCase):
         import torch
 
         from sglang.srt.speculative.dflash_utils import (
-            dflash_draft_kv_bytes_per_token,
+            dflash_draft_cell_size_per_token,
         )
 
         draft = SimpleNamespace(
@@ -660,7 +660,7 @@ class TestDflashDraftKvBudget(unittest.TestCase):
         )
         # 4 kv heads * (128 + 128) dims * 5 layers * 2 bytes
         self.assertEqual(
-            dflash_draft_kv_bytes_per_token(
+            dflash_draft_cell_size_per_token(
                 draft_model_config=draft,
                 draft_num_layers=5,
                 draft_kv_cache_dtype=torch.bfloat16,
@@ -669,7 +669,7 @@ class TestDflashDraftKvBudget(unittest.TestCase):
             10240,
         )
         self.assertEqual(
-            dflash_draft_kv_bytes_per_token(
+            dflash_draft_cell_size_per_token(
                 draft_model_config=draft,
                 draft_num_layers=0,
                 draft_kv_cache_dtype=torch.bfloat16,
@@ -693,7 +693,7 @@ class TestDflashDraftKvBudget(unittest.TestCase):
             mr.spec_aux_config = SimpleNamespace(
                 eagle_draft_num_layers=None,
                 dflash_draft_num_layers=5,
-                dflash_draft_kv_bytes_per_token=draft_kv_per_token,
+                dflash_draft_cell_size_per_token=draft_kv_per_token,
             )
             with mock_cpu_env():
                 from sglang.srt.model_executor.pool_configurator import (
