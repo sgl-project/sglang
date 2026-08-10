@@ -15,6 +15,7 @@ export const config = {
   ],
   quantizations: [
     { id: "bf16", label: "BF16" },
+    { id: "fp8", label: "FP8" },
   ],
   strategies: [
     { id: "high-throughput", label: "High-Throughput" },
@@ -25,6 +26,7 @@ export const config = {
 
   modelNames: {
     "default|bf16": "inclusionAI/Ling-3.0-tiny",
+    "default|fp8": "inclusionAI/Ling-3.0-tiny-fp8",
   },
 
   placeholders: {
@@ -94,8 +96,6 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--context-length 131072",
-        "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -106,8 +106,6 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--context-length 131072",
-        "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -118,8 +116,6 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--context-length 131072",
-        "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -130,8 +126,6 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--context-length 131072",
-        "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -142,8 +136,6 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--context-length 131072",
-        "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -154,8 +146,66 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--context-length 131072",
-        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h800", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
