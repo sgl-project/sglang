@@ -169,6 +169,43 @@ def prepare_vision_attention_metadata(
     )
 
 
+def prepare_flashinfer_cudnn_vision_attention_metadata(
+    cu_seqlens: torch.Tensor,
+    device: torch.device,
+    *,
+    elem_per_token: int,
+) -> VisionAttentionMetadata:
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    batch_size = int(seq_lens.numel())
+    padded_batch_size = next(
+        (size for size in BATCH_BUCKETS if size >= batch_size),
+        math.ceil(batch_size / BATCH_BUCKETS[0]) * BATCH_BUCKETS[0],
+    )
+    if padded_batch_size != batch_size:
+        pad_size = padded_batch_size - batch_size
+        padded_indptrs = torch.cat([cu_seqlens, cu_seqlens[-1].expand(pad_size)])
+        padded_seq_lens = torch.cat([seq_lens, seq_lens.new_zeros(pad_size)])
+    else:
+        padded_indptrs = cu_seqlens
+        padded_seq_lens = seq_lens
+
+    elem_indptrs = padded_indptrs * elem_per_token
+    real_max_seqlen = int(seq_lens.max().item())
+    max_seqlen = next(
+        (size for size in FLASHINFER_MAX_SEQLEN_BUCKETS if size >= real_max_seqlen),
+        math.ceil(real_max_seqlen / FLASHINFER_MAX_SEQLEN_BUCKETS[-1])
+        * FLASHINFER_MAX_SEQLEN_BUCKETS[-1],
+    )
+    return prepare_vision_attention_metadata(
+        cu_seqlens,
+        device=device,
+        packed_indptrs=torch.cat([elem_indptrs] * 3),
+        sequence_lengths=padded_seq_lens.view(-1, 1, 1, 1),
+        flashinfer_max_seqlen=max_seqlen,
+    )
+
+
 # TODO: requires real seqlens from images
 @functools.lru_cache(maxsize=128)
 def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Tensor:

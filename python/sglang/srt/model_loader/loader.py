@@ -48,6 +48,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     register_memory_region,
 )
 from sglang.srt.runtime_context import (
+    configured_moe_dp_size,
     get_exec,
     get_model,
     get_parallel,
@@ -83,6 +84,9 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.moe.utils import (
+    install_shared_experts_fusion_decision,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
@@ -314,6 +318,13 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+    # Decide the shared-experts-fusion question here, once per runner, before any
+    # layer exists: this is the only place a model class is instantiated, and it
+    # is the last point that still knows both the checkpoint's quantization and
+    # (through the build scope) whether this runner is a draft.
+    install_shared_experts_fusion_decision(
+        model_class, model_config.hf_config, quant_config
+    )
     kwargs = {
         "config": model_config.hf_config,
         "quant_config": quant_config,
@@ -586,7 +597,6 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            server_args = get_server_args()
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
             weight_loader_prefetch = get_model().weight_loader_prefetch_checkpoints
             prefetch_num_threads = get_model().weight_loader_prefetch_num_threads
@@ -835,11 +845,31 @@ class DefaultModelLoader(BaseModelLoader):
 
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
+        is_modelopt_fp4_online = (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not quant_config.is_checkpoint_nvfp4_serialized
+        )
+        is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
+        if is_mxfp8:
+            weights = (
+                (
+                    f"{name}_inv" if name.endswith(".weight_scale") else name,
+                    loaded_weight,
+                )
+                for name, loaded_weight in weights
+            )
 
-        if is_nvfp4_online:
+        if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
-            with temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"):
+            with temp_set_env(
+                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
+                FLASHINFER_NVFP4_4OVER6="1",
+                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
+                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
+                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
+            ):
                 model.load_weights(weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
@@ -1747,14 +1777,13 @@ class PreshardedModelLoader(DefaultModelLoader):
                 return 1
 
         parallel = get_parallel()
-        server_args = get_server_args()
         return {
             "tp": _safe(lambda: parallel.tp_size),
             "dp": _safe(lambda: parallel.moe_dp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
             "pp": _safe(lambda: parallel.pp_size),
             "moe_dense_tp_size": parallel.moe_dense_tp_size,
-            "moe_dp_size": server_args.moe_dp_size,
+            "moe_dp_size": configured_moe_dp_size(),
             "enable_dp_lm_head": parallel.enable_dp_lm_head,
             "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,
@@ -4093,12 +4122,29 @@ def get_model_loader(
         logger.info("Using IncModelLoader due to AutoRound quantization config.")
         return IncModelLoader(load_config)
 
-    # ModelOptModelLoader's local-copy quantize-and-export workflow doesn't apply
-    # to non-local loaders. These loaders own their weight transport path and still
-    # initialize the model with ModelOpt quantization config where applicable.
-    model_optloader_allowed = model_config and load_config.load_format not in (
-        LoadFormat.RUNAI_STREAMER,
-        LoadFormat.REMOTE_INSTANCE,
+    modelopt_config = load_config.modelopt_config
+    modelopt_workflow_requested = modelopt_config is not None and any(
+        (
+            modelopt_config.checkpoint_restore_path,
+            modelopt_config.checkpoint_save_path,
+            modelopt_config.export_path,
+        )
+    )
+
+    # Online modelopt_fp4 converts weights through DefaultModelLoader unless the
+    # caller explicitly requests ModelOpt calibration/checkpoint/export work.
+    # Non-local loaders still own their weight transport path.
+    modelopt_fp4_online = (
+        model_config
+        and model_config.quantization == "modelopt_fp4"
+        and not model_config._is_already_quantized()
+        and not modelopt_workflow_requested
+    )
+    model_optloader_allowed = (
+        model_config
+        and not modelopt_fp4_online
+        and load_config.load_format
+        not in (LoadFormat.RUNAI_STREAMER, LoadFormat.REMOTE_INSTANCE)
     )
 
     if model_optloader_allowed and (

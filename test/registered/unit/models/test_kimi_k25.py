@@ -1,7 +1,8 @@
 """CPU coverage for Kimi-K2.5/K2.7 encoder-DP wiring."""
 
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import pytest
@@ -24,14 +25,21 @@ from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
+from sglang.srt.multimodal.processors.kimi_k3 import (
+    KimiK3GPUProcessorWrapper,
+    KimiK3ImageProcessor,
+    _expand_k3_image_prompt_text,
+    _expand_k3_image_prompt_token_ids,
+)
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
+    KimiK2_5VLImageProcessor,
     _ensure_chw_rgb,
     _expand_image_token_ids,
     _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
@@ -309,7 +317,11 @@ def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
     tower = _MoonViT3dTower()
     pixel_values = torch.randn(4, 2)
 
-    with get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0):
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
+    with get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    ):
         output = run_dp_sharded_mrope_vision_model(
             tower, pixel_values, [[1, 2, 2]], rope_type="rope_2d_packed"
         )
@@ -323,7 +335,11 @@ def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
     pixel_values = torch.randn(4, 2)
     loader = Mock(return_value=pixel_values)
 
-    with get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0):
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
+    with get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    ):
         output = run_dp_sharded_mrope_vision_model(
             tower,
             None,
@@ -471,11 +487,10 @@ def test_kimi_non_dp_keeps_grid_thws_on_the_host():
     model.mm_projector = _IdentityProjector()
     items = [_image_item(torch.randn(4, 2), [[1, 2, 2]])]
 
-    with get_parallel().override(
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
+    with get_context().override_server_args(tp_size=1), get_parallel().override(
         tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-    ), patch(
-        "sglang.srt.models.kimi_k25.get_server_args",
-        return_value=SimpleNamespace(tp_size=1),
     ):
         model.get_image_feature(items)
 
@@ -514,6 +529,380 @@ def test_kimi_lazy_ipc_feature_acknowledges_all_tp_consumers():
     item.reconstruct(0, ipc_consumer_count=8)
 
     proxy.reconstruct_on_target_device.assert_called_once_with(0, consumer_count=8)
+
+
+def test_kimi_lazy_vmm_feature_uses_proxy_consumer_count():
+    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+    proxy.consumer_count = 2
+    proxy.reconstruct_on_target_device = Mock(return_value=torch.randn(1, 2))
+    item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+
+    item.reconstruct(0, ipc_consumer_count=8)
+
+    proxy.reconstruct_on_target_device.assert_called_once_with(0, consumer_count=2)
+
+
+def test_kimi_lazy_vmm_cache_hit_uses_proxy_consumer_count():
+    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+    proxy.consumer_count = 2
+    proxy.acknowledge_consumption = Mock()
+    item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+
+    item.acknowledge_deferred_cuda_ipc_feature(consumer_count=8)
+
+    proxy.acknowledge_consumption.assert_called_once_with(2)
+
+
+class _Tokenizer:
+    def encode(self, text, allowed_special=None):
+        tokens = {
+            "<|media_begin|>image 1536x1024<|media_content|>": [10, 11],
+            "<|media_begin|>image 1024x1536<|media_content|>": [12, 13],
+            "<|media_end|>": [14],
+        }
+        return tokens.get(text, [])
+
+
+class _HFProcessor:
+    def __init__(self):
+        self.tokenizer = _Tokenizer()
+        self.image_processor = SimpleNamespace()
+        self.media_processor = SimpleNamespace(
+            media_proc_cfg={
+                "patch_size": 14,
+                "merge_kernel_size": 2,
+                "in_patch_limit": 16384,
+                "patch_limit_on_one_side": 256,
+                "fixed_output_tokens": None,
+                "image_mean": [0.5, 0.5, 0.5],
+                "image_std": [0.5, 0.5, 0.5],
+                "transparent_bg_config": None,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("processor_cls", "wrapper_cls"),
+    [
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper),
+        (KimiK3ImageProcessor, KimiK3GPUProcessorWrapper),
+    ],
+)
+def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
+    server_args = SimpleNamespace(
+        mm_feature_transport="cpu",
+        disable_fast_image_processor=False,
+        skip_tokenizer_init=False,
+        mm_process_config={},
+        mm_io_worker_num=0,
+        mm_processor_worker_num=0,
+        tokenizer_worker_num=1,
+        base_gpu_id=0,
+    )
+    processor = processor_cls(
+        hf_config=SimpleNamespace(media_placeholder_token_id=42),
+        server_args=server_args,
+        _processor=_HFProcessor(),
+        transport_mode=None,
+    )
+    try:
+        worker_processor = asyncio.run(
+            processor.mm_processor_executor.run(lambda *, processor: processor)
+        )
+        assert isinstance(processor._processor, wrapper_cls)
+        assert isinstance(worker_processor, wrapper_cls)
+        assert worker_processor is not processor._processor
+    finally:
+        processor.mm_processor_executor.shutdown()
+        processor.io_executor.shutdown()
+        processor.cpu_executor.shutdown()
+
+
+def test_kimi_k3_expands_image_placeholders_with_original_dimensions():
+    actual = _expand_k3_image_prompt_token_ids(
+        [1, 99, 2, 99, 3],
+        99,
+        [3, 2],
+        [(1536, 1024), (1024, 1536)],
+        _Tokenizer(),
+    )
+
+    assert actual.tolist() == [[1, 10, 11, 99, 99, 99, 14, 2, 12, 13, 99, 99, 14, 3]]
+
+
+def test_kimi_k3_cpu_prompt_uses_the_same_media_contract():
+    actual = _expand_k3_image_prompt_text(
+        "before<|media_pad|>between<|media_pad|>after",
+        "<|media_pad|>",
+        [3, 2],
+        [(1536, 1024), (1024, 1536)],
+    )
+
+    assert actual == (
+        "before<|media_begin|>image 1536x1024<|media_content|>"
+        "<|media_pad|><|media_pad|><|media_pad|><|media_end|>between"
+        "<|media_begin|>image 1024x1536<|media_content|>"
+        "<|media_pad|><|media_pad|><|media_end|>after"
+    )
+
+
+def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.hf_config = SimpleNamespace(
+        vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
+    )
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor._tokenizer = _Tokenizer()
+    embeddings = {Modality.IMAGE: torch.arange(20, dtype=torch.float32).reshape(5, 4)}
+
+    output = processor.get_mm_data(
+        [1, 99, 2, 99, 3],
+        embeddings,
+        img_grid_thw=torch.tensor([[1, 2, 6], [1, 2, 4]]),
+        original_image_sizes=[[1536, 1024], [1024, 1536]],
+    )
+
+    assert output.input_ids == [
+        1,
+        10,
+        11,
+        99,
+        99,
+        99,
+        14,
+        2,
+        12,
+        13,
+        99,
+        99,
+        14,
+        3,
+    ]
+    assert [item.offsets for item in output.mm_items] == [[(3, 5)], [(10, 11)]]
+    torch.testing.assert_close(
+        output.mm_items[0].precomputed_embeddings, embeddings[Modality.IMAGE][:3]
+    )
+    torch.testing.assert_close(
+        output.mm_items[1].precomputed_embeddings, embeddings[Modality.IMAGE][3:]
+    )
+
+
+def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
+    from sglang.srt.multimodal.kimi_k3_image_processing import (
+        DEFERRED_PREPROCESSING_KEY,
+    )
+
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.mm_feature_transport = "cpu"
+    processor.use_cuda_ipc = False
+    processor._processor = SimpleNamespace(
+        _patch_size=2,
+        prepare_deferred=Mock(
+            return_value=(
+                torch.tensor([[1, 99, 99, 2, 99, 3]]),
+                [
+                    {
+                        "num_tokens": 2,
+                        "new_width": 4,
+                        "new_height": 2,
+                        "pad_width": 0,
+                        "pad_height": 2,
+                    },
+                    {
+                        "num_tokens": 1,
+                        "new_width": 2,
+                        "new_height": 2,
+                        "pad_width": 2,
+                        "pad_height": 2,
+                    },
+                ],
+                {
+                    "image_mean": [0.5, 0.5, 0.5],
+                    "image_std": [0.5, 0.5, 0.5],
+                    "transparent_bg_config": None,
+                },
+            )
+        ),
+    )
+    images = [
+        torch.arange(3 * 2 * 4, dtype=torch.uint8).reshape(3, 2, 4),
+        torch.arange(3 * 2 * 2, dtype=torch.uint8).reshape(3, 2, 2),
+    ]
+    base_output = SimpleNamespace(
+        input_text="prompt", images=images, input_ids=[1, 99, 2, 99, 3]
+    )
+
+    output = processor._build_deferred_output(base_output)
+
+    assert output.input_ids == [1, 99, 99, 2, 99, 3]
+    assert [item.offsets for item in output.mm_items] == [[(1, 2)], [(4, 4)]]
+    assert [item.feature.dtype for item in output.mm_items] == [
+        torch.uint8,
+        torch.uint8,
+    ]
+    assert [item.feature.shape for item in output.mm_items] == [
+        torch.Size([3, 2, 4]),
+        torch.Size([3, 2, 2]),
+    ]
+    assert [item.image_grid_thw.tolist() for item in output.mm_items] == [
+        [[1, 2, 2]],
+        [[1, 2, 2]],
+    ]
+    assert all(item.hash is not None for item in output.mm_items)
+    assert all(item.pad_value is not None for item in output.mm_items)
+    assert all(
+        DEFERRED_PREPROCESSING_KEY in item.model_specific_data
+        for item in output.mm_items
+    )
+
+
+@pytest.mark.parametrize(
+    ("image_shape", "in_patch_limit", "expected"),
+    [((3, 32, 32), 65536, True), ((3, 1024, 1024), 1, False)],
+)
+def test_kimi_k3_defers_only_when_raw_transport_is_smaller(
+    image_shape, in_patch_limit, expected
+):
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
+    processor._processor = SimpleNamespace(
+        _patch_size=14,
+        _merge_kernel_size=2,
+        _in_patch_limit=in_patch_limit,
+        _patch_limit_on_one_side=512,
+        _fixed_output_tokens=None,
+    )
+    image = torch.zeros(image_shape, dtype=torch.uint8)
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert processor._should_defer_gpu_preprocessing([image]) is expected
+
+
+def test_kimi_k3_does_not_defer_non_uint8_tensor_preprocessing():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert not processor._should_defer_gpu_preprocessing(
+            [torch.zeros((3, 32, 32), dtype=torch.float32)]
+        )
+
+
+def test_kimi_k3_does_not_defer_empty_image_batch():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert not processor._should_defer_gpu_preprocessing([])
+
+
+def test_kimi_k3_eager_preprocessing_preserves_float_tensor_support():
+    from sglang.srt.multimodal.processors.kimi_k3 import _k3_to_cuda_chw
+
+    image = torch.zeros((1, 4, 4), dtype=torch.float32)
+    with patch.object(torch.Tensor, "cuda", lambda self: self):
+        output = _k3_to_cuda_chw(image)
+
+    assert output.dtype == torch.float32
+    assert output.shape == (3, 4, 4)
+
+
+@pytest.mark.parametrize("transport", ["cuda_ipc", "fabric"])
+def test_kimi_k3_keeps_gpu_transport_preprocessing_eager(transport):
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = transport
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert not processor._should_defer_gpu_preprocessing(
+            [torch.zeros((3, 32, 32), dtype=torch.uint8)]
+        )
+
+
+def test_kimi_k3_rejects_silently_dropped_images():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = Mock()
+    processor.load_mm_data = AsyncMock(return_value=SimpleNamespace(images=[object()]))
+
+    with pytest.raises(ValueError, match="expected 2, loaded 1"):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=["image-1", "image-2"],
+                input_text="<|media_pad|><|media_pad|>",
+                request_obj=SimpleNamespace(video_data=None),
+            )
+        )
+
+
+def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.mm_feature_transport = "cuda_ipc"
+    processor.use_cuda_ipc = True
+    processor.fast_load_mm_data = AsyncMock(
+        return_value=SimpleNamespace(
+            images=[object(), object()], input_ids=[1, 99, 2, 99, 3]
+        )
+    )
+    processor.load_mm_data = AsyncMock()
+    processor.process_and_combine_mm_data_async = AsyncMock(
+        return_value=([], torch.tensor([[1, 2]]), None)
+    )
+
+    asyncio.run(
+        processor.process_mm_data_async(
+            image_data=["image-1", "image-2"],
+            input_text=[1, 99, 2, 99, 3],
+            request_obj=SimpleNamespace(video_data=None),
+        )
+    )
+
+    processor.fast_load_mm_data.assert_awaited_once()
+    processor.load_mm_data.assert_not_awaited()
+
+
+def test_kimi_k3_rejects_tokenized_placeholder_mismatch():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.fast_load_mm_data = AsyncMock()
+    processor.load_mm_data = AsyncMock()
+
+    with pytest.raises(ValueError, match=r"expected 2, found 1 token\(s\)"):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=["image-1", "image-2"],
+                input_text=torch.tensor([[1, 99, 2]]),
+                request_obj=SimpleNamespace(video_data=None),
+            )
+        )
+
+    processor.fast_load_mm_data.assert_not_awaited()
+    processor.load_mm_data.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("request_obj", "extra_kwargs"),
+    [
+        (SimpleNamespace(video_data=["video"]), {}),
+        (SimpleNamespace(video_data=None), {"audio_data": ["audio"]}),
+    ],
+)
+def test_kimi_k3_rejects_unsupported_modalities(request_obj, extra_kwargs):
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = Mock()
+    processor.load_mm_data = AsyncMock()
+
+    with pytest.raises(ValueError, match="supports image input only"):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=[],
+                input_text="prompt",
+                request_obj=request_obj,
+                **extra_kwargs,
+            )
+        )
+    processor.load_mm_data.assert_not_awaited()
 
 
 if __name__ == "__main__":

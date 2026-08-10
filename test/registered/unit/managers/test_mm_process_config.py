@@ -8,10 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class TestMmProcessConfigValidation(CustomTestCase):
@@ -237,6 +237,31 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_not_called()
 
+    def test_cuda_vmm_keeps_features_on_device_without_ipc_pool(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        hf_processor = self._processor()
+        feature = torch.empty(1, device="meta")
+        hf_processor.return_value = {"pixel_values": feature}
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("cuda_vmm"),
+                _processor=hf_processor,
+                transport_mode=None,
+            )
+
+        result = processor.process_mm_data("test")
+
+        self.assertEqual(processor.mm_feature_transport, "cuda_vmm")
+        self.assertFalse(processor.use_cuda_ipc)
+        self.assertTrue(processor.keep_mm_features_on_device)
+        self.assertEqual(processor.cpu_executor._mp_context.get_start_method(), "spawn")
+        self.assertIs(result["pixel_values"], feature)
+        memory_pool.assert_not_called()
+
 
 class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
     @staticmethod
@@ -251,6 +276,7 @@ class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
             processor = BaseMultimodalProcessor()
         processor.precompute_hash_before_cpu_transfer = enabled
         processor.use_cuda_ipc = False
+        processor.mm_feature_transport = "cpu"
         return processor
 
     def test_enabled_path_sets_hash_and_pad_value(self):

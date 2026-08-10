@@ -36,7 +36,7 @@ register_kernel(
     KernelSpec(
         op="diffusion.residual_gate_add",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.diffusion.residual_gate_add:residual_gate_add_cuda",
+        target="sglang.kernels.ops.diffusion.residual_gate_add:residual_gate_add",
         capabilities=_CUDA,
         format_signature=FormatSignature(description="residual + gate * update"),
         description="Fused residual gate-add (sglang.kernels.jit).",
