@@ -12,7 +12,7 @@ export const Llama31Deployment = () => {
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
         { id: 'xeon', label: 'XEON', default: false },
-        { id: 'Arc B', label: 'BMG', default: false },
+        { id: 'arc_b', label: 'BMG', default: false },
       ]
     },
     modelsize: {
@@ -66,28 +66,28 @@ export const Llama31Deployment = () => {
         ...options.modelsize,
         items: options.modelsize.items.map(item => ({
           ...item,
-          disabled: (values.hardware === 'xeon' || values.hardware === 'Arc B') && item.id !== '8b'
+          disabled: (values.hardware === 'xeon' || values.hardware === 'arc_b') && item.id !== '8b'
         }))
       },
       category: {
         ...options.category,
         items: options.category.items.map(item => ({
           ...item,
-          disabled: values.hardware === 'Arc B' && item.id !== 'instruct'
+          disabled: values.hardware === 'arc_b' && item.id !== 'instruct'
         }))
       },
       quantization: {
         ...options.quantization,
         items: options.quantization.items.map(item => ({
           ...item,
-          disabled: (values.hardware === 'xeon' && item.id === 'fp8') || (values.hardware === 'Arc B' && item.id !== 'bf16')
+          disabled: (values.hardware === 'xeon' && item.id === 'fp8') || (values.hardware === 'arc_b' && item.id !== 'bf16')
         }))
       },
       optimization: {
         ...options.optimization,
         items: options.optimization.items.map(item => ({
           ...item,
-          disabled: (values.hardware === 'xeon' || values.hardware === 'Arc B') && item.id !== 'basic'
+          disabled: (values.hardware === 'xeon' || values.hardware === 'arc_b') && item.id !== 'basic'
         }))
       }
     };
@@ -130,7 +130,7 @@ export const Llama31Deployment = () => {
         next.quantization = 'bf16';
         next.optimization = 'basic';
       }
-      if (optionName === 'hardware' && value === 'Arc B') {
+      if (optionName === 'hardware' && value === 'arc_b') {
         next.modelsize = '8b';
         next.category = 'instruct';
         next.quantization = 'bf16';
@@ -160,7 +160,7 @@ export const Llama31Deployment = () => {
 
     // Determine model path
     let modelPath;
-    if (quantization === 'fp8' && category === 'instruct' && !isXeon && hardware !== 'Arc B') {
+    if (quantization === 'fp8' && category === 'instruct' && !isXeon && hardware !== 'arc_b') {
       if (effectiveModelSize === '405b') {
         // Meta official FP8 for 405B
         modelPath = `meta-llama/Llama-3.1-${sizeToken}${categorySuffix}-FP8`;
@@ -201,7 +201,7 @@ export const Llama31Deployment = () => {
     } else if (isXeon) {
       // Intel Xeon CPU TP configuration
       tpSize = 3;
-    } else if (hardware === 'Arc B') {
+    } else if (hardware === 'arc_b') {
       tpSize = 1;
     } else {
       // NVIDIA GPU TP configuration
@@ -219,7 +219,7 @@ export const Llama31Deployment = () => {
     if (isXeon) {
       args.push(`--device cpu`);
       args.push(`--disable-overlap-schedule`);
-    } else if (hardware === 'Arc B') {
+    } else if (hardware === 'arc_b') {
       args.push(`--device xpu`);
     }
 
@@ -228,12 +228,12 @@ export const Llama31Deployment = () => {
     }
 
     // Add quantization flag only if not using FP8 variant model
-    if (quantization === 'fp8' && (hardware === 'Arc B' || (category !== 'instruct' && !isXeon))) {
+    if (quantization === 'fp8' && (hardware === 'arc_b' || (category !== 'instruct' && !isXeon))) {
       args.push(`--quantization fp8`);
     }
 
     // NVIDIA-specific optimizations
-    if (!isAMD && !isXeon && hardware !== 'Arc B') {
+    if (!isAMD && !isXeon && hardware !== 'arc_b') {
       if (optimization === 'throughput') {
         args.push(`--enable-dp-attention`);
         args.push(`--mem-fraction-static 0.85`);
@@ -260,7 +260,7 @@ export const Llama31Deployment = () => {
     }
 
     let cmd = 'sglang serve \\\n';
-    if (hardware === 'Arc B') {
+    if (hardware === 'arc_b') {
       cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd; 
     }
     cmd += `  ${args.join(' \\\n  ')}`;
