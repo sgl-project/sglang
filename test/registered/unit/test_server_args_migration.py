@@ -87,6 +87,40 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         self.assertEqual(sa.deepep_mode, "low_latency")
         self.assertEqual(sa.elastic_ep_backend, "none")
 
+    def test_megamoe_runner_alias_matches_a2a_backend(self):
+        alias = self._parse(["--moe-runner-backend", "megamoe"])
+        canonical = self._parse(["--moe-a2a-backend", "megamoe"])
+
+        self.assertEqual(alias.moe_runner_backend, canonical.moe_runner_backend)
+        self.assertEqual(alias.moe_a2a_backend, canonical.moe_a2a_backend)
+        self.assertEqual(alias.moe_runner_backend, "auto")
+        self.assertEqual(alias.moe_a2a_backend, "megamoe")
+
+    def test_megamoe_runner_alias_overrides_conflicting_a2a_backend(self):
+        with self.assertLogs("sglang.srt.server_args", level="WARNING"):
+            server_args = self._parse(
+                [
+                    "--moe-runner-backend",
+                    "megamoe",
+                    "--moe-a2a-backend",
+                    "deepep",
+                ]
+            )
+
+        self.assertEqual(server_args.moe_runner_backend, "auto")
+        self.assertEqual(server_args.moe_a2a_backend, "megamoe")
+
+    def test_megamoe_is_not_a_speculative_runner_alias(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(
+                [
+                    "--model",
+                    "dummy",
+                    "--speculative-moe-runner-backend",
+                    "megamoe",
+                ]
+            )
+
     def test_deprecated_flags_still_work(self):
         """Deprecated flags set the correct dest field."""
         sa = self._parse(["--stream-output"])

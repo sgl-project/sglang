@@ -64,7 +64,7 @@ HIGH_THROUGHPUT_ARGS = [
     "--dp",
     "4",
     "--enable-dp-attention",
-    "--moe-a2a-backend",
+    "--moe-runner-backend",
     "megamoe",
     "--mem-fraction-static",
     "0.9",

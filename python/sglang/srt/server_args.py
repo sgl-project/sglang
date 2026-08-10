@@ -268,6 +268,11 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
 ]
 
+# MegaMoE is an A2A backend, but --moe-runner-backend accepts it as a
+# compatibility alias. Keep it out of the real runner choices used by the
+# speculative model.
+MOE_RUNNER_BACKEND_CLI_CHOICES = [*MOE_RUNNER_BACKEND_CHOICES, "megamoe"]
+
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
@@ -413,6 +418,7 @@ def add_grammar_backend_choices(choices):
 
 def add_moe_runner_backend_choices(choices):
     MOE_RUNNER_BACKEND_CHOICES.extend(choices)
+    MOE_RUNNER_BACKEND_CLI_CHOICES.extend(choices)
 
 
 def add_mxfp8_moe_runner_backend_choices(choices):
@@ -2326,7 +2332,7 @@ class ServerArgs:
         str,
         Arg(
             help="Choose the runner backend for MoE.",
-            choices=MOE_RUNNER_BACKEND_CHOICES,
+            choices=MOE_RUNNER_BACKEND_CLI_CHOICES,
             resolvable=True,
         ),
         NS("exec.moe"),
@@ -3504,6 +3510,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -3671,6 +3678,20 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_moe_runner_backend_alias(self):
+        if self.moe_runner_backend != "megamoe":
+            return
+
+        if self.moe_a2a_backend not in ("none", "megamoe"):
+            logger.warning(
+                "--moe-runner-backend megamoe is an alias for "
+                "--moe-a2a-backend megamoe; overriding "
+                "--moe-a2a-backend %s.",
+                self.moe_a2a_backend,
+            )
+        self.moe_runner_backend = "auto"
+        self.moe_a2a_backend = "megamoe"
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
