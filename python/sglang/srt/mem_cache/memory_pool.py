@@ -3724,17 +3724,8 @@ class HybridLinearKVPool(KVCache):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
         if self.use_mla and _is_npu:
-            if not layer_ids:
-                return []
-
-            data_ptrs, _, _ = self.full_kv_pool.get_contiguous_buf_infos()
-            if len(data_ptrs) % len(layer_ids) != 0:
-                raise RuntimeError(
-                    "NPU MLA KV entries must be evenly grouped by layer: "
-                    f"entries={len(data_ptrs)}, layers={len(layer_ids)}"
-                )
-            return layer_ids * (len(data_ptrs) // len(layer_ids))
-
+            # Ascend stores latent KV and RoPE keys in separate buffers.
+            return layer_ids * 2
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
