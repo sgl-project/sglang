@@ -65,6 +65,9 @@ class InsertParams:
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
 
+    # DSV4 NPU C128 sidecar pages, one page id per 2048-token group.
+    c128_value: Optional[torch.Tensor] = None
+
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0

@@ -423,6 +423,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ComponentType.FULL: params.num_tokens,
             ComponentType.SWA: params.swa_num_tokens,
             ComponentType.MAMBA: params.mamba_num,
+            ComponentType.C128: 0,
         }
         self._evict_components(request_by_type, tracker)
 
@@ -737,7 +738,7 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.insert(insert_params)
 
         # Match prefix
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len

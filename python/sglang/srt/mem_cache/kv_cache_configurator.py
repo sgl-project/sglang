@@ -904,37 +904,18 @@ class KVCacheConfigurator:
         else:
             compression_ratios = self.model_config.compress_ratios
 
-        # NPU + DSV4 → paged-state subclass: the fused compressor kernel
-        # needs cache_mode=1 (paged); Atlas A3 rejects cache_mode=2 (ring),
-        # so the CUDA ring-buffer state path can't be shared. CUDA keeps
-        # DeepSeekV4TokenToKVPool unchanged; NPU recomputes state sizes below.
+        # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
+        # follows the same fixed ring ownership as GPU. Do not replace the
+        # configurator's C4-SWA/C128-request budgets with a paged allocator
+        # estimate: Atlas A3 cache_mode=2 consumes explicit flat state_locs.
         if _is_npu:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
                 DSV4NPUTokenToKVPool,
-                npu_state_pool_size,
             )
 
             pool_cls = DSV4NPUTokenToKVPool
-            # Recompute state pool sizes for the NPU paged formula (CUDA's
-            # ring sizes are dropped here). Tail-only allocation keeps the
-            # per-req-budget formula sufficient at any prefill length: long
-            # prompts allocate only ``tail+128`` (c4) / ``tail`` (c128)
-            # slots (tail = seq_len % 128), and decode is drained by
-            # sliding eviction in ``ScheduleBatch._evict_swa``.
-            c4_state_pool_size = npu_state_pool_size(
-                ratio=4,
-                page_size=self.server_args.page_size,
-                max_num_reqs=max_running_requests,
-            )
-            c128_state_pool_size = npu_state_pool_size(
-                ratio=128,
-                page_size=self.server_args.page_size,
-                max_num_reqs=max_running_requests,
-            )
         else:
             pool_cls = DeepSeekV4TokenToKVPool
-            c4_state_pool_size = c4_state_pool_size
-            c128_state_pool_size = c128_state_pool_size
 
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,

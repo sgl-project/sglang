@@ -330,6 +330,7 @@ class PrefillBootstrapQueue:
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
+        req.disagg_decode_prefix_len = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
             num_kv_indices_to_send, self.token_to_kv_pool.page_size
@@ -1147,7 +1148,9 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _swa_payload():
                 window_size = self.sliding_window_size
-                window_start = max(0, seq_len - window_size)
+                window_start = max(
+                    req.disagg_decode_prefix_len, seq_len - window_size
+                )
                 window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
@@ -1221,8 +1224,7 @@ class SchedulerDisaggregationPrefillMixin:
                         req.req_pool_idx,
                         seq_len,
                         page_size,
-                        self.sliding_window_size,
-                        prefix_len=0,
+                        prefix_len=req.disagg_decode_prefix_len,
                     )
                 )
             state_indices = [
