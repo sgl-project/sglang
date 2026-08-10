@@ -72,24 +72,30 @@ class Cosmos3SamplingParams(SamplingParams):
     action_normalization: str = "quantile"
 
     def _adjust(self, server_args) -> None:
-        super()._adjust(server_args)
-        if self.action_mode is None:
-            return
+        action_output = False
+        if self.action_mode is not None:
+            self.action_mode = str(self.action_mode).strip().lower()
+            if self.action_mode not in (
+                "policy",
+                "forward_dynamics",
+                "inverse_dynamics",
+            ):
+                raise ValueError(
+                    f"Unsupported action_mode={self.action_mode!r}; expected "
+                    "'policy', 'forward_dynamics', or 'inverse_dynamics'."
+                )
+            action_output = self.action_mode != "forward_dynamics"
+            if action_output and self.output_file_name is None:
+                # Base visual adjustment derives a filename by JSON-encoding all
+                # fields. In-memory observation images are intentionally not
+                # serializable and action output never needs a visual filename.
+                self.output_file_name = "action.json"
 
-        self.action_mode = str(self.action_mode).strip().lower()
-        if self.action_mode not in (
-            "policy",
-            "forward_dynamics",
-            "inverse_dynamics",
-        ):
-            raise ValueError(
-                f"Unsupported action_mode={self.action_mode!r}; expected "
-                "'policy', 'forward_dynamics', or 'inverse_dynamics'."
-            )
+        super()._adjust(server_args)
 
         # Policy and inverse dynamics produce actions. Forward dynamics consumes
         # actions to produce video and therefore remains a visual request.
-        if self.action_mode != "forward_dynamics":
+        if action_output:
             self.data_type = DataType.ACTION
             self.save_output = False
             self.return_file_paths_only = False
