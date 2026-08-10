@@ -127,9 +127,17 @@ def pad_zimage_prompt_kwargs(
         cap_freq = bcg_utils.first_tensor(freqs_cis[0])
     cap_freq_len = int(cap_freq.shape[0]) if torch.is_tensor(cap_freq) else seq
 
-    bucket = bcg_utils.select_text_bucket(max(seq, cap_freq_len), buckets)
-    if bucket is None:
-        return call_kwargs
+    # Z-Image attends its caption slots UNMASKED: the pipeline pads captions
+    # to the native length (a multiple of 32) with learned pad-token
+    # embeddings that act as attended registers, and the DiT derives the
+    # attention length from the full padded tensor (`lens == target` ->
+    # mask=None). Padding further to a text bucket therefore changes how many
+    # registers every token attends -- a materially different (not bit-exact)
+    # forward, cascading over the few-step distilled sampler. Capture at the
+    # native length instead: signatures stay bounded because the pipeline
+    # already quantizes caption lengths, and unseen lengths fall back to
+    # eager at serving time.
+    bucket = max(seq, cap_freq_len)
 
     out = {
         key: value
