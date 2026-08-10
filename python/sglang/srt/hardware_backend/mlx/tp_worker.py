@@ -54,19 +54,10 @@ class MlxLaunch:
 
     Produced by :meth:`MlxTpModelWorker.async_forward_batch_generation_mlx`
     and :meth:`MlxTpModelWorker.async_chained_decode_mlx`, consumed by
-    :meth:`MlxTpModelWorker.finalize_mlx_result`.
-
-    Attributes:
-        lazy_tokens: an ``mx.array`` that, when evaluated, forces
-            materialisation of the whole batch's outputs.  ``None`` for
-            idle batches.
-        prefills: one :class:`MlxPendingPrefill` per new request in an
-            extend batch; empty for pure-decode steps.
-        extends: one :class:`MlxPendingExtend` per chunked-prefill
-            continuation; also empty for pure-decode steps.
-        decode: the :class:`MlxPendingDecode` covering full decode mode
-            AND mixed single-token decodes inside an extend batch.
-        mode: one of ``"idle"``, ``"decode"``, ``"extend"``.
+    :meth:`MlxTpModelWorker.finalize_mlx_result`.  Evaluating ``lazy_tokens``
+    materialises the whole batch.  ``decode`` covers both full decode mode and
+    single-token decodes mixed into an extend batch; ``mode`` is one of
+    ``"idle"``, ``"decode"``, ``"extend"``.
     """
 
     lazy_tokens: Optional[mx.array]

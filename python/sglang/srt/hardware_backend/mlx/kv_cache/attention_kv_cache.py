@@ -152,8 +152,7 @@ class ContiguousAttentionKVCache:
         """Return valid K/V: (1, n_kv_heads, min(offset, window), head_dim).
 
         ``window`` keeps only the trailing window a sliding-window layer can
-        attend to.  Slicing here rather than slicing the full history and then
-        slicing again costs one op instead of two per request per layer.
+        attend to; slicing it here costs one op instead of two.
         """
         start = 0 if window is None else max(0, self.offset - window)
         return (
@@ -216,9 +215,8 @@ class WindowedAttentionKVCache:
     def _append(self, keys: mx.array, values: mx.array) -> tuple[int, int]:
         """Append a chunk in place; return the (start, end) span it serves.
 
-        Split out from ``update_and_fetch`` so the decode path can skip
-        building the two return slices, which its caller discards in
-        favour of ``get_kv``.
+        Split out of ``update_and_fetch`` so the decode path can skip building
+        the two return slices, which it discards in favour of ``get_kv``.
         """
         S = keys.shape[2]
         kept = min(self._local, self.window)

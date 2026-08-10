@@ -97,7 +97,6 @@ class BatchedDecodeContext:
 
         The mask is boolean (``True`` keeps the key), broadcast-shaped
         ``(B, 1, 1, width)``, and ``None`` when no request needs padding.
-        Cached per window: all layers in the step share one build.
         """
         cached = self._padding_by_window.get(window, None)
         if cached is not None:

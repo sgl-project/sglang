@@ -6,37 +6,22 @@ the forward pass.  That is what lets sampling coexist with the overlap
 scheduler: ``decode_batch_start_chained`` feeds step N's still-unevaluated
 sampled tokens as step N+1's input ids, with no host sync.
 
-Semantics mirror the sglang pytorch sampling backend
-(``top_k_top_p_min_p_sampling_from_probs_torch`` / ``multinomial_with_seed``
-in ``sglang/srt/layers/sampler.py``): per-row ``softmax(logits /
-temperature)``, descending sort, zero out rank >= top_k / cumulative mass
-beyond top_p (the top token is always kept) / probs below
-``max_prob * min_p``, then multinomial via Gumbel-max.
+Semantics mirror ``top_k_top_p_min_p_sampling_from_probs_torch`` /
+``multinomial_with_seed`` in ``sglang/srt/layers/sampler.py``.
 
-Deviations from the pytorch backend:
+Gaps against that backend:
 
-* Seeded determinism is MLX-local: noise math runs in float32 (Metal has
-  no float64) and tie order follows MLX's sort, so the same seed on a
-  CUDA backend may pick a different token from the same distribution.
-* Unseeded rows draw their Gumbel noise in whichever space the chain is
-  running (candidate or vocab), so the bounded top-K path consumes the
-  RNG differently from the full-vocab one.  Seeded rows hash the token
-  id, so ``--enable-deterministic-inference`` is unaffected.
-* Penalties (frequency/presence/repetition) are not applied on the MLX
-  path (warned once per process).
+* Penalties (frequency/presence/repetition) are not applied (warned once
+  per process).
 * Custom logit processors run on pure-decode steps only: the first
   generated token and decode steps mixed into an extend batch are not
   processed (``apply_custom_logit_processor`` requires logits rows to
   match the full ``sampling_info``).
-* Logprob output covers the sampled token, top-k, and requested token
-  ids for every generated token; prompt/input logprobs
-  (``logprob_start_len``) are not computed.
-
-Logit edits (grammar vocab masks, ``logit_bias``) arrive as a pre-combined
-additive [B, vocab] array built by the worker at graph launch; batches
-carrying them must not chain, which the scheduler enforces.  NaN/inf
-sanitization mirrors ``sanitize_nan_logits`` and is gated on the same
-``SGLANG_SANITIZE_NAN_LOGITS`` env var.
+* Logprobs cover the sampled token, top-k, and requested token ids;
+  prompt/input logprobs (``logprob_start_len``) are not computed.
+* Seeded determinism is MLX-local: noise math runs in float32 (Metal has
+  no float64) and tie order follows MLX's sort, so the same seed on a
+  CUDA backend may pick a different token from the same distribution.
 """
 
 from __future__ import annotations
@@ -179,11 +164,9 @@ def scale_by_temperature(
 ) -> mx.array:
     """``logits / temperature`` per row, in float32.
 
-    Both :func:`sample_tokens` and :func:`compute_logprobs` start here.  MLX
-    builds eager graphs and does not eliminate common subexpressions, so a
-    step that samples *and* reports logprobs would otherwise pay two
-    full-vocab divisions; callers needing both compute this once and pass it
-    to each.
+    Both :func:`sample_tokens` and :func:`compute_logprobs` start here and take
+    the result as their ``scaled`` argument: MLX does not eliminate common
+    subexpressions, so a step doing both would otherwise divide twice.
     """
     temps = mx.array([p.temperature for p in params], dtype=mx.float32)[:, None]
     return last_logits.astype(mx.float32) / temps
@@ -202,9 +185,6 @@ def compute_logprobs(
     ``log_softmax(edited_logits / temperature)`` — after grammar-mask /
     logit_bias / sanitization, before top-k/top-p/min-p filtering (the
     filters affect which token is drawn, not the reported logprobs).
-
-    ``scaled`` optionally supplies :func:`scale_by_temperature`'s result when
-    the caller already built it for :func:`sample_tokens`.
     """
     if scaled is None:
         scaled = scale_by_temperature(last_logits, params)
@@ -243,12 +223,9 @@ def sample_tokens(
     """Select one token per row of ``last_logits`` ([B, vocab], lazy ok).
 
     Pure ``mx`` ops — the result stays inside the lazy graph.  ``positions``
-    are the absolute sequence positions of the tokens being sampled (only
-    consumed for seeded rows).  Callers should shortcut to ``mx.argmax``
-    when ``all_greedy(params)`` — this function assumes at least one row
-    samples.  ``scaled`` optionally supplies
-    :func:`scale_by_temperature`'s result when the caller already built it
-    for :func:`compute_logprobs`.
+    are the absolute sequence positions being sampled (seeded rows only).
+    Assumes at least one row samples; callers shortcut to ``mx.argmax`` when
+    ``all_greedy(params)``.
     """
     batch_size, vocab_size = last_logits.shape
     logits32 = last_logits.astype(mx.float32)
@@ -320,10 +297,9 @@ def sample_tokens(
     greedy = [p.is_greedy for p in params]
     if not any(greedy):
         return sampled
-    # Greedy rows still run the sampled path above (the row exists either way);
+    # Greedy rows still ran the sampled path above (the row exists either way);
     # overwriting them with the unnoised argmax is what keeps their token
-    # independent of the noise.  Callers shortcut the whole function when the
-    # batch is all-greedy.
+    # independent of the noise.
     return mx.where(mx.array(greedy), mx.argmax(logits32, axis=-1), sampled)
 
 
@@ -400,15 +376,11 @@ def _murmur_hash32(
 ) -> mx.array:
     """Port of ``murmur_hash32`` (Triton) to mx ops: [B, V] uint32.
 
-    Blocks mixed in kernel order: seed_low, seed_high, position, column.
-    The first three are per-row scalars, so they are folded exactly on the
-    CPU with Python ints; only the column block and finalization run as
-    vectorized uint32 ops (verified to wrap like the Triton kernel).
-
-    ``columns`` hashes an explicit [B, K] set of token ids instead of every
-    id in ``[0, vocab_size)`` — same value per (row, token id) either way,
-    which is what keeps a seeded row's token identical on the bounded
-    top-K path.
+    Blocks mixed in kernel order: seed_low, seed_high, position, column.  The
+    first three are per-row scalars, folded exactly on the CPU with Python
+    ints; only the column block and finalization run as vectorized uint32 ops.
+    ``columns`` hashes an explicit [B, K] set of token ids instead of every id
+    in ``[0, vocab_size)``.
     """
     row_states = []
     for seed, pos in zip(seeds, positions):
