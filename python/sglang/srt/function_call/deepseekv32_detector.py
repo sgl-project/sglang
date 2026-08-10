@@ -226,6 +226,20 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
+    def _find_tool_call_start(self, text: str) -> int:
+        """Index of the earliest tool-call opener in `text`, or -1 if absent.
+
+        Mirrors the two markers `has_tool_call` accepts, so subclasses that
+        override `bot_token` (V4 uses `tool_calls` where V3.2 uses
+        `function_calls`) are handled without hardcoding either spelling.
+        """
+        candidates = [
+            idx
+            for idx in (text.find(self.bot_token), text.find("<｜DSML｜invoke"))
+            if idx != -1
+        ]
+        return min(candidates, default=-1)
+
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
     ) -> StreamingParseResult:
@@ -257,6 +271,22 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if e_token in current_text:
                     current_text = current_text.replace(e_token, "")
             return StreamingParseResult(normal_text=current_text)
+
+        # Content the model emitted before the tool-call section is normal text
+        # and still has to be streamed out. `detect_and_parse` already splits on
+        # `text[:idx]`; without the same split here the `normal_text=""` returns
+        # below drop whatever sits in front of the opener, so a response that
+        # mixes content with tool calls loses the tail of its text as soon as
+        # the opening marker lands in the buffer.
+        pending_normal_text = ""
+        if self.current_tool_id == -1:
+            tool_call_start = self._find_tool_call_start(current_text)
+            if tool_call_start > 0:
+                pending_normal_text = current_text[:tool_call_start].removesuffix(
+                    "\n\n"
+                )
+                self._buffer = current_text[tool_call_start:]
+                current_text = self._buffer
 
         all_calls: list[ToolCallItem] = []
         try:
@@ -355,11 +385,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(
+                normal_text=pending_normal_text, calls=all_calls
+            )
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=pending_normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
