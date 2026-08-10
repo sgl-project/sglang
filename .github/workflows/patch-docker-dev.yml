@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_numbers:
-        description: "Comma-separated PR numbers, applied in the order listed (e.g. 18962,19010). Empty = fast-forward the base image to latest main."
+        description: "Comma-separated PR numbers, merged in the order listed (e.g. 18962,19010). Empty = fast-forward the base image to latest main."
         required: false
         default: ""
       image_tag:
@@ -73,8 +73,7 @@ jobs:
           # stdout and would otherwise be captured as part of the SHA.
           BASE_SHA=$(docker run --rm --entrypoint git "${BASE_IMAGE}" \
             -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null | tail -n 1)
-          # Keep anything but a bare SHA out of GITHUB_ENV: a multi-line value
-          # there is parsed as further NAME=VALUE lines and fails the step.
+          # A banner line reaching GITHUB_ENV breaks the step, as above.
           case "${BASE_SHA}" in *[!0-9a-f]*) BASE_SHA="" ;; esac
           [ "${#BASE_SHA}" -eq 40 ] || BASE_SHA=""
           if [ -z "${BASE_SHA}" ]; then
@@ -91,20 +90,27 @@ jobs:
           PR_NUMBERS: ${{ inputs.pr_numbers }}
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          # git merge below writes merge commits and needs an identity.
-          git config --global user.email "ci@sglang.local"
-          git config --global user.name "sglang CI"
           git fetch origin main
           git fetch origin "${BASE_SHA}"
 
-          # Fixed paths on a persistent runner: drop leftovers from prior runs.
-          rm -rf /tmp/patch-ctx /tmp/base-tree
-          mkdir -p /tmp/patch-ctx
+          # Per-run paths: the concurrency group keys on output_tag, so two runs
+          # with different tags can land on this runner at the same time.
+          WORK="/tmp/patch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf "${WORK}"
+          mkdir -p "${WORK}/ctx"
           git worktree prune
           # Merge onto the image's own commit so the patch context matches the
           # image tree exactly and cannot drift. Conflicts then surface here in
           # seconds instead of failing the build after a multi-GB pull.
-          git worktree add --detach /tmp/base-tree "${BASE_SHA}"
+          git worktree add --detach "${WORK}/base-tree" "${BASE_SHA}"
+          echo "PATCH_CTX=${WORK}/ctx" >> "$GITHUB_ENV"
+
+          # -c rather than --global: leave no identity behind on the runner.
+          merge_into_base() {
+            git -C "${WORK}/base-tree" \
+              -c user.email=ci@sglang.local -c user.name="sglang CI" \
+              merge --no-edit "$1"
+          }
 
           if [ -n "${PR_NUMBERS}" ]; then
             IFS=',' read -ra PRS <<< "${PR_NUMBERS}"
@@ -118,37 +124,38 @@ jobs:
               esac
               echo "Merging PR #${pr}"
               git fetch origin "pull/${pr}/head:pr-${pr}"
-              git -C /tmp/base-tree merge --no-edit "pr-${pr}" || {
+              merge_into_base "pr-${pr}" || {
                 echo "::error::PR #${pr} conflicts with base image commit ${BASE_SHA}"
-                git -C /tmp/base-tree diff --name-only --diff-filter=U
+                git -C "${WORK}/base-tree" diff --name-only --diff-filter=U
                 exit 1
               }
             done
           else
             echo "Fast-forwarding to latest main"
-            git -C /tmp/base-tree merge --no-edit origin/main || {
+            merge_into_base origin/main || {
               echo "::error::Cannot merge latest main into base image commit ${BASE_SHA}"
-              git -C /tmp/base-tree diff --name-only --diff-filter=U
+              git -C "${WORK}/base-tree" diff --name-only --diff-filter=U
               exit 1
             }
           fi
 
-          git -C /tmp/base-tree diff --binary "${BASE_SHA}"..HEAD > /tmp/patch-ctx/merged.patch
-          if [ ! -s /tmp/patch-ctx/merged.patch ]; then
+          git -C "${WORK}/base-tree" diff --binary "${BASE_SHA}"..HEAD > "${WORK}/ctx/merged.patch"
+          if [ ! -s "${WORK}/ctx/merged.patch" ]; then
             echo "::error::Patch is empty - nothing to apply on top of ${BASE_IMAGE}"
             exit 1
           fi
-          git -C /tmp/base-tree diff --shortstat "${BASE_SHA}"..HEAD
+          PATCH_STAT=$(git -C "${WORK}/base-tree" diff --shortstat "${BASE_SHA}"..HEAD | xargs)
+          echo "Patch: ${PATCH_STAT}"
+          echo "PATCH_STAT=${PATCH_STAT}" >> "$GITHUB_ENV"
 
       - name: Build and push patched image
         run: |
-          cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
+          cat <<'DOCKERFILE' > "${PATCH_CTX}/Dockerfile"
           ARG BASE_IMAGE
           FROM ${BASE_IMAGE}
           COPY merged.patch /tmp/merged.patch
-          # The patch was diffed against this image's own commit, so it applies
-          # with exact context - no fuzz needed. git apply (not patch) also
-          # handles renames, mode changes and binary files.
+          # git apply, not patch: no fuzz is needed given the exact context, and
+          # it handles renames, mode changes and binary files.
           RUN cd /sgl-workspace/sglang \
               && git apply --binary -v -p1 /tmp/merged.patch \
               && rm -f /tmp/merged.patch \
@@ -156,17 +163,16 @@ jobs:
               && ( find python -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true )
           DOCKERFILE
 
-          # One multi-platform build: the base tag is a manifest list, so each
-          # platform patches its own arch and the output stays a manifest list.
-          # A base without both arches fails here, which is the point - a
-          # single-arch output would not be pullable on the other arch.
+          # Each platform patches its own arch of the base manifest list, so the
+          # output stays a list. A single-arch base fails here on purpose: the
+          # output would not be pullable on the other arch.
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
             --no-cache \
             --build-arg BASE_IMAGE="${BASE_IMAGE}" \
             -t "${OUT_IMAGE}" \
             --push \
-            /tmp/patch-ctx/
+            "${PATCH_CTX}/"
 
       - name: Write summary
         env:
@@ -180,11 +186,18 @@ jobs:
           {
             echo "### Patched \`${OUT_IMAGE}\`"
             echo "- **Base image:** \`${BASE_IMAGE}\`"
-            echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`"
+            echo "- **Base commit:** \`${BASE_SHA}\`"
             echo "- **Source:** ${SOURCE}"
+            echo "- **Patch:** ${PATCH_STAT}"
             echo "- **Platforms:** \`linux/amd64,linux/arm64\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Prune builder cache
+      - name: Clean up
         if: always()
-        run: docker buildx prune --filter "until=72h" -f || true
+        run: |
+          # Per-run paths are never reclaimed by a later run, so drop them here.
+          WORK="/tmp/patch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git worktree remove --force "${WORK}/base-tree" 2>/dev/null || true
+          rm -rf "${WORK}"
+          git worktree prune 2>/dev/null || true
+          docker buildx prune --filter "until=72h" -f || true
