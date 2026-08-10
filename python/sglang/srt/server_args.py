@@ -2765,6 +2765,15 @@ class ServerArgs:
         "Enable global multimodal embedding cache to skip redundant ViT inference.",
         NS("mm"),
     ] = False
+    mm_global_cache_backend: A[
+        str,
+        Arg(
+            help="Storage backend for the multimodal global embedding cache. "
+            "Used when --enable-mm-global-cache is set.",
+            choices=["mooncake"],
+        ),
+        NS("mm"),
+    ] = "mooncake"
     disable_fast_image_processor: A[
         bool, "Adopt base image processor instead of fast image processor.", NS("mm")
     ] = False

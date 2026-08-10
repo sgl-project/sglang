@@ -23,6 +23,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
     SamplingParams,
     generate_request_id,
 )
@@ -410,7 +411,16 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
 
     sampling_params_cls = _video_sampling_params_cls(server_args)
     kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)
-    return build_sampling_params(request_id, **kwargs)
+    sampling_params = build_sampling_params(request_id, **kwargs)
+    if (
+        isinstance(sampling_params, SamplingParams)
+        and sampling_params.data_type == DataType.ACTION
+    ):
+        raise ValueError(
+            "Action-producing policy and inverse-dynamics requests use "
+            "/v1/actions/generations; /v1/videos is reserved for visual outputs"
+        )
+    return sampling_params
 
 
 # extract metadata which http_server needs to know
