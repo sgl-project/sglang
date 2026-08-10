@@ -386,6 +386,41 @@ class KVCacheConfigurator:
                 unified_memory_pool=bundle.unified_memory_pool,
             )
 
+        # The unified allocator hands out VIRTUAL token ids from the whole
+        # virtual space (> max_total_num_tokens); the direct-indexed draft
+        # pool must be sized by that space.
+        draft_virtual_id_space: Optional[int] = None
+        if self.is_draft_worker and token_to_kv_pool_allocator is not None:
+            from sglang.srt.mem_cache.multi_ended_allocator import (
+                UnifiedMambaTokenToKVPoolAllocator,
+                UnifiedSWATokenToKVPoolAllocator,
+            )
+
+            if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
+                raise ValueError(
+                    "Speculative decoding with --enable-unified-memory is only "
+                    "supported for hybrid-Mamba targets; the unified hybrid-SWA "
+                    "pool's draft sizing (virtual-id space) is not wired yet."
+                )
+            if isinstance(
+                token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+            ):
+                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                assert draft_virtual_id_space >= sizes.max_total_num_tokens, (
+                    "unified allocator virtual space smaller than the token "
+                    f"budget: size_full={draft_virtual_id_space} < "
+                    f"max_total_num_tokens={sizes.max_total_num_tokens}"
+                )
+                # Round UP to page alignment (paged draft backends view the
+                # pool as (-1, page_size, H, D); size_full is not aligned).
+                page = max(int(self.pool_page_size or 1), 1)
+                draft_virtual_id_space = (
+                    (draft_virtual_id_space + page - 1) // page * page
+                )
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
+
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
             req_to_token_pool = self._build_req_to_token_pool(
@@ -427,6 +462,15 @@ class KVCacheConfigurator:
             is_dsv4_model=is_dsv4_model,
             req_to_token_pool=req_to_token_pool,
         )
+
+        if draft_virtual_id_space is not None:
+            assert token_to_kv_pool.size >= draft_virtual_id_space, (
+                "draft token_to_kv_pool smaller than the shared unified "
+                f"allocator's virtual-id space: pool size="
+                f"{token_to_kv_pool.size} < size_full={draft_virtual_id_space}; "
+                "verify-window writes at high virtual ids would go out of "
+                "bounds."
+            )
 
         token_to_kv_pool_allocator = self._build_token_to_kv_pool_allocator(
             sizes=sizes,
@@ -870,6 +914,10 @@ class KVCacheConfigurator:
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
         # separately via `mamba_envelope_layout` on the req-to-token pool above.
         enable_page_major = get_memory().enable_page_major_kv_layout
+        if self.is_draft_worker and get_memory().enable_unified_memory:
+            # Page-major is a target-pool layout choice; the draft backend
+            # reads the plain per-layer contiguous layout.
+            enable_page_major = False
         mha_pool_class = (
             PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
         )
