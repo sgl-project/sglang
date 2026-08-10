@@ -257,8 +257,21 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
 class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
 
+    # The blk64 kernel is built `-gencode=arch=compute_100a,code=sm_100a`, which
+    # is arch-specific: 10.3 (B300 / GB300) and 12.x have no cubin. Its own guard
+    # only compares the major version, so it would accept 10.3 and fail later.
+    required_capability = (10, 0)
+
     @classmethod
     def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        if capability is None or capability != cls.required_capability:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "SubBlock sparse attention needs compute capability "
+                f"{'.'.join(map(str, cls.required_capability))} (B200 / GB200); "
+                f"this device reports {found}."
+            )
         try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (  # noqa: F401
                 load_bsa_attn_blk64_fwd,
@@ -267,8 +280,8 @@ class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
                 SubBlockSparseAttentionBackend,
             )
 
-            # The 64-block sparse kernel is SM100-only; loading it here turns a
-            # mid-denoise failure into a startup error.
+            # Importing the entry point catches a missing or broken FlashInfer;
+            # the CUDA extension itself is built lazily on the first call.
             load_bsa_attn_blk64_fwd()
             return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn.SubBlockSparseAttentionBackend"
         except Exception as e:

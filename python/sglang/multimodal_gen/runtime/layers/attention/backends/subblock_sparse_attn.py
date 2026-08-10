@@ -20,8 +20,8 @@ Requirements inherited from the kernel: compute capability 10.0 (B200 / GB200
 class -- it is built for ``sm_100a``, which does not forward-run on 10.3 or
 12.x), bf16, head_dim 128. On such a GPU any call the kernel cannot serve --
 cross/refiner attention, short sequences, non-bf16 -- runs dense instead, so
-selecting this backend is safe model-wide. On any other GPU it raises rather
-than falling back; see the README.
+selecting this backend is safe model-wide. On any other GPU the resolver refuses
+it at startup rather than falling back.
 """
 
 from __future__ import annotations
@@ -138,6 +138,11 @@ class SubBlockSparseAttentionMetadata(AttentionMetadata):
 
 
 class SubBlockSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
+    # The base class declares __init__ abstract, so a builder that does not
+    # override it cannot be instantiated at all.
+    def __init__(self) -> None:
+        pass
+
     def prepare(self) -> None:
         pass
 

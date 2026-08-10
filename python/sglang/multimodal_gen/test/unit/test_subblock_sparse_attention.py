@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.rou
     _snap_up_to_8,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+    SubBlockSparseAttentionBackend,
     SubBlockSparseAttentionImpl,
     SubBlockSparseSchedule,
     _dit_layer_index,
@@ -34,7 +35,8 @@ NUM_HEADS = 4
 def _sm100_available() -> bool:
     if not torch.cuda.is_available():
         return False
-    if torch.cuda.get_device_capability(0)[0] != 10:
+    # Exactly 10.0: the kernel is built for sm_100a, and 10.3 has no cubin.
+    if torch.cuda.get_device_capability(0) != (10, 0):
         return False
     try:
         from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
@@ -166,6 +168,19 @@ class TestBudgetGranularity(unittest.TestCase):
         self.assertEqual(_snap_up_to_8(3, 5), 5)
 
 
+class TestSubBlockSparseBackend(unittest.TestCase):
+    def test_the_advertised_builder_can_be_built(self):
+        """`AttentionMetadataBuilder.__init__` is abstract; a builder that does
+        not override it makes `get_builder_cls()()` a TypeError."""
+        builder = SubBlockSparseAttentionBackend.get_builder_cls()()
+        builder.prepare()
+        metadata = builder.build(current_timestep=7)
+        self.assertIsInstance(
+            metadata, SubBlockSparseAttentionBackend.get_metadata_cls()
+        )
+        self.assertEqual(metadata.current_timestep, 7)
+
+
 class TestSubBlockGating(unittest.TestCase):
     """The schedule must decide sparsity from the layer and the step alone."""
 
@@ -284,11 +299,14 @@ class TestSubBlockNumerics(unittest.TestCase):
 
         num_blocks = (self.seq_len + 63) // 64
         topk = impl.router.route(q, k, sparsity=0.75, softmax_scale=HEAD_DIM**-0.5).topk
-        random_index = torch.randint(
-            num_blocks,
-            (1, NUM_HEADS, num_blocks, topk),
-            device=device,
-            dtype=torch.int32,
+        # A random permutation per row, not `randint`: sampling with replacement
+        # would leave the control holding duplicate blocks, so it would attend
+        # fewer distinct blocks than the router at the same budget, and the
+        # repeats would distort the softmax mass on top of that.
+        random_index = (
+            torch.rand(1, NUM_HEADS, num_blocks, num_blocks, device=device)
+            .argsort(dim=-1)[..., :topk]
+            .to(torch.int32)
         )
         random_out = load_bsa_attn_blk64_fwd()(
             q,

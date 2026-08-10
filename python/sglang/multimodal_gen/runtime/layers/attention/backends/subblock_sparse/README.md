@@ -36,11 +36,11 @@ Within a supported GPU, anything the kernel cannot serve — cross attention, th
 token refiner, sequences under `min_seq_len`, non-bf16 activations, head_dim !=
 128 — silently runs dense, so the backend is safe to select model-wide.
 
-**On an unsupported GPU it is not a fallback, it is an error.** The kernel raises
-`RuntimeError: BSA blk64 only supports SM100` on the first sparse attention call.
-The startup resolver imports the entry point, which catches a missing or broken
-FlashInfer install, but the extension itself is built lazily inside that first
-call, so the device check does not happen until then.
+**On an unsupported GPU it is not a fallback, it is an error at startup.** The
+resolver checks the compute capability before anything loads and refuses
+anything but 10.0, so an H100 or a B300 fails at launch rather than after ten
+dense denoise steps. Do not rely on the kernel's own guard for this: it compares
+only the major version, so it would accept 10.3 and then fail with no cubin.
 
 ## How the score works
 
