@@ -1120,18 +1120,14 @@ async def execute_encode_pipeline(
     except asyncio.TimeoutError:
         error_msg = "encoder batch timed out"
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await server_module.meta_registry.publish(
-            req_id, 0, 0, 0, error=error_msg
-        )
+        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
         await enc.release_request(req_id, preserve_metadata=backend == "mooncake")
         _record_pipeline_result(modality, "error")
         raise
     except Exception as e:
         error_msg = str(e)
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await server_module.meta_registry.publish(
-            req_id, 0, 0, 0, error=error_msg
-        )
+        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
         await enc.release_request(req_id, preserve_metadata=backend == "mooncake")
         _record_pipeline_result(modality, "error")
         raise
@@ -1139,9 +1135,7 @@ async def execute_encode_pipeline(
     nbytes, embedding_len, embedding_dim, error_msg, error_code = result
     if error_msg:
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await server_module.meta_registry.publish(
-            req_id, 0, 0, 0, error=error_msg
-        )
+        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
         if backend == "mooncake":
             await enc.release_request(req_id, preserve_metadata=True)
         else:
@@ -1275,9 +1269,7 @@ async def _dp_worker_handle_request(
             content = None
         elif dp_type == "wait_metadata":
             try:
-                content = await server_module.meta_registry.wait(
-                    request["req_id"]
-                )
+                content = await server_module.meta_registry.wait(request["req_id"])
             except asyncio.TimeoutError as e:
                 raise MMError(
                     "encode metadata not ready", code=HTTPStatus.GATEWAY_TIMEOUT
@@ -1302,9 +1294,7 @@ async def _dp_worker_handle_request(
             # a pre-refcount decoder: stay eager rather than pin until the sweep.
             receive_count = request.get("receive_count")
             if receive_count:
-                await server_module.meta_registry.note_send_done(
-                    req_id, receive_count
-                )
+                await server_module.meta_registry.note_send_done(req_id, receive_count)
             else:
                 await enc.release_request(req_id)
             content = None
