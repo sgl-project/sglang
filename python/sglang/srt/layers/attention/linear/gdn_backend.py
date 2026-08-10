@@ -65,30 +65,39 @@ elif is_cpu():
 
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
-    """FlashInfer for the narrow SM100 GDN prefill domain we validated, else None."""
+    """FlashInfer for the GDN prefill domains we validated, else None.
+
+    Validated domains (head_k = head_v = 128 in both cases):
+    - SM100: bf16 SSM state, chunked prefill up to 8192 tokens
+    - SM90:  fp32 SSM state (the FlashInfer SM90 chunk kernel requires fp32
+      state), chunked prefill up to 32768 tokens
+    """
     args = model_runner.server_args
+    sm_major = torch.cuda.get_device_capability()[0] if is_cuda() else 0
     if (
         args.linear_attn_prefill_backend is not None
         or args.linear_attn_backend != "triton"
         or args.enable_page_major_kv_layout
         or not is_cuda()
-        or torch.cuda.get_device_capability()[0] != 10
+        or sm_major not in (9, 10)
     ):
         return None
 
     cuda_version = torch.version.cuda
     chunk_size = args.chunked_prefill_size
     config = hybrid_gdn_config(model_runner.model_config)
+    max_chunk = 8192 if sm_major == 10 else 32768
+    expected_state_dtype = torch.bfloat16 if sm_major == 10 else torch.float32
     if (
         cuda_version is None
         or int(cuda_version.split(".", 1)[0]) < 13
         or args.enable_dynamic_chunking
         or chunk_size is None
-        or not 1 <= chunk_size <= 8192
+        or not 1 <= chunk_size <= max_chunk
         or getattr(config, "linear_key_head_dim", None) != 128
         or getattr(config, "linear_value_head_dim", None) != 128
         or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
-        != torch.bfloat16
+        != expected_state_dtype
     ):
         return None
 
@@ -99,7 +108,7 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     if not is_flashinfer_gdn_prefill_available():
         return None
 
-    rank0_log("Defaulting SM100 GDN prefill backend to FlashInfer.")
+    rank0_log(f"Defaulting SM{sm_major}0 GDN prefill backend to FlashInfer.")
     return "flashinfer"
 
 

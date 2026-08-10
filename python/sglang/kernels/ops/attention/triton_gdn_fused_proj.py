@@ -237,33 +237,20 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
             + tl.arange(0, V_BLOCK)
         )
         blk_z_st_ptr = (
-            z
-            + i_bs * NUM_HEADS_V * HEAD_V
-            + i_qk * V_BLOCK
-            + tl.arange(0, V_BLOCK)
+            z + i_bs * NUM_HEADS_V * HEAD_V + i_qk * V_BLOCK + tl.arange(0, V_BLOCK)
         )
         tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
         tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
     else:
         for i in tl.static_range(V_PER_GROUP):
             v_off = (i_qk * V_PER_GROUP + i) * HEAD_V + tl.arange(0, HEAD_V)
-            v_val = tl.load(
-                mixed_qkvz + i_bs * TOTAL_QKVZ + TOTAL_Q + TOTAL_K + v_off
-            )
+            v_val = tl.load(mixed_qkvz + i_bs * TOTAL_QKVZ + TOTAL_Q + TOTAL_K + v_off)
             tl.store(
-                mixed_qkv
-                + i_bs * QKV_DIM_T
-                + NUM_HEADS_QK * HEAD_QK * 2
-                + v_off,
+                mixed_qkv + i_bs * QKV_DIM_T + NUM_HEADS_QK * HEAD_QK * 2 + v_off,
                 v_val,
             )
             z_val = tl.load(
-                mixed_qkvz
-                + i_bs * TOTAL_QKVZ
-                + TOTAL_Q
-                + TOTAL_K
-                + TOTAL_V
-                + v_off
+                mixed_qkvz + i_bs * TOTAL_QKVZ + TOTAL_Q + TOTAL_K + TOTAL_V + v_off
             )
             tl.store(z + i_bs * NUM_HEADS_V * HEAD_V + v_off, z_val)
 
