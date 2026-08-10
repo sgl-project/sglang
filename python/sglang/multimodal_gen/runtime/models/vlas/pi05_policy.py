@@ -164,7 +164,8 @@ class Pi05PolicyModel(nn.Module):
             logger.info("Pi05 split runtime role on rank: %s", self.runtime_role)
         self.action_expert = Pi05ActionExpert(config, self.core_model)
         self.prefix_graph_runner = VLAPrefixGraphRunner(
-            enabled=self._prefix_cuda_graph_enabled()
+            enabled=self._prefix_cuda_graph_enabled(),
+            max_entries=config.prefix_cuda_graph_max_entries,
         )
         self.graph_runner = VLADenoiseGraphRunner(
             enabled=config.enable_action_cuda_graph
@@ -900,7 +901,11 @@ class Pi05PolicyModel(nn.Module):
                 layout={"full_attention": full_attention},
             )
 
-        if not use_cuda_graph or not self.prefix_graph_runner.enabled:
+        if (
+            not use_cuda_graph
+            or not self.prefix_graph_runner.enabled
+            or observation.batch_size != 1
+        ):
             return encode(graph_inputs)
 
         signature = VLAPrefixGraphSignature(

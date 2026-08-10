@@ -59,7 +59,7 @@ class Pi05Pipeline(ComposedPipelineBase):
             or bool(server_args.text_encoder_cpu_offload)
         )
         logger.info(
-            "Pi05 memory config: prefix_cache=%s/%s, cuda_graph=%s/%s, "
+            "Pi05 memory config: prefix_cache=%s/%s, cuda_graph=%s/%s/%s, "
             "offload_image=%s, offload_image_after_embed=%s, "
             "offload_tokens=%s, offload_language_layers=%s, "
             "offload_language_after_prefix=%s/%s, "
@@ -67,6 +67,7 @@ class Pi05Pipeline(ComposedPipelineBase):
             pipeline_config.enable_global_prefix_cache,
             pipeline_config.prefix_cache_max_entries,
             pipeline_config.enable_prefix_cuda_graph,
+            pipeline_config.prefix_cuda_graph_max_entries,
             pipeline_config.enable_action_cuda_graph,
             pipeline_config.offload_prefix_image_encoder,
             pipeline_config.offload_prefix_image_encoder_after_embed,

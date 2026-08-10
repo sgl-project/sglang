@@ -47,6 +47,7 @@ class Pi05PipelineConfig(PipelineConfig):
 
     enable_global_prefix_cache: bool = False
     enable_prefix_cuda_graph: bool = True
+    prefix_cuda_graph_max_entries: int = 1
     enable_action_cuda_graph: bool = True
     prefix_cache_max_entries: int = 1
     prefix_cache_layout_version: str = "pi05-prefix-v1"

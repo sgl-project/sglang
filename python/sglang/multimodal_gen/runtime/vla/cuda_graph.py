@@ -95,8 +95,9 @@ def _copy_prefix_context_(dst: PrefixContext, src: PrefixContext) -> None:
 class VLAPrefixGraphRunner:
     """Full CUDA graph runner for VLA prefix encoding shape buckets."""
 
-    def __init__(self, enabled: bool = True):
-        self.enabled = enabled
+    def __init__(self, enabled: bool = True, max_entries: int = 1):
+        self.max_entries = max(0, max_entries)
+        self.enabled = enabled and self.max_entries > 0
         self._captured: dict[VLAPrefixGraphSignature, _CapturedPrefixGraph] = {}
         self._disabled_signatures: set[VLAPrefixGraphSignature] = set()
         self._capture_stream: torch.cuda.Stream | None = None
@@ -162,6 +163,8 @@ class VLAPrefixGraphRunner:
             return step_fn(inputs)
 
         captured = self._captured.get(signature)
+        if captured is None and len(self._captured) >= self.max_entries:
+            return step_fn(inputs)
         try:
             if captured is None:
                 captured = self._capture(signature, step_fn, inputs)
