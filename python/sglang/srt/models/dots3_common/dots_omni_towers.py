@@ -11,12 +11,12 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from sglang.srt.models.dots_omni_audio import (
+from sglang.srt.models.dots3_common.dots_omni_audio import (
     OmniAudioConfig,
     OmniAudioModel,
     compute_audio_token_length,
 )
-from sglang.srt.models.dots_omni_vision import (
+from sglang.srt.models.dots3_common.dots_omni_vision import (
     DotsMoEVitConfig,
     DotsMoEVitModel,
 )

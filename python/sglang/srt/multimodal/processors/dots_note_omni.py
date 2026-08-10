@@ -18,7 +18,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.dots3 import Dots3NoteForCausalLM
-from sglang.srt.models.dots_omni_towers import (
+from sglang.srt.models.dots3_common.dots_omni_towers import (
     DotsNoteOmniImagePreprocessor,
     OmniAudioConfig,
     get_audio_token_string,
