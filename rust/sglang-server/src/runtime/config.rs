@@ -178,9 +178,9 @@ pub struct ModelConfig {
 /// (`repetition_penalty`, `temperature`, `top_k`, `top_p`, `min_p`), filtered
 /// to values the generation config actually sets — hence all `Option`.
 ///
-/// `top_k` / `min_p` / `repetition_penalty` are parsed for parity with the
-/// Python dict but not yet consumed: the Dynamo chat request type only carries
-/// `temperature` and `top_p`, so the conversion resolves just those two.
+/// The Dynamo chat request type only carries user overrides for `temperature`
+/// and `top_p`; the remaining fields still supply model defaults when omitted,
+/// matching Python's `to_sampling_params` resolution chain.
 #[derive(Debug, Default, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct DefaultSamplingParams {
@@ -246,6 +246,8 @@ impl ServerArgs {
                 self.disaggregation_mode
             ));
         }
+        crate::message::validate_preferred_sampling_params(self.preferred_sampling_params.as_ref())
+            .map_err(|error| format!("invalid preferred_sampling_params: {error}"))?;
         Ok(())
     }
 
@@ -296,5 +298,41 @@ impl ServerArgs {
     pub fn api_worker_num(&self) -> usize {
         4.max(self.tokenizer_worker_num)
             .max(self.detokenizer_worker_num)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerArgs;
+
+    fn args_with_preferred(preferred: serde_json::Value) -> ServerArgs {
+        serde_json::from_value(serde_json::json!({
+            "served_model_name": "model",
+            "model_config": {"context_len": 1024, "vocab_size": 1000},
+            "preferred_sampling_params": preferred,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn preferred_sampling_params_are_validated_at_startup() {
+        assert!(
+            args_with_preferred(serde_json::json!({
+                "temperature": 0.2,
+                "max_new_tokens": 64,
+            }))
+            .validate_mandatory()
+            .is_ok()
+        );
+        for preferred in [
+            serde_json::json!([]),
+            serde_json::json!({"zzz_not_a_field": 1}),
+            serde_json::json!({"temperature": "bad"}),
+        ] {
+            let error = args_with_preferred(preferred)
+                .validate_mandatory()
+                .expect_err("invalid preferred sampling params must fail startup");
+            assert!(error.contains("preferred_sampling_params"), "{error}");
+        }
     }
 }

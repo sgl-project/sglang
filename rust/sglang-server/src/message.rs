@@ -27,7 +27,10 @@ pub use request::{GenerateBody, GenerateRequest, MmRequest, MmWorkItem, RequestK
 // Constructed directly only by tests: `api_server::prefetch` fills its
 // `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
 pub use request::MmData;
-pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
+pub(crate) use sampling::{
+    SamplingParams, SamplingParamsInput, SamplingParamsMap, merge_sampling_params,
+    validate_preferred_sampling_params,
+};
 pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};
 
 use bytes::Bytes;

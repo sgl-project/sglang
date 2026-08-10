@@ -37,7 +37,9 @@ use super::{
     streaming_error, submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
-use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
+use crate::message::{
+    ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams, merge_sampling_params,
+};
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -276,6 +278,7 @@ pub(super) fn chat_sampling(
     let mut sampling = chat_sampling_params(
         request,
         &defaults.with_model_defaults(&server_args.model_config.default_sampling_params),
+        server_args.preferred_sampling_params.as_ref(),
     )?;
     apply_tool_constraint(
         &mut sampling,
@@ -325,9 +328,15 @@ pub(super) struct SamplingDefaults {
     /// `--sampling-defaults openai` (the Python dump is then empty).
     temperature: Option<f64>,
     top_p: Option<f64>,
+    top_k: Option<i64>,
+    min_p: Option<f64>,
+    repetition_penalty: Option<f64>,
     /// OpenAI terminal defaults for chat completions.
     fallback_temperature: f64,
     fallback_top_p: f64,
+    fallback_top_k: i64,
+    fallback_min_p: f64,
+    fallback_repetition_penalty: f64,
 }
 
 impl SamplingDefaults {
@@ -335,8 +344,14 @@ impl SamplingDefaults {
     pub(super) const CHAT: SamplingDefaults = SamplingDefaults {
         temperature: None,
         top_p: None,
+        top_k: None,
+        min_p: None,
+        repetition_penalty: None,
         fallback_temperature: 1.0,
         fallback_top_p: 1.0,
+        fallback_top_k: -1,
+        fallback_min_p: 0.0,
+        fallback_repetition_penalty: 1.0,
     };
     /// The resolved model defaults (empty in `--sampling-defaults openai`
     /// mode), which slot between the user's values and the OpenAI terminals.
@@ -346,6 +361,9 @@ impl SamplingDefaults {
     ) -> SamplingDefaults {
         self.temperature = model.temperature;
         self.top_p = model.top_p;
+        self.top_k = model.top_k;
+        self.min_p = model.min_p;
+        self.repetition_penalty = model.repetition_penalty;
         self
     }
 }
@@ -354,9 +372,10 @@ impl SamplingDefaults {
 pub(super) fn chat_sampling_params(
     request: &CreateChatCompletionRequest,
     defaults: &SamplingDefaults,
+    preferred: Option<&serde_json::Value>,
 ) -> Result<SamplingParams, String> {
     let mut stop = None;
-    let mut stop_token_ids = None;
+    let mut stop_token_ids: Option<Vec<i64>> = None;
     match request.stop.as_ref() {
         Some(Stop::String(value)) => stop = Some(OneOrMany::One(value.clone())),
         Some(Stop::StringArray(values)) => stop = Some(OneOrMany::Many(values.clone())),
@@ -380,31 +399,50 @@ pub(super) fn chat_sampling_params(
         _ => None,
     };
 
-    Ok(SamplingParams {
-        max_new_tokens: request
-            .max_completion_tokens
-            .or(request.max_tokens)
-            .map(i64::from),
-        stop,
-        stop_token_ids,
-        temperature: request
+    let mut request_params = serde_json::json!({
+        "temperature": request
             .temperature
             .map(f64::from)
             .or(defaults.temperature)
             .unwrap_or(defaults.fallback_temperature),
-        top_p: request
+        "max_new_tokens": request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .map(i64::from),
+        "min_new_tokens": 0,
+        "stop": stop,
+        "stop_token_ids": stop_token_ids,
+        "stop_regex": null,
+        "top_p": request
             .top_p
             .map(f64::from)
             .or(defaults.top_p)
             .unwrap_or(defaults.fallback_top_p),
-        frequency_penalty: request.frequency_penalty.unwrap_or(0.0) as f64,
-        presence_penalty: request.presence_penalty.unwrap_or(0.0) as f64,
-        n: 1,
-        logit_bias: (!logit_bias.is_empty()).then_some(logit_bias),
-        sampling_seed: request.seed,
-        json_schema,
-        ..Default::default()
+        "top_k": defaults.top_k.unwrap_or(defaults.fallback_top_k),
+        "min_p": defaults.min_p.unwrap_or(defaults.fallback_min_p),
+        "presence_penalty": request.presence_penalty.unwrap_or(0.0) as f64,
+        "frequency_penalty": request.frequency_penalty.unwrap_or(0.0) as f64,
+        "repetition_penalty": defaults
+            .repetition_penalty
+            .unwrap_or(defaults.fallback_repetition_penalty),
+        "regex": null,
+        "ebnf": null,
+        "n": 1,
+        "no_stop_trim": false,
+        "ignore_eos": false,
+        "skip_special_tokens": true,
+        "logit_bias": (!logit_bias.is_empty()).then_some(logit_bias),
+        "custom_params": null,
+        "sampling_seed": request.seed,
+        "spaces_between_special_tokens": true,
     })
+    .as_object()
+    .expect("chat sampling params are an object")
+    .clone();
+    if let Some(json_schema) = json_schema {
+        request_params.insert("json_schema".into(), serde_json::Value::String(json_schema));
+    }
+    merge_sampling_params(preferred, request_params).map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -835,13 +873,14 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk, senders};
     use super::{
-        SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        SamplingDefaults, apply_tool_constraint, chat_event_stream, chat_logprobs,
+        chat_sampling_params, merge_template_stops, unary_chat,
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::ChunkExtras;
     use crate::runtime::DefaultSamplingParams;
     use axum::http::StatusCode;
+    use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
 
@@ -860,16 +899,22 @@ mod tests {
         let model = DefaultSamplingParams {
             temperature: Some(0.6),
             top_p: Some(0.9),
-            ..Default::default()
+            top_k: Some(40),
+            min_p: Some(0.1),
+            repetition_penalty: Some(1.1),
         };
         // Omitted → model defaults, not the 1.0 OpenAI terminals.
         let sampling = chat_sampling_params(
             &request(),
             &SamplingDefaults::CHAT.with_model_defaults(&model),
+            None,
         )
         .unwrap();
         assert_eq!(sampling.temperature, 0.6);
         assert_eq!(sampling.top_p, 0.9);
+        assert_eq!(sampling.top_k, 40);
+        assert_eq!(sampling.min_p, 0.1);
+        assert_eq!(sampling.repetition_penalty, 1.1);
         // Explicit request values win. `Option<f32>` loses precision in f64 —
         // compare with tolerance.
         let mut request = request();
@@ -878,6 +923,7 @@ mod tests {
         let sampling = chat_sampling_params(
             &request,
             &SamplingDefaults::CHAT.with_model_defaults(&model),
+            None,
         )
         .unwrap();
         assert!((sampling.temperature - 0.2).abs() < 1e-6);
@@ -892,10 +938,53 @@ mod tests {
         let sampling = chat_sampling_params(
             &request(),
             &SamplingDefaults::CHAT.with_model_defaults(&openai_mode),
+            None,
         )
         .unwrap();
         assert_eq!(sampling.temperature, 1.0);
         assert_eq!(sampling.top_p, 1.0);
+    }
+
+    #[test]
+    fn chat_adapter_and_constraints_override_preferred_params() {
+        let preferred = serde_json::json!({
+            "temperature": 0.2,
+            "stream_interval": 7,
+            "stop": ["preferred"],
+            "json_schema": "preferred",
+        });
+        let chatml = super::super::template::builtin_template("chatml").unwrap();
+        let formatter = super::super::ChatFormatter::Legacy(Box::new(
+            super::super::template::LegacyFormatter { spec: chatml },
+        ));
+        let mut request = request();
+        merge_template_stops(&mut request, &formatter);
+
+        let mut sampling =
+            chat_sampling_params(&request, &SamplingDefaults::CHAT, Some(&preferred)).unwrap();
+        assert_eq!(sampling.temperature, 1.0);
+        assert_eq!(sampling.stream_interval, Some(7));
+        assert_eq!(
+            sampling.stop,
+            Some(crate::message::OneOrMany::Many(vec![
+                "<|endoftext|>".into(),
+                "<|im_end|>".into(),
+            ]))
+        );
+
+        apply_tool_constraint(
+            &mut sampling,
+            Some("llama3"),
+            &DynamoToolChoice::Required,
+            &[ToolDefinition {
+                name: "get_weather".into(),
+                parameters: Some(serde_json::json!({"type": "object"})),
+                strict: Some(false),
+            }],
+            Some(false),
+        )
+        .unwrap();
+        assert_ne!(sampling.json_schema.as_deref(), Some("preferred"));
     }
 
     /// Python `_apply_conversation_template`: template `stop_str` first, then
@@ -984,7 +1073,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            chat_sampling_params(&request, &SamplingDefaults::CHAT)
+            chat_sampling_params(&request, &SamplingDefaults::CHAT, None)
                 .unwrap()
                 .max_new_tokens,
             None

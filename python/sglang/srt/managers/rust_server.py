@@ -373,19 +373,6 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         server_args = scheduler.server_args
-        # `TokenizerManager` merges these under each request's own sampling params
-        # (`{**preferred, **obj.sampling_params}`), and this server replaces that
-        # manager wholesale — so honouring the flag is not implemented here yet.
-        # Refuse rather than run: silently dropping it means generating with
-        # sampling the operator did not configure, and `/get_model_info` would go on
-        # advertising values no request ever receives.
-        if server_args.preferred_sampling_params:
-            raise ValueError(
-                "SGLANG_RUST_SERVER does not yet apply --preferred-sampling-params "
-                "(the Python TokenizerManager merges it into every request; the rust "
-                "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
-                "drop --preferred-sampling-params and send those values per request."
-            )
         http_addr = f"{server_args.host}:{server_args.port}"
 
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,

@@ -29,7 +29,7 @@ use super::{
 use crate::ids::Rid;
 use crate::message::{
     ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, RequestKind,
-    SamplingParams, TokenIds,
+    SamplingParams, TokenIds, merge_sampling_params,
 };
 
 pub(super) fn routes() -> Router<AppState> {
@@ -105,7 +105,10 @@ async fn completions(
         Ok(prompts) => prompts,
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
     };
-    let mut sampling = match completion_sampling_params(&request) {
+    let mut sampling = match completion_sampling_params(
+        &request,
+        state.server_args.preferred_sampling_params.as_ref(),
+    ) {
         Ok(sampling) => sampling,
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
     };
@@ -297,7 +300,10 @@ fn token_prompt_spec(ids: &[u32]) -> Result<PromptSpec, String> {
     Ok(PromptSpec::TokenIds(input_ids))
 }
 
-fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<SamplingParams, String> {
+fn completion_sampling_params(
+    request: &CreateCompletionRequest,
+    preferred: Option<&serde_json::Value>,
+) -> Result<SamplingParams, String> {
     let mut stop = None;
     let mut stop_token_ids = None;
     match request.stop.as_ref() {
@@ -321,21 +327,40 @@ fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<Sampl
         }
     }
 
-    Ok(SamplingParams {
-        max_new_tokens: Some(request.max_tokens.unwrap_or(16) as i64),
-        stop,
-        stop_token_ids,
-        temperature: request.temperature.unwrap_or(1.0) as f64,
-        top_p: request.top_p.unwrap_or(1.0) as f64,
-        frequency_penalty: request.frequency_penalty.unwrap_or(0.0) as f64,
-        presence_penalty: request.presence_penalty.unwrap_or(0.0) as f64,
+    let request_params = serde_json::json!({
+        "temperature": request.temperature.unwrap_or(1.0) as f64,
+        "max_new_tokens": request.max_tokens.unwrap_or(16) as i64,
+        "min_new_tokens": 0,
+        "stop": stop,
+        "stop_token_ids": stop_token_ids,
+        "stop_regex": null,
+        "top_p": request.top_p.unwrap_or(1.0) as f64,
+        "top_k": -1,
+        "min_p": 0.0,
+        "presence_penalty": request.presence_penalty.unwrap_or(0.0) as f64,
+        "frequency_penalty": request.frequency_penalty.unwrap_or(0.0) as f64,
+        "repetition_penalty": 1.0,
+        "regex": null,
+        "json_schema": null,
+        "ebnf": null,
         // OpenAI `n` is implemented by fan-out: every native request has one
         // output, avoiding the native path's intentional `n > 1` rejection.
-        n: 1,
-        logit_bias: (!logit_bias.is_empty()).then_some(logit_bias),
-        sampling_seed: request.seed,
-        ..Default::default()
-    })
+        "n": 1,
+        "no_stop_trim": false,
+        "ignore_eos": false,
+        "skip_special_tokens": true,
+        "logit_bias": (!logit_bias.is_empty()).then_some(logit_bias),
+        "custom_params": null,
+        "sampling_seed": request.seed,
+    });
+    merge_sampling_params(
+        preferred,
+        request_params
+            .as_object()
+            .expect("completion sampling params are an object")
+            .clone(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub(super) async fn unary_completion(
@@ -717,7 +742,8 @@ mod tests {
     use super::super::test_utils::{chunk, senders, submitted};
     use super::{
         ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
-        completion_prompt_specs, completion_response_value, unary_completion,
+        completion_prompt_specs, completion_response_value, completion_sampling_params,
+        unary_completion,
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::ChunkExtras;
@@ -754,6 +780,27 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(request.max_tokens, Some(0));
+    }
+
+    #[test]
+    fn completion_adapter_fields_override_preferred_params() {
+        let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": "hello"
+        }))
+        .unwrap();
+        let preferred = serde_json::json!({
+            "temperature": 0.2,
+            "max_new_tokens": 64,
+            "stream_interval": 7,
+            "custom_params": {"preferred": true},
+        });
+
+        let sampling = completion_sampling_params(&request, Some(&preferred)).unwrap();
+        assert_eq!(sampling.temperature, 1.0);
+        assert_eq!(sampling.max_new_tokens, Some(16));
+        assert_eq!(sampling.stream_interval, Some(7));
+        assert_eq!(sampling.custom_params, None);
     }
 
     #[test]
