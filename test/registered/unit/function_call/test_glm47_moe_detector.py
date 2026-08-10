@@ -212,10 +212,10 @@ class TestGlm47MoeDetector(CustomTestCase):
     def test_streaming_never_emits_truncated_tool_name(self):
         """A partial function name is not emitted."""
         detector = Glm47MoeDetector()
-        result = detector.parse_streaming_increment("<tool_call>get_wea", self.tools)
+        result = detector.parse_streaming_increment("<tool_call>get_weat", self.tools)
         self.assertEqual(result.calls, [])
         result = detector.parse_streaming_increment(
-            "ther<arg_key>city</arg_key><arg_value>x</arg_value></tool_call>",
+            "her<arg_key>city</arg_key><arg_value>x</arg_value></tool_call>",
             self.tools,
         )
         names = [c.name for c in result.calls if c.name is not None]
