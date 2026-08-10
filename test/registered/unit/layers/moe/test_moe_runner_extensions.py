@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -230,3 +231,7 @@ def test_lora_uses_quant_method_contract_for_registered_backend(
     assert wrapper._quant_info is quant_info
     assert quant_calls == [(base_layer, backend)]
     assert created_runners == [(backend, base_layer.moe_runner_config, True)]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
