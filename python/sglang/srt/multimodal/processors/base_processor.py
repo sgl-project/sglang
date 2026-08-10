@@ -20,6 +20,8 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     envs,
@@ -494,7 +496,11 @@ class BaseMultimodalProcessor(ABC):
         tokenizer process each carry their own ``base_gpu_id``.
         """
         server_args = self.server_args
-        if _is_cpu or server_args.rl_on_policy_target is not None:
+        if (
+            _is_cpu
+            or server_args.rl_on_policy_target is not None
+            or is_true_on_policy_enabled()
+        ):
             return "cpu"
         if _is_xpu:
             return "xpu"
