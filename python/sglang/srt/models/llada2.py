@@ -41,9 +41,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -60,11 +58,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.topk import (
-    StandardTopKOutput,
-    TopK,
-    TritonKernelTopKOutput,
-)
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TritonKernelTopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -118,7 +112,9 @@ def _block_aggregation_kernel(
     expert_capacity: tl.constexpr,
     stride_logits_n,
     stride_logits_e,
+    stride_bias,
     BLOCK_SIZE_E: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
 ):
     """Select the block-level expert set and store compact expert IDs."""
     block_id = tl.program_id(0)
@@ -127,21 +123,35 @@ def _block_aggregation_kernel(
     expert_offs = tl.arange(0, BLOCK_SIZE_E)
     expert_mask = expert_offs < num_experts_total
     bias = tl.load(
-        correction_bias_ptr + expert_offs,
+        correction_bias_ptr + expert_offs * stride_bias,
         mask=expert_mask,
         other=0.0,
     ).to(tl.float32)
 
-    token_in_block = tl.arange(0, block_size)
+    token_in_block = tl.arange(0, BLOCK_SIZE_T)
     token_offs = block_start_token + token_in_block[:, None]
-    valid_2d = (token_offs < num_tokens) & expert_mask[None, :]
+    valid_2d = (
+        (token_in_block[:, None] < block_size)
+        & (token_offs < num_tokens)
+        & expert_mask[None, :]
+    )
     logits_ptrs = (
         router_logits_ptr
         + token_offs * stride_logits_n
         + expert_offs[None, :] * stride_logits_e
     )
-    logits = tl.load(logits_ptrs, mask=valid_2d, other=float("-inf"))
-    corrected_scores = tl.sigmoid(logits.to(tl.float32)) + bias[None, :]
+    logits = tl.load(logits_ptrs, mask=valid_2d, other=0.0)
+    # Keep this formula identical to _token_topk_kernel: a mismatch can change
+    # the selected expert at the block-capacity cutoff.
+    base_scores = libdevice.div_rn(
+        1.0,
+        1.0 + libdevice.exp(-logits.to(tl.float32)),
+    )
+    corrected_scores = tl.where(
+        valid_2d,
+        base_scores + bias[None, :],
+        float("-inf"),
+    )
     block_scores = tl.max(corrected_scores, axis=0)
     block_scores = tl.where(expert_mask, block_scores, float("-inf"))
 
@@ -188,6 +198,7 @@ def _token_topk_kernel(
     top_k: tl.constexpr,
     stride_logits_n,
     stride_logits_e,
+    stride_bias,
     BLOCK_SIZE_C: tl.constexpr,
     TOPK_POW2: tl.constexpr,
 ):
@@ -205,21 +216,18 @@ def _token_topk_kernel(
         other=0,
     ).to(tl.int32)
     bias = tl.load(
-        correction_bias_ptr + expert_ids,
+        correction_bias_ptr + expert_ids * stride_bias,
         mask=candidate_mask,
         other=0.0,
     ).to(tl.float32)
     logits = tl.load(
-        router_logits_ptr
-        + token_idx * stride_logits_n
-        + expert_ids * stride_logits_e,
+        router_logits_ptr + token_idx * stride_logits_n + expert_ids * stride_logits_e,
         mask=candidate_mask,
         other=float("-inf"),
     )
 
-    # libdevice exp plus round-to-nearest division matches ATen's FP32 sigmoid
-    # more closely than Triton's approximate tl.sigmoid.  This is important at
-    # token top-k boundaries and keeps routing weights in FP32.
+    # Keep this formula identical to _block_aggregation_kernel. libdevice exp
+    # plus round-to-nearest division also keeps routing weights in FP32.
     base_scores = libdevice.div_rn(
         1.0,
         1.0 + libdevice.exp(-logits.to(tl.float32)),
@@ -299,8 +307,14 @@ def block_topk_triton(
             "correction_bias must have shape "
             f"({num_experts_total},), got {tuple(correction_bias.shape)}"
         )
-    if block_size <= 0:
-        raise ValueError(f"block_size must be positive, got {block_size}")
+    if (
+        not isinstance(block_size, int)
+        or block_size <= 0
+        or block_size & (block_size - 1)
+    ):
+        raise ValueError(
+            f"block_size must be a positive power of two, got {block_size!r}"
+        )
     if not (0 < top_k <= expert_capacity <= num_experts_total):
         raise ValueError(
             "expected 0 < top_k <= expert_capacity <= num_experts, got "
@@ -347,7 +361,9 @@ def block_topk_triton(
         expert_capacity,
         router_logits.stride(0),
         router_logits.stride(1),
+        correction_bias.stride(0),
         BLOCK_SIZE_E=block_size_e,
+        BLOCK_SIZE_T=block_size,
         num_warps=4,
         num_stages=1,
     )
@@ -364,6 +380,7 @@ def block_topk_triton(
         top_k,
         router_logits.stride(0),
         router_logits.stride(1),
+        correction_bias.stride(0),
         BLOCK_SIZE_C=block_size_c,
         TOPK_POW2=topk_pow2,
         num_warps=1,
@@ -492,6 +509,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
         self.use_block_routing = getattr(config, "expert_capacity", None) is not None
         if self.use_block_routing:
+            if _is_npu:
+                raise ValueError(
+                    "LLaDA2 block routing is not supported on NPU; "
+                    "expert_capacity must be unset"
+                )
             self.block_size = config.block_size
             self.expert_capacity = config.expert_capacity
 
@@ -541,8 +563,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         if self.use_block_routing:
             if get_moe_a2a_backend().is_deepep():
                 raise ValueError(
-                    "LLaDA2 block routing does not support "
-                    "--moe-a2a-backend deepep"
+                    "LLaDA2 block routing does not support " "--moe-a2a-backend deepep"
                 )
             if self.correction_bias is None:
                 raise ValueError(
@@ -553,19 +574,30 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                     "block routing requires score_function='sigmoid', got "
                     f"{self.score_function!r}"
                 )
-            if not isinstance(self.block_size, int) or self.block_size <= 0:
-                raise ValueError(
-                    f"block_size must be a positive integer, got {self.block_size!r}"
-                )
-            if not (
-                0 < self.top_k <= self.expert_capacity <= self.num_experts
+            if (
+                not isinstance(self.block_size, int)
+                or self.block_size <= 0
+                or self.block_size & (self.block_size - 1)
             ):
+                raise ValueError(
+                    "block_size must be a positive power of two, got "
+                    f"{self.block_size!r}"
+                )
+            if not (0 < self.top_k <= self.expert_capacity <= self.num_experts):
                 raise ValueError(
                     "block routing requires "
                     "0 < num_experts_per_tok <= expert_capacity <= num_experts, "
                     f"got top_k={self.top_k}, "
                     f"expert_capacity={self.expert_capacity}, "
                     f"num_experts={self.num_experts}"
+                )
+            if get_moe_runner_backend().is_triton_kernels() and self.top_k & (
+                self.top_k - 1
+            ):
+                raise ValueError(
+                    "LLaDA2 block routing with --moe-runner-backend "
+                    "triton_kernel requires num_experts_per_tok to be a "
+                    f"power of two, got {self.top_k}"
                 )
 
         if self.score_function is not None:
@@ -662,8 +694,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
     def _block_topk(self, router_logits: torch.Tensor):
         """Block top-k routing via two-phase Triton kernel."""
         return block_topk_triton(
-            router_logits, self.correction_bias,
-            self.block_size, self.expert_capacity,
+            router_logits,
+            self.correction_bias,
+            self.block_size,
+            self.expert_capacity,
             self.top_k,
         )
 
@@ -691,9 +725,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
         if topk_ids.numel() == 0:
             # Avoid launching the Triton top-k kernel with a zero-row grid.
-            dispatch_indx = torch.empty(
-                (0,), dtype=torch.int32, device=topk_ids.device
-            )
+            dispatch_indx = torch.empty((0,), dtype=torch.int32, device=topk_ids.device)
             combine_indx = torch.empty_like(dispatch_indx)
             expert_counts = torch.zeros(
                 (self.num_experts,), dtype=torch.int32, device=topk_ids.device
@@ -805,8 +837,8 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                     self.forward_normal_block_routing_dual_stream(hidden_states)
                 )
             else:
-                final_hidden_states, shared_output = (
-                    self.forward_normal_dual_stream(hidden_states)
+                final_hidden_states, shared_output = self.forward_normal_dual_stream(
+                    hidden_states
                 )
         else:
             shared_output = self._forward_shared_experts(hidden_states)

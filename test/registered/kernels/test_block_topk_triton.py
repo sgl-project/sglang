@@ -11,6 +11,10 @@ import unittest
 import torch
 
 from sglang.srt.models.llada2 import block_topk_triton
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 def block_topk_reference(
@@ -51,19 +55,17 @@ def block_topk_reference(
     block_scores = corrected_scores_padded.view(
         num_blocks, block_size, num_experts
     ).amax(dim=1)
-    allowed_ids = torch.argsort(
-        block_scores, dim=-1, descending=True, stable=True
-    )[:, :expert_capacity]
-    allowed = torch.zeros(
-        (num_blocks, num_experts), dtype=torch.bool, device=device
-    )
+    allowed_ids = torch.argsort(block_scores, dim=-1, descending=True, stable=True)[
+        :, :expert_capacity
+    ]
+    allowed = torch.zeros((num_blocks, num_experts), dtype=torch.bool, device=device)
     allowed.scatter_(1, allowed_ids, True)
     token_allowed = allowed.repeat_interleave(block_size, dim=0)[:num_tokens]
 
     token_scores = corrected_scores.masked_fill(~token_allowed, float("-inf"))
-    topk_ids = torch.argsort(
-        token_scores, dim=-1, descending=True, stable=True
-    )[:, :top_k]
+    topk_ids = torch.argsort(token_scores, dim=-1, descending=True, stable=True)[
+        :, :top_k
+    ]
     selected_base_scores = base_scores.gather(1, topk_ids)
     if top_k > 1:
         weight_sum = selected_base_scores.sum(dim=-1, keepdim=True)
@@ -76,7 +78,7 @@ def block_topk_reference(
     return topk_weights.float(), topk_ids.to(torch.int32)
 
 
-class TestBlockTopkTriton(unittest.TestCase):
+class TestBlockTopkTriton(CustomTestCase):
     """Test block_topk_triton against PyTorch reference."""
 
     def _run_case(self, num_tokens, num_experts, expert_capacity, block_size, top_k):
@@ -86,7 +88,9 @@ class TestBlockTopkTriton(unittest.TestCase):
         router_logits = torch.randn(
             num_tokens, num_experts, dtype=torch.float32, device=device
         )
-        correction_bias = torch.randn(num_experts, dtype=torch.float32, device=device) * 0.1
+        correction_bias = (
+            torch.randn(num_experts, dtype=torch.float32, device=device) * 0.1
+        )
 
         weights_triton, ids_triton = block_topk_triton(
             router_logits, correction_bias, block_size, expert_capacity, top_k
@@ -103,9 +107,7 @@ class TestBlockTopkTriton(unittest.TestCase):
             f"  Ref:    {ids_ref[:4]}",
         )
         self.assertEqual(weights_triton.dtype, torch.float32)
-        torch.testing.assert_close(
-            weights_triton, weights_ref, rtol=0.0, atol=2e-6
-        )
+        torch.testing.assert_close(weights_triton, weights_ref, rtol=0.0, atol=2e-6)
 
     def test_basic_small(self):
         """32 tokens, 16 experts, capacity=8, block_size=8, top_k=2."""
@@ -149,12 +151,14 @@ class TestBlockTopkTriton(unittest.TestCase):
             num_tokens=256, num_experts=128, expert_capacity=32, block_size=32, top_k=4
         )
 
-
     def test_partial_block_and_non_power_of_two_experts(self):
         """Tail tokens and non-power-of-two expert counts are supported."""
         self._run_case(
-            num_tokens=65, num_experts=100, expert_capacity=48,
-            block_size=32, top_k=8,
+            num_tokens=65,
+            num_experts=100,
+            expert_capacity=48,
+            block_size=32,
+            top_k=8,
         )
 
     def test_exact_ties_choose_lower_expert_id(self):
@@ -176,6 +180,36 @@ class TestBlockTopkTriton(unittest.TestCase):
         _, ids = block_topk_triton(logits, bias, 32, 16, 1)
         self.assertTrue(torch.equal(ids, torch.ones_like(ids)))
 
+    def test_capacity_cutoff_near_tie(self):
+        """Phase 1 and phase 2 must use the same sigmoid at the cutoff."""
+        logits = torch.full((8, 4), -20.0, dtype=torch.float32, device="cuda")
+        bias = torch.zeros((4,), dtype=torch.float32, device="cuda")
+
+        # These adjacent FP32 logits exercise a capacity-1 boundary where
+        # approximate sigmoid implementations can round differently. Both
+        # routing phases must agree that expert 1 has the higher score.
+        logits[:, 0] = 0.49701982736587524
+        logits[:, 1] = 0.49701985716819763
+
+        weights, ids = block_topk_triton(
+            logits, bias, block_size=8, expert_capacity=1, top_k=1
+        )
+
+        self.assertTrue(torch.equal(ids, torch.ones_like(ids)))
+        expected_weight = torch.sigmoid(logits[0, 1].cpu()).item()
+        torch.testing.assert_close(
+            weights,
+            torch.full_like(weights, expected_weight),
+            rtol=0.0,
+            atol=1e-7,
+        )
+
+    def test_rejects_non_power_of_two_block_size(self):
+        logits = torch.zeros((6, 4), dtype=torch.float32, device="cuda")
+        bias = torch.zeros((4,), dtype=torch.float32, device="cuda")
+        with self.assertRaisesRegex(ValueError, "positive power of two"):
+            block_topk_triton(logits, bias, 3, 2, 1)
+
     def test_empty_input_returns_fp32_weights(self):
         logits = torch.empty((0, 16), dtype=torch.bfloat16, device="cuda")
         bias = torch.zeros((16,), dtype=torch.float32, device="cuda")
@@ -188,4 +222,3 @@ class TestBlockTopkTriton(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
