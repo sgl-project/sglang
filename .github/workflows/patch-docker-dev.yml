@@ -69,11 +69,18 @@ jobs:
       - name: Extract base commit
         run: |
           docker pull "${BASE_IMAGE}"
-          if BASE_SHA=$(docker run --rm "${BASE_IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
+          # --entrypoint skips the CUDA base image's banner, which goes to
+          # stdout and would otherwise be captured as part of the SHA.
+          BASE_SHA=$(docker run --rm --entrypoint git "${BASE_IMAGE}" \
+            -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null | tail -n 1)
+          # Keep anything but a bare SHA out of GITHUB_ENV: a multi-line value
+          # there is parsed as further NAME=VALUE lines and fails the step.
+          case "${BASE_SHA}" in *[!0-9a-f]*) BASE_SHA="" ;; esac
+          [ "${#BASE_SHA}" -eq 40 ] || BASE_SHA=""
+          if [ -n "${BASE_SHA}" ]; then
             echo "Image built from commit: ${BASE_SHA}"
           else
-            BASE_SHA=""
-            echo "::warning::Image has no .git directory - cannot extract base commit"
+            echo "::warning::Cannot read base commit from ${BASE_IMAGE} - fast-forward mode needs it"
           fi
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
           # Pulled only for the rev-parse above; buildx pulls the base itself.
