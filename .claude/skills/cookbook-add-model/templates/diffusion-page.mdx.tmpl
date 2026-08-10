@@ -6,6 +6,7 @@ metatags:
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { DiffusionFeatureGuide } from '/src/snippets/diffusion/feature-guide.jsx';
 
 <DiffusionModelTags tags={["__MODALITY__", "__PRIMARY_TASK__", "__DIFFERENTIATOR__", "__IMPORTANT_BOUNDARY__"]} />
 
@@ -46,6 +47,37 @@ __REQUEST_EXAMPLES__
 
 ## 5. Optional feature overlays
 
-| Goal | Overlay | Quality contract | Verified scope |
-| --- | --- | --- | --- |
-| __FEATURE_GOAL__ | `__FEATURE_FLAG__` | __QUALITY_CONTRACT__ | __VERIFIED_SCOPE__ |
+<DiffusionFeatureGuide
+  serveFeatures={[{
+    id: "__SERVE_FEATURE_ID__",
+    marker: "SV",
+    title: "__SERVE_FEATURE_TITLE__",
+    summary: "__SERVE_FEATURE_SUMMARY__",
+    quality: { label: "__QUALITY_LABEL__", tone: "__QUALITY_TONE__" },
+    scope: "__VERIFIED_SCOPE__",
+    defaultValue: "__DEFAULT_VALUE__",
+    contract: "__QUALITY_CONTRACT__",
+    compatibility: "__COMPATIBILITY_BOUNDARY__",
+    recipes: [{
+      label: "__RECIPE_LABEL__",
+      quality: { label: "__RECIPE_QUALITY__", tone: "__RECIPE_TONE__" },
+      code: "__INCREMENTAL_FLAG__",
+    }],
+  }]}
+  requestFeatures={[{
+    id: "__REQUEST_FEATURE_ID__",
+    marker: "RQ",
+    title: "__REQUEST_FEATURE_TITLE__",
+    summary: "__REQUEST_FEATURE_SUMMARY__",
+    quality: { label: "__QUALITY_LABEL__", tone: "__QUALITY_TONE__" },
+    scope: "__VERIFIED_SCOPE__",
+    defaultValue: "__DEFAULT_VALUE__",
+    contract: "__QUALITY_CONTRACT__",
+    compatibility: "__COMPATIBILITY_BOUNDARY__",
+    recipes: [{
+      label: "__RECIPE_LABEL__",
+      quality: { label: "__RECIPE_QUALITY__", tone: "__RECIPE_TONE__" },
+      code: "__REQUEST_FIELD__",
+    }],
+  }]}
+/>

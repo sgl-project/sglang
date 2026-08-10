@@ -6,6 +6,7 @@ metatags:
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { DiffusionFeatureGuide } from '/src/snippets/diffusion/feature-guide.jsx';
 
 <DiffusionModelTags tags={["video + audio", "T2VA / FL2VA / Ref2VA", "multimodal references", "4–15 seconds", "768p"]} />
 
@@ -76,7 +77,7 @@ also selects the verified 2-node cross-node topology. AMD keeps its resident
 AITER recipe, while RTX 5090 uses its dedicated layerwise-offload profile.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
-import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
+import { config, featureGuide } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
 
 <Deployment config={config} />
 
@@ -85,6 +86,18 @@ The ready-to-run request template lives behind the **$ cURL** button in the
 picker above. It regenerates as you change the selection, so the payload it
 shows always matches the serve command next to it.
 </Note>
+
+### Add orthogonal features
+
+Start with the picker-generated base recipe. Apply startup flags from the
+serve-time rail, then choose request fields independently for each generation.
+The widget shows defaults, quality contracts, compatibility boundaries, and
+only the incremental configuration that must be added.
+
+<DiffusionFeatureGuide
+  serveFeatures={featureGuide.serveFeatures}
+  requestFeatures={featureGuide.requestFeatures}
+/>
 
 The selector uses the verified Hugging Face ID. To use ModelScope through the
 same normal `sglang serve` path, prefix the copied command with
@@ -560,22 +573,9 @@ path above remains fail-closed to the audited 4×H200 workload.
 
 ## 7. Optional feature overlays
 
-Start from the picker-generated base command, then add only the overlays that
-match the deployment goal. These controls are intentionally outside the
-hardware matrix: changing an attention kernel, weight precision, cache policy,
-or encoder scheduling does not create a new base topology.
-
-- **Production baseline** — Leave attention and quantization unset. This keeps native BF16/FP32 weights and platform-selected dense attention; start here and use it for consistency ground truth.
-
-- **Force FlashAttention** — Add `--attention-backend fa`. Inputs keep their native precision, but backend-level floating-point differences remain; use it for an explicit kernel comparison rather than as a second default.
-
-- **SageAttention** — Add `--attention-backend sage_attn`. Its attention math is quantized and approximate; benchmark latency and inspect both video and audio quality. Hopper requires the fixed installation below.
-
-- **Online FP8 weights** — Add `--quantization fp8`. Transformer weights are approximate while required H3 projections remain FP32. This is verified only on resident B200/B300; do not infer support for other cells.
-
-- **Cache-DiT** — Use the sampling configuration from section 6. Block reuse is approximate, task-dependent, and incompatible with FSDP or DiT layerwise offload.
-
-- **Encoder scheduling** — Use `--encoder-parallel auto|fold|dp|replicate`. Keep `auto` for the base recipe; `fold` and `replicate` preserve single-request encoding, while DP is a separately measured throughput choice.
+The feature guide beside the base command keeps the common decisions compact.
+Use the detailed reference below for installation requirements, complete
+commands, topology limits, and validation evidence.
 
 <Tabs>
 
@@ -687,6 +687,37 @@ H3 validation runs.
 
 </Tab>
 
+<Tab title="Encoder scheduling">
+
+Keep `--encoder-parallel auto` for the base recipe. At the default request
+batch size of one, H100/H200/B200/B300 servers with peer-to-peer access fold
+the Qwen encoder across otherwise idle Ulysses ranks. A pure-TP recipe already
+shards the encoder over its TP group and does not add a world fold.
+
+Use an explicit fold for measured single-request latency:
+
+```bash Overlay
+--encoder-parallel fold
+```
+
+Encoder DP is a throughput policy for compatible request batches. It requires
+TP1 and DiT DP1, replicates the encoder weights, and does not improve a batch
+of one:
+
+```bash Overlay
+--encoder-parallel dp \
+--batching-max-size 2
+```
+
+Use replication for cross-node H3, where the automatic fold decision is not
+node-boundary aware:
+
+```bash Overlay
+--encoder-parallel replicate
+```
+
+</Tab>
+
 </Tabs>
 
 ## 8. Configuration notes
@@ -701,9 +732,6 @@ H3 validation runs.
 - The distilled pipeline uses a single denoising branch, so CFG parallelism does not apply. Do not enable it: `--enable-cfg-parallel true` or `--cfg-parallel-size` greater than 1 is rejected instead of duplicating the positive branch. Explicitly disabling CFG, or setting its size to 1, remains a valid no-op.
 - The released visual VAE quality recipe uses overlapping tiled decode. SGLang keeps that recipe by default and distributes complete tiles across the decode group; this changes scheduling, not the computation inside each tile.
 - H3 rejects `--vae-config.parallel-decode-mode spatial` and `spatial_shard`: validation found output mismatches. Use the default released tiled recipe.
-- Keep the default `--encoder-parallel auto`. With the server’s default `batching_max_size` of 1, single-node H100/H200/B200/B300 recipes with peer-to-peer access fold the Qwen text encoder over otherwise idle Ulysses ranks. This is separate from DiT tensor parallelism. A pure-TP recipe already shards the encoder over its TP group and does not add a world fold.
-- For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1; compatible requests are distributed across ranks, while every rank keeps a full encoder replica. Encoder DP requires TP1 and DiT DP1, so it is disabled for the H100 TP2 + Ulysses2 and RTX 5090 TP2 recipes. It provides no benefit for a batch of one and is not bitwise-identical to the folded deployment.
-- Use explicit **Fold** to prioritize single-request latency and encoder memory on a measured high-bandwidth single-node topology. Use **Replicate** as the compatibility path when folding or encoder DP is unsuitable.
 - `--use-fsdp-inference true` shards only the DiT. MiniMax-H3 preserves the original FP32 dtype of its patch, time, and output projections during FSDP all-gather, so this path does not trade numerical correctness for memory. On 4×H100, prefer TP2 + Ulysses2 for speed; use FSDP as an explicit capacity policy rather than assuming it is faster.
 - `speed` keeps model components resident, `auto` applies the model-aware 120 GiB residency threshold, and `memory` enables the memory-saving placement policy. Explicit `--layerwise-offload-components` overrides that placement list. DiT residency/prefetch knobs are scoped to the DiT; the text encoder and video VAE decoder use one-layer prefetch and zero residency, while the H3 video VAE encoder stays resident. When `memory` is combined with explicit FSDP, H3 instead keeps the sharded DiT on GPU and layerwise-offloads the text encoder and executable VAE decoder blocks. Use `speed` only after confirming that the complete target workload fits.
 - Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.

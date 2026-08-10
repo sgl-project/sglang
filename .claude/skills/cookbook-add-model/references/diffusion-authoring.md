@@ -44,18 +44,24 @@ only when it changes one of these:
 - pipeline or request mode needed to produce the matching command and cURL;
 - a placement policy with a separately validated capacity/performance cell.
 
-Do not multiply the matrix for independent feature knobs. Put them in an `Optional feature
-overlays` section after the base recipe:
+Do not multiply the matrix for independent feature knobs. Use the shared
+`DiffusionFeatureGuide` after the base recipe and separate controls by lifecycle:
 
-| Goal | Overlay | Quality contract | Verified scope |
-| --- | --- | --- | --- |
-| Force an attention kernel | `--attention-backend ...` | Native precision or approximate/quantized | Exact hardware and task tested |
-| Quantize weights | `--quantization ...` | Approximate; list protected FP32 layers | Exact checkpoint and hardware tested |
-| Reuse computation | Cache-DiT sampling config | Approximate block reuse | Exact task profile tested |
+- **Serve-time overlays** are startup flags that change kernels, precision, placement, or
+  execution policy without creating a new base topology. Examples include attention backend,
+  online quantization, encoder scheduling, and graph execution.
+- **Request-time features** are sampling fields that may change between requests on the same
+  resident server. Examples include an audited Cache-DiT quality level or multiple outputs.
 
-For every overlay, document the default, the exact flag/config, whether it changes numerical
-or perceptual output, incompatible combinations, and the hardware/task actually validated.
-Sampling controls stay with request examples; they do not belong in the deployment matrix.
+Each feature entry must expose its default, exact incremental flag/config, quality contract,
+incompatible combinations, and verified hardware/task. Use the quality labels to distinguish
+native or lossless execution from approximate and experimental paths. Keep the collapsed
+summary decision-complete; put installation steps, full commands, and benchmark methodology in
+the detailed reference below the widget.
+
+Do not make the guide another stateful command builder. Its copy action emits only the overlay
+fragment, and its choices do not join the deployment matrix or URL state. Sampling controls stay
+with request examples even when the guide summarizes them.
 
 ## Review checklist
 
@@ -63,6 +69,7 @@ Sampling controls stay with request examples; they do not belong in the deployme
 - the first screen explains capability, strength, and boundary without marketing filler;
 - checkpoint variants and request modes are unambiguous;
 - the picker remains a small base-recipe selector;
+- the feature guide separates serve-time startup flags from request-time sampling fields;
 - attention, quantization, caching, compile, and similar orthogonal features have explicit
   quality contracts and verified scopes;
 - unverified hardware or performance claims are absent;

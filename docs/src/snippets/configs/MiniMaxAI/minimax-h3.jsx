@@ -566,3 +566,155 @@ export const config = {
     },
   ],
 };
+
+export const featureGuide = {
+  serveFeatures: [
+    {
+      id: "attention",
+      marker: "AT",
+      title: "Attention backend",
+      summary: "Choose the dense-attention kernel without changing the checkpoint.",
+      quality: { label: "Mixed paths", tone: "neutral" },
+      scope: "Platform-dependent",
+      defaultValue: "Platform-selected dense attention",
+      contract: "FlashAttention keeps native input dtype; SageAttention quantizes attention math.",
+      compatibility: "Use component overrides only for measured modules. SageAttention requires its packed-varlen dependency.",
+      recipes: [
+        {
+          label: "Platform default",
+          quality: { label: "Baseline", tone: "baseline" },
+          description: "Leave the flag unset for the production and consistency baseline.",
+        },
+        {
+          label: "FlashAttention",
+          quality: { label: "Native dtype", tone: "native" },
+          description: "Use for an explicit kernel comparison; floating-point ordering can still differ.",
+          code: "--attention-backend fa",
+        },
+        {
+          label: "SageAttention",
+          quality: { label: "Approximate", tone: "approximate" },
+          description: "Quantized attention math; inspect both video and audio quality.",
+          code: "--attention-backend sage_attn",
+        },
+      ],
+    },
+    {
+      id: "quantization",
+      marker: "Q8",
+      title: "Online FP8",
+      summary: "Reduce transformer weight memory while protecting H3's FP32 projections.",
+      quality: { label: "Approximate", tone: "approximate" },
+      scope: "B200 / B300 resident",
+      defaultValue: "Native BF16/FP32 weights",
+      contract: "Transformer linear weights are quantized; required patch, time, and output projections remain FP32.",
+      compatibility: "Validated only on resident B200/B300. Combining it with Cache-DiT compounds approximations.",
+      recipes: [
+        {
+          label: "Online FP8",
+          quality: { label: "Approximate", tone: "approximate" },
+          code: "--quantization fp8",
+        },
+        {
+          label: "Protect extra layers",
+          quality: { label: "Selective FP8", tone: "approximate" },
+          code: "--quantization fp8 \\\n--quantization-ignored-layers blocks.0.attn token_refiner",
+        },
+      ],
+    },
+    {
+      id: "encoder",
+      marker: "EP",
+      title: "Encoder scheduling",
+      summary: "Place Qwen text encoding independently from DiT parallelism.",
+      quality: { label: "Execution policy", tone: "native" },
+      scope: "Topology-dependent",
+      defaultValue: "auto",
+      contract: "Fold and replicate preserve native weights; DP changes batching and is not bitwise-identical to fold.",
+      compatibility: "DP requires TP1 and DiT DP1. Fold expects fast peer-to-peer access; cross-node H3 uses replicate.",
+      recipes: [
+        {
+          label: "Fold for one request",
+          quality: { label: "Native weights", tone: "native" },
+          code: "--encoder-parallel fold",
+        },
+        {
+          label: "DP for a request batch",
+          quality: { label: "Throughput", tone: "baseline" },
+          code: "--encoder-parallel dp \\\n--batching-max-size 2",
+        },
+        {
+          label: "Cross-node compatibility",
+          quality: { label: "Native weights", tone: "native" },
+          code: "--encoder-parallel replicate",
+        },
+      ],
+    },
+    {
+      id: "graphs",
+      marker: "GX",
+      title: "Graph execution",
+      summary: "Opt into captured or compiled execution only for a measured signature.",
+      quality: { label: "Experimental", tone: "experimental" },
+      scope: "B200 Ref2VA / H200",
+      defaultValue: "Eager DiT",
+      contract: "BCG preserves matching-signature eager output; torch.compile currently changes H3 numerical output.",
+      compatibility: "BCG takes precedence over Cache-DiT and reserves capture memory. Compile is not a consistency mode.",
+      recipes: [
+        {
+          label: "Breakable CUDA graph",
+          quality: { label: "Matching signature", tone: "native" },
+          code: "--enable-breakable-cuda-graph true \\\n--warmup-resolutions 1344x768 \\\n--bcg-text-buckets 5504",
+        },
+        {
+          label: "torch.compile experiment",
+          quality: { label: "Numerically different", tone: "experimental" },
+          code: "--enable-torch-compile true",
+        },
+      ],
+    },
+  ],
+  requestFeatures: [
+    {
+      id: "quality",
+      marker: "QD",
+      title: "Quality level",
+      summary: "Switch between the reference path and the audited Cache-DiT policy per request.",
+      quality: { label: "Approximate option", tone: "approximate" },
+      scope: "4× H200 audited",
+      defaultValue: "quality: lossless",
+      contract: "lossless is reference-exact; high measured 1.40× with SSIM 0.931 and PSNR 28.16 dB.",
+      compatibility: "high is fail-closed to the audited workload and cannot use FSDP, DiT offload, or BCG.",
+      recipes: [
+        {
+          label: "Reference path",
+          quality: { label: "Lossless", tone: "native" },
+          code: "\"quality\": \"lossless\"",
+        },
+        {
+          label: "Audited acceleration",
+          quality: { label: "1.40× measured", tone: "approximate" },
+          code: "\"quality\": \"high\"",
+        },
+      ],
+    },
+    {
+      id: "outputs",
+      marker: "N×",
+      title: "Multiple outputs",
+      summary: "Generate several variants without changing the resident server.",
+      quality: { label: "Independent variants", tone: "baseline" },
+      scope: "2× RTX 5090 measured",
+      defaultValue: "One output",
+      contract: "Each output runs its own denoise and decode path; model math is unchanged.",
+      compatibility: "The 32 GB offload recipe runs outputs sequentially to keep peak memory bounded.",
+      recipes: [
+        {
+          label: "Two variants",
+          quality: { label: "Request field", tone: "baseline" },
+          code: "\"num_outputs_per_prompt\": 2",
+        },
+      ],
+    },
+  ],
+};
