@@ -187,7 +187,7 @@ class Pi05PolicyModel(nn.Module):
             not self.config.enable_prefix_cuda_graph
             or self.device.type != "cuda"
             or self.runtime_role not in ("all", "prefix")
-            or self._prefix_kv_requires_tp_gather()
+            or self._prefix_tensor_parallel_enabled()
         ):
             return False
         return not any(
@@ -820,6 +820,10 @@ class Pi05PolicyModel(nn.Module):
         if paligemma is None:
             return None
         return paligemma.model.language_model
+
+    def _prefix_tensor_parallel_enabled(self) -> bool:
+        language_model = self._prefix_language_model()
+        return language_model is not None and language_model.tensor_parallel
 
     def _prefix_kv_requires_tp_gather(self) -> bool:
         language_model = self._prefix_language_model()

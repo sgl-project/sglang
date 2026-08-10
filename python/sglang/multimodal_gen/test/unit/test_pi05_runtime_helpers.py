@@ -102,6 +102,16 @@ def test_denoise_graph_copies_mutable_prefix_graph_output():
     assert captured.static_prefix_context.past_key_values[0][0].eq(2.0).all()
 
 
+def test_prefix_graph_rejects_tensor_parallel_prefix():
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    model.config = Pi05PipelineConfig()
+    model.device = torch.device("cuda")
+    model.runtime_role = "all"
+    model._prefix_language_model = lambda: SimpleNamespace(tensor_parallel=True)
+
+    assert not model._prefix_cuda_graph_enabled()
+
+
 def test_runai_direct_gpu_loader_does_not_reject_split_roles(monkeypatch):
     class FakeSafeOpen:
         def __enter__(self):
