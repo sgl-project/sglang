@@ -568,7 +568,9 @@ def test_kimi_k25_encoder_dp_loader_preserves_owner_item_order():
         torch.testing.assert_close(loaded, torch.cat([second, first]))
         return torch.zeros(3, 2)
 
-    with patch(
+    with get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    ), patch(
         "sglang.srt.models.kimi_k25.run_dp_sharded_mrope_vision_model",
         side_effect=run_dp,
     ):
