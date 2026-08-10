@@ -42,12 +42,12 @@ export const config = {
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"What is the capital of France?"}] }'`,
 
   dockerImages: {
-    "h20-3e": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "h200": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "h800": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "h100": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "b200": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "gb300": "lmsysorg/sglang:dev-Ling-3.0-flash",
+    "h20-3e": "lmsysorg/sglang:dev-Ling-3.0-tiny",
+    "h200": "lmsysorg/sglang:dev-Ling-3.0-tiny",
+    "h800": "lmsysorg/sglang:dev-Ling-3.0-tiny",
+    "h100": "lmsysorg/sglang:dev-Ling-3.0-tiny",
+    "b200": "lmsysorg/sglang:dev-Ling-3.0-tiny",
+    "gb300": "lmsysorg/sglang:dev-Ling-3.0-tiny",
   },
 
   benchmarkCommands: {

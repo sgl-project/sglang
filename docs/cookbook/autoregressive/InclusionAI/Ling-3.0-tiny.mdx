@@ -11,7 +11,7 @@ tag: NEW
 <Accordion title="Install SGLang">
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-Ling-3.0-flash
+docker pull lmsysorg/sglang:dev-Ling-3.0-tiny
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -53,7 +53,7 @@ It is a thinking model with chain-of-thought enabled by default, and it supports
 ## 2. Configuration Tips
 
 - At ~7.9B total / 15.8 GB in BF16 (~7.9 GB in FP8), a single GPU is plenty — `--tp 1` on every supported card. Tensor parallelism (`--tp 2`/`--tp 4`) is only useful to raise aggregate KV-cache capacity for many long-context concurrent requests.
-- SGLang uses the same `lmsysorg/sglang:dev-Ling-3.0-flash` runtime image for Ling-3.0-tiny; the `bailing_hybrid` architecture is shared with Ling-3.0-flash, so no separate image is needed.
+- Use the dedicated `lmsysorg/sglang:dev-Ling-3.0-tiny` runtime image below; it carries the `bailing_hybrid` support Ling-3.0-tiny needs.
 - The FP8 checkpoint uses blockwise (128×128) E4M3 weights with dynamic activations, quantized from the BF16 model with attention projections, the dense MoE gate, and the lm_head left in higher precision. SGLang detects the format from the checkpoint's `quantization_config`, so no explicit quantization flag is needed; the same `--tp 1` recipe serves it (`(512 / 1) % 128 == 0`).
 - Unlike Ling-3.0-flash (which pairs `--reasoning-parser ling3` / `--tool-call-parser ling3`), Ling-3.0-tiny uses `--reasoning-parser deepseek-r1` and `--tool-call-parser glm45` — its chat template emits Qwen-style `<tool_call>` blocks and an inline `...</think>` chain-of-thought. Toggle them in the **Parsers** card of the [Playground](#playground).
 - Only `--model-path`, `--tp`, `--host`, and `--port` are needed. SGLang auto-resolves the context length (native 128K from `max_position_embeddings`), the attention backend, and `--mem-fraction-static` from the GPU and the CUDA-graph runtime, so the recipes leave them unset.
