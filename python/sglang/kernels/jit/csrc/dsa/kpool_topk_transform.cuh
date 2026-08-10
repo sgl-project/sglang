@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cuda_fp16.h>
 
+namespace sglang {
 namespace {
 
 #ifndef C10_LIKELY
@@ -460,3 +461,5 @@ struct KpoolTopKTransformKernel {
 };
 
 }  // namespace
+
+}  // namespace sglang
