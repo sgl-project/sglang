@@ -82,8 +82,8 @@ pub(crate) const DEFAULT_MAX_BATCH_AGE: Duration = Duration::from_secs(10);
 pub(crate) struct ReadyObject {
     pub slug: String,
     pub raw_bytes: Vec<u8>,
-    // Read by tests (record-count assertions) but not by the production pump.
-    #[allow(dead_code)]
+    /// NDJSON record count in this batch; added to
+    /// `sgl_router_s3_export_records_uploaded_total` on successful upload.
     pub records: u64,
 }
 
@@ -518,6 +518,7 @@ fn gzip_fast(raw: Vec<u8>) -> Option<Vec<u8>> {
 
 struct UploadJobArgs {
     raw_bytes: Vec<u8>,
+    records: u64,
     slug: String,
     seq: u64,
     prefix: String,
@@ -532,8 +533,18 @@ struct UploadJobArgs {
 /// Single upload job: gzip in a blocking thread, compute key, put with retry, record metrics.
 /// The semaphore permit is moved in and held for the job's lifetime, providing backpressure.
 async fn upload_job(args: UploadJobArgs) {
-    let UploadJobArgs { raw_bytes, slug, seq, prefix, pod, uploader, metrics, is_drain, _permit } =
-        args;
+    let UploadJobArgs {
+        raw_bytes,
+        records,
+        slug,
+        seq,
+        prefix,
+        pod,
+        uploader,
+        metrics,
+        is_drain,
+        _permit,
+    } = args;
 
     // Gzip on a blocking thread so we don't hold the async executor during CPU work.
     let gz = match tokio::task::spawn_blocking(move || gzip_fast(raw_bytes)).await {
@@ -550,6 +561,7 @@ async fn upload_job(args: UploadJobArgs) {
 
     if put_with_retry(&uploader, &key, gz, PUT_MAX_ATTEMPTS).await {
         metrics.record_s3_export("object_put");
+        metrics.add_s3_export_records_uploaded(records);
         if is_drain {
             metrics.record_s3_export("drain_flushed");
         }
@@ -655,6 +667,7 @@ async fn dispatch_ready(
 
         join_set.spawn(upload_job(UploadJobArgs {
             raw_bytes: obj.raw_bytes,
+            records: obj.records,
             slug: obj.slug,
             seq: current_seq,
             prefix: prefix.to_string(),
