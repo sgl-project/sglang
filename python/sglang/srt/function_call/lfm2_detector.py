@@ -377,6 +377,13 @@ class Lfm2Detector(BaseFormatDetector):
         elif isinstance(val, ast.Set):
             # JSON has no set type; decode as a list in source order.
             return [self._get_parameter_value(v) for v in val.elts]
+        elif isinstance(val, ast.JoinedStr) and all(
+            isinstance(part, ast.Constant) for part in val.values
+        ):
+            # A placeholder-free f-string (f'hello') is a plain string
+            # constant, but Python parses it as JoinedStr; f-strings with
+            # real placeholders still fall through to the raise below.
+            return "".join(str(part.value) for part in val.values)
         elif isinstance(val, ast.Name):
             # Python True/False/None are ast.Constant on modern Python, but
             # accept their legacy node shape plus LFM2's JSON-literal spellings.
