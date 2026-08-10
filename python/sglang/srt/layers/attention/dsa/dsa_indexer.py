@@ -53,6 +53,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
+    get_device_module,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -922,10 +923,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if cached_budget is not None:
             return cached_budget
 
-        if _is_xpu:
-            total_mem = torch.xpu.get_device_properties(device_index).total_memory
-        else:
-            total_mem = torch.cuda.get_device_properties(device_index).total_memory
+        total_mem = get_device_module().get_device_properties(device_index).total_memory
 
         total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
         mem_fraction_static = get_schedule().mem_fraction_static
@@ -1011,11 +1009,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             else:
                 assert page_size == 64, "only support page size 64"
 
-            assert len(weights.shape) == 3
-            assert (
-                forward_batch.seq_lens_cpu is not None
-                and forward_batch.extend_seq_lens_cpu is not None
-            )
+        assert len(weights.shape) == 3
+        assert (
+            forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
         weights = weights.squeeze(-1)
 
         if _is_hip and not _use_aiter_preshuffle:
@@ -1560,10 +1558,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ) -> Optional[torch.Tensor]:
         if _is_hip:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
-        elif _is_xpu:
-            from sglang.srt.hardware_backend.xpu.kernels.dsa.act_quant import (
-                act_quant,
-            )
         elif not _is_npu:
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 

@@ -151,6 +151,11 @@ if _is_hip:
         print(
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
+elif _is_xpu:
+    from sgl_kernel.flash_attn import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+    )
 else:
     from sglang.kernels.ops.attention.flash_attention import (
         flash_attn_varlen_func,
@@ -2928,24 +2933,6 @@ class DeepseekSparseAttnBackend(
                 is_causal=causal,
                 return_lse=False,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-            )
-
-        # Use FA3 for SM90 (Hopper/H200) / XPU
-        if _is_xpu:
-            from sgl_kernel.flash_attn import (
-                flash_attn_varlen_func as xpu_flash_attn_varlen_func,
-            )
-
-            return xpu_flash_attn_varlen_func(
-                q=q,
-                k=k,
-                v=v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=metadata.max_seq_len_q,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=layer.scaling,
-                causal=causal,
             )
 
         return flash_attn_varlen_func(
