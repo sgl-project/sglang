@@ -451,6 +451,14 @@ class Lfm2Detector(BaseFormatDetector):
             if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                 return None  # Skip unknown tools (default legacy behavior)
 
+        if call.args:
+            # Only keyword arguments carry parameter names; positional
+            # values used to be dropped silently, emitting a
+            # successful-looking call with arguments missing. Reject
+            # instead (parseable sibling calls are kept).
+            logger.warning(f"Tool call {function_name} has positional arguments")
+            return None
+
         # Parse arguments
         arguments = {}
         for keyword in call.keywords:
