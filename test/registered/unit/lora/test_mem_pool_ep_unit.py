@@ -114,15 +114,22 @@ def _load_lora_weight_to_buffer(pool, **kwargs):
 
 def _load_moe_backend_enum():
     tree = ast.parse(MOE_UTILS_PATH.read_text())
-    backend = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MoeRunnerBackend"
-    )
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    backend = classes["MoeRunnerBackend"]
+    # The `is_*()` predicates live on a plain base class in the same module
+    # (`_MoeRunnerBackendPredicates`), shared with the extension-supplied
+    # `RegisteredMoeRunnerBackend`. Exec any such in-module base first so the
+    # enum's own ClassDef can resolve its bases; `Enum` comes from `namespace`.
+    body = [
+        classes[base.id]
+        for base in backend.bases
+        if isinstance(base, ast.Name) and base.id in classes
+    ]
+    body.append(backend)
     namespace = {"Enum": Enum}
     exec(
         compile(
-            ast.fix_missing_locations(ast.Module(body=[backend], type_ignores=[])),
+            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
             str(MOE_UTILS_PATH),
             "exec",
         ),
