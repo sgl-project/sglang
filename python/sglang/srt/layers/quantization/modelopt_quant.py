@@ -945,9 +945,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
             return UnquantizedLinearMethod()
 
-        # Must stay after the ParallelLMHead branch above: ParallelLMHead
-        # subclasses VocabParallelEmbedding, and a tied lm_head IS the
-        # embedding module, so it reaches here and gets a gather-only method.
+        # Must stay after the ParallelLMHead branch: ParallelLMHead subclasses
+        # VocabParallelEmbedding, and a tied lm_head IS the embedding module.
         if isinstance(layer, VocabParallelEmbedding):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping

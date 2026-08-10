@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Unit tests for NVFP4 token-embedding dequantization on gather."""
 
 import unittest
 
@@ -24,11 +23,8 @@ _REFERENCE_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 def reference_dequant(
     packed: torch.Tensor, block_scale: torch.Tensor, global_scale: float
 ) -> torch.Tensor:
-    """Naive per-element NVFP4 dequant used as the comparison oracle.
-
-    Deliberately a plain Python loop over the packed nibbles rather than a
-    vectorized rewrite of the code under test.
-    """
+    """Comparison oracle. Kept as a plain per-element loop on purpose: a
+    vectorized rewrite would mirror the code under test."""
     rows, half = packed.shape
     hidden = half * 2
     out = torch.zeros(rows, hidden, dtype=torch.float32)
@@ -44,8 +40,7 @@ def reference_dequant(
 
 
 def build_layer(method, vocab_size: int, hidden_size: int) -> torch.nn.Module:
-    """Materialize the layer through create_weights, then fill the packed
-    tensors the way a checkpoint would."""
+    """Materialize through create_weights, then fill as a checkpoint would."""
     layer = torch.nn.Module()
     method.create_weights(
         layer,
