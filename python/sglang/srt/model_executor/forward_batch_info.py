@@ -510,6 +510,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # req_to_token-derived READ indices can be translated at production.
     # None on non-unified pools.
     _unified_kv_loc_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    # Per-batch read-index source view (KVIndexBatchView), built lazily by the
+    # first attention-backend consumer via KVIndexSource and stashed here so
+    # TBO children and multi-consumer forwards build it once. Eager path only —
+    # the captured path rebuilds into capture-stable buffers at replay prep.
+    kv_index_view: Optional[object] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed

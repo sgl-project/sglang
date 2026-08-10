@@ -7,14 +7,25 @@ FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SI
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_to_token_ptr,  # [max_batch, max_context_len] token table; at
+    # SRC_PAGE_SIZE > 1 a PAGE-granular table (the unified pool's canonical)
     req_pool_indices_ptr,
     page_kernel_lens_ptr,
     kv_indptr,
     kv_start_idx,
     kv_indices_ptr,
     req_to_token_ptr_stride: tl.constexpr,
+    SRC_PAGE_SIZE: tl.constexpr = 1,
 ):
+    """Gather per-request token ids into a flat CSR kv_indices stream.
+
+    ``SRC_PAGE_SIZE == 1`` (default): the source table is token-granular and
+    entries are emitted verbatim — byte-identical to the historical kernel.
+    ``SRC_PAGE_SIZE == ps``: the source is the choke point's PAGE-granular
+    canonical table (entries already kernel-facing page ids); token ids are
+    reconstructed by the affine rule ``token = entry * ps + pos % ps``, exact
+    because every kernel-facing id space preserves in-page offsets.
+    """
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
 
@@ -34,13 +45,23 @@ def create_flashinfer_kv_indices_triton(
         # index into req_to_token_ptr needs to be int64
         offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
         mask = offset < kv_end - kv_start
-        data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + kv_start
-            + offset,
-            mask=mask,
-        )
+        if SRC_PAGE_SIZE == 1:
+            data = tl.load(
+                req_to_token_ptr
+                + req_pool_index * req_to_token_ptr_stride
+                + kv_start
+                + offset,
+                mask=mask,
+            )
+        else:
+            pos = kv_start + offset
+            entry = tl.load(
+                req_to_token_ptr
+                + req_pool_index * req_to_token_ptr_stride
+                + pos // SRC_PAGE_SIZE,
+                mask=mask,
+            )
+            data = entry.to(tl.int64) * SRC_PAGE_SIZE + pos % SRC_PAGE_SIZE
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 

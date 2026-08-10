@@ -90,6 +90,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
+from sglang.srt.mem_cache.kv_index_source import KVIndexSource
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
@@ -799,6 +800,18 @@ class ModelRunner:
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         return max(capture_bs) * num_tokens_per_req
 
+    def init_kv_index_source(self):
+        """The read-path id-space choke point: attention backends build their
+        kv_indices / page tables from its per-batch view instead of probing
+        the allocator's id spaces themselves."""
+        self.kv_index_source = KVIndexSource(
+            req_to_token=self.req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            token_to_kv_pool=self.token_to_kv_pool,
+            page_size=self.page_size or 1,
+            device=self.device,
+        )
+
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
@@ -825,6 +838,8 @@ class ModelRunner:
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
+        self.init_kv_index_source()
+
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
