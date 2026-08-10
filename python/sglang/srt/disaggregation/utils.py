@@ -941,6 +941,26 @@ def build_transfer_entry_pairs(
     return [(i, i) for i in range(n_src)]
 
 
+def collect_kv_layer_ids_for_transfer(*pool_entries) -> List[int]:
+    """Collect complete layer metadata for all KV pools in wire-pointer order.
+
+    Speculative serving appends the draft KV pointers after the target pointers.
+    A partially described pointer list is unsafe for PP mapping, so retain the
+    legacy metadata-free path unless every non-empty pool describes every entry.
+    """
+    layer_ids = []
+    for pool, num_entries in pool_entries:
+        if num_entries == 0:
+            continue
+        if pool is None or not hasattr(pool, "get_kv_layer_ids"):
+            return []
+        pool_layer_ids = list(pool.get_kv_layer_ids())
+        if len(pool_layer_ids) != num_entries:
+            return []
+        layer_ids.extend(pool_layer_ids)
+    return layer_ids
+
+
 def resolve_dcp_dst_entry_indices(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],

@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    collect_kv_layer_ids_for_transfer,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
@@ -107,6 +108,21 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    def test_target_and_draft_layer_ids_follow_wire_pointer_order(self):
+        target = SimpleNamespace(get_kv_layer_ids=lambda: [3, 7, 3, 7])
+        draft = SimpleNamespace(get_kv_layer_ids=lambda: [0, 0])
+        self.assertEqual(
+            collect_kv_layer_ids_for_transfer((target, 4), (draft, 2)),
+            [3, 7, 3, 7, 0, 0],
+        )
+
+    def test_incomplete_draft_layer_ids_disable_all_metadata(self):
+        target = SimpleNamespace(get_kv_layer_ids=lambda: [3, 7, 3, 7])
+        draft = SimpleNamespace(get_kv_layer_ids=lambda: [0])
+        self.assertEqual(
+            collect_kv_layer_ids_for_transfer((target, 4), (draft, 2)), []
+        )
+
     def test_mha_fallback_maps_pp_entries_by_global_layer(self):
         manager = object.__new__(MooncakeKVManager)
         manager.is_mla_backend = False

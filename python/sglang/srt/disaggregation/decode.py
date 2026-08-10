@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    collect_kv_layer_ids_for_transfer,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -439,6 +440,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
         )
+        target_kv_entry_count = len(kv_data_ptrs)
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
             if self.scheduler.enable_hisparse
@@ -465,15 +467,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
+        else:
+            draft_kv_data_ptrs = []
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
+        kv_args.kv_layer_ids = collect_kv_layer_ids_for_transfer(
+            (self.token_to_kv_pool, target_kv_entry_count),
+            (self.draft_token_to_kv_pool, len(draft_kv_data_ptrs)),
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
