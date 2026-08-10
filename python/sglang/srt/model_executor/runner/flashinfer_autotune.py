@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA. The skip
 # stays on every arch it was already applied to; SM120 is exempted because the
-# IMA does not reproduce there and the kernel is otherwise left untuned.
+# IMA is not observed there and the kernel is otherwise left untuned.
 FLASHINFER_AUTOTUNE_MXFP8_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
 
 
@@ -114,8 +114,8 @@ def should_run_flashinfer_autotune(
         "modelopt_fp8",
         "modelopt_mixed",
     )
-    # SM120 reaches the same tunable FlashInfer CUTLASS MXFP8 dense GEMM, so it
-    # needs autotuning too; without this the kernel always runs at tactic=-1.
+    # SM120 reaches the same tunable FlashInfer CUTLASS FP8 GEMM path as SM100,
+    # so without this the kernel always runs at tactic=-1.
     fp8_gemm_needs_autotune = get_fp8_gemm_runner_backend().is_flashinfer_cutlass() or (
         model_uses_modelopt_fp8 and (is_sm100_supported() or is_sm120_supported())
     )
