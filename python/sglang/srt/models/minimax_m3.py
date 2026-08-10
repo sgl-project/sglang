@@ -98,6 +98,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _device_sm = get_device_sm()
 
 _FP8_KV_DTYPES = (
@@ -343,7 +344,7 @@ class MiniMaxM3MoE(nn.Module):
             num_fused_shared_experts=self.num_fused_shared_experts,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=(
-                self.experts.should_fuse_routed_scaling_factor_in_topk
+                self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
             ),
         )
 
