@@ -71,6 +71,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import (
+    get_exec,
     get_global_dwdp_manager,
     get_parallel,
     get_server_args,
@@ -91,6 +92,34 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# Log the deferred-finalize config at most once per process (rank). Different MoE
+# layers can resolve to different quant methods, so print_info_once (keyed on the
+# full message) would otherwise fire once per distinct quant method.
+_deferred_finalize_info_logged = False
+
+
+def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """Copy a CPU tensor view into independent contiguous storage."""
+    if loaded_weight.device.type != "cpu":
+        return loaded_weight
+    tensor_bytes = loaded_weight.numel() * loaded_weight.element_size()
+    needs_copy = not (
+        loaded_weight.is_contiguous()
+        and loaded_weight.storage_offset() == 0
+        and loaded_weight.untyped_storage().nbytes() == tensor_bytes
+    )
+    if not needs_copy:
+        return loaded_weight
+    return loaded_weight.clone(memory_format=torch.contiguous_format)
+
+
+def _maybe_copy_weight_view_before_h2d(
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor:
+    if not envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
+        return loaded_weight
+    return _copy_weight_view_before_h2d(loaded_weight)
 
 
 def _get_deepep_comm_group(a2a_backend):
@@ -123,6 +152,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_mooncake()
         or a2a_backend.is_mori()
         or a2a_backend.is_nixl()
+        or a2a_backend.is_pplx()
     ):
         return MaybeTboDeepEPDispatcher(
             group=_get_deepep_comm_group(a2a_backend),
@@ -153,6 +183,24 @@ class FusedMoeWeightScaleSupported(Enum):
     CHANNEL = "channel"
     GROUP = "group"
     BLOCK = "block"
+
+
+def _validate_hpc_ops_quant_method(quant_method) -> None:
+    """--moe-runner-backend hpc_ops makes the standard dispatcher keep global
+    expert ids for every MoE layer, so the resolved quant method must be the
+    FP8 one the hpc_ops runner supports. Quant methods that never construct a
+    MoeRunner (e.g. W4AFp8 calls its kernel directly from apply()) bypass the
+    MoeRunner-level guard, so validate here at layer init.
+    """
+    if get_moe_runner_backend().is_hpc_ops() and not isinstance(
+        quant_method, Fp8MoEMethod
+    ):
+        raise ValueError(
+            "--moe-runner-backend hpc_ops only supports Fp8MoEMethod "
+            "(FP8 blockwise or per-tensor MoE), but this layer selected "
+            f"{type(quant_method).__name__}. Remove --moe-runner-backend "
+            "hpc_ops for this model."
+        )
 
 
 class FusedMoE(torch.nn.Module):
@@ -240,12 +288,11 @@ class FusedMoE(torch.nn.Module):
             num_shared_slots = num_fused_shared_experts
 
         self._num_global_routed = num_experts - num_shared_slots
-        server_args = get_server_args()
-        if server_args.ep_join_mode == "scale":
-            storage_ep_size = server_args.elastic_ep_initial_size
+        if get_exec().moe.ep_join_mode == "scale":
+            storage_ep_size = get_parallel().elastic_ep_initial_size
             assert storage_ep_size is not None
             self._expert_storage_rank = (
-                server_args.ep_join_rank_offset + self.moe_ep_rank
+                get_parallel().ep_join_rank_offset + self.moe_ep_rank
             )
         else:
             storage_ep_size = self.moe_ep_size
@@ -331,17 +378,21 @@ class FusedMoE(torch.nn.Module):
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
                 )
+        _validate_hpc_ops_quant_method(self.quant_method)
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
             and get_moe_runner_backend().is_flashinfer_trtllm()
             and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
         )
-        print_info_once(
-            "FlashInfer TRTLLM MoE deferred finalize is "
-            f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
-            f"(moe_runner_backend={server_args.moe_runner_backend}, "
-            f"quant_method={type(self.quant_method).__name__})."
-        )
+        global _deferred_finalize_info_logged
+        if not _deferred_finalize_info_logged:
+            _deferred_finalize_info_logged = True
+            logging.getLogger(__name__).info(
+                "FlashInfer TRTLLM MoE deferred finalize is "
+                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+                f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
+                f"quant_method={type(self.quant_method).__name__})."
+            )
 
         self.quant_method.create_weights(
             layer=self,
@@ -539,6 +590,7 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
+            loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
@@ -606,12 +658,32 @@ class FusedMoE(torch.nn.Module):
                 if not is_bias and self.use_triton_kernels:
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
+                # When the buffer is padded (e.g., MXFP4 SM100 rounds
+                # intermediate up to 256), shard_size from the buffer may
+                # exceed the checkpoint's per-TP slice.  Derive the actual
+                # shard size from the loaded weight so we index correctly.
+                loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
+                    shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
-        expert_data.copy_(loaded_weight)
+
+        loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
+        # loaded_weight may be smaller than expert_data along shard_dim when
+        # the buffer is padded.  Copy into the leading slice and leave the
+        # trailing padding as zeros.  Rank-mismatched tensors (bias / scalar
+        # scales) don't carry shard_dim; they keep the plain broadcast copy.
+        if (
+            loaded_weight.dim() == expert_data.dim()
+            and shard_dim < expert_data.dim()
+            and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
+        ):
+            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
+                loaded_weight
+            )
+        else:
+            expert_data.copy_(loaded_weight)
 
     def _load_w2(
         self,
@@ -676,12 +748,28 @@ class FusedMoE(torch.nn.Module):
             if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
+                # Derive shard size from the loaded weight so padded buffers
+                # do not cause out-of-bounds indexing into the checkpoint.
+                loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
+                    shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
-        expert_data.copy_(loaded_weight)
+        loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
+        # loaded_weight may be smaller than expert_data along shard_dim when
+        # the buffer is padded.  Copy into the leading slice only.  See the
+        # rank-mismatch note in _load_w13.
+        if (
+            loaded_weight.dim() == expert_data.dim()
+            and shard_dim < expert_data.dim()
+            and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
+        ):
+            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
+                loaded_weight
+            )
+        else:
+            expert_data.copy_(loaded_weight)
 
     def _maybe_load_fp8_shared_expert_as_fp4(
         self,
@@ -819,7 +907,7 @@ class FusedMoE(torch.nn.Module):
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
-            not expert_id
+            expert_id is None
             and self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
@@ -1313,7 +1401,12 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
@@ -1341,11 +1434,20 @@ class FusedMoE(torch.nn.Module):
                 )
             else:
                 # Make sure there is torch lib op registration for the whole moe layer
-                return self.forward_impl(hidden_states, topk_output)
+                return self.forward_impl(
+                    hidden_states, topk_output, pre_quant_input=pre_quant_input
+                )
         else:
-            return self.forward_impl(hidden_states, topk_output)
+            return self.forward_impl(
+                hidden_states, topk_output, pre_quant_input=pre_quant_input
+            )
 
-    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -1356,6 +1458,18 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        if (
+            pre_quant_input is not None
+            and dispatch_output.format.is_standard()
+            and dispatch_output.hidden_states_scale is None
+        ):
+            # SGLANG_OPT_MOE_QUANT_ONCE: the standard dispatch was a pure
+            # passthrough, so the caller's pre-quantized (q, scale) pair still
+            # matches dispatch_output.hidden_states; attach it for the triton
+            # fused runner to skip its own activation quant.
+            dispatch_output = dispatch_output._replace(
+                hidden_states_pre_quant=pre_quant_input
+            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
