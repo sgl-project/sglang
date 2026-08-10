@@ -463,11 +463,11 @@ def _fwd_kernel(
             )
             final_mask &= custom_mask
         if SLIDING_WINDOW_SIZE > 0:
-            # Add mask where q_id <= kv_id + sliding_window_size
+            # Add mask where q_id < kv_id + sliding_window_size
             # q_id = prefix_len + cur_m, kv_id = cur_n
             window_mask = (
                 cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
-            ) <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
+            ) < (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
             final_mask &= window_mask
 
         SKIP_TILE = False
@@ -622,8 +622,8 @@ def _fwd_kernel(
             final_mask &= mask_non_causal
 
         if SLIDING_WINDOW_SIZE > 0:
-            # Add mask where q_id <= kv_id + sliding_window_size
-            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
+            # Add mask where q_id < kv_id + sliding_window_size
+            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) < (
                 start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
             )
             final_mask &= window_mask
