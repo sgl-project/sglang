@@ -33,17 +33,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA, which is
-# only known to reproduce on SM100.
-FLASHINFER_AUTOTUNE_SM100_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
+# TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA. The skip
+# stays on every arch it was already applied to; SM120 is exempted because the
+# IMA does not reproduce there and the kernel is otherwise left untuned.
+FLASHINFER_AUTOTUNE_MXFP8_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
 
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
-    from sglang.srt.utils import is_sm100_supported
+    from sglang.srt.utils import is_sm120_supported
 
     skip_ops = set(model_runner.server_args.flashinfer_autotune_skip_ops or ())
-    if is_sm100_supported():
-        skip_ops.update(FLASHINFER_AUTOTUNE_SM100_WORKAROUND_SKIPS)
+    if not is_sm120_supported():
+        skip_ops.update(FLASHINFER_AUTOTUNE_MXFP8_WORKAROUND_SKIPS)
     return skip_ops
 
 
