@@ -21,6 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.npu import NpuSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
@@ -46,6 +47,16 @@ def _is_xpu_available() -> bool:
     return torch.xpu.is_available()
 
 
+def _is_npu_available() -> bool:
+    # Guard on hasattr because ``torch.npu`` is registered by ``torch_npu``
+    # at import time; environments without torch_npu installed simply won't
+    # have the attribute. We intentionally do NOT call
+    # ``sglang.srt.utils.common.is_npu`` here -- that helper raises when
+    # torch_npu is present but no NPU device is visible, and a boolean
+    # "available" probe must never raise.
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
 def _resolve_platform() -> SRTPlatform:
     """
     Discover and instantiate the active platform.
@@ -68,6 +79,7 @@ def _resolve_platform() -> SRTPlatform:
          - 0 activated + CUDA available → fallback CudaSRTPlatform
          - 0 activated + ROCm available → fallback RocmSRTPlatform
          - 0 activated + XPU available  → fallback XpuSRTPlatform
+         - 0 activated + NPU available  → fallback NpuSRTPlatform
          - 0 activated + none of the above → fallback base SRTPlatform
          - 1 activated → use it
          - N activated → RuntimeError (must set SGLANG_PLATFORM)
@@ -135,6 +147,9 @@ def _resolve_platform() -> SRTPlatform:
         if _is_xpu_available():
             logger.debug("No platform plugin detected. Using XPU SRTPlatform defaults.")
             return XpuSRTPlatform()
+        if _is_npu_available():
+            logger.debug("No platform plugin detected. Using NPU SRTPlatform defaults.")
+            return NpuSRTPlatform()
         logger.debug("No platform detected. Using base SRTPlatform.")
         return SRTPlatform()
 
