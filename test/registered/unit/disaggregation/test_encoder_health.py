@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from sglang.srt.disaggregation import encode_http_server as encode_server
+from sglang.srt.disaggregation.encoder import http_server
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -34,11 +34,11 @@ class _FakeEncoder:
 
 def _install_tp_encoder(monkeypatch, encoder):
     broadcasts = []
-    monkeypatch.setattr(encode_server, "dp_dispatcher", None)
-    monkeypatch.setattr(encode_server, "encoder", encoder)
-    monkeypatch.setattr(encode_server, "send_sockets", [object()])
+    monkeypatch.setattr(http_server, "dp_dispatcher", None)
+    monkeypatch.setattr(http_server, "encoder", encoder)
+    monkeypatch.setattr(http_server, "send_sockets", [object()])
     monkeypatch.setattr(
-        encode_server,
+        http_server,
         "sock_send",
         lambda socket, payload: broadcasts.append((socket, payload)),
     )
@@ -51,7 +51,7 @@ def test_health_encode_waits_for_collective_dispatch_lock(monkeypatch):
         broadcasts = _install_tp_encoder(monkeypatch, encoder)
         await encoder.encode_dispatch_lock.acquire()
 
-        task = asyncio.create_task(encode_server.health_generate())
+        task = asyncio.create_task(http_server.health_generate())
         await asyncio.sleep(0)
         assert broadcasts == []
         assert encoder.encode_calls == []
@@ -71,7 +71,7 @@ def test_health_encode_rechecks_busy_state_after_waiting(monkeypatch):
         broadcasts = _install_tp_encoder(monkeypatch, encoder)
         await encoder.encode_dispatch_lock.acquire()
 
-        task = asyncio.create_task(encode_server.health_generate())
+        task = asyncio.create_task(http_server.health_generate())
         await asyncio.sleep(0)
         encoder.embedding_to_send["real-request"] = object()
         encoder.encode_dispatch_lock.release()

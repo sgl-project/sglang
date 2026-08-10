@@ -21,7 +21,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
-from sglang.srt.disaggregation.encode_server import MMEncoder, launch_encoder
+from sglang.srt.disaggregation.encoder.server import MMEncoder, launch_encoder
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.runtime_context import get_disagg

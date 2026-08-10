@@ -15,17 +15,17 @@ import zmq.asyncio
 from fastapi import HTTPException
 from PIL import Image
 
-from sglang.srt.disaggregation.encode_receiver import (
+from sglang.srt.disaggregation.encoder.preprocessor import (
+    EncoderPreprocessor,
+    EncoderPreprocessResult,
+)
+from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
     MMReceiverHTTP,
     MultiModalEmbeddingData,
     _select_mm_processor_prompt,
 )
-from sglang.srt.disaggregation.encode_server import MMEncoder
-from sglang.srt.disaggregation.encoder_preprocessor import (
-    EncoderPreprocessor,
-    EncoderPreprocessResult,
-)
+from sglang.srt.disaggregation.encoder.server import MMEncoder
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
@@ -155,13 +155,13 @@ def test_kimi_k3_epd_selects_matching_jpeg_decode_mode(
 ):
     expected = torch.zeros((3, 2, 3), dtype=torch.uint8)
     encoder = _encoder()
-    encoder.use_image_processor_gpu = use_image_processor_gpu
+    encoder.preprocessor.use_image_processor_gpu = use_image_processor_gpu
 
     with patch(
-        "sglang.srt.disaggregation.encode_server.load_image",
+        "sglang.srt.disaggregation.encoder.preprocessor.load_image",
         return_value=(expected, None),
     ) as load:
-        output = encoder._load_single_item(b"jpeg", Modality.IMAGE)
+        output = encoder.preprocessor._load_single_item(b"jpeg", Modality.IMAGE)
 
     assert output is expected
     load.assert_called_once_with(b"jpeg", expected_decode_mode)

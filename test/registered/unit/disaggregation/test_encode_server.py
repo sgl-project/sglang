@@ -7,8 +7,10 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.encode_receiver import EmbeddingData
-from sglang.srt.disaggregation.encode_server import (
+from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
+from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
+from sglang.srt.disaggregation.encoder.runtime import execute_encode_pipeline
+from sglang.srt.disaggregation.encoder.server import (
     EncoderDelivery,
     InternalError,
     MMEncoder,
@@ -21,8 +23,6 @@ from sglang.srt.disaggregation.encode_server import (
     rid_to_receive_count,
     rid_to_receive_endpoint,
 )
-from sglang.srt.disaggregation.encoder_preprocessor import EncoderPreprocessor
-from sglang.srt.disaggregation.encoder_runtime import execute_encode_pipeline
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci

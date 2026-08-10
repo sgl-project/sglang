@@ -22,15 +22,15 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encode_receiver import (
-    EmbeddingData,
-    video_meta_attrs_for,
-)
-from sglang.srt.disaggregation.encoder_preprocessor import (
+from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
     _convert,
     _mm_grid_attrs,
+)
+from sglang.srt.disaggregation.encoder.receiver import (
+    EmbeddingData,
+    video_meta_attrs_for,
 )
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
@@ -443,7 +443,7 @@ class MMEncoder:
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
         self.rank = rank
-        # DP rank for metric labels; overridden by encoder_runtime.run_dp_worker.
+        # DP rank for metric labels; overridden by runtime.run_dp_worker.
         # 0 in the single-instance (non-DP) path.
         self.dp_rank = 0
         self.profiler = EncoderProfiler(rank)
@@ -1994,7 +1994,7 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
 
 
 # Per-process encoder metrics collector. Set by
-# encoder_runtime.launch_local_runtime (non-DP) and
-# encoder_runtime.run_dp_worker (DP mode). None when metrics disabled. Kept
+# runtime.launch_local_runtime (non-DP) and
+# runtime.run_dp_worker (DP mode). None when metrics disabled. Kept
 # here because MMEncoder GPU methods reference it directly.
 encoder_metrics_collector: Optional[EncoderMetricsCollector] = None

@@ -1,7 +1,7 @@
 """Protocol-neutral runtime for the EPD encoder server.
 
 The current runtime keeps :class:`EncoderScheduler` and the rank-0
-:class:`encode_server.MMEncoder` in the same process.  It also owns HTTP's
+:class:`server.MMEncoder` in the same process.  It also owns HTTP's
 existing DP replica processes and dispatch plumbing so another transport can
 reuse that backend topology without importing the HTTP server.
 """
@@ -23,9 +23,9 @@ from typing import Dict, List, Optional, Set, Tuple
 import zmq
 import zmq.asyncio
 
-import sglang.srt.disaggregation.encode_server as encode_server_module
+import sglang.srt.disaggregation.encoder.server as server_module
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encode_server import (
+from sglang.srt.disaggregation.encoder.server import (
     ENCODER_MAX_BATCH_SIZE,
     ENCODER_MAX_BATCH_SIZE_EXPLICIT,
     EncoderProfiler,
@@ -101,7 +101,7 @@ class EncoderScheduler:
         send_sockets: List[zmq.Socket],
         max_batch_size: int,
         coalesce_same_turn: bool = False,
-        request_timeout: float = encode_server_module.ENCODER_REQ_TIMEOUT,
+        request_timeout: float = server_module.ENCODER_REQ_TIMEOUT,
     ):
         self.encoder = encoder
         self.send_sockets = send_sockets
@@ -241,7 +241,7 @@ class EncoderScheduler:
                 continue
             logger.error(f"Dropping req_id={p.request.get('req_id')} from batch: {err}")
             if not p.future.done():
-                p.future.set_exception(encode_server_module.BadRequestError(err))
+                p.future.set_exception(server_module.BadRequestError(err))
         if not valid:
             return
         group = valid
@@ -249,9 +249,9 @@ class EncoderScheduler:
         requests = [p.request for p in group]
         start = time.time()
         modality_str = modality.name.lower()
-        if encode_server_module.encoder_metrics_collector is not None:
+        if server_module.encoder_metrics_collector is not None:
             for p in group:
-                encode_server_module.encoder_metrics_collector.observe_queue_wait(
+                server_module.encoder_metrics_collector.observe_queue_wait(
                     max(0.0, start - p.submit_time), modality=modality_str
                 )
         try:
@@ -319,8 +319,8 @@ class EncoderScheduler:
             req = p.request
             try:
                 start = time.time()
-                if encode_server_module.encoder_metrics_collector is not None:
-                    encode_server_module.encoder_metrics_collector.observe_queue_wait(
+                if server_module.encoder_metrics_collector is not None:
+                    server_module.encoder_metrics_collector.observe_queue_wait(
                         max(0.0, start - p.submit_time), modality=modality_str
                     )
                 for sock in self.send_sockets:
@@ -520,7 +520,7 @@ class DPDispatcher:
         # Skip ranks whose worker process has died.
         alive_ranks = self.alive_ranks
         if not alive_ranks:
-            raise encode_server_module.MMError(
+            raise server_module.MMError(
                 "All encoder DP workers are dead.",
                 code=HTTPStatus.SERVICE_UNAVAILABLE,
             )
@@ -557,14 +557,14 @@ class DPDispatcher:
             # An alive-but-stuck worker (NCCL deadlock etc.) wouldn't trip
             # the watchdog, so bound the wait explicitly.
             return await asyncio.wait_for(
-                future, timeout=encode_server_module.ENCODER_REQ_TIMEOUT
+                future, timeout=server_module.ENCODER_REQ_TIMEOUT
             )
         except asyncio.TimeoutError:
             self._drop_pending_and_mapping(rank, req_id)
             return self._timeout_envelope(
                 req_id,
                 "encode",
-                f"Encoder DP rank={rank} timed out after {encode_server_module.ENCODER_REQ_TIMEOUT}s",
+                f"Encoder DP rank={rank} timed out after {server_module.ENCODER_REQ_TIMEOUT}s",
             )
         except BaseException:
             self._drop_pending_and_mapping(rank, req_id)
@@ -573,7 +573,7 @@ class DPDispatcher:
     async def dispatch_register_destinations(self, request: dict) -> dict:
         """Route a scheduler receive URL to the DP worker owning ``req_id``."""
         req_id = request["req_id"]
-        deadline = time.monotonic() + min(5.0, encode_server_module.ENCODER_REQ_TIMEOUT)
+        deadline = time.monotonic() + min(5.0, server_module.ENCODER_REQ_TIMEOUT)
         async with self._mapping_condition:
             while req_id not in self.req_id_to_rank:
                 remaining = deadline - time.monotonic()
@@ -616,7 +616,7 @@ class DPDispatcher:
                 self.dispatch_sockets[rank], wrap_as_pickle(worker_request)
             )
             return await asyncio.wait_for(
-                future, timeout=encode_server_module.ENCODER_REQ_TIMEOUT
+                future, timeout=server_module.ENCODER_REQ_TIMEOUT
             )
         except asyncio.TimeoutError:
             self.pending_futures[rank].pop(key, None)
@@ -625,7 +625,7 @@ class DPDispatcher:
                 req_id,
                 "register_destinations",
                 f"Encoder DP rank={rank} URL registration timed out after "
-                f"{encode_server_module.ENCODER_REQ_TIMEOUT}s",
+                f"{server_module.ENCODER_REQ_TIMEOUT}s",
             )
         except BaseException:
             self.pending_futures[rank].pop(key, None)
@@ -640,7 +640,7 @@ class DPDispatcher:
         early landing-buffer allocation in DP mode.
         """
         req_id = request["req_id"]
-        deadline = time.monotonic() + min(5.0, encode_server_module.ENCODER_REQ_TIMEOUT)
+        deadline = time.monotonic() + min(5.0, server_module.ENCODER_REQ_TIMEOUT)
         async with self._mapping_condition:
             while req_id not in self.req_id_to_rank:
                 remaining = deadline - time.monotonic()
@@ -683,7 +683,7 @@ class DPDispatcher:
                 self.dispatch_sockets[rank], wrap_as_pickle(worker_request)
             )
             return await asyncio.wait_for(
-                future, timeout=encode_server_module.ENCODER_REQ_TIMEOUT
+                future, timeout=server_module.ENCODER_REQ_TIMEOUT
             )
         except asyncio.TimeoutError:
             self.pending_futures[rank].pop(key, None)
@@ -692,7 +692,7 @@ class DPDispatcher:
                 req_id,
                 "wait_metadata",
                 f"Encoder DP rank={rank} metadata wait timed out after "
-                f"{encode_server_module.ENCODER_REQ_TIMEOUT}s",
+                f"{server_module.ENCODER_REQ_TIMEOUT}s",
             )
         except BaseException:
             self.pending_futures[rank].pop(key, None)
@@ -737,7 +737,7 @@ class DPDispatcher:
         try:
             await async_sock_send(self.dispatch_sockets[rank], wrap_as_pickle(request))
             return await asyncio.wait_for(
-                future, timeout=encode_server_module.ENCODER_REQ_TIMEOUT
+                future, timeout=server_module.ENCODER_REQ_TIMEOUT
             )
         except asyncio.TimeoutError:
             self.pending_futures[rank].pop(key, None)
@@ -747,7 +747,7 @@ class DPDispatcher:
             return self._timeout_envelope(
                 req_id,
                 "send",
-                f"Encoder DP rank={rank} /send timed out after {encode_server_module.ENCODER_REQ_TIMEOUT}s",
+                f"Encoder DP rank={rank} /send timed out after {server_module.ENCODER_REQ_TIMEOUT}s",
             )
         except BaseException:
             self.pending_futures[rank].pop(key, None)
@@ -762,11 +762,11 @@ class DPDispatcher:
         # surface as a spurious per-rank timeout. All dead → 503 (same as
         # dispatch), which the profile endpoints turn into an HTTP error.
         eff_timeout = (
-            timeout if timeout is not None else encode_server_module.ENCODER_REQ_TIMEOUT
+            timeout if timeout is not None else server_module.ENCODER_REQ_TIMEOUT
         )
         alive_ranks = self.alive_ranks
         if not alive_ranks:
-            raise encode_server_module.MMError(
+            raise server_module.MMError(
                 "All encoder DP workers are dead.",
                 code=HTTPStatus.SERVICE_UNAVAILABLE,
             )
@@ -1052,8 +1052,8 @@ async def _push_embedding_to_prefill(
 
 
 def _record_pipeline_result(modality: Modality, status: str) -> None:
-    if encode_server_module.encoder_metrics_collector is not None:
-        encode_server_module.encoder_metrics_collector.inc_requests_total(
+    if server_module.encoder_metrics_collector is not None:
+        server_module.encoder_metrics_collector.inc_requests_total(
             modality=modality.name.lower(), status=status
         )
 
@@ -1080,11 +1080,11 @@ async def execute_encode_pipeline(
     modality = Modality.from_str(request["modality"])
     modality_str = modality.name.lower()
     time_stats.modality = modality_str
-    time_stats.set_metrics_collector(encode_server_module.encoder_metrics_collector)
+    time_stats.set_metrics_collector(server_module.encoder_metrics_collector)
     backend = enc.transfer_backend
 
-    if encode_server_module.encoder_metrics_collector is not None:
-        encode_server_module.encoder_metrics_collector.inc_requests_received(
+    if server_module.encoder_metrics_collector is not None:
+        server_module.encoder_metrics_collector.inc_requests_received(
             modality=modality_str
         )
 
@@ -1120,7 +1120,7 @@ async def execute_encode_pipeline(
     except asyncio.TimeoutError:
         error_msg = "encoder batch timed out"
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await encode_server_module.meta_registry.publish(
+        await server_module.meta_registry.publish(
             req_id, 0, 0, 0, error=error_msg
         )
         await enc.release_request(req_id, preserve_metadata=backend == "mooncake")
@@ -1129,7 +1129,7 @@ async def execute_encode_pipeline(
     except Exception as e:
         error_msg = str(e)
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await encode_server_module.meta_registry.publish(
+        await server_module.meta_registry.publish(
             req_id, 0, 0, 0, error=error_msg
         )
         await enc.release_request(req_id, preserve_metadata=backend == "mooncake")
@@ -1139,7 +1139,7 @@ async def execute_encode_pipeline(
     nbytes, embedding_len, embedding_dim, error_msg, error_code = result
     if error_msg:
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await encode_server_module.meta_registry.publish(
+        await server_module.meta_registry.publish(
             req_id, 0, 0, 0, error=error_msg
         )
         if backend == "mooncake":
@@ -1163,7 +1163,7 @@ async def execute_encode_pipeline(
     try:
         # Publish the actual result for every backend. ZMQ does not consume this
         # early and removes it when its synchronous send releases the request.
-        await encode_server_module.meta_registry.publish(
+        await server_module.meta_registry.publish(
             req_id, nbytes, embedding_len, embedding_dim
         )
 
@@ -1275,7 +1275,7 @@ async def _dp_worker_handle_request(
             content = None
         elif dp_type == "wait_metadata":
             try:
-                content = await encode_server_module.meta_registry.wait(
+                content = await server_module.meta_registry.wait(
                     request["req_id"]
                 )
             except asyncio.TimeoutError as e:
@@ -1302,7 +1302,7 @@ async def _dp_worker_handle_request(
             # a pre-refcount decoder: stay eager rather than pin until the sweep.
             receive_count = request.get("receive_count")
             if receive_count:
-                await encode_server_module.meta_registry.note_send_done(
+                await server_module.meta_registry.note_send_done(
                     req_id, receive_count
                 )
             else:
@@ -1397,7 +1397,7 @@ async def run_dp_worker(
         }
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
-        encode_server_module.encoder_metrics_collector = EncoderMetricsCollector(labels)
+        server_module.encoder_metrics_collector = EncoderMetricsCollector(labels)
         enc.dp_rank = dp_rank
 
     max_batch_size, coalesce_same_turn = _resolve_encoder_batch_policy(
@@ -1510,7 +1510,7 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
         }
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
-        encode_server_module.encoder_metrics_collector = EncoderMetricsCollector(labels)
+        server_module.encoder_metrics_collector = EncoderMetricsCollector(labels)
 
     process_context = mp.get_context("spawn")
     zmq_context = zmq.Context(10)

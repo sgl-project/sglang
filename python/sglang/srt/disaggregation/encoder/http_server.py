@@ -3,9 +3,9 @@
 This module is designed to be replaceable by a Rust implementation.
 It contains the FastAPI application, HTTP route handlers, HTTP lifecycle, and
 response conversion. Backend scheduling and process management are provided by
-the protocol-neutral :mod:`encoder_runtime` module.
+the protocol-neutral :mod:`runtime` module.
 
-GPU tensor operations remain in :mod:`encode_server.MMEncoder`.
+GPU tensor operations remain in :mod:`server.MMEncoder`.
 """
 
 import asyncio
@@ -23,20 +23,20 @@ import zmq
 from fastapi import Body, FastAPI
 from fastapi.responses import ORJSONResponse, Response
 
-import sglang.srt.disaggregation.encode_server as encode_server_module
+import sglang.srt.disaggregation.encoder.server as server_module
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encode_server import (
-    EncoderProfiler,
-    MMEncoder,
-    MMError,
-)
-from sglang.srt.disaggregation.encoder_runtime import (
+from sglang.srt.disaggregation.encoder.runtime import (
     DPDispatcher,
     EncoderRuntime,
     EncoderScheduler,
     execute_encode_pipeline,
     launch_dp_runtime,
     launch_local_runtime,
+)
+from sglang.srt.disaggregation.encoder.server import (
+    EncoderProfiler,
+    MMEncoder,
+    MMError,
 )
 from sglang.srt.managers.io_struct import (
     ProfileReq,
@@ -201,7 +201,7 @@ def launch_server(server_args: ServerArgs):
     configure_logger(server_args, prefix=" encode_server")
     if server_args.dp_size > 1:
         dp_dispatcher = launch_dp_runtime(server_args)
-        # encoder_runtime initializes multiprocess metrics before spawning;
+        # runtime initializes multiprocess metrics before spawning;
         # HTTP only exposes their endpoint.
         if server_args.enable_metrics:
             add_prometheus_middleware(app)
@@ -386,7 +386,7 @@ async def handle_send_request(request: dict):
     # No count means a pre-refcount decoder: leave it to the sweep, as when
     # some rank never sends at all.
     if receive_count:
-        await encode_server_module.meta_registry.note_send_done(req_id, receive_count)
+        await server_module.meta_registry.note_send_done(req_id, receive_count)
     return ORJSONResponse(content=None)
 
 
@@ -416,7 +416,7 @@ async def handle_scheduler_receive_meta_data(request: dict):
         meta = result.get("content")
     else:
         try:
-            meta = await encode_server_module.meta_registry.wait(req_id)
+            meta = await server_module.meta_registry.wait(req_id)
         except asyncio.TimeoutError:
             logger.error(f"[{req_id}] /scheduler_receive_meta_data timed out")
             return ORJSONResponse(

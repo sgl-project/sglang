@@ -47,7 +47,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -660,7 +660,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None
         if self.server_args.language_only:
-            from sglang.srt.disaggregation.encode_receiver import (
+            from sglang.srt.disaggregation.encoder.receiver import (
                 EncoderBootstrapServer,
             )
 

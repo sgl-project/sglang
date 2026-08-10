@@ -3,7 +3,7 @@
 This module is designed to be replaceable by a Rust implementation.
 It handles all CPU-bound work: media I/O (image/video/audio loading),
 HF processor calls, config validation, and related helper computations.
-GPU tensor operations remain in :mod:`encode_server.MMEncoder`.
+GPU tensor operations remain in :mod:`server.MMEncoder`.
 """
 
 import asyncio
@@ -295,8 +295,8 @@ class EncoderPreprocessor:
 
         except CLIENT_MEDIA_EXCEPTIONS as e:
             # Not ValueError: the DP envelope classifies by `.code`, which only
-            # MMError carries. Lazy import: encode_server imports this module.
-            from sglang.srt.disaggregation.encode_server import BadRequestError
+            # MMError carries. Lazy import: server imports this module.
+            from sglang.srt.disaggregation.encoder.server import BadRequestError
 
             raise BadRequestError(f"Error while loading data {data}: {e}") from e
         except Exception as e:
