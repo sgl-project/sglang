@@ -9,7 +9,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -314,7 +314,16 @@ class GroupCoordinator:
             if curr_stream != stream:
                 stream.wait_stream(curr_stream)
 
-            with torch.cuda.stream(stream):
+            # Custom all-reduce has an eager path and a graph path; only inside
+            # capture() does all_reduce pick the graph one, and only capture()
+            # exit registers the graph-pool buffers with the peers. Capturing the
+            # eager path instead faults on replay (unmapped peer IPC address).
+            custom_ar = self.srt_custom_allreduce
+            maybe_ca_context = (
+                nullcontext() if custom_ar is None else custom_ar.capture()
+            )
+
+            with torch.cuda.stream(stream), maybe_ca_context:
                 yield graph_capture_context
         else:
             # For non-CUDA platforms (MPS, CPU), just yield the context without stream management
