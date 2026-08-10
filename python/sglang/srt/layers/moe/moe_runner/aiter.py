@@ -98,10 +98,32 @@ _AITER_ACTIVATIONS = {
 }
 
 
-def _aiter_activation(activation: str):
+# aiter's ActivationType.Swiglu is SwiGLU-OAI (gpt-oss) with the alpha and the
+# `(up + beta)` bias baked in as compile-time constants.
+_AITER_SWIGLU_OAI_ALPHA = 1.702
+_AITER_SWIGLU_OAI_BETA = 1.0
+
+
+def aiter_swiglu_oai_limit(config: MoeRunnerConfig) -> Optional[float]:
+    """Clamp limit to pass aiter when ``config`` asks for exactly the SwiGLU-OAI
+    that ``ActivationType.Swiglu`` implements, else ``None``."""
+    if config.activation != "silu" or not config.is_gated:
+        return None
+    if config.gemm1_alpha != _AITER_SWIGLU_OAI_ALPHA:
+        return None
+    if config.gemm1_beta not in (None, _AITER_SWIGLU_OAI_BETA):
+        return None
+    if config.gemm1_clamp_limit is None:
+        return None
+    return float(config.gemm1_clamp_limit)
+
+
+def _aiter_activation(config: MoeRunnerConfig):
     from aiter import ActivationType
 
-    return getattr(ActivationType, _AITER_ACTIVATIONS.get(activation, "Gelu"))
+    if aiter_swiglu_oai_limit(config) is not None:
+        return ActivationType.Swiglu
+    return getattr(ActivationType, _AITER_ACTIVATIONS.get(config.activation, "Gelu"))
 
 
 def _aiter_quant_type(quant_type: AiterQuantType):
@@ -200,7 +222,7 @@ class AiterRunnerCore(MoeRunnerCore):
 
         activation = extra.pop("activation", None)
         if activation is None:
-            activation = _aiter_activation(self.config.activation)
+            activation = _aiter_activation(self.config)
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
