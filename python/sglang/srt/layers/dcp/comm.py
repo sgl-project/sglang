@@ -85,7 +85,6 @@ def cp_lse_ag_out_rs_mha(
     cp_group: GroupCoordinator,
     return_lse: bool = False,
 ):
-    """Merge DCP partial attention outputs using natural-log LSE (PR #25090)."""
     if cp_group.world_size == 1:
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
@@ -95,7 +94,8 @@ def cp_lse_ag_out_rs_mha(
     scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
     scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
 
-    out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
+    out = cp_attn_out.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+    out.mul_(scale)
     out = cp_group.all_reduce(out)
 
     cp_num_heads = global_lse.shape[1] // cp_group.world_size
