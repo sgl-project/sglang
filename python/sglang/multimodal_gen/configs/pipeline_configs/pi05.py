@@ -90,6 +90,9 @@ class Pi05PipelineConfig(PipelineConfig):
     def supports_native_grouped_requests(self):
         return True
 
+    def supports_openpi_endpoint(self) -> bool:
+        return True
+
     def estimate_request_cost(self, batch) -> float:
         return float(
             self.action_horizon * self.action_dim * self.default_num_inference_steps

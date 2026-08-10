@@ -71,6 +71,32 @@ class Cosmos3SamplingParams(SamplingParams):
     action_stats_path: str | None = None
     action_normalization: str = "quantile"
 
+    def _adjust(self, server_args) -> None:
+        super()._adjust(server_args)
+        if self.action_mode is None:
+            return
+
+        self.action_mode = str(self.action_mode).strip().lower()
+        if self.action_mode not in (
+            "policy",
+            "forward_dynamics",
+            "inverse_dynamics",
+        ):
+            raise ValueError(
+                f"Unsupported action_mode={self.action_mode!r}; expected "
+                "'policy', 'forward_dynamics', or 'inverse_dynamics'."
+            )
+
+        # Policy and inverse dynamics produce actions. Forward dynamics consumes
+        # actions to produce video and therefore remains a visual request.
+        if self.action_mode != "forward_dynamics":
+            self.data_type = DataType.ACTION
+            self.save_output = False
+            self.return_file_paths_only = False
+            self.return_frames = False
+            self.output_file_name = None
+            self.output_compression = 0
+
     def _set_output_file_name(self) -> None:
         # The pipeline config's ``task_type=TI2V`` drives ``data_type`` to
         # VIDEO, but a single-frame request is a T2I and must pick the IMAGE

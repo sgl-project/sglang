@@ -423,8 +423,9 @@ def create_app(server_args: ServerArgs):
     app.include_router(image_api.router)
     app.include_router(video_api.router)
     app.include_router(realtime_video_api.router)
-    if server_args.pipeline_config.task_type.is_action_gen():
+    if server_args.pipeline_config.supports_action_endpoint():
         app.include_router(vla_api.router)
+    if server_args.pipeline_config.supports_openpi_endpoint():
         app.include_router(openpi.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
