@@ -161,6 +161,11 @@ DEFAULT_IMAGE_URL = "https://raw.githubusercontent.com/sgl-project/sglang/main/e
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
+# Loading a few hundred GB of weights across 8 GPUs runs 600-820s on a warm
+# cache. Declared per test rather than inferred from the runner: these files
+# also run on b200, and a machine-keyed default has to be re-derived by every
+# workflow that launches tests (which is how the nightly reorg lost it once).
+LARGE_MODEL_LAUNCH_TIMEOUT = 1800
 
 
 def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Image:
@@ -210,11 +215,6 @@ def is_blackwell_system():
     return is_blackwell()
 
 
-def is_h200_system():
-    """Return whether it is running on an H200 system."""
-    return envs.IS_H200.get()
-
-
 def is_rust_server_built():
     """Return whether the embedded Rust server extension (``SGLANG_RUST_SERVER``)
     is importable.
@@ -252,13 +252,10 @@ else:
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600  # Match H200 timeout for large models
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
-
-if is_h200_system():
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
 if is_in_ci() and is_xpu():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1800
