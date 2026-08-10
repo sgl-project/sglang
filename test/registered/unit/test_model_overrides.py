@@ -22,8 +22,10 @@ from sglang.srt.arg_groups.overrides import (
     register_model_override,
     validate_declarations,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_context,
+    get_exec,
     get_server_args,
     reset_context,
 )
@@ -89,6 +91,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "fp8_gemm_runner_backend",
                     "disable_custom_all_reduce",
                     "enable_aiter_allreduce_fusion",
+                    "enable_symm_mem",
+                    "speculative_attention_mode",
                 }
             ),
         )
@@ -343,6 +347,51 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertTrue(flags.enable_tf32_matmul)
         self.assertFalse(flags.enable_multi_layer_eagle)  # pristine materialize
 
+    def test_minimax_m2_sm10x_nvfp4_uses_routed_trtllm(self):
+        """MiniMax-M2 NVFP4 auto must avoid the unsupported plain TRT-LLM path."""
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            explicit = self._construct(
+                "MiniMaxM2ForCausalLM",
+                "llama",
+                quantization="modelopt_fp4",
+                moe_runner_backend="flashinfer_cutlass",
+            )
+            non_nvfp4 = self._construct(
+                "MiniMaxM2ForCausalLM", "llama", quantization="fp8"
+            )
+            nvfp4 = self._construct(
+                "MiniMaxM2ForCausalLM", "llama", quantization="modelopt_fp4"
+            )
+
+        self.assertEqual(explicit.moe_runner_backend, "flashinfer_cutlass")
+        self.assertEqual(non_nvfp4.moe_runner_backend, "auto")
+        self.assertEqual(nvfp4.moe_runner_backend, "flashinfer_trtllm_routed")
+        self.assertTrue(nvfp4.disable_shared_experts_fusion)
+        self.assertIn(
+            (
+                "_minimax_m2_overrides",
+                {
+                    "enable_tf32_matmul": True,
+                    "moe_runner_backend": "flashinfer_trtllm_routed",
+                },
+            ),
+            nvfp4._resolved_overrides,
+        )
+        self.assertIn(
+            ("_moe_runner_fusion_disable", {"disable_shared_experts_fusion": True}),
+            nvfp4._resolved_overrides,
+        )
+
+        # Thor (SM110) and other architectures keep the existing auto behavior.
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            non_sm10x = self._construct(
+                "MiniMaxM2ForCausalLM", "llama", quantization="modelopt_fp4"
+            )
+        self.assertEqual(non_sm10x.moe_runner_backend, "auto")
+
+        self._publish(nvfp4)
+        self.assertEqual(get_exec().moe.moe_runner_backend, "flashinfer_trtllm_routed")
+
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.
@@ -401,6 +450,116 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 [("_mimo_v2_overrides", {"enable_multi_layer_eagle": True})],
             )
+
+    def _nemotron_h_args(self, *, quantized_layers):
+        hf_config = SimpleNamespace(
+            architectures=["NemotronHForCausalLM"],
+            mlp_hidden_act="relu2",
+            quantization_config={
+                "quant_algo": "MIXED_PRECISION",
+                "quant_method": "modelopt_mixed",
+                "quantized_layers": quantized_layers,
+            },
+        )
+        model_config = SimpleNamespace(
+            quantization="modelopt_mixed", hf_config=hf_config
+        )
+        return (
+            SimpleNamespace(
+                quantization="modelopt_fp4",
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+                attention_backend=None,
+                get_model_config=lambda: model_config,
+            ),
+            hf_config,
+        )
+
+    def test_nemotron_h_w4a16_moe_uses_marlin_on_sm100(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                },
+                "backbone.layers.1.mixer.experts.0.down_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                },
+                "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+            }
+        )
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _nemotron_h_overrides(server_args, hf_config),
+                {
+                    "quantization": "modelopt_mixed",
+                    "moe_runner_backend": "marlin",
+                    "attention_backend": "flashinfer",
+                },
+            )
+
+    def test_nemotron_h_nvfp4_moe_keeps_flashinfer_trtllm_on_sm100(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                },
+                "backbone.layers.1.mixer.experts.0.down_proj": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                },
+                "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+            }
+        )
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _nemotron_h_overrides(server_args, hf_config),
+                {
+                    "quantization": "modelopt_mixed",
+                    "moe_runner_backend": "flashinfer_trtllm",
+                    "attention_backend": "flashinfer",
+                },
+            )
+
+    def test_nemotron_h_w4a16_moe_rejects_a2a_backend(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                }
+            }
+        )
+        server_args.moe_a2a_backend = "deepep"
+
+        with self.assertRaisesRegex(ValueError, "moe-a2a-backend=none"):
+            _nemotron_h_overrides(server_args, hf_config)
+
+    def test_nemotron_h_w4a16_moe_rejects_non_marlin_runner(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                }
+            }
+        )
+        server_args.moe_runner_backend = "flashinfer_trtllm"
+
+        with self.assertRaisesRegex(ValueError, "moe-runner-backend=marlin"):
+            _nemotron_h_overrides(server_args, hf_config)
 
     def test_step3p_hierarchical_cache_golden(self):
         # SWA-hybrid arch: the mini config needs layer_types/sliding_window.
@@ -875,12 +1034,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
 
-        def _hf(quant_algo="NVFP4"):
-            return SimpleNamespace(
+        def _hf(quant_algo="NVFP4", *, include_quantization_config=True):
+            hf = SimpleNamespace(
                 architectures=["NemotronHForCausalLM"],
                 mlp_hidden_act="relu2",
-                quantization_config={"quant_algo": quant_algo},
             )
+            if include_quantization_config:
+                hf.quantization_config = {"quant_algo": quant_algo}
+            return hf
 
         def _args(mc_quant, hf, **kw):
             mc = SimpleNamespace(quantization=mc_quant, hf_config=hf)
@@ -936,6 +1097,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _nemotron_h_overrides(_args(None, hf, moe_runner_backend="triton"), hf),
                 {},
             )
+
+        hf_without_quant_cfg = _hf(include_quantization_config=False)
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            for modelopt_quantization in ("modelopt_fp8", "modelopt_fp4"):
+                with self.subTest(modelopt_quantization=modelopt_quantization):
+                    self.assertEqual(
+                        _nemotron_h_overrides(
+                            _args(modelopt_quantization, hf_without_quant_cfg),
+                            hf_without_quant_cfg,
+                        ),
+                        {
+                            "quantization": modelopt_quantization,
+                            "moe_runner_backend": "flashinfer_trtllm",
+                            "attention_backend": "flashinfer",
+                        },
+                    )
 
     def test_speculative_moe_runner_default_pass(self):
         from sglang.srt.arg_groups.overrides import (
@@ -1642,6 +1819,87 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {},
             )
 
+    def test_m3_fp8_attn_gemm_resolution(self):
+        from sglang.srt.arg_groups.overrides import _minimax_m3_overrides
+        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+
+        def _args(**kw):
+            defaults = dict(
+                attention_backend="trtllm_mha",
+                kv_cache_dtype="fp8_e4m3",
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=True):
+            # e4m3 + trtllm_mha + SM100: mode active
+            self.assertTrue(m3_fp8_attn_gemm_enabled(_args()))
+            # fa4 dense backend: mode inactive (no fp8-q GEMM path)
+            self.assertFalse(m3_fp8_attn_gemm_enabled(_args(attention_backend="fa4")))
+            # bf16 KV: mode inactive
+            self.assertFalse(m3_fp8_attn_gemm_enabled(_args(kv_cache_dtype="auto")))
+            # e5m2: mode inactive (fmha_sm100's variant lookup would silently
+            # dispatch the e4m3 kernel)
+            self.assertFalse(m3_fp8_attn_gemm_enabled(_args(kv_cache_dtype="fp8_e5m2")))
+            # SGLANG_DISABLE_M3_FP8_ATTN_GEMM kill switch wins over an
+            # otherwise-active config
+            with envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.override(True):
+                self.assertFalse(m3_fp8_attn_gemm_enabled(_args()))
+        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=False):
+            # non-SM100: mode inactive
+            self.assertFalse(m3_fp8_attn_gemm_enabled(_args()))
+
+        def _m3_args(**kw):
+            defaults = dict(
+                quantization=None,
+                _quantization_explicitly_unset=True,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                page_size=None,
+                moe_runner_backend="auto",
+                kv_cache_dtype="auto",
+            )
+            defaults.update(kw)
+            ns = SimpleNamespace(**defaults)
+            ns.is_attention_backend_not_set = lambda: (
+                ns.attention_backend is None
+                and ns.prefill_attention_backend is None
+                and ns.decode_attention_backend is None
+            )
+            return ns
+
+        hf = SimpleNamespace()
+        with patch.object(overrides_module, "is_hip", return_value=False), patch.object(
+            overrides_module, "is_sm100_supported", return_value=True
+        ), patch.object(overrides_module, "get_quantization_config", return_value=None):
+            # fp8_e4m3 KV: SM100 backend default flips to trtllm_mha (the only
+            # dense backend with the fp8-q GEMM path); page snaps to 128
+            ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)
+            self.assertEqual(ov["attention_backend"], "trtllm_mha")
+            self.assertEqual(ov["page_size"], 128)
+            # auto KV: fa4 stays the SM100 default
+            ov = _minimax_m3_overrides(_m3_args(), hf)
+            self.assertEqual(ov["attention_backend"], "fa4")
+            self.assertEqual(ov["page_size"], 128)
+            # e5m2 KV: stays on fa4 + the widening Triton path, and warns
+            with self.assertLogs(
+                "sglang.srt.arg_groups.overrides", level="WARNING"
+            ) as logs:
+                ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e5m2"), hf)
+            self.assertEqual(ov["attention_backend"], "fa4")
+            self.assertIn("fp8_e5m2", "\n".join(logs.output))
+            # explicit backend choice is never overridden
+            ov = _minimax_m3_overrides(
+                _m3_args(kv_cache_dtype="fp8_e4m3", attention_backend="fa4"), hf
+            )
+            self.assertNotIn("attention_backend", ov)
+            # kill switch also reverts the SM100 backend default to fa4
+            with envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.override(True):
+                ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)
+            self.assertEqual(ov["attention_backend"], "fa4")
+            self.assertEqual(ov["page_size"], 128)
+
     def test_page_constraint_passes_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
@@ -1655,6 +1913,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 attention_backend=None,
                 decode_attention_backend=None,
                 prefill_attention_backend=None,
+                speculative_draft_attention_backend=None,
                 page_size=1,
             )
             defaults.update(kw)
@@ -1681,6 +1940,30 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             ),
             {"page_size": 64},
+        )
+        # trtllm_mha accepts 128 (trtllm-gen dynamic tokens-per-page kernels)
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(attention_backend="trtllm_mha", page_size=128)
+            ),
+            {},
+        )
+        # trtllm_mha with an unsupported page still snaps to 64
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(attention_backend="trtllm_mha", page_size=256)
+            ),
+            {"page_size": 64},
+        )
+        # chained: cutlass_mla decode -> 128, then trtllm_mha prefill keeps 128
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(
+                    decode_attention_backend="cutlass_mla",
+                    prefill_attention_backend="trtllm_mha",
+                )
+            ),
+            {"page_size": 128},
         )
         # no matching backend: nothing declared
         self.assertEqual(_mla_backend_page_constraints(_view()), {})
@@ -1903,7 +2186,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self.assertEqual(
             _a2a_ep_size(
-                ResolvedView(SimpleNamespace(moe_a2a_backend="deepep", tp_size=8))
+                ResolvedView(
+                    SimpleNamespace(moe_a2a_backend="deepep", ep_size=1, tp_size=8)
+                )
             ),
             {"ep_size": 8},
         )
