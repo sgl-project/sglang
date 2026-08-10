@@ -158,9 +158,8 @@ MultimodalDataInputFormat = Union[
 
 @dataclass
 class GenerateReqInput:
-    # Logical request ID(s). If omitted, generated during normalization. For
-    # batch requests, a string is expanded to one ID per original batch item.
-    # Parallel-sampling child IDs are internal to TokenizerManager.
+    # Request ID(s). If omitted, generated during normalization. For batch
+    # requests, a string is expanded to per-item IDs using it as a prefix.
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
@@ -263,6 +262,11 @@ class GenerateReqInput:
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
+    # Deprecated alias for `routed_dp_rank`, still accepted because
+    # sgl-model-gateway's dp-aware mode injects this spelling into every
+    # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
+    # entrypoints and Engine.generate() accept it as well.
+    data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
@@ -323,17 +327,12 @@ class GenerateReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
-    def regenerate_rid(self, prefix: Optional[str] = None):
+    def regenerate_rid(self):
         """Generate a new request ID and return it."""
-
-        def new_rid() -> str:
-            suffix = uuid.uuid4().hex
-            return f"{prefix}_{suffix}" if prefix is not None else suffix
-
         if isinstance(self.rid, list):
-            self.rid = [new_rid() for _ in range(len(self.rid))]
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
         else:
-            self.rid = new_rid()
+            self.rid = uuid.uuid4().hex
         return self.rid
 
     def _validate_rid_uniqueness(self):
@@ -365,6 +364,18 @@ class GenerateReqInput:
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        if self.data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.routed_dp_rank is None:
+                self.routed_dp_rank = self.data_parallel_rank
+            self.data_parallel_rank = None
+
         self._validate_inputs()
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
@@ -489,7 +500,7 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
-        self._normalize_rid()
+        self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
@@ -599,16 +610,16 @@ class GenerateReqInput:
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
 
-    def _normalize_rid(self):
-        """Normalize one logical request ID per original batch item."""
+    def _normalize_rid(self, num):
+        """Normalize request IDs for batch processing."""
         if self.rid is None:
-            self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            self.rid = [uuid.uuid4().hex for _ in range(num)]
         elif isinstance(self.rid, str):
-            if self.batch_size == 1:
-                self.rid = [self.rid]
-            else:
-                self.rid = [f"{self.rid}_{i}" for i in range(self.batch_size)]
+            new_rids = [f"{self.rid}_{i}" for i in range(num)]
+            self.rid = new_rids
         elif isinstance(self.rid, list):
+            # Note: the length of rid shall be the same as the batch_size,
+            # as the rid would be expanded for parallel sampling in tokenizer_manager
             if len(self.rid) != self.batch_size:
                 raise ValueError(
                     "The specified rids length mismatch with the batch_size for batch processing."
@@ -760,9 +771,8 @@ class GenerateReqInput:
         cache = self.__dict__.setdefault("_sub_obj_cache", {})
         if i in cache:
             return cache[i]
-        logical_index = i % self.batch_size
         sub = GenerateReqInput(
-            rid=self.rid[logical_index],
+            rid=self.rid[i],
             session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,

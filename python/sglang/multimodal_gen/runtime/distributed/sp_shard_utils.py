@@ -19,7 +19,6 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_ring_parallel_world_size,
     get_sp_parallel_rank,
     get_sp_world_size,
 )
@@ -222,8 +221,6 @@ def plan_text_strategy(txt_len: int) -> str:
     num_pad = local_len * sp_size - txt_len
     # padding must fit in the final shard to remain one global-tail block
     if num_pad > local_len:
-        return "replicate"
-    if txt_len % sp_size != 0 and get_ring_parallel_world_size() > 1:
         return "replicate"
     if txt_len < _TEXT_SHARD_MIN:
         return "replicate"
