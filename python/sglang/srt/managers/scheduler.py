@@ -1899,15 +1899,7 @@ class Scheduler(
             ps=self.ps,
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
-            set_detailed_annotations=self._set_model_runner_detailed_annotations,
         )
-
-    def _set_model_runner_detailed_annotations(self, enabled: bool) -> None:
-        # Some backends (e.g. MLX) may not expose a model_runner; detailed-
-        # annotation step-span folding only applies to the standard runner path.
-        model_runner = getattr(self.tp_worker, "model_runner", None)
-        if model_runner is not None:
-            model_runner.detailed_annotations = enabled
 
     def init_weight_updater(self) -> None:
         self.weight_updater = SchedulerWeightUpdaterManager(
@@ -3595,8 +3587,6 @@ class Scheduler(
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
 
-        # Detailed-annotation aggregates are folded into the model_runner step
-        # span (gated on model_runner.detailed_annotations), so no wrapper here.
         return self._run_batch_inner(batch, pp_proxy_tensors)
 
     def _run_batch_inner(

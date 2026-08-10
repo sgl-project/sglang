@@ -30,6 +30,22 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+# Process-wide toggle for detailed step-span annotations. Set by the scheduler's
+# profiler manager on profile start/stop and read by build_step_span_name, so no
+# per-runner flag or scheduler bridge is needed. Covers all model runners in the
+# process (e.g. both the EAGLE draft and target runners).
+_DETAILED_ANNOTATIONS_ENABLED = False
+
+
+def set_detailed_annotations_enabled(enabled: bool) -> None:
+    global _DETAILED_ANNOTATIONS_ENABLED
+    _DETAILED_ANNOTATIONS_ENABLED = bool(enabled)
+
+
+def detailed_annotations_enabled() -> bool:
+    return _DETAILED_ANNOTATIONS_ENABLED
+
+
 def _agg(nqs: List[int], nkvs: List[int]) -> Tuple[int, int, int, int]:
     """Return (Σ N_Q, Σ N_KV, Σ N_Q², Σ N_Q·N_KV) for one request group."""
     sq = sum(nqs)
@@ -127,14 +143,18 @@ def build_detailed_annotation_suffix(forward_batch: ForwardBatch) -> str:
 
 
 def build_step_span_name(
-    forward_batch: ForwardBatch, detailed_annotations: bool = False
+    forward_batch: ForwardBatch, detailed_annotations: bool | None = None
 ) -> str:
     """Build the profile-trace span name for one forward step.
 
-    When ``detailed_annotations`` is set (only while a detailed-annotation
-    profile is active), the aggregates are folded into the label via
-    :func:`build_detailed_annotation_suffix`.
+    Detailed annotations are folded into the label (via
+    :func:`build_detailed_annotation_suffix`) when enabled. ``detailed_annotations``
+    defaults to the process-wide toggle (:func:`detailed_annotations_enabled`, set
+    by the profiler manager); pass an explicit bool to override (e.g. in tests).
     """
+    if detailed_annotations is None:
+        detailed_annotations = detailed_annotations_enabled()
+
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
     if mode == ForwardMode.EXTEND:

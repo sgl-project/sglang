@@ -12,6 +12,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_npu
@@ -157,6 +158,10 @@ class ProfileManager:
             f"Profiling done. Traces are saved to: {self.profiler_kwargs['output_dir']}"
         )
         self.profiler = None
+        # Clear the detailed step-span toggle here too: the v2 trigger auto-stop
+        # goes through _do_stop (not SchedulerProfilerManager._stop_profile), so
+        # this guarantees the flag resets on every stop path.
+        set_detailed_annotations_enabled(False)
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):

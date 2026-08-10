@@ -340,10 +340,6 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
-        # Toggled by the scheduler's profiler manager while a detailed-annotation
-        # profile is active; folds the per-phase sq/sqsq/sqsk/sk aggregates
-        # (context ``c_`` / generation ``g_``) into the step span.
-        self.detailed_annotations = False
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -1475,10 +1471,9 @@ class ModelRunner:
             )
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
-        # Step span
-        step_span_ctx = profile_range(
-            build_step_span_name(forward_batch, self.detailed_annotations)
-        )
+        # Step span (detailed-annotation folding is gated by the process-wide
+        # toggle set by the profiler manager; see step_span_utils).
+        step_span_ctx = profile_range(build_step_span_name(forward_batch))
 
         canary_ctx = (
             context_tuple(

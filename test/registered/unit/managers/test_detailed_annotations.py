@@ -19,7 +19,11 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import ProfileReq
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.model_executor.step_span_utils import build_step_span_name
+from sglang.srt.model_executor.step_span_utils import (
+    build_step_span_name,
+    detailed_annotations_enabled,
+    set_detailed_annotations_enabled,
+)
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -194,6 +198,38 @@ class TestDetailedAnnotationPlumbing(CustomTestCase):
         parsed = json.loads(json.dumps(payload))
         self.assertTrue(parsed["detailed_annotations"])
         self.assertTrue(ProfileReq(**parsed).detailed_annotations)
+
+
+class TestDetailedAnnotationsToggle(CustomTestCase):
+    """The process-wide toggle (set by the profiler manager) is the default source
+    for build_step_span_name when no explicit flag is passed."""
+
+    def tearDown(self):
+        set_detailed_annotations_enabled(False)
+
+    def test_default_off_no_suffix(self):
+        set_detailed_annotations_enabled(False)
+        self.assertFalse(detailed_annotations_enabled())
+        fb = _fb(ForwardMode.DECODE, batch_size=2, seq_lens_cpu=[10, 20])
+        self.assertEqual(build_step_span_name(fb), "step[DECODE bs=2]")
+
+    def test_toggle_on_folds_suffix(self):
+        set_detailed_annotations_enabled(True)
+        self.assertTrue(detailed_annotations_enabled())
+        fb = _fb(ForwardMode.DECODE, batch_size=2, seq_lens_cpu=[10, 20])
+        # sq=2, sk=30, sqsq=2, sqsk=30
+        self.assertEqual(
+            build_step_span_name(fb),
+            "step[DECODE bs=2 g_sq=2 g_sqsq=2 g_sqsk=30 g_sk=30]",
+        )
+
+    def test_explicit_arg_overrides_toggle(self):
+        set_detailed_annotations_enabled(True)
+        fb = _fb(ForwardMode.DECODE, batch_size=2, seq_lens_cpu=[10, 20])
+        # explicit False wins over the enabled toggle
+        self.assertEqual(
+            build_step_span_name(fb, detailed_annotations=False), "step[DECODE bs=2]"
+        )
 
 
 if __name__ == "__main__":

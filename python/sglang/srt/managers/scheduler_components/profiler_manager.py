@@ -18,6 +18,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_mps, is_npu
@@ -52,10 +53,6 @@ class SchedulerProfilerManager:
     ps: Any
     dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
-    # Toggles model_runner.detailed_annotations so the step span folds in the
-    # per-phase sq/sqsq/sqsk/sk aggregates (context ``c_`` / generation ``g_``)
-    # while a detailed-annotation profile is active.
-    set_detailed_annotations: Optional[Callable[[bool], None]] = None
 
     def __post_init__(self) -> None:
         if envs.SGLANG_PROFILE_V2.get():
@@ -162,8 +159,10 @@ class SchedulerProfilerManager:
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _apply_detailed_annotations(self, enabled: bool) -> None:
-        if self.set_detailed_annotations is not None:
-            self.set_detailed_annotations(enabled)
+        # Toggle the process-wide flag read by build_step_span_name; folds the
+        # per-phase sq/sqsq/sqsk/sk aggregates (context c_ / generation g_)
+        # into the step span while a detailed-annotation profile is active.
+        set_detailed_annotations_enabled(enabled)
 
     def _start_profile(
         self, stage: Optional[ForwardMode] = None
