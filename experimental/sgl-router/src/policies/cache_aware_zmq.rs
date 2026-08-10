@@ -997,37 +997,65 @@ impl Policy for CacheAwareZmqPolicy {
                     }
                 }
             }
-            // Measure-only (issue-2 prep, no routing change yet): before the
-            // cold spill, quantify how much of this request's prefix a partial-
-            // overlap spill WOULD preserve. Compared in prod against
-            // `sgl_router_overlap_blocks` this proves whether routing to a
-            // shallower unqueued prefix holder is worth doing — which is what
-            // the follow-up change acts on. Sampled so the extra tree
-            // re-descents stay within pick_min_load's budget.
+            // Queued-owner spill to partial overlap: every prefix owner is over
+            // the queue limit, but a sampled unqueued worker may still hold a
+            // SHALLOWER piece of this prefix (a shared system-prompt head, or a
+            // prefix an earlier spill already replicated there). Prefer it over
+            // a cold min-load pick: same unqueued destination, but some prefill
+            // is served from cache instead of a full cold prefill that evicts
+            // other prefixes and manufactures the next round of misses. Bounded
+            // to pick_min_load's sample budget (`min_load_choices` re-descents),
+            // and it inherits the same cross-replica divergence. Falls through
+            // to the cold spill below when no sampled unqueued worker holds any
+            // prefix — `best_overlap_spill_candidate` returns `None` both then
+            // and when every worker is queueing (the all-queued path owns that).
             //
-            // `owners_present` scopes the measurement to actual queued-owner
-            // spills. Without it this would also fire when the owners were
-            // never candidates at all (`MatchedWorkersIneligible`: drained or
-            // admission-filtered — reachable under either gate, and the ONLY
-            // way here under `FleetSpread`, whose `admits_affinity` is always
-            // true), counting requests the queue gate never diverted and
-            // inflating the evidence the follow-up routing change stands on.
-            if owners_present && should_log(&SPILL_OVERLAP_LOG_COUNTER) {
-                if let Some((cand, recoverable)) = self.best_overlap_spill_candidate(
+            // `owners_present` scopes the spill to owners the queue gate
+            // actually rejected. Without it this would also hijack requests
+            // whose owners were never candidates at all
+            // (`MatchedWorkersIneligible`: drained or admission-filtered —
+            // reachable under either gate, and the ONLY way here under
+            // `FleetSpread`, whose `admits_affinity` is always true),
+            // rebooking them under a label that promises a queued-owner
+            // diversion and polluting the diverted-overlap histogram with
+            // requests the gate never diverted.
+            if owners_present {
+                if let Some((cand, recovered)) = self.best_overlap_spill_candidate(
                     workers,
                     &loads,
                     &self.config.load_gate,
                     self.config.min_load_choices,
                     &outcome,
                 ) {
-                    tracing::info!(
-                        model = %ctx.model(),
-                        candidate = %cand.url,
-                        recoverable_overlap_blocks = recoverable,
-                        matched_blocks = outcome.matched_blocks,
-                        n_blocks = outcome.query_blocks,
-                        "cache-aware-zmq: queued-owner spill could preserve partial overlap on an unqueued worker (measure-only; not yet routed)",
+                    self.record_match_outcome(
+                        model_id,
+                        CacheAwareDecision::CacheWorkerSpilledOverlap,
+                        &outcome,
+                        &cand,
                     );
+                    // Book the at-stake prefix on the same histogram as the cold
+                    // diversion (`CacheWorkerQueued`), so the two spill costs are
+                    // directly comparable; the per-decision `selected` counter in
+                    // `record_match_outcome` already captures how much this spill
+                    // actually recovered.
+                    if let Some(m) = self.metrics.get() {
+                        m.observe_diverted_overlap_blocks(model_id, outcome.matched_blocks as u64);
+                    }
+                    if should_log(&SPILL_OVERLAP_LOG_COUNTER) {
+                        tracing::info!(
+                            model = %ctx.model(),
+                            worker = %cand.url,
+                            worker_load = loads.load_of(&cand),
+                            worker_waiting = loads.waiting_of(&cand),
+                            recovered_overlap_blocks = recovered,
+                            matched_blocks = outcome.matched_blocks,
+                            n_blocks = outcome.query_blocks,
+                            matched_workers = matched_urls.len(),
+                            worker_queue_limit = queue_limit,
+                            "cache-aware-zmq: queued-owner spill routed to an unqueued partial-overlap worker instead of cold min-load",
+                        );
+                    }
+                    return Some(cand);
                 }
             }
             // The fallback prefers an unqueued worker but is never queue-
@@ -1916,9 +1944,11 @@ mod tests {
         );
     }
 
-    /// A diversion that happens to land somewhere warm is not a full loss, and
-    /// the metric must say so rather than assuming the worst. w0 (gated) holds
-    /// 3 blocks, w1 (the diversion target) holds the first 2 of them.
+    /// A queued-owner spill deliberately prefers an unqueued worker that holds
+    /// a shallower piece of the prefix over a cold min-load pick. w0 (gated)
+    /// holds all 3 blocks; w1 (unqueued) holds the first 2 of them, so the
+    /// request routes to w1 and books `cache_worker_spilled_overlap`, crediting
+    /// the 2 blocks it kept and the 3 that were at stake.
     #[test]
     fn diverted_selection_credits_prefix_the_target_already_holds() {
         let tree = Arc::new(HashTree::new());
@@ -1964,15 +1994,90 @@ mod tests {
         let rendered = metrics.render();
         assert!(
             rendered.contains(
-                "sgl_router_matched_overlap_blocks_total{model_id=\"tiny\",decision=\"cache_worker_queued\"} 3"
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_worker_spilled_overlap\"} 1"
+            ),
+            "a queued-owner spill onto a partial-overlap worker books spilled_overlap, not the cold cache_worker_queued; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_matched_overlap_blocks_total{model_id=\"tiny\",decision=\"cache_worker_spilled_overlap\"} 3"
             ),
             "fleet-best overlap is w0's full 3 blocks; got:\n{rendered}"
         );
         assert!(
             rendered.contains(
-                "sgl_router_selected_overlap_blocks_total{model_id=\"tiny\",decision=\"cache_worker_queued\"} 2"
+                "sgl_router_selected_overlap_blocks_total{model_id=\"tiny\",decision=\"cache_worker_spilled_overlap\"} 2"
             ),
             "w1 holds 2 of the 3 blocks, so only 1 block of locality was lost; got:\n{rendered}"
+        );
+    }
+
+    /// The spill-to-overlap path is scoped to owners the queue gate actually
+    /// rejected. Here the matched owner (w0) is not in the candidate slice at
+    /// all — drained or admission-filtered — while w1 (unqueued) still holds a
+    /// shallower piece of the prefix. The gate diverted nothing, so the
+    /// selection must stay the plain min-load fallback booked as
+    /// `matched_workers_ineligible`, not get hijacked into
+    /// `cache_worker_spilled_overlap`.
+    #[test]
+    fn ineligible_owner_fallback_is_not_rebooked_as_spilled_overlap() {
+        let tree = Arc::new(HashTree::new());
+        let tokens: Vec<u32> = (1..=12).collect();
+        let hashes = compute_block_hashes(&tokens, 4);
+        assert_eq!(hashes.len(), 3);
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        tree.insert(
+            &KvWorkerId::new("http://w1:30000".into(), 0),
+            None,
+            &hashes[..2],
+        );
+
+        let metrics = MetricsRegistry::new();
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        // Both candidates are unqueued; w1 (the overlap holder) is busier, so
+        // a min-load fallback provably prefers the cold w2 — the opposite of
+        // what the spill path would pick.
+        engine_load.set("http://w1:30000", 0, load_stat(3, 0), now);
+        engine_load.set("http://w2:30000", 0, load_stat(0, 0), now);
+
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(2).unwrap()),
+                min_load_choices: usize::MAX,
+                saturation_queue_floor: None,
+            },
+            Arc::clone(&tree),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        // The prefix owner w0 is absent from the candidate slice.
+        let workers = vec![
+            worker("http://w1:30000", "tiny"),
+            worker("http://w2:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&tokens));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w2:30000",
+            "with the owner ineligible the fallback is plain min-load, not best-overlap",
+        );
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"matched_workers_ineligible\"} 1"
+            ),
+            "an absent owner books matched_workers_ineligible; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("decision=\"cache_worker_spilled_overlap\""),
+            "the spill path must not run when the gate diverted nothing; got:\n{rendered}"
         );
     }
 

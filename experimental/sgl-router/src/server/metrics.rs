@@ -324,6 +324,17 @@ pub enum CacheAwareDecision {
     /// router's per-worker cap is excluded upstream and lands there. Read the
     /// two together when attributing locality loss to load.
     CacheWorkerQueued,
+    /// Every prefix owner was over `--worker-queue-limit`, an UNQUEUED
+    /// alternative existed, and rather than spilling to a cold min-load worker
+    /// the request was routed to an unqueued worker that still holds a
+    /// *shallower* piece of the prefix. Distinct from [`Self::CacheWorkerQueued`]
+    /// (spilled to zero overlap) so the two spill outcomes can be told apart:
+    /// this one preserved some cache, that one forfeited all of it. The blocks
+    /// preserved are the `selected` counter under this label; the at-stake
+    /// fleet-best overlap additionally lands in the (unlabelled, per-model)
+    /// `sgl_router_diverted_overlap_blocks` histogram alongside cold
+    /// diversions, keeping the two spill costs on one comparable curve.
+    CacheWorkerSpilledOverlap,
     /// The fleet-saturation label; which selection it describes depends on
     /// whether `--saturation-queue-floor` is set.
     ///
@@ -365,6 +376,7 @@ impl CacheAwareDecision {
             Self::MatchedNodeUnowned => "matched_node_unowned",
             Self::MatchedWorkersIneligible => "matched_workers_ineligible",
             Self::CacheWorkerQueued => "cache_worker_queued",
+            Self::CacheWorkerSpilledOverlap => "cache_worker_spilled_overlap",
             Self::CacheHitAllQueued => "cache_hit_all_queued",
         }
     }
@@ -558,8 +570,12 @@ impl MetricsRegistry {
         hist.observe(blocks as f64);
     }
 
-    /// Observe the prefix a queue-gated request GAVE UP, for
-    /// `sgl_router_diverted_overlap_blocks`.
+    /// Observe the prefix a queue-gated request was diverted OFF, for
+    /// `sgl_router_diverted_overlap_blocks`. This is the at-stake fleet-best
+    /// overlap: a cold spill (`cache_worker_queued`) forfeits all of it, a
+    /// partial-overlap spill (`cache_worker_spilled_overlap`) keeps the part
+    /// its target holds — split the net loss via the per-decision
+    /// matched/selected counters.
     ///
     /// Shares [`OVERLAP_BLOCKS_BUCKETS`] with `sgl_router_overlap_blocks` so the
     /// two are directly comparable: that one is the overlap distribution of
