@@ -2786,6 +2786,8 @@ class UnifiedRadixCacheSuite:
                 cd = ancestor.component_data[ct]
                 if cd.value is not None and cd.host_value is None:
                     cd.host_value = cd.value.clone()
+            # A real backup registers duplicate tracking at its ack.
+            cache.tree_core._update_duplicate_tracking(ancestor)
 
     def _simulate_backup_tree(self, cache):
         """Backup all non-root nodes (simulates write-through)."""

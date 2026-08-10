@@ -1570,7 +1570,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _drain_storage_control_queues_impl(
         self,
-        n_revoke: Optional[int],
         n_storage_hit: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
@@ -1589,10 +1588,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained += 1
                 yield item
 
-        def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
-
         def _drain_and_alloc_storage_hit():
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 req_id = operation.request_id
@@ -1602,6 +1597,10 @@ class UnifiedRadixCache(BasePrefixCache):
                     continue
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
+                    self._revoke_pending_prefetch(req_id)
+                    continue
+                if operation.storage_hit_count < self.prefetch_threshold:
+                    # not to prefetch if not enough benefits
                     self._revoke_pending_prefetch(req_id)
                     continue
 
@@ -1679,7 +1678,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
-        _drain_revoke()
         _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
@@ -1690,7 +1688,6 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
         local_qsize_list = [
-            cc.prefetch_revoke_queue.qsize(),
             cc.prefetch_hit_queue.qsize(),
             cc.ack_backup_queue.qsize(),
             cc.host_mem_release_queue.qsize(),
@@ -1705,13 +1702,12 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
-        n_revoke, n_storage_hit, n_backup, n_release = qsize_list[:4]
+        n_storage_hit, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
             pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[4:])
+            for pool_name, count in zip(extra_pool_names, qsize_list[3:])
         }
         self._drain_storage_control_queues_impl(
-            n_revoke=n_revoke,
             n_storage_hit=n_storage_hit,
             n_backup=n_backup,
             n_release=n_release,
@@ -1835,7 +1831,6 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             storage_queue_sizes = (
                 (
-                    cc.prefetch_revoke_queue.qsize(),
                     cc.prefetch_hit_queue.qsize(),
                     cc.ack_backup_queue.qsize(),
                     cc.host_mem_release_queue.qsize(),
@@ -1845,22 +1840,30 @@ class UnifiedRadixCache(BasePrefixCache):
                 else ()
             )
 
+        # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
+        # equal iff reclaim victim order matched on every rank.
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
         ready_counts = torch.tensor(
             [
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
+                digest,
+                -digest,
             ],
-            dtype=torch.int,
+            dtype=torch.int64,
             device="cpu",
         )
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
+        assert (
+            count_values[-2] == -count_values[-1]
+        ), "write_back duplicate-reclaim victims diverged across TP ranks"
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2:]),
+            tuple(count_values[2:-2]),
             extra_pool_names,
         )
 
@@ -1932,11 +1935,17 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count = 0
             if self.pp_rank == 0:
                 finish_count = self._count_ready_acks(cc.ack_load_queue)
-            finish_count_tensor = torch.tensor(
-                finish_count, dtype=torch.int, device="cpu"
+            # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
+            # equal iff reclaim victim order matched on every rank.
+            digest = self.tree_core.write_back_duplicate_reclaim_digest
+            sync_tensor = torch.tensor(
+                [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-            finish_count = finish_count_tensor.item()
+            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = int(sync_tensor[0].item())
+            assert (
+                sync_tensor[1].item() == -sync_tensor[2].item()
+            ), "write_back duplicate-reclaim victims diverged across TP ranks"
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
@@ -1945,6 +1954,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
+                # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
+                self.tree_core.finish_load_back(node)
 
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -2026,16 +2037,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self.loading_check(finish_count=load_finish_count)
 
             if self.enable_storage and storage_queue_sizes:
-                n_revoke, n_storage_hit, n_backup, n_release = storage_queue_sizes[:4]
+                n_storage_hit, n_backup, n_release = storage_queue_sizes[:3]
                 extra_release_counts = {
                     pool_name: count
                     for pool_name, count in zip(
                         extra_pool_names,
-                        storage_queue_sizes[4:],
+                        storage_queue_sizes[3:],
                     )
                 }
                 self._drain_storage_control_queues_impl(
-                    n_revoke=n_revoke,
                     n_storage_hit=n_storage_hit,
                     n_backup=n_backup,
                     n_release=n_release,
