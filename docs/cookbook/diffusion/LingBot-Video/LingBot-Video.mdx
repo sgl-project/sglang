@@ -40,9 +40,11 @@ sglang serve \
   --ulysses-degree 4
 ```
 
+Sequence parallelism splits the sequence, not the weights, so every rank still holds all 30B parameters. When that does not fit, shard the weights as well with `--dit-layerwise-offload` or `--use-fsdp-inference true`; otherwise the DiT runs out of memory as it is placed on device.
+
 `--tp-size`, `--ulysses-degree`, `--ring-degree`, and CFG parallel can be combined, except that image conditioning does not support sequence parallelism (see 5.2). `num_attention_heads` divided by `--tp-size` must stay divisible by `--ulysses-degree`; the server refuses the configuration at startup otherwise. The full list of supported optimizations is in the [compatibility matrix](/docs/sglang-diffusion/compatibility_matrix).
 
-`torch.compile` is not enabled by default for this model, including under `--performance-mode speed`. The fp32-pinned norms have not been checked against the eager baseline, so enable `--enable-torch-compile` only if you verify output quality yourself.
+`torch.compile` is not enabled by default for this model, including under `--performance-mode speed`. Benchmark it on your own hardware before enabling it: whether it pays off depends on the GPU.
 
 ## 4. Prompt format
 
@@ -50,11 +52,36 @@ The model is trained on structured JSON captions. A raw natural-language prompt 
 
 ```json Example
 {
-  "comprehensive_description": "A red fox trots across fresh snow in a pine forest, morning light, shallow depth of field.",
-  "camera": "slow dolly following the fox",
-  "style": "cinematic live action"
+  "comprehensive_description": {
+    "scene_content_description": "A red fox trots across fresh snow in a pine forest at sunrise, its coat bright against the white ground.",
+    "camera_movement_description": "The camera stays stationary at eye level in a medium shot."
+  },
+  "camera_info": {
+    "color": "Warm",
+    "frame_size": "Medium",
+    "shot_type_angle": "Eye level",
+    "lens_size": "Medium",
+    "composition": "Center",
+    "lighting": "Soft light",
+    "lighting_type": "Daylight"
+  },
+  "world_knowledge": [],
+  "prominent_elements": [
+    {
+      "name": "red fox",
+      "description": "A fox with a dense orange-red coat and a white-tipped tail.",
+      "actions": [
+        { "timestamp": "[0.0s - 1.5s]", "action": "trots from the left toward the center" },
+        { "timestamp": "[1.5s - 3.0s]", "action": "pauses to sniff the air, then continues" }
+      ],
+      "location": "center of the frame",
+      "relative_size": "dominant"
+    }
+  ]
 }
 ```
+
+`comprehensive_description` and `camera_info` are objects, not strings, and each entry in `prominent_elements` carries timestamped actions. A caption with the right keys but flatter values is still out of distribution. The rewriter below emits this shape, so use it rather than writing the JSON by hand.
 
 ### 4.1 Prompt rewriter
 
@@ -189,6 +216,8 @@ On 8 GPUs:
 - Text-to-video and text-to-image: `--ulysses-degree 8`.
 - Image-to-video: `--tp-size 8`. Sequence parallelism is rejected for image conditioning, so tensor parallelism is the way to shard.
 - Refiner: `--ulysses-degree 8 --use-fsdp-inference true`. Sequence parallelism replicates both sets of DiT weights on every GPU; FSDP shards them, which is what keeps the second pass inside memory at 1088x1920. The refiner tiles the VAE for its own decode and re-encode regardless of `--vae-tiling`.
+
+The model uses CFG, so `--enable-cfg-parallel` is also available: it runs the two guidance branches on separate GPU groups and halves the sequence-parallel group size. Whether that beats pure Ulysses depends on interconnect bandwidth, so benchmark both on your own topology. Cache-DiT does not support this model.
 
 ## 7. Notes
 

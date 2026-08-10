@@ -171,8 +171,7 @@ class LingBotVideoAttention(nn.Module):
         self.head_dim = hidden_size // num_heads
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
-        # The ulysses all-to-all splits the TP-local heads again, and only
-        # asserts deep inside the collective.
+        # The ulysses all-to-all splits the TP-local heads again.
         ulysses_size = max(get_ulysses_parallel_world_size(), 1)
         if self.local_num_heads % ulysses_size != 0:
             raise ValueError(

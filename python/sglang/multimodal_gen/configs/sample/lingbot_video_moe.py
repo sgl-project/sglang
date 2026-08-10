@@ -60,8 +60,7 @@ class LingBotVideoMoESamplingParams(SamplingParams):
             self.adjust_frames = False
             if not self._explicitly_set("negative_prompt"):
                 self.negative_prompt = DEFAULT_NEGATIVE_PROMPT_IMAGE
-        # The DiT shards the joint sequence itself, but super() only auto-enables
-        # that for a fixed model list, hence the flag either side of it.
+        # The DiT shards the joint sequence itself, so keep the flag on by default.
         enable_sequence_shard = self.enable_sequence_shard
         if enable_sequence_shard is None or enable_sequence_shard:
             self.adjust_frames = False

@@ -59,8 +59,7 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
     refiner_sigma_tail_steps: int = 2
     # Prompt rewriter, off unless a URL or a local base model is configured.
     rewriter_url: str | None = None
-    # The mapping turn can live on a second endpoint when one server cannot hold
-    # both the base weights and the adapter.
+    # Falls back to rewriter_url when the mapping turn shares the endpoint.
     rewriter_map_url: str | None = None
     rewriter_expand_model: str = "lingbot-rewriter-base"
     rewriter_map_model: str = "lingbot-rewriter-lora"
@@ -89,16 +88,12 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         return self.rewriter_url is not None or self.rewriter_model_path is not None
 
     def supports_dynamic_batching(self) -> bool:
-        # The scheduler already keeps image requests out of batches, so TI2V can
-        # batch. Auto-negative is the exception: a merged request carries one
-        # negative prompt for several captions, which cannot be pruned per request.
+        # A merged request carries one negative prompt for several captions.
         return not self.rewriter_auto_negative
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        # torch.compile is left opt-in: the fp32-pinned norms and the per-block
-        # dtype round-trips have not been checked against the bf16 baseline.
+        # torch.compile stays opt-in: not yet validated for this DiT.
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
             speed_mode_enable_torch_compile_by_default=False,
         )
 
