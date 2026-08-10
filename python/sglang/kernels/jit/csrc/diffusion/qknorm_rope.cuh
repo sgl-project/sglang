@@ -471,12 +471,9 @@ struct QKNormRopePackKVKernel {
     TensorMatcher({N, K, D}).with_strides({Dv, Dd, 1}).with_dtype<DType>().with_device(device).verify(v);
     TensorMatcher({NP, K, D}).with_strides({Dkp, Dd, 1}).with_dtype<DType>().with_device(device).verify(k_prefix);
     TensorMatcher({NP, K, D}).with_strides({Dvp, Dd, 1}).with_dtype<DType>().with_device(device).verify(v_prefix);
-    TensorMatcher({B, T, K, D})
-        .with_strides({T * K * D, K * D, D, 1})
-        .with_dtype<DType>()
-        .with_device(device)
-        .verify(packed_k)
-        .verify(packed_v);
+    TensorMatcher({B, T, K, D}).with_dtype<DType>().with_device(device).verify(packed_k).verify(packed_v);
+    RuntimeCheck(packed_k.is_contiguous(), "packed_k must be contiguous");
+    RuntimeCheck(packed_v.is_contiguous(), "packed_v must be contiguous");
     TensorMatcher({D}).with_dtype<DType>().with_device(device).verify(q_weight).verify(k_weight);
     TensorMatcher({-1, R}).with_dtype<CacheDType>().with_device(device).verify(cos_sin_cache);
     TensorMatcher({N}).with_dtype<int32_t, int64_t>(id_type).with_device(device).verify(positions);
@@ -524,8 +521,8 @@ struct QKNormRopePackKVKernel {
         runtime::get_blocks_per_sm(kernel<int64_t>, kThreadsPerBlock),
     };
     const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
-    const auto num_prefix_works = batch_size * prefix_tokens * num_kv_heads;
-    const auto num_works =
+    const uint32_t num_prefix_works = static_cast<uint32_t>(batch_size * prefix_tokens) * num_kv_heads;
+    const uint32_t num_works =
         (num_qo_heads + num_kv_heads) * num_tokens + 2 * num_prefix_works + num_tokens * num_kv_heads;
     const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
     const auto num_blocks = std::min(max_blocks, needed_blocks);
