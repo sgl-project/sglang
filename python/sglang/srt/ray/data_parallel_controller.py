@@ -52,11 +52,13 @@ class RayDataParallelController(DataParallelController):
         placement_group,
         bundle_for_node: Optional[List[int]],
         rank0_node_ip: str,
+        is_custom_pg: bool = False,
     ):
         # Set Ray-specific attributes BEFORE super().__init__() because the
         # parent constructor calls launch_dp_schedulers / launch_dp_attention_schedulers
         # which we override, and those methods need these attributes.
         self.pg = placement_group
+        self.is_custom_pg = is_custom_pg
         self.bundle_for_node = bundle_for_node
         self.rank0_node_ip = rank0_node_ip
         self.scheduler_actors: List = []
@@ -137,7 +139,7 @@ class RayDataParallelController(DataParallelController):
         nnodes = server_args.nnodes
         batch_start_idx = len(self.scheduler_actors)
 
-        if self.server_args.placement_group is None:
+        if not self.is_custom_pg:
             for node_idx in range(nnodes):
                 bundle_idx = self.bundle_for_node[node_idx]
                 pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
