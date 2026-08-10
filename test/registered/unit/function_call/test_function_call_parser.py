@@ -4052,6 +4052,48 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "search")
 
+    # ==================== recovery tests (dropped-call regressions) ====================
+
+    def test_multiline_string_argument_recovered(self):
+        """A raw newline inside a string argument (multi-line shell command)
+        is invalid Python, so ast.parse failed and the whole call was
+        dropped. The value must round-trip with the newline intact."""
+        text = (
+            "<|tool_call_start|>[search(query='line one\nline two')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "line one\nline two")
+
+    def test_nul_byte_in_string_argument_recovered(self):
+        """A NUL byte anywhere makes ast.parse raise ValueError (not
+        SyntaxError), so the call was dropped with no recovery path."""
+        text = "<|tool_call_start|>[search(query='printf a\x00b')]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "printf a\x00b")
+
+    def test_streaming_recovers_multiline(self):
+        """Streaming buffers the block and delegates to detect_and_parse;
+        an incremental rewrite of the streaming path would bypass the
+        recovery rewrites and re-drop multi-line commands."""
+        text = (
+            "<|tool_call_start|>[search(query='line one\nline two')]<|tool_call_end|>"
+        )
+        detector = Lfm2Detector()
+        calls = []
+        for i in range(0, len(text), 7):
+            result = detector.parse_streaming_increment(text[i : i + 7], self.tools)
+            calls.extend(result.calls)
+
+        self.assertEqual(len(calls), 1)
+        params = json.loads(calls[0].parameters)
+        self.assertEqual(params["query"], "line one\nline two")
+
     # ==================== structure_info tests ====================
 
     def test_supports_structural_tag(self):
