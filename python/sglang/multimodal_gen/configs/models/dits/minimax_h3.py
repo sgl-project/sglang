@@ -14,6 +14,61 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
 
     lora_param_names_mapping: dict = field(default_factory=dict)
 
+    # Diffusers/PEFT Turbo LoRA keys (e.g. lightx2v/Minimax-h3-Turbo).
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"^(.*\.lora_[AB])\.default$": r"\1",
+            r"^transformer_blocks\.(\d+)\.attn\.to_q\.(lora_[AB])$": (
+                r"blocks.\1.attn.qkv_proj.\2",
+                0,
+                3,
+            ),
+            r"^transformer_blocks\.(\d+)\.attn\.to_k\.(lora_[AB])$": (
+                r"blocks.\1.attn.qkv_proj.\2",
+                1,
+                3,
+            ),
+            r"^transformer_blocks\.(\d+)\.attn\.to_v\.(lora_[AB])$": (
+                r"blocks.\1.attn.qkv_proj.\2",
+                2,
+                3,
+            ),
+            r"^transformer_blocks\.(\d+)\.attn\.to_out\.0\.(lora_[AB])$": (
+                r"blocks.\1.attn.out_proj.\2"
+            ),
+            r"^transformer_blocks\.(\d+)\.ff\.net\.0\.proj\.(lora_[AB])$": (
+                r"blocks.\1.mlp.fc1.\2"
+            ),
+            r"^transformer_blocks\.(\d+)\.ff\.net\.2\.(lora_[AB])$": (
+                r"blocks.\1.mlp.fc2.\2"
+            ),
+            r"^token_refiner\.refiner_blocks\.(\d+)\.attn\.to_q\.(lora_[AB])$": (
+                r"token_refiner.blocks.\1.attn.qkv_proj.\2",
+                0,
+                3,
+            ),
+            r"^token_refiner\.refiner_blocks\.(\d+)\.attn\.to_k\.(lora_[AB])$": (
+                r"token_refiner.blocks.\1.attn.qkv_proj.\2",
+                1,
+                3,
+            ),
+            r"^token_refiner\.refiner_blocks\.(\d+)\.attn\.to_v\.(lora_[AB])$": (
+                r"token_refiner.blocks.\1.attn.qkv_proj.\2",
+                2,
+                3,
+            ),
+            r"^token_refiner\.refiner_blocks\.(\d+)\.attn\.to_out\.0\.(lora_[AB])$": (
+                r"token_refiner.blocks.\1.attn.out_proj.\2"
+            ),
+            r"^token_refiner\.refiner_blocks\.(\d+)\.ff\.net\.0\.proj\.(lora_[AB])$": (
+                r"token_refiner.blocks.\1.mlp.fc1.\2"
+            ),
+            r"^token_refiner\.refiner_blocks\.(\d+)\.ff\.net\.2\.(lora_[AB])$": (
+                r"token_refiner.blocks.\1.mlp.fc2.\2"
+            ),
+        }
+    )
+
     num_layers: int = 50
     token_refiner_num_layers: int = 2
     hidden_size: int = 5376

@@ -399,6 +399,20 @@ curl -sS -X POST http://127.0.0.1:30010/v1/set_lora \
 
 When the repository contains multiple safetensors files, prefer `minimax_h3_turbo_4step_ckpt500.safetensors` (upstream default) via `--lora-path` and `--lora-weight-name` on `sglang serve`, or pass the local path to that file as `lora_path`.
 
+[`lightx2v/Minimax-h3-Turbo`](https://huggingface.co/lightx2v/Minimax-h3-Turbo) is a Diffusers/PEFT-format preview LoRA for the same FL2VA few-step path. SGLang maps its keys automatically. The Hub repo ships weights only (no `adapter_config.json`); upstream training uses `lora_alpha=8` with rank `128`, so set `"strength": 0.0625` (or `--lora-scale 0.0625`) to match their official script default of `--lora-alpha 8 --lora-scale 1.0`. Prefer [`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora) when quality matters — lightx2v omits `adaln_proj` adapters.
+
+```bash Command
+curl -sS -X POST http://127.0.0.1:30010/v1/set_lora \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lora_nickname": "h3-turbo-lightx2v",
+    "lora_path": "lightx2v/Minimax-h3-Turbo",
+    "strength": 0.0625
+  }'
+```
+
+Use `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` via `--lora-weight-name` when serving from the repo root.
+
 <Warning>
 LoRAs for the ComfyUI pruned MiniMax-H3 graph (for example H3-GalaxyAce) are not compatible with SGLang's native FL2VA weights.
 </Warning>

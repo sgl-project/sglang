@@ -43,7 +43,6 @@ def _ensure_single_process_parallel_runtime() -> None:
 
 def test_native_weight_names_and_grouped_qkv_reorder():
     arch = MiniMaxH3DiTArchConfig()
-    assert arch.param_names_mapping == {}
     assert arch.reverse_param_names_mapping == {}
     mapping = get_param_names_mapping(arch.param_names_mapping)
     for key in (
