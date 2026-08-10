@@ -311,7 +311,7 @@ class GroupCoordinator:
         for ranks in group_ranks:
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             if "mooncake" in torch_distributed_backend:
-                from mooncake.ep import MooncakeBackendOptions
+                from mooncake.pg import MooncakeBackendOptions
 
                 pg_active_size = len(ranks)
                 if not recovered_rank and max_world_size is not None:
@@ -348,12 +348,14 @@ class GroupCoordinator:
                     backend="mooncake",
                     pg_options=dev_opts,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:device",
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
                     pg_options=cpu_opts,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:cpu",
                 )
             else:
                 active_ranks = torch.ones(
@@ -366,11 +368,15 @@ class GroupCoordinator:
                     backend=torch_distributed_backend,
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:device",
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
                 cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
+                    ranks,
+                    backend="gloo",
+                    timeout=gloo_timeout,
+                    group_desc=f"{group_name}:cpu",
                 )
             if self.rank in ranks:
                 self.ranks = ranks
@@ -695,10 +701,22 @@ class GroupCoordinator:
             self.pymscclpp_comm is not None
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         )
+        # With the MNNVL opt-in, let CustomAllReduceV2 take eligible (small)
+        # inputs ahead of the symm-mem pynccl fast path; otherwise pynccl
+        # would absorb every all-reduce whenever --enable-symm-mem is on and
+        # v2 never runs. Large inputs fail should_custom_ar and still go to
+        # the symm-mem path below.
+        _ca_takes_input = (
+            _CA_V2_MULTINODE
+            and self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.should_custom_ar(input_)
+        )
         if (
             self.pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
             and not should_use_pymscclpp_allreduce
+            and not _ca_takes_input
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
@@ -1984,6 +2002,9 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+# Read once at import: whether CustomAllReduceV2 is opted in on a multi-node
+# (MNNVL) group. Used on the all_reduce hot path (see GroupCoordinator).
+_CA_V2_MULTINODE = envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get()
 
 
 def set_custom_all_reduce(enable: bool):
@@ -2114,7 +2135,7 @@ def init_distributed_environment(
         _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
 
         if backend == "mooncake":
-            from mooncake.ep import MooncakeBackendOptions
+            from mooncake.pg import MooncakeBackendOptions
 
             use_max_ws = max_world_size and max_world_size > world_size
             ar_size = max_world_size if use_max_ws else world_size

@@ -6,34 +6,16 @@ crashed TBO cuda-graph capture until reset. CPU-only.
 """
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
-import sglang.srt.batch_overlap.two_batch_overlap as tbo
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-
-import pytest as _pytest_defer
-
-_DEFER_REASON = (
-    "Temporarily skipped during the ServerArgs config-namespace migration; "
-    "re-enabled once the runtime-config accessor API stabilizes."
-)
-pytestmark = _pytest_defer.mark.skip(reason=_DEFER_REASON)
-
-
-def setUpModule():
-    import unittest
-
-    raise unittest.SkipTest(_DEFER_REASON)
 
 
 def _make_target_verify_batch(bs: int) -> ForwardBatch:
@@ -52,10 +34,11 @@ def _make_target_verify_batch(bs: int) -> ForwardBatch:
 
 
 def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
-    fake_args = SimpleNamespace(moe_dense_tp_size=None, attention_backend="fa3")
-    with get_parallel().override(attn_tp_size=1), patch.object(
-        tbo, "get_server_args", lambda: fake_args
-    ):
+    # filter_batch reads attention_backend (get_server_args) and
+    # moe_dense_tp_size (get_parallel) from the published config.
+    with get_context().override_server_args(
+        attention_backend="fa3", moe_dense_tp_size=None
+    ), get_parallel().override(attn_tp_size=1):
         return TboForwardBatchPreparer.filter_batch(
             batch,
             start_token_index=lo,

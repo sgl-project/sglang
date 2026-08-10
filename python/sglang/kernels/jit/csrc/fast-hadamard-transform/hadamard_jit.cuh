@@ -19,10 +19,8 @@
 #include <cstdint>
 #include <cstring>
 
-namespace {
+namespace sglang {
 
-using ::bf16_t;
-using ::fp16_t;
 using ::HadamardParamsBase;
 
 constexpr inline int ceil_log2(int val) {
@@ -479,4 +477,4 @@ struct Hadamard40NKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
