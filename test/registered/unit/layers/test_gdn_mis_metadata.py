@@ -16,18 +16,16 @@ class TestGDNMISMetadata(CustomTestCase):
             input_ids=torch.empty(8, dtype=torch.int64),
             extend_seq_lens_cpu=[5],
             extend_prefix_lens_cpu=[0],
-            multi_item_delimiter_indices=[
-                torch.tensor([1, 4], dtype=torch.int64)
-            ],
+            multi_item_delimiter_indices=[torch.tensor([1, 4], dtype=torch.int64)],
             is_prefill_only=True,
         )
 
         metadata = build_gdn_mis_metadata(forward_batch)
 
         torch.testing.assert_close(
-            torch.cat(
-                [metadata.query_token_indices, metadata.item_token_indices]
-            ).sort().values,
+            torch.cat([metadata.query_token_indices, metadata.item_token_indices])
+            .sort()
+            .values,
             torch.arange(5, dtype=torch.int64),
         )
 
@@ -77,9 +75,7 @@ class TestGDNMISMetadata(CustomTestCase):
             input_ids=torch.empty(4, dtype=torch.int64),
             extend_seq_lens_cpu=[5],
             extend_prefix_lens_cpu=[0],
-            multi_item_delimiter_indices=[
-                torch.tensor([1, 4], dtype=torch.int64)
-            ],
+            multi_item_delimiter_indices=[torch.tensor([1, 4], dtype=torch.int64)],
             is_prefill_only=True,
         )
 
