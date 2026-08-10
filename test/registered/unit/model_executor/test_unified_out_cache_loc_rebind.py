@@ -77,15 +77,24 @@ def _make_fb(out_cache_loc, **kw):
 
 
 def _make_runner(v2p=None, swa_map=None):
-    """Fake ModelRunner carrying just the two translate handles the hook probes."""
-    allocator = SimpleNamespace()
+    """Fake ModelRunner carrying a KVIndexSource with the translate surface
+    under test (the isinstance capability probe itself is pinned in
+    test_kv_index_source.py; here we pin the REBIND semantics)."""
+    from sglang.srt.mem_cache.kv_index_source import KVIndexSource
+
+    src = KVIndexSource(
+        req_to_token=torch.zeros((1, 4), dtype=torch.int64),
+        token_to_kv_pool_allocator=SimpleNamespace(),
+        token_to_kv_pool=SimpleNamespace(),
+        page_size=1,
+        device=_DEV,
+    )
     if v2p is not None:
-        # Fresh-tensor gather, like MultiEndedAllocator.translate_kv_loc.
-        allocator.translate_kv_loc = lambda t: v2p[t.to(torch.int64)]
-    pool = SimpleNamespace()
-    if swa_map is not None:
-        pool.translate_loc_from_full_to_swa = swa_map
-    return SimpleNamespace(token_to_kv_pool_allocator=allocator, token_to_kv_pool=pool)
+        src.enabled = True
+        # Fresh-tensor gather, like the composite's translate_kv_loc_dense.
+        src._translate_full = lambda t, out=None: v2p[t.to(torch.int64)]
+        src._translate_swa = swa_map
+    return SimpleNamespace(kv_index_source=src)
 
 
 class TestApplyUnifiedKvLocRebind(CustomTestCase):
@@ -104,7 +113,7 @@ class TestApplyUnifiedKvLocRebind(CustomTestCase):
         self.assertTrue(torch.equal(fb.out_cache_loc, virtual + 1000))
         self.assertTrue(torch.equal(virtual, virtual_copy))
         self.assertTrue(fb.out_cache_loc_is_physical)
-        self.assertIsNotNone(fb._unified_kv_loc_translate)
+        self.assertIsNotNone(fb._kv_index_source)
         # No SWA pool on this runner -> no swa rail.
         self.assertIsNone(fb.swa_out_cache_loc)
 
@@ -142,7 +151,7 @@ class TestApplyUnifiedKvLocRebind(CustomTestCase):
         self.assertIs(fb.out_cache_loc, virtual)  # identity alias preserved
         self.assertFalse(fb.out_cache_loc_is_physical)
         self.assertIsNone(fb.swa_out_cache_loc)
-        self.assertIsNone(fb._unified_kv_loc_translate)
+        self.assertIsNone(fb._kv_index_source)
 
     def test_none_loc_is_a_noop(self):
         fb = _make_fb(None)
@@ -224,7 +233,7 @@ class TestTboSplitCarriesContractFields(CustomTestCase):
         fb.seq_lens = torch.ones(n, dtype=torch.int64)
         fb.swa_out_cache_loc = torch.tensor([20, 21, 22, 23], dtype=torch.int32)
         fb.out_cache_loc_is_physical = True
-        fb._unified_kv_loc_translate = lambda t: t
+        fb._kv_index_source = SimpleNamespace(translate_full=lambda t: t)
 
         with patch.object(
             tbo,
@@ -243,7 +252,7 @@ class TestTboSplitCarriesContractFields(CustomTestCase):
             )
 
         # The strict unknown-field check did not raise, the swa rail is
-        # token-sliced like out_cache_loc, and the contract flag + callable are
+        # token-sliced like out_cache_loc, and the contract flag + source are
         # inherited by the child.
         self.assertTrue(
             torch.equal(child.out_cache_loc, torch.tensor([11, 12], dtype=torch.int64))
@@ -254,7 +263,7 @@ class TestTboSplitCarriesContractFields(CustomTestCase):
             )
         )
         self.assertTrue(child.out_cache_loc_is_physical)
-        self.assertIsNotNone(child._unified_kv_loc_translate)
+        self.assertIsNotNone(child._kv_index_source)
 
 
 class TestSetMlaKvBufferDoorContract(CustomTestCase):
@@ -305,7 +314,9 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
         fb.seq_lens = torch.tensor([2, 3], dtype=torch.int64)
         fb.seq_lens_cpu = torch.tensor([2, 3], dtype=torch.int32)
         fb.req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
-        fb._unified_kv_loc_translate = translate
+        fb._kv_index_source = (
+            SimpleNamespace(translate_full=translate) if translate is not None else None
+        )
         return fb
 
     def test_one_shot_indices_translated_once_and_cached(self):

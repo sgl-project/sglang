@@ -410,50 +410,21 @@ class NgramEmbeddingInfo:
 
 def apply_unified_kv_loc_rebind(fb, model_runner) -> None:
     """Unified memory pool: translate the forward batch's WRITE loc to
-    PHYSICAL ids, exactly once, at ForwardBatch preparation.
+    kernel-facing ids, exactly once, at ForwardBatch preparation.
 
-    The ONE RULE of the physical-loc contract: ScheduleBatch-side tensors stay
+    The ONE RULE of the id-space contract: ScheduleBatch-side tensors stay
     VIRTUAL always (radix/accept/inflight machinery reads them); each
     ForwardBatch is translated exactly once at its construction. `init_new`
     calls this for every standard construction; the rare hand-built live
     forward (e.g. the DFLASH draft-block batch) calls it explicitly. Backends
-    with a wired translate handle assert `out_cache_loc_is_physical`, so a
-    construction site that forgets fails loudly instead of writing virtual ids
-    as if physical.
+    assert `out_cache_loc_is_physical`, so a construction site that forgets
+    fails loudly instead of writing virtual ids as if physical.
 
-    REBIND, never mutate: `translate_kv_loc` returns a FRESH tensor, so the
-    ScheduleBatch's aliased tensor is untouched (scheduler-thread readers —
-    on_forward_launched, accept bookkeeping — require virtual ids).
-
-    ORDER-CRITICAL for hybrid SWA: one virtual id maps to TWO physicals
-    (full + swa). The swa rail must be computed from the still-VIRTUAL loc
-    BEFORE the full-side rebind replaces it.
-
-    No-op (byte-identical) on non-unified pools: they have no
-    `translate_kv_loc`, and `out_cache_loc` is already physical there.
+    ALL id-space knowledge (which translate, dense vs physical, the swa rail
+    ordering) lives on the choke point — see KVIndexSource.rebind_write_loc.
+    No-op (byte-identical) on non-unified pools.
     """
-    # Dense-first, EXACTLY the preference the attention backends use for
-    # their kernel-facing translate handle: the MLA composite exposes
-    # `translate_kv_loc_dense` (virtual -> dense view id; collapses onto the
-    # physical id at page-multiplier 1), every other composite only
-    # `translate_kv_loc` (virtual -> physical). Using the same preference
-    # here is what makes every downstream consumer — backend metadata,
-    # cuda-graph refill, pool doors — a pure passthrough.
-    allocator = model_runner.token_to_kv_pool_allocator
-    translate = getattr(allocator, "translate_kv_loc_dense", None) or getattr(
-        allocator, "translate_kv_loc", None
-    )
-    if translate is None or fb.out_cache_loc is None:
-        return
-    swa_map = getattr(
-        model_runner.token_to_kv_pool, "translate_loc_from_full_to_swa", None
-    )
-    if swa_map is not None:
-        # int32 — the shared read-index kernel convention (dtype preserved).
-        fb.swa_out_cache_loc = swa_map(fb.out_cache_loc)
-    fb.out_cache_loc = translate(fb.out_cache_loc)
-    fb.out_cache_loc_is_physical = True
-    fb._unified_kv_loc_translate = translate
+    model_runner.kv_index_source.rebind_write_loc(fb)
 
 
 @dataclass
@@ -505,11 +476,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # this — a hand-built ForwardBatch that skipped the rebind fails loudly
     # instead of writing virtual ids as if physical.
     out_cache_loc_is_physical: bool = False
-    # The allocator's translate_kv_loc, stashed for read-rail producers
-    # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices) so
-    # req_to_token-derived READ indices can be translated at production.
-    # None on non-unified pools.
-    _unified_kv_loc_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    # The read-path choke point (KVIndexSource), stashed by rebind_write_loc
+    # for the read-rail producers (fetch_mha_one_shot_kv_indices /
+    # prepare_chunked_kv_indices) so req_to_token-derived READ indices can be
+    # translated at production. None on non-unified pools.
+    _kv_index_source: Optional[object] = None
     # Per-batch read-index source view (KVIndexBatchView), built lazily by the
     # first attention-backend consumer via KVIndexSource and stashed here so
     # TBO children and multi-consumer forwards build it once. Eager path only —

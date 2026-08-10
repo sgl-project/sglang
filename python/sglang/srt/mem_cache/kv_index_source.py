@@ -251,6 +251,35 @@ class KVIndexSource:
             full_to_swa_map=None,
         )
 
+    def rebind_write_loc(self, forward_batch) -> None:
+        """The WRITE half of the id-space contract, folded
+        onto the choke point.
+
+        Translate the forward batch's write loc to KERNEL-FACING ids exactly
+        once, at ForwardBatch preparation. REBIND, never mutate: the translate
+        returns a FRESH tensor, so the ScheduleBatch's aliased tensor stays
+        VIRTUAL (radix/accept/inflight machinery reads it). ORDER-CRITICAL for
+        hybrid SWA: one virtual id maps to TWO kernel-facing ids — the swa
+        rail must be computed from the still-VIRTUAL loc BEFORE the full-side
+        rebind replaces it. No-op (byte-identical) on non-unified pools.
+
+        Also stashes this source on the batch for the read-rail producers
+        (the deepseek MHA mixin) that translate req_to_token-derived indices
+        at production.
+        """
+        if not self.enabled or forward_batch.out_cache_loc is None:
+            return
+        if self._translate_swa is not None:
+            # int32 — the shared read-index kernel convention (dtype preserved).
+            forward_batch.swa_out_cache_loc = self._translate_swa(
+                forward_batch.out_cache_loc
+            )
+        forward_batch.out_cache_loc = self._translate_full(
+            forward_batch.out_cache_loc
+        )
+        forward_batch.out_cache_loc_is_physical = True
+        forward_batch._kv_index_source = self
+
     def build_into(
         self,
         *,

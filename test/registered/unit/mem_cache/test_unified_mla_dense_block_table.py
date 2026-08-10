@@ -262,9 +262,7 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
 
         if v2p:
             # The choke point's canonical, then the wrapper copies its rows.
-            canonical = torch.zeros(
-                (bs, max_pages), dtype=torch.int32, device=_DEV
-            )
+            canonical = torch.zeros((bs, max_pages), dtype=torch.int32, device=_DEV)
             build_kernel_page_table(
                 req_to_token=rt,
                 req_pool_indices=rpi,
@@ -354,69 +352,6 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
     # (The old fa3<->flashmla agreement case is gone: both families now
     # consume the SAME canonical builder, so cross-family agreement holds by
     # construction and the per-family cases above cover the two consumers.)
-
-
-class TestUnifiedMLAHookDetection(unittest.TestCase):
-    """`unified_mla_hooks` decides whether the paged MLA backends translate at
-    all. Getting the predicate wrong is silent: the block table and KV write loc
-    stay in virtual id space and address the wrong pages once virtual and
-    physical diverge (e.g. after compaction)."""
-
-    @staticmethod
-    def _probe(**attrs):
-        from sglang.srt.layers.attention.unified_mem_hooks import (
-            unified_mla_hooks,
-        )
-
-        class _Alloc:
-            pass
-
-        alloc = _Alloc()
-        for k, v in attrs.items():
-            setattr(alloc, k, v)
-        return unified_mla_hooks(alloc)
-
-    def test_static_pool_disables_every_hook(self):
-        """No v2p table -> statically-partitioned pool; req_to_token is already
-        physical, so all hooks must stay off (byte-identical to pre-change)."""
-        hooks = self._probe()
-        self.assertFalse(hooks.enabled)
-        self.assertIsNone(hooks.v2p_page_table)
-        self.assertIsNone(hooks.translate_kv_loc_dense)
-        self.assertEqual(hooks.kernel_page_multiplier, 1)
-
-    def test_multi_layer_unified_pool(self):
-        table = torch.arange(8)
-        hooks = self._probe(
-            full_v2p_page_table=table,
-            translate_kv_loc_dense=lambda x, **kw: x,
-            kernel_page_multiplier=_LAYERS,
-        )
-        self.assertTrue(hooks.enabled)
-        self.assertIs(hooks.v2p_page_table, table)
-        self.assertIsNotNone(hooks.translate_kv_loc_dense)
-        self.assertEqual(hooks.kernel_page_multiplier, _LAYERS)
-
-    def test_single_full_attention_layer_pool_is_still_unified(self):
-        """REGRESSION: `kernel_page_multiplier == 1` does NOT mean static.
-
-        A hybrid MLA config with exactly one full-attention layer (e.g. a
-        pipeline-parallel rank owning a single MLA layer) has multiplier 1, yet
-        its locs are still virtual. Detecting on `multiplier > 1` would disable
-        the v2p gather here and corrupt reads/writes after compaction.
-        """
-        table = torch.arange(8)
-        hooks = self._probe(
-            full_v2p_page_table=table,
-            translate_kv_loc_dense=lambda x, **kw: x,
-            kernel_page_multiplier=1,
-        )
-        self.assertTrue(hooks.enabled, "single-layer unified pool read as static")
-        self.assertIs(hooks.v2p_page_table, table)
-        self.assertIsNotNone(hooks.translate_kv_loc_dense)
-        # Multiplier stays 1: dense id == physical id, so the v2p gather alone is
-        # the whole translation and PAGE_MULT must not scale it.
-        self.assertEqual(hooks.kernel_page_multiplier, 1)
 
 
 if __name__ == "__main__":

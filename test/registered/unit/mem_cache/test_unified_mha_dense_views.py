@@ -523,15 +523,25 @@ class TestFactoryDenseFlip(unittest.TestCase):
         self.assertIsNotNone(v)
         expected_full = alloc.full_v2p_page_table[v] * self.FULL_MULT  # ps=1
         expected_swa = (alloc.swa_v2p_page_table[v] * self.SWA_MULT).to(torch.int32)
+        from sglang.srt.mem_cache.kv_index_source import KVIndexSource
+
         fb = SimpleNamespace(
             out_cache_loc=v.clone(),
             swa_out_cache_loc=None,
             out_cache_loc_is_physical=False,
-            _unified_kv_loc_translate=None,
+            _kv_index_source=None,
         )
+        # Real KVIndexSource over the real factory allocator/pool: this pins
+        # the whole chain — capability probe, dense-first translate, swa-rail
+        # ordering — not a faked translate surface.
         runner = SimpleNamespace(
-            token_to_kv_pool_allocator=alloc,
-            token_to_kv_pool=b.token_to_kv_pool,
+            kv_index_source=KVIndexSource(
+                req_to_token=torch.zeros((1, 8), dtype=torch.int64),
+                token_to_kv_pool_allocator=alloc,
+                token_to_kv_pool=b.token_to_kv_pool,
+                page_size=1,
+                device="cpu",
+            )
         )
         apply_unified_kv_loc_rebind(fb, runner)
         self.assertTrue(fb.out_cache_loc_is_physical)
