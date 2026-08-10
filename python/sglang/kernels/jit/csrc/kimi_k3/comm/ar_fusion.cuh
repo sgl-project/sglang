@@ -613,10 +613,6 @@ __launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid
   pull_barrier_exit<kUsePDL>(params, barrier_window);
 }
 
-}  // namespace sglang
-
-using namespace sglang;
-
 // Host entry points
 
 template <uint32_t kWorldSize, bool kUsePDL>
@@ -906,3 +902,5 @@ struct AllReduceFusionKernel {
     launch_pull_norm(params, num_blocks, unroll, input.device());
   }
 };
+
+}  // namespace sglang

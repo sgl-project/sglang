@@ -318,10 +318,10 @@ export const Qwen35Deployment = () => {
 
     let modelName;
     if (quantization === 'fp4') {
-      // AMD MI355X uses the MXFP4 checkpoint; Blackwell uses NVFP4.
+      // AMD MI355X uses the MXFP4 checkpoint; Blackwell uses NVFP4-V2.
       modelName = hardware === 'mi355x'
         ? 'amd/Qwen3.5-397B-A17B-MXFP4'
-        : 'nvidia/Qwen3.5-397B-A17B-NVFP4';
+        : 'nvidia/Qwen3.5-397B-A17B-NVFP4-V2';
     } else {
       const suffix = MODEL_SUFFIX[model];
       const quantSuffix = quantization === 'fp8' ? '-FP8' : '';

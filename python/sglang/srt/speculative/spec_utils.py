@@ -49,7 +49,13 @@ from sglang.srt.mem_cache.allocation import (
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_spec,
+    mamba_extra_buffer_enabled,
+    mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -253,16 +259,14 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
     record_stream_each(candidates, fwd_stream)
 
 
-def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
-    if server_args is None:
-        server_args = get_server_args()
-
+def spec_need_hidden_states() -> bool:
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
     # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
+    spec = get_spec()
+    if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
-    return not server_args.enable_multi_layer_eagle
+    return not spec.enable_multi_layer_eagle
 
 
 @torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
@@ -752,9 +756,7 @@ def move_accept_tokens_to_target_kvcache(
     )
 
 
-def _recover_ssm_track_unreachable(
-    batch: ScheduleBatch, server_args: ServerArgs
-) -> bool:
+def _recover_ssm_track_unreachable(batch: ScheduleBatch) -> bool:
     """Whether RecoverSSM may drop this verify's mamba-track plan entirely.
 
     RecoverSSM (``--gdn-mtp-cache-mode none``) caches no intermediate h, so its
@@ -773,12 +775,12 @@ def _recover_ssm_track_unreachable(
     consistent with the independently computed ping-pong advance in
     ``BatchResultProcessor._mamba_check_track_boundary``.
     """
-    if server_args.gdn_mtp_cache_mode != "none":
+    if get_exec().mamba.gdn_mtp_cache_mode != "none":
         return False
-    max_draft_tokens = server_args.max_speculative_num_draft_tokens
+    max_draft_tokens = max_speculative_num_draft_tokens()
     if max_draft_tokens is None:
         return False
-    mamba_track_interval = server_args.mamba_track_interval
+    mamba_track_interval = get_exec().mamba.mamba_track_interval
     return not any(
         mamba_lazy_spec_in_window(req, mamba_track_interval, max_draft_tokens)
         for req in batch.reqs
@@ -800,10 +802,9 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     RecoverSSM: leave the plan unset on steps where no crossing is reachable,
     which elides a whole per-GDN-layer boundary recovery sweep.
     """
-    server_args = get_server_args()
-    if not server_args.enable_mamba_extra_buffer():
+    if not mamba_extra_buffer_enabled():
         return
-    if _recover_ssm_track_unreachable(batch, server_args):
+    if _recover_ssm_track_unreachable(batch):
         # Cleared explicitly: a plan built for an earlier step would otherwise
         # survive here and re-arm the boundary sweep against stale slots.
         batch.mamba_track_indices = None
@@ -811,7 +812,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
         batch.mamba_track_seqlens = None
         return
     track_positions = None
-    if server_args.enable_mamba_extra_buffer_lazy():
+    if mamba_extra_buffer_lazy_enabled():
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
         assert track_positions is not None and len(track_positions) == len(
             batch.reqs
@@ -1073,12 +1074,11 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    server_args = get_server_args()
-    if server_args.enable_mamba_extra_buffer_lazy():
+    if mamba_extra_buffer_lazy_enabled():
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             get_exec().mamba.mamba_track_interval,
-            server_args.max_speculative_num_draft_tokens,
+            max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)

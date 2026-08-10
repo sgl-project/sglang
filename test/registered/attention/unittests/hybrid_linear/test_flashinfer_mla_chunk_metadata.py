@@ -46,9 +46,10 @@ class _ChunkKVMLARunner(MockMLAModelRunner):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         from sglang.srt.runtime_context import get_context
+        from sglang.test.test_utils import server_args_variant
 
-        self.server_args = self.server_args.derive(
-            "attention-unittest",
+        self.server_args = server_args_variant(
+            self.server_args,
             disable_chunked_prefix_cache=False,
             flashinfer_mla_disable_ragged=False,
         )
