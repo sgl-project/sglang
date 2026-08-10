@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration
-register_cuda_ci(est_time=180, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=250, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-large-amd")
 
 

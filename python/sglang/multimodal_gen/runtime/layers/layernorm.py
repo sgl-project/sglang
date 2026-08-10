@@ -321,7 +321,11 @@ class RMSNormNoWeight(CustomOp):
         return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
 
     def forward_cuda(self, x: torch.Tensor, eps: float) -> torch.Tensor:
-        return self.forward_native(x, eps=eps)
+        # Torch 2.12+ runs rms_norm in fp32 under CUDA autocast. This operator
+        # historically preserved the activation dtype, and callers rely on
+        # that contract for both memory use and downstream kernel selection.
+        with torch.autocast(device_type="cuda", enabled=False):
+            return self.forward_native(x, eps=eps)
 
     def forward_npu(self, x: torch.Tensor, eps: float) -> torch.Tensor:
         return fused_rmsnorm_without_weight(x, eps)
@@ -448,18 +452,21 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         )
         self._forward_method = self.dispatch_forward()
 
-        try:
-            import attentions  # noqa: F401
-        except ImportError:
-            from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+        if _is_npu:
+            try:
+                import attentions  # noqa: F401
+            except ImportError:
+                from sglang.multimodal_gen.runtime.utils.logging_utils import (
+                    init_logger,
+                )
 
-            logger = init_logger(__name__)  # pylint: disable=invalid-name
-            logger.warning(
-                "The 'attentions' library is not installed. Falling back to native layernorm. "
-                "Installing this library may improve performance on NPU."
-                "See: sgl-project/sgl-kernel-npu"
-            )
-            self._forward_method = self.forward_native
+                logger = init_logger(__name__)  # pylint: disable=invalid-name
+                logger.warning(
+                    "The 'attentions' library is not installed. Falling back to native layernorm. "
+                    "Installing this library may improve performance on NPU."
+                    "See: sgl-project/sgl-kernel-npu"
+                )
+                self._forward_method = self.forward_native
 
     def _cached_fp32_param(
         self, attr: str, param: torch.Tensor | None, device: torch.device

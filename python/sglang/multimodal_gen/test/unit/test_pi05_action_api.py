@@ -6,13 +6,13 @@ from types import SimpleNamespace
 import numpy as np
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
+from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_generation_response,
     action_metadata,
     action_raw_response,
@@ -33,15 +33,16 @@ def _server_args(config: Pi05PipelineConfig | None = None) -> SimpleNamespace:
         sp_degree=1,
         ulysses_degree=1,
         ring_degree=1,
+        kv_gather_degree=1,
         pipeline_config=config or Pi05PipelineConfig(),
     )
 
 
-def test_pi05_uses_vla_sampling_params_not_visual_sampling_params():
+def test_pi05_uses_action_sampling_params_not_visual_sampling_params():
     params = Pi05SamplingParams()
     field_names = {field.name for field in dataclasses.fields(params)}
 
-    assert isinstance(params, VLASamplingParams)
+    assert isinstance(params, ActionSamplingParams)
     assert not isinstance(params, SamplingParams)
     assert "action_horizon" in field_names
     assert "action_dim" in field_names
@@ -174,6 +175,7 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
     assert metadata["runtime"]["materialize_dtype"] == "bf16"
     assert metadata["runtime"]["enable_autocast"] is True
     assert metadata["runtime"]["parallelism"]["num_gpus"] == 1
+    assert metadata["runtime"]["parallelism"]["kv_gather_degree"] == 1
     assert metadata["runtime"]["parallelism"]["prefix_strategy"] == "tp"
     assert metadata["runtime"]["parallelism"]["action_strategy"] == "sp"
     assert metadata["defaults"]["prefix_cache"] is False

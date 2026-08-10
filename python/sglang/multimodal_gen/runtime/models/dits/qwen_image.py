@@ -16,6 +16,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     can_fuse_linear_gelu,
+    fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
@@ -39,6 +40,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     DynamicVarlenMaskMeta,
     USPAttention,
     build_varlen_mask_meta,
+    build_varlen_mask_meta_from_ranges,
 )
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.fused_scale_shift_gate import (
@@ -768,7 +770,9 @@ class QwenImageCrossAttention(nn.Module):
         # Joint order [text, image]; join_seqs relocates any SP text tail-pad
         # behind the image (see sp_shard.join_seqs for why).
         seg_qkv = None
-        if sp_text_sharded:
+        # The segmented pre-all-to-all emits Ulysses layout; K/V-gather takes
+        # the join_seqs path and exchanges inside the attention instead.
+        if sp_text_sharded and self.attn.sp_attention_mode == "ulysses":
             from sglang.multimodal_gen.runtime.layers.usp import (
                 _ipc_input_a2a_qkv_segmented,
             )
@@ -861,9 +865,7 @@ class QwenImageGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
-            self.proj, hidden_states
-        ):
+        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -1369,23 +1371,24 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
-        patch_size = config.arch_config.patch_size
-        in_channels = config.arch_config.in_channels
-        out_channels = config.arch_config.out_channels
-        num_layers = config.arch_config.num_layers
-        attention_head_dim = config.arch_config.attention_head_dim
-        num_attention_heads = config.arch_config.num_attention_heads
-        joint_attention_dim = config.arch_config.joint_attention_dim
-        axes_dims_rope = config.arch_config.axes_dims_rope
-        self.zero_cond_t = getattr(config.arch_config, "zero_cond_t", False)
+        arch = self.config
+        patch_size = arch.patch_size
+        in_channels = arch.in_channels
+        out_channels = arch.out_channels
+        num_layers = arch.num_layers
+        attention_head_dim = arch.attention_head_dim
+        num_attention_heads = arch.num_attention_heads
+        joint_attention_dim = arch.joint_attention_dim
+        axes_dims_rope = arch.axes_dims_rope
+        self.zero_cond_t = getattr(arch, "zero_cond_t", False)
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
 
         self.use_additional_t_cond: bool = getattr(
-            config.arch_config, "use_additional_t_cond", False
+            arch, "use_additional_t_cond", False
         )  # For qwen-image-layered now
         self.use_layer3d_rope: bool = getattr(
-            config.arch_config, "use_layer3d_rope", False
+            arch, "use_layer3d_rope", False
         )  # For qwen-image-layered now
 
         if not self.use_layer3d_rope:
@@ -1563,6 +1566,26 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 # once, so build varlen metadata replay-locally from the current
                 # static mask instead of closing over stale cu_seqlens/indices.
                 block_attention_kwargs["attn_mask_meta"] = DynamicVarlenMaskMeta()
+            elif (
+                txt_seq_lens is not None
+                and len(txt_seq_lens) == batch_size
+                and all(0 <= n <= encoder_hidden_states.shape[1] for n in txt_seq_lens)
+            ):
+                # txt_seq_lens already carries each row's valid text prefix
+                # (the mask is built from it), so the varlen metadata can be
+                # assembled host-side; the mask-based builder costs a GPU
+                # nonzero plus a device sync on every denoising step.
+                txt_len = encoder_hidden_states.shape[1]
+                block_attention_kwargs["attn_mask_meta"] = (
+                    build_varlen_mask_meta_from_ranges(
+                        [
+                            [(0, int(n)), (txt_len, txt_len + image_seq_len)]
+                            for n in txt_seq_lens
+                        ],
+                        max_seqlen=txt_len + image_seq_len,
+                        device=hidden_states.device,
+                    )
+                )
             else:
                 # Precompute varlen metadata once per request so every block
                 # reuses the same cu_seqlens / indices instead of rebuilding.
