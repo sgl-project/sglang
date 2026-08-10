@@ -111,7 +111,12 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     to_chw_uint8,
 )
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+    get_exec,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import is_blackwell_supported, is_hip, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -3082,7 +3087,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
         def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
             """Materialize only the images assigned to this vision-DP rank."""
-            ipc_consumer_count = max(get_parallel().tp_size, 1)
+            # Match the configured TP consumer count captured when the
+            # tokenizer creates MmItemMemoryPool. A live attention subgroup
+            # size could leave acknowledgements missing and strand the lease.
+            ipc_consumer_count = max(configured_tp_size(), 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
