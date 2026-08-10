@@ -394,6 +394,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    if processed_messages is not None:
+                        sampling_params["skip_special_tokens"] = (
+                            processed_messages.skip_special_tokens
+                        )
 
                     # _process_messages set skip_special_tokens on a chat_request
                     # we then discard, so re-apply it to the engine sampling dict.
@@ -808,6 +812,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
     ):
+        chat_tools = self._response_tools_to_chat_tools(request)
         if self.reasoning_parser:
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
@@ -819,6 +824,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ),
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
+                tool_call_parser_active=bool(
+                    chat_tools
+                    and self.tool_call_parser
+                    and request.tool_choice != "none"
+                ),
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -851,7 +861,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             output_items.append(reasoning_item)
 
-        chat_tools = self._response_tools_to_chat_tools(request)
         is_required = request.tool_choice == "required"
         tool_call_items: list[ResponseFunctionToolCall] = []
         parsed_via_native = False
@@ -1977,6 +1986,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ),
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
+                tool_call_parser_active=isinstance(tool_parser, FunctionCallParser),
             )
 
         current_output_index = -1
@@ -2210,11 +2220,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                     stream_offset = len(text)
                 if not delta and finish_reason is None:
                     continue
+                flush = (
+                    finish_reason is not None and finish_reason.get("type") != "abort"
+                )
 
                 if reasoning_parser_obj is not None:
                     reasoning_chunk, delta = reasoning_parser_obj.parse_stream_chunk(
                         delta
                     )
+                    if flush:
+                        end_reasoning, end_normal = (
+                            reasoning_parser_obj.parse_stream_end()
+                        )
+                        if end_reasoning:
+                            reasoning_chunk = (reasoning_chunk or "") + end_reasoning
+                        if end_normal:
+                            delta = (delta or "") + end_normal
                 else:
                     reasoning_chunk = None
 
@@ -2278,7 +2299,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
 
-                if not delta:
+                if not delta and not flush:
                     continue
 
                 if isinstance(tool_parser, JsonArrayParser):
@@ -2286,6 +2307,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     normal_text, tool_calls = sp.normal_text or "", sp.calls
                 elif tool_parser is not None:
                     normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
+                    if flush:
+                        end_text, end_calls = tool_parser.parse_stream_end()
+                        normal_text = (normal_text or "") + end_text
+                        tool_calls = list(tool_calls) + end_calls
                 else:
                     normal_text, tool_calls = delta, []
 

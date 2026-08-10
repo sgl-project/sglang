@@ -314,7 +314,9 @@ class BaseRunner(ABC):
                 run_ctx=canary_run_ctx,
             )
 
-        run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
+        run_flashinfer_autotune_forward(
+            self.model_runner, forward_fn, skip_logits=False
+        )
 
     def _alloc_dummy_decode_buffers(
         self,

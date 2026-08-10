@@ -264,6 +264,7 @@ class ModelConfig:
         is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
+        language_model_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
@@ -451,7 +452,8 @@ class ModelConfig:
         )
         # TODO: requires further polishing
         # Key on the tower, not the attribute: several config classes default
-        # vision_config to None, which presence alone would read as image-capable.
+        # vision_config to None, which presence alone would read as image-capable
+        # (MuseGlimmerConfig's text-only layouts are one such case).
         self.is_image_understandable_model = (
             enable_multimodal
             and not self.is_lm_only
@@ -534,6 +536,7 @@ class ModelConfig:
 
         self.hf_config.encoder_only = encoder_only
         self.hf_config.language_only = language_only
+        self.hf_config.language_model_only = language_model_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
@@ -582,6 +585,7 @@ class ModelConfig:
             override_config_file=override_config_file,
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
+            language_model_only=server_args.language_model_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
             is_draft_quantization_explicit=(
@@ -1039,11 +1043,13 @@ class ModelConfig:
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
-        self.vocab_size = self.hf_text_config.vocab_size
-        # GLM-Image is the only model here whose output head predicts vision tokens.
-        # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
-        if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
-            self.vocab_size = self.hf_text_config.vision_vocab_size
+        # DFlash drafts have no vocab of their own.
+        if self.is_draft_model and not hasattr(self.hf_text_config, "vocab_size"):
+            self.vocab_size = None
+        else:
+            self.vocab_size = self.hf_text_config.vocab_size
+            if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
+                self.vocab_size = self.hf_text_config.vision_vocab_size
 
     def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
         """Base MLA attention scale from the head dims, then the rope mscale."""
@@ -1830,6 +1836,7 @@ multimodal_model_archs = [
     "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "MuseGlimmerForConditionalGeneration",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
@@ -1893,6 +1900,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "MuseGlimmerForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -2036,6 +2044,8 @@ def is_hybrid_swa_model(
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
         "MellumForCausalLM",
+        "MuseGlimmerForCausalLM",
+        "MuseGlimmerForConditionalGeneration",
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
@@ -2111,6 +2121,8 @@ def get_hybrid_layer_ids(
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
         or "LagunaForCausalLM" in model_architectures
         or "MellumForCausalLM" in model_architectures
+        or "MuseGlimmerForCausalLM" in model_architectures
+        or "MuseGlimmerForConditionalGeneration" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [

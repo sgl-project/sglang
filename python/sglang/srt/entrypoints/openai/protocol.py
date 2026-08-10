@@ -1937,6 +1937,7 @@ class MessageProcessingResult:
     tool_call_constraint: Optional[ToolCallConstraint] = None
     skip_special_tokens: bool = True
     require_reasoning: bool = False
+    skip_special_tokens: bool = True
 
 
 class ToolCallProcessingResult(NamedTuple):

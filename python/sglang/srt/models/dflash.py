@@ -65,9 +65,12 @@ def _get_dflash_layer_attention_params(
         )
         return -1, attention_type
     if layer_type == "sliding_attention":
+        # DFlash uses non-causal attention over the draft block on every layer --
+        # the reference sets it on the whole draft context, so a sliding layer is
+        # windowed but still bidirectional (masking only p1 - p0 >= sliding_window).
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
-        return sliding_window_size, AttentionType.DECODER
+        return sliding_window_size, AttentionType.ENCODER_ONLY
     raise ValueError(
         "Unsupported DFLASH draft layer type. "
         f"layer_types[{layer_id}]={layer_type!r}."
@@ -359,11 +362,12 @@ class DFlashDraftModel(nn.Module):
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
         draft_config = parse_dflash_draft_config(draft_hf_config=config)
-        target_num_layers = (
-            int(draft_config.num_target_layers)
-            if draft_config.num_target_layers is not None
-            else num_layers
-        )
+        if draft_config.num_target_layers is not None:
+            target_num_layers = int(draft_config.num_target_layers)
+        elif draft_config.target_layer_ids is not None:
+            target_num_layers = max(draft_config.target_layer_ids) + 1
+        else:
+            target_num_layers = num_layers
         target_layer_ids = draft_config.resolve_target_layer_ids(
             target_num_layers=target_num_layers, draft_num_layers=num_layers
         )
@@ -448,6 +452,12 @@ class DFlashDraftModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
+        # Alias the native export's "encoder." names.
+        _VENDOR_ENCODER_ALIASES = {
+            "encoder.fc.weight": "fc.weight",
+            "encoder.output_norm_enc.weight": "hidden_norm.weight",
+        }
+
         def resolve_param_name(name: str) -> Optional[str]:
             if name in params_dict:
                 return name
@@ -459,6 +469,9 @@ class DFlashDraftModel(nn.Module):
                 prefixed_name = f"model.{name}"
                 if prefixed_name in params_dict:
                     return prefixed_name
+            aliased_name = _VENDOR_ENCODER_ALIASES.get(name)
+            if aliased_name is not None and aliased_name in params_dict:
+                return aliased_name
             return None
 
         for name, loaded_weight in weights:
@@ -586,4 +599,8 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(self.fc(fused))
 
 
-EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM]
+class MuseGlimmerAssistantModel(DFlashDraftModel):
+    """Alias for checkpoints declaring architectures=["MuseGlimmerAssistantModel"]."""
+
+
+EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM, MuseGlimmerAssistantModel]
