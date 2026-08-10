@@ -2765,6 +2765,15 @@ class ServerArgs:
         "Enable global multimodal embedding cache to skip redundant ViT inference.",
         NS("mm"),
     ] = False
+    mm_global_cache_backend: A[
+        str,
+        Arg(
+            help="Storage backend for the multimodal global embedding cache. "
+            "Used when --enable-mm-global-cache is set.",
+            choices=["mooncake"],
+        ),
+        NS("mm"),
+    ] = "mooncake"
     disable_fast_image_processor: A[
         bool, "Adopt base image processor instead of fast image processor.", NS("mm")
     ] = False
@@ -4382,11 +4391,8 @@ class ServerArgs:
         if (
             self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
             and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
-            # Keep trtllm_mla on the preferred breakable path. Its current
-            # breakable compatibility rule disables the graph, avoiding the
-            # tc_piecewise FlashInfer paged-MLA fallback; once breakable gains
-            # native support, that rule can be relaxed without re-enabling the
-            # deprecated tc_piecewise path.
+            # Keep trtllm_mla on the preferred breakable path, which now serves
+            # MLA by falling back to the flashinfer MLA impl for extend.
             and self._resolved_attention_backends()[0] != "trtllm_mla"
         ):
             logger.info(
@@ -4490,22 +4496,10 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import (
-            is_deepseek_dsa,
-            is_deepseek_v4,
-            is_nemotron_h,
-        )
+        from sglang.srt.configs.model_config import is_deepseek_v4, is_nemotron_h
         from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
-            # MLA prefill under BCG takes forward_mha, which has no eager
-            # breaks. DSA is exempt: BCG forces the sparse path, whose
-            # indexer already splits eagerly.
-            (
-                "MLA attention (non-DSA)",
-                lambda: self.use_mla_backend()
-                and not is_deepseek_dsa(self.get_model_config().hf_config),
-            ),
             # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
             # state-track write is not wired into the captured buffers, so a
             # replay can commit a cache slot it never wrote.
@@ -5378,12 +5372,10 @@ class ServerArgs:
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
             # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
-            # None of these backends exist on MPS, and under MLX attention
-            # runs inside the MLX runner, so attention_backend is still unset
-            # at this point (the torch_native default fills later). macOS
-            # *without* MLX is not exempt: it has no runner of its own, so it
-            # must still be held to the supported-backend list instead of
-            # silently landing on torch_native (no SWA, no sinks).
+            # Exempt MLX only: none of these backends exist on MPS, and MLX runs
+            # attention inside its own runner, so attention_backend is still
+            # unset here.  Plain macOS stays on the list -- torch_native has
+            # neither sliding window nor attention sinks.
             if not (is_mps() and use_mlx()):
                 supported_backends = [
                     "triton",
@@ -8018,10 +8010,31 @@ class ServerArgs:
         assert self.disaggregation_mode == "null", (
             "--enable-unified-memory is not yet compatible with PD " "disaggregation."
         )
-        assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
+        assert self.speculative_algorithm in (None, "DSPARK"), (
+            "--enable-unified-memory only supports --speculative-algorithm "
+            "DSPARK (chain draft); other speculative algorithms are not yet "
+            "audited for the unified pool's virtual/dense loc translation. Got "
+            f"--speculative-algorithm={self.speculative_algorithm!r}."
         )
+        if self.speculative_algorithm == "DSPARK":
+            assert self.speculative_eagle_topk in (None, 1), (
+                "--enable-unified-memory + DSPARK supports a linear draft "
+                "chain only (--speculative-eagle-topk in {None, 1}); tree "
+                "verify is not audited for the unified pool. Got "
+                f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
+            )
+            # Both roles: verify routes to either backend depending on
+            # --speculative-attention-mode.
+            spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+            spec_backends = set(self._resolved_attention_backends())
+            spec_backends.discard(None)
+            assert spec_backends <= spec_allowed, (
+                "--enable-unified-memory + DSPARK requires spec-verify-audited "
+                f"attention backends {sorted(spec_allowed)} for both prefill "
+                f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
+                "not translate speculative verify indices to the unified "
+                "pool's dense space yet."
+            )
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
