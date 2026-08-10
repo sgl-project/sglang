@@ -13,6 +13,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter_prompts import (
     IMAGE_STEP1_EXPAND,
     IMAGE_STEP2_MAP,
+    VIDEO_DURATION_EN,
+    VIDEO_DURATION_ZH,
     VIDEO_STEP1_EXPAND,
     VIDEO_STEP2_MAP,
 )
@@ -26,11 +28,8 @@ _FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
 def build_expand_prompt(mode: str, prompt: str, duration: int) -> str:
     if mode == "t2i":
         return f"{IMAGE_STEP1_EXPAND}\n\nUser image prompt:\n{prompt}"
-    duration_line = (
-        f"视频时长：{duration} 秒"
-        if _CJK.search(prompt)
-        else f"Video Duration: {duration} seconds"
-    )
+    template = VIDEO_DURATION_ZH if _CJK.search(prompt) else VIDEO_DURATION_EN
+    duration_line = template.format(duration=duration)
     return f"{VIDEO_STEP1_EXPAND}\n\n{prompt}\n\n{duration_line}"
 
 

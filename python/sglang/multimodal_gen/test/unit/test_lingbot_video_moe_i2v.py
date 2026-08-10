@@ -56,6 +56,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     parse_caption,
     resolve_mode,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter_prompts import (
+    VIDEO_DURATION_EN,
+    VIDEO_DURATION_ZH,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     IMG_PROMPT_TEMPLATE,
     PROMPT_TEMPLATE,
@@ -537,7 +541,11 @@ def test_expand_prompt_carries_the_duration_for_video_modes():
 
 
 def test_expand_prompt_matches_the_caption_language():
-    assert "视频时长：5 秒" in build_expand_prompt("t2v", "一只红狐狸", 5)
+    cjk_prompt = VIDEO_DURATION_ZH.format(duration=3)
+    expanded = build_expand_prompt("t2v", cjk_prompt, 5)
+
+    assert VIDEO_DURATION_ZH.format(duration=5) in expanded
+    assert VIDEO_DURATION_EN.format(duration=5) not in expanded
 
 
 def test_map_prompt_feeds_the_expansion_back():

@@ -188,6 +188,9 @@ VIDEO_STEP2_MAP = (
     "- Output ONLY the JSON object (valid and parseable), following the schema and rules above."
 )
 
+VIDEO_DURATION_EN = "Video Duration: {duration} seconds"
+VIDEO_DURATION_ZH = "视频时长：{duration} 秒"
+
 IMAGE_STEP1_EXPAND = (
     "You write ONE short, natural, standalone IMAGE caption in English from a brief user image\n"
     "prompt — as if briefly describing a real photo of that idea.\n"
