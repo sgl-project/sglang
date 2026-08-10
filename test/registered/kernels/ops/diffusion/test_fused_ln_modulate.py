@@ -50,6 +50,32 @@ def test_fused_ln_modulate_guards_and_mount_protocol():
     assert not mount_fused_ln_modulate(nn.Module())  # no marked sites
 
 
+@torch.no_grad()
+def test_mounted_ln_modulate_site_torch_compile_fullgraph():
+    class Site(nn.Module):
+        def __init__(self):
+            super().__init__()
+            mark_fused_ln_modulate_site(self)
+
+        def forward(self, x, scale, shift):
+            if fused_ln_modulate_active(self) and can_fuse_ln_modulate(x, scale, shift):
+                return fused_ln_modulate(x, scale, shift, eps=1e-6)
+            return (
+                nn.functional.layer_norm(x, (x.shape[-1],), eps=1e-6)
+                * (1 + scale[:, None])
+                + shift[:, None]
+            )
+
+    site = Site()
+    assert mount_fused_ln_modulate(site)
+    x = torch.randn(1, 64, 128, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
+    shift = torch.randn_like(scale)
+    expected = site(x, scale, shift)
+    actual = torch.compile(site, fullgraph=True)(x, scale, shift)
+    torch.testing.assert_close(actual, expected, atol=0.0625, rtol=0.05)
+
+
 if __name__ == "__main__":
     import sys
 

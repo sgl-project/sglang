@@ -83,11 +83,11 @@ def zimage_rmsnorm_tanh_mul_add(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
-            zimage_rmsnorm_tanh_residual,
+        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
+            rmsnorm_tanh_residual,
         )
 
-        y = zimage_rmsnorm_tanh_residual(
+        y = rmsnorm_tanh_residual(
             x,
             gate,
             residual,
@@ -106,11 +106,11 @@ def zimage_rmsnorm_scale(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
-            zimage_rmsnorm_scale as fused_zimage_rmsnorm_scale,
+        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
+            rmsnorm_scale,
         )
 
-        y = fused_zimage_rmsnorm_scale(
+        y = rmsnorm_scale(
             x,
             norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
             scale,

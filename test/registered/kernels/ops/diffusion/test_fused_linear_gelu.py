@@ -21,7 +21,7 @@ class _Site(nn.Module):
         gelu.mark_fused_gelu_site(self, "proj")
 
     def forward(self, x):
-        if self._sgl_fused_gelu_enabled and gelu.can_fuse_linear_gelu(self.proj, x):
+        if gelu.fused_gelu_active(self) and gelu.can_fuse_linear_gelu(self.proj, x):
             return gelu.fused_linear_gelu_tanh(x, self.proj.weight, self.proj.bias)
         return F.gelu(self.proj(x), approximate="tanh")
 
@@ -59,7 +59,7 @@ def test_mount_guards_and_lossless_path():
     good, bad = _Site(), _Site(torch.float32)
     model = nn.ModuleList([good, bad])
     assert not gelu.mount_fused_linear_gelu(model)
-    assert not good._sgl_fused_gelu_enabled
+    assert not gelu.fused_gelu_active(good)
 
     x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
     ref = good(x)
@@ -70,6 +70,16 @@ def test_mount_guards_and_lossless_path():
     no_bias = nn.Linear(8, 8, bias=False, device="cuda", dtype=torch.bfloat16)
     assert not gelu.can_fuse_linear_gelu_static(no_bias)
     assert not gelu.can_fuse_linear_gelu(good.proj, x.float())
+
+
+@torch.no_grad()
+def test_mounted_site_torch_compile_fullgraph():
+    site = _Site()
+    x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+    assert gelu.mount_fused_linear_gelu(site)
+    expected = site(x)
+    actual = torch.compile(site, fullgraph=True)(x)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
