@@ -20,7 +20,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt import runtime_context as rc
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -94,6 +97,77 @@ class TestGetDcpLens(CustomTestCase):
         lens = torch.tensor(LENS, dtype=torch.int32)
         self.assertTrue(torch.equal(get_dcp_lens(lens, 1, 0), lens))
 
+    def test_gqa_current_chunk_selects_kv_for_the_global_dcp_head_layout(self):
+        """A local Q shard must not restart GQA mapping at KV head zero."""
+
+        class FakeDcpGroup:
+            world_size = 4
+            rank_in_group = 1
+
+            def __init__(self):
+                self.all_gather_calls = 0
+
+            def all_gather(self, tensor, dim):
+                self.all_gather_calls += 1
+                return torch.cat((tensor, tensor + 10), dim=dim)
+
+        group = FakeDcpGroup()
+        backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        backend.forward_metadata = SimpleNamespace(
+            custom_mask=None,
+            kv_indptr=torch.zeros(2, dtype=torch.int32),
+            kv_indices=torch.empty(0, dtype=torch.int64),
+            max_extend_len=1,
+            qo_indptr=torch.tensor([0, 1], dtype=torch.int64),
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _layer_id: torch.empty(0),
+            get_value_buffer=lambda _layer_id: torch.empty(0),
+        )
+
+        kernel_q_shapes = []
+        kernel_k = []
+
+        def fake_extend_attention(q, k, _v, out, *_args, lse_extend, **_kwargs):
+            kernel_q_shapes.append(q.shape)
+            kernel_k.append(k.clone())
+            out.copy_(q.float())
+            lse_extend.zero_()
+
+        backend.extend_attention_fwd = fake_extend_attention
+        layer = SimpleNamespace(
+            sliding_window_size=-1,
+            tp_q_head_num=2,
+            tp_k_head_num=2,
+            qk_head_dim=2,
+            v_head_dim=2,
+            k_scale=None,
+            v_scale=None,
+            layer_id=0,
+            scaling=1.0,
+            xai_temperature_len=-1,
+        )
+        q = torch.arange(4, dtype=torch.bfloat16).view(1, 4)
+        k = torch.tensor([[[0.0, 1.0], [10.0, 11.0]]])
+
+        with rc.get_parallel().override(dcp_group=group):
+            out = backend._forward_extend_dcp(
+                q=q,
+                k=k,
+                v=k.clone(),
+                layer=layer,
+                forward_batch=SimpleNamespace(),
+                causal=True,
+                logits_soft_cap=0.0,
+                sinks=None,
+            )
+
+        self.assertEqual(group.all_gather_calls, 0)
+        self.assertEqual(kernel_q_shapes, [torch.Size([1, 2, 2])])
+        # In TP4/DCP4 with two KV heads, ranks 0 and 1 both belong to KV head 0.
+        self.assertTrue(torch.equal(kernel_k[0], k[:, 0:1]))
+        self.assertTrue(torch.equal(out, q))
+
     def test_paged_allocator_exposes_dcp_virtual_capacity(self):
         real_kv_size = 1024
         dcp_size = 4
@@ -123,6 +197,58 @@ class TestGetDcpLens(CustomTestCase):
             real_kv_size + physical_page_size,
         )
 
+    @staticmethod
+    def _kv_head_config(*, is_draft_model: bool):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = SimpleNamespace(model_type="qwen3_5_text")
+        model_config.hf_text_config = SimpleNamespace(num_key_value_heads=8)
+        model_config.is_draft_model = is_draft_model
+        return model_config
+
+    def test_model_config_uses_non_dcp_tp_size_for_kv_heads(self):
+        model_config = self._kv_head_config(is_draft_model=False)
+
+        self.assertEqual(model_config.get_num_kv_heads(16), 1)
+        self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 2)
+
+    def test_a_draft_keeps_kv_heads_tp_sharded_under_dcp(self):
+        """The draft pool must match what a TP-sharded draft builds; sizing it
+        with the target's dcp_size over-allocates by that factor."""
+        model_config = self._kv_head_config(is_draft_model=True)
+
+        self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 1)
+        self.assertEqual(model_config.get_num_kv_heads(16), 1)
+
+    def test_gqa_qkv_loader_replicates_kv_within_dcp_group(self):
+        hidden_size = 4
+        head_size = 2
+        q_weight = torch.arange(64, dtype=torch.float32).view(16, hidden_size)
+        k_weight = torch.arange(16, dtype=torch.float32).view(4, hidden_size) + 100
+        v_weight = torch.arange(16, dtype=torch.float32).view(4, hidden_size) + 200
+
+        for tp_rank in range(4):
+            layer = QKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=head_size,
+                total_num_heads=8,
+                total_num_kv_heads=2,
+                bias=False,
+                params_dtype=torch.float32,
+                tp_rank=tp_rank,
+                tp_size=4,
+                kv_tp_rank=tp_rank // 2,
+                kv_tp_size=2,
+            )
+            layer.weight_loader(layer.weight, q_weight, "q")
+            layer.weight_loader(layer.weight, k_weight, "k")
+            layer.weight_loader(layer.weight, v_weight, "v")
+
+            q, k, v = layer.weight.split([4, 2, 2], dim=0)
+            kv_start = (tp_rank // 2) * 2
+            self.assertTrue(torch.equal(q, q_weight[tp_rank * 4 : (tp_rank + 1) * 4]))
+            self.assertTrue(torch.equal(k, k_weight[kv_start : kv_start + 2]))
+            self.assertTrue(torch.equal(v, v_weight[kv_start : kv_start + 2]))
+
     def test_configurator_scales_only_the_virtual_dcp_allocator(self):
         physical_kv_size = 1024
         physical_page_size = 64
@@ -137,35 +263,32 @@ class TestGetDcpLens(CustomTestCase):
         )
         allocators = {}
 
-        # The configurator's bag reads (disaggregation_mode / page_size /
-        # enable_hisparse) come from the published context; the per-iteration
-        # dcp_size stays on the injected instance stand-in.
-        self._sa_override = rc.get_context().override_server_args(
+        # The configurator's own inputs are published leaves now, so the case
+        # publishes them once. The DCP *scale* is not one of them: the allocator
+        # widens from the live get_parallel().attn_dcp_size, which the per-size
+        # override inside the loop drives.
+        override = rc.get_context().override_server_args(
             disaggregation_mode="null",
             page_size=physical_page_size,
             enable_hisparse=False,
         )
-        self._sa_override.install()
-        self.addCleanup(self._sa_override.restore)
-
+        override.install()
+        self.addCleanup(override.restore)
         for dcp_size in (1, 4):
             configurator = SimpleNamespace(
-                server_args=SimpleNamespace(
-                    disaggregation_mode="null",
-                    enable_hisparse=False,
-                    page_size=physical_page_size,
-                    dcp_size=dcp_size,
-                ),
+                server_args=SimpleNamespace(),
                 hybrid_gdn_config=None,
                 is_hybrid_swa=False,
                 kv_cache_dtype=torch.bfloat16,
                 device="cpu",
                 is_draft_worker=False,
             )
+            # The allocator widens from get_parallel(), not from the injected
+            # server_args stand-in -- drive the cause, not the effect.
             with patch(
                 "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
                 return_value=False,
-            ):
+            ), rc.get_parallel().override(attn_dcp_size=dcp_size):
                 allocators[dcp_size] = (
                     KVCacheConfigurator._build_token_to_kv_pool_allocator(
                         configurator,

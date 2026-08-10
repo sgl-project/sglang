@@ -224,7 +224,7 @@ class TestSWA(unittest.TestCase):
         allocator.free_swa(full_indices[1:2])
         self.assertEqual(allocator.swa_available_size(), 16)
 
-    def test_free_swa_batches_with_free_group(self):
+    def test_free_swa_group_owns_deferred_indices(self):
         _, allocator, _ = _build_swa_tree(
             is_eagle=False,
             kv_size=32,
@@ -235,6 +235,7 @@ class TestSWA(unittest.TestCase):
             indices = _swa_alloc(allocator, size)
             assert indices is not None
             index_batches.append(indices)
+        original_indices = torch.cat([indices.clone() for indices in index_batches])
 
         available_before_free = allocator.swa_available_size()
         allocator.free_group_begin()
@@ -243,20 +244,19 @@ class TestSWA(unittest.TestCase):
 
         self.assertEqual(len(allocator.swa_free_group), len(index_batches))
         self.assertEqual(allocator.swa_available_size(), available_before_free)
-
+        for indices in index_batches:
+            indices.zero_()
         allocator.free_group_end()
 
-        all_indices = torch.cat(index_batches).to(torch.int64)
-        self.assertEqual(allocator.swa_free_group, [])
         self.assertTrue(
             torch.equal(
-                allocator.full_to_swa_index_mapping[all_indices],
-                torch.zeros_like(all_indices),
+                allocator.full_to_swa_index_mapping[original_indices.to(torch.int64)],
+                torch.zeros_like(original_indices),
             )
         )
         self.assertEqual(
             allocator.swa_available_size(),
-            available_before_free + all_indices.numel(),
+            available_before_free + original_indices.numel(),
         )
 
     def test_swa_radix_cache_1(self):

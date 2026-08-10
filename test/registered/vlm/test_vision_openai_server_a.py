@@ -9,12 +9,16 @@ import unittest
 import openai
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.vlm_utils import *
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    popen_launch_server,
+)
 from sglang.test.vlm_utils import (
+    IMAGE_MAN_IRONING_URL,
     AudioOpenAITestMixin,
     CustomTestCase,
     ImageOpenAITestMixin,
-    OmniOpenAITestMixin,
     TestOpenAIMLLMServerBase,
     VideoOpenAITestMixin,
     terminate_and_kill_process_tree,
@@ -231,7 +235,6 @@ del (
     ImageOpenAITestMixin,
     VideoOpenAITestMixin,
     AudioOpenAITestMixin,
-    OmniOpenAITestMixin,
 )
 
 
