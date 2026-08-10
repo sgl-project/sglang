@@ -303,6 +303,25 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
+    def test_served_model_name_cli_arg(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--served-model-name",
+            "my-served-name",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(server_args.served_model_name, "my-served-name")
+
     def test_dit_layerwise_offload_cli_arg(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)

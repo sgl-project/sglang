@@ -422,7 +422,11 @@ def _video_job_from_sampling(
     return {
         "id": request_id,
         "object": "video",
-        "model": req.model or "sora-2",
+        "model": (
+            req.model
+            or getattr(get_global_server_args(), "served_model_name", None)
+            or "sora-2"
+        ),
         "status": "queued",
         "progress": 0,
         "created_at": int(time.time()),

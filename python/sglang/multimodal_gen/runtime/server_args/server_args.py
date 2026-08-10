@@ -199,6 +199,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # explicit model ID override (e.g. "Qwen-Image")
     model_id: str | None = None
 
+    # served model name exposed via /v1/models and generation responses
+    served_model_name: str | None = None
+
     # Model backend (sglang native or diffusers)
     backend: Backend = Backend.AUTO
 
@@ -1423,6 +1426,15 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Useful when --model-path is a local directory whose name does not match "
                 "any registered HF repo name. Should be the repo name portion of the HF ID "
                 "(e.g. 'Qwen-Image' for 'Qwen/Qwen-Image')."
+            ),
+        )
+        parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=ServerArgs.served_model_name,
+            help=(
+                "Override the model name exposed by /v1/models and used in generation "
+                "responses. Defaults to model_id if set, otherwise the model path."
             ),
         )
         parser.add_argument(

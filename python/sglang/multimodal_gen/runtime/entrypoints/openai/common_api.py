@@ -203,7 +203,9 @@ async def available_models():
     if not server_args:
         raise HTTPException(status_code=500, detail="Server args not initialized")
 
-    model_card = _build_model_card(server_args, server_args.model_path)
+    model_card = _build_model_card(
+        server_args, server_args.served_model_name or server_args.model_path
+    )
 
     # Return dict directly to preserve extended fields (ModelList strips them)
     return {"object": "list", "data": [model_card.model_dump()]}
