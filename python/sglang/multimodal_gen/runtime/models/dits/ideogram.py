@@ -7,6 +7,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
+    fused_gate_rmsnorm_active,
+    fused_rmsnorm_scale,
+    fused_rmsnorm_tanh_residual,
+    mark_fused_gate_rmsnorm_site,
+)
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -294,6 +300,46 @@ class Ideogram4MLP(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+def _norm_scale(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    norm: Ideogram4RMSNorm,
+    enable_fused: bool,
+) -> torch.Tensor:
+    """``RMSNorm(x) * (1 + scale)``, fused for ``quality="high"`` batches."""
+    if enable_fused:
+        y = fused_rmsnorm_scale(
+            x,
+            norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
+            1.0 + scale,
+            norm.eps,
+        )
+        if y is not None:
+            return y
+    return norm(x) * (1.0 + scale)
+
+
+def _gate_residual(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    norm: Ideogram4RMSNorm,
+    enable_fused: bool,
+) -> torch.Tensor:
+    """``residual + tanh(gate) * RMSNorm(x)``, fused for ``quality="high"``."""
+    if enable_fused:
+        y = fused_rmsnorm_tanh_residual(
+            x,
+            gate,
+            residual,
+            norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
+            norm.eps,
+        )
+        if y is not None:
+            return y
+    return residual + torch.tanh(gate) * norm(x)
+
+
 class Ideogram4TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -328,6 +374,13 @@ class Ideogram4TransformerBlock(nn.Module):
         self.ffn_norm1 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.attention_norm2 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
         self.ffn_norm2 = Ideogram4RMSNorm(hidden_size, eps=norm_eps)
+        # quality="high" fusion sites: each RMSNorm modulate/gate chain
+        # collapses into one Triton kernel (Z-Image bf16-native suite). Off by
+        # default (bit-exact reference path); mounted per batch by the
+        # denoising stage.
+        mark_fused_gate_rmsnorm_site(
+            self, ("attention_norm1", "attention_norm2", "ffn_norm1", "ffn_norm2")
+        )
         self.adaln_modulation = _linear(
             adaln_dim,
             4 * hidden_size,
@@ -341,20 +394,21 @@ class Ideogram4TransformerBlock(nn.Module):
         scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaln_modulation(
             adaln_input
         ).chunk(4, dim=-1)
-        gate_msa = torch.tanh(gate_msa)
-        gate_mlp = torch.tanh(gate_mlp)
+        enable_fused = (
+            fused_gate_rmsnorm_active(self) and not torch.compiler.is_compiling()
+        )
         attn_out = self.attention(
-            self.attention_norm1(x) * (1.0 + scale_msa),
+            _norm_scale(x, scale_msa, self.attention_norm1, enable_fused),
             cos=cos,
             sin=sin,
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
         )
-        x = x + gate_msa * self.attention_norm2(attn_out)
-        x = x + gate_mlp * self.ffn_norm2(
-            self.feed_forward(self.ffn_norm1(x) * (1.0 + scale_mlp))
+        x = _gate_residual(attn_out, gate_msa, x, self.attention_norm2, enable_fused)
+        ffn_out = self.feed_forward(
+            _norm_scale(x, scale_mlp, self.ffn_norm1, enable_fused)
         )
-        return x
+        return _gate_residual(ffn_out, gate_mlp, x, self.ffn_norm2, enable_fused)
 
 
 def _sinusoidal_embedding(t: torch.Tensor, dim: int, scale: float = 1e4):

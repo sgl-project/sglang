@@ -10,6 +10,12 @@
 //! the rest of the pipeline only through `flume` channels: [`TmEvent`] into the
 //! ingress loop, [`Senders`] fanning out to the pools.
 
+mod egress;
+mod ingress;
+
+pub use egress::{ActivityCounter, Egress};
+pub use ingress::{Ingress, Limits, Mm};
+
 use crate::ids::Rid;
 use crate::message::{DetokMsg, Request};
 
@@ -30,6 +36,13 @@ pub enum TmEvent {
     /// A request back from the tokenizer pool: `PreSendValidating` (ids filled) on success,
     /// or `Failed` on a tokenize error. `drive` handles both.
     Tokenized(Request),
+    /// An MM worker finished a request parked in `Encoding`: `input_ids` are the
+    /// final placeholder-expanded prompt ids. The buffers ride the rid-keyed
+    /// sidecar (`Server.take_mm`), not this event.
+    MmEncoded { rid: Rid, input_ids: Vec<i32> },
+    /// An MM worker rejected a request parked in `Encoding` (bad media URL,
+    /// unsupported modality, preprocess error, …).
+    MmFailed { rid: Rid, message: String },
 }
 
 /// Producer-side handles, cloned into every stage that needs to emit.

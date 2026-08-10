@@ -102,7 +102,7 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         only by the in_capture=True branch (via ``_bind_metadata_buffers``).
         If TBO short-circuits its capture to its own replay path, those dicts
         are empty and replay raises ``KeyError: bs``. Reproduces the
-        deepep-4-gpu-h100 failure where
+        4-gpu-h100 failure where
         ``flashattention_backend.target_verify_metadata[bs]`` lookup blew up
         during ``init_device_graphs``.
 
