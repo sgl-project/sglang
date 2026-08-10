@@ -19,7 +19,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_list_of_buffers,
 )
 from sglang.srt.disaggregation.mooncake.conn import (
-    KVArgsRegisterInfo as MooncakeKVArgsRegisterInfo,
+    KVArgsRegisterInfo,
     MooncakeKVManager,
 )
 from sglang.srt.disaggregation.utils import (
@@ -62,7 +62,7 @@ class TestDisaggregationWire(unittest.TestCase):
             b"2",
         ]
 
-        info = MooncakeKVArgsRegisterInfo.from_zmq(msg)
+        info = KVArgsRegisterInfo.from_zmq(msg)
 
         self.assertEqual(info.staging_base_ptr, 0x3000)
         self.assertEqual(info.staging_total_size, 4096)
