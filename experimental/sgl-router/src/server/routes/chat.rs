@@ -311,7 +311,7 @@ async fn chat_completions_inner(
     // extension must be matchable at all (`extension_can_match`: DSV4 thinking
     // mode without tools re-renders history divergently, so its extensions
     // could only ever be dead blocks — mirroring the engine's own miss).
-    let extend_tee_armed = ctx.cache_sim_tee.is_some()
+    let extend_tee_armed = (ctx.cache_sim_tee.is_some() || ctx.s3_export_sink.is_some())
         && request_tokens.is_some()
         && request_value
             .as_ref()
@@ -407,12 +407,21 @@ async fn chat_completions_inner(
     // ingest record whose extend can never arrive — indistinguishable
     // downstream from a response that generated nothing. The bias would grow
     // exactly when the fleet is shedding, i.e. anti-correlated with health.
+    let tee_attr = tee_attribution(&headers);
     if let (Some(tee), Some(t)) = (ctx.cache_sim_tee.as_ref(), request_tokens.as_ref()) {
         tee.offer(
             &model_str,
             &t.ids,
             &derived_request_id,
-            tee_attribution(&headers),
+            tee_attr.clone(),
+        );
+    }
+    if let (Some(sink), Some(t)) = (ctx.s3_export_sink.as_ref(), request_tokens.as_ref()) {
+        sink.offer_ingest(
+            &model_str,
+            &t.ids,
+            &derived_request_id,
+            tee_attr.slug.as_deref(),
         );
     }
     if let Some(p) = &phase {
@@ -621,17 +630,16 @@ async fn chat_completions_inner(
             // stay bounded under any load. Budget exhausted ⇒ don't capture this
             // stream (skip its extend tee, counted as `capture_capped`); the
             // capture is observational, so shedding it never affects serving.
-            let permit = match ctx
+            // When cache-sim is off (s3-only path), there is no permit pool to
+            // draw from — proceed without one.
+            let permit = ctx
                 .cache_sim_tee
                 .as_ref()
-                .and_then(|t| t.try_acquire_capture_permit())
-            {
-                Some(p) => p,
-                None => {
-                    ctx.metrics.record_cache_sim_tee("capture_capped");
-                    return None;
-                }
-            };
+                .and_then(|t| t.try_acquire_capture_permit());
+            if ctx.cache_sim_tee.is_some() && permit.is_none() {
+                ctx.metrics.record_cache_sim_tee("capture_capped");
+                return None;
+            }
             let ctx = Arc::clone(&ctx);
             let model = model.clone();
             let request_body = request_body.clone();
@@ -639,7 +647,7 @@ async fn chat_completions_inner(
             let request_id = request_id.clone();
             Some(StreamCapture {
                 max_bytes: cache_sim_extend::MAX_EXTEND_CAPTURE_BYTES,
-                _permit: Some(permit),
+                _permit: permit,
                 on_done: Box::new(move |buf| {
                     cache_sim_extend::spawn_extend_tee(
                         ctx,

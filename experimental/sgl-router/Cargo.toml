@@ -123,6 +123,8 @@ rmp-serde = "1"
 sha2 = "0.10"
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+hmac = "0.12"
+hex = "0.4"
 
 # Signal-based (SIGPROF/setitimer) CPU profiler, not perf_event_open — works
 # unprivileged in a container regardless of perf_event_paranoid. Optional: only

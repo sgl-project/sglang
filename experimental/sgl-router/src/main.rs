@@ -280,6 +280,18 @@ async fn main() -> Result<()> {
     ));
     let server_result = serve.await.context("axum serve");
 
+    // 在停止接受连接、在途请求已 drain 后，把 S3 token 导出的队列/缓冲全部
+    // flush 出去再退出（滚动重启不丢）。用 grace 预算兜底，避免卡死退出。
+    if let Some(sink) = ctx.s3_export_sink.as_ref() {
+        let budget = std::time::Duration::from_secs(cfg.server.shutdown_drain_secs.max(60));
+        sgl_router::server::shutdown::await_with_timeout(
+            sink.drain(),
+            budget,
+            "s3 export drain",
+        )
+        .await;
+    }
+
     // Best-effort: cancel discovery + manager + janitor on shutdown.
     // The janitor handle's drop signals cancellation; we additionally
     // await `shutdown` so the task joins cleanly before the process

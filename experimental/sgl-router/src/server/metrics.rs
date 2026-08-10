@@ -540,6 +540,10 @@ pub struct MetricsRegistry {
     /// broken tee is failing while serving stays healthy — `http_error` +
     /// `error` are the two that indict it.
     cache_sim_tee_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    /// Outcomes of the best-effort S3 token-export tee (see
+    /// [`crate::server::s3_export`]), keyed by `result` — one of `enqueued`,
+    /// `dropped_queue_full`, `object_put`, `put_failed`, `drain_flushed`.
+    s3_export_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     /// Extensions teed with a prompt/output boundary that could not be true
     /// (0, or >= the sequence length). Deliberately NOT a `result` label on
     /// cache_sim_tee_total: those partition delivery attempts and the message
@@ -608,6 +612,7 @@ impl Default for MetricsRegistry {
             decode_affinity_total: Default::default(),
             sticky_total: Default::default(),
             cache_sim_tee_total: Default::default(),
+            s3_export_total: Default::default(),
             cache_sim_boundary_impossible_total: AtomicU64::new(0),
             ingress_tokenize_errors_total: Default::default(),
             backpressure_rejected_total: Default::default(),
@@ -1112,6 +1117,17 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_s3_export_total{result}`. `result` is a fixed
+    /// `&'static str` (enqueued|dropped_queue_full|object_put|put_failed|drain_flushed), so label
+    /// cardinality is bounded regardless of traffic.
+    pub fn record_s3_export(&self, result: &'static str) {
+        let mut guard = self.s3_export_total.lock();
+        guard
+            .entry(result)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Bump `sgl_router_engine_aborts_total{reason}` — one increment per
@@ -1683,6 +1699,21 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_cache_sim_tee_total{{result=\"{}\"}} {}\n",
                 result, value,
+            ));
+        }
+        drop(guard);
+
+        // s3_export_total
+        out.push_str(
+            "# HELP sgl_router_s3_export_total Token-export S3 tee outcomes (result=enqueued|dropped_queue_full|object_put|put_failed|drain_flushed).\n",
+        );
+        out.push_str("# TYPE sgl_router_s3_export_total counter\n");
+        let guard = self.s3_export_total.lock();
+        for (result, v) in guard.iter() {
+            out.push_str(&format!(
+                "sgl_router_s3_export_total{{result=\"{}\"}} {}\n",
+                result,
+                v.load(Ordering::Relaxed)
             ));
         }
         drop(guard);
@@ -2718,5 +2749,16 @@ mod tests {
         let out = reg.render();
         assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="8000"} 0"#));
         assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="+Inf"} 1"#));
+    }
+
+    #[test]
+    fn record_s3_export_counts_by_result() {
+        let m = MetricsRegistry::new();
+        m.record_s3_export("enqueued");
+        m.record_s3_export("enqueued");
+        m.record_s3_export("dropped_queue_full");
+        let out = m.render();
+        assert!(out.contains("sgl_router_s3_export_total{result=\"enqueued\"} 2"));
+        assert!(out.contains("sgl_router_s3_export_total{result=\"dropped_queue_full\"} 1"));
     }
 }

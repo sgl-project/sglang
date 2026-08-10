@@ -105,9 +105,12 @@ pub struct StreamCapture {
     /// RAII permit from the router-global capture semaphore. Held for the pump's
     /// lifetime and released on drop (clean end, discard, or teardown), so the
     /// TOTAL number of concurrent captures — and hence aggregate capture memory
-    /// (≤ N × `max_bytes`) — is bounded no matter the traffic. `None` only in
-    /// unit tests that don't exercise the budget; production arming acquires one
-    /// and skips the capture entirely when the budget is exhausted.
+    /// (≤ N × `max_bytes`) — is bounded no matter the traffic. `None` in unit
+    /// tests that don't exercise the budget, and in the cache-sim-off /
+    /// S3-export-only path (no cache-sim tee to acquire the permit from); in
+    /// that case each stream is still bounded by `max_bytes`. When cache-sim is
+    /// on, arming acquires one and skips the capture entirely when the budget is
+    /// exhausted.
     pub _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 

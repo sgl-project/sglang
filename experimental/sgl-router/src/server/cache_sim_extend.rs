@@ -176,7 +176,7 @@ pub(crate) fn spawn_extend_tee(
     prompt: Option<IngressPrompt>,
     source: ReplySource,
 ) {
-    if ctx.cache_sim_tee.is_none() {
+    if ctx.cache_sim_tee.is_none() && ctx.s3_export_sink.is_none() {
         return;
     }
     tokio::spawn(async move {
@@ -238,7 +238,7 @@ pub(crate) fn spawn_extend_tee(
                 )
                 .map(|ids| (ids, None)),
             };
-            if let (Some(tee), Some((ids, prompt_len))) = (ctx.cache_sim_tee.as_ref(), produced) {
+            if let Some((ids, prompt_len)) = produced {
                 // Only tag a genuine fan-out. A single-choice response is the
                 // common case and needs no discriminator; N>1 must have one or
                 // the N records collapse onto one join key.
@@ -254,14 +254,28 @@ pub(crate) fn spawn_extend_tee(
                 } else {
                     output_tokens
                 };
-                tee.offer_extend(
-                    &model,
-                    &ids,
-                    &request_id,
-                    prompt_len,
-                    choice,
-                    per_choice_output,
-                );
+                if let Some(tee) = ctx.cache_sim_tee.as_ref() {
+                    tee.offer_extend(
+                        &model,
+                        &ids,
+                        &request_id,
+                        prompt_len,
+                        choice,
+                        per_choice_output,
+                    );
+                }
+                if let Some(sink) = ctx.s3_export_sink.as_ref() {
+                    sink.offer_extend(
+                        &model,
+                        &ids,
+                        &request_id,
+                        prompt_len,
+                        per_choice_output,
+                        choice.as_ref().map(|c| c.index),
+                        choice.as_ref().map(|c| c.count),
+                        None, // extend 路径当前不持有 attribution（见 spec §11）
+                    );
+                }
             } else {
                 tracing::debug!(model = %model, "cache-sim extend: tokenize failed; skipping");
             }

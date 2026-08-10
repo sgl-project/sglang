@@ -11,3 +11,4 @@ pub mod header_utils;
 pub mod metrics;
 pub mod routes;
 pub mod shutdown;
+pub mod s3_export;
