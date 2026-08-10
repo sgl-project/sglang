@@ -110,7 +110,7 @@ MTP needs no separate download — the draft head is embedded in the target chec
 
 - **DSpark requires `SGLANG_RAGGED_VERIFY_MODE=static` in the environment.** Without it, the ragged verification path picks its own mode and `--speculative-dspark-block-size` is not honored. The Deploy panel emits this as an inline environment variable on the DSpark cells.
 
-- **Platform backends differ.** H100 uses the platform-default attention path; DGX Spark pins `--attention-backend flashinfer` with the Triton Mamba backend and caps the decode CUDA-graph batch at 4 rather than 16. Both share `--mamba-radix-cache-strategy extra_buffer`. Don't cross-apply these — the Deploy panel already picks the right set per platform.
+- **Platform backends differ in exactly three flags.** H100 uses `--attention-backend fa3`, a decode CUDA-graph batch cap of 16, and a 1800s watchdog; DGX Spark uses `--attention-backend flashinfer`, a cap of 4, and a 300s watchdog. Everything else — Triton Mamba, `extra_buffer` radix caching, Marlin MoE — is shared. Don't cross-apply these; the Deploy panel picks the right set per platform.
 
 ## 3. Advanced Usage
 
