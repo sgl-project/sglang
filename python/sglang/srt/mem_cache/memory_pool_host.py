@@ -1718,15 +1718,17 @@ class HostPoolGroup:
         pool_transfers: Optional[list] = None,
     ) -> None:
         # 1. Anchor (KV) backup
-        anchor_host_indices, anchor_device_indices = self._normalize_backup_indices(
-            self.anchor_entry, host_indices, device_indices, io_backend
-        )
-        self.anchor_entry.host_pool.backup_from_device_all_layer(
-            self.anchor_entry.device_pool,
-            anchor_host_indices,
-            anchor_device_indices,
-            io_backend,
-        )
+        # A zero-length anchor denotes a component-only backup.
+        if host_indices.numel() > 0:
+            anchor_host_indices, anchor_device_indices = self._normalize_backup_indices(
+                self.anchor_entry, host_indices, device_indices, io_backend
+            )
+            self.anchor_entry.host_pool.backup_from_device_all_layer(
+                self.anchor_entry.device_pool,
+                anchor_host_indices,
+                anchor_device_indices,
+                io_backend,
+            )
         # 2. Extra pool backup
         for transfer in pool_transfers or []:
             entry = self.entry_map.get(transfer.name)
