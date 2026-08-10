@@ -4,19 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       pr_numbers:
-        description: "Comma-separated PR numbers to apply (e.g. 18962,19010)"
+        description: "Comma-separated PR numbers to apply (e.g. 18962,19010). Empty = fast-forward the base image to latest main."
         required: false
         default: ""
       image_tag:
         description: "Base image tag to patch (e.g. dev, dev-cu13, dev-cu12)"
         required: true
       output_tag:
-        description: "Tag to publish as. Empty = refresh image_tag in place. Set a custom name (e.g. dev-myfeature) to publish a separate image."
-        required: false
-        default: ""
+        description: "Tag to publish as. Must start with 'patch-' (e.g. patch-myfeature)."
+        required: true
 
 concurrency:
-  group: patch-docker-${{ inputs.output_tag || inputs.image_tag }}
+  group: patch-docker-${{ inputs.image_tag }}-${{ inputs.output_tag }}
   cancel-in-progress: true
 
 jobs:
@@ -26,30 +25,41 @@ jobs:
     steps:
       - name: Resolve and validate image tags
         env:
-          # Inject via env so a crafted tag cannot break out of the script.
+          # Inject via env so a crafted input cannot break out of the script.
           IMAGE_TAG: ${{ inputs.image_tag }}
           OUTPUT_TAG: ${{ inputs.output_tag }}
         run: |
-          OUT_TAG="${OUTPUT_TAG:-${IMAGE_TAG}}"
-
-          # Guard only an explicit output_tag. An empty one means "refresh
-          # image_tag in place", which is this workflow's original mode.
-          if [ -n "${OUTPUT_TAG}" ]; then
-            case "${OUT_TAG}" in
-              latest|latest-*|dev|dev-cu12|dev-cu13|nightly-*|v[0-9]*)
-                echo "::error::output_tag '${OUT_TAG}' is a published tag; pick a custom name such as dev-myfeature"
+          # Whole-string checks. A '^...$' regex anchors per LINE, so a
+          # multi-line value would pass and then inject extra GITHUB_ENV lines.
+          validate_tag() {
+            case "$2" in
+              ""|[!a-zA-Z0-9_]*|*[!a-zA-Z0-9._-]*)
+                echo "::error::${1} is not a valid Docker tag"
                 exit 1
                 ;;
             esac
-          fi
+            if [ "${#2}" -gt 128 ]; then
+              echo "::error::${1} exceeds the 128-character Docker tag limit"
+              exit 1
+            fi
+          }
+          validate_tag image_tag "${IMAGE_TAG}"
+          validate_tag output_tag "${OUTPUT_TAG}"
 
-          if ! printf '%s' "${OUT_TAG}" | grep -qE '^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$'; then
-            echo "::error::'${OUT_TAG}' is not a valid Docker tag"
-            exit 1
-          fi
+          # Released tags belong to release-docker*.yml, which builds them as
+          # multi-arch manifests. This job is x64-only, so it publishes under a
+          # prefix those builders never emit rather than denylisting their
+          # current names, which would rot as the release tag scheme changes.
+          case "${OUTPUT_TAG}" in
+            patch-?*) ;;
+            *)
+              echo "::error::output_tag must start with 'patch-' (e.g. patch-myfeature)"
+              exit 1
+              ;;
+          esac
 
           echo "BASE_IMAGE=lmsysorg/sglang:${IMAGE_TAG}" >> "$GITHUB_ENV"
-          echo "OUT_IMAGE=lmsysorg/sglang:${OUT_TAG}" >> "$GITHUB_ENV"
+          echo "OUT_IMAGE=lmsysorg/sglang:${OUTPUT_TAG}" >> "$GITHUB_ENV"
 
       - name: Cleanup workspace (remove root-owned files from prior runs)
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
@@ -72,20 +82,31 @@ jobs:
             echo "Image built from commit: ${BASE_SHA}"
           else
             BASE_SHA=""
-            echo "::warning::Image has no .git directory — cannot extract base commit"
+            echo "::warning::Image has no .git directory - cannot extract base commit"
           fi
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
 
       - name: Generate patches
+        env:
+          PR_NUMBERS: ${{ inputs.pr_numbers }}
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git fetch origin main
+          # Fixed path on a persistent runner: drop patches left by prior runs
+          # so they cannot be picked up by this run's COPY *.patch.
+          rm -rf /tmp/patch-ctx
           mkdir -p /tmp/patch-ctx
 
-          if [ -n "${{ inputs.pr_numbers }}" ]; then
-            IFS=',' read -ra PRS <<< "${{ inputs.pr_numbers }}"
+          if [ -n "${PR_NUMBERS}" ]; then
+            IFS=',' read -ra PRS <<< "${PR_NUMBERS}"
             for pr in "${PRS[@]}"; do
               pr=$(echo "${pr}" | xargs)
+              case "${pr}" in
+                ""|*[!0-9]*)
+                  echo "::error::Invalid PR number: '${pr}'"
+                  exit 1
+                  ;;
+              esac
               echo "Fetching PR #${pr}"
               git fetch origin "pull/${pr}/head:pr-${pr}"
               MERGE_BASE=$(git merge-base origin/main "pr-${pr}")
@@ -94,18 +115,18 @@ jobs:
               echo "  PR #${pr}: $(wc -l < /tmp/patch-ctx/${pr}.patch) lines"
             done
           elif [ -n "${BASE_SHA}" ]; then
-            echo "Generating diff: image ${BASE_SHA} → latest main"
+            echo "Generating diff: image ${BASE_SHA} -> latest main"
             git fetch origin "${BASE_SHA}"
             git diff "${BASE_SHA}..origin/main" > /tmp/patch-ctx/main.patch
             echo "  main: $(wc -l < /tmp/patch-ctx/main.patch) lines"
           else
-            echo "::error::No PR numbers specified and image has no .git — cannot generate diff against main"
+            echo "::error::No PR numbers specified and image has no .git - cannot generate diff against main"
             exit 1
           fi
 
           TOTAL=$(cat /tmp/patch-ctx/*.patch | wc -l)
           if [ "${TOTAL}" -eq 0 ]; then
-            echo "::warning::All patches are empty — image is already up to date"
+            echo "::warning::All patches are empty - image is already up to date"
             echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
           fi
 
@@ -137,10 +158,39 @@ jobs:
 
       - name: Push patched image
         if: env.SKIP_BUILD != 'true'
+        env:
+          PR_NUMBERS: ${{ inputs.pr_numbers }}
         run: |
           docker push "${OUT_IMAGE}"
 
-          echo "### Patched \`${OUT_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Base image:** \`${BASE_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Source:** ${{ inputs.pr_numbers && format('PRs: {0}', inputs.pr_numbers) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${PR_NUMBERS}" ]; then
+            SOURCE="PRs: ${PR_NUMBERS}"
+          else
+            SOURCE="latest main"
+          fi
+          {
+            echo "### Patched \`${OUT_IMAGE}\`"
+            echo "- **Base image:** \`${BASE_IMAGE}\`"
+            echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`"
+            echo "- **Source:** ${SOURCE}"
+            echo "- **Platform:** \`linux/amd64\` only - patched on an x64 runner, so the base image's multi-arch manifest is not carried over"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # An empty patch set still has to produce output_tag, otherwise the run
+      # goes green having published nothing. imagetools retags by digest, so
+      # this path keeps the base image's multi-arch manifest intact.
+      - name: Set up Docker Buildx
+        if: env.SKIP_BUILD == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Retag base image under output tag
+        if: env.SKIP_BUILD == 'true'
+        run: |
+          docker buildx imagetools create -t "${OUT_IMAGE}" "${BASE_IMAGE}"
+
+          {
+            echo "### Retagged \`${OUT_IMAGE}\`"
+            echo "- **Base image:** \`${BASE_IMAGE}\`"
+            echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`"
+            echo "- All patches were empty, so the base image was retagged unchanged (multi-arch manifest preserved)."
+          } >> "$GITHUB_STEP_SUMMARY"
