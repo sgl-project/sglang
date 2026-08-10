@@ -3527,14 +3527,17 @@ def dispose_tensor(x: torch.Tensor):
     interfering with torch.compile's memory tracking and graph recording.
     """
 
-    # Skip disposal during piecewise CUDA graph capture/replay: freeing the
-    # backing storage would invalidate addresses recorded in the graph.
-    # Local import avoids a circular dependency.
+    # Skip disposal under a captured prefill graph (piecewise or breakable):
+    # freeing the backing storage would invalidate addresses recorded in the
+    # graph. Local imports avoid a circular dependency.
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         is_in_tc_piecewise_cuda_graph,
     )
 
-    if is_in_tc_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return
 
     from sglang.srt.runtime_context import get_flags
