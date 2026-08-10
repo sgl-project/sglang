@@ -19,7 +19,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnB
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -98,6 +98,20 @@ class CompressorAscendBackendMixin:
             values = values.cpu().tolist()
         return [int(v) for v in values]
 
+    def _draft_token_num_from_spec_info(self, spec_info) -> int:
+        """Resolve the uniform verify width declared by the current forward.
+
+        ``self.speculative_num_draft_tokens`` is only the server-wide default.
+        Capture/replay and speculative algorithms may attach a different width
+        to the current ``spec_info``, so forward-specific metadata must prefer
+        that value.
+        """
+        n_draft = getattr(spec_info, "draft_token_num", None)
+        if n_draft is None:
+            n_draft = self.speculative_num_draft_tokens
+        n_draft = int(n_draft or 1)
+        return n_draft
+
     def _extend_prefix_lens_cpu(
         self, forward_batch: ForwardBatch
     ) -> Optional[list[int]]:
@@ -125,7 +139,10 @@ class CompressorAscendBackendMixin:
         _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
         if _verify_compress:
-            _seq_lens = _seq_lens + self.speculative_num_draft_tokens
+            n_draft = self._draft_token_num_from_spec_info(
+                getattr(forward_batch, "spec_info", None)
+            )
+            _seq_lens = _seq_lens + n_draft
         result = self._compute_compress_locs(
             pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -1181,14 +1198,7 @@ class DeepseekV4AscendAttnBackend(
         if not self._is_dspark_draft_block(forward_batch):
             return
 
-        block_size = int(
-            getattr(
-                forward_batch.spec_info,
-                "draft_token_num",
-                self.speculative_num_draft_tokens,
-            )
-            or 1
-        )
+        block_size = self._draft_token_num_from_spec_info(forward_batch.spec_info)
         out_cache_loc = forward_batch.out_cache_loc
 
         ori_sparse_indices = self._build_dspark_sparse_indices(
@@ -1779,14 +1789,7 @@ class DeepseekV4AscendAttnBackend(
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             B = forward_batch.batch_size
-            n_draft = int(
-                getattr(
-                    forward_batch.spec_info,
-                    "draft_token_num",
-                    get_spec().speculative_num_draft_tokens,
-                )
-                or 1
-            )
+            n_draft = self._draft_token_num_from_spec_info(forward_batch.spec_info)
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
             )
@@ -1823,13 +1826,8 @@ class DeepseekV4AscendAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            max_seqlen_q = int(
-                getattr(
-                    forward_batch.spec_info,
-                    "draft_token_num",
-                    get_spec().speculative_num_draft_tokens,
-                )
-                or 1
+            max_seqlen_q = self._draft_token_num_from_spec_info(
+                forward_batch.spec_info
             )
         else:
             max_seqlen_q = 1
@@ -2112,12 +2110,8 @@ class DeepseekV4AscendAttnBackend(
         positions = forward_batch.positions
         t = positions.shape[0]
         bs = forward_batch.batch_size
-        n_draft = int(
-            getattr(
-                getattr(forward_batch, "spec_info", None),
-                "draft_token_num",
-                self.speculative_num_draft_tokens,
-            )
+        n_draft = self._draft_token_num_from_spec_info(
+            getattr(forward_batch, "spec_info", None)
         )
         # The parent backend normalizes this to final KV lengths for every
         # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
@@ -2156,82 +2150,18 @@ class DeepseekV4AscendAttnBackend(
                         loc[: bl.numel()].copy_(bl.to(torch.int32))
                 setattr(fm, f"c{ratio}_loc", loc)
 
-    def _fill_verify_positions_cmp_padding(
-        self,
-        positions: torch.Tensor,
-        c4_positions: torch.Tensor,
-        c128_positions: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor] = None,
-    ) -> None:
-        c4_positions.fill_(0)
-        c128_positions.fill_(0)
-        if positions.numel() == 0:
-            return
-
-        n_draft = self.speculative_num_draft_tokens
-        request_num = positions.shape[0] // n_draft
-        if request_num == 0:
-            return
-
-        fm = self.forward_metadata
-        if seq_lens_cpu is None:
-            seq_lens_cpu = getattr(fm, "seq_lens_cpu", None)
-        if seq_lens_cpu is None:
-            seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
-        if seq_lens_cpu is None:
-            raise RuntimeError(
-                "DSV4 verify buffer refresh requires seq_lens_cpu or "
-                "seq_lens_cpu_int on forward metadata."
-            )
-        seq_lens_cpu = seq_lens_cpu[:request_num]
-        if seq_lens_cpu.device.type != "cpu":
-            seq_lens_cpu = seq_lens_cpu.cpu()
-
-        start_positions = seq_lens_cpu - n_draft + 1
-        abs_positions = start_positions.view(-1, 1) + torch.arange(
-            n_draft, dtype=start_positions.dtype
-        ).view(1, -1)
-        mask_c4 = (abs_positions % 4) != 0
-        mask_c128 = (abs_positions % 128) != 0
-
-        gather_shape_c4 = min(
-            positions.shape[0], mask_c4.numel(), c4_positions.shape[0]
-        )
-        gather_shape_c128 = min(
-            positions.shape[0], mask_c128.numel(), c128_positions.shape[0]
-        )
-        sorted_indices_c4 = (
-            torch.argsort(mask_c4.flatten(), dim=0, stable=True)[:gather_shape_c4]
-            .pin_memory()
-            .to(device=positions.device, non_blocking=True)
-        )
-        sorted_indices_c128 = (
-            torch.argsort(mask_c128.flatten(), dim=0, stable=True)[:gather_shape_c128]
-            .pin_memory()
-            .to(device=positions.device, non_blocking=True)
-        )
-
-        c4_positions[:gather_shape_c4].copy_(
-            torch.gather(positions, 0, sorted_indices_c4)
-        )
-        c128_positions[:gather_shape_c128].copy_(
-            torch.gather(positions, 0, sorted_indices_c128)
-        )
-
     def _fill_verify_positions_cmp_padding_one(
         self,
         positions: torch.Tensor,
         dst: torch.Tensor,
         ratio: int,
         seq_lens_cpu: torch.Tensor,
-        n_draft: Optional[int] = None,
+        n_draft: int,
     ) -> None:
         dst.zero_()
         if ratio not in self._dsv4_compress_ratios or positions.numel() == 0:
             return
 
-        if n_draft is None:
-            n_draft = self.speculative_num_draft_tokens
         n_draft = int(n_draft)
         request_num = positions.shape[0] // n_draft
         if request_num == 0:
@@ -2265,9 +2195,7 @@ class DeepseekV4AscendAttnBackend(
         if c4_positions is None or c128_positions is None:
             return
 
-        n_draft = int(
-            getattr(spec_info, "draft_token_num", self.speculative_num_draft_tokens)
-        )
+        n_draft = self._draft_token_num_from_spec_info(spec_info)
         seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
         if seq_lens_cpu is None:
             seq_lens_cpu = getattr(spec_info, "seq_lens_cpu", None)
