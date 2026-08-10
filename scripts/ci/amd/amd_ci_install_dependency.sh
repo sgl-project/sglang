@@ -5,10 +5,12 @@ GPU_ARCH="mi30x"   # default
 SKIP_TT_DEPS=""
 SKIP_SGLANG_BUILD=""
 SKIP_AITER_BUILD=""
+SKIP_TRITON_BUILD=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --skip-aiter-build) SKIP_AITER_BUILD="1"; shift;;
+    --skip-triton-build) SKIP_TRITON_BUILD="1"; shift;;
     --skip-sglang-build) SKIP_SGLANG_BUILD="1"; shift;;
     --skip-test-time-deps) SKIP_TT_DEPS="1"; shift;;
     -h|--help)
@@ -16,6 +18,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --skip-sglang-build         Don't build checkout sglang, use what was shipped with the image"
       echo "  --skip-aiter-build          Don't build aiter, use what was shipped with the image"
+      echo "  --skip-triton-build         Don't rebuild triton, use what was shipped with the image"
       echo "  --skip-test-time-deps       Don't build miscellaneous dependencies"
       exit 0
       ;;
@@ -185,6 +188,98 @@ EOF
 
   # Install accelerate for distributed training and inference support
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
+fi
+
+# -----------------------
+# TRITON
+# The CI image bakes a source-built Triton at the docker/rocm.Dockerfile-pinned
+# commit; when a PR bumps TRITON_COMMIT the image is not rebuilt, so rebuild it
+# here the same way the Dockerfile does.
+#
+# Only images built with BUILD_TRITON=1 (the rocm720 stages) ship
+# /sgl-workspace/triton-custom -- the others take Triton from the base image and
+# the Dockerfile would not have built one either, so there is nothing to sync.
+#
+# Ordering matters twice:
+#   * AFTER the sglang install. The Dockerfile itself warns that this custom
+#     build "breaks pip dependency management"; a later `pip install` can
+#     resolve a PyPI triton over the editable one, so the sync has to run after
+#     the last big pip operation that could clobber it.
+#   * BEFORE the AITER build below, which imports triton and builds against it
+#     (AITER_USE_SYSTEM_TRITON=1).
+if [[ -n "${SKIP_TRITON_BUILD}" ]]; then
+  echo "[CI-TRITON-CHECK] --skip-triton-build given, leaving the image's triton alone"
+elif ! docker exec ci_sglang test -d /sgl-workspace/triton-custom; then
+  echo "[CI-TRITON-CHECK] No /sgl-workspace/triton-custom (BUILD_TRITON=0 image), nothing to sync"
+else
+  echo "[CI-TRITON-CHECK] === TRITON VERSION CHECK START ==="
+
+  TRITON_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+TRITON_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*TRITON_REPO="\([^"]*\)".*/\1/')
+  REPO_TRITON_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+TRITON_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*TRITON_COMMIT="\([^"]*\)".*/\1/')
+
+  if [[ -z "${REPO_TRITON_COMMIT}" || -z "${TRITON_REPO}" ]]; then
+      echo "[CI-TRITON-CHECK] ERROR: Failed to extract TRITON_REPO/TRITON_COMMIT from Dockerfile."
+      exit 1
+  fi
+  echo "[CI-TRITON-CHECK] Dockerfile expects TRITON_COMMIT=${REPO_TRITON_COMMIT}"
+
+  # What is actually IMPORTABLE, which is not the same question as what the
+  # checkout is parked on: a wheel installed over the editable build leaves the
+  # source tree untouched at the old commit. Prefer the `+git<sha>` suffix pip
+  # reports, and only fall back to the tree when the version string carries no
+  # commit (e.g. a plain PyPI wheel).
+  IMAGE_TRITON_VERSION=$(docker exec ci_sglang bash -c "pip show triton 2>/dev/null | awk '/^Version:/{print \$2}'" || echo "")
+  IMAGE_TRITON_COMMIT=$(printf '%s' "${IMAGE_TRITON_VERSION}" | sed -n 's/.*git\([0-9a-f]\{7,\}\).*/\1/p')
+  TREE_TRITON_COMMIT=$(docker exec ci_sglang bash -c "git -C /sgl-workspace/triton-custom rev-parse HEAD 2>/dev/null" || echo "")
+  echo "[CI-TRITON-CHECK] Installed triton: ${IMAGE_TRITON_VERSION:-none} (commit=${IMAGE_TRITON_COMMIT:-unknown})"
+  echo "[CI-TRITON-CHECK] triton-custom checkout HEAD: ${TREE_TRITON_COMMIT:-unknown}"
+
+  EFFECTIVE_TRITON_COMMIT="${IMAGE_TRITON_COMMIT:-${TREE_TRITON_COMMIT}}"
+
+  NEED_TRITON_REBUILD="false"
+  if [[ -n "${TRITON_COMMIT_OVERRIDE:-}" ]]; then
+      echo "[CI-TRITON-CHECK] TRITON_COMMIT_OVERRIDE=${TRITON_COMMIT_OVERRIDE} -> forcing rebuild"
+      REPO_TRITON_COMMIT="${TRITON_COMMIT_OVERRIDE}"
+      NEED_TRITON_REBUILD="true"
+  elif [[ -z "${EFFECTIVE_TRITON_COMMIT}" ]]; then
+      echo "[CI-TRITON-CHECK] Cannot determine the installed triton commit -> rebuild needed"
+      NEED_TRITON_REBUILD="true"
+  # Compare by prefix: pip reports an abbreviated sha, the Dockerfile pins a full one.
+  elif [[ "${REPO_TRITON_COMMIT}" == "${EFFECTIVE_TRITON_COMMIT}"* || "${EFFECTIVE_TRITON_COMMIT}" == "${REPO_TRITON_COMMIT}"* ]]; then
+      echo "[CI-TRITON-CHECK] triton commit matches"
+  else
+      echo "[CI-TRITON-CHECK] Commit mismatch: image=${EFFECTIVE_TRITON_COMMIT}, repo=${REPO_TRITON_COMMIT}"
+      NEED_TRITON_REBUILD="true"
+  fi
+
+  if [[ "${NEED_TRITON_REBUILD}" == "true" ]]; then
+      echo "[CI-TRITON-CHECK] === TRITON REBUILD START (${REPO_TRITON_COMMIT}) ==="
+      # Mirrors the Dockerfile's BUILD_TRITON block. `checkout -f` for the same
+      # reason as AITER below: the tree is freshly cloned, there is nothing to
+      # preserve, and a smudge-filter-dirty tree must not block the checkout.
+      docker exec ci_sglang bash -c "
+          set -euo pipefail
+          pip uninstall -y triton triton-kernels || true
+          apt install -y cmake
+          rm -rf /sgl-workspace/triton-custom
+          git clone '${TRITON_REPO}' /sgl-workspace/triton-custom
+          cd /sgl-workspace/triton-custom
+          git checkout -f '${REPO_TRITON_COMMIT}'
+          pip install --cache-dir=/sgl-data/pip-cache -r python/requirements.txt
+          pip install --cache-dir=/sgl-data/pip-cache -e .
+          if [ -d python/triton_kernels ]; then
+            pip install --cache-dir=/sgl-data/pip-cache -e python/triton_kernels --no-deps
+          fi
+      "
+      # Triton caches compiled kernels keyed by its own version; a stale cache
+      # after a version change surfaces as an opaque CompilationError rather
+      # than a miss, so drop it.
+      docker exec ci_sglang bash -c "rm -rf ~/.triton/cache /root/.triton/cache" || true
+      docker exec ci_sglang python3 -c "import triton; print('[CI-TRITON-CHECK] now on triton', triton.__version__)"
+      echo "[CI-TRITON-CHECK] === TRITON REBUILD COMPLETE ==="
+  fi
+
+  echo "[CI-TRITON-CHECK] === TRITON VERSION CHECK END ==="
 fi
 
 # -----------------------
