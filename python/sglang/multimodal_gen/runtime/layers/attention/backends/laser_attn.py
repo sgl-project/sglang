@@ -9,18 +9,23 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABac
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+logger = init_logger(__name__)
+
 # Import to use torch.ops.attentions, install package with sgl_kernel_npu
 try:
     import attentions  # noqa: F401
 except ImportError as e:
+    logger.warning(
+        "The 'attentions' library is not installed. Laser Attention is unavailable. "
+        "Installing this library may improve performance on NPU. "
+        "See: sgl-project/sgl-kernel-npu"
+    )
     raise ImportError(
         (
-            "The required 'attentions' package is not installed."
-            "The package can be installed with sgl_kernel_npu"
+            "The required 'attentions' package is not installed. "
+            "Install it from sgl-project/sgl-kernel-npu."
         )
     ) from e
-
-logger = init_logger(__name__)
 
 # The current NPU kernel stores QK scores and V in FP16 even for BF16 inputs.
 _BF16_LASER_SCALE = 256.0
