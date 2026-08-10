@@ -115,23 +115,13 @@ class AscendKVManager(MooncakeKVManager):
                 "destination device KV indices"
             )
         # Hybrid MLA pools expose PP-local source entries but PP=1 decode
-        # registers all model layers. Pair entries by their global layer ids
-        # instead of interpreting the hybrid buffers as MHA K/V lists.
-        logger.warning(
-            "[ascend-pd-kv-debug] pp=%s/%s tp=%s/%s mla=%s hybrid_mla=%s "
-            "src_ptrs=%d src_item_lens=%d src_layer_ids=%s "
-            "dst_ptrs=%d dst_layer_ids=%s",
-            self.pp_rank,
-            self.pp_size,
-            self.attn_tp_rank,
-            self.attn_tp_size,
-            self.is_mla_backend,
-            self.is_hybrid_mla_backend,
-            len(self.kv_args.kv_data_ptrs),
-            len(self.kv_args.kv_item_lens),
-            self.kv_args.kv_layer_ids,
-            len(dst_kv_ptrs),
-            dst_layer_ids,
+        # registers all model layers. Pair those entries by global layer id.
+        # Other backends retain the legacy positional mapping.
+        src_layer_ids = (
+            self.kv_args.kv_layer_ids if self.is_hybrid_mla_backend else None
+        )
+        mapped_dst_layer_ids = (
+            dst_layer_ids if self.is_hybrid_mla_backend else None
         )
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
@@ -141,8 +131,8 @@ class AscendKVManager(MooncakeKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
-            src_layer_ids=self.kv_args.kv_layer_ids,
-            dst_layer_ids=dst_layer_ids,
+            src_layer_ids=src_layer_ids,
+            dst_layer_ids=mapped_dst_layer_ids,
         )
 
     def _is_generic_kvcache_state_type(self, st) -> bool:

@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from unittest.mock import patch
 
 import torch
 
@@ -74,6 +75,40 @@ class TestMamba(unittest.TestCase):
         self.assertIn(
             "layer_id=1 not in full attention layers:", str(context.exception)
         )
+
+    def test_hybrid_linear_kv_pool_layer_ids_match_buffer_groups(self):
+        class FakeFullKVPool:
+            def __init__(self, num_entries):
+                self.num_entries = num_entries
+
+            def get_contiguous_buf_infos(self):
+                entries = list(range(self.num_entries))
+                return entries, entries, entries
+
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
+
+        # Existing non-NPU layouts remain unchanged.
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", False):
+            pool.use_mla = True
+            pool.full_kv_pool = FakeFullKVPool(4)
+            self.assertEqual(pool.get_kv_layer_ids(), [3, 7])
+
+            pool.use_mla = False
+            self.assertEqual(pool.get_kv_layer_ids(), [3, 7, 3, 7])
+
+        # NPU MLA exposes multiple buffers per layer (latent KV, RoPE key,
+        # and optionally an index buffer).
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
+            pool.use_mla = True
+            for num_groups in (2, 3):
+                with self.subTest(num_groups=num_groups):
+                    pool.full_kv_pool = FakeFullKVPool(2 * num_groups)
+                    self.assertEqual(pool.get_kv_layer_ids(), [3, 7] * num_groups)
+
+            pool.full_kv_pool = FakeFullKVPool(3)
+            with self.assertRaisesRegex(RuntimeError, "evenly grouped by layer"):
+                pool.get_kv_layer_ids()
 
     def test_mamba_pool(self):
         max_num_reqs = 10
