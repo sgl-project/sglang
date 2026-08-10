@@ -47,6 +47,8 @@
 
 // Local PTX primitives (cp.async / mbarrier / async-proxy fence)
 
+namespace sglang {
+
 namespace ptx {
 
 // Generic ptr -> 32-bit `.shared` address: inline-PTX `.shared` instructions
@@ -132,8 +134,6 @@ static SGL_DEVICE void fence_async_smem() {
 }
 
 }  // namespace ptx
-
-namespace {
 
 constexpr int kDimK = 128;
 constexpr int kDimV = 128;
@@ -1061,4 +1061,4 @@ struct KdaFusedDecodeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
