@@ -1393,6 +1393,11 @@ export const Deployment = ({ config, benchmarks }) => {
     return (
       <label
         key={item.id}
+        className="sg-command-visualizer-choice"
+        role="radio"
+        aria-checked={checked}
+        aria-disabled={disabled}
+        tabIndex={disabled ? -1 : 0}
         style={{
           ...s.labelBase,
           ...(checked ? s.checked : {}),
@@ -1405,6 +1410,11 @@ export const Deployment = ({ config, benchmarks }) => {
         }
         onClick={(e) => {
           if (disabled) { e.preventDefault(); return; }
+          handleSelect(dim, item.id);
+        }}
+        onKeyDown={(e) => {
+          if (disabled || (e.key !== "Enter" && e.key !== " ")) return;
+          e.preventDefault();
           handleSelect(dim, item.id);
         }}
       >
@@ -1434,7 +1444,7 @@ export const Deployment = ({ config, benchmarks }) => {
     <div
       id={DEPLOYMENT_COMPONENT_ID}
       style={{ ...s.container, scrollMarginTop: "104px" }}
-      className="not-prose"
+      className="not-prose sg-command-visualizer"
     >
       {/* Hardware section (2 vendor rows in one card, equal-width grid) */}
       <div style={s.cardColumn}>
@@ -1484,6 +1494,7 @@ export const Deployment = ({ config, benchmarks }) => {
                   {runModes.map((mode, index) => (
                     <span
                       key={mode}
+                      className="sg-command-visualizer-tab"
                       style={{
                         ...(index === runModes.length - 1
                           ? s.runModeChipLast(activeRunMode === mode)
@@ -1491,7 +1502,13 @@ export const Deployment = ({ config, benchmarks }) => {
                         ...(runModes.length === 1 ? { borderRadius: 7 } : {}),
                       }}
                       onClick={() => setRunMode(mode)}
+                      onKeyDown={(e) => {
+                        if (e.key !== "Enter" && e.key !== " ") return;
+                        e.preventDefault();
+                        setRunMode(mode);
+                      }}
                       role="tab"
+                      tabIndex={0}
                       aria-selected={activeRunMode === mode}
                     >
                       {mode === "docker" ? "Docker" : "Python"}

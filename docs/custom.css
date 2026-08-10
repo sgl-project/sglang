@@ -191,6 +191,34 @@ html.dark table tbody tr:nth-child(even) td,
   overflow-y: visible;
 }
 
+/* command visualizer controls: restrained pointer lift with a matching
+   terracotta keyboard focus ring */
+.sg-command-visualizer :where(button:not(:disabled), .sg-command-visualizer-choice[aria-disabled="false"], .sg-command-visualizer-tab) {
+  transition: transform 160ms cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .sg-command-visualizer :where(button:not(:disabled), .sg-command-visualizer-choice[aria-disabled="false"], .sg-command-visualizer-tab):hover {
+    transform: translateY(-1px) scale(1.015);
+  }
+}
+
+.sg-command-visualizer :where(button:not(:disabled), .sg-command-visualizer-choice[aria-disabled="false"], .sg-command-visualizer-tab):active {
+  transform: translateY(0) scale(0.985);
+}
+
+.sg-command-visualizer :where(button, .sg-command-visualizer-choice, .sg-command-visualizer-tab):focus-visible {
+  outline: 2px solid #e2775f;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sg-command-visualizer :where(button, .sg-command-visualizer-choice, .sg-command-visualizer-tab) {
+    transition: none;
+    transform: none !important;
+  }
+}
+
 .sgd-muted {
   color: rgb(107, 114, 128);
   font-size: 0.85rem;
