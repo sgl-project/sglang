@@ -59,6 +59,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 )
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.encoder_preprocessing import (
+    EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
     invoke_encoder_preprocessor,
 )
@@ -69,7 +70,13 @@ from sglang.srt.observability.trace import (
     process_tracing_init,
     trace_set_thread_info,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec, get_mm, publish
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_mm,
+    get_parallel,
+    publish,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -1705,7 +1712,7 @@ class MMEncoder:
             images = self._normalize_kimi_encoder_images(images)
         original_image_sizes = [_get_original_image_size(item) for item in images]
         if model_preprocessor:
-            return invoke_encoder_preprocessor(
+            processor_output = invoke_encoder_preprocessor(
                 model_preprocessor,
                 images,
                 Modality.IMAGE,
@@ -1713,6 +1720,18 @@ class MMEncoder:
                 image_processor=self.image_processor,
                 use_gpu_preprocessing=self.use_image_processor_gpu,
             )
+            if (
+                isinstance(processor_output, EncoderPreprocessOutput)
+                and processor_output.materialize_local_items is not None
+            ):
+                parallel = get_parallel()
+                await asyncio.get_running_loop().run_in_executor(
+                    self.preproc_executor,
+                    processor_output.materialize_for_rank,
+                    parallel.attn_tp_rank,
+                    parallel.attn_tp_size,
+                )
+            return processor_output
         image_config = self.vision_config.get("image", {})
         processor_input = await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,

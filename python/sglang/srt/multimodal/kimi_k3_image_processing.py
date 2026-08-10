@@ -1,3 +1,5 @@
+import functools
+import math
 from typing import Union
 
 import numpy as np
@@ -18,7 +20,10 @@ def prepare_kimi_k3_encoder_inputs(
     assigned to the local vision rank.
     """
     from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-    from sglang.srt.multimodal.encoder_preprocessing import EncoderPreprocessOutput
+    from sglang.srt.multimodal.encoder_preprocessing import (
+        EncoderPreprocessOutput,
+        hash_raw_encoder_item,
+    )
     from sglang.srt.multimodal.processors.kimi_k25 import (
         _grid_thw_from_resize_config,
         navit_resize_config,
@@ -83,24 +88,21 @@ def prepare_kimi_k3_encoder_inputs(
         )
         grid_thw = _grid_thw_from_resize_config(resize_config, patch_size)
         grid_tensor = torch.tensor([grid_thw], dtype=torch.int64)
-        items.append(
-            MultimodalDataItem(
-                modality=Modality.IMAGE,
-                feature=(
-                    to_chw_uint8(image)
-                    if use_gpu_preprocessing
-                    else to_hwc_uint8(image)
-                ),
-                model_specific_data={
-                    "grid_thws": grid_tensor,
-                    DEFERRED_PREPROCESSING_KEY: {
-                        **common_deferred_config,
-                        "feature_layout": ("chw" if use_gpu_preprocessing else "hwc"),
-                        "resize_config": resize_config,
-                    },
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=to_chw_uint8(image) if use_gpu_preprocessing else image,
+            model_specific_data={
+                "grid_thws": grid_tensor,
+                DEFERRED_PREPROCESSING_KEY: {
+                    **common_deferred_config,
+                    "feature_layout": "chw" if use_gpu_preprocessing else "raw",
+                    "resize_config": resize_config,
                 },
-            )
+            },
         )
+        if not use_gpu_preprocessing:
+            item.set_hash(hash_raw_encoder_item(image))
+        items.append(item)
         grids.append(grid_thw)
         original_image_sizes.append([width, height])
 
@@ -114,6 +116,15 @@ def prepare_kimi_k3_encoder_inputs(
             "original_image_sizes": original_image_sizes,
         },
         mm_items=items,
+        item_sizes=[math.prod(grid) for grid in grids],
+        materialize_local_items=(
+            None
+            if use_gpu_preprocessing
+            else functools.partial(
+                materialize_kimi_k3_cpu_item_features,
+                image_processor=image_processor,
+            )
+        ),
     )
 
 
@@ -122,21 +133,24 @@ def materialize_kimi_k3_cpu_features(items, image_processor) -> torch.Tensor:
     medias = []
     for item in items:
         image = item.feature
-        if not isinstance(image, torch.Tensor) or image.dtype != torch.uint8:
-            raise TypeError("Kimi-K3 deferred CPU preprocessing expects uint8 tensors")
         config = item.model_specific_data[DEFERRED_PREPROCESSING_KEY]
-        if config["feature_layout"] != "hwc":
-            raise ValueError("Kimi-K3 deferred CPU preprocessing expects HWC inputs")
-        image = image.detach().cpu().contiguous().numpy()
-        channels = image.shape[-1]
-        if channels == 1:
-            image = Image.fromarray(image[..., 0], mode="L")
-        elif channels == 3:
-            image = Image.fromarray(image, mode="RGB")
-        elif channels == 4:
-            image = Image.fromarray(image, mode="RGBA")
-        else:
-            raise ValueError(f"Unsupported Kimi-K3 image channel count: {channels}")
+        if config["feature_layout"] != "raw":
+            raise ValueError("Kimi-K3 deferred CPU preprocessing expects raw inputs")
+        if not isinstance(image, Image.Image):
+            if not isinstance(image, torch.Tensor) or image.dtype != torch.uint8:
+                raise TypeError(
+                    "Kimi-K3 deferred CPU preprocessing expects PIL or uint8 tensors"
+                )
+            image = to_hwc_uint8(image).numpy()
+            channels = image.shape[-1]
+            if channels == 1:
+                image = Image.fromarray(image[..., 0], mode="L")
+            elif channels == 3:
+                image = Image.fromarray(image, mode="RGB")
+            elif channels == 4:
+                image = Image.fromarray(image, mode="RGBA")
+            else:
+                raise ValueError(f"Unsupported Kimi-K3 image channel count: {channels}")
         medias.append({"type": "image", "image": image})
 
     output = image_processor.preprocess(medias, return_tensors="pt")
@@ -146,6 +160,20 @@ def materialize_kimi_k3_cpu_features(items, image_processor) -> torch.Tensor:
     if not torch.equal(output["grid_thws"].cpu(), expected_grids.cpu()):
         raise ValueError("Kimi-K3 deferred CPU preprocessing produced wrong grids")
     return output["pixel_values"]
+
+
+def materialize_kimi_k3_cpu_item_features(items, image_processor) -> list[torch.Tensor]:
+    """Return exact checkpoint-processor features split by logical image."""
+    pixel_values = materialize_kimi_k3_cpu_features(items, image_processor)
+    patch_counts = [
+        math.prod(item.model_specific_data["grid_thws"][0].tolist()) for item in items
+    ]
+    if sum(patch_counts) != pixel_values.shape[0]:
+        raise ValueError(
+            "Kimi-K3 processor feature length does not match image grids: "
+            f"{pixel_values.shape[0]} != {sum(patch_counts)}"
+        )
+    return list(pixel_values.split(patch_counts))
 
 
 def to_hwc_uint8(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:

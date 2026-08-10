@@ -3113,6 +3113,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
         def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
             """Materialize only the images assigned to this vision-DP rank."""
+            from sglang.srt.multimodal.encoder_preprocessing import (
+                LOCAL_PREPROCESSED_KEY,
+            )
+
             # Same source as MmItemMemoryPool.try_to_recycle(), which waits on
             # configured_tp_size(): the live world size agrees once dist is up,
             # but a refcount that disagrees with the waiter would strand items.
@@ -3129,6 +3133,21 @@ class KimiK3ForConditionalGeneration(nn.Module):
                         device_index, ipc_consumer_count=ipc_consumer_count
                     )
                 selected_items.append(item)
+
+            locally_preprocessed = [
+                item.model_specific_data.get(LOCAL_PREPROCESSED_KEY, False)
+                for item in selected_items
+            ]
+            if any(locally_preprocessed):
+                if not all(locally_preprocessed):
+                    raise ValueError(
+                        "Kimi-K3 cannot mix local preprocessed and deferred images"
+                    )
+                return materialize_multimodal_features(
+                    [item.feature for item in selected_items],
+                    device=device,
+                    dtype=target_dtype,
+                )
 
             deferred = [
                 item.model_specific_data.get(DEFERRED_PREPROCESSING_KEY)

@@ -28,8 +28,10 @@ from sglang.srt.managers.tokenizer_manager import (
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.encoder_preprocessing import (
+    LOCAL_PREPROCESSED_KEY,
     EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
+    hash_raw_encoder_item,
     invoke_encoder_preprocessor,
 )
 from sglang.srt.multimodal.kimi_k3_image_processing import (
@@ -180,10 +182,11 @@ def test_kimi_k3_epd_preprocess_preserves_raw_per_image_items():
     assert len(items) == 2
     assert output["original_image_sizes"] == [[8, 6], [5, 9]]
     assert output["grid_thws"].tolist() == [[1, 4, 4], [1, 6, 4]]
-    for item, size in zip(items, ((6, 8), (9, 5))):
+    for item, image in zip(items, (first, second)):
         assert item.modality == Modality.IMAGE
-        assert item.feature.dtype == torch.uint8
-        assert item.feature.shape == (*size, 3)
+        assert item.feature is image
+        assert item.hash is not None
+        assert item.pad_value is not None
         deferred = item.model_specific_data[DEFERRED_PREPROCESSING_KEY]
         assert deferred["image_mean"] == [0.5, 0.5, 0.5]
         assert deferred["image_std"] == [0.5, 0.5, 0.5]
@@ -192,6 +195,10 @@ def test_kimi_k3_epd_preprocess_preserves_raw_per_image_items():
 def test_kimi_k3_epd_model_preprocessor_receives_image_processor():
     image = Image.new("RGB", (8, 6), color=(1, 2, 3))
     image_processor = _kimi_k3_image_processor()
+    image_processor.preprocess = lambda medias, return_tensors: {
+        "pixel_values": torch.zeros(16, 12),
+        "grid_thws": torch.tensor([[1, 4, 4]]),
+    }
     calls = []
 
     def model_preprocessor(
@@ -212,8 +219,17 @@ def test_kimi_k3_epd_model_preprocessor_receives_image_processor():
     encoder.use_image_processor_gpu = False
     encoder.vision_config = {"image": {"return_tensors": "pt"}}
     encoder._flatten_and_load_images = AsyncMock(return_value=[image])
-
-    output = asyncio.run(encoder._process_image_items([image], model_preprocessor))
+    encoder.preproc_executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        with patch(
+            "sglang.srt.disaggregation.encode_server.get_parallel",
+            return_value=SimpleNamespace(attn_tp_rank=0, attn_tp_size=1),
+        ):
+            output = asyncio.run(
+                encoder._process_image_items([image], model_preprocessor)
+            )
+    finally:
+        encoder.preproc_executor.shutdown()
 
     assert len(calls) == 1
     assert calls[0][0][0] == {"type": "image", "image": image}
@@ -274,6 +290,47 @@ def test_kimi_k3_epd_default_cpu_materialization_is_owner_only_and_exact():
     assert processor.calls[0][0]["image"].getpixel((0, 0)) == (11, 0, 0)
     assert torch.all(materialized == 11)
     assert items[0].model_specific_data[DEFERRED_PREPROCESSING_KEY]["backend"] == "cpu"
+
+
+def test_encoder_preprocess_materializes_only_local_size_balanced_items():
+    items = [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.tensor([value], dtype=torch.uint8),
+        )
+        for value in (3, 5, 7)
+    ]
+    calls = []
+
+    def materialize(selected):
+        calls.append(selected)
+        return [item.feature.float() + 10 for item in selected]
+
+    output = EncoderPreprocessOutput(
+        {"pixel_values": [item.feature for item in items]},
+        mm_items=items,
+        item_sizes=[8, 5, 3],
+        materialize_local_items=materialize,
+    )
+
+    output.materialize_for_rank(rank=1, world_size=2)
+
+    assert calls == [[items[1], items[2]]]
+    assert items[0].feature.tolist() == [3]
+    assert items[1].feature.tolist() == [15.0]
+    assert items[2].feature.tolist() == [17.0]
+    assert LOCAL_PREPROCESSED_KEY not in items[0].model_specific_data
+    assert items[1].model_specific_data[LOCAL_PREPROCESSED_KEY]
+    assert items[2].model_specific_data[LOCAL_PREPROCESSED_KEY]
+
+
+def test_raw_encoder_hash_includes_shape_and_dtype():
+    flat = torch.arange(12, dtype=torch.uint8)
+
+    assert hash_raw_encoder_item(flat.reshape(2, 2, 3)) != hash_raw_encoder_item(
+        flat.reshape(3, 2, 2)
+    )
+    assert hash_raw_encoder_item(flat) != hash_raw_encoder_item(flat.to(torch.int16))
 
 
 @pytest.mark.parametrize(
