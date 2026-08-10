@@ -11,6 +11,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -173,7 +174,11 @@ if _is_cuda:
     from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
 
     from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
-    from sglang.kernels.ops.gemm.fp8_scaled_mm import fp8_scaled_mm
+
+    if envs.SGLANG_USE_AOT_FP8_GEMM.get():
+        from sgl_kernel import fp8_scaled_mm
+    else:
+        from sglang.kernels.ops.gemm.fp8_scaled_mm import fp8_scaled_mm
 
     @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
     def _bmm_fp8_batched_op(

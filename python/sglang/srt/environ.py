@@ -887,6 +887,7 @@ class Envs:
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    SGLANG_USE_AOT_FP8_GEMM = EnvBool(False)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
