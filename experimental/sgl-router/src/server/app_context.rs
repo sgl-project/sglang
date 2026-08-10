@@ -149,7 +149,8 @@ impl AppContext {
             .map(|u| u.trim())
             .filter(|u| !u.is_empty())
             .map(|url| CacheSimTee::spawn(url.to_owned(), Arc::clone(&metrics), max_captures));
-        // 读取 pod 名用于对象 key 去重；未注入时退化为 "unknown-pod"。
+        // Read the pod name for object-key deduplication; fall back to
+        // "unknown-pod" when the downward-API env var is not injected.
         let pod = std::env::var("POD_NAME").unwrap_or_else(|_| "unknown-pod".to_string());
         let s3_export_sink = config
             .observability
@@ -157,7 +158,7 @@ impl AppContext {
             .as_ref()
             .map(|u| u.trim())
             .filter(|u| !u.is_empty())
-            .and_then(|uri| S3ExportSink::spawn(uri, pod, Arc::clone(&metrics)));
+            .and_then(|uri| S3ExportSink::spawn(uri, pod, Arc::clone(&metrics), max_captures));
         Self {
             config,
             tokenizers,

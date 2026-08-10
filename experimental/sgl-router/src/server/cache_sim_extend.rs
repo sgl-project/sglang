@@ -175,6 +175,7 @@ pub(crate) fn spawn_extend_tee(
     request_body: Bytes,
     prompt: Option<IngressPrompt>,
     source: ReplySource,
+    slug: Option<String>,
 ) {
     if ctx.cache_sim_tee.is_none() && ctx.s3_export_sink.is_none() {
         return;
@@ -273,7 +274,7 @@ pub(crate) fn spawn_extend_tee(
                         per_choice_output,
                         choice.as_ref().map(|c| c.index),
                         choice.as_ref().map(|c| c.count),
-                        None, // extend 路径当前不持有 attribution（见 spec §11）
+                        slug.as_deref(),
                     );
                 }
             } else {
@@ -956,6 +957,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(1, 9)),
+            None,
         );
 
         let got = wait_for(&cap, 1).await;
@@ -997,6 +999,7 @@ mod spawn_tests {
             request_body(),
             None,
             ReplySource::Json(body_with(1, 5)),
+            None,
         );
         let got = wait_for(&cap, 1).await;
         let v = &got[0];
@@ -1025,6 +1028,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(1, 5)),
+            None,
         );
         let got = wait_for(&cap, 1).await;
         assert!(got[0].get("prompt_len").is_none(), "{:?}", got[0]);
@@ -1059,6 +1063,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(3, 30)),
+            None,
         );
 
         let got = wait_for(&cap, 3).await;
@@ -1128,6 +1133,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(resp),
+            None,
         );
         let got = wait_for(&cap, 1).await;
         let v = &got[0];
@@ -1187,6 +1193,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(resp),
+            None,
         );
         let got = wait_for(&cap, 2).await;
         let mut idx: Vec<u64> = got
@@ -1227,6 +1234,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(1, 12)),
+            None,
         );
         let got = wait_for(&cap, 1).await;
         let v = &got[0];

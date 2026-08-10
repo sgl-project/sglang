@@ -621,6 +621,7 @@ async fn chat_completions_inner(
         let request_body = body.clone();
         let prompt = extend_prompt.clone();
         let request_id = derived_request_id.clone();
+        let slug = tee_attr.slug.clone();
         move || -> Option<StreamCapture> {
             if !armed {
                 return None;
@@ -630,21 +631,38 @@ async fn chat_completions_inner(
             // stay bounded under any load. Budget exhausted ⇒ don't capture this
             // stream (skip its extend tee, counted as `capture_capped`); the
             // capture is observational, so shedding it never affects serving.
-            // When cache-sim is off (s3-only path), there is no permit pool to
-            // draw from — proceed without one.
-            let permit = ctx
-                .cache_sim_tee
-                .as_ref()
-                .and_then(|t| t.try_acquire_capture_permit());
-            if ctx.cache_sim_tee.is_some() && permit.is_none() {
-                ctx.metrics.record_cache_sim_tee("capture_capped");
+            //
+            // When cache-sim is on, draw from the cache-sim tee's pool and record
+            // `capture_capped` there. Also record `dropped_capture_capped` on the
+            // S3 sink so both consumers reflect the drop.
+            // When cache-sim is off but the S3 sink is on, draw from the sink's
+            // own permit pool so S3-only mode is equally memory-bounded.
+            let permit = if let Some(tee) = ctx.cache_sim_tee.as_ref() {
+                let p = tee.try_acquire_capture_permit();
+                if p.is_none() {
+                    ctx.metrics.record_cache_sim_tee("capture_capped");
+                    if ctx.s3_export_sink.is_some() {
+                        ctx.metrics.record_s3_export("dropped_capture_capped");
+                    }
+                    return None;
+                }
+                p
+            } else if let Some(sink) = ctx.s3_export_sink.as_ref() {
+                let p = sink.try_acquire_capture_permit();
+                if p.is_none() {
+                    ctx.metrics.record_s3_export("dropped_capture_capped");
+                    return None;
+                }
+                p
+            } else {
                 return None;
-            }
+            };
             let ctx = Arc::clone(&ctx);
             let model = model.clone();
             let request_body = request_body.clone();
             let prompt = prompt.clone();
             let request_id = request_id.clone();
+            let slug = slug.clone();
             Some(StreamCapture {
                 max_bytes: cache_sim_extend::MAX_EXTEND_CAPTURE_BYTES,
                 _permit: permit,
@@ -656,6 +674,7 @@ async fn chat_completions_inner(
                         request_body,
                         prompt,
                         ReplySource::Sse(buf),
+                        slug,
                     );
                 }),
             })
@@ -1334,6 +1353,7 @@ async fn chat_completions_inner(
                     body.clone(),
                     extend_prompt,
                     ReplySource::Json(bytes.clone()),
+                    tee_attr.slug.clone(),
                 );
             }
         }

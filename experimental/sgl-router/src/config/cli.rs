@@ -361,9 +361,10 @@ pub struct Cli {
     /// capture. Only meaningful with `--cache-sim-url`.
     #[arg(long, default_value_t = default_cache_sim_max_concurrent_captures())]
     pub cache_sim_max_concurrent_captures: usize,
-    /// `s3://bucket/prefix/` 目标；设置即开启 token 数据集导出，写入每个
-    /// 请求的 ingest/extend token 序列（NDJSON+gzip）。凭证/region 走标准
-    /// AWS 环境变量。不设则关闭。
+    /// `s3://bucket/prefix/` target. When set, enables token-dataset export:
+    /// writes each request's ingest/extend token sequences as NDJSON+gzip.
+    /// Credentials and region come from the standard AWS environment variables.
+    /// When absent, export is disabled.
     #[arg(long, env = "RADIXARK_TOKEN_EXPORT_S3_URI")]
     pub token_export_s3_uri: Option<String>,
 }

@@ -1,5 +1,6 @@
-//! S3 token 数据集导出：与 cache-sim 独立的第二条 tee，把 ingest/extend 的
-//! token 序列以 NDJSON+gzip 批量写入 S3，供离线复算 cache hit。
+//! S3 token-dataset export: a second tee independent of the cache-sim that
+//! writes ingest/extend token sequences as NDJSON+gzip batches to S3 for
+//! offline cache-hit recomputation.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -14,8 +15,8 @@ pub(crate) enum ExportKind {
     Extend,
 }
 
-/// 一条导出记录（序列化成一行 NDJSON）。可选字段缺失即省略，语义与
-/// `cache_sim_tee::IngestIdsBody` 对齐。
+/// One export record (serialized as one NDJSON line). Optional fields are
+/// omitted when absent; semantics align with `cache_sim_tee::IngestIdsBody`.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ExportRecord {
     pub kind: ExportKind,
@@ -35,8 +36,9 @@ pub(crate) struct ExportRecord {
 }
 
 impl ExportRecord {
-    /// 序列化为一行 NDJSON（含结尾换行）。序列化不可能失败（纯值类型），
-    /// 万一失败返回空串，由调用方计数而非 panic。
+    /// Serialize to one NDJSON line (with a trailing newline). Serialization
+    /// cannot fail for pure value types; if it does, return an empty string
+    /// and let the caller count it rather than panicking.
     pub(crate) fn to_ndjson_line(&self) -> String {
         match serde_json::to_string(self) {
             Ok(mut s) => {
@@ -48,8 +50,9 @@ impl ExportRecord {
     }
 }
 
-/// 解析 `s3://bucket/prefix/...` -> `(bucket, key_prefix)`。
-/// `key_prefix` 去掉前导 `/`、去掉末尾 `/`（拼 key 时再补）。非 s3:// 返回 None。
+/// Parse `s3://bucket/prefix/...` into `(bucket, key_prefix)`.
+/// `key_prefix` is stripped of leading and trailing `/` (re-added when
+/// constructing the key). Returns `None` for non-s3:// URIs.
 pub fn parse_s3_uri(uri: &str) -> Option<(String, String)> {
     let rest = uri.trim().strip_prefix("s3://")?;
     let mut parts = rest.splitn(2, '/');
@@ -58,8 +61,8 @@ pub fn parse_s3_uri(uri: &str) -> Option<(String, String)> {
     Some((bucket, prefix))
 }
 
-/// Hive 风格分区的对象 key。`unix_nanos + seq` 保证同 pod 不碰撞；
-/// `pod` 保证跨 replica 不碰撞。
+/// Hive-style partitioned object key. `unix_nanos + seq` prevents collisions
+/// within one pod; `pod` prevents collisions across replicas.
 pub(crate) fn object_key(
     prefix: &str,
     slug: &str,
@@ -74,6 +77,22 @@ pub(crate) fn object_key(
         format!("{prefix}/")
     };
     format!("{head}slug={slug}/date={date}/{pod}-{unix_nanos}-{seq}.ndjson.gz")
+}
+
+/// The slug is a client-suppliable header (x-radixark-endpoint-slug). Only a
+/// strict allowlist may reach S3 key paths or the batcher map: hostile values
+/// (path separators, huge/high-cardinality strings) collapse to "unknown".
+fn safe_slug(slug: Option<&str>) -> String {
+    match slug {
+        Some(s)
+            if !s.is_empty()
+                && s.len() <= 64
+                && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) =>
+        {
+            s.to_string()
+        }
+        _ => "unknown".to_string(),
+    }
 }
 
 pub(crate) const DEFAULT_MAX_BATCH_BYTES: usize = 8 << 20;
@@ -93,8 +112,9 @@ struct Buf {
     opened_at: Instant,
 }
 
-/// per-slug 累积未压缩 NDJSON 字节；按大小或年龄触发，产出原始（未压缩）字节。
-/// gzip 压缩由 upload worker 异步完成。
+/// Per-slug accumulator of uncompressed NDJSON bytes. Triggers on size or age
+/// and yields raw (uncompressed) bytes. Gzip compression is done by the upload
+/// worker asynchronously.
 pub(crate) struct SlugBatcher {
     max_bytes: usize,
     max_age: Duration,
@@ -116,9 +136,10 @@ impl SlugBatcher {
         buf.records += 1;
     }
 
-    /// 取出所有「已就绪」的 slug 缓冲（超 size 或超 age，或 `force`），返回原始字节。
-    /// 未就绪的保留。size 触发比较未压缩字节数与 `max_bytes`（spec §5.3）。
-    /// gzip 压缩由 upload worker 完成（不在此处）。
+    /// Remove all "ready" slug buffers (over size, over age, or `force=true`)
+    /// and return their raw bytes. Unready buffers are retained. The size
+    /// trigger compares uncompressed bytes against `max_bytes` (spec §5.3);
+    /// gzip compression is done by the upload worker, not here.
     pub(crate) fn take_ready(&mut self, now: Instant, force: bool) -> Vec<ReadyObject> {
         let ready_slugs: Vec<String> = self
             .bufs
@@ -149,7 +170,8 @@ use crate::server::metrics::MetricsRegistry;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 
-/// 测试用内存 store。`fail_first` 次 put 先返回错误，之后成功并记录。
+/// In-memory store for tests. The first `fail_first` `put` calls return an
+/// error; subsequent calls succeed and record the key+body.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct FakeStore {
     pub puts: Mutex<Vec<(String, Vec<u8>)>>,
@@ -163,7 +185,7 @@ impl FakeStore {
     }
 }
 
-// ---- SigV4 helpers（纯函数，可单测）----
+// ---- SigV4 helpers (pure functions, unit-testable) ----
 
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -180,7 +202,7 @@ pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     m.finalize().into_bytes().into()
 }
 
-/// SigV4 signing key：HMAC 链 AWS4+secret -> date -> region -> service -> aws4_request。
+/// SigV4 signing key: HMAC chain AWS4+secret -> date -> region -> service -> aws4_request.
 pub(crate) fn signing_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> [u8; 32] {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date_stamp.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
@@ -188,7 +210,8 @@ pub(crate) fn signing_key(secret: &str, date_stamp: &str, region: &str, service:
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-/// RFC3986 编码；`encode_slash=false` 时保留 `/`（用于 S3 canonical URI）。
+/// RFC3986 percent-encode. When `encode_slash=false`, `/` is left literal
+/// (used for S3 canonical URIs).
 pub(crate) fn uri_encode(s: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -203,7 +226,8 @@ pub(crate) fn uri_encode(s: &str, encode_slash: bool) -> String {
     out
 }
 
-/// 我们固定只签 host / x-amz-content-sha256 / x-amz-date 三个头，query 为空。
+/// We sign exactly three headers: host, x-amz-content-sha256, x-amz-date.
+/// The query string is empty.
 pub(crate) fn canonical_request(
     method: &str,
     canonical_uri: &str,
@@ -243,7 +267,8 @@ impl Uploader {
     async fn put(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
         match self {
             Uploader::S3 { http, access_key, secret_key, region, bucket } => {
-                // virtual-hosted-style（radixark bucket 名无点，无 TLS SNI 问题）。
+                // Virtual-hosted-style URL (bucket names without dots have no
+                // TLS SNI issue).
                 let host = format!("{bucket}.s3.{region}.amazonaws.com");
                 let canonical_uri = format!("/{}", uri_encode(key, false));
                 let url = format!("https://{host}{canonical_uri}");
@@ -303,8 +328,9 @@ impl Uploader {
     }
 }
 
-/// 指数退避重试；`max_attempts` 次内成功返回 true，否则 false（由调用方计数）。
-/// 退避从 100ms 起翻倍，封顶 5s。
+/// Exponential-backoff retry. Returns true on success within `max_attempts`,
+/// false otherwise (the caller is responsible for counting). Backoff starts at
+/// 100 ms, doubles on each failure, and is capped at 5 s.
 pub(crate) async fn put_with_retry(
     up: &Uploader,
     key: &str,
@@ -328,13 +354,19 @@ pub(crate) async fn put_with_retry(
     false
 }
 
-pub(crate) const CHANNEL_CAPACITY: usize = 8192;
+/// Count-only channel bound. At long-context record sizes this caps worst-case
+/// queue memory while a fast non-blocking pump keeps normal buffering ample.
+pub(crate) const CHANNEL_CAPACITY: usize = 2048;
 const PUT_MAX_ATTEMPTS: u32 = 8;
-/// pump 的定时 flush 心跳；配合 batcher 的 age 触发。
+/// Periodic flush heartbeat for the pump, paired with the batcher's age trigger.
 const TICK: Duration = Duration::from_secs(1);
 /// Bounded pool of concurrent gzip+upload worker tasks. Keeps CPU usage bounded
 /// on the shared 8-core container while allowing parallelism.
 const UPLOAD_CONCURRENCY: usize = 4;
+/// Bounds pending raw-batch memory (~32×8 MiB) and keeps the pump loop live
+/// during an S3 outage — a best-effort tee sheds, never stalls its own
+/// heartbeat.
+const MAX_PENDING_UPLOADS: usize = 32;
 
 enum PumpMsg {
     Record(Box<ExportRecord>),
@@ -345,6 +377,10 @@ pub struct S3ExportSink {
     tx: mpsc::Sender<PumpMsg>,
     metrics: Arc<MetricsRegistry>,
     join: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Semaphore bounding the number of concurrent captures in S3-only mode.
+    /// Mirrors `CacheSimTee::try_acquire_capture_permit` so S3-only deployments
+    /// have the same aggregate-capture memory bound as cache-sim deployments.
+    capture_sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for S3ExportSink {
@@ -354,9 +390,16 @@ impl std::fmt::Debug for S3ExportSink {
 }
 
 impl S3ExportSink {
-    /// 生产入口：解析 uri、从标准 AWS env 读凭证/region、构造 reqwest S3 uploader、
-    /// 起 pump。uri 无效或凭证缺失返回 None（sink 不启用）。
-    pub fn spawn(uri: &str, pod: String, metrics: Arc<MetricsRegistry>) -> Option<Arc<Self>> {
+    /// Production entry point: parse `uri`, read credentials/region from the
+    /// standard AWS environment variables, build an S3 uploader, and start the
+    /// pump. Returns `None` if the URI is invalid, credentials are missing, or
+    /// temporary (session-token) credentials are detected.
+    pub fn spawn(
+        uri: &str,
+        pod: String,
+        metrics: Arc<MetricsRegistry>,
+        max_captures: usize,
+    ) -> Option<Arc<Self>> {
         let (bucket, prefix) = parse_s3_uri(uri)?;
         // `.trim()`: a secretKeyRef-injected value can carry a trailing newline
         // (if the stored secret was created with a trailing `\n`); an untrimmed
@@ -382,6 +425,17 @@ impl S3ExportSink {
                 return None;
             }
         };
+        // Reject temporary credentials: our static-key SigV4 signer only signs
+        // host;x-amz-content-sha256;x-amz-date, so STS/SSO creds would produce
+        // a 403 SignatureDoesNotMatch on every PUT because the unsigned
+        // x-amz-security-token header is not in SignedHeaders.
+        if std::env::var("AWS_SESSION_TOKEN").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            tracing::error!(
+                "token export: AWS_SESSION_TOKEN is set (temporary credentials) but the signer \
+                 only supports static keys; disabling s3 export"
+            );
+            return None;
+        }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -393,11 +447,19 @@ impl S3ExportSink {
         let join = tokio::spawn(async move {
             run_pump(rx, Arc::new(uploader), prefix, pod, metrics2, DEFAULT_MAX_BATCH_BYTES).await;
         });
+        let capture_sem = Arc::new(tokio::sync::Semaphore::new(max_captures.max(1)));
         tracing::info!("s3 token export enabled");
-        Some(Arc::new(Self { tx, metrics, join: AsyncMutex::new(Some(join)) }))
+        Some(Arc::new(Self { tx, metrics, join: AsyncMutex::new(Some(join)), capture_sem }))
     }
 
-    /// 测试入口：注入 uploader（不触碰 AWS）。
+    /// Try to acquire one capture permit. Returns `None` when the pool is
+    /// exhausted. Mirrors `CacheSimTee::try_acquire_capture_permit` so the
+    /// same backpressure logic applies whether cache-sim is on or off.
+    pub fn try_acquire_capture_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.capture_sem).try_acquire_owned().ok()
+    }
+
+    /// Test entry point: inject an uploader (does not touch AWS).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn_with_uploader(
         uploader: Uploader,
@@ -408,7 +470,8 @@ impl S3ExportSink {
         Self::spawn_with_uploader_batch(uploader, prefix, pod, metrics, DEFAULT_MAX_BATCH_BYTES)
     }
 
-    /// 测试入口（可配置 batch size）：用于需要在小输入量下触发多 batch 的测试。
+    /// Test entry point (configurable batch size): for tests that need to
+    /// trigger multiple batches from a small number of records.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn_with_uploader_batch(
         uploader: Uploader,
@@ -423,7 +486,8 @@ impl S3ExportSink {
         let join = tokio::spawn(async move {
             run_pump(rx, uploader, prefix, pod, metrics2, max_batch_bytes).await;
         });
-        Arc::new(Self { tx, metrics, join: AsyncMutex::new(Some(join)) })
+        let capture_sem = Arc::new(tokio::sync::Semaphore::new(64));
+        Arc::new(Self { tx, metrics, join: AsyncMutex::new(Some(join)), capture_sem })
     }
 
     fn enqueue(&self, rec: ExportRecord) {
@@ -432,7 +496,11 @@ impl S3ExportSink {
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.metrics.record_s3_export("dropped_queue_full")
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Pump is gone (post-drain offers). Make these visible so a
+                // closed sink doesn't look like zero traffic.
+                self.metrics.record_s3_export("dropped_closed")
+            }
         }
     }
 
@@ -449,7 +517,7 @@ impl S3ExportSink {
         self.enqueue(ExportRecord {
             kind: ExportKind::Ingest,
             request_id: request_id.to_string(),
-            slug: slug.filter(|s| !s.is_empty()).unwrap_or("unknown").to_string(),
+            slug: safe_slug(slug),
             model: model.to_string(),
             input_ids: input_ids.to_vec(),
             prompt_len: None,
@@ -478,7 +546,7 @@ impl S3ExportSink {
         self.enqueue(ExportRecord {
             kind: ExportKind::Extend,
             request_id: request_id.to_string(),
-            slug: slug.filter(|s| !s.is_empty()).unwrap_or("unknown").to_string(),
+            slug: safe_slug(slug),
             model: model.to_string(),
             input_ids: input_ids.to_vec(),
             prompt_len,
@@ -489,7 +557,8 @@ impl S3ExportSink {
         });
     }
 
-    /// 发关闭信号，等 pump flush 全部剩余并结束。用于 SIGTERM 关闭序列。
+    /// Send the drain signal and wait for the pump to flush all remaining
+    /// records and exit. Used in the SIGTERM shutdown sequence.
     pub async fn drain(&self) {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         // `send` awaits capacity; the pump keeps draining records and freeing
@@ -526,12 +595,14 @@ struct UploadJobArgs {
     uploader: Arc<Uploader>,
     metrics: Arc<MetricsRegistry>,
     is_drain: bool,
-    /// Held for the job's lifetime to bound concurrency via the semaphore.
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    /// The semaphore to acquire a permit from at job start. The permit is held
+    /// for the job's lifetime to bound concurrency.
+    sem: Arc<tokio::sync::Semaphore>,
 }
 
-/// Single upload job: gzip in a blocking thread, compute key, put with retry, record metrics.
-/// The semaphore permit is moved in and held for the job's lifetime, providing backpressure.
+/// Single upload job: gzip in a blocking thread, compute key, put with retry,
+/// record metrics. Acquires a semaphore permit at start so the pump never
+/// blocks on permit acquisition.
 async fn upload_job(args: UploadJobArgs) {
     let UploadJobArgs {
         raw_bytes,
@@ -543,8 +614,14 @@ async fn upload_job(args: UploadJobArgs) {
         uploader,
         metrics,
         is_drain,
-        _permit,
+        sem,
     } = args;
+
+    // Acquire the permit inside the job so the pump loop is never blocked.
+    let _permit = match sem.acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return, // semaphore closed; should not happen in normal operation
+    };
 
     // Gzip on a blocking thread so we don't hold the async executor during CPU work.
     let gz = match tokio::task::spawn_blocking(move || gzip_fast(raw_bytes)).await {
@@ -571,7 +648,8 @@ async fn upload_job(args: UploadJobArgs) {
     // _permit is dropped here, releasing the semaphore slot.
 }
 
-/// 后台泵：消费记录 → 攒批 → 定时/超量 flush → 并发上传。永不 panic。
+/// Background pump: consume records, accumulate batches, flush on time/size,
+/// upload concurrently. Never panics.
 async fn run_pump(
     mut rx: mpsc::Receiver<PumpMsg>,
     uploader: Arc<Uploader>,
@@ -600,13 +678,13 @@ async fn run_pump(
                         dispatch_ready(
                             &mut batcher, &uploader, &prefix, &pod, &metrics,
                             &mut seq, false, &sem, &mut join_set,
-                        ).await;
+                        );
                     }
                     Some(PumpMsg::Drain(ack)) => {
                         dispatch_ready(
                             &mut batcher, &uploader, &prefix, &pod, &metrics,
                             &mut seq, true, &sem, &mut join_set,
-                        ).await;
+                        );
                         // Wait for all in-flight uploads before acking.
                         while join_set.join_next().await.is_some() {}
                         let _ = ack.send(());
@@ -617,7 +695,7 @@ async fn run_pump(
                         dispatch_ready(
                             &mut batcher, &uploader, &prefix, &pod, &metrics,
                             &mut seq, true, &sem, &mut join_set,
-                        ).await;
+                        );
                         while join_set.join_next().await.is_some() {}
                         return;
                     }
@@ -627,7 +705,7 @@ async fn run_pump(
                 dispatch_ready(
                     &mut batcher, &uploader, &prefix, &pod, &metrics,
                     &mut seq, false, &sem, &mut join_set,
-                ).await;
+                );
             }
         }
         // Opportunistically reap finished jobs so the JoinSet doesn't grow unbounded.
@@ -637,10 +715,14 @@ async fn run_pump(
 
 /// Dispatch all ready batches from the batcher as concurrent upload jobs.
 /// When `force` is true, flushes all remaining slugs.
-/// Acquiring the semaphore permit awaits when all UPLOAD_CONCURRENCY slots are busy,
-/// providing backpressure: the mpsc channel fills and offer() sheds under overload.
+///
+/// This function is synchronous (no `.await`): the pump never blocks on
+/// permit acquisition. Jobs self-acquire their semaphore permits, so a
+/// stalled S3 upload does not freeze the tick or the drain path. Pending
+/// job count is bounded by `MAX_PENDING_UPLOADS`; excess batches are dropped
+/// and metered as `dropped_upload_backlog`.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_ready(
+fn dispatch_ready(
     batcher: &mut SlugBatcher,
     uploader: &Arc<Uploader>,
     prefix: &str,
@@ -655,15 +737,10 @@ async fn dispatch_ready(
         let current_seq = *seq;
         *seq += 1;
 
-        // Await a permit — this is the backpressure point.
-        let permit = match Arc::clone(sem).acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                // Semaphore closed; should not happen in normal operation.
-                metrics.record_s3_export("put_failed");
-                continue;
-            }
-        };
+        if join_set.len() >= MAX_PENDING_UPLOADS {
+            metrics.record_s3_export("dropped_upload_backlog");
+            continue;
+        }
 
         join_set.spawn(upload_job(UploadJobArgs {
             raw_bytes: obj.raw_bytes,
@@ -675,7 +752,7 @@ async fn dispatch_ready(
             uploader: Arc::clone(uploader),
             metrics: Arc::clone(metrics),
             is_drain: force,
-            _permit: permit,
+            sem: Arc::clone(sem),
         }));
     }
 }
@@ -716,9 +793,9 @@ mod tests {
         let t0 = Instant::now();
         b.push("slugA", "a\n", t0);
         b.push("slugB", "b\n", t0);
-        // 未到 age、未超 size -> 不 ready
+        // Not yet over age or size -> not ready
         assert!(b.take_ready(t0, false).is_empty());
-        // 过了 age -> 两个 slug 各出一个对象
+        // Past the age threshold -> one object per slug
         let later = t0 + Duration::from_millis(150);
         let mut ready = b.take_ready(later, false);
         ready.sort_by(|x, y| x.slug.cmp(&y.slug));
@@ -828,7 +905,7 @@ mod tests {
         );
         let k2 = object_key("token-export", "slugA", "2026-08-10", "pod-1", 111, 1);
         assert_ne!(k1, k2, "seq must disambiguate same-nanos objects");
-        // 空 prefix 不产生前导斜杠
+        // Empty prefix must not produce a leading slash.
         let k3 = object_key("", "s", "2026-08-10", "pod-1", 1, 0);
         assert_eq!(k3, "slug=s/date=2026-08-10/pod-1-1-0.ndjson.gz");
     }
@@ -918,7 +995,7 @@ mod tests {
 
     #[test]
     fn sha256_hex_of_empty_is_known_vector() {
-        // 众所周知的 SHA-256("") 向量。
+        // Well-known SHA-256("") test vector.
         assert_eq!(
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -927,7 +1004,7 @@ mod tests {
 
     #[test]
     fn hmac_sha256_matches_rfc4231_case2() {
-        // RFC 4231 Test Case 2：key="Jefe", data="what do ya want for nothing?"
+        // RFC 4231 Test Case 2: key="Jefe", data="what do ya want for nothing?"
         let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
         assert_eq!(
             hex::encode(mac),
@@ -941,7 +1018,7 @@ mod tests {
         let k2 = signing_key("secret", "20260810", "us-west-2", "s3");
         assert_eq!(k1, k2);
         assert_eq!(k1.len(), 32);
-        // 不同 date -> 不同 key（证明派生链引用了各段）
+        // Different date -> different key (proves each segment contributes to the chain).
         assert_ne!(k1, signing_key("secret", "20260811", "us-west-2", "s3"));
     }
 
@@ -1019,7 +1096,7 @@ mod tests {
             "pod-1".into(),
             test_metrics(),
         );
-        sink.offer_ingest("m", &[7], "rid", None); // slug 缺失
+        sink.offer_ingest("m", &[7], "rid", None); // missing slug
         sink.drain().await;
         let puts = store.puts.lock().unwrap();
         assert_eq!(puts.len(), 1);
@@ -1060,5 +1137,19 @@ mod tests {
         // Total decompressed line count must equal N.
         let total_lines: usize = puts.iter().map(|(_, gz)| gunzip(gz).lines().count()).sum();
         assert_eq!(total_lines, N, "decompressed line count mismatch");
+    }
+
+    #[test]
+    fn safe_slug_allowlists() {
+        // Well-formed slugs pass through unchanged.
+        assert_eq!(safe_slug(Some("good-slug.1")), "good-slug.1");
+        // Path separators collapse to "unknown".
+        assert_eq!(safe_slug(Some("a/date=1")), "unknown");
+        // Empty string collapses.
+        assert_eq!(safe_slug(Some("")), "unknown");
+        // A 65-character slug exceeds the 64-byte cap and collapses.
+        assert_eq!(safe_slug(Some(&"a".repeat(65))), "unknown");
+        // None collapses.
+        assert_eq!(safe_slug(None), "unknown");
     }
 }

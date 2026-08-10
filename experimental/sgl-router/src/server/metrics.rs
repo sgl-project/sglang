@@ -542,7 +542,8 @@ pub struct MetricsRegistry {
     cache_sim_tee_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     /// Outcomes of the best-effort S3 token-export tee (see
     /// [`crate::server::s3_export`]), keyed by `result` — one of `enqueued`,
-    /// `dropped_queue_full`, `object_put`, `put_failed`, `drain_flushed`.
+    /// `dropped_queue_full`, `dropped_capture_capped`, `dropped_upload_backlog`,
+    /// `dropped_closed`, `object_put`, `put_failed`, `drain_flushed`.
     s3_export_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     /// Total records (NDJSON lines) successfully uploaded to S3 by the token
     /// export sink — records-out counterpart to `s3_export_total{result="enqueued"}`
@@ -1125,7 +1126,7 @@ impl MetricsRegistry {
     }
 
     /// Bump `sgl_router_s3_export_total{result}`. `result` is a fixed
-    /// `&'static str` (enqueued|dropped_queue_full|object_put|put_failed|drain_flushed), so label
+    /// `&'static str` (enqueued|dropped_queue_full|dropped_capture_capped|dropped_upload_backlog|dropped_closed|object_put|put_failed|drain_flushed), so label
     /// cardinality is bounded regardless of traffic.
     pub fn record_s3_export(&self, result: &'static str) {
         let mut guard = self.s3_export_total.lock();
@@ -1717,7 +1718,7 @@ impl MetricsRegistry {
 
         // s3_export_total
         out.push_str(
-            "# HELP sgl_router_s3_export_total Token-export S3 tee outcomes (result=enqueued|dropped_queue_full|object_put|put_failed|drain_flushed).\n",
+            "# HELP sgl_router_s3_export_total Token-export S3 tee outcomes (result=enqueued|dropped_queue_full|dropped_capture_capped|dropped_upload_backlog|dropped_closed|object_put|put_failed|drain_flushed).\n",
         );
         out.push_str("# TYPE sgl_router_s3_export_total counter\n");
         let guard = self.s3_export_total.lock();
