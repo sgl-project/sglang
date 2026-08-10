@@ -8,11 +8,15 @@ on:
         required: false
         default: ""
       image_tag:
-        description: "Base image tag to patch (e.g. dev-x86, dev-x86-cu13)"
+        description: "Base image tag to patch (e.g. dev, dev-cu13, dev-cu12)"
         required: true
+      output_tag:
+        description: "Tag to publish as. Empty = refresh image_tag in place. Set a custom name (e.g. dev-myfeature) to publish a separate image."
+        required: false
+        default: ""
 
 concurrency:
-  group: patch-docker-${{ inputs.image_tag }}
+  group: patch-docker-${{ inputs.output_tag || inputs.image_tag }}
   cancel-in-progress: true
 
 jobs:
@@ -20,6 +24,33 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: x64-docker-build-node
     steps:
+      - name: Resolve and validate image tags
+        env:
+          # Inject via env so a crafted tag cannot break out of the script.
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          OUTPUT_TAG: ${{ inputs.output_tag }}
+        run: |
+          OUT_TAG="${OUTPUT_TAG:-${IMAGE_TAG}}"
+
+          # Guard only an explicit output_tag. An empty one means "refresh
+          # image_tag in place", which is this workflow's original mode.
+          if [ -n "${OUTPUT_TAG}" ]; then
+            case "${OUT_TAG}" in
+              latest|latest-*|dev|dev-cu12|dev-cu13|nightly-*|v[0-9]*)
+                echo "::error::output_tag '${OUT_TAG}' is a published tag; pick a custom name such as dev-myfeature"
+                exit 1
+                ;;
+            esac
+          fi
+
+          if ! printf '%s' "${OUT_TAG}" | grep -qE '^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$'; then
+            echo "::error::'${OUT_TAG}' is not a valid Docker tag"
+            exit 1
+          fi
+
+          echo "BASE_IMAGE=lmsysorg/sglang:${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "OUT_IMAGE=lmsysorg/sglang:${OUT_TAG}" >> "$GITHUB_ENV"
+
       - name: Cleanup workspace (remove root-owned files from prior runs)
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
@@ -36,9 +67,8 @@ jobs:
 
       - name: Pull base image and extract commit
         run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
-          docker pull "${IMAGE}"
-          if BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
+          docker pull "${BASE_IMAGE}"
+          if BASE_SHA=$(docker run --rm "${BASE_IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
             echo "Image built from commit: ${BASE_SHA}"
           else
             BASE_SHA=""
@@ -82,8 +112,6 @@ jobs:
       - name: Build patched image
         if: env.SKIP_BUILD != 'true'
         run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
-
           cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
           ARG BASE_IMAGE
           FROM ${BASE_IMAGE}
@@ -103,16 +131,16 @@ jobs:
 
           docker build \
             --no-cache \
-            --build-arg BASE_IMAGE="${IMAGE}" \
-            -t "${IMAGE}" \
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            -t "${OUT_IMAGE}" \
             /tmp/patch-ctx/
 
       - name: Push patched image
         if: env.SKIP_BUILD != 'true'
         run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
-          docker push "${IMAGE}"
+          docker push "${OUT_IMAGE}"
 
-          echo "### Patched \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Patched \`${OUT_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Base image:** \`${BASE_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Source:** ${{ inputs.pr_numbers && format('PRs: {0}', inputs.pr_numbers) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"
