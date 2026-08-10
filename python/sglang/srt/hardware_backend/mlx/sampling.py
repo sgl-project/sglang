@@ -215,11 +215,27 @@ def sanitize_logits(logits: mx.array) -> mx.array:
     return mx.clip(mx.where(mx.isnan(logits), -1e30, logits), -1e30, 1e30)
 
 
+def scale_by_temperature(
+    last_logits: mx.array, params: list[MlxSamplingParams]
+) -> mx.array:
+    """``logits / temperature`` per row, in float32.
+
+    Both :func:`sample_tokens` and :func:`compute_logprobs` start here.  MLX
+    builds eager graphs and does not eliminate common subexpressions, so a
+    step that samples *and* reports logprobs would otherwise pay two
+    full-vocab divisions; callers needing both compute this once and pass it
+    to each.
+    """
+    temps = mx.array([p.temperature for p in params], dtype=mx.float32)[:, None]
+    return last_logits.astype(mx.float32) / temps
+
+
 def compute_logprobs(
     last_logits: mx.array,
     params: list[MlxSamplingParams],
     tokens: mx.array,
     spec: MlxLogprobSpec,
+    scaled: mx.array | None = None,
 ) -> MlxLazyLogprobs:
     """Lazy log-probabilities of this step's distribution.
 
@@ -227,9 +243,12 @@ def compute_logprobs(
     ``log_softmax(edited_logits / temperature)`` — after grammar-mask /
     logit_bias / sanitization, before top-k/top-p/min-p filtering (the
     filters affect which token is drawn, not the reported logprobs).
+
+    ``scaled`` optionally supplies :func:`scale_by_temperature`'s result when
+    the caller already built it for :func:`sample_tokens`.
     """
-    temps = mx.array([p.temperature for p in params], dtype=mx.float32)[:, None]
-    scaled = last_logits.astype(mx.float32) / temps
+    if scaled is None:
+        scaled = scale_by_temperature(last_logits, params)
     logp = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
 
     chosen = mx.take_along_axis(logp, tokens[:, None], axis=-1).squeeze(-1)
@@ -260,6 +279,7 @@ def sample_tokens(
     params: list[MlxSamplingParams],
     positions: list[int],
     key: mx.array,
+    scaled: mx.array | None = None,
 ) -> mx.array:
     """Select one token per row of ``last_logits`` ([B, vocab], lazy ok).
 
@@ -267,12 +287,14 @@ def sample_tokens(
     are the absolute sequence positions of the tokens being sampled (only
     consumed for seeded rows).  Callers should shortcut to ``mx.argmax``
     when ``all_greedy(params)`` — this function assumes at least one row
-    samples.
+    samples.  ``scaled`` optionally supplies
+    :func:`scale_by_temperature`'s result when the caller already built it
+    for :func:`compute_logprobs`.
     """
     batch_size, vocab_size = last_logits.shape
     logits32 = last_logits.astype(mx.float32)
-    temps = mx.array([p.temperature for p in params], dtype=mx.float32)[:, None]
-    scaled = logits32 / temps
+    if scaled is None:
+        scaled = scale_by_temperature(logits32, params)
 
     filtering = any(
         not p.is_greedy and (p.top_k < vocab_size or p.top_p < 1.0 or p.min_p > 0.0)

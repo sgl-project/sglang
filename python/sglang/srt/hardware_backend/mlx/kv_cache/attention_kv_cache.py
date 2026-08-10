@@ -209,6 +209,11 @@ class WindowedAttentionKVCache:
                 "WindowedAttentionKVCache holds only the trailing window and "
                 "cannot serve a full-context attention mask"
             )
+        # No N == 1 shortcut here, tempting as it looks: mlx_lm's banded mask is
+        # ``linds < rinds + window_size`` (strict), so a window of W admits
+        # exactly W keys.  Once ``kept == window`` this buffer returns W + 1 of
+        # them -- the trailing window plus the token just written -- and the
+        # oldest must still be masked out.
         return make_attention_mask(
             N, kept, return_array=return_array, window_size=window_size
         )

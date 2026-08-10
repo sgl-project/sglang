@@ -38,6 +38,7 @@ if _HAS_MLX:
     from sglang.srt.hardware_backend.mlx.kv_cache import (
         BatchedDecodeContext,
         ContiguousAttentionKVCache,
+        MlxAttentionKVPool,
         MLXAttentionWrapper,
         WindowedAttentionKVCache,
         find_attention_layers,
@@ -134,9 +135,27 @@ class TestSwaLayoutAndPoolContract(CustomTestCase):
             plain.full_kv_pool_index_by_layer, plain.attention_pool_index_by_layer
         )
 
-    def test_pool_covers_full_attention_layers_only(self):
+    def test_sliding_window_model_gets_no_pool(self):
+        # An SWA prefix hit recomputes the prefix instead of gathering it, so
+        # the shared pool would have no reader. Allocating it would burn the
+        # whole auto-sized KV budget on a write-only buffer.
         runner = _stub_runner(_tiny_gpt_oss_model(), disable_radix_cache=False)
-        self.assertEqual(runner._attention_kv_pool.num_layers, 2)
+        self.assertTrue(runner._cache_layout.has_sliding_window_layers)
+        self.assertIsNone(runner._attention_kv_pool)
+        # The layer-type split still resolves -- it is the seam the shared
+        # window-aware SWA pool will build on.
+        self.assertEqual(runner._cache_layout.full_kv_pool_index_by_layer, {1: 0, 3: 1})
+
+    def test_pool_covers_every_layer_without_sliding_windows(self):
+        model = _tiny_gpt_oss_model()
+        layers, attrs = find_attention_layers(model)
+        runner = _stub_runner(model, disable_radix_cache=True)
+        runner._cache_layout = MlxModelCacheLayout.from_attention_discovery(
+            layers, attrs
+        )
+        runner.disable_radix_cache = False
+        runner.init_cache_pools(None)
+        self.assertEqual(runner._attention_kv_pool.num_layers, 4)
         self.assertEqual(runner._attention_kv_pool.pool_size, 65)
 
     def test_all_sliding_window_model_gets_no_pool(self):
@@ -175,6 +194,18 @@ class TestSwaLayoutAndPoolContract(CustomTestCase):
 
     def test_sync_writes_full_layers_only(self):
         runner = _stub_runner(_tiny_gpt_oss_model(), disable_radix_cache=False)
+        # init_cache_pools skips the pool on an SWA model (see
+        # test_sliding_window_model_gets_no_pool), so attach one by hand: the
+        # layer-type filtering in _sync_new_kv_to_pool is what the shared
+        # window-aware SWA pool will rely on, and it must stay correct.
+        self.assertIsNone(runner._attention_kv_pool)
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=runner._pool_size + 1,
+            num_layers=runner._cache_layout.num_full_attention_layers,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=mx.float32,
+        )
         cache = runner._new_native_cache()
         per_layer_k = {}
         for layer_idx in range(4):

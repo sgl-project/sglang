@@ -246,8 +246,16 @@ class MlxTpModelWorker(TpModelWorker):
         has_grammar = bool(sinfo.grammars)
         if not has_grammar and sinfo.logit_bias is None:
             return None
-        combined = torch.zeros(len(batch.reqs), sinfo.vocab_size, dtype=torch.float32)
-        if has_grammar:
+        if not has_grammar:
+            # logit_bias alone is already the dense [B, vocab] additive row we
+            # want; converting it directly skips a second [B, vocab] float32
+            # allocation and an add on every step (~6 MB of churn per step at
+            # vocab 200k, batch 8).  Not mutated below, so no clone is needed.
+            combined = sinfo.logit_bias.to(device="cpu", dtype=torch.float32)
+        else:
+            combined = torch.zeros(
+                len(batch.reqs), sinfo.vocab_size, dtype=torch.float32
+            )
             sinfo.update_regex_vocab_mask()
             if sinfo.grammar_mask is not None:
                 grammar_mask = sinfo.grammar_mask
@@ -258,8 +266,8 @@ class MlxTpModelWorker(TpModelWorker):
                 # Release promptly; mirrors the VRAM-leak note in the CUDA
                 # ModelRunner._preprocess_logits.
                 sinfo.grammar_mask = None
-        if sinfo.logit_bias is not None:
-            combined += sinfo.logit_bias.to("cpu")
+            if sinfo.logit_bias is not None:
+                combined += sinfo.logit_bias.to("cpu")
         rows = mx.array(combined.numpy())
         return {req.rid: rows[i] for i, req in enumerate(batch.reqs)}
 

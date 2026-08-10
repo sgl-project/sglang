@@ -69,6 +69,7 @@ from sglang.srt.hardware_backend.mlx.sampling import (
     lazy_logprob_arrays,
     sample_tokens,
     sanitize_logits,
+    scale_by_temperature,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import (
@@ -697,11 +698,33 @@ class MlxModelRunner:
         if self.disable_radix_cache:
             return
         num_pool_layers = self._cache_layout.num_full_attention_layers
-        if num_pool_layers == 0:
+        if self._cache_layout.has_sliding_window_layers:
+            # The pool exists to serve radix prefix hits, and an SWA prefix hit
+            # recomputes the prefix instead of gathering it (see prefill_start),
+            # so on any SWA model the pool has no reader: its sole consumer is
+            # PoolBackedAttentionKVCache, reachable only when
+            # trusted_prefix_len > 0, which requires no SWA layers. Allocating
+            # it anyway would burn the whole auto-sized KV budget
+            # (_compute_pool_size fills mem_fraction_static) on a buffer that is
+            # only ever written. Skipping it also disables the fused AOT
+            # RoPE + pool-scatter kernel for the full layers, whose scatter half
+            # is dead work here; that kernel is opt-in
+            # (SGLANG_MLX_USE_CUSTOM_ROPE, default off), so the default path
+            # loses nothing.
+            #
+            # Un-gate this together with the window-aware shared SWA pool that
+            # restores fast prefix hits: the seams it needs (the layout
+            # partition, the full-pool index, layer-type dispatch) are already
+            # in place.
             logger.info(
-                "All attention layers use sliding windows; skipping the "
-                "shared attention KV pool (windowed per-request caches only)."
+                "Model has %d sliding-window attention layers; skipping the "
+                "shared attention KV pool (an SWA prefix hit recomputes the "
+                "prefix, so the pool would never be read). Per-request "
+                "windowed caches only.",
+                len(self._cache_layout.swa_attention_layer_indices),
             )
+            return
+        if num_pool_layers == 0:
             return
         n_kv_heads, head_dim, dtype = self._get_attn_config()
         # +1 for padding slot 0
@@ -893,9 +916,13 @@ class MlxModelRunner:
                 lazy_logprobs=lazy_logprobs,
             )
 
+        # A pool is required only where one can actually be read: a model with
+        # full-attention layers and no sliding-window layers.  init_cache_pools
+        # skips it otherwise, and the gather path below is unreachable then.
         assert (
             self._attention_kv_pool is not None
             or self._cache_layout.num_full_attention_layers == 0
+            or self._cache_layout.has_sliding_window_layers
         )
 
         new_token_count = len(new_token_ids)
@@ -1153,17 +1180,34 @@ class MlxModelRunner:
             return mx.argmax(last_logits, axis=-1), None
         params = [self._req_sampling[rid] for rid in req_ids]
         edited = self._edited_logits(last_logits, edit_rows)
-        if all_greedy(params):
+        greedy = all_greedy(params)
+        # Built once and shared: sampling and logprobs both start from
+        # logits/temperature, and MLX does not CSE the two identical graphs.
+        # Stays None when neither needs it (the greedy, no-logprob path).
+        scaled = (
+            scale_by_temperature(edited, params)
+            if not greedy or logprob_spec is not None
+            else None
+        )
+        if greedy:
             tokens = mx.argmax(edited, axis=-1)
         else:
             positions = [self._first_attention_cache(c).offset - 1 for c in caches]
             self._rng_key, key = mx.random.split(self._rng_key)
             tokens = sample_tokens(
-                last_logits=edited, params=params, positions=positions, key=key
+                last_logits=edited,
+                params=params,
+                positions=positions,
+                key=key,
+                scaled=scaled,
             )
         lazy_logprobs = (
             compute_logprobs(
-                last_logits=edited, params=params, tokens=tokens, spec=logprob_spec
+                last_logits=edited,
+                params=params,
+                tokens=tokens,
+                spec=logprob_spec,
+                scaled=scaled,
             )
             if logprob_spec is not None
             else None
@@ -1176,6 +1220,16 @@ class MlxModelRunner:
         """Apply the additive logit edits and env-gated NaN sanitization."""
         edited = last_logits
         if edit_rows is not None:
+            # The edit rows are sized from SamplingBatchInfo.vocab_size while
+            # these logits come from the model's lm_head.  A model whose head
+            # is padded past the tokenizer vocabulary would otherwise fail as
+            # an opaque broadcast error deep in the lazy graph.
+            if edit_rows.shape[-1] != last_logits.shape[-1]:
+                raise RuntimeError(
+                    "Logit edit rows do not match the model's vocabulary: "
+                    f"sampling_info.vocab_size={edit_rows.shape[-1]} vs "
+                    f"lm_head width {last_logits.shape[-1]}"
+                )
             edited = edited.astype(mx.float32) + edit_rows
         if self._sanitize_nan:
             edited = sanitize_logits(edited.astype(mx.float32))
