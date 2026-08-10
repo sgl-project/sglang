@@ -624,7 +624,7 @@ class DeepseekV4AttnBackend(
 
         num_draft_tokens = self.speculative_num_draft_tokens
         return CompressorPrefillPlan.generate_online_mtp(
-            prefix_lens=seq_lens,
+            prefix_lens=seq_lens.to(torch.int64),
             req_pool_indices=req_pool_indices,
             num_draft_tokens=num_draft_tokens,
             state_slot_offset=online_c128_state_slot_offset,
