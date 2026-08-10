@@ -47,8 +47,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
 
-_is_hip = is_hip()
-
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
