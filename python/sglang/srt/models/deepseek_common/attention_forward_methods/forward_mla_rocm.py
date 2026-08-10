@@ -53,6 +53,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla imp
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+    _is_block_scale_fp8,
     _is_gfx95_supported,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
@@ -224,7 +225,7 @@ def rocm_absorb_v_bmm(
         # _bmm_buf is already (batch, heads, dim) contiguous
         if attn.o_proj.weight.dtype == torch.uint8:
             attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
-        elif attn.o_proj.weight.dtype == torch.float8_e4m3fn:
+        elif _is_block_scale_fp8(attn.o_proj):
             attn_bmm_output = fused_flatten_fp8_group_quant(
                 _bmm_buf,
                 group_size=128,
@@ -240,7 +241,7 @@ def rocm_absorb_v_bmm(
     elif attn.o_proj.weight.dtype == torch.uint8:
         attn_bmm_output = attn_bmm_output.transpose(0, 1)
         attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-    elif attn.o_proj.weight.dtype == torch.float8_e4m3fn:
+    elif _is_block_scale_fp8(attn.o_proj):
         attn_bmm_output = attn_bmm_output.transpose(0, 1)
         attn_bmm_output = fused_flatten_fp8_group_quant(
             attn_bmm_output,
@@ -335,7 +336,7 @@ class DeepseekMLARocmForwardMixin:
                     self.kv_a_layernorm.weight,
                     self.kv_a_layernorm.variance_epsilon,
                 )
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
+            elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
                 if self.use_dsa:
                     q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
                         q,

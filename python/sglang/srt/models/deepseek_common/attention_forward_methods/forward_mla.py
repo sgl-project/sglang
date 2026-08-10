@@ -55,7 +55,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
-    _is_block_scale_fp8,
     _is_cpu,
     _is_cublas_ge_129,
     _is_cuda,
@@ -335,66 +334,8 @@ class DeepseekMLAForwardMixin:
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
             else:
-                if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, _, k_nope, *_ = fused_rms_mxfp4_quant(
-                        q,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.variance_epsilon,
-                        k_nope,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.variance_epsilon,
-                    )
-                else:
-                    q_lora = None
-                    if _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
-                        if self.use_dsa:
-                            q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
-                                q,
-                                self.q_a_layernorm.weight,
-                                self.q_a_layernorm.variance_epsilon,
-                                k_nope,
-                                self.kv_a_layernorm.weight,
-                                self.kv_a_layernorm.variance_epsilon,
-                                group_size=128,
-                                dtype_quant=torch.float8_e4m3fn,
-                                res1=None,
-                                output_unquantized_inp1=True,
-                                transpose_scale=False,
-                            )
-                            if _use_aiter_bpreshuffle_gfx95:
-                                q_quanted = materialize_bpreshuffle_fp8_scale_tuple(
-                                    q_quanted
-                                )
-                            q = q_quanted
-                        else:
-                            q, _, k_nope, _ = fused_rms_fp8_group_quant(
-                                q,
-                                self.q_a_layernorm.weight,
-                                self.q_a_layernorm.variance_epsilon,
-                                k_nope,
-                                self.kv_a_layernorm.weight,
-                                self.kv_a_layernorm.variance_epsilon,
-                                group_size=128,
-                                dtype_quant=torch.float8_e4m3fn,
-                                res1=None,
-                                output_unquantized_inp1=False,
-                                transpose_scale=False,
-                            )
-                            if _use_aiter_bpreshuffle_gfx95:
-                                q = materialize_bpreshuffle_fp8_scale_tuple(q)
-
-                    elif _use_aiter:
-                        q, k_nope = fused_qk_rmsnorm_bf16(
-                            q,
-                            self.q_a_layernorm.weight,
-                            self.q_a_layernorm.variance_epsilon,
-                            k_nope,
-                            self.kv_a_layernorm.weight,
-                            self.kv_a_layernorm.variance_epsilon,
-                        )
-                    else:
-                        q = self.q_a_layernorm(q)
-                        k_nope = self.kv_a_layernorm(k_nope)
+                q = self.q_a_layernorm(q)
+                k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_dsa:
@@ -881,83 +822,6 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
-        elif _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
-            if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
-                x = attn_output.transpose(0, 1)
-                B_heads, M_batch = x.shape[0], x.shape[1]
-                N_vdim = self.w_vc.shape[2]
-                # Allocate in (batch, heads, dim) so the post-GEMM
-                # transpose+flatten is a free view instead of a copy.
-                _bmm_buf = torch.empty(
-                    M_batch,
-                    B_heads,
-                    N_vdim,
-                    device=x.device,
-                    dtype=torch.bfloat16,
-                )
-                attn_bmm_output = _bmm_buf.transpose(0, 1)
-                batched_gemm_afp4wfp4_pre_quant(
-                    x,
-                    self.w_vc.transpose(-2, -1),
-                    self.w_scale_v.transpose(-2, -1),
-                    torch.bfloat16,
-                    attn_bmm_output,
-                )
-            else:
-                _bmm_buf = None
-                if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
-                    attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                        X=attn_output,
-                        WQ=self.w_vc.transpose(-1, -2),
-                        w_scale=self.w_scale,
-                        group_size=128,
-                        YQ=None,
-                        transpose_bm=False,
-                        transpose_bm_in=True,
-                        dtype=torch.bfloat16,
-                    )
-                else:
-                    attn_bmm_output = torch.bmm(
-                        attn_output.to(torch.bfloat16).transpose(0, 1),
-                        self.w_vc.to(torch.bfloat16) * self.w_scale,
-                    )
-
-            if _bmm_buf is not None:
-                # _bmm_buf is already (batch, heads, dim) contiguous
-                if self.o_proj.weight.dtype == torch.uint8:
-                    attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
-                elif _is_block_scale_fp8(self.o_proj):
-                    attn_bmm_output = fused_flatten_fp8_group_quant(
-                        _bmm_buf,
-                        group_size=128,
-                        dtype_quant=torch.float8_e4m3fn,
-                        transpose_scale=False,
-                    )
-                    if _use_aiter_bpreshuffle_gfx95:
-                        attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
-                            attn_bmm_output
-                        )
-                else:
-                    attn_bmm_output = _bmm_buf.flatten(1, 2)
-            elif self.o_proj.weight.dtype == torch.uint8:
-                attn_bmm_output = attn_bmm_output.transpose(0, 1)
-                attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif _is_block_scale_fp8(self.o_proj):
-                attn_bmm_output = attn_bmm_output.transpose(0, 1)
-                attn_bmm_output = fused_flatten_fp8_group_quant(
-                    attn_bmm_output,
-                    group_size=128,
-                    dtype_quant=torch.float8_e4m3fn,
-                    transpose_scale=False,
-                )
-                if _use_aiter_bpreshuffle_gfx95:
-                    attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
-                        attn_bmm_output
-                    )
-            else:
-                attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(
