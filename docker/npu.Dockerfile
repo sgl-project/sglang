@@ -19,6 +19,7 @@ ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=main
+ARG SGLANG_ATTENTIONS_NPU_TAG=2026.7.27
 
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ARG DEVICE_TYPE
@@ -115,8 +116,10 @@ RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
     && mkdir sgl-kernel-npu \
     && cd sgl-kernel-npu \
     && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
+    && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_ATTENTIONS_NPU_TAG}/sgl-kernel-npu-${SGLANG_ATTENTIONS_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
     && unzip sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
-    && ${PIP_INSTALL} deep_ep*.whl sgl_kernel_npu*.whl attentions*.whl \
+    && unzip sgl-kernel-npu-${SGLANG_ATTENTIONS_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip 'attentions*.whl' \
+    && ${PIP_INSTALL} deep_ep*.whl sgl_kernel_npu*.whl ./attentions*.whl \
     && cd .. && rm -rf sgl-kernel-npu \
     && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
 
