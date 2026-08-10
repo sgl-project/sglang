@@ -14,9 +14,10 @@
 """Profile-trace step-span naming (kept dependency-light for CPU unit tests).
 
 The step span wraps each ``ModelRunner.forward`` in the torch/Perfetto trace.
-Its name carries the forward mode and batch shape; when roofline annotations
-are enabled it also folds in the per-iteration roofline aggregates so a single
-label describes both timing and the analytical work of that forward.
+Its name carries the forward mode and batch shape; when detailed annotations
+are enabled it also folds in the per-iteration aggregates (for roofline-style
+analysis) so a single label describes both timing and the analytical work of
+that forward.
 """
 
 from __future__ import annotations
@@ -55,10 +56,10 @@ def _decode_query_width(forward_batch: ForwardBatch) -> int:
     return width if isinstance(width, int) and width > 0 else 1
 
 
-def build_roofline_suffix(forward_batch: ForwardBatch) -> str:
-    """Compute the roofline aggregates from the batch's CPU-side length mirrors.
+def build_detailed_annotation_suffix(forward_batch: ForwardBatch) -> str:
+    """Compute the detailed-annotation aggregates from the batch's CPU-side length mirrors.
 
-    All roofline aggregates are emitted, always prefixed by phase: ``c_`` for
+    All aggregates are emitted, always prefixed by phase: ``c_`` for
     context (EXTEND) and ``g_`` for generation (DECODE, TARGET_VERIFY), with
     MIXED emitting both groups. The per-phase ``sq`` (Σ N_Q) is always emitted
     so the suffix is self-contained, even where it duplicates the base label's
@@ -126,13 +127,13 @@ def build_roofline_suffix(forward_batch: ForwardBatch) -> str:
 
 
 def build_step_span_name(
-    forward_batch: ForwardBatch, roofline_annotations: bool = False
+    forward_batch: ForwardBatch, detailed_annotations: bool = False
 ) -> str:
     """Build the profile-trace span name for one forward step.
 
-    When ``roofline_annotations`` is set (only while a roofline-annotated
-    profile is active), the roofline aggregates are folded into the label via
-    :func:`build_roofline_suffix`.
+    When ``detailed_annotations`` is set (only while a detailed-annotation
+    profile is active), the aggregates are folded into the label via
+    :func:`build_detailed_annotation_suffix`.
     """
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
@@ -142,8 +143,8 @@ def build_step_span_name(
     else:
         base = f"step[{mode.name} bs={bs}"
 
-    if roofline_annotations:
-        suffix = build_roofline_suffix(forward_batch)
+    if detailed_annotations:
+        suffix = build_detailed_annotation_suffix(forward_batch)
         if suffix:
             base = f"{base} {suffix}"
     return f"{base}]"

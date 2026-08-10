@@ -1,11 +1,11 @@
-"""Unit tests for roofline profiling annotations (#24911) — no server, no model loading.
+"""Unit tests for detailed profiling annotations (#24911) — no server, no model loading.
 
-The roofline aggregates are folded into SGLang's existing per-forward ``step[...]``
+The detailed-annotation aggregates are folded into SGLang's existing per-forward ``step[...]``
 span (see ``sglang.srt.model_executor.step_span_utils.build_step_span_name``): the
 per-phase ``sq``/``sqsq``/``sqsk``/``sk`` terms (with the context/generation split
 for MIXED) are appended and are self-contained, so ``sq`` is emitted even where it
 duplicates the base label's ``bs``/``toks``. This also covers the
-``roofline_annotations`` plumbing on ``ProfileReq``.
+``detailed_annotations`` plumbing on ``ProfileReq``.
 """
 
 import json
@@ -45,7 +45,7 @@ def _fb(
     num_tokens_per_req=None,
 ):
     # A spec input (EAGLE/MTP) only needs to expose ``num_tokens_per_req`` for
-    # the roofline suffix; None -> no spec_info (vanilla decode, N_Q == 1).
+    # the detailed-annotation suffix; None -> no spec_info (vanilla decode, N_Q == 1).
     spec_info = (
         None
         if num_tokens_per_req is None
@@ -62,9 +62,9 @@ def _fb(
     )
 
 
-class TestStepSpanRoofline(CustomTestCase):
+class TestStepSpanDetailedAnnotations(CustomTestCase):
     def _name(self, fb):
-        return build_step_span_name(fb, roofline_annotations=True)
+        return build_step_span_name(fb, detailed_annotations=True)
 
     def test_pure_decode_batch(self):
         # Two decode reqs: each nq=1, nkv=seqlen.
@@ -170,7 +170,7 @@ class TestStepSpanGating(CustomTestCase):
     def test_disabled_flag_emits_base_label(self):
         fb = _fb(ForwardMode.DECODE, batch_size=2, seq_lens_cpu=[10, 20])
         self.assertEqual(
-            build_step_span_name(fb, roofline_annotations=False), "step[DECODE bs=2]"
+            build_step_span_name(fb, detailed_annotations=False), "step[DECODE bs=2]"
         )
 
     def test_disabled_flag_is_default(self):
@@ -184,16 +184,16 @@ class TestStepSpanGating(CustomTestCase):
         self.assertEqual(build_step_span_name(fb), "step[EXTEND bs=1 toks=4]")
 
 
-class TestRooflineAnnotationPlumbing(CustomTestCase):
+class TestDetailedAnnotationPlumbing(CustomTestCase):
     def test_default_is_false(self):
-        self.assertFalse(ProfileReq().roofline_annotations)
+        self.assertFalse(ProfileReq().detailed_annotations)
 
     def test_json_round_trip(self):
-        req = ProfileReq(output_dir="/tmp/x", roofline_annotations=True)
-        payload = {"roofline_annotations": req.roofline_annotations}
+        req = ProfileReq(output_dir="/tmp/x", detailed_annotations=True)
+        payload = {"detailed_annotations": req.detailed_annotations}
         parsed = json.loads(json.dumps(payload))
-        self.assertTrue(parsed["roofline_annotations"])
-        self.assertTrue(ProfileReq(**parsed).roofline_annotations)
+        self.assertTrue(parsed["detailed_annotations"])
+        self.assertTrue(ProfileReq(**parsed).detailed_annotations)
 
 
 if __name__ == "__main__":

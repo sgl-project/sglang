@@ -52,10 +52,10 @@ class SchedulerProfilerManager:
     ps: Any
     dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
-    # Toggles model_runner.roofline_annotations so the step span folds in the
+    # Toggles model_runner.detailed_annotations so the step span folds in the
     # per-phase sq/sqsq/sqsk/sk aggregates (context ``c_`` / generation ``g_``)
-    # while a roofline-annotated profile is active.
-    set_roofline_annotations: Optional[Callable[[bool], None]] = None
+    # while a detailed-annotation profile is active.
+    set_detailed_annotations: Optional[Callable[[bool], None]] = None
 
     def __post_init__(self) -> None:
         if envs.SGLANG_PROFILE_V2.get():
@@ -81,7 +81,7 @@ class SchedulerProfilerManager:
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
         self.merge_profiles = False
-        self.roofline_annotations: bool = False
+        self.detailed_annotations: bool = False
 
         # For ROCM
         self.rpd_profiler = None
@@ -98,11 +98,11 @@ class SchedulerProfilerManager:
         profile_id: str,
         merge_profiles: bool = False,
         profile_prefix: str = "",
-        roofline_annotations: bool = False,
+        detailed_annotations: bool = False,
         profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
         if envs.SGLANG_PROFILE_V2.get():
-            self.roofline_annotations = roofline_annotations
+            self.detailed_annotations = detailed_annotations
             return self._profile_manager.configure(
                 output_dir=output_dir,
                 start_step=start_step,
@@ -115,7 +115,7 @@ class SchedulerProfilerManager:
                 merge_profiles=merge_profiles,
                 profile_prefix=profile_prefix,
                 profile_stages=profile_stages,
-                roofline_annotations=roofline_annotations,
+                detailed_annotations=detailed_annotations,
             )
 
         if self.profile_in_progress:
@@ -138,7 +138,7 @@ class SchedulerProfilerManager:
         self.profiler_activities = activities
         self.profile_id = profile_id
         self.profile_prefix = profile_prefix
-        self.roofline_annotations = roofline_annotations
+        self.detailed_annotations = detailed_annotations
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
@@ -161,15 +161,15 @@ class SchedulerProfilerManager:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
-    def _apply_roofline_annotations(self, enabled: bool) -> None:
-        if self.set_roofline_annotations is not None:
-            self.set_roofline_annotations(enabled)
+    def _apply_detailed_annotations(self, enabled: bool) -> None:
+        if self.set_detailed_annotations is not None:
+            self.set_detailed_annotations(enabled)
 
     def _start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
-            self._apply_roofline_annotations(self.roofline_annotations)
+            self._apply_detailed_annotations(self.detailed_annotations)
             return self._profile_manager.manual_start()
 
         stage_str = f" for {stage.name}" if stage else ""
@@ -275,7 +275,7 @@ class SchedulerProfilerManager:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
-        self._apply_roofline_annotations(self.roofline_annotations)
+        self._apply_detailed_annotations(self.detailed_annotations)
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _merge_profile_traces(self) -> str:
@@ -314,7 +314,7 @@ class SchedulerProfilerManager:
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
-            self._apply_roofline_annotations(False)
+            self._apply_detailed_annotations(False)
             return self._profile_manager.manual_stop()
 
         if not self.profile_in_progress:
@@ -398,7 +398,7 @@ class SchedulerProfilerManager:
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
-        self._apply_roofline_annotations(False)
+        self._apply_detailed_annotations(False)
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
@@ -455,7 +455,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
-                    recv_req.roofline_annotations,
+                    recv_req.detailed_annotations,
                     recv_req.profile_stages,
                 )
             else:
@@ -470,7 +470,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
-                    recv_req.roofline_annotations,
+                    recv_req.detailed_annotations,
                 )
                 return self._start_profile()
         else:

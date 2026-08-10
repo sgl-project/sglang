@@ -198,7 +198,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 - `start_step` (optional): Step number at which to start profiling (inclusive). Useful for skipping warmup iterations
 - `activities` (optional): List of activities to profile, e.g., `["CPU", "GPU"]`. Default is `["CPU", "GPU"]`
 - `merge_profiles` (optional): Whether to merge distributed traces. Default is `false`
-- `roofline_annotations` (optional): Whether to fold per-iteration request and KV-length aggregates into the trace's `step[...]` markers, for roofline-style analysis. Default is `false`. See [Roofline annotations](#roofline-annotations) below.
+- `detailed_annotations` (optional): Whether to fold per-iteration request and KV-length aggregates into the trace's `step[...]` markers, for detailed analysis. Default is `false`. See [Detailed annotations](#detailed-annotations) below.
 
 **Note on step ranges:** Profiling starts at `start_step` (inclusive) and continues for `num_steps` iterations. For example, with `start_step=3` and `num_steps=10`, profiling captures steps 3, 4, 5, 6, 7, 8, 9, 10, 11, and 12 (10 steps total, starting from step 3).
 
@@ -223,9 +223,9 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 curl -X POST http://127.0.0.1:30000/start_profile
 ```
 
-#### Roofline annotations
+#### Detailed annotations
 
-Set `roofline_annotations` to `true` to fold per-iteration roofline aggregates into SGLang's existing per-forward `step[...]` span. For every execution step that runs while profiling is active, SGLang augments that step's marker on the GPU stream with the request and KV-length distribution of the step, so you can reconstruct roofline-style compute and memory bounds directly from the trace without per-request details.
+Set `detailed_annotations` to `true` to fold per-iteration aggregates into SGLang's existing per-forward `step[...]` span. For every execution step that runs while profiling is active, SGLang augments that step's marker on the GPU stream with the request and KV-length distribution of the step, so you can reconstruct compute and memory bounds directly from the trace without per-request details.
 
 All four per-request aggregates are appended, prefixed by phase — `c_` for context (prefill) and `g_` for generation (decode). The per-phase `sq` is always emitted so each `step[...]` label is self-contained for roofline analysis, even where it duplicates the base label's `bs` (decode) or `toks` (prefill):
 
@@ -249,18 +249,18 @@ step[TARGET_VERIFY bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30]
 ```
 
 ```bash Command
-# Profile 10 steps with roofline annotations enabled
+# Profile 10 steps with detailed annotations enabled
 curl -X POST http://127.0.0.1:30000/start_profile \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "/tmp/profiles",
     "num_steps": 10,
     "activities": ["CPU", "GPU"],
-    "roofline_annotations": true
+    "detailed_annotations": true
   }'
 ```
 
-The annotations only appear when profiling is active with `roofline_annotations` enabled, so they add no overhead on the normal serving path. The behavior is identical in eager and CUDA graph modes. When viewing the trace (see [View traces](#view-traces)), the augmented `step[...]` markers appear on the GPU stream alongside the kernels for each step.
+The annotations only appear when profiling is active with `detailed_annotations` enabled, so they add no overhead on the normal serving path. The behavior is identical in eager and CUDA graph modes. When viewing the trace (see [View traces](#view-traces)), the augmented `step[...]` markers appear on the GPU stream alongside the kernels for each step.
 
 #### Using `/stop_profile` endpoint
 
