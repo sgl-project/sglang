@@ -13,21 +13,35 @@ from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
     fused_recurrent_linear_replayssm_decode,
 )
 from sglang.kernels.ops.attention.fla.kda import chunk_kda as triton_chunk_kda
-from sglang.kernels.ops.attention.helion.kda_decode import (
-    helion_fused_recurrent_kda_packed_decode,
-)
-from sglang.kernels.ops.attention.helion.kda_prefill import (
-    _intra_matrices_wide,
-)
-from sglang.kernels.ops.attention.helion.kda_prefill import (
-    chunk_kda as helion_chunk_kda,
-)
-from sglang.kernels.ops.attention.helion.kda_replayssm import (
-    helion_fused_recurrent_kda_replayssm_decode,
-)
 from sglang.test.ci.ci_register import register_cuda_ci
 
+try:
+    import helion  # noqa: F401
+except ModuleNotFoundError as error:
+    if error.name != "helion":
+        raise
+    HELION_AVAILABLE = False
+else:
+    HELION_AVAILABLE = True
+    from sglang.kernels.ops.attention.helion.kda_decode import (
+        helion_fused_recurrent_kda_packed_decode,
+    )
+    from sglang.kernels.ops.attention.helion.kda_prefill import (
+        _intra_matrices_wide,
+    )
+    from sglang.kernels.ops.attention.helion.kda_prefill import (
+        chunk_kda as helion_chunk_kda,
+    )
+    from sglang.kernels.ops.attention.helion.kda_replayssm import (
+        helion_fused_recurrent_kda_replayssm_decode,
+    )
+
 register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+pytestmark = pytest.mark.skipif(
+    not HELION_AVAILABLE,
+    reason="helion is not installed",
+)
 
 _DECODE_STATE_ATOL = {
     torch.float32: 1e-5,
@@ -244,20 +258,23 @@ def test_packed_decode_lower_bound_contract(state_dtype: torch.dtype) -> None:
     assert torch.count_nonzero(helion_out[1]).item() == 0
 
 
+# `v_heads` selects the tuned config: <= KDA_SMALL_VALUE_HEAD_THRESHOLD picks the
+# small-head bf16 schedule, above it the wide bf16 one. Cover both.
 @pytest.mark.parametrize(
-    ("state_dtype", "lower_bound"),
+    ("state_dtype", "lower_bound", "v_heads"),
     [
-        (torch.float32, None),
-        (torch.bfloat16, None),
-        (torch.bfloat16, -5.0),
+        (torch.float32, None, 4),
+        (torch.bfloat16, None, 4),
+        (torch.bfloat16, -5.0, 4),
+        (torch.bfloat16, None, 16),
     ],
-    ids=["fp32", "bf16", "bf16-lower-bound"],
+    ids=["fp32", "bf16-small-head", "bf16-small-head-lower-bound", "bf16"],
 )
 def test_replayssm_decode_contract(
-    state_dtype: torch.dtype, lower_bound: float | None
+    state_dtype: torch.dtype, lower_bound: float | None, v_heads: int
 ) -> None:
     """Match Triton ring writes, forced flushes, and natural flushes."""
-    batch, q_heads, v_heads, key_dim, value_dim = 3, 2, 4, 128, 128
+    batch, q_heads, key_dim, value_dim = 3, 2, 128, 128
     cache_length, pool_size = 4, 5
     scale = key_dim**-0.5
     torch.manual_seed(721)

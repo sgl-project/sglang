@@ -32,6 +32,16 @@ class HelionKDAKernel(LinearAttnKernelBase):
         self._packed_decode = None
         self._replayssm_decode = None
         self._chunk_kda = None
+        if enable_decode or enable_prefill:
+            try:
+                import helion  # noqa: F401
+            except ModuleNotFoundError as error:
+                if error.name != "helion":
+                    raise
+                raise ImportError(
+                    "The Helion package is required when a KDA backend is set to "
+                    "Helion. Install it with: pip install 'sglang[helion]'"
+                ) from None
         if enable_decode:
             from sglang.kernels.ops.attention.helion.kda_decode import (
                 helion_fused_recurrent_kda_packed_decode,

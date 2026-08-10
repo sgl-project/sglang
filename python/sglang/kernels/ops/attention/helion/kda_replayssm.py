@@ -1,4 +1,12 @@
-"""Helion ReplaySSM decode for Kimi Delta Attention."""
+"""Helion ReplaySSM decode for Kimi Delta Attention.
+
+The public :func:`helion_fused_recurrent_kda_replayssm_decode` mirrors
+``fused_recurrent_linear_replayssm_decode(..., is_kda=True)`` from
+``sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm``.  That
+Triton kernel is gate-generic (GDN scalar gate / KDA per-K gate); this module
+implements the KDA path only, and additionally supports the bounded gate,
+which the Triton ReplaySSM kernel does not expose.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +24,7 @@ _IGNORED_WARNINGS = [helion.exc.ProcessGroupNameNotFound]
 _LOG2_E = 1.4426950408889634
 
 # Indexing and eviction-policy lists are positional in the traced load order.
-# Retune both configs if the ReplaySSM body gains, loses, or reorders loads.
+# Retune them if the ReplaySSM body gains, loses, or reorders loads.
 _KDA_REPLAYSSM_FP32_CONFIG = helion.Config(
     atomic_indexing=[],
     block_sizes=[32, 128],
@@ -688,7 +696,14 @@ def helion_fused_recurrent_kda_replayssm_decode(
     use_qk_l2norm_in_kernel: bool = False,
     lower_bound: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run one buffered KDA decode step using caller-owned ReplaySSM state."""
+    """Run one buffered KDA decode step using caller-owned ReplaySSM state.
+
+    Allocates nothing persistent: the caller owns ``d_cache`` / ``k_cache`` /
+    ``g_cache`` and is responsible for advancing ``write_pos`` modulo the ring
+    length after a non-flush step and resetting it to zero after a natural or
+    forced flush. ``initial_state`` is both the checkpoint read (h0) and the
+    flush-only checkpoint write (ht), in place.
+    """
     batch = mixed_qkv.size(0)
     if a.ndim not in (2, 3) or not a.is_contiguous():
         raise ValueError("KDA `a` must be a contiguous 2D or 3D tensor.")
