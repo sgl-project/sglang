@@ -11,6 +11,26 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestGDNMISMetadata(CustomTestCase):
+    def test_allows_trailing_attention_padding(self):
+        forward_batch = SimpleNamespace(
+            input_ids=torch.empty(8, dtype=torch.int64),
+            extend_seq_lens_cpu=[5],
+            extend_prefix_lens_cpu=[0],
+            multi_item_delimiter_indices=[
+                torch.tensor([1, 4], dtype=torch.int64)
+            ],
+            is_prefill_only=True,
+        )
+
+        metadata = build_gdn_mis_metadata(forward_batch)
+
+        torch.testing.assert_close(
+            torch.cat(
+                [metadata.query_token_indices, metadata.item_token_indices]
+            ).sort().values,
+            torch.arange(5, dtype=torch.int64),
+        )
+
     def test_mixed_batch_with_empty_query(self):
         forward_batch = SimpleNamespace(
             input_ids=torch.empty(16, dtype=torch.int64),
@@ -51,6 +71,20 @@ class TestGDNMISMetadata(CustomTestCase):
             metadata.item_request_indices,
             torch.tensor([0, 0, 0, 1, 1], dtype=torch.int64),
         )
+
+    def test_rejects_sequence_lengths_beyond_input(self):
+        forward_batch = SimpleNamespace(
+            input_ids=torch.empty(4, dtype=torch.int64),
+            extend_seq_lens_cpu=[5],
+            extend_prefix_lens_cpu=[0],
+            multi_item_delimiter_indices=[
+                torch.tensor([1, 4], dtype=torch.int64)
+            ],
+            is_prefill_only=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "exceed the input tokens"):
+            build_gdn_mis_metadata(forward_batch)
 
     def test_rejects_missing_final_delimiter(self):
         forward_batch = SimpleNamespace(

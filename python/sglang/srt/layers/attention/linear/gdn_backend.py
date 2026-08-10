@@ -67,8 +67,8 @@ def build_gdn_mis_metadata(forward_batch: ForwardBatch) -> GDNMISMetadata:
     delimiter_indices = forward_batch.multi_item_delimiter_indices
     if delimiter_indices is None or len(delimiter_indices) != len(seq_lens):
         raise ValueError("GDN MIS requires delimiter indices for every request")
-    if sum(seq_lens) != forward_batch.input_ids.numel():
-        raise ValueError("GDN MIS sequence lengths do not cover the input tokens")
+    if sum(seq_lens) > forward_batch.input_ids.numel():
+        raise ValueError("GDN MIS sequence lengths exceed the input tokens")
 
     query_token_indices: list[int] = []
     query_seq_lens_cpu: list[int] = []
@@ -854,7 +854,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         conv_states[cache_indices] = 0
         ssm_states[cache_indices] = 0
-        output = mixed_qkv.new_empty(
+        output = mixed_qkv.new_zeros(
             1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
         )
 
