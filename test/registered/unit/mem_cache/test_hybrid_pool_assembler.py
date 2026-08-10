@@ -1,11 +1,13 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _get_mamba_hicache_ratio,
     _split_hicache_size,
     build_full_draft_pools,
 )
@@ -32,6 +34,14 @@ class TestSplitHicacheSize(CustomTestCase):
         )
         self.assertEqual(shares, (75.0, 25.0))  # proportional to device KV bytes
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
+
+    def test_mamba_ratio_defaults_to_shared_hicache_ratio(self):
+        server_args = SimpleNamespace(hicache_ratio=3.0, hicache_mamba_ratio=None)
+        self.assertEqual(_get_mamba_hicache_ratio(server_args), 3.0)
+
+    def test_mamba_ratio_can_be_overridden_independently(self):
+        server_args = SimpleNamespace(hicache_ratio=3.0, hicache_mamba_ratio=1.0)
+        self.assertEqual(_get_mamba_hicache_ratio(server_args), 1.0)
 
     def test_splits_total_budget_by_device_bytes_three_pools(self):
         # scalar and (k, v) tuple return shapes both supported

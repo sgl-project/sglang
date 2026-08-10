@@ -1281,6 +1281,32 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.hicache_mem_layout, "page_first")
         self.assertIsNone(args.decode_attention_backend)
 
+    def test_hicache_mamba_ratio_must_be_positive(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_mamba_ratio=0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--hicache-mamba-ratio"):
+            args._handle_hicache()
+
+    def test_fixed_hicache_size_warns_that_it_overrides_mamba_ratio(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_mamba_ratio=1.0,
+            hicache_size=64,
+        )
+
+        with self.assertLogs(level="WARNING") as logs:
+            args._handle_hicache()
+
+        self.assertTrue(
+            any(
+                "--hicache-size overrides --hicache-mamba-ratio" in line
+                for line in logs.output
+            )
+        )
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):

@@ -2631,6 +2631,12 @@ class ServerArgs:
         "The ratio of the size of host KV cache memory pool to the size of device pool.",
         NS("memory"),
     ] = 2.0
+    hicache_mamba_ratio: A[
+        Optional[float],
+        "The ratio of the host Mamba state pool to the device Mamba state pool. "
+        "Defaults to --hicache-ratio. --hicache-size overrides this ratio when set.",
+        NS("memory"),
+    ] = None
     hicache_size: A[
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
@@ -7185,6 +7191,15 @@ class ServerArgs:
             or self.disaggregation_decode_enable_offload_kvcache
         ):
             return
+
+        if self.hicache_mamba_ratio is not None:
+            if self.hicache_mamba_ratio <= 0:
+                raise ValueError("--hicache-mamba-ratio must be greater than zero")
+            if self.hicache_size > 0:
+                logger.warning(
+                    "--hicache-size overrides --hicache-mamba-ratio; the fixed "
+                    "host budget is split by device-pool bytes."
+                )
 
         # Step 1: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()

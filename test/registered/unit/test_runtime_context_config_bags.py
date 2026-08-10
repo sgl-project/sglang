@@ -81,6 +81,7 @@ class TestConfigBags(CustomTestCase):
         self.assertEqual(rc.get_exec().moe.moe_runner_backend, sa.moe_runner_backend)
         self.assertEqual(rc.get_exec().kernel.attention_backend, sa.attention_backend)
         self.assertEqual(rc.get_memory().hicache_ratio, sa.hicache_ratio)
+        self.assertEqual(rc.get_memory().hicache_mamba_ratio, sa.hicache_mamba_ratio)
         self.assertEqual(rc.get_schedule().page_size, sa.page_size)
         self.assertEqual(rc.get_serving().host, sa.host)
         self.assertEqual(rc.get_model().model_path, sa.model_path)

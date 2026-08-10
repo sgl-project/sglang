@@ -125,6 +125,12 @@ def _split_hicache_size(
     )
 
 
+def _get_mamba_hicache_ratio(server_args: ServerArgs) -> float:
+    if server_args.hicache_mamba_ratio is None:
+        return server_args.hicache_ratio
+    return server_args.hicache_mamba_ratio
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -653,7 +659,7 @@ def build_hybrid_mamba_stack(
         )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        server_args.hicache_ratio,
+        _get_mamba_hicache_ratio(server_args),
         mamba_host_size,
         allocator_type=_get_allocator_type(server_args),
         layout=server_args.hicache_mem_layout,
@@ -757,7 +763,7 @@ def build_hybrid_mamba_swa_stack(
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        server_args.hicache_ratio,
+        _get_mamba_hicache_ratio(server_args),
         mamba_host_size,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
