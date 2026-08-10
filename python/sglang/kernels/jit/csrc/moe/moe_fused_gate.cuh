@@ -10,7 +10,7 @@
 #include <cfloat>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 constexpr uint32_t kWarpSize = 32;
 constexpr uint32_t kWarpsPerCTA = 6;
@@ -364,4 +364,4 @@ struct MoEFusedGateKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

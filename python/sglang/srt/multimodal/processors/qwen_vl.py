@@ -17,6 +17,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models.interns2_mobius import (
+    InternS2MobiusForConditionalGeneration,
+)
 from sglang.srt.models.interns2preview import InternS2PreviewForConditionalGeneration
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
@@ -292,6 +295,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen3_5MoeForConditionalGeneration,
         Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
+        InternS2MobiusForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
     ]
 
@@ -305,6 +309,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "interns2_mobius",
         ):
             # Two workers overlap CPU preprocessing without over-fragmenting
             # burst arrivals into smaller GPU prefill batches. Higher counts can
@@ -514,6 +519,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "interns2_mobius",
         ):
             return None
 
@@ -757,6 +763,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "interns2_mobius",
         ):
             processor_kwargs.update(
                 video_metadata=video_metadata,

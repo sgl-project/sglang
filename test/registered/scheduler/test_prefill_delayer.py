@@ -371,6 +371,53 @@ _NEGOTIATE_TEST_CASES = [
         # One queue-trigger delay was recorded before the wall-clock release.
         expected_wait_forward_passes=1,
     ),
+    # slot_condition (all-branch) must not delay forever: with 128-100=28
+    # free slots < max_prefill_bs=80 the delay holds, but it must release
+    # with wait_timeout after max_delay_passes, like the mixed branch.
+    NegotiateTestCase(
+        name="slot_condition_pass_cap_timeout",
+        max_delay_passes=3,
+        token_usage_low_watermark=0.8,
+        calls=[
+            # skip_first_delayer consumes the first would-be delay.
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=128,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=128,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=128,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=128,
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_timeout",
+        # Two slot-condition delays accumulated after the skip-first pass.
+        expected_wait_forward_passes=2,
+    ),
 ]
 
 
