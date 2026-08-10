@@ -450,10 +450,12 @@ class ModelConfig:
             self.hf_config.architectures
         )
         # TODO: requires further polishing
+        # Key on the tower, not the attribute: several config classes default
+        # vision_config to None, which presence alone would read as image-capable.
         self.is_image_understandable_model = (
             enable_multimodal
             and not self.is_lm_only
-            and hasattr(self.hf_config, "vision_config")
+            and getattr(self.hf_config, "vision_config", None) is not None
         )
 
         # Models expose audio_config at different nesting levels:
