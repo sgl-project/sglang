@@ -9,7 +9,7 @@ export const Nemotron3NanoDeployment = () => {
         { id: 'h200', label: 'H200', default: false },
         { id: 'b200', label: 'B200', default: true },
         { id: 'b300', label: 'B300', default: false },
-        { id: 'Arc B', label: 'BMG', default: false }
+        { id: 'arc_b', label: 'BMG', default: false }
       ]
     },
     modelVariant: {
@@ -77,7 +77,7 @@ export const Nemotron3NanoDeployment = () => {
       cmd += `  --attention-backend flashinfer \\\n`;
     }
 
-    if (hardware === 'Arc B') {
+    if (hardware === 'arc_b') {
       cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
       cmd += `  --device xpu \\\n`;
     }
@@ -160,12 +160,12 @@ export const Nemotron3NanoDeployment = () => {
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => {
-      if (prev.hardware === 'Arc B' && optionName === 'modelVariant' && value !== 'bf16') {
+      if (prev.hardware === 'arc_b' && optionName === 'modelVariant' && value !== 'bf16') {
         return prev;
       }
 
       const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware' && value === 'Arc B') {
+      if (optionName === 'hardware' && value === 'arc_b') {
         next.modelVariant = 'bf16';
         next.tp = '4';
       }
@@ -345,7 +345,7 @@ export const Nemotron3NanoDeployment = () => {
                 items.map((item) => {
                   const isChecked = values[option.name] === item.id;
                   const isArcBModelLocked =
-                    values.hardware === 'Arc B' &&
+                    values.hardware === 'arc_b' &&
                     option.name === 'modelVariant' &&
                     item.id !== 'bf16';
                   const isDisabled = Boolean(item.disabled || isArcBModelLocked);

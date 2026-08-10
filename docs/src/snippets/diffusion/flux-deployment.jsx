@@ -16,7 +16,7 @@ export const FluxDeployment = () => {
           { id: 'mi300x', label: 'MI300X', default: false },
           { id: 'a2', label: 'A2', default: false },
           { id: 'a3', label: 'A3', default: false },
-          { id: 'Arc B', label: 'BMG', default: false },
+          { id: 'arc_b', label: 'BMG', default: false },
         ]
       },
       version: {
@@ -59,7 +59,7 @@ sglang serve \\
   --num-gpus 2`;
       }
 
-      if (hardware === 'Arc B') {
+      if (hardware === 'arc_b') {
         return `sglang serve \\
   --model-path ${config.repoId} \\
   --num-gpus 4 \\
@@ -155,12 +155,12 @@ sglang serve \\
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => {
-      if (prev.hardware === 'Arc B' && optionName === 'version' && value === 'flux1-dev') {
+      if (prev.hardware === 'arc_b' && optionName === 'version' && value === 'flux1-dev') {
         return prev;
       }
 
       const nextValues = { ...prev, [optionName]: value };
-      if (optionName === 'hardware' && value === 'Arc B' && nextValues.version === 'flux1-dev') {
+      if (optionName === 'hardware' && value === 'arc_b' && nextValues.version === 'flux1-dev') {
         nextValues.version = 'flux2-dev';
       }
       return nextValues;
@@ -342,7 +342,7 @@ sglang serve \\
                 items.map((item) => {
                   const isChecked = values[option.name] === item.id;
                   const isArcBVersionLocked =
-                    values.hardware === 'Arc B' &&
+                    values.hardware === 'arc_b' &&
                     option.name === 'version' &&
                     item.id === 'flux1-dev';
                   const isDisabled = Boolean(item.disabled || isArcBVersionLocked);
