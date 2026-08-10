@@ -19,6 +19,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
 )
+from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -144,13 +145,13 @@ class MlxModelRunnerStub(ModelRunner):
         (``MlxAuxiliaryStateComponent``) raises ``NotImplementedError`` for
         the mode.
         """
-        if self.server_args.disable_radix_cache:
+        if get_memory().disable_radix_cache:
             return 1
         return MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO
 
     def _explicit_aux_state_size_per_worker(self) -> int | None:
         """Return the explicit auxiliary-state cap for this attention-DP owner."""
-        aux_state_size = self.server_args.max_mamba_cache_size
+        aux_state_size = get_schedule().max_mamba_cache_size
         if aux_state_size is None:
             return None
         return aux_state_size // self.ps.attn_dp_size
@@ -173,7 +174,7 @@ class MlxModelRunnerStub(ModelRunner):
         Requires ``self.max_total_num_tokens`` to already be set.
         """
         capacity_cap = self.max_total_num_tokens // 2
-        requested = self.server_args.max_running_requests
+        requested = get_schedule().max_running_requests
         if requested is None:
             requested_per_worker = None
             resolved = min(capacity_cap, 4096)
@@ -189,7 +190,7 @@ class MlxModelRunnerStub(ModelRunner):
             ratio = self._aux_state_slots_per_request()
             resolved = min(resolved, aux_state_size // ratio)
             if resolved <= 0:
-                global_aux_state_size = self.server_args.max_mamba_cache_size
+                global_aux_state_size = get_schedule().max_mamba_cache_size
                 min_global_aux_state_size = ratio * self.ps.attn_dp_size
                 raise RuntimeError(
                     f"MLX auxiliary-state cache is too small to serve any "
@@ -221,7 +222,7 @@ class MlxModelRunnerStub(ModelRunner):
         from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
+            enable=get_exec().features.enable_memory_saver
         )
 
         # Load model (sets metadata only)
@@ -267,7 +268,7 @@ class MlxModelRunnerStub(ModelRunner):
                 # With the radix cache disabled no tree component exists to
                 # release auxiliary slots, so the pool owns their release
                 # (see MlxAuxiliaryStateReqToTokenPool docstring).
-                owns_auxiliary_state_release=self.server_args.disable_radix_cache,
+                owns_auxiliary_state_release=get_memory().disable_radix_cache,
             )
         else:
             self.req_to_token_pool = ReqToTokenPool(
@@ -293,7 +294,6 @@ class MlxModelRunnerStub(ModelRunner):
 
         # No CUDA graphs, no attention backend
         self.decode_cuda_graph_runner = None
-        self.graph_mem_usage = 0
         self.attn_backend = None
 
         self.init_ngram_embedding_manager()
@@ -308,3 +308,12 @@ class MlxModelRunnerStub(ModelRunner):
     def alloc_memory_pool(self, memory_pool_config=None):
         """No-op: MLX manages its own KV cache."""
         pass
+
+    def init_attention_backends(self):
+        """No-op: attention runs inside the MLX runner.
+
+        The backend named by ``server_args.attention_backend`` would never
+        be used, and building one can crash: some backends read real KV
+        buffers in ``__init__``, which this stub never allocates.
+        """
+        self.attn_backend = None

@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include <string>
 
-namespace {
+namespace sglang {
 
 #ifdef USE_ROCM
 constexpr int WARP_SIZE = 64;
@@ -32,21 +32,108 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
 }
 
 #ifdef USE_ROCM
+// 128-bit vector type used by the wide copy path below.
+using TransferVec4 = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+
 __device__ __forceinline__ void transfer_item_warp(
     int32_t lane_id, const void* __restrict__ src_addr, void* __restrict__ dst_addr, int64_t item_size_bytes) {
   const auto src = static_cast<const char*>(src_addr);
   auto dst = static_cast<char*>(dst_addr);
 
+  // Wide path: one 128-bit dwordx4 per lane instead of two 64-bit dwordx2,
+  // which halves the load/store instruction count and the number of serialized
+  // round trips per item. The source is usually pinned host DRAM, so those
+  // round trips are what the copy is actually paying for.
+  //
+  // Gated on item_size_bytes >= WARP_SIZE * 16, and this gate is load-bearing:
+  // a 16B-per-lane step only covers item_size_bytes/16 lanes, so below that
+  // threshold the wide path idles part of the wavefront while needing the same
+  // number of iterations as the 8B path. Measured on MI355X (gfx950, wave64)
+  // with 512B items, ungated widening was 14-22% SLOWER because 512/16 = 32
+  // lanes work instead of 512/8 = 64. At 1024B (= WARP_SIZE * 16) the whole
+  // wavefront stays busy and the item moves in a single instruction per lane.
+  //
+  // The load is non-temporal because these items are streamed in once; there
+  // is no reuse to preserve and they should not evict resident lines from
+  // L2/MALL. The store is deliberately left cached: its destination is the
+  // device buffer that the attention kernel reads immediately afterwards.
+  int64_t byte_pos = 0;
+  const bool aligned_16b = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 0xF) == 0;
+  const bool wide_fills_wave = item_size_bytes >= static_cast<int64_t>(WARP_SIZE) * 16;
+  if (aligned_16b && wide_fills_wave) {
+    constexpr int64_t kVecBytes = static_cast<int64_t>(sizeof(TransferVec4));
+    const int64_t vec_count = item_size_bytes / kVecBytes;
+    const auto src_vec = reinterpret_cast<const TransferVec4*>(src);
+    auto dst_vec = reinterpret_cast<TransferVec4*>(dst);
+    for (int64_t i = lane_id; i < vec_count; i += WARP_SIZE) {
+      dst_vec[i] = __builtin_nontemporal_load(&src_vec[i]);
+    }
+    byte_pos = vec_count * kVecBytes;
+  }
+
+  // 64-bit path: covers the unaligned case in full, and the <= 8-byte
+  // remainder the wide path leaves behind.
   const int64_t word_count = item_size_bytes / static_cast<int64_t>(sizeof(uint64_t));
+  const int64_t word_start = byte_pos / static_cast<int64_t>(sizeof(uint64_t));
   const auto src_words = reinterpret_cast<const uint64_t*>(src);
   auto dst_words = reinterpret_cast<uint64_t*>(dst);
-  for (int64_t i = lane_id; i < word_count; i += WARP_SIZE) {
+  for (int64_t i = word_start + lane_id; i < word_count; i += WARP_SIZE) {
     dst_words[i] = src_words[i];
   }
 
   const int64_t tail_start = word_count * static_cast<int64_t>(sizeof(uint64_t));
   for (int64_t i = tail_start + lane_id; i < item_size_bytes; i += WARP_SIZE) {
     dst[i] = src[i];
+  }
+}
+
+// Copies one DSv4 C4 token as a single 73-word space instead of two separate
+// transfer_item_warp calls.
+//
+// A token is a 576B value and an 8B scale that sit in different runs of the
+// page row, so it cannot be moved as one contiguous range. Copying the two
+// pieces separately costs three wavefront passes on wave64 -- 64 value words,
+// 8 value words, then 1 scale word -- and because item_size_bytes reaches
+// transfer_item_warp as a runtime argument the compiler keeps the value copy
+// as a rolled loop with s_waitcnt vmcnt(0) inside it, so all three passes
+// serialize on host memory latency. Walking one 73-word space puts the value
+// tail and the scale in the same pass, and the pass count being a compile-time
+// constant lets both loads issue before either store, leaving one exposed
+// round trip instead of three. This is the same shape as the CUDA
+// device::hisparse::transfer_item, adapted to wave64.
+__device__ __forceinline__ void transfer_dsv4_item_warp(
+    int32_t lane_id,
+    const int64_t* __restrict__ src_value,
+    const int64_t* __restrict__ src_scale,
+    int64_t* __restrict__ dst_value,
+    int64_t* __restrict__ dst_scale) {
+  constexpr int32_t kValueWords = static_cast<int32_t>(device::hisparse::kValueBytes / sizeof(int64_t));
+  constexpr int32_t kTotalWords = static_cast<int32_t>(device::hisparse::kItemBytes / sizeof(int64_t));
+  constexpr int32_t kPasses = (kTotalWords + WARP_SIZE - 1) / WARP_SIZE;
+  static_assert(device::hisparse::kValueBytes % sizeof(int64_t) == 0, "value must be whole 64-bit words");
+  static_assert(device::hisparse::kScaleBytes % sizeof(int64_t) == 0, "scale must be whole 64-bit words");
+
+  const int64_t* src_slot[kPasses];
+  int64_t* dst_slot[kPasses];
+  int64_t staged[kPasses];
+
+#pragma unroll
+  for (int32_t p = 0; p < kPasses; ++p) {
+    const int32_t i = p * WARP_SIZE + lane_id;
+    const bool is_value = i < kValueWords;
+    const bool is_scale = !is_value && i < kTotalWords;
+    src_slot[p] = is_value ? src_value + i : (is_scale ? src_scale + (i - kValueWords) : nullptr);
+    dst_slot[p] = is_value ? dst_value + i : (is_scale ? dst_scale + (i - kValueWords) : nullptr);
+    if (src_slot[p] != nullptr) {
+      staged[p] = *src_slot[p];
+    }
+  }
+
+#pragma unroll
+  for (int32_t p = 0; p < kPasses; ++p) {
+    if (dst_slot[p] != nullptr) {
+      *dst_slot[p] = staged[p];
+    }
   }
 }
 #else
@@ -217,10 +304,18 @@ __global__ void load_cache_to_device_buffer_kernel(
   constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
 
   const int bid = blockIdx.x;
-  // Early exit for padded blocks (CUDA graph pads batch to a captured size)
-  if (bid >= num_real_reqs[0]) return;
-
   const int tid = threadIdx.x;
+  int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
+
+  // CUDA graph pads the batch to a captured size. Keep padded output rows
+  // invalid without a separate fill kernel.
+  if (bid >= num_real_reqs[0]) {
+    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+      req_top_k_device_locs[i] = -1;
+    }
+    return;
+  }
+
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
   const BallotMask lanes_before = (BallotMask(1) << lane_id) - BallotMask(1);
@@ -230,7 +325,6 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   // Calculate offsets for this request
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
-  int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
 
   const int64_t buffer_offset = rid * buffer_stride_0;
   int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
@@ -241,11 +335,15 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (seq_len <= HOT_BUFFER_SIZE) {
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
-    for (int i = tid; i < count; i += BLOCK_SIZE) {
-      int32_t token_pos = req_top_k_tokens[i];
-      if (token_pos >= 0) {
-        req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
+    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+      int32_t device_loc = -1;
+      if (i < count) {
+        int32_t token_pos = req_top_k_tokens[i];
+        if (token_pos >= 0) {
+          device_loc = req_device_buffer_locs[token_pos];
+        }
       }
+      req_top_k_device_locs[i] = device_loc;
     }
     return;
   }
@@ -510,14 +608,13 @@ __global__ void load_cache_to_device_buffer_kernel(
       // ROCm path: host cache and device buffer both use the page-padded C4
       // layout (same as the write path and the CUDA branch). We can't reuse
       // device::hisparse::transfer_item here because its warp logic is hardcoded
-      // to a 32-lane warp; on wavefront64 we use the warp-width-agnostic
-      // transfer_item_warp with paged source and destination addressing.
+      // to a 32-lane warp; on wavefront64 we use transfer_dsv4_item_warp, which
+      // moves the value and the scale in one warp-width-agnostic copy.
       using namespace device::hisparse;
       const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(device_buffer_k, static_cast<int32_t>(dst_loc));
       const auto [src_value_ptr, src_scale_ptr] =
           get_pointer_paged(const_cast<void*>(host_cache_k), static_cast<int32_t>(src_loc));
-      transfer_item_warp(lane_id, src_value_ptr, dst_value_ptr, kValueBytes);
-      transfer_item_warp(lane_id, src_scale_ptr, dst_scale_ptr, kScaleBytes);
+      transfer_dsv4_item_warp(lane_id, src_value_ptr, src_scale_ptr, dst_value_ptr, dst_scale_ptr);
 #else
       // CUDA path: page-padded device layout + page-padded host layout, K-only.
       // The host cache is pinned DRAM but uses the same row layout as the GPU C4
@@ -659,4 +756,4 @@ void load_cache_to_device_buffer(
   }
 }
 
-}  // namespace
+}  // namespace sglang

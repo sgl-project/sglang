@@ -306,7 +306,9 @@ class CompressorBackendMixin:
         The compression math is the same JIT kernel as the fused path; only
         the epilogue is left to the caller.
         """
-        from sglang.kernels.ops.attention.deepseek_v4_rope import fused_norm_rope_inplace_triton
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            fused_norm_rope_inplace_triton,
+        )
 
         compress_ratio = compressor.ratio
         head_dim = compressor.head_dim

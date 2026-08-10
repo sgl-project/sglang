@@ -35,7 +35,10 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    mamba_cache_chunk_size,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -65,10 +68,47 @@ class MambaComponent(TreeComponent):
                 params.page_size == 1
             ), f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
         super().__init__(cache, params)
-        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
-        self.mamba_max_states_per_path = get_server_args().mamba_max_states_per_path
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
+        self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
+
+    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        data = node.component_data[self.component_type]
+        return data.value is not None and data.host_value is None
+
+    def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        cd = leaf.component_data[self.component_type]
+        cd.session_ref += 1
+        if cd.session_ref == 1:
+            self._refresh_session_partition(leaf)
+
+    def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        cd = leaf.component_data[self.component_type]
+        assert cd.session_ref > 0
+        cd.session_ref -= 1
+        if cd.session_ref == 0:
+            self._refresh_session_partition(leaf)
+
+    def _advance_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        old_ancestor: Optional[UnifiedTreeNode],
+    ) -> None:
+        self._inc_session_coverage(session_id, leaf)
+        if old_ancestor is not None:
+            self._dec_session_coverage(session_id, old_ancestor)
+
+    def _recede_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        fallback: Optional[UnifiedTreeNode],
+    ) -> None:
+        self._dec_session_coverage(session_id, leaf)
+        if fallback is not None:
+            self._inc_session_coverage(session_id, fallback)
 
     def refresh_lru(
         self,
@@ -120,7 +160,9 @@ class MambaComponent(TreeComponent):
 
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
-        # that lies beyond the current Mamba boundary.
+        # that lies beyond the current Mamba boundary. With HiCache, incremental
+        # persistence of a new branching state is currently write-through only;
+        # write-back eviction may discard the device-only state.
         aligned_seqlen = (
             result.full_kv_hit_length // self.mamba_cache_chunk_size
         ) * self.mamba_cache_chunk_size
@@ -266,6 +308,8 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
         new_parent.component_data[ct].value = None
         new_parent.component_data[ct].lock_ref = 0
+        new_parent.component_data[ct].session_ref = 0
+        new_parent.component_data[ct].session_ids = None
         # HiCache: mamba host_value stays on child (mamba = leaf-only data)
         new_parent.component_data[ct].host_value = None
         new_parent.component_data[ct].host_lock_ref = 0
@@ -311,9 +355,14 @@ class MambaComponent(TreeComponent):
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
-        self._evict_device_cursor = self.tree_core.lru_lists[
-            self.component_type
-        ].get_lru_no_lock()
+        if self.tree_core.enable_session_radix_cache:
+            lru = self.tree_core.lru_lists[self.component_type]
+            lru.cursor_begin()
+            self._evict_device_cursor = lru.cursor_next()
+        else:
+            self._evict_device_cursor = self.tree_core.lru_lists[
+                self.component_type
+            ].get_lru_no_lock()
 
     def _evict_device_next_node(
         self,
@@ -322,14 +371,18 @@ class MambaComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> Optional[NodeId]:
         """Return the next device-leaf node for the driver to evict, or None.
-        Internal nodes are tombstoned inline (no IO); the cursor is re-validated
-        (reset to LRU head) if the previous node's eviction removed it."""
+        Internal nodes are tombstoned inline (no IO). If the previous node's
+        eviction removed the cursor, the walk resumes from the partition
+        sentinel with session refs on, else it restarts at the LRU tail."""
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
+        enabled = self.tree_core.enable_session_radix_cache
         if self._evict_device_cursor is not None and not lru.in_list(
             self._evict_device_cursor
         ):
-            self._evict_device_cursor = lru.get_lru_no_lock()
+            self._evict_device_cursor = (
+                lru.cursor_next() if enabled else lru.get_lru_no_lock()
+            )
         while (
             tracker[ct] < self._evict_device_request_cnt
             and self._evict_device_cursor is not None
@@ -337,10 +390,15 @@ class MambaComponent(TreeComponent):
         ):
             x = self._evict_device_cursor
             assert x.component_data[ct].value is not None
-            if x in self.tree_core.evictable_device_leaves:
-                self._evict_device_cursor = lru.get_prev_no_lock(x)
+            if x in self.tree_core.evictable_device_leaves and (
+                not enabled or self._can_evict_leaf_atomically(x)
+            ):
+                self._evict_device_cursor = (
+                    lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
+                )
                 return x.id
-            x_next = lru.get_prev_no_lock(x)
+            if not enabled:
+                x_next = lru.get_prev_no_lock(x)
             self.tree_core._evict_component_and_detach_lru(
                 x,
                 self,
@@ -352,11 +410,13 @@ class MambaComponent(TreeComponent):
             self.tree_core._cascade_evict(
                 x, self, tracker, device_frees=device_frees, host_frees=host_frees
             )
-            self._evict_device_cursor = x_next
+            self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
+        if self.tree_core.enable_session_radix_cache:
+            self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
 
     def acquire_component_lock(
@@ -787,15 +847,23 @@ class MambaComponent(TreeComponent):
         Host leaves: atomic eviction via _evict_host_leaf."""
         ct = self.component_type
         host_lru = self.tree_core.host_lru_lists[ct]
-        x = host_lru.get_lru_no_host_lock()
+        enabled = self.tree_core.enable_session_radix_cache
+        if enabled:
+            host_lru.cursor_begin()
+            x = host_lru.cursor_next(host_lock=True)
+        else:
+            x = host_lru.get_lru_no_host_lock()
         while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
-            x_next = host_lru.get_prev_no_host_lock(x)
+            if not enabled:
+                x_next = host_lru.get_prev_no_host_lock(x)
             cd = x.component_data[ct]
-            if x in self.tree_core.evictable_host_leaves:
+            if x in self.tree_core.evictable_host_leaves and (
+                not enabled or self._can_evict_leaf_atomically(x)
+            ):
                 # Host leaf: atomic eviction (all components host + delete)
                 self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
             else:
-                # Internal: tombstone Mamba + cascade
+                # Internal (or a leaf a session still pins): tombstone Mamba + cascade
                 assert cd.host_value is not None
                 self.tree_core._evict_component_and_detach_lru(
                     x,
@@ -814,7 +882,12 @@ class MambaComponent(TreeComponent):
                     target=EvictLayer.HOST,
                 )
                 self.tree_core._update_evictable_leaf_sets(x)
-            x = x_next
+            if enabled:
+                x = host_lru.cursor_next(host_lock=True)
+            else:
+                x = x_next
+        if enabled:
+            host_lru.cursor_end()
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._mamba_pool_host is None:
@@ -826,12 +899,11 @@ class MambaComponent(TreeComponent):
         if isinstance(action, MambaEvictExcessPathStates):
             device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
             host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-            # Drain even if the walk raises so tombstoned slots are not leaked.
+            # Drain even if the walk raises so tombstoned slots are not leaked;
+            # the walk runs behind the tree-core interface (Rust runs it natively).
             try:
-                self._evict_excess_path_states(
-                    self.tree_core.node_by_id(action.tail_node_id),
-                    device_frees,
-                    host_frees,
+                self.tree_core.evict_excess_path_states(
+                    action.tail_node_id, device_frees, host_frees
                 )
             finally:
                 self.cache._free_values(device_frees, host_frees)

@@ -13,7 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
@@ -30,6 +30,19 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+# Single source of truth for the CUDA-graph capture trace output directory,
+# shared by both the original single-trace export and the per-batch-size
+# (SGLANG_GRAPH_BATCH_CAPTURE) traces so they land in the same place.
+GRAPH_CAPTURE_PROFILE_DIRNAME = "graph_capture_profile"
+
+
+def graph_capture_profile_dir() -> str:
+    """``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile`` — the one directory
+    both capture-trace modes write to. Change the location here only."""
+    return os.path.join(
+        envs.SGLANG_TORCH_PROFILER_DIR.get(), GRAPH_CAPTURE_PROFILE_DIRNAME
+    )
+
 
 def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: int):
     """Persist a CUDA-graph capture profiler trace (chrome trace) to disk.
@@ -37,15 +50,13 @@ def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: 
     Opt-in via ``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE`` (no-op otherwise). The
     capture profiler must have run with ``record_shapes=True`` so the trace can
     be inspected offline as a per-kernel shape/identity record. The file lands in
-    ``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile/`` and is namespaced by
-    runner class and TP rank so concurrent capture passes (e.g. EAGLE3
-    target/draft/draft-extend) and ranks don't overwrite each other.
+    ``graph_capture_profile_dir()`` and is namespaced by runner class and TP rank
+    so concurrent capture passes (e.g. EAGLE3 target/draft/draft-extend) and
+    ranks don't overwrite each other.
     """
     if not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
         return
-    output_dir = os.path.join(
-        envs.SGLANG_TORCH_PROFILER_DIR.get(), "graph_capture_profile"
-    )
+    output_dir = graph_capture_profile_dir()
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(
         output_dir, f"cuda_graph_capture-{runner_name}-TP-{tp_rank}.json.gz"
@@ -62,7 +73,7 @@ class ProfileManager:
         )
         self.ps = ps
         self.cpu_group = cpu_group
-        self.first_rank_in_node = ps.gpu_id == get_server_args().base_gpu_id
+        self.first_rank_in_node = ps.gpu_id == get_device().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
 
