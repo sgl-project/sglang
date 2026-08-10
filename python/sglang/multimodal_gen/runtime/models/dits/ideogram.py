@@ -499,9 +499,6 @@ class Ideogram4FinalLayer(nn.Module):
         return self.linear(self.norm_final(x) * scale)
 
 
-_ARCH_DEFAULTS = Ideogram4DiTArchConfig()
-
-
 class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["Ideogram4TransformerBlock"]
     layer_names = ["layers"]
@@ -511,7 +508,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
     }
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    param_names_mapping = Ideogram4DiTArchConfig().param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(

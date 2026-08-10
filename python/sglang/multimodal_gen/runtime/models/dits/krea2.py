@@ -506,9 +506,6 @@ class SingleStreamBlock(nn.Module):
 # --------------------------------------------------------------------------- #
 # Top-level model
 # --------------------------------------------------------------------------- #
-_ARCH_DEFAULTS = Krea2ArchConfig()
-
-
 class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """K2 single-stream MMDiT for the SGLang diffusion runtime.
 
@@ -518,7 +515,7 @@ class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = []
     _compile_conditions = []
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    param_names_mapping = Krea2ArchConfig().param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(

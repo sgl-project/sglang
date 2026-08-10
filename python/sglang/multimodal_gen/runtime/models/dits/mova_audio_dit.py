@@ -90,15 +90,12 @@ class Conv1dLocalIsland(nn.Conv1d):
             return super().forward(input)
 
 
-_ARCH_DEFAULTS = MOVAAudioArchConfig()
-
-
 class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = MOVAAudioArchConfig().param_names_mapping
+    reverse_param_names_mapping = MOVAAudioArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = MOVAAudioArchConfig().lora_param_names_mapping
 
     def __init__(
         self,

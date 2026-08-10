@@ -766,15 +766,12 @@ class RopeEmbedder:
         return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
 
 
-_ARCH_DEFAULTS = ZImageArchConfig()
-
-
 class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = [is_zimage_layer]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
+    param_names_mapping = ZImageArchConfig().param_names_mapping
+    reverse_param_names_mapping = ZImageArchConfig().reverse_param_names_mapping
 
     # Maps fused runtime layer names to their checkpoint shard names.
     # Used by is_layer_skipped() to correctly handle --quantization-ignored-layers

@@ -154,15 +154,12 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
         return hidden_states
 
 
-_ARCH_DEFAULTS = LongLive2ArchConfig()
-
-
 class LongLive2Transformer3DModel(CausalWanTransformer3DModel):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = LongLive2ArchConfig().param_names_mapping
+    reverse_param_names_mapping = LongLive2ArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = LongLive2ArchConfig().lora_param_names_mapping
 
     def __init__(
         self,

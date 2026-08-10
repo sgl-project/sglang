@@ -345,18 +345,17 @@ class LingBotVideoBlock(nn.Module):
         return x
 
 
-_ARCH_DEFAULTS = LingBotVideoMoEArchConfig()
-
-
 class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _no_split_modules = ("LingBotVideoBlock",)
     _keep_in_fp32_modules = tuple(LINGBOT_VIDEO_FP32_MODULES)
 
     _fsdp_shard_conditions = [is_lingbot_block]
     _compile_conditions = [is_lingbot_block]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = LingBotVideoMoEArchConfig().param_names_mapping
+    reverse_param_names_mapping = (
+        LingBotVideoMoEArchConfig().reverse_param_names_mapping
+    )
+    lora_param_names_mapping = LingBotVideoMoEArchConfig().lora_param_names_mapping
 
     def to(self, *args, **kwargs):
         # _parse_to is private but the only exact parser for .to() overloads.

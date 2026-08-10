@@ -906,9 +906,6 @@ class Flux2PosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
-_ARCH_DEFAULTS = FluxArchConfig()
-
-
 class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux 2.
@@ -917,7 +914,7 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     """
 
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    param_names_mapping = FluxArchConfig().param_names_mapping
     scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
     # FLUX.2 stays closer to the official diffusers output with Torch SDPA.
     # The generic FA path still produces a measurable image-level drift here.

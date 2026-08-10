@@ -502,9 +502,6 @@ class MMSingleStreamBlock(nn.Module):
         return self.output_residual(output, mod_gate, x)
 
 
-_ARCH_DEFAULTS = HunyuanVideoArchConfig()
-
-
 class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     HunyuanVideo Transformer backbone adapted for distributed training.
@@ -522,9 +519,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     # shard single stream, double stream blocks, and refiner_blocks
     _fsdp_shard_conditions = [is_double_block, is_single_block, is_refiner_block]
     _compile_conditions = [is_double_block, is_single_block, is_txt_in]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = HunyuanVideoArchConfig().param_names_mapping
+    reverse_param_names_mapping = HunyuanVideoArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = HunyuanVideoArchConfig().lora_param_names_mapping
 
     def __init__(
         self,

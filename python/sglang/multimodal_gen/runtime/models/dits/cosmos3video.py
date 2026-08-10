@@ -916,9 +916,6 @@ class Cosmos3LanguageModel(nn.Module):
 # -----------------------------------------------------------------------------
 
 
-_ARCH_DEFAULTS = Cosmos3VideoArchConfig()
-
-
 class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
     """Cosmos3 Omni transformer.
 
@@ -929,9 +926,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = [is_cosmos_layer]
     _compile_conditions = [is_cosmos_layer]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = Cosmos3VideoArchConfig().param_names_mapping
+    reverse_param_names_mapping = Cosmos3VideoArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = Cosmos3VideoArchConfig().lora_param_names_mapping
 
     def __init__(
         self,

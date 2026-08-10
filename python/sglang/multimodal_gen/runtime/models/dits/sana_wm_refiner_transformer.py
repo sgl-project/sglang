@@ -205,9 +205,6 @@ class SanaWMRefinerBlock(nn.Module):
         return hidden_states
 
 
-_ARCH_DEFAULTS = SanaWMRefinerArchConfig()
-
-
 class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
     """SANA-WM stage-2 LTX-2 video-only refiner.
 
@@ -218,7 +215,7 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
     _compile_conditions = [is_blocks_or_transformer_blocks]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    param_names_mapping = SanaWMRefinerArchConfig().param_names_mapping
     reverse_param_names_mapping: dict = {}
     lora_param_names_mapping: dict = {}
 

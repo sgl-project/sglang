@@ -860,15 +860,12 @@ class WanTransformerBlock_VSA(nn.Module):
         return hidden_states
 
 
-_ARCH_DEFAULTS = WanVideoArchConfig()
-
-
 class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = WanVideoArchConfig().param_names_mapping
+    reverse_param_names_mapping = WanVideoArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = WanVideoArchConfig().lora_param_names_mapping
 
     def __init__(
         self,

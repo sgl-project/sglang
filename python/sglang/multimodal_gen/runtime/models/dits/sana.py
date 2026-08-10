@@ -387,9 +387,6 @@ class SanaTransformerBlock(nn.Module):
         return hidden_states
 
 
-_ARCH_DEFAULTS = SanaArchConfig()
-
-
 class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = [
@@ -398,7 +395,7 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _compile_conditions = [
         lambda n, m: isinstance(m, SanaTransformerBlock),
     ]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    param_names_mapping = SanaArchConfig().param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(self, config: SanaConfig, hf_config=None, **kwargs):

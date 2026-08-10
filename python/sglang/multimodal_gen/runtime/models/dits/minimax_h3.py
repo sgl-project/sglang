@@ -67,7 +67,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
 )
 
-_ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
 
@@ -1026,9 +1025,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
     _compile_conditions = [is_block]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = MiniMaxH3DiTArchConfig().param_names_mapping
+    reverse_param_names_mapping = MiniMaxH3DiTArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = MiniMaxH3DiTArchConfig().lora_param_names_mapping
 
     def _can_batch_block_adaln(self) -> bool:
         return (

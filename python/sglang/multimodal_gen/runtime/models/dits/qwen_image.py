@@ -1331,9 +1331,6 @@ def to_hashable(obj):
     return obj
 
 
-_ARCH_DEFAULTS = QwenImageArchConfig()
-
-
 class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Qwen.
@@ -1345,7 +1342,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    param_names_mapping = QwenImageArchConfig().param_names_mapping
     _fsdp_shard_conditions = [is_transformer_block]
 
     @classmethod

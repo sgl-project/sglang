@@ -555,9 +555,6 @@ class HeliosTransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-_ARCH_DEFAULTS = HeliosArchConfig()
-
-
 class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     Helios Transformer 3D model for video generation.
@@ -568,9 +565,9 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = HeliosArchConfig().param_names_mapping
+    reverse_param_names_mapping = HeliosArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = HeliosArchConfig().lora_param_names_mapping
 
     def __init__(
         self,

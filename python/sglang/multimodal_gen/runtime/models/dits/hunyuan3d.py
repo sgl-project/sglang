@@ -455,15 +455,12 @@ class _FluxLastLayer(nn.Module):
         return x
 
 
-_ARCH_DEFAULTS = Hunyuan3DDiTArchConfig()
-
-
 class Hunyuan3D2DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
     """Hunyuan3D DiT model (Flux-style architecture for Hunyuan3D-2.0)."""
 
     _aliases = ["hy3dgen.shapegen.models.Hunyuan3DDiT"]
 
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    param_names_mapping = Hunyuan3DDiTArchConfig().param_names_mapping
 
     @classmethod
     def build_config_from_params(cls, params: dict) -> Hunyuan3DDiTConfig:

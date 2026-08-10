@@ -582,15 +582,12 @@ class LingBotWorldTransformerBlock(nn.Module):
         return hidden_states.to(orig_dtype)
 
 
-_ARCH_DEFAULTS = LingBotWorldArchConfig()
-
-
 class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_lingbot_block]
     _compile_conditions = [is_lingbot_block]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = LingBotWorldArchConfig().param_names_mapping
+    reverse_param_names_mapping = LingBotWorldArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = LingBotWorldArchConfig().lora_param_names_mapping
 
     def __init__(
         self,
@@ -1144,9 +1141,9 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
 class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
     _fsdp_shard_conditions = [is_lingbot_block]
     _compile_conditions = [is_lingbot_block]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = LingBotWorldArchConfig().param_names_mapping
+    reverse_param_names_mapping = LingBotWorldArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = LingBotWorldArchConfig().lora_param_names_mapping
 
     def __init__(
         self,

@@ -420,15 +420,12 @@ class Conv3dLocalIsland(nn.Conv3d):
             return super().forward(input)
 
 
-_ARCH_DEFAULTS = MOVAVideoArchConfig()
-
-
 class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = MOVAVideoArchConfig().param_names_mapping
+    reverse_param_names_mapping = MOVAVideoArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = MOVAVideoArchConfig().lora_param_names_mapping
 
     def __init__(
         self,

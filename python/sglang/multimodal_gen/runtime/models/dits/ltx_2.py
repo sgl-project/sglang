@@ -1506,15 +1506,12 @@ class LTX2TransformerBlock(nn.Module):
         return hidden_states, audio_hidden_states
 
 
-_ARCH_DEFAULTS = LTX2ArchConfig()
-
-
 class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
     _compile_conditions = [is_blocks_or_transformer_blocks]
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
-    reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
-    lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+    param_names_mapping = LTX2ArchConfig().param_names_mapping
+    reverse_param_names_mapping = LTX2ArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = LTX2ArchConfig().lora_param_names_mapping
 
     @staticmethod
     def _collapse_prompt_timestep(timestep: torch.Tensor) -> torch.Tensor:

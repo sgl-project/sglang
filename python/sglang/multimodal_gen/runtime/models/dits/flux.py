@@ -1154,9 +1154,6 @@ class FluxPosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
-_ARCH_DEFAULTS = FluxArchConfig()
-
-
 class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux.
@@ -1164,7 +1161,7 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
 
-    param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
+    param_names_mapping = FluxArchConfig().param_names_mapping
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
