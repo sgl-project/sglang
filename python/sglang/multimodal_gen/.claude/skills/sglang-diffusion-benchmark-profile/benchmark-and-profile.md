@@ -37,6 +37,9 @@ python3 "$ENV_PY" check-write-access >/dev/null
 
 export HF_TOKEN=<your_hf_token>  # required for gated repos such as black-forest-labs/FLUX.*
 export FLASHINFER_DISABLE_VERSION_CHECK=1
+# Required for correctly attributed stage-level denoise/decode timings. The
+# checked-in benchmark helper sets this by default unless you explicitly set 0.
+export SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1
 # Leave CUDA_VISIBLE_DEVICES unset to let the preset helper select the number
 # of idle GPUs it requires. For manual runs, set --count to that command's
 # exact --num-gpus value.
@@ -83,6 +86,8 @@ Environment notes:
 - all commands below assume you are inside the configured diffusion container shell
 - export `HF_TOKEN` before any gated Hugging Face model run
 - export `FLASHINFER_DISABLE_VERSION_CHECK=1` before any benchmark or profiler run
+- keep `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for stage-level comparisons;
+  without it, asynchronous GPU work can be charged to a later stage
 - re-run `print-idle-gpus` before each perf command if GPU availability may have changed
 - keep benchmark commands within 4 GPUs or fewer
 
@@ -129,6 +134,10 @@ PYTHONPATH=python python3 "$BENCH_PY" \
   --label baseline \
   --output-dir "${BENCH_DIR}"
 ```
+
+The helper sets `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for accurate stage
+attribution. Set it to `0` explicitly only when collecting an e2e-only run and
+do not compare its per-stage values with synchronized results.
 
 Keep `torch.compile` off when the task requires it:
 
@@ -500,9 +509,16 @@ Always keep:
 - denoise latency
 - end-to-end latency
 - peak GPU memory
-- exact command line, model shape, dtype, and GPU topology
+- exact command line, model shape, dtype, request `quality`, GPU topology, and
+  whether synchronized stage profiling was enabled
 
 Never keep a perf dump produced after a diffusers-backend fallback.
+
+Stage durations are host wall times around asynchronous GPU launches unless
+`SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`. Without the sync, queued denoise
+work can leak into the next blocking stage and inflate `DecodingStage` by 2-3x.
+Use synchronized dumps for denoise/decode attribution and keep the setting
+identical in every before/after pair.
 
 ## `torch.profiler` Workflow
 
@@ -604,9 +620,13 @@ the known mainline families.
 | `fused_inplace_qknorm_rope` missing, but separate qk norm plus rope show up | Check whether the fused diffusion `QK norm + RoPE` path should have engaged |
 | `to_q -> to_k -> to_v` on NVFP4 or Nunchaku FLUX-family checkpoints | Treat as a packed-QKV fast-path miss or checkpoint-format mismatch |
 | `zimage_rmsnorm_scale` or `zimage_rmsnorm_tanh_residual` missing on Z-Image | Check the bf16-native Triton eligibility guards before proposing a new fusion |
+| FLUX.1, GLM-Image, or SANA shows separate LayerNorm plus adaLN elementwise kernels | Check the bit-exact `modulate_scale_shift` and `fused_layernorm_modulate` guards/self-test before proposing another norm fusion |
+| `quality=high` shows the same FLUX/GLM DiT or FLUX-family/Wan VAE chain as `lossless` | Check whether the request-scoped quality gate mounted and whether every site passed its all-or-nothing compatibility checks |
 | LTX-2 split RoPE appears as a long PyTorch elementwise chain | Check the `apply_ltx2_split_rotary_emb` Triton path and its shape guards |
+| Wan decode is dominated by causal `cat + pad + contiguous`, feature-cache copies, or `repeat_interleave + permute + add` | Check the bit-exact Wan causal-cache and DupUp3D data-movement kernels before writing a new decoder kernel |
 | masked attention spends time packing/unpacking Q/K/V | Check whether fused varlen USP pack/scatter should have engaged |
 | `all_to_all`, ring attention, or async A2A dominate | Classify against Ulysses, USP, or turbo-layer overlap first |
+| Fixed-resolution image/video traces show many small launch gaps | Check supported breakable CUDA graph capture, declared warmup resolutions, and text buckets before adding a new graph mechanism |
 | H3 shows separate indexed gather + scale/shift, QK norm + RoPE, or three Q/K/V Ulysses relayouts | Check H3's indexed-modulation, fused QK-norm+RoPE, packed Ulysses-QKV, and USP relayout guards before writing a new kernel |
 | H3 TP traces show one AdaLN collective per block | Check the batched TP AdaLN projection/all-gather path in `minimax_h3.py` before attempting communication overlap |
 | split `fc1 -> gelu -> quant -> fc2.lora_down` on Nunchaku FLUX | Treat as a missing fused GELU MLP path |
@@ -633,6 +653,7 @@ This skill intentionally stops here. It tells you whether you are looking at:
 
 - [ ] fixed-shape baseline perf dump saved
 - [ ] fixed-shape new perf dump saved
+- [ ] request `quality` and `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING` match
 - [ ] `compare_perf.py` table generated
 - [ ] one representative `torch.profiler` trace saved
 - [ ] hotspot classified against `existing-fast-paths.md`

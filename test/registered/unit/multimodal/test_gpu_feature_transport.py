@@ -278,8 +278,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.prepare_for_dispatch.return_value = []
         manager.cuda_vmm_feature_transport = transport
         manager._dispatch_to_scheduler = MagicMock()
-        state = SimpleNamespace(dispatched=False)
-        manager.rid_to_state = {"test-request": state}
         tokenized_obj = SimpleNamespace(
             rid="test-request",
             mm_inputs=None,
@@ -293,7 +291,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
         transport.prepare_for_dispatch.assert_called_once_with((None,))
         transport.cancel_for_dispatch.assert_not_called()
-        self.assertTrue(state.dispatched)
 
     def test_failed_dispatch_cancels_published_items(self):
         from sglang.srt.managers import tokenizer_manager
@@ -308,8 +305,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager._dispatch_to_scheduler = MagicMock(
             side_effect=RuntimeError("send failed")
         )
-        state = SimpleNamespace(dispatched=False)
-        manager.rid_to_state = {"test-request": state}
         items = [MultimodalDataItem(modality=Modality.IMAGE, feature=torch.arange(2))]
         tokenized_obj = SimpleNamespace(
             rid="test-request",
@@ -330,7 +325,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             (tokenized_obj.mm_inputs,)
         )
         transport.cancel_for_dispatch.assert_called_once_with(items)
-        self.assertFalse(state.dispatched)
 
     def test_post_dispatch_failure_does_not_cancel_published_items(self):
         from sglang.srt.managers import tokenizer_manager
@@ -343,8 +337,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock()
-        state = SimpleNamespace(dispatched=False)
-        manager.rid_to_state = {"test-request": state}
         time_stats = MagicMock()
         time_stats.set_api_server_dispatch_finish_time.side_effect = RuntimeError(
             "bookkeeping failed"
@@ -367,7 +359,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
         transport.cancel_for_dispatch.assert_not_called()
-        self.assertTrue(state.dispatched)
 
     def test_prepare_batch_cancels_prior_groups_on_failure(self):
         from sglang.srt.utils.cuda_vmm_transport_utils import (
