@@ -87,13 +87,72 @@ def _escape_ctrl_chars_in_strings(text: str) -> str:
     return "".join(out)
 
 
+def _normalize_leading_zero_ints(text: str) -> str:
+    """Strip leading zeros from decimal int literals (``month=07`` -> ``7``).
+
+    Zero-padded integers are a ``SyntaxError`` no other rewrite recovers.
+    Only rewrites outside string literals; tokens that are already valid
+    Python (``0x``/``0o``/``0b``, floats, exponents, all-zero literals,
+    fractional parts like ``1.07``) are left untouched.
+    """
+    out: List[str] = []
+    quote: Optional[str] = None
+    index, length = 0, len(text)
+    while index < length:
+        char = text[index]
+        if quote is not None:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            out.append(char)
+            index += 1
+            continue
+        if char.isalpha() or char == "_":
+            end = index
+            while end < length and (text[end].isalnum() or text[end] == "_"):
+                end += 1
+            out.append(text[index:end])
+            index = end
+            continue
+        if char.isdigit():
+            end = index
+            while end < length and (text[end].isdigit() or text[end] == "_"):
+                end += 1
+            token = text[index:end]
+            digits = token.replace("_", "")
+            follower = text[end] if end < length else ""
+            preceded_by_dot = index > 0 and text[index - 1] == "."
+            if (
+                digits[0] == "0"
+                and digits.strip("0")
+                and not preceded_by_dot
+                and follower not in {".", "e", "E", "j", "J"}
+            ):
+                out.append(str(int(digits)))
+            else:
+                out.append(token)
+            index = end
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _recovery_candidates(content: str) -> List[str]:
     """Progressive rewrites for content that failed to parse.
 
     Each rewrite is a no-op on already-valid text; the first candidate whose
     result parses wins.
     """
-    return [_escape_ctrl_chars_in_strings(content)]
+    return [_escape_ctrl_chars_in_strings(_normalize_leading_zero_ints(content))]
 
 
 class Lfm2Detector(BaseFormatDetector):

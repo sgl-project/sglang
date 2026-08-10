@@ -4077,6 +4077,16 @@ class TestLfm2Detector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["query"], "printf a\x00b")
 
+    def test_zero_padded_int_recovered(self):
+        """Zero-padded ints (day=07) are a SyntaxError ("leading zeros in
+        decimal integer literals"); the call was dropped."""
+        text = "<|tool_call_start|>[get_weather(city='NYC', day=07)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["day"], 7)
+
     def test_streaming_recovers_multiline(self):
         """Streaming buffers the block and delegates to detect_and_parse;
         an incremental rewrite of the streaming path would bypass the
