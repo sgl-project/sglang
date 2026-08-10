@@ -35,6 +35,7 @@ from PIL import Image
 from sglang.benchmark.serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -804,7 +805,7 @@ def _subprocess_popen_with_outputs(
     # Release allocator-cached GPU memory to the driver before spawning a
     # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
     if torch.cuda.is_initialized():
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     if not return_stdout_stderr:
         return subprocess.Popen(command, stdout=None, stderr=None, env=env)
@@ -2153,11 +2154,17 @@ async def send_concurrent_generate_requests_with_custom_params(
     return await asyncio.gather(*tasks)
 
 
-def run_distributed_test(func, world_size=2, backend="nccl", **kwargs):
+def run_distributed_test(func, world_size=2, backend=None, **kwargs):
     """Spawn ``world_size`` processes, initialise torch.distributed in each,
     run *func(rank, **kwargs)*, and propagate any worker exception to the caller.
+
+    ``backend`` defaults to the resolved platform's backend ("nccl" on CUDA,
+    "xccl" on XPU, "gloo" on CPU).
     """
     import torch.multiprocessing as mp
+
+    if backend is None:
+        backend = current_platform.get_torch_distributed_backend_str()
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
@@ -2186,8 +2193,10 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
 
     import torch.distributed as dist
 
-    if backend == "nccl":
-        torch.cuda.set_device(rank)
+    # "gloo" is host-side, so there is no device to bind; every other backend
+    # is device-backed and needs this rank pinned before init_process_group.
+    if backend != "gloo":
+        current_platform.set_device(current_platform.get_device(rank))
     dist.init_process_group(
         backend=backend,
         init_method=f"tcp://127.0.0.1:{port}",
@@ -2661,7 +2670,7 @@ def empty_gpu_cache():
 
     # CUDA
     if hasattr(torch, "cuda") and torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         return
 
     # XPU (Intel)

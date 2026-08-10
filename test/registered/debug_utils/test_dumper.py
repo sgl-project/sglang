@@ -41,7 +41,11 @@ from sglang.srt.debug_utils.dumper import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import temp_set_env
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -52,6 +56,17 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=30, stage="nightly", runner_config="2-gpu-large")
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
+register_xpu_ci(est_time=360, suite="nightly-xpu-2-gpu", nightly=True)
+
+# Device-agnostic placement: these tests only need "a device-backed tensor on
+# rank N", not CUDA specifically, so they resolve the accelerator at import time
+# and run on XPU/ROCm/... as well.
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+device_backend = dist.get_default_backend_for_device(device_type)
+
+
+def _device(index: int) -> str:
+    return f"{device_type}:{index}"
 
 
 @contextmanager
@@ -468,7 +483,7 @@ class TestDumperDistributed:
 
     @staticmethod
     def _test_basic_func(rank, tmpdir):
-        tensor = torch.randn(10, 10, device=f"cuda:{rank}")
+        tensor = torch.randn(10, 10, device=_device(rank))
 
         dumper.dump("tensor_a", tensor, arg=100)
         dumper.step()
@@ -483,7 +498,7 @@ class TestDumperDistributed:
         dumper.configure(filter=None)
         dumper.step()
 
-        dumper.dump_dict("obj", {"a": torch.randn(3, device=f"cuda:{rank}"), "b": 42})
+        dumper.dump_dict("obj", {"a": torch.randn(3, device=_device(rank)), "b": 42})
         dumper.step()
 
         dist.barrier()
@@ -528,7 +543,7 @@ class TestDumperDistributed:
 
     @staticmethod
     def _test_file_content_func(rank, tmpdir):
-        tensor = torch.arange(12, device=f"cuda:{rank}").reshape(3, 4).float()
+        tensor = torch.arange(12, device=_device(rank)).reshape(3, 4).float()
 
         dumper.dump("content_check", tensor)
         dumper.step()
@@ -554,9 +569,9 @@ class TestDumperFileWriteControl:
 
     @staticmethod
     def _test_filter_func(rank, tmpdir):
-        dumper.dump("keep_this", torch.randn(5, device=f"cuda:{rank}"))
-        dumper.dump("skip_this", torch.randn(5, device=f"cuda:{rank}"))
-        dumper.dump("not_keep_this", torch.randn(5, device=f"cuda:{rank}"))
+        dumper.dump("keep_this", torch.randn(5, device=_device(rank)))
+        dumper.dump("skip_this", torch.randn(5, device=_device(rank)))
+        dumper.dump("not_keep_this", torch.randn(5, device=_device(rank)))
         dumper.step()
 
         dist.barrier()
@@ -576,7 +591,7 @@ class TestDumperFileWriteControl:
 
     @staticmethod
     def _test_save_false_func(rank, tmpdir):
-        dumper.dump("no_save_tensor", torch.randn(5, device=f"cuda:{rank}"), save=False)
+        dumper.dump("no_save_tensor", torch.randn(5, device=_device(rank)), save=False)
         dumper.step()
 
         dist.barrier()
@@ -3229,9 +3244,9 @@ def _run_graft_test(worker_func, **kwargs):
     """Spawn one GPU-using process per role (rank 0 = baseline, rank 1 = target).
 
     Limited to 1+1 because CI machines we can rely on have only 2 GPUs.
-    Each process initializes its OWN default PG (nccl, world_size=1) from
-    the start, mirroring production where baseline and target are
-    independently launched.
+    Each process initializes its OWN default PG (this platform's
+    `device_backend`, world_size=1) from the start, mirroring production
+    where baseline and target are independently launched.
 
     For asymmetric / multi-rank coverage that doesn't need GPU, see
     `_run_graft_test_cpu_multi` below.
@@ -3263,9 +3278,9 @@ def _run_graft_test(worker_func, **kwargs):
 def _graft_worker_entry(rank, role_port, worker_func, result_queue, kwargs):
     import traceback
 
-    torch.cuda.set_device(rank)
+    torch.accelerator.set_device_index(rank)
     dist.init_process_group(
-        backend="nccl",
+        backend=device_backend,
         init_method=f"tcp://127.0.0.1:{role_port}",
         world_size=1,
         rank=0,
@@ -3353,9 +3368,9 @@ def _graft_split_worker_entry(
             config=_dumper_module.DumperConfig.from_env()
         )
 
-        torch.cuda.set_device(global_rank)
+        torch.accelerator.set_device_index(global_rank)
         dist.init_process_group(
-            backend="nccl",
+            backend=device_backend,
             init_method=f"tcp://127.0.0.1:{role_port}",
             world_size=1,
             rank=0,
@@ -3480,6 +3495,7 @@ def _make_grafter_test_config(
         grafter_master_port=graft_port,
         grafter_baseline_world_size=1,
         grafter_target_world_size=1,
+        grafter_backend=device_backend,
         grafter_group_name=group_name,
         grafter_timeout=timeout,
         # Loading the user transform on the recv side; for b2t the recv is
@@ -3505,10 +3521,10 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=_device(0))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.zeros(3, device="cuda:1")
+                target = torch.zeros(3, device=_device(1))
                 with _capture_stdout() as captured:
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [1.0, 2.0, 3.0], f"got {target.tolist()}"
@@ -3538,10 +3554,10 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 1:
-                tensor = torch.tensor([4.0, 5.0, 6.0], device="cuda:1")
+                tensor = torch.tensor([4.0, 5.0, 6.0], device=_device(1))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.zeros(3, device="cuda:0")
+                target = torch.zeros(3, device=_device(0))
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [4.0, 5.0, 6.0], f"got {target.tolist()}"
         finally:
@@ -3580,10 +3596,10 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=_device(0))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.zeros(3, device="cuda:1")
+                target = torch.zeros(3, device=_device(1))
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [2.0, 4.0, 6.0], f"got {target.tolist()}"
         finally:
@@ -3606,7 +3622,7 @@ class TestGrafterDistributed:
             )
         )
         try:
-            target = torch.tensor([7.0, 7.0, 7.0], device=f"cuda:{rank}")
+            target = torch.tensor([7.0, 7.0, 7.0], device=_device(rank))
             grafter.maybe_intercept(value=target, tags={"name": "other"})
             assert target.tolist() == [7.0, 7.0, 7.0], "tensor must not be modified"
             assert grafter._pg is None, "group must not init for unmatched name"
@@ -3634,11 +3650,11 @@ class TestGrafterDistributed:
         try:
             if rank == 0:
                 # Baseline sends shape=(3,)
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=_device(0))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
                 # Target's local target has shape=(4,) — mismatch with sender.
-                target = torch.tensor([7.0, 7.0, 7.0, 7.0], device="cuda:1")
+                target = torch.tensor([7.0, 7.0, 7.0, 7.0], device=_device(1))
                 # No exception should propagate; tensor must stay unchanged.
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [
@@ -3684,10 +3700,10 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=_device(0))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.tensor([9.0, 9.0, 9.0], device="cuda:1")
+                target = torch.tensor([9.0, 9.0, 9.0], device=_device(1))
                 with _capture_stdout() as captured:
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [
@@ -3738,14 +3754,14 @@ class TestGrafterDistributed:
         try:
             if rank == 0:
                 # Baseline (sender) attaches an extras dict.
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=_device(0))
                 grafter.maybe_intercept(
                     value=tensor,
                     tags={"name": "x"},
                     extras={"fill_value": 42.0},
                 )
             else:
-                target = torch.zeros(3, device="cuda:1")
+                target = torch.zeros(3, device=_device(1))
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [
                     42.0,
@@ -3775,11 +3791,11 @@ class TestGrafterDistributed:
             with _capture_stdout() as captured:
                 if rank == 1:
                     time.sleep(4)
-                tensor = torch.tensor([1.0, 2.0, 3.0], device=f"cuda:{rank}")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=_device(rank))
                 if rank == 0:
                     grafter.maybe_intercept(value=tensor, tags={"name": "x"})
                 else:
-                    target = torch.zeros(3, device=f"cuda:{rank}")
+                    target = torch.zeros(3, device=_device(rank))
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
             output = captured.getvalue()
             if rank == 0:
@@ -3810,11 +3826,11 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=_device(0))
                 # Note: extras kwarg omitted entirely → None on the wire.
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.zeros(3, device="cuda:1")
+                target = torch.zeros(3, device=_device(1))
                 with _capture_stdout() as captured:
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
                 # Default identity transform copies tensor through; recv log
@@ -3846,8 +3862,8 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                t1 = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
-                t2 = torch.tensor([4.0, 5.0, 6.0], device="cuda:0")
+                t1 = torch.tensor([1.0, 2.0, 3.0], device=_device(0))
+                t2 = torch.tensor([4.0, 5.0, 6.0], device=_device(0))
                 grafter.maybe_intercept(value=t1, tags={"name": "x"})
                 pg_after_first = grafter._pg
                 assert pg_after_first is not None
@@ -3856,8 +3872,8 @@ class TestGrafterDistributed:
                     grafter._pg is pg_after_first
                 ), "_pg must be cached across calls, not re-initialized"
             else:
-                target1 = torch.zeros(3, device="cuda:1")
-                target2 = torch.zeros(3, device="cuda:1")
+                target1 = torch.zeros(3, device=_device(1))
+                target2 = torch.zeros(3, device=_device(1))
                 grafter.maybe_intercept(value=target1, tags={"name": "x"})
                 pg_after_first = grafter._pg
                 assert pg_after_first is not None
@@ -3905,10 +3921,10 @@ class TestGrafterDistributed:
         )
         try:
             if rank == 0:
-                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                tensor = torch.tensor([1.0, 2.0, 3.0], device=_device(0))
                 grafter.maybe_intercept(value=tensor, tags={"name": "x"})
             else:
-                target = torch.tensor([7.0, 7.0, 7.0], device="cuda:1")
+                target = torch.tensor([7.0, 7.0, 7.0], device=_device(1))
                 with _capture_stdout() as captured:
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
                 # target must be unchanged; error must be logged with traceback.
@@ -4253,6 +4269,9 @@ class TestGrafterE2eExample:
             DUMPER_GRAFTER_GROUP_NAME="grafter_e2e",
             DUMPER_GRAFTER_TIMEOUT="30",
             DUMPER_GRAFTER_TRANSFORM_PATH=f"{__name__}._e2e_transform",
+            # grafter_backend defaults to "nccl"; pin it to this platform's
+            # backend so the test isn't CUDA-only.
+            DUMPER_GRAFTER_BACKEND=device_backend,
         ):
             outputs = _run_graft_test_split(self._worker_baseline, self._worker_target)
 
@@ -4287,7 +4306,8 @@ class TestGrafterE2eExample:
         # min/max/mean/sample fields wildcard out.
         tinfo_f32_4 = (
             r"type=<class 'torch\.Tensor'> shape=torch\.Size\(\[4\]\) "
-            r"dtype=torch\.float32 device=cuda:\d stride=\(1,\) "
+            rf"dtype=torch\.float32 device={re.escape(device_type)}:\d "
+            r"stride=\(1,\) "
             r"req_grad=False .*"
         )
         diff = r"rel_diff=[-\d.eE+]+ max_abs=[-\d.eE+]+ mean_abs=[-\d.eE+]+"
@@ -4305,7 +4325,7 @@ class TestGrafterE2eExample:
             r"\A"
             f"{prefix}\\[Grafter\\] init group: role=baseline "
             r"baseline_world=1 target_world=1 rank=0 "
-            r"init_method=tcp://127\.0\.0\.1:\d+ backend=nccl "
+            rf"init_method=tcp://127\.0\.0\.1:\d+ backend={re.escape(device_backend)} "
             r"name=grafter_e2e\n"
             f"{prefix}\\[Grafter\\] recv role=baseline dir=t2b "
             f"tags={attn_input_tags} n_senders=1 "
@@ -4322,7 +4342,7 @@ class TestGrafterE2eExample:
             r"\A"
             f"{prefix}\\[Grafter\\] init group: role=target "
             r"baseline_world=1 target_world=1 rank=1 "
-            r"init_method=tcp://127\.0\.0\.1:\d+ backend=nccl "
+            rf"init_method=tcp://127\.0\.0\.1:\d+ backend={re.escape(device_backend)} "
             r"name=grafter_e2e\n"
             f"{prefix}\\[Grafter\\] send role=target dir=t2b "
             f"tags={attn_input_tags} extras={extras_lit} "
@@ -4358,7 +4378,7 @@ class TestGrafterE2eExample:
         # `_e2e_transform` runs on the recv side, asserts the dummy extras
         # made it across, then returns target's q so baseline's local
         # placeholder is overwritten via .copy_().
-        q = torch.tensor([99.0, 99.0, 99.0, 99.0], device="cuda:0")
+        q = torch.tensor([99.0, 99.0, 99.0, 99.0], device=_device(0))
         dumper.dump("attn_input", q)
         assert q.tolist() == [1.0, 2.0, 3.0, 4.0], (
             f"baseline's q should be overwritten by target's via the t->b graft, "
@@ -4382,7 +4402,7 @@ class TestGrafterE2eExample:
 
         # Step 1: graft input. target sends its real q to baseline along
         # with a dummy extras key the recv-side transform will assert on.
-        q = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda:1")
+        q = torch.tensor([1.0, 2.0, 3.0, 4.0], device=_device(1))
         dumper.dump(
             "attn_input",
             q,

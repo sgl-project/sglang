@@ -23,6 +23,7 @@ import torch.distributed as dist
 import zmq
 
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_serving
 
 # -------------------------------------- config base ------------------------------------------
@@ -1171,7 +1172,9 @@ def _get_default_exp_name(timeout_seconds: int = 60):
 
     if dist.is_initialized():
         _collective_with_timeout(
-            lambda: dist.broadcast_object_list(object_list, device="cuda"),
+            lambda: dist.broadcast_object_list(
+                object_list, device=current_platform.device_type
+            ),
             operation_name="broadcast_object_list in _get_default_exp_name",
             timeout_seconds=timeout_seconds,
         )
