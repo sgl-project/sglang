@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import (
+from flexkv.integration.sglang.connector import (
     FlexKVConnector,
     FlexKVHostReleaseShim,
 )
@@ -499,33 +499,9 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         # race the layerwise H2D writer. Waiting requests cannot own a lease
         # because every admission rejection runs before init_load_back.
 
-    def prefetch_request(self, req: "Req") -> None:
-        """Wait-complete FlexKV prefetch; see FlexKVRadixCache.prefetch_request."""
-        req.init_next_round_input(tree_cache=None, cow_mamba=False)
-        fill_ids = req.full_untruncated_fill_ids
-        if not fill_ids:
-            return
-        match_end = req._compute_max_prefix_len(len(fill_ids))
-        self.prefetch_from_storage(req.rid, None, fill_ids[:match_end])
-
-    def prefetch_from_storage(
-        self,
-        rid: str,
-        last_host_node: Any = None,
-        token_ids=None,
-        last_hash=None,
-        prefix_keys=None,
-    ) -> None:
-        del last_host_node, last_hash, prefix_keys
-        if not token_ids:
-            return
-        ids = list(token_ids)
-        if self.page_size > 1:
-            aligned = (len(ids) // self.page_size) * self.page_size
-            ids = ids[:aligned]
-        if not ids:
-            return
-        self.flexkv_connector.prefetch_async(rid, ids, sglang_req_id=rid)
+    def prefetch_from_storage(self, rid: str, last_host_node: Any, token_ids) -> None:
+        del last_host_node
+        self.flexkv_connector.prefetch_async(rid, list(token_ids), sglang_req_id=rid)
 
     def check_prefetch_progress(self, rid: str) -> bool:
         return self.flexkv_connector.check_prefetch_progress(rid)
@@ -534,9 +510,6 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self.flexkv_connector.cancel_prefetch(rid)
 
     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
-        pop = getattr(self.flexkv_connector, "pop_prefetch_loaded_tokens", None)
-        if callable(pop):
-            return int(pop(rid))
         del rid
         return 0
 

@@ -356,8 +356,6 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
-
-        self.enable_flexkv = bool(server_args.enable_flexkv)
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
@@ -2404,10 +2402,6 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
-        elif self.enable_flexkv:
-            logger.info(f"[FlexKV] sglang startprefetch: request={req.rid}")
-            # Wait-complete FlexKV prefetch: tree_cache owns token selection.
-            self.tree_cache.prefetch_request(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -2484,7 +2478,7 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hicache_storage or self.enable_flexkv:
+                if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 elif self.enable_hierarchical_cache:
@@ -2516,7 +2510,7 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                if self.enable_hicache_storage or self.enable_flexkv:
+                if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
@@ -2652,7 +2646,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        if self.enable_hicache_storage or self.enable_flexkv:
+        if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
@@ -3007,7 +3001,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage or self.enable_flexkv:
+            if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
@@ -4095,7 +4089,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage or self.enable_flexkv:
+            if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
@@ -4128,7 +4122,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                if self.enable_hicache_storage or self.enable_flexkv:
+                if self.enable_hicache_storage:
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(rid=req.rid), req
@@ -4152,7 +4146,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    if self.enable_hicache_storage or self.enable_flexkv:
+                    if self.enable_hicache_storage:
                         self.tree_cache.release_aborted_request(req.rid)
 
                     if hasattr(req.disagg_kv_sender, "abort"):

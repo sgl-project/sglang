@@ -9,10 +9,7 @@ contract is identical:
 * MP (synchronous) mode — the default.
   ``match_prefix`` fires only a FlexKV LOOKUP and returns ``host_hit_length``;
   the scheduler then calls :meth:`init_load_back` at dispatch time which
-  allocates slots and fires the FlexKV RETRIEVE. With ``--enable-flexkv``,
-  the scheduler also runs enqueue-time :meth:`prefetch_from_storage` and
-  waits via :meth:`check_prefetch_progress` so Remote/Mooncake blocks are
-  on CPU before lookup/retrieve (compute GET no longer issues REMOTE2H).
+  allocates slots and fires the FlexKV RETRIEVE.
 
 * IP (layerwise) mode — enabled with ``FLEXKV_ENABLE_LAYERWISE_TRANSFER=1``.
   ``match_prefix`` allocates uncached slots and kicks off a layerwise
@@ -44,7 +41,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import (
+from flexkv.integration.sglang.connector import (
     FlexKVConnector,
     FlexKVHostReleaseShim,
 )
@@ -505,46 +502,13 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector.release_pending(rid)
         self.flexkv_connector.cancel_prefetch(rid)
 
-    def prefetch_request(self, req: "Req") -> None:
-        """Wait-complete FlexKV prefetch for a queued request.
-
-        Owns fill-id refresh / page alignment so the scheduler only needs
-        ``tree_cache.prefetch_request(req)``. Does not call FlexKV lookup
-        (that happens at admission after prefetch completes).
-        """
-        req.init_next_round_input(tree_cache=None, cow_mamba=False)
-        fill_ids = req.full_untruncated_fill_ids
-        if not fill_ids:
-            return
-        match_end = req._compute_max_prefix_len(len(fill_ids))
-        tokens = fill_ids[:match_end]
-        self.prefetch_from_storage(req.rid, None, tokens)
-
     def prefetch_from_storage(
-        self,
-        rid: str,
-        last_host_node=None,
-        token_ids=None,
-        last_hash=None,
-        prefix_keys=None,
+        self, rid: str, last_host_node: TreeNode, token_ids
     ) -> None:
-        """Kick off FlexKV prefetch (SSD/Remote/Mooncake → CPU).
-
-        Extra HiCache-style args (``last_host_node`` / hashes) are ignored;
-        FlexKV addresses blocks by token ids.
-        """
-        del last_host_node, last_hash, prefix_keys
-        if not token_ids:
-            return
-        ids = list(token_ids)
-        if self.page_size > 1:
-            aligned = (len(ids) // self.page_size) * self.page_size
-            ids = ids[:aligned]
-        if not ids:
-            return
+        """Kick off an opportunistic prefetch (SSD/Remote → CPU)."""
         try:
             self.flexkv_connector.prefetch_async(
-                rid, ids, sglang_req_id=rid
+                rid, list(token_ids), sglang_req_id=rid
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] prefetch_from_storage: %s", exc)
@@ -556,11 +520,7 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector.cancel_prefetch(rid)
 
     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
-        pop = getattr(self.flexkv_connector, "pop_prefetch_loaded_tokens", None)
-        if callable(pop):
-            return int(pop(rid))
-        # Fallback until connector exposes actual prefetch hit length (M1).
-        del rid
+        # FlexKV doesn't expose per-rid prefetched token counts yet.
         return 0
 
     @property
