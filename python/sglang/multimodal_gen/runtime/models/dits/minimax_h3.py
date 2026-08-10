@@ -515,9 +515,6 @@ class MiniMaxH3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.bcg_breakpoint = bcg_breakpoint
-        # Backends whose behaviour depends on where the layer sits in the stack
-        # (block-sparse schedules) read it back off the impl's prefix.
-        self.prefix = prefix
         self.tp_size = get_tp_world_size()
         if arch.num_attention_heads % self.tp_size:
             raise ValueError(
