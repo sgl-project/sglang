@@ -285,7 +285,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
 
 def get_global_expert_distribution_recorder():
-    from sglang.srt.runtime_context import get_resources
+    from sglang.srt.runtime_context import get_resources, get_schedule
 
     resources = get_resources()
     if resources.expert_distribution_recorder is None:
@@ -390,7 +390,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             (
                 expert_location_metadata.num_layers,
                 # TODO determine the max number
-                server_args.chunked_prefill_size * 8,
+                get_schedule().chunked_prefill_size * 8,
                 self._TOP_K_NUM,
             ),
             dtype=torch.int32,

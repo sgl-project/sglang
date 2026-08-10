@@ -36,7 +36,7 @@ from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 
 if TYPE_CHECKING:
 
@@ -205,7 +205,7 @@ def build_kv_cache(
                 "with Mamba/SSM models"
             )
 
-    effective_chunked_prefill_size = server_args.chunked_prefill_size
+    effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
 
