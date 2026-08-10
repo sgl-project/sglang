@@ -260,6 +260,28 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
         )
 
+    def test_abort_releases_lora_reference(self):
+        """Aborting a LoRA request should release its registry reference."""
+
+        async def run():
+            tm = _make_tokenizer_manager()
+            tm.enable_lora = True
+            tm.lora_registry = MagicMock()
+            tm.lora_registry.release = AsyncMock()
+            rid = "abort_lora_rid"
+            lora_id = "abort_lora_id"
+            state = _make_req_state(rid)
+            state.obj.lora_path = "abort_lora_path"
+            state.obj.lora_id = lora_id
+            tm.rid_to_state[rid] = state
+
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+
+            tm.lora_registry.release.assert_awaited_once_with(lora_id)
+
+        asyncio.run(run())
+
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
     """Test that _handle_batch_output removes rid from rid_to_state on completion."""
