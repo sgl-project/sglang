@@ -251,6 +251,31 @@ class KVIndexSource:
             full_to_swa_map=None,
         )
 
+    def view_for_forward_batch(self, forward_batch) -> KVIndexBatchView:
+        """Eager per-batch view, stashed on the ForwardBatch so TBO children
+        and multi-consumer forwards build it once. The captured path does NOT
+        stash — it rebuilds into the capture-stable buffers at every replay
+        prep via ``batch_view(captured=True)``."""
+        view = forward_batch.kv_index_view
+        if view is not None:
+            return view
+        max_pages = None
+        if self.enabled:
+            slc = forward_batch.seq_lens_cpu
+            if slc is not None and slc.numel() > 0:
+                max_seq = int(slc.max())
+            else:
+                # gpu_only batches carry no CPU mirror; bound by the table.
+                max_seq = self.req_to_token.shape[1]
+            max_pages = max(-(-max_seq // self.page_size), 1)
+        view = self.batch_view(
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            max_pages=max_pages,
+        )
+        forward_batch.kv_index_view = view
+        return view
+
     def _rows_for(self, bs: int) -> torch.Tensor:
         if self._rows is None or self._rows.numel() < bs:
             self._rows = torch.arange(

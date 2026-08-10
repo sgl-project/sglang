@@ -207,43 +207,79 @@ class TestDenseBlockTable(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_CUDA, "requires CUDA")
 class TestFa3MetadataDenseBlockTable(unittest.TestCase):
-    """fa3 folds the unified remap into `normal_decode_set_metadata`, the fused
-    gather that writes its captured-decode page table, so the kernel itself has
-    to get the mapping right. Two kernels back it: a page_size == 1 / no-SWA fast
-    path (what Kimi-Linear takes, since fa3 imposes no page-size constraint) and
-    a general one.
+    """fa3's captured-decode page table is written by `normal_decode_set_metadata`
+    fed with the choke point's canonical kernel page table
+    (src_is_kernel_page_table=True): the fused kernel copies the canonical
+    rows' live prefixes into the capture-stable buffer. Pinned END-TO-END:
+    build_kernel_page_table -> wrapper -> page_table must equal the python
+    reference of the dense formula, on both the page_size == 1 / no-SWA fast
+    path (what Kimi-Linear takes) and the general kernel. The static call
+    (no source flag) stays byte-identical to the pre-choke-point kernel.
     """
 
     def _run(self, page_size, *, v2p, mult, bs=5, max_ctx=2048):
         from sglang.kernels.ops.attention.metadata import normal_decode_set_metadata
+        from sglang.kernels.ops.kvcache.kernel_page_table import (
+            build_kernel_page_table,
+        )
 
         maker = TestDenseBlockTable._make_batch
         rt, rpi, sl, v2p_full = maker(self, page_size, bs=bs, max_ctx=max_ctx)
-        v2p_arg = v2p_full if v2p else None
 
         max_pages = (max_ctx + page_size - 1) // page_size
         page_table = torch.zeros((bs, max_pages), dtype=torch.int32, device=_DEV)
         cache_seqlens = torch.zeros((bs,), dtype=torch.int32, device=_DEV)
         cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=_DEV)
-        strided = torch.arange(0, max_ctx, page_size, device=_DEV)
         max_seq_pages = (int(sl.max().item()) + page_size - 1) // page_size
 
-        normal_decode_set_metadata(
-            cache_seqlens,
-            cu_seqlens_k,
-            page_table,
-            rt,
-            rpi,
-            strided,
-            max_seq_pages,
-            sl.to(torch.int64),
-            0,
-            page_size,
-            v2p_page_table=v2p_arg,
-            kernel_page_multiplier=mult,
-        )
+        if v2p:
+            # The choke point's canonical, then the wrapper copies its rows.
+            canonical = torch.zeros(
+                (bs, max_pages), dtype=torch.int32, device=_DEV
+            )
+            build_kernel_page_table(
+                req_to_token=rt,
+                req_pool_indices=rpi,
+                seq_lens=sl.to(torch.int64),
+                v2p=v2p_full,
+                multiplier=mult,
+                page_size=page_size,
+                max_pages=max_pages,
+                out=canonical,
+            )
+            rows = torch.arange(bs, dtype=torch.int64, device=_DEV)
+            normal_decode_set_metadata(
+                cache_seqlens,
+                cu_seqlens_k,
+                page_table,
+                canonical,
+                rows,
+                max_seq_pages,
+                sl.to(torch.int64),
+                0,
+                page_size,
+                None,
+                None,
+                src_is_kernel_page_table=True,
+            )
+        else:
+            normal_decode_set_metadata(
+                cache_seqlens,
+                cu_seqlens_k,
+                page_table,
+                rt,
+                rpi,
+                max_seq_pages,
+                sl.to(torch.int64),
+                0,
+                page_size,
+                None,
+                None,
+            )
         torch.cuda.synchronize()
-        want = _reference(rt, rpi, sl, page_size, v2p=v2p_arg, mult=mult)
+        want = _reference(
+            rt, rpi, sl, page_size, v2p=(v2p_full if v2p else None), mult=mult
+        )
         return page_table, want, sl
 
     def _assert_live_prefix(self, got, want, sl, page_size):

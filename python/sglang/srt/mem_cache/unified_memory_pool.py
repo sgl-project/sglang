@@ -1765,7 +1765,7 @@ class UnifiedSWAKVPool(SWAKVPool):
         """Route to the right sub-pool. Both `swa_loc` and `full_loc` are PHYSICAL
         (pre-translated once per forward by the attention backend); never translates here.
         """
-        _, swa_loc, full_loc = unwrap_write_loc(loc_info)
+        loc, swa_loc, full_loc = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         pool_layer_id, is_swa = self.layers_mapping[layer_id]
         if is_swa:
@@ -1785,12 +1785,16 @@ class UnifiedSWAKVPool(SWAKVPool):
                 layer_id_override=pool_layer_id,
             )
             return
-        # Full layer: full_loc is full-physical, always precomputed (eager + cuda-graph).
-        assert full_loc is not None, (
-            "UnifiedSWAKVPool.set_kv_buffer: full layer received no full_loc; "
-            "ForwardMetadata.out_cache_loc_full_physical must be precomputed for "
-            "the unified memory pool."
-        )
+        # Full layer: the generic `loc` IS the full-side kernel-facing
+        # rail — apply_unified_kv_loc_rebind rebinds out_cache_loc before any
+        # backend sees it (backends tripwire on out_cache_loc_is_physical), so
+        # an explicit full_loc is an optional same-space alias. Triton's
+        # captured path still passes its capture-stable buffer; every other
+        # backend's 2-arg KVWriteLoc (loc, swa) falls back to loc here
+        # (an SWA model on fa3 hit the old must-be-precomputed assert at
+        # cuda-graph capture).
+        if full_loc is None:
+            full_loc = loc
         self.full_kv_pool.set_kv_buffer(
             None,
             full_loc,

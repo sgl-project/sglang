@@ -59,9 +59,11 @@ class _RecordingPool:
 
 
 class TestUnifiedSWARouting(unittest.TestCase):
-    """`UnifiedSWAKVPool.set_kv_buffer` routing: full layers write the full-physical
-    `full_loc`; SWA layers write the swa-physical `swa_loc`. Both come from the
-    write metadata; the pool never translates."""
+    """`UnifiedSWAKVPool.set_kv_buffer` routing: full layers write `full_loc`
+    when present (triton's capture-stable buffer), else the rebound generic
+    `loc` — the same id space once the loc is rebound; SWA layers write the swa-physical
+    `swa_loc`, which has no fallback (a different id space). The pool never
+    translates."""
 
     def _make_bare_pool(self):
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
@@ -96,21 +98,29 @@ class TestUnifiedSWARouting(unittest.TestCase):
         self.assertIsNot(forwarded, virtual_loc)
         self.assertNotIn("already_physical", kwargs)
 
-    def test_full_layer_requires_full_loc(self):
+    def test_full_layer_falls_back_to_generic_loc(self):
+        """Bug regression: fa3 x unified-SWA crashed at gpt-oss
+        cuda-graph capture because every backend except triton bundles the
+        2-arg KVWriteLoc(loc, swa) and the full-layer door demanded an explicit
+        full_loc. Once the loc is rebound the generic `loc` IS the full-side kernel-facing rail
+        (apply_unified_kv_loc_rebind runs before any backend sees the batch),
+        so the door must fall back to it — the pool still never translates."""
         pool = self._make_bare_pool()
-        virtual_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
+        rebound_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
         swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
 
         layer = types.SimpleNamespace(layer_id=0)
-        # No full_loc precomputed -> fail loud (the unified memory pool must precompute
-        # out_cache_loc_full_physical) rather than write a virtual loc as physical.
-        with self.assertRaises(AssertionError):
-            pool.set_kv_buffer(
-                layer,
-                _loc_info(virtual_loc, swa_phys),
-                torch.zeros(3, 4, 8),
-                torch.zeros(3, 4, 8),
-            )
+        pool.set_kv_buffer(
+            layer,
+            _loc_info(rebound_loc, swa_phys),
+            torch.zeros(3, 4, 8),
+            torch.zeros(3, 4, 8),
+        )
+
+        self.assertEqual(len(pool.full_kv_pool.calls), 1)
+        forwarded, kwargs = pool.full_kv_pool.calls[0]
+        self.assertIs(forwarded, rebound_loc)
+        self.assertNotIn("already_physical", kwargs)
 
     def test_swa_layer_writes_swa_loc(self):
         pool = self._make_bare_pool()
