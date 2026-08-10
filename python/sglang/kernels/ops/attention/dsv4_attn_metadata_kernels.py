@@ -182,7 +182,9 @@ def _expand_prefill_causally_kernel(
 
     seq_len = tl.load(seq_lens_ptr + r, mask=mask, other=0).to(tl.int32)
     ext = tl.load(extend_seq_lens_ptr + r, mask=mask, other=0).to(tl.int32)
-    start_loc = tl.sum(tl.where(started, extend[None, :], 0).to(tl.int32), axis=1) - ext
+    # start_loc == start_locs[r]. `started` selects the contiguous prefix b <= r
+    # and start_locs is monotonic, so max-reduce over the selected cumsum yields start_locs[r].
+    start_loc = tl.max(tl.where(started, start_locs[None, :], -1), axis=1)
     causal = (seq_len - ext + 1) + (t - start_loc)
     causal = tl.where(is_real, causal, 1)
 
