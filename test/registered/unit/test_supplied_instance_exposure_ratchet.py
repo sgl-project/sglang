@@ -91,7 +91,6 @@ _EXPOSED = {
     ("kv_canary/token_oracle/install.py", "sampling_backend"),
     ("layers/moe/kt_ep_wrapper.py", "chunked_prefill_size"),
     ("layers/moe/utils.py", "speculative_moe_runner_backend"),
-    ("lora/lora_manager.py", "cuda_graph_config"),
     ("managers/data_parallel_controller.py", "load_balance_method"),
     ("managers/load_snapshot.py", "load_balance_method"),
     ("managers/scheduler.py", "page_size"),
@@ -107,8 +106,6 @@ _EXPOSED = {
         "cuda_graph_config",
     ),
     ("models/sarvam_moe.py", "attention_backend"),
-    ("speculative/dspark_components/dspark_planner.py", "max_running_requests"),
-    ("speculative/dspark_components/dspark_worker_v2.py", "cuda_graph_config"),
     ("utils/common.py", "page_size"),
     ("utils/cuda_vmm_transport_utils.py", "mm_feature_transport"),
 }

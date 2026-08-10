@@ -143,16 +143,32 @@ class TestProfileSpsTable(CustomTestCase):
         self.assertEqual(table.max_batch_tokens, 256)
 
 
+_PUBLISHED = []
+
+
+def tearDownModule():
+    while _PUBLISHED:
+        _PUBLISHED.pop().restore()
+
+
 def _build_sps_cost_table_for(*, sps_table_path):
+    from sglang.srt.runtime_context import get_context, get_server_args
     from sglang.srt.speculative.dspark_components.dspark_planner import (
         build_sps_cost_table,
     )
 
-    server_args = SimpleNamespace(
+    # The table bound reads `max_running_requests` from the published bags, so
+    # the case publishes it; the table path stays on the handed record, which is
+    # what `build_sps_cost_table` takes.
+    override = get_context().override_server_args(
         speculative_dspark_sps_table_path=sps_table_path,
         max_running_requests=4,
     )
-    return build_sps_cost_table(server_args=server_args, verify_num_draft_tokens=5)
+    override.install()
+    _PUBLISHED.append(override)
+    return build_sps_cost_table(
+        server_args=get_server_args(), verify_num_draft_tokens=5
+    )
 
 
 class TestBuildSpsCostTableContract(CustomTestCase):
