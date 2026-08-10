@@ -178,39 +178,48 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     # Start a new server with multiple worker processes
     logger.info("Starting server...")
 
+    # num_gpus is the total world size across every node; each node runs
+    # its own num_gpus // nnodes local workers, offset by node_rank into the
+    # global rank space (mirrors srt's tp_size_per_node convention). With
+    # nnodes == 1 this is exactly the prior single-node arithmetic.
     num_gpus = server_args.num_gpus
+    nnodes = server_args.nnodes
+    node_rank = server_args.node_rank
+    local_num_gpus = num_gpus // nnodes
+    rank_offset = node_rank * local_num_gpus
     processes = []
 
-    # Pipes for master to talk to slaves
+    # Pipes for master to talk to slaves (local to this node)
     task_pipes_to_slaves_w = []
     task_pipes_to_slaves_r = []
-    for _ in range(num_gpus - 1):
+    for _ in range(local_num_gpus - 1):
         r, w = mp.Pipe(duplex=False)
         task_pipes_to_slaves_r.append(r)
         task_pipes_to_slaves_w.append(w)
 
-    # Pipes for slaves to talk to master
+    # Pipes for slaves to talk to master (local to this node)
     result_pipes_from_slaves_w = []
     result_pipes_from_slaves_r = []
-    for _ in range(num_gpus - 1):
+    for _ in range(local_num_gpus - 1):
         r, w = mp.Pipe(duplex=False)
         result_pipes_from_slaves_r.append(r)
         result_pipes_from_slaves_w.append(w)
 
-    # Launch all worker processes
+    # Launch this node's local worker processes
     master_port = server_args.master_port
     scheduler_pipe_readers = []
     scheduler_pipe_writers = []
 
-    for i in range(num_gpus):
+    for i in range(local_num_gpus):
+        rank = rank_offset + i
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
-        if i == 0:  # Master worker
+        if i == 0:  # This node's local pipe master
             process = mp.Process(
                 target=run_scheduler_process,
                 args=(
                     i,  # local_rank
-                    i,  # rank
+                    rank,
                     master_port,
                     server_args,
                     writer,
@@ -219,7 +228,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     task_pipes_to_slaves_w,
                     result_pipes_from_slaves_r,
                 ),
-                name=f"sglang-diffusionWorker-{i}",
+                name=f"sglang-diffusionWorker-{rank}",
                 daemon=True,
             )
         else:  # Slave workers
@@ -227,7 +236,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                 target=run_scheduler_process,
                 args=(
                     i,  # local_rank
-                    i,  # rank
+                    rank,
                     master_port,
                     server_args,
                     writer,
@@ -236,7 +245,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     task_pipes_to_slaves_r[i - 1],
                     result_pipes_from_slaves_w[i - 1],
                 ),
-                name=f"sglang-diffusionWorker-{i}",
+                name=f"sglang-diffusionWorker-{rank}",
                 daemon=True,
             )
         scheduler_pipe_readers.append(reader)
@@ -263,7 +272,8 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             data = reader.recv()
         except EOFError:
             logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+                f"Rank {rank_offset + i} scheduler is dead. Please check if "
+                "there are relevant logs."
             )
             processes[i].join()
             logger.error(f"Exit code: {processes[i].exitcode}")
@@ -277,6 +287,22 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         reader.close()
 
     logger.debug("All workers are ready")
+
+    if node_rank != 0:
+        # The TokenizerManager / HTTP surface lives on the node that owns
+        # global rank 0; this node only hosts local workers, which tear
+        # down together with the distributed group on shutdown.
+        logger.info(
+            "Node %d ready with %d local worker(s); no local HTTP surface.",
+            node_rank,
+            local_num_gpus,
+        )
+        try:
+            for p in processes:
+                p.join()
+        finally:
+            shutdown_scheduler_processes(None, processes, request_shutdown=False)
+        return processes
 
     if launch_http_server:
         if server_args.pipeline_config.task_type.is_action_gen():
@@ -411,8 +437,7 @@ def launch_pool_disagg_server(
                 "pool_work_endpoint": work_eps[inst_idx],
                 "pool_result_endpoint": result_ep,
                 "num_gpus": num_role_gpus,
-                "warmup": role_type == RoleType.ENCODER,
-                "server_warmup": False,
+                "warmup_mode": "request" if role_type == RoleType.ENCODER else "off",
                 "scheduler_port": find_port(port_cursor),
                 "master_port": find_port(port_cursor + 100),
                 # Per-role parallelism (None = auto-derive from num_gpus)
@@ -692,8 +717,7 @@ def launch_disagg_role(server_args: ServerArgs):
         "disagg_mode": True,
         "pool_work_endpoint": work_endpoint,
         "pool_result_endpoint": result_endpoint,
-        "warmup": role_type == RoleType.ENCODER,
-        "server_warmup": False,
+        "warmup_mode": "request" if role_type == RoleType.ENCODER else "off",
         "scheduler_port": internal_scheduler_port,
         # Per-role parallelism (None = auto-derive from num_gpus)
         "tp_size": role_par["tp_size"],
@@ -768,6 +792,9 @@ def launch_disagg_role(server_args: ServerArgs):
 
 def dispatch_launch(server_args: ServerArgs):
     """Route to the correct launch function based on --disagg-role."""
+    if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
+        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+
     role = server_args.disagg_role
     if role == RoleType.MONOLITHIC:
         launch_server(server_args)

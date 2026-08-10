@@ -2,18 +2,24 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from torch import nn
 
 import sglang.multimodal_gen.runtime.models.vlas.pi05_policy as pi05_policy_module
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
+    Pi05CoreModel,
     Pi05SiglipAttention,
     patch_siglip_vision_attention_to_native,
 )
 from sglang.multimodal_gen.runtime.models.vlas.pi05_policy import (
     Pi05CheckpointManifest,
     Pi05PolicyModel,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.pi05_preprocess import (
+    _preprocess_image,
+    _resize_with_pad_image_tensor,
 )
 from sglang.multimodal_gen.runtime.vla.denoise_cuda_graph import (
     VLADenoiseGraphRunner,
@@ -172,3 +178,64 @@ def test_siglip_attention_patch_uses_native_wrapper_once():
 
     assert isinstance(first, Pi05SiglipAttention)
     assert layer.self_attn is first
+
+
+def test_prefix_language_embedding_matches_openpi_scale():
+    image_embedding = torch.ones(1, 2, 8)
+    language_embedding = torch.full((1, 3, 8), 0.25)
+    model = SimpleNamespace(
+        paligemma_with_expert=SimpleNamespace(
+            embed_images=lambda images: [image_embedding],
+            embed_language_tokens=lambda tokens: language_embedding,
+        )
+    )
+
+    embeddings, _, _ = Pi05CoreModel.embed_prefix(
+        model,
+        images=[torch.zeros(1, 3, 4, 4)],
+        image_masks=[torch.ones(1, dtype=torch.bool)],
+        tokens=torch.ones(1, 3, dtype=torch.long),
+        token_masks=torch.ones(1, 3, dtype=torch.bool),
+    )
+
+    torch.testing.assert_close(
+        embeddings[:, 2:],
+        language_embedding * (language_embedding.shape[-1] ** 0.5),
+    )
+
+
+def test_uint8_resize_rounds_before_normalization():
+    image = torch.tensor([[[0.0, 1.0], [2.0, 3.0]]]) / 255.0
+
+    resized = _resize_with_pad_image_tensor(
+        image,
+        (3, 3),
+        round_to_uint8=True,
+    )
+
+    expected = (
+        torch.round(
+            torch.nn.functional.interpolate(
+                image[None], size=(3, 3), mode="bilinear", align_corners=False
+            )[0]
+            * 255.0
+        )
+        / 255.0
+    )
+    torch.testing.assert_close(resized, expected, rtol=0.0, atol=0.0)
+
+
+def test_normalized_float_image_is_not_normalized_twice():
+    image = np.full((2, 4, 3), -0.5, dtype=np.float32)
+
+    preprocessed = _preprocess_image(image, (4, 4))
+
+    assert preprocessed.shape == (3, 4, 4)
+    torch.testing.assert_close(
+        preprocessed[:, 1:3],
+        torch.full((3, 2, 4), -0.5),
+    )
+    torch.testing.assert_close(
+        preprocessed[:, (0, 3)],
+        torch.full((3, 2, 4), -1.0),
+    )

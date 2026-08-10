@@ -135,6 +135,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmFeatureTransport
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
     pyspy_dump_schedulers,
@@ -391,6 +392,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.startup_time: Optional[Dict[str, Any]] = None
         self._config_updates: List[Tuple[str, Dict[str, Any]]] = []
         self.elastic_worker_count = server_args.dp_size
         self.elastic_pending_ep_size = None
@@ -408,6 +410,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init model config
         self.init_model_config()
+        self._validate_cuda_vmm_feature_transport_support()
 
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
@@ -436,6 +439,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        # Construct this last so later initialization failures cannot orphan
+        # the transport's recycler thread.
+        self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
+            self.server_args, self.mm_processor
+        )
+
     def init_model_config(self):
         server_args = self.server_args
         model_config_class = getattr(self, "model_config_class", ModelConfig)
@@ -461,8 +470,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
-            _processor = _get_processor_wrapper(server_args)
-            transport_mode = _determine_tensor_transport_mode(self.server_args)
+            _processor = get_processor_wrapper(server_args)
+            transport_mode = determine_tensor_transport_mode(self.server_args)
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
@@ -507,6 +516,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+    def _validate_cuda_vmm_feature_transport_support(self) -> None:
+        if self.server_args.mm_feature_transport != "cuda_vmm":
+            return
+
+        from sglang.srt.model_loader.utils import get_model_architecture
+
+        model_class, _ = get_model_architecture(self.model_config)
+        if not getattr(model_class, "supports_cuda_vmm_feature_transport", False):
+            raise ValueError(
+                "--mm-feature-transport=cuda_vmm is not supported by model class "
+                f"{model_class.__name__}"
+            )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -701,6 +723,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
 
+    def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
+        self.startup_time = startup_time
+        if self.enable_metrics:
+            self.metrics_collector.emit_startup_time(startup_time)
+
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -734,6 +761,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and obj.max_thinking_tokens is not None
+            and not self.server_args.enable_strict_thinking
+        ):
+            raise ValueError(
+                "max_thinking_tokens requires the server to be launched with "
+                "--enable-strict-thinking"
+            )
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.elastic_worker_count
@@ -772,7 +808,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
-        except Exception:
+        except BaseException:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -1302,6 +1338,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
+        if isinstance(obj, GenerateReqInput) and obj.max_thinking_tokens is not None:
+            sampling_kwargs = dict(sampling_kwargs)
+            custom_params = dict(sampling_kwargs.get("custom_params") or {})
+            custom_params["thinking_budget"] = obj.max_thinking_tokens
+            sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
@@ -1507,13 +1548,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
-        tokenized_obj.time_stats.set_api_server_dispatch_time()
-        tokenized_obj = wrap_shm_features(tokenized_obj)
-        time_stats = tokenized_obj.time_stats
-        tokenized_obj.wrap_pickle_fields()
-        self._dispatch_to_scheduler(tokenized_obj)
-        tokenized_obj.time_stats = time_stats
-        tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+        prepared_mm_items = []
+        dispatched = False
+        try:
+            prepared_mm_items = self.cuda_vmm_feature_transport.prepare_for_dispatch(
+                (tokenized_obj.mm_inputs,)
+            )
+            tokenized_obj.time_stats.set_api_server_dispatch_time()
+            tokenized_obj = wrap_shm_features(tokenized_obj)
+            time_stats = tokenized_obj.time_stats
+            tokenized_obj.wrap_pickle_fields()
+            self._dispatch_to_scheduler(tokenized_obj)
+            dispatched = True
+            tokenized_obj.time_stats = time_stats
+            tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+        finally:
+            if not dispatched:
+                self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
 
     def _send_batch_request(
         self,
@@ -1522,20 +1573,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
-        set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
-        time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
-        for tokenized_obj in tokenized_objs:
-            tokenized_obj.wrap_pickle_fields()
+        prepared_mm_items = []
+        dispatched = False
+        try:
+            prepared_mm_items = self.cuda_vmm_feature_transport.prepare_for_dispatch(
+                tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
+            )
 
-        if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-            batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
-        else:
-            batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
+            set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+            time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
+            for tokenized_obj in tokenized_objs:
+                tokenized_obj.wrap_pickle_fields()
 
-        self._dispatch_to_scheduler(batch_req)
-        for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
-            tokenized_obj.time_stats = time_stat
-        set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+            if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
+                batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+            else:
+                batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
+
+            self._dispatch_to_scheduler(batch_req)
+            dispatched = True
+            for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
+                tokenized_obj.time_stats = time_stat
+            set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+        finally:
+            if not dispatched:
+                self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
 
     def _coalesce_streaming_chunks(
         self,
@@ -1826,11 +1888,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
         if not is_stream:
-            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
+            outputs = await self._collect_batch_responses(generators)
             yield outputs
         else:
-            rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+            async for response in self._stream_batch_responses(generators, rids):
+                yield response
+
+    async def _collect_batch_responses(self, generators):
+        tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(
+                *(gen.aclose() for gen in generators),
+                return_exceptions=True,
+            )
+
+    async def _stream_batch_responses(self, generators, rids):
+        rid_to_index = {rid: i for i, rid in enumerate(rids)}
+        task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+        try:
             while task_map:
                 done, _ = await asyncio.wait(
                     task_map.keys(), return_when=asyncio.FIRST_COMPLETED
@@ -1846,6 +1927,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         task_map[new_task] = gen
                     except StopAsyncIteration:
                         pass
+        finally:
+            pending_tasks = list(task_map)
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            await asyncio.gather(
+                *(gen.aclose() for gen in generators),
+                return_exceptions=True,
+            )
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.
@@ -2783,6 +2874,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._request_has_grammar(state.obj),
                 cached_tokens_details,
                 spec_verify_ct=spec_verify_ct,
+                is_streaming=getattr(state.obj, "stream", False),
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
@@ -3463,7 +3555,7 @@ async def print_exception_wrapper(func):
         sys.exit(1)
 
 
-def _get_processor_wrapper(server_args):
+def get_processor_wrapper(server_args):
     try:
         processor = get_processor(
             server_args.tokenizer_path,
@@ -3494,7 +3586,7 @@ def _get_processor_wrapper(server_args):
     return processor
 
 
-def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
     is_cross_node = server_args.dist_init_addr
 
     if is_cross_node:

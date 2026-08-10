@@ -12,8 +12,8 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_musa
+from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -46,6 +46,15 @@ if is_cuda() or is_musa():
         top_k_renorm_prob = None
         top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
+elif is_hip():
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_k_renorm_probs_triton as top_k_renorm_prob,
+    )
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_p_renorm_probs_triton as top_p_renorm_prob,
+    )
+
+    tree_speculative_sampling_target_only = None
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
@@ -54,6 +63,22 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def dflash_draft_cell_size_per_token(
+    *,
+    draft_model_config: Any,
+    draft_num_layers: int,
+    draft_kv_cache_dtype: torch.dtype,
+    tp_size: int,
+) -> int:
+    """Exact bytes/token of the DFLASH draft KV pool."""
+    if draft_num_layers <= 0:
+        return 0
+    num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
+    kv_dim_per_head = draft_model_config.head_dim + draft_model_config.v_head_dim
+    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
+    return int(num_kv_heads * kv_dim_per_head * int(draft_num_layers) * dtype_size)
 
 
 def scale_kv_cell_size_per_token_for_dflash(
@@ -602,8 +627,8 @@ def apply_dflash_simulated_acceptance(
     """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
     block_size = candidates.shape[1]
 
-    # _sample_simulated_acc_len clamps to [1, block_size].
-    forced_commit_len = _sample_simulated_acc_len(
+    # sample_simulated_acc_len clamps to [1, block_size].
+    forced_commit_len = sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, block_size
     )
     forced_accept_len = forced_commit_len - 1
@@ -832,9 +857,6 @@ def build_dflash_verify_target_probs(
 
 
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
-    if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
-
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 

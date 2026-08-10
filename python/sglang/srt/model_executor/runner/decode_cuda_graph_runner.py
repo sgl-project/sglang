@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -43,6 +44,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -101,7 +103,10 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
-from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
+from sglang.srt.utils.profile_utils import (
+    export_cuda_graph_capture_trace,
+    graph_capture_profile_dir,
+)
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -176,8 +181,12 @@ def build_replay_fb_view(
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
         # reads THAT in the decode track-save — this slot is never mutated. None
-        # when mamba-track is disabled.
-        mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
+        # when mamba-track is disabled, slice to [:bs] like every other buffer
+        mamba_track_indices=(
+            None
+            if buffers.mamba_track_indices is None
+            else buffers.mamba_track_indices[:bs]
+        ),
         spec_info=forward_batch.spec_info,
     )
 
@@ -199,6 +208,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         super().__init__(model_runner)
+        self._war_read_done_node_planted = False
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -293,6 +303,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
         self._ragged_graph_size = 0
+        # Per-tier capture layouts; their verify_lens / qo_indptr tensors are
+        # baked into the captured graphs and refreshed in place each replay.
+        self._captured_ragged_layouts: dict[int, object] = {}
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.server_args.enable_lora
@@ -373,6 +386,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
+            pp_proxy_residual_num_blocks=(
+                self.model_runner.get_pp_proxy_residual_num_blocks()
+            ),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -407,6 +423,48 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _plant_war_read_done_node(self):
+        """Record the read-done event as a graph node right after the in-graph
+        metadata hook. Safe for both full and breakable capture: capture is
+        active here (breakable opens segment 1 on context entry) and every
+        segment replays, re-arming the node. Non-capturing runs (warmup,
+        debug-eager, no external-event support) leave the flag unset and stay
+        on the fallback paths."""
+        if (
+            self.model_runner.war_read_done_event is not None
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            self.model_runner.war_read_done_event.record()
+            self._war_read_done_node_planted = True
+
+    def _war_read_done_record(self, attn_backend, forward_mode) -> SharedReadBoundary:
+        """Where this replay records its WAR read-done event; UNKNOWN records
+        nothing."""
+        if forward_mode.is_target_verify():
+            if not self.model_runner.spec_algorithm.is_war_publish_phase(forward_mode):
+                return SharedReadBoundary.UNKNOWN
+        elif not forward_mode.is_decode():
+            return SharedReadBoundary.UNKNOWN
+        boundary = attn_backend.shared_read_boundary(forward_mode)
+        if (
+            boundary is SharedReadBoundary.IN_REPLAY
+            and not self._war_read_done_node_planted
+        ):
+            # Non-capturing runs / no external-event support.
+            return SharedReadBoundary.PRE_REPLAY
+        return boundary
+
+    def _publish_war_read_done(self, in_graph: bool):
+        """Publish the read-done event the scheduler's WAR barrier waits on."""
+        if in_graph:
+            self.model_runner.war_fastpath_read_done_event = (
+                self.model_runner.war_read_done_event
+            )
+        else:
+            read_done = self.device_module.Event()
+            read_done.record()
+            self.model_runner.war_fastpath_read_done_event = read_done
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
         buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
@@ -491,11 +549,36 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_slots=self._ragged_capture_slots(num_tokens),
             num_draft_tokens=self.captured_req_width,
         )
-        return RaggedVerifyLayout.from_verify_lens(
+        layout = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=verify_lens_cpu,
             device=self.device,
             grid=self.capture_num_tokens,
         )
+        self._captured_ragged_layouts[num_tokens] = layout
+        return layout
+
+    def _stage_ragged_verify_layout(self, ragged_layout, graph_size_key: int) -> None:
+        # Without this refresh every replay reuses the capture-time synthetic
+        # verify_lens / qo_indptr and mis-slices the packed q rows.
+        cap_layout = self._captured_ragged_layouts.get(graph_size_key)
+        if cap_layout is None:
+            return
+        live = ragged_layout
+        if live.bs != cap_layout.bs or live.cap is None:
+            live = live.padded_to_bucket(
+                padded_bs=cap_layout.bs, cap=self.captured_req_width
+            )
+        cap_layout.verify_lens.copy_(live.verify_lens)
+        cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
+
+    @staticmethod
+    def _max_dp_batch_size(forward_batch: ForwardBatch) -> int:
+        request_counts = forward_batch.original_global_num_tokens_cpu
+        if request_counts is None:
+            raise RuntimeError(
+                "DP CUDA graph replay requires raw per-rank request counts"
+            )
+        return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
@@ -524,9 +607,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         if self.require_mlp_tp_gather:
-            # Raw sync values are per-rank request counts on decode-family
-            # rounds -- no width division, no per-algorithm enumeration.
-            cuda_graph_bs = max(forward_batch.original_global_num_tokens_cpu)
+            cuda_graph_bs = self._max_dp_batch_size(forward_batch)
         else:
             cuda_graph_bs = forward_batch.batch_size
 
@@ -604,11 +685,63 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and capture_hidden_mode_matches
         )
 
-    def _init_profile_context_and_memory_record(self):
-        profile_context = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True,
+    def _graph_batch_capture_active(self) -> bool:
+        """Whether the per-batch-size capture-trace feature is active.
+
+        Gated by SGLANG_GRAPH_BATCH_CAPTURE. The original single-trace export
+        (SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE) takes precedence: when both are
+        set we fall back to the original behavior.
+        """
+        return (
+            envs.SGLANG_GRAPH_BATCH_CAPTURE.get()
+            and not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get()
         )
+
+    def _init_profile_context_and_memory_record(self):
+        if self._graph_batch_capture_active():
+            # Per-batch-size capture traces (SGLANG_GRAPH_BATCH_CAPTURE): a
+            # scheduled profiler is stepped once per batch size (see
+            # FullCudaGraphBackend.capture_one) and on_trace_ready writes one
+            # chrome trace per bs.
+            rank = get_parallel().tp_rank
+            runner_name = type(self).__name__
+            trace_dir = graph_capture_profile_dir()
+            os.makedirs(trace_dir, exist_ok=True)
+
+            # Track which BS is currently being captured for trace file naming
+            self._profile_bs_list = list(reversed(self.capture_bs))
+            self._profile_bs_idx = 0
+
+            def on_trace_ready(prof):
+                bs = self._profile_bs_list[self._profile_bs_idx]
+                trace_file = os.path.join(
+                    trace_dir, f"{runner_name}_bs_{bs}_rank{rank}.json.gz"
+                )
+                prof.export_chrome_trace(trace_file)
+                logger.info(f"Saved trace for bs={bs} to {trace_file}")
+                self._profile_bs_idx += 1
+
+            profile_context = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                # Schedule: wait=2 (skip 2 dummy runs), warmup=0, active=1
+                # (capture run); repeat=0 repeats the cycle so each batch size
+                # gets its own trace.
+                schedule=torch.profiler.schedule(wait=2, warmup=0, active=1, repeat=0),
+                record_shapes=True,
+                with_stack=True,
+                with_flops=True,
+                profile_memory=True,
+                on_trace_ready=on_trace_ready,
+            )
+        else:
+            # a single unscheduled pass over the whole
+            # capture. The combined trace (if any) is exported in
+            # _post_process_after_profile via export_cuda_graph_capture_trace,
+            # gated by SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.
+            profile_context = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+            )
         torch.cuda.memory._record_memory_history()
         return profile_context
 
@@ -628,10 +761,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         logger.info(log_message)
 
-        # Optionally persist the shaped capture trace (record_shapes=True) for
-        # offline per-kernel analysis -- opt-in via
-        # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE; the in-log tables above are
-        # unchanged.
+        # single-trace export for the whole capture pass; no-op unless
+        # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE is set. In per-bs mode
+        # (SGLANG_GRAPH_BATCH_CAPTURE) that env is unset, so this stays a no-op
+        # and the per-bs on_trace_ready handles export instead.
         export_cuda_graph_capture_trace(
             prof_context,
             runner_name=type(self).__name__,
@@ -808,8 +941,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner, self.captured_req_width
             )
         profile_context = empty_context()
+        # Holds the active torch profiler during capture so the backend can
+        # advance its schedule (profiler.step()) per batch size. Only the
+        # scheduled per-bs profiler (SGLANG_GRAPH_BATCH_CAPTURE) needs stepping;
+        # the original unscheduled pass leaves this None.
+        self._profiler = None
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
+            if self._graph_batch_capture_active():
+                self._profiler = profile_context
 
         # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-
         # wide pool, so they may alias a buffer seeded by an earlier runner (the
@@ -819,6 +959,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # captured graph needs before capturing.
         self.buffers.seq_lens.fill_(self.seq_len_fill_value)
         self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+        # Capture runs real forwards, so a mid-serving recapture would index --
+        # and write KV -- through the previous batch's live values. Replay is
+        # already covered by the registry's padding policy.
+        self.buffers.reset_index_buffers()
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -842,6 +986,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
+        self._profiler = None
 
         # No pool-side pin to clear: the captured full-physical write loc rides the
         # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
@@ -921,6 +1066,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
                 # the captured graph reads already-physical locs. Base no-op for triton.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
+                self._plant_war_read_done_node()
 
                 # No invalidate_loc_cache() here: the unified pool translates its
                 # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
@@ -1032,6 +1178,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"stale ragged raw_num_token {self.raw_num_token} != "
                     f"{ragged_layout.graph_num_tokens}"
                 )
+                self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
@@ -1068,18 +1215,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 f"{raw_bs}; the planner must reject this batch before replay"
             )
             padded_num_tokens = graph_size_key
+            self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
             raw_num_token = raw_bs * self.captured_req_width
             if self.require_mlp_tp_gather:
-                max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-                max_batch_size = (
-                    max_num_tokens / self.captured_req_width
-                    if self.model_runner.spec_algorithm.is_eagle()
-                    or self.model_runner.spec_algorithm.is_standalone()
-                    or self.model_runner.spec_algorithm.is_dflash_family()
-                    else max_num_tokens
-                )
-                bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
+                max_batch_size = self._max_dp_batch_size(forward_batch)
+                bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
             else:
                 bs = self._pad_to_bucket(raw_bs, self.capture_bs)
             padded_num_tokens = bs * self.captured_req_width
@@ -1163,20 +1304,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         timer_ctx = device_timer_ctx(
             self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
-        # Publish a read-done event for the WAR barrier: a cuda-graph forward
-        # finishes its shared req_to_token / SWA reads at this pre-replay
-        # snapshot, so plain DECODE and block-draft TARGET_VERIFY qualify.
-        publish_read_done = forward_batch.forward_mode.is_decode() or (
-            forward_batch.forward_mode.is_target_verify()
-            and self.model_runner.spec_algorithm.is_dflash_family()
-        )
-        # Exception: breakable-graph verify replays (captured forward metadata)
-        # re-read req_to_token *during* replay, so the pre-replay snapshot is
-        # too early -- record the event after replay instead.
-        read_done_post_replay = (
-            publish_read_done
-            and forward_batch.forward_mode.is_target_verify()
-            and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        war_record = self._war_read_done_record(
+            self.attn_backend, forward_batch.forward_mode
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
@@ -1194,15 +1323,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         else ""
                     ),
                 )
-            if publish_read_done and not read_done_post_replay:
-                read_done = self.device_module.Event()
-                read_done.record()
-                self.model_runner.war_fastpath_read_done_event = read_done
+            if war_record is SharedReadBoundary.PRE_REPLAY:
+                self._publish_war_read_done(in_graph=False)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
-            if read_done_post_replay:
-                read_done = self.device_module.Event()
-                read_done.record()
-                self.model_runner.war_fastpath_read_done_event = read_done
+            if war_record is SharedReadBoundary.POST_REPLAY:
+                self._publish_war_read_done(in_graph=False)
+            elif war_record is SharedReadBoundary.IN_REPLAY:
+                self._publish_war_read_done(in_graph=True)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
