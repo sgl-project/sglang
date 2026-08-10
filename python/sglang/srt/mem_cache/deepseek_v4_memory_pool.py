@@ -529,6 +529,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        use_mxfp4: bool = False,
     ):
         super().__init__(
             swa_size,
@@ -607,7 +608,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.indexer_head_dim = indexer_head_dim
-        self.dsv4_kv_cache_store_mxfp4 = envs.SGLANG_OPT_DSV4_MXFP4_KVCACHE.get()
+        # Decided by the caller from kv_cache_dtype/fp4_kv_cache_recipe; the
+        # pool no longer reads environment variables directly.
+        self.dsv4_kv_cache_store_mxfp4 = use_mxfp4
 
         stage_layer_num = len(stage_ratios)
         c4_layer_num = sum(1 for r in stage_ratios if r == 4)

@@ -256,8 +256,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         device: str,
         enable_memory_saver: bool,
         global_page_size: int,
+        use_mxfp4: bool = False,
         cls: type = DeepSeekV4SingleKVPool,
     ) -> NPUDeepSeekV4SingleKVPool:
+        # MXFP4 KV cache is CUDA-only; the NPU pool ignores the flag.
+        del use_mxfp4
         # NPU does not use the HiSparse c4 device pool; fail loud if someone
         # enables it so the silent layout mismatch surfaces at init.
         assert cls is DeepSeekV4SingleKVPool, (

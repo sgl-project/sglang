@@ -529,7 +529,9 @@ class DeepseekV4AttnBackend(
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
-        self.swa_page_size = 128
+        # Logical 128-token SWA attention window. The physical SWA cache page
+        # size lives on the KV pool (``swa_page_size``).
+        self.swa_window_size = SWA_WINDOW
         assert model_runner.page_size is not None
         assert model_runner.req_to_token_pool is not None
         self.page_size = model_runner.page_size
@@ -1378,7 +1380,7 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert self.req_to_token_pool.req_to_token is self.req_to_token
 
-        assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
+        assert self.swa_window_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         if max_seq_len_override is None:
             max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
         if max_seq_len_override is not None:
@@ -1679,11 +1681,11 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            swa_window_size = token_to_kv_pool.swa_window_size
+            swa_page_size = token_to_kv_pool.swa_page_size
             assert swa_k_cache.ndim == 2
             k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
-            swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
-                swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
+            swa_k_cache = swa_k_cache[:, : swa_page_size * k_cache_total_dim].view(
+                swa_k_cache.shape[0], swa_page_size, 1, k_cache_total_dim
             )
 
             if extra_k_cache is not None:
@@ -2131,7 +2133,7 @@ class DeepseekV4AttnBackend(
                 req_to_token=self.req_to_token,
                 full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
                 swa_window_size=SWA_WINDOW,
-                swa_page_size=token_to_kv_pool.swa_window_size,
+                swa_page_size=token_to_kv_pool.swa_page_size,
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
                 total_swa=total_swa,
@@ -2302,7 +2304,7 @@ class DeepseekV4AttnBackend(
         dspark_block_size: Optional[int] = None,
         num_tokens: Optional[int] = None,
     ) -> DSV4AttnMetadata:
-        assert self.swa_page_size == SWA_WINDOW
+        assert self.swa_window_size == SWA_WINDOW
 
         prep = BuildPageTablePositions.execute(
             req_to_token=req_to_token,
