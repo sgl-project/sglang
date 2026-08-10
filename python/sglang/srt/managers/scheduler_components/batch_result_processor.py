@@ -37,7 +37,8 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_observability,
-    get_server_args,
+    mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
@@ -1073,7 +1074,7 @@ class SchedulerBatchResultProcessor:
                     prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
-                    if get_server_args().enable_mamba_extra_buffer_lazy()
+                    if mamba_extra_buffer_lazy_enabled()
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
@@ -1109,7 +1110,7 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        lazy = get_server_args().enable_mamba_extra_buffer_lazy()
+        lazy = mamba_extra_buffer_lazy_enabled()
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
             track_seqlen = req.kv_committed_len
@@ -1162,7 +1163,6 @@ class SchedulerBatchResultProcessor:
             keep_written_by_this_step = (
                 crossed and planned_pos == req.mamba_next_track_idx
             )
-            server_args = get_server_args()
             other_idx = 1 - req.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
@@ -1171,7 +1171,7 @@ class SchedulerBatchResultProcessor:
             ].item() == -1 and mamba_lazy_spec_in_window(
                 req,
                 get_exec().mamba.mamba_track_interval,
-                server_args.max_speculative_num_draft_tokens,
+                max_speculative_num_draft_tokens(),
             )
             if (
                 planned_pos is None
