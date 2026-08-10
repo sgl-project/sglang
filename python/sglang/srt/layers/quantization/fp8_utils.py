@@ -51,6 +51,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     offloader,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -65,6 +66,7 @@ _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
@@ -230,6 +232,8 @@ def use_rowwise_torch_scaled_mm():
         # The condition is determined once as the operations
         # are time consuming.
         return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
+    if _is_xpu:
+        return torch_release >= (2, 13)
     return False
 
 
@@ -526,12 +530,51 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     """
     backend = get_fp8_gemm_runner_backend()
 
+    if _is_xpu:
+        return torch_w8a8_block_fp8_linear
+
     # Handle explicit backend selection via --fp8-gemm-backend
     if not backend.is_auto():
         return _dispatch_explicit_backend(backend)
 
     # Auto mode: Select based purely on hardware/backend availability
     return _dispatch_auto_backend()
+
+
+def torch_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run block-FP8 linear with Torch's scaled_mm implementation."""
+    _, block_k = block_size
+    input_2d = input.view(-1, input.shape[-1])
+    if input_scale is None:
+        q_input, activation_scale = per_token_group_quant_fp8(input_2d, block_k)
+    else:
+        q_input = input_2d
+        activation_scale = input_scale.view(-1, input_scale.shape[-1])
+
+    if not q_input.is_contiguous():
+        q_input = q_input.contiguous()
+    if not activation_scale.is_contiguous():
+        activation_scale = activation_scale.contiguous()
+    weight_t = weight.t()
+    weight_scale_t = weight_scale.t()
+    output = torch._scaled_mm(
+        q_input,
+        weight_t,
+        scale_a=activation_scale,
+        scale_b=weight_scale_t,
+        out_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        bias=bias,
+    )
+    if isinstance(output, tuple):
+        output = output[0]
+    return output.view(*input.shape[:-1], weight.shape[0])
 
 
 def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
@@ -1923,12 +1966,27 @@ def apply_fp8_linear(
     # When the number of token is 1,
     # per-token scale has shape (1, 1), per-tensor scale has shape (1) or ().
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
-
+    rowwise_torch_scaled_mm = (
+        USE_ROWWISE_TORCH_SCALED_MM
+        and (
+            not _is_xpu
+            or (
+                x_scale.ndim == 2
+                and x_scale.shape[1] == 1
+                and x_scale.is_contiguous()
+                and weight_scale.ndim == 2
+                and weight_scale.shape[1] == 1
+                and weight_scale.t().is_contiguous()
+                # XPU fused rowwise scaled_mm is slower for decode and small prefills.
+                and qinput.shape[0] >= 64
+            )
+        )
+    )
     if (
         use_per_token_if_dynamic
         and not per_tensor_weights
         and not per_tensor_activations
-        and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
+        and (rowwise_torch_scaled_mm or _use_aiter)
     ):
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor
