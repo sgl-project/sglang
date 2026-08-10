@@ -15,10 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.verify_splitkv import (
-    _AMD_LAUNCH_KWARGS,
-    can_handle,
-)
+from sglang.kernels.ops.attention.verify_splitkv import _AMD_LAUNCH_KWARGS
 
 MAX_N_SPLITS = 32  # Grid split dim upper bound
 TARGET_PROGRAMS = 512  # Target total stage-1 programs
@@ -556,6 +553,89 @@ def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device):
     else:
         vk.grow_buffers(max_bs)
     return vk
+
+
+def can_handle(
+    q_extend,
+    k_extend,
+    v_extend,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    custom_mask,
+    is_causal,
+    mask_indptr,
+    max_len_extend,
+    sliding_window_size=-1,
+    sinks=None,
+    logit_cap=0.0,
+    xai_temperature_len=-1,
+):
+    """Return True iff the MLA split-KV verify path can serve this exact problem
+    with the same result as extend_attention_fwd. Conservative: anything not
+    explicitly handled -> False -> caller falls back to the baseline.
+
+    IMPORTANT: ``custom_mask`` is intentionally NOT inspected (its values can't
+    be read inside a captured HIP graph without a host sync). The kernel always
+    computes pure-causal attention, which equals the tree mask ONLY at
+    speculative topk == 1. The caller therefore MUST gate enablement on topk == 1
+    (TritonAttnBackend does: ``use_verify_mla = ... and self.topk == 1``).
+    At topk > 1 the tree is not causal and this path must stay disabled."""
+    # No exotic features.
+    if sinks is not None:
+        return False
+    if sliding_window_size is not None and sliding_window_size > 0:
+        return False
+    if logit_cap and logit_cap > 0:
+        return False
+    if xai_temperature_len is not None and xai_temperature_len > 0:
+        return False
+    if not is_causal:
+        return False
+    # q layout must be [tokens, H_Q, D]; head dims handled by power-of-2 pad.
+    if q_extend.dim() != 3 or k_extend.dim() != 3 or v_extend.dim() != 3:
+        return False
+    # GQA group must divide evenly.
+    h_q = q_extend.shape[1]
+    h_kv = k_extend.shape[1]
+    if h_kv == 0 or h_q % h_kv != 0:
+        return False
+    # head dims must match buffers.
+    if k_buffer.shape[1] != h_kv or v_buffer.shape[1] != h_kv:
+        return False
+    if q_extend.shape[2] != k_extend.shape[2]:
+        return False
+    if q_extend.shape[2] != k_buffer.shape[2]:
+        return False
+    if v_extend.shape[2] != v_buffer.shape[2]:
+        return False
+    # NOTE: must NOT read any tensor *values* here (no .item()/.cpu()): the
+    # target-verify step runs inside a captured CUDA/HIP graph, where a
+    # device->host sync raises hipErrorStreamCaptureUnsupported. We therefore
+    # gate purely on static shapes/dtypes/python scalars.
+    bs = qo_indptr.shape[0] - 1
+    if bs < 1:
+        return False
+    # max_len_extend must be a known positive python int (it is the static
+    # server_args.speculative_num_draft_tokens for the verify path). For
+    # topk=1 the per-seq extend len is constant == num_draft_tokens ==
+    # max_len_extend by construction of qo_indptr (arange with that step), so
+    # the L_EXT row-tile mask is exactly right and the tree custom_mask equals
+    # causal -- no value inspection required.
+    try:
+        mle = int(max_len_extend)
+    except (TypeError, ValueError):
+        return False
+    if mle < 1:
+        return False
+    # The packed extend tensor must hold exactly bs * max_len_extend rows
+    # (constant extend len). This is a pure shape check (no sync) and rejects
+    # any ragged/variable-extend batch -> falls back to the baseline.
+    if q_extend.shape[0] != bs * mle:
+        return False
+    return True
 
 
 def verify_mla_fwd(
