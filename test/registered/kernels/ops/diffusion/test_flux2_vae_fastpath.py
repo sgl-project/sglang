@@ -32,6 +32,11 @@ def test_flux2_vae_fastpath():
         gn_kernel.group_norm_silu_4d(x.contiguous(), gn.weight, gn.bias, 32, 1e-6)
         is None
     )
+    assert gn_kernel.group_norm_silu_4d(x, gn.weight.cpu(), gn.bias, 32, 1e-6) is None
+    assert (
+        gn_kernel.group_norm_silu_4d(x[..., :0, :], gn.weight, gn.bias, 32, 1e-6)
+        is None
+    )
 
     gate.enabled = True
     fast = fused_gn(x)
