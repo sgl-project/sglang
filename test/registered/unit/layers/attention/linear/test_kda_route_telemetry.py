@@ -177,6 +177,7 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
             CakePackedDecodeReason.NEGATIVE_ROW_STRIDE,
             CakePackedDecodeReason.OVERLAPPING_ROW_STRIDE,
             CakePackedDecodeReason.STORAGE_ALIAS,
+            CakePackedDecodeReason.CACHE_INDEX_UNVERIFIED,
             CakePackedDecodeReason.CACHE_INDEX_OOB,
             CakePackedDecodeReason.CACHE_INDEX_DUPLICATE,
         )
