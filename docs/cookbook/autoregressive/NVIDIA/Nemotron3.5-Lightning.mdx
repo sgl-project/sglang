@@ -1,6 +1,6 @@
 ---
 title: Nemotron3.5-Lightning
-description: "Deploy NVIDIA Nemotron 3.5 Lightning with SGLang — NVFP4 hybrid Mamba + MoE serving on a single H100 or DGX Spark, with MTP / DFlash / DSpark speculative decoding, reasoning, tool calling, and a tunable thinking budget."
+description: "Deploy NVIDIA Nemotron 3.5 Lightning with SGLang — NVFP4 serving with MTP, DFlash, and DSpark speculative decoding, reasoning, and tool calling."
 tag: NEW
 ---
 
@@ -40,7 +40,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware + recipe to generate the launch command. Both **H100** and **DGX Spark** publish four single-GPU NVFP4 operating points: **Balanced** (no speculation) plus the three validated speculative decoders — **MTP**, **DFlash**, and **DSpark**. Use the Playground below to explore knobs beyond them.
+Pick your hardware and recipe to generate the launch command. Every platform publishes four operating points: **Balanced** (no speculation) plus three speculative decoders — **MTP**, **DFlash**, and **DSpark**. Use the Playground below to explore knobs beyond them.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/nvidia/nemotron-3.5-lightning.jsx";
@@ -58,9 +58,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**NVIDIA Nemotron 3.5 Lightning** is a 30B-A3B hybrid reasoning LLM that interleaves Mamba sequence-modeling layers with Mixture-of-Experts feed-forward layers and standard self-attention, rather than a uniform "attention + MLP" transformer stack. It ships a post-training-quantized **NVFP4** checkpoint that serves on a **single H100 80GB or DGX Spark** at TP=1, and supports thinking-on / thinking-off modes plus structured tool calling.
-
-The model is published as two checkpoints, plus two standalone speculative draft models:
+**NVIDIA Nemotron 3.5 Lightning** is a 30B-A3B hybrid reasoning LLM. See the Hugging Face model cards below for architecture and evaluation details.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -79,7 +77,7 @@ The model is published as two checkpoints, plus two standalone speculative draft
     <tr style={{background: "rgba(255,255,255,0.02)"}}>
       <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16">NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16</a></strong></td>
       <td style={{padding: "9px 12px"}}>BF16</td>
-      <td style={{padding: "9px 12px"}}>Full-precision accuracy reference</td>
+      <td style={{padding: "9px 12px"}}>Full-precision reference</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/nemotron-3.5-dflash-w4a16-preview">nemotron-3.5-dflash-w4a16-preview</a></strong></td>
@@ -96,85 +94,44 @@ The model is published as two checkpoints, plus two standalone speculative draft
 
 MTP needs no separate download — the draft head is embedded in the target checkpoint.
 
-**Resources:** [HuggingFace](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4).
+## 2. Usage
 
-## 2. Configuration Tips
-
-- **Parser names are backend-specific and not interchangeable.** SGLang uses `--reasoning-parser nemotron_3` and `--tool-call-parser qwen3_coder`. vLLM uses `--reasoning-parser nemotron_v3`, and TensorRT-LLM uses `--reasoning_parser nemotron-v3` — different identifiers for the same logical capability.
-
-- **Reasoning tokens count toward `max_tokens`.** If `content` comes back as `None` with `finish_reason: "length"`, the thinking trace consumed the whole budget before an answer was produced — raise `max_tokens`.
-
-- **Hybrid Mamba memory pool.** This is a Mamba + attention hybrid, so GPU memory is split between the KV cache and the Mamba state pool. If concurrency is clamped lower than expected, or you hit a "not enough space for mamba cache" error, tune `--mamba-full-memory-ratio` (or pin `--max-mamba-cache-size`).
-
-- **Tool calling with reasoning on** requires `"force_nonempty_content": true` inside `chat_template_kwargs`. Without it, the server may not correctly surface both the reasoning trace and the tool-call output in the same response.
-
-- **DSpark requires `SGLANG_RAGGED_VERIFY_MODE=static` in the environment.** Without it, the ragged verification path picks its own mode and `--speculative-dspark-block-size` is not honored. The Deploy panel emits this as an inline environment variable on the DSpark cells.
-
-- **Platform backends differ in exactly three flags.** H100 uses `--attention-backend fa3`, a decode CUDA-graph batch cap of 16, and a 1800s watchdog; DGX Spark uses `--attention-backend flashinfer`, a cap of 4, and a 300s watchdog. Everything else — Triton Mamba, `extra_buffer` radix caching, Marlin MoE — is shared. Don't cross-apply these; the Deploy panel picks the right set per platform.
-
-## 3. Advanced Usage
-
-### 3.1 Reasoning
-
-Enable the `nemotron_3` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate thinking from the final answer. The parser is separate-field: the thinking trace lands in `message.reasoning_content` and the answer in `message.content`.
-
-The model supports two modes — Reasoning ON (default) and Reasoning OFF, toggled with `enable_thinking` in `chat_template_kwargs`.
-
-<Accordion title="Reasoning Example (Python)">
+The server speaks the OpenAI API. With `--reasoning-parser nemotron_3` enabled, the thinking trace lands in `message.reasoning_content` and the answer in `message.content`.
 
 ```python Example
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
-MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="null",
+)
 
-# Reasoning on (default)
-resp = client.chat.completions.create(
-    model=MODEL,
+response = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
     messages=[
         {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Write a haiku about GPUs."},
+        {"role": "user", "content": "Briefly explain: what is SGLang?"},
     ],
+    temperature=1.0,
+    top_p=0.95,
     max_tokens=1024,
 )
-print("Reasoning:", resp.choices[0].message.reasoning_content)
-print("Content:", resp.choices[0].message.content)
-
-# Reasoning off
-resp = client.chat.completions.create(
-    model=MODEL,
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Give me 3 interesting facts about SGLang."},
-    ],
-    max_tokens=256,
-    extra_body={"chat_template_kwargs": {"enable_thinking": False,
-                                         "force_nonempty_content": True}},
-)
-print("Content:", resp.choices[0].message.content)
+choice = response.choices[0]
+print("Reasoning:", choice.message.reasoning_content)
+print("Content:", choice.message.content)
 ```
 
-</Accordion>
+### 2.1 Tool Calling
 
-<Accordion title="Example Output">
-
-```text Output
-Pending update...
-```
-
-</Accordion>
-
-### 3.2 Tool Calling
-
-Enable the `qwen3_coder` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`.
-
-<Accordion title="Tool Calling Example (Python)">
+With `--tool-call-parser qwen3_coder` enabled, structured tool calls are returned in `message.tool_calls`.
 
 ```python Example
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
-MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="null",
+)
 
 TOOLS = [
     {
@@ -193,152 +150,13 @@ TOOLS = [
     }
 ]
 
-completion = client.chat.completions.create(
-    model=MODEL,
+response = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
     messages=[{"role": "user", "content": "My bill is $50. What will be the amount for 15% tip?"}],
     tools=TOOLS,
     max_tokens=1024,
-    extra_body={"chat_template_kwargs": {"enable_thinking": True,
-                                         "force_nonempty_content": True}},
 )
-
-choice = completion.choices[0]
-print("Reasoning:", choice.message.reasoning_content)
+choice = response.choices[0]
 print("Content:", choice.message.content)
 print("Tool calls:", choice.message.tool_calls)
 ```
-
-</Accordion>
-
-<Accordion title="Example Output">
-
-```text Output
-Pending update...
-```
-
-</Accordion>
-
-### 3.3 Controlling the Reasoning Budget
-
-To cap how long the model thinks before answering, run the thinking phase with a bounded `max_tokens`, close the trace yourself, then continue the turn through the completions endpoint with the remaining budget.
-
-<Accordion title="Reasoning Budget Example (Python)">
-
-```python Example
-from typing import Any, Dict, List
-
-import openai
-from transformers import AutoTokenizer
-
-MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
-
-
-class ThinkingBudgetClient:
-    def __init__(self, base_url: str, api_key: str, tokenizer_name_or_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
-        self.client = openai.OpenAI(base_url=base_url, api_key=api_key)
-
-    def chat_completion(
-        self,
-        model: str,
-        messages: List[Dict[str, Any]],
-        reasoning_budget: int = 512,
-        max_tokens: int = 1024,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        assert max_tokens > reasoning_budget, "reasoning_budget must be smaller than max_tokens"
-
-        response = self.client.chat.completions.create(
-            model=model, messages=messages, max_tokens=reasoning_budget, **kwargs
-        )
-        reasoning_content = response.choices[0].message.reasoning_content or ""
-        if "</think>" not in reasoning_content:
-            reasoning_content = f"{reasoning_content}.\n</think>\n\n"
-
-        reasoning_tokens_used = len(
-            self.tokenizer.encode(reasoning_content, add_special_tokens=False)
-        )
-        remaining_tokens = max_tokens - reasoning_tokens_used
-        assert remaining_tokens > 0, "Increase max_tokens or lower reasoning_budget"
-
-        messages.append({"role": "assistant", "content": reasoning_content})
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, continue_final_message=True
-        )
-        response = self.client.completions.create(
-            model=model, prompt=prompt, max_tokens=remaining_tokens, **kwargs
-        )
-        return {
-            "reasoning_content": reasoning_content.strip().strip("</think>").strip(),
-            "content": response.choices[0].text,
-            "finish_reason": response.choices[0].finish_reason,
-        }
-
-
-budget_client = ThinkingBudgetClient(
-    base_url="http://localhost:30000/v1", api_key="EMPTY", tokenizer_name_or_path=MODEL
-)
-
-resp = budget_client.chat_completion(
-    model=MODEL,
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Write a haiku about GPUs."},
-    ],
-    max_tokens=1024,
-    reasoning_budget=128,
-)
-print("Reasoning:", resp["reasoning_content"])
-print("Content:", resp["content"])
-```
-
-</Accordion>
-
-<Accordion title="Example Output">
-
-```text Output
-Pending update...
-```
-
-</Accordion>
-
-### 3.4 Speculative Decoding
-
-Three speculative decoders are validated for this model. Pick one in the **Deploy** panel's recipe selector, or layer one on top of the current cell from the **Speculative Decoding** card in the [Playground above](#playground).
-
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Decoder</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Draft source</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Shape</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px"}}><strong>MTP</strong></td>
-      <td style={{padding: "9px 12px"}}>Embedded in the target checkpoint</td>
-      <td style={{padding: "9px 12px"}}>5 steps, top-k 1, 6 draft tokens</td>
-    </tr>
-    <tr style={{background: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}><strong>DFlash</strong></td>
-      <td style={{padding: "9px 12px"}}>Standalone W4A16 draft model</td>
-      <td style={{padding: "9px 12px"}}>Depth 5 &rarr; block/verify width 6</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px"}}><strong>DSpark</strong></td>
-      <td style={{padding: "9px 12px"}}>Standalone W4A16 draft model</td>
-      <td style={{padding: "9px 12px"}}>Gamma 7 &rarr; verify width 8</td>
-    </tr>
-  </tbody>
-</table>
-
-**MTP** (Multi-Token Prediction) uses a small draft layer built into the model to guess several tokens ahead, which the model then verifies in one step. SGLang reaches that layer through its EAGLE path, so `--speculative-draft-model-path` points at the target checkpoint itself.
-
-**DFlash** does the same thing, but the guesses come from a separate draft model rather than a layer inside the model.
-
-**DSpark** also uses a separate draft model, but it proposes a whole block of tokens at once rather than one at a time. It requires `SGLANG_RAGGED_VERIFY_MODE=static` in the environment. The public draft checkpoint uses `sample_from_anchor=false` and works with static ragged verification without SPS or STS calibration tables.
-
-<Note>
-Measure acceptance length with **representative text prompts** at temperature 1. Random token IDs are useful for fixed-shape throughput measurements, but are not a valid stochastic draft-quality workload — they will understate acceptance for all three decoders.
-</Note>
