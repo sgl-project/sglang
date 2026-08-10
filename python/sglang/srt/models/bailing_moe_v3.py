@@ -588,6 +588,10 @@ class BailingMoE(nn.Module):
             ),
             num_fused_shared_experts=self.num_fused_shared_experts,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+            is_fp4_experts=(
+                quant_config is not None
+                and getattr(quant_config, "is_fp4_experts", False)
+            ),
         )
 
         # Whether to apply routed_scaling_factor at model layer.
@@ -1486,8 +1490,8 @@ class BailingMoeV3ForCausalLM(nn.Module):
                 "Only Bailing MoE V3 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
             )
-        # Check mixed routed-expert quantization. Shared experts remain in their
-        # original format and therefore cannot share a fused MoE weight tensor.
+        # w4afp8 and fp4-expert checkpoints keep shared experts in a different
+        # quant format, so they cannot share a fused MoE weight slot.
         elif self.quant_config and (
             self.quant_config.get_name() == "w4afp8"
             or getattr(self.quant_config, "is_fp4_experts", False)

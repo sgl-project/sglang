@@ -441,8 +441,8 @@ class TopK(BaseFusedOp):
             num_fused_shared_experts = 0
             output_format = TopKOutputFormat.STANDARD
 
-        # flashinfer_mxfp4 backend only: True -> STANDARD (Mxfp4FlashinferTrtllmMoEMethod
-        # consumes), False -> BYPASSED (flashinfer's own mxfp4 kernel). No-op otherwise.
+        # Under the flashinfer_mxfp4 backend, fp4-expert ckpts take STANDARD
+        # (consumes topk_ids/weights); otherwise BYPASSED. No-op on other backends.
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k,
