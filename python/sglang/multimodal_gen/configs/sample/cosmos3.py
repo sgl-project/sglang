@@ -109,6 +109,7 @@ class Cosmos3SamplingParams(SamplingParams):
             is_edge_checkpoint,
         )
 
+        # adjust distil and edge args
         distilled_sigmas = get_distilled_sigmas(server_args.model_path)
         if distilled_sigmas is not None:
             self.num_inference_steps = len(distilled_sigmas)
@@ -116,7 +117,33 @@ class Cosmos3SamplingParams(SamplingParams):
             is_edge_checkpoint(server_args.model_path),
             is_distilled=distilled_sigmas is not None,
         )
+
+        # adjust action args
+        action_output = False
+        if self.action_mode is not None:
+            self.action_mode = str(self.action_mode).strip().lower()
+            if self.action_mode not in (
+                "policy",
+                "forward_dynamics",
+                "inverse_dynamics",
+            ):
+                raise ValueError(
+                    f"Unsupported action_mode={self.action_mode!r}; expected "
+                    "'policy', 'forward_dynamics', or 'inverse_dynamics'."
+                )
+            action_output = self.action_mode != "forward_dynamics"
+
         super()._adjust(server_args)
+
+        # Policy and inverse dynamics produce actions. Forward dynamics consumes
+        # actions to produce video and therefore remains a visual request.
+        if action_output:
+            self.data_type = DataType.ACTION
+            self.save_output = False
+            self.return_file_paths_only = False
+            self.return_frames = False
+            self.output_file_name = None
+            self.output_compression = 0
 
     def _guidance_is_explicit(self) -> bool:
         explicit = getattr(self, "_explicit_fields", None)
@@ -154,6 +181,10 @@ class Cosmos3SamplingParams(SamplingParams):
                     )
 
     def _set_output_file_name(self) -> None:
+        # Action outputs never need a visual filename. This also avoids hashing
+        # in-memory observation images while base visual adjustment is running.
+        if self.action_mode in ("policy", "inverse_dynamics"):
+            return
         # The pipeline config's ``task_type=TI2V`` drives ``data_type`` to
         # VIDEO, but a single-frame request is a T2I and must pick the IMAGE
         # extension. Flip before the base derives the file name.
