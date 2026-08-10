@@ -134,29 +134,115 @@ cleanup_stale_shm() {
 }
 
 install_apt_packages() {
-    apt-get update || true
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
+        build-essential cmake rdma-core infiniband-diags perftest libibumad3
         libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
+        libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
-    apt-get install -y --no-install-recommends "${CI_APT_PACKAGES[@]}" || {
-        echo "Warning: apt-get install failed, checking if required packages are available..."
-        for pkg in "${CI_APT_PACKAGES[@]}"; do
-            if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
-                echo "ERROR: Required package $pkg is not installed and apt-get failed"
+
+    # The images bake these in, so the usual run pays apt-get update's round
+    # trips to install nothing. Skipping it costs no currency either: apt-get
+    # install only ever considers the packages named above, and a passing run
+    # leaves 100+ others un-upgraded - the image is what pins these versions.
+    local pkg
+    local -a MISSING_APT_PACKAGES=()
+    for pkg in "${CI_APT_PACKAGES[@]}"; do
+        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || MISSING_APT_PACKAGES+=("$pkg")
+    done
+
+    if [ ${#MISSING_APT_PACKAGES[@]} -eq 0 ]; then
+        echo "All required apt packages are already installed, skipping apt-get"
+    else
+        echo "Installing missing apt packages: ${MISSING_APT_PACKAGES[*]}"
+        apt-get update || true
+        apt-get install -y --no-install-recommends "${MISSING_APT_PACKAGES[@]}" || {
+            echo "ERROR: apt-get failed to install: ${MISSING_APT_PACKAGES[*]}"
+            exit 1
+        }
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_gdrcopy() {
+    # DeepEP tests only run on 4+ GPU hosts. Keep GDRCopy in the shared CUDA
+    # bootstrap while avoiding a DKMS/package build on the 1- and 2-GPU jobs.
+    local gpu_count=0
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        gpu_count=$(
+            (nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true) |
+                awk 'NF {count++} END {print count + 0}'
+        )
+    fi
+    if [ "${gpu_count}" -lt 4 ]; then
+        echo "Skipping GDRCopy install on ${gpu_count}-GPU runner"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    if ldconfig -p 2>/dev/null | grep 'libgdrapi\.so' >/dev/null; then
+        echo "GDRCopy userspace library is already installed"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    local gdrcopy_root=/opt/gdrcopy
+    local gdrcopy_version=2.5.1
+    local -a gdrcopy_packages=(
+        nvidia-dkms-580 devscripts debhelper fakeroot dkms
+        check libsubunit0 libsubunit-dev python3-venv
+    )
+
+    apt-get update || true
+    apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
+        echo "Warning: apt-get failed while installing GDRCopy build dependencies; checking installed packages"
+        local package
+        for package in "${gdrcopy_packages[@]}"; do
+            if ! dpkg -l "${package}" 2>/dev/null | grep -q '^ii'; then
+                echo "ERROR: Required GDRCopy package ${package} is unavailable"
                 exit 1
             fi
         done
-        echo "All required packages are already installed, continuing..."
     }
+
+    rm -rf "${gdrcopy_root}"
+    git clone --branch "v${gdrcopy_version}" --depth 1 \
+        https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}"
+    (
+        cd "${gdrcopy_root}/packages"
+        CUDA=/usr/local/cuda ./build-deb-packages.sh
+        dpkg -i gdrdrv-dkms_*.deb
+        dpkg -i libgdrapi_*.deb
+        dpkg -i gdrcopy-tests_*.deb
+        dpkg -i gdrcopy_*.deb
+    )
+
+    local lib_path="/usr/lib/${ARCH}-linux-gnu"
+    if [ ! -e "${lib_path}/libmlx5.so" ] && [ -e "${lib_path}/libmlx5.so.1" ]; then
+        ln -s "${lib_path}/libmlx5.so.1" "${lib_path}/libmlx5.so"
+    fi
+    ldconfig
 
     mark_step_done "${FUNCNAME[0]}"
 }
 
 clean_site_packages() {
-    # Clear torch compilation cache
-    python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
+    # Clear torch compilation cache from every location it can be in; sglang
+    # is not installed yet, so it cannot be asked which one is in use.
+    python3 -c '
+import getpass, os, shutil, tempfile
+
+sglang_cache_dir = os.environ.get("SGLANG_CACHE_DIR") or "~/.cache/sglang"
+for cache_dir in (
+    os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
+    os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()),
+    os.path.join(os.path.expanduser(sglang_cache_dir), "inductor"),
+):
+    if cache_dir:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+'
 
     # Remove broken dist-info directories (missing METADATA per PEP 376)
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
@@ -171,15 +257,62 @@ clean_site_packages() {
         set -x
     fi
 
+    # An orphaned sglang/ shadows the checkout: `uv pip uninstall` deletes only
+    # what RECORD lists, so __pycache__ keeps the directory alive without
+    # __init__.py, PathFinder claims it as a namespace portion, and the editable
+    # install's _EditableFinder sits at the END of sys.meta_path - submodule
+    # imports fail. No install leaves this directory without __init__.py.
+    if [ -d "$SITE_PACKAGES/sglang" ] && [ ! -f "$SITE_PACKAGES/sglang/__init__.py" ]; then
+        echo "Removing orphaned sglang skeleton that would shadow the checkout: $SITE_PACKAGES/sglang"
+        find "$SITE_PACKAGES/sglang" -maxdepth 2 | head -20
+        rm -rf "$SITE_PACKAGES/sglang"
+    fi
+
     # Install protoc + Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
     bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
+
+    # Same-step counterpart of the PATH export above: install_rustup.sh exports
+    # RUSTUP_TOOLCHAIN too, but as a child process only reaches later steps.
+    # rust-toolchain.toml does not cover it either - setuptools-rust runs cargo
+    # from python/, outside the pin's cwd scope - so without this an image's own
+    # older rustc builds the crates and fails their MSRV.
+    RUST_PINNED_CHANNEL=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "${REPO_ROOT}/rust/rust-toolchain.toml" 2>/dev/null || true)
+    if [ -n "${RUST_PINNED_CHANNEL}" ]; then
+        export RUSTUP_TOOLCHAIN="${RUST_PINNED_CHANNEL}"
+        echo "Using pinned Rust toolchain ${RUST_PINNED_CHANNEL} for this install"
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+setup_cargo_cache() {
+    # actions/checkout's `git clean -ffdx` deletes the gitignored in-repo
+    # rust/target, so every job recompiles the whole dependency graph. Move the
+    # target dir out of the tree: setuptools-rust has no target-dir option of its
+    # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
+    export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+    mkdir -p "${CARGO_TARGET_DIR}"
+
+    # Same disk-pressure guard as the uv cache in ci_cleanup_venv.sh (which
+    # carries the ENOSPC story). cargo cannot prune partially, so drop the whole
+    # tree and pay one cold build.
+    local used
+    used="$(df --output=pcent "${CARGO_TARGET_DIR}" 2>/dev/null | tr -dc '0-9')"
+    if [ "${used:-0}" -ge 85 ]; then
+        echo "cargo target dir filesystem at ${used}%; dropping ${CARGO_TARGET_DIR}"
+        rm -rf "${CARGO_TARGET_DIR}"
+        mkdir -p "${CARGO_TARGET_DIR}"
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
 
 setup_pip_toolchain() {
-    python3 -m pip install --upgrade pip
+    if [ "$USE_VENV" = "1" ]; then
+        # The bootstrap upgrade hit system pip; this upgrades the venv's own.
+        python3 -m pip install --upgrade pip
+    fi
 
     if [ "$USE_VENV" != "1" ]; then
         export UV_SYSTEM_PYTHON=1
@@ -191,7 +324,13 @@ setup_pip_toolchain() {
     PIP_UNINSTALL_CMD="uv pip uninstall"
     PIP_UNINSTALL_SUFFIX=""
 
-    $PIP_UNINSTALL_CMD sgl-kernel sglang-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
+    # Remove both the legacy source distribution and the SGLang wheel before
+    # resolving the pyproject pin. They own the same deep_ep module files, so
+    # leaving either installed can make pip preserve a mixed installation.
+    $PIP_UNINSTALL_CMD deep-ep sgl-deep-ep $PIP_UNINSTALL_SUFFIX || true
+
+    # sglang-kernel stays: install_sglang_kernel version-gates and reinstalls it.
+    $PIP_UNINSTALL_CMD sgl-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -282,6 +421,80 @@ uninstall_stale_flashinfer() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_pytorch_stack() {
+    PYTORCH_SPECS=()
+    for package in torch torchaudio torchvision torchao torchcodec; do
+        spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
+        if [ -n "$spec" ]; then
+            PYTORCH_SPECS+=("$spec")
+        fi
+    done
+
+    $PIP_CMD install \
+        "${PYTORCH_SPECS[@]}" \
+        --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_cuda12_deepep_wheel() {
+    if [ "$CU_MAJOR" = "13" ]; then
+        echo "CUDA 13 uses the public sgl-deep-ep wheel declared in python/pyproject.toml"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    local version
+    version=$(grep -Po -m1 '"sgl-deep-ep==\K[^"]+' python/pyproject.toml || true)
+    if [ -z "$version" ]; then
+        echo "ERROR: python/pyproject.toml must pin sgl-deep-ep"
+        exit 1
+    fi
+
+    # CUDA 12 wheels intentionally live only on the SGLang wheel index. Their
+    # local version satisfies the public-version pyproject pin, so the later
+    # editable SGLang install keeps this CUDA-matched wheel.
+    $PIP_CMD install "sgl-deep-ep==${version}+${CU_VERSION}" \
+        --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" \
+        --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+require_prebuilt_rust_exts() {
+    # Stages whose download succeeded set this to none. Runs before
+    # setup_pip_toolchain uninstalls sglang, so clearing it here still reaches
+    # install_sglang below - setup.py reads it from the environment at build time.
+    if [ "${SGLANG_BUILD_RUST_EXTS:-}" != "none" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    # Exact EXT_SUFFIX rather than a _core*.so glob: no crate sets abi3, so a module
+    # built for another minor version satisfies the glob while the import system
+    # ignores it, leaving is_rust_server_built() false and the Rust-server tests
+    # silently skipped. Stages have no setup-python, so the interpreter is whatever
+    # the image ships, and the pools are not on one version (h20 is 3.12 while
+    # h100 is 3.10) - a mismatch is drift to route around, not a failure.
+    local suffix
+    suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
+    local missing=()
+    local pkg
+    for pkg in server grpc multimodal; do
+        [ -f "python/sglang/srt/${pkg}/_core${suffix}" ] || missing+=("${pkg}")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "::warning::no prebuilt _core${suffix} for: ${missing[*]}; building from source"
+        ls -l python/sglang/srt/*/_core*.so 2>/dev/null || echo "(no extension modules at all)"
+        export SGLANG_BUILD_RUST_EXTS=
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+    echo "Using prebuilt Rust extension modules; skipping the cargo build."
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 install_sglang() {
     EXTRAS="dev,runai,tracing"
     if [ -n "$OPTIONAL_DEPS" ]; then
@@ -301,6 +514,40 @@ install_sglang() {
     fi
 
     mark_step_done "${FUNCNAME[0]}"
+}
+
+# Trust an installed wheel only if the version matches and every RECORD file is
+# on disk (dist-info can survive a partial install - cf. the cusparselt guard).
+# reject-local refuses wheels installed from a local file: a kernel-PR job
+# installs its own build under the SAME +cuXXX version string, and only file://
+# provenance (PEP 610; index installs record none) tells them apart.
+installed_wheel_ok() {
+    WHEEL_DIST="$1" WHEEL_WANTED="$2" WHEEL_REJECT_LOCAL="${3:-}" python3 - <<'EOF'
+import importlib.metadata as md
+import os
+import sys
+
+name = os.environ["WHEEL_DIST"]
+wanted = os.environ["WHEEL_WANTED"]
+try:
+    dist = md.distribution(name)
+except md.PackageNotFoundError:
+    print(f"{name} not installed (required: {wanted}); installing")
+    sys.exit(1)
+if dist.version != wanted:
+    print(f"{name} mismatch (installed: {dist.version}, required: {wanted}); reinstalling")
+    sys.exit(1)
+if os.environ["WHEEL_REJECT_LOCAL"] and "file://" in (dist.read_text("direct_url.json") or ""):
+    print(f"{name} came from a locally built wheel; reinstalling from the index")
+    sys.exit(1)
+if dist.files is None:
+    print(f"{name} has no RECORD to verify; reinstalling")
+    sys.exit(1)
+missing = [str(f) for f in dist.files if not dist.locate_file(f).exists()]
+if missing:
+    print(f"{name} is missing {len(missing)} installed files (e.g. {missing[0]}); reinstalling")
+    sys.exit(1)
+EOF
 }
 
 install_sglang_kernel() {
@@ -332,54 +579,29 @@ install_sglang_kernel() {
         fi
     fi
 
-    # Reinstall torch with matching CUDA version if needed
-    # TODO: Remove after torch 2.11 where cu13 is enabled by default
-    REINSTALL_TORCH=false
-    if TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')" 2>&1); then
-        echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
-    else
-        TORCH_IMPORT_ERROR="${TORCH_CUDA_VER}"
-        TORCH_CUDA_VER=""
-        echo "WARNING: importing torch failed while probing CUDA version; force-reinstalling torch packages."
-        printf '%s\n' "${TORCH_IMPORT_ERROR}"
-        REINSTALL_TORCH=true
-    fi
-    TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
-        REINSTALL_TORCH=true
-    else
-        for cuda_ver in "${TORCHAUDIO_CUDA_VER}" "${TORCHVISION_CUDA_VER}"; do
-            if [ -n "${cuda_ver}" ] && [ "${cuda_ver}" != "${CU_VERSION}" ]; then
-                REINSTALL_TORCH=true
-                break
-            fi
-        done
-    fi
-    if [ "${REINSTALL_TORCH}" = true ]; then
-        TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        if [ -z "${TORCH_VER}" ] || [ -z "${TORCHAUDIO_VER}" ] || [ -z "${TORCHVISION_VER}" ]; then
-            echo "ERROR: could not determine installed torch package versions before reinstall."
-            pip show torch torchaudio torchvision || true
-            exit 1
-        fi
-        echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
-        $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-    fi
-
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
-        # install_sglang above pulls sglang-kernel from PyPI, whose default wheel
-        # tracks one CUDA version (currently cu130). Force-reinstall from the
-        # CU_VERSION-matched sglang wheel index so runners on a different CUDA
-        # (e.g. h20 / cu129) get a wheel linked against the right libnvrtc.
-        $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+        # The PyPI default wheel tracks one CUDA version (currently cu130); other
+        # runners (e.g. h20 / cu129) need the +${CU_VERSION}-tagged wheel from the
+        # sglang index, linked against the right libnvrtc.
+        SGL_KERNEL_WANTED="${SGL_KERNEL_VERSION_FROM_SRT}+${CU_VERSION}"
+        if installed_wheel_ok sglang-kernel "${SGL_KERNEL_WANTED}" reject-local; then
+            echo "sglang-kernel==${SGL_KERNEL_WANTED} already installed, keeping it"
+        else
+            $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+        fi
     else
         echo "CUSTOM_BUILD_SGL_KERNEL=true: keeping freshly built sgl-kernel wheel."
     fi
     SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
     if [ "$CU_MAJOR" = "13" ]; then
+        SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}"
+    else
+        SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}+cu129"
+    fi
+    # No reject-local: nothing builds sgl-deep-gemm locally.
+    if installed_wheel_ok sgl-deep-gemm "${SGL_DEEP_GEMM_WANTED}"; then
+        echo "sgl-deep-gemm==${SGL_DEEP_GEMM_WANTED} already installed, keeping it"
+    elif [ "$CU_MAJOR" = "13" ]; then
         $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
     else
         $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
@@ -390,7 +612,6 @@ install_sglang_kernel() {
 
 install_sglang_router() {
     $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
-    $PIP_CMD list
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -554,9 +775,9 @@ prepare_runner() {
 
 setup_ld_library_path() {
     # NVIDIA pip packages and torch ship .so files under site-packages that are
-    # not on the default LD_LIBRARY_PATH.
+    # not on the default LD_LIBRARY_PATH; lib/ always nests under nvidia/.
     SITE_PACKAGES=$(python3 -c "import site, sys; print(site.getsitepackages()[0])")
-    NVIDIA_LIBS=$(find "$SITE_PACKAGES" -path "*/nvidia/*/lib" -type d 2>/dev/null | tr '\n' ':')
+    NVIDIA_LIBS=$( (find "$SITE_PACKAGES/nvidia" -type d -name lib 2>/dev/null || true) | tr '\n' ':')
     TORCH_LIB="$SITE_PACKAGES/torch/lib"
     VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
     export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -574,8 +795,44 @@ setup_ld_library_path() {
 
 verify_imports() {
     $PIP_CMD list
-    python3 -c "import torch; print(torch.version.cuda)"
-    python3 -c "import cutlass; import cutlass.cute;"
+
+    # One process; torch/cutlass do not import sglang, so the find_spec check
+    # still runs ahead of any sglang import.
+    SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+import torch
+print(torch.version.cuda)
+import deep_ep
+print(f"deep_ep loads from {deep_ep.__file__}")
+import cutlass
+import cutlass.cute
+
+# A shadowed sglang still imports, so without this the failure only surfaces
+# as a missing submodule during the test step. find_spec, not import: the
+# finders alone answer this without importing sglang.
+import importlib.util, os
+want = os.environ["SGLANG_EXPECTED_INIT"]
+spec = importlib.util.find_spec("sglang")
+if spec is None:
+    raise SystemExit("sglang is not importable at all after install")
+if spec.origin != want:
+    raise SystemExit(
+        f"sglang resolves to origin={spec.origin} "
+        f"(search={list(spec.submodule_search_locations or [])}), expected {want}; "
+        "something in site-packages is shadowing the checkout"
+    )
+print(f"sglang resolves to {spec.origin}")
+
+# Import, not find_spec: the finders locate an extension without dlopening it,
+# so a .so that cannot load passes find_spec and only fails inside some suite.
+import importlib
+for mod in ("server", "grpc", "multimodal"):
+    name = f"sglang.srt.{mod}._core"
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        raise SystemExit(f"{name} is present but does not load: {exc!r}")
+    print(f"{name} loads")
+'
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -590,10 +847,15 @@ main() {
     kill_existing_processes
     cleanup_stale_shm
     install_apt_packages
+    install_gdrcopy
     clean_site_packages
+    setup_cargo_cache
+    require_prebuilt_rust_exts
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
+    install_pytorch_stack
+    install_cuda12_deepep_wheel
     install_sglang
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.

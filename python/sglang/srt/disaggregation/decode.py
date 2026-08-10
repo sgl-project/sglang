@@ -88,7 +88,7 @@ from sglang.srt.observability.req_time_stats import (
     set_time_batch,
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel
-from sglang.srt.utils import get_num_new_pages, is_npu
+from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -211,7 +211,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         speculative_eagle_topk: Optional[int] = None,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
-        enable_gdn_replayssm_spec: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -258,7 +258,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             speculative_eagle_topk=speculative_eagle_topk,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
-            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
         )
 
     def clear(self):
@@ -406,6 +406,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if page_size > 1:
+            # Match the allocator, which charges whole pages for both pools.
+            full_len = ceil_align(full_len, page_size)
+            swa_len = ceil_align(swa_len, page_size)
         swa_reserved = self.num_reserved_decode_tokens
         if self.scheduler.server_args.disable_radix_cache:
             swa_reserved = 0
@@ -1120,8 +1125,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 hicache_reserved_tokens=reserved_restore_tokens,
             )
             if uses_swa_tail_prealloc:
-                # SWA budget uses simple decrement (no radix cache eviction in
-                # the SWA pool, so page-rounding drift is negligible).
+                # SWA has no radix cache eviction, so decrement its
+                # page-aligned requirement directly.
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = total_prefix_len
 
@@ -1249,6 +1254,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            device_page_indices = None
+            if (
+                self.scheduler.enable_hisparse
+                and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+            ):
+                # alloc_logical_only() already allocated the shared logical pages
+                # used by C4 indexer and C128 KV. These device buffers do not use
+                # the C4 sparse physical-slot mapping; carry their logical page IDs
+                # alongside the independently allocated C4 host page IDs.
+                full_kv_indices = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx,
+                    prefix_len:origin_input_len,
+                ]
+                device_page_indices = kv_to_page_indices(
+                    full_kv_indices,
+                    page_size,
+                ).astype(np.int32)
+                if self.transfer_backend != TransferBackend.MOONCAKE:
+                    raise NotImplementedError(
+                        "DSV4 HiSparse direct PD transfer currently requires "
+                        "the Mooncake backend"
+                    )
+            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if device_page_indices is not None:
+                metadata_kwargs["device_kv_indices"] = device_page_indices
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1263,7 +1294,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                decode_prefix_len=total_prefix_len,
+                **metadata_kwargs,
             )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
