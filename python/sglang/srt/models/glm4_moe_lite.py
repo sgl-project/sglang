@@ -249,6 +249,11 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
+            _shared_expert_use_tp1 = (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+            )
             self.shared_experts = Glm4MoeLiteMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -256,14 +261,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else {}
-                ),
+                **(dict(tp_rank=0, tp_size=1) if _shared_expert_use_tp1 else {}),
             )
+            self._shared_expert_tp1 = _shared_expert_use_tp1
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
             )
