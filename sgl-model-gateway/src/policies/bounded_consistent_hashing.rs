@@ -143,23 +143,14 @@ impl BoundedConsistentHashingPolicy {
         // the first match is deterministic and preserves the affinity search
         // order. If every worker is above the bound, retain the preferred
         // worker instead of failing an otherwise routable request.
-        let candidate_idx = if let Some(ring) = info.hash_ring.as_ref() {
+        let candidate_idx = info.hash_ring.as_ref().and_then(|ring| {
             ring.find_healthy_url(key, |url| {
                 healthy_url_to_idx.get(url).is_some_and(|idx| {
                     self.within_relative_bound(workers[*idx].load(), mean_healthy_load)
                 })
             })
             .and_then(|url| healthy_url_to_idx.get(url).copied())
-        } else {
-            workers
-                .iter()
-                .enumerate()
-                .find(|(_, worker)| {
-                    worker.is_healthy()
-                        && self.within_relative_bound(worker.load(), mean_healthy_load)
-                })
-                .map(|(idx, _)| idx)
-        };
+        });
 
         match candidate_idx {
             Some(idx) if idx != preferred_idx => (Some(idx), Branch::ExplicitRoutingKeySpillover),
@@ -667,7 +658,91 @@ mod tests {
     }
 
     #[test]
-    fn no_eligible_candidate_retains_preferred_worker() {
+    fn non_igw_bounded_selection_is_invariant_to_available_slice_order() {
+        let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+            max_load_skew: 1.5,
+            min_load_gap: 1,
+        });
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let key = key_for_worker(&workers, &ring, 0);
+        set_loads(&workers, &[4, 0, 0]);
+        let headers = headers_with_routing_key(&key);
+        let expected_url = ring
+            .find_healthy_url(&key, |url| url != workers[0].url())
+            .unwrap()
+            .to_string();
+
+        let forward_info = SelectWorkerInfo {
+            headers: Some(&headers),
+            hash_ring: Some(Arc::clone(&ring)),
+            ..Default::default()
+        };
+        let (forward_idx, forward_branch) = policy.select_worker_impl(&workers, &forward_info);
+        let forward_url = workers[forward_idx.unwrap()].url().to_string();
+
+        let reversed: Vec<Arc<dyn Worker>> = workers.iter().rev().cloned().collect();
+        let reversed_info = SelectWorkerInfo {
+            headers: Some(&headers),
+            hash_ring: Some(ring),
+            ..Default::default()
+        };
+        let (reversed_idx, reversed_branch) = policy.select_worker_impl(&reversed, &reversed_info);
+        let reversed_url = reversed[reversed_idx.unwrap()].url().to_string();
+
+        assert_eq!(forward_url, expected_url);
+        assert_eq!(reversed_url, expected_url);
+        assert_eq!(forward_branch, Branch::ExplicitRoutingKeySpillover);
+        assert_eq!(reversed_branch, Branch::ExplicitRoutingKeySpillover);
+
+        for _ in 0..4 {
+            workers[0].decrement_load();
+        }
+        assert!(workers.iter().all(|worker| worker.load() == 0));
+    }
+
+    #[tokio::test]
+    async fn missing_ring_retains_preferred_instead_of_slice_first_spill() {
+        let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+            max_load_skew: 1.5,
+            min_load_gap: 1,
+        });
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let key = (0..10_000)
+            .map(|index| format!("missing-ring-key-{index}"))
+            .find(|key| {
+                ConsistentHashingPolicy::find_by_consistent_hash(
+                    &workers,
+                    &SelectWorkerInfo::default(),
+                    key,
+                ) == Some(2)
+            })
+            .expect("could not find a no-ring modulo key for worker 2");
+        set_loads(&workers, &[0, 0, 4]);
+        let headers = headers_with_routing_key(&key);
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            hash_ring: None,
+            ..Default::default()
+        };
+
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(2));
+        assert_eq!(branch, Branch::ExplicitRoutingKeyNoEligibleCandidate);
+        assert_eq!(
+            branch.as_str(),
+            "explicit_routing_key_no_eligible_candidate"
+        );
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
+
+        for _ in 0..4 {
+            workers[2].decrement_load();
+        }
+        assert!(workers.iter().all(|worker| worker.load() == 0));
+    }
+
+    #[tokio::test]
+    async fn no_eligible_candidate_retains_preferred_worker() {
         // Public validation rejects max_load_skew < 1.0. Constructing the
         // policy directly exercises the defensive no-candidate fallback.
         let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
@@ -678,10 +753,27 @@ mod tests {
         let ring = Arc::new(HashRing::new(&workers));
         let key = key_for_worker(&workers, &ring, 0);
         set_loads(&workers, &[4, 1]);
+        let headers = headers_with_routing_key(&key);
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            hash_ring: Some(ring),
+            ..Default::default()
+        };
 
-        let (result, branch) = select_explicit(&policy, &workers, &ring, &key);
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(0));
         assert_eq!(branch, Branch::ExplicitRoutingKeyNoEligibleCandidate);
+        assert_eq!(
+            branch.as_str(),
+            "explicit_routing_key_no_eligible_candidate"
+        );
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+
+        for _ in 0..4 {
+            workers[0].decrement_load();
+        }
+        workers[1].decrement_load();
+        assert!(workers.iter().all(|worker| worker.load() == 0));
     }
 
     #[test]

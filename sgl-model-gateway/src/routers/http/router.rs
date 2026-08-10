@@ -163,10 +163,15 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self
-            .worker_registry
-            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+        // Use the aggregate Regular+HTTP ring only for the explicit-key
+        // non-IGW bounded path. All strict/implicit/anonymous paths preserve
+        // their existing model-ring source.
+        let hash_ring = if self.should_use_non_igw_bounded_ring(policy.name(), headers) {
+            self.worker_registry.get_non_igw_regular_http_hash_ring()
+        } else {
+            self.worker_registry
+                .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID))
+        };
 
         let idx = policy
             .select_worker(
@@ -351,6 +356,17 @@ impl Router {
             policy_name,
             "cache_aware" | "manual" | "bounded_consistent_hashing"
         )
+    }
+
+    #[inline]
+    fn should_use_non_igw_bounded_ring(
+        &self,
+        policy_name: &str,
+        headers: Option<&HeaderMap>,
+    ) -> bool {
+        !self.enable_igw
+            && policy_name == "bounded_consistent_hashing"
+            && header_utils::extract_routing_key(headers).is_some()
     }
 
     // Generic simple routing for GET/POST without JSON body
@@ -861,14 +877,16 @@ impl RouterTrait for Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::BasicWorkerBuilder;
+    use crate::{
+        config::types::PolicyConfig,
+        core::{BasicWorkerBuilder, ModelCard},
+        policies::ConsistentHashingPolicy,
+    };
 
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(
-            crate::config::types::PolicyConfig::RoundRobin,
-        ));
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
         // Register test workers
         let worker1 = BasicWorkerBuilder::new("http://worker1:8080")
@@ -895,6 +913,20 @@ mod tests {
         let workers = router.worker_registry.get_all();
         workers[0].set_healthy(false);
         router
+    }
+
+    fn create_test_hashing_router(
+        worker_registry: Arc<WorkerRegistry>,
+        policy: PolicyConfig,
+    ) -> Router {
+        Router {
+            worker_registry,
+            policy_registry: Arc::new(PolicyRegistry::new(policy)),
+            dp_aware: false,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            enable_igw: false,
+        }
     }
 
     #[test]
@@ -939,5 +971,132 @@ mod tests {
         assert!(Router::policy_tracks_worker_load("cache_aware"));
         assert!(Router::policy_tracks_worker_load("manual"));
         assert!(!Router::policy_tracks_worker_load("consistent_hashing"));
+    }
+
+    #[test]
+    fn non_igw_aggregate_ring_is_scoped_to_bounded_explicit_keys() {
+        let mut router = create_test_regular_router();
+        let mut explicit_headers = HeaderMap::new();
+        explicit_headers.insert("x-smg-routing-key", HeaderValue::from_static("session-key"));
+
+        assert!(router.should_use_non_igw_bounded_ring(
+            "bounded_consistent_hashing",
+            Some(&explicit_headers),
+        ));
+        assert!(
+            !router.should_use_non_igw_bounded_ring("consistent_hashing", Some(&explicit_headers),)
+        );
+
+        let mut implicit_headers = HeaderMap::new();
+        implicit_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer implicit-session"),
+        );
+        assert!(!router.should_use_non_igw_bounded_ring(
+            "bounded_consistent_hashing",
+            Some(&implicit_headers),
+        ));
+        assert!(!router.should_use_non_igw_bounded_ring("bounded_consistent_hashing", None));
+
+        router.enable_igw = true;
+        assert!(!router.should_use_non_igw_bounded_ring(
+            "bounded_consistent_hashing",
+            Some(&explicit_headers),
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_igw_hashing_scope_preserves_actual_worker_mapping() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for url in [
+            "http://scope-a:8080",
+            "http://scope-b:8080",
+            "http://scope-c:8080",
+        ] {
+            worker_registry.register(Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .model(ModelCard::new("served-model"))
+                    .build(),
+            ));
+        }
+
+        assert!(worker_registry.get_hash_ring(UNKNOWN_MODEL_ID).is_none());
+        let available = worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Regular),
+            Some(ConnectionMode::Http),
+            None,
+            false,
+        );
+        let ring = worker_registry
+            .get_non_igw_regular_http_hash_ring()
+            .unwrap();
+        let (key, ring_url, modulo_url) = (0..10_000)
+            .find_map(|index| {
+                let key = format!("scope-preservation-key-{index}");
+                let ring_url = ring.find_healthy_url(&key, |_| true)?;
+                let modulo_idx = ConsistentHashingPolicy::find_by_consistent_hash(
+                    &available,
+                    &SelectWorkerInfo::default(),
+                    &key,
+                )?;
+                let modulo_url = available[modulo_idx].url();
+                (ring_url != modulo_url)
+                    .then(|| (key, ring_url.to_string(), modulo_url.to_string()))
+            })
+            .expect("could not distinguish aggregate-ring and no-ring mappings");
+
+        let bounded = create_test_hashing_router(
+            Arc::clone(&worker_registry),
+            PolicyConfig::BoundedConsistentHashing {
+                max_load_skew: 1.5,
+                min_load_gap: 1,
+            },
+        );
+        let mut explicit = HeaderMap::new();
+        explicit.insert("x-smg-routing-key", key.parse().unwrap());
+        let selected = bounded
+            .select_worker_for_model(Some("served-model"), None, Some(&explicit))
+            .await
+            .unwrap();
+        assert_eq!(selected.url(), ring_url);
+
+        let modulo_worker = worker_registry.get_by_url(&modulo_url).unwrap();
+        for _ in 0..4 {
+            modulo_worker.increment_load();
+        }
+        for header_name in ["authorization", "x-forwarded-for", "cookie"] {
+            let mut implicit = HeaderMap::new();
+            implicit.insert(header_name, key.parse().unwrap());
+            let selected = bounded
+                .select_worker_for_model(Some("served-model"), None, Some(&implicit))
+                .await
+                .unwrap();
+            assert_eq!(selected.url(), modulo_url, "implicit header {header_name}");
+        }
+        for _ in 0..4 {
+            modulo_worker.decrement_load();
+        }
+        assert_eq!(modulo_worker.load(), 0);
+
+        let strict = create_test_hashing_router(
+            Arc::clone(&worker_registry),
+            PolicyConfig::ConsistentHashing,
+        );
+        let selected = strict
+            .select_worker_for_model(Some("served-model"), None, Some(&explicit))
+            .await
+            .unwrap();
+        assert_eq!(selected.url(), modulo_url);
+
+        let mut targeted = explicit;
+        targeted.insert("x-smg-target-worker", HeaderValue::from_static("0"));
+        let selected = bounded
+            .select_worker_for_model(Some("served-model"), None, Some(&targeted))
+            .await
+            .unwrap();
+        assert_eq!(selected.url(), available[0].url());
     }
 }
