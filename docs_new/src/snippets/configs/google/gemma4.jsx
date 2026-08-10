@@ -3,9 +3,11 @@
 //
 // MIGRATED from the legacy Gemma 4 interactive command generator. Faithful port:
 // every cell mirrors the legacy generator's output for that combination verbatim
-// (modulo the {{HOST_IP}}/{{PORT}} tail + the EAGLE alias rewrite). No cell is
-// `verified` — the legacy page carried no per-combo green-badge data and
-// migration never flips a cell to verified.
+// (modulo the {{HOST_IP}}/{{PORT}} tail). The legacy generator emits
+// `--speculative-algorithm NEXTN`; NEXTN is SGLang's CLI alias that resolves to the
+// EAGLE builtin (speculative/spec_registry.py), so cells emit `--speculative-algorithm
+// EAGLE`. No cell is `verified` — the legacy page carried no per-combo
+// green-badge data and migration never flips a cell to verified.
 //
 // 5-dim mapping (legacy control -> new home):
 //   modelSize  -> variant (e2b/e4b/12b/31b/26b-a4b)
@@ -36,7 +38,7 @@
 export const config = {
   modelName: "Gemma 4",
 
-  supportedHardware: ["h200", "b200", "mi300x"],
+  supportedHardware: ["h200", "b200", "b300", "mi300x"],
 
   // 2nd dim — model sizes (the legacy "Model Variant" radio).
   variants: [
@@ -89,13 +91,12 @@ export const config = {
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
-  // ⚡ Reproduce commands. The legacy benchmark numbers were measured on the
-  // "gemma4 branch" — a moving development ref, not a reproducible anchor — so the
-  // measured results (speed AND accuracy) are dropped (no -benchmarks.jsx). These
-  // commands stay so users can re-measure against a pinned build (e.g. the Gemma 4
-  // enabling PR #21952, or any release that ships it). GSM8K is the chat-template
-  // run_eval harness (the few-shot completion harness under-elicits the
-  // reasoning-oriented variants — see Configuration Tips).
+  // ⚡ Reproduce commands. Speed numbers are build-sensitive and dropped; accuracy
+  // numbers are build-robust and kept (see gemma4-benchmarks.jsx). These commands let
+  // users re-measure against a pinned build that ships the Gemma 4 encoder-free unified
+  // family (sgl-project/sglang#27167). GSM8K uses the chat-template run_eval harness (the
+  // few-shot completion harness under-elicits the reasoning-oriented variants — see
+  // Configuration Tips).
   benchmarkCommands: {
     speed:
 `python3 -m sglang.bench_serving \\
@@ -106,15 +107,26 @@ export const config = {
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
     accuracy: {
-      gsm8k_pct:
+      gsm8k:
 `# Chat-template harness (robust answer extraction for the reasoning-oriented variants)
 python3 -m sglang.test.run_eval \\
   --eval-name gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}}`,
     },
-    numPromptsByConc: { 1: 10, 100: 1000 },
+    numPromptsByConc: { 1: 8, 16: 64, 1024: 2048, 4096: 8192 },
   },
+
+  // Eval set shown in the Accuracy card + ⚡ Reproduce modal. REQUIRED whenever
+  // benchmarks carry accuracy data (the engine ships no default eval set). Keys
+  // match the `accuracy` fields in gemma4-benchmarks.jsx + benchmarkCommands.accuracy.
+  // Values are stored as the legacy page reported them (0–1 fractions, e.g. 0.720),
+  // so the unit is blank — the engine renders the value verbatim.
+  accuracyLabels: [
+    ["mmlu",  "MMLU",       ""],
+    ["mmmu",  "MMMU (val)", ""],
+    ["gsm8k", "GSM8K",      ""],
+  ],
 
   // Per-hw image for the `docker run` framing. The legacy page pinned dedicated
   // multi-arch (amd64 + arm64) Gemma-4 dev images; copy them verbatim. AMD ROCm
@@ -123,6 +135,7 @@ python3 -m sglang.test.run_eval \\
   dockerImages: {
     h200:   "lmsysorg/sglang:dev-gemma-4-12B",
     b200:   "lmsysorg/sglang:dev-gemma-4-12B",
+    b300:   "lmsysorg/sglang:dev-gemma-4-12B",
     mi300x: "lmsysorg/sglang:dev-rocm720-mi30x",
   },
 
@@ -195,7 +208,8 @@ python3 -m sglang.test.run_eval \\
 
   // ===== Cells — faithful 1:1 port of the legacy generator output (parsers
   // stripped to the Playground axis; spec flags baked into the low-latency tier;
-  // EAGLE = the NEXTN alias the legacy generator emitted). All YELLOW. =====
+  // the legacy generator's --speculative-algorithm NEXTN is emitted as its resolved
+  // EAGLE builtin — NEXTN is SGLang's CLI alias for EAGLE). All YELLOW. =====
   cells: [
     {
       match: { hw: "h200", variant: "e4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
@@ -323,7 +337,14 @@ python3 -m sglang.test.run_eval \\
       ],
     },
     {
+      // Pending — the upstream QAT checkpoint (google/gemma-4-12B-it-qat-q4_0-unquantized)
+      // is erroneous vs current sglang: its vision_config omits `model_patch_size` (the bf16
+      // sibling ships 48), and its vision-embedder weights are 640-wide while sglang's
+      // gemma4_unified builds them as model_patch_size**2*3. Injecting the field only surfaces
+      // a weight-shape mismatch (640 vs 1536), so no serving flag can load it — needs an
+      // upstream sglang model-def / checkpoint fix. Verified broken on H200/B200/B300 @ 0.5.16.
       match: { hw: "h200", variant: "12b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -338,7 +359,14 @@ python3 -m sglang.test.run_eval \\
       ],
     },
     {
+      // Pending — the upstream QAT checkpoint (google/gemma-4-12B-it-qat-q4_0-unquantized)
+      // is erroneous vs current sglang: its vision_config omits `model_patch_size` (the bf16
+      // sibling ships 48), and its vision-embedder weights are 640-wide while sglang's
+      // gemma4_unified builds them as model_patch_size**2*3. Injecting the field only surfaces
+      // a weight-shape mismatch (640 vs 1536), so no serving flag can load it — needs an
+      // upstream sglang model-def / checkpoint fix. Verified broken on H200/B200/B300 @ 0.5.16.
       match: { hw: "h200", variant: "12b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -579,7 +607,14 @@ python3 -m sglang.test.run_eval \\
       ],
     },
     {
+      // Pending — the upstream QAT checkpoint (google/gemma-4-12B-it-qat-q4_0-unquantized)
+      // is erroneous vs current sglang: its vision_config omits `model_patch_size` (the bf16
+      // sibling ships 48), and its vision-embedder weights are 640-wide while sglang's
+      // gemma4_unified builds them as model_patch_size**2*3. Injecting the field only surfaces
+      // a weight-shape mismatch (640 vs 1536), so no serving flag can load it — needs an
+      // upstream sglang model-def / checkpoint fix. Verified broken on H200/B200/B300 @ 0.5.16.
       match: { hw: "b200", variant: "12b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -594,7 +629,14 @@ python3 -m sglang.test.run_eval \\
       ],
     },
     {
+      // Pending — the upstream QAT checkpoint (google/gemma-4-12B-it-qat-q4_0-unquantized)
+      // is erroneous vs current sglang: its vision_config omits `model_patch_size` (the bf16
+      // sibling ships 48), and its vision-embedder weights are 640-wide while sglang's
+      // gemma4_unified builds them as model_patch_size**2*3. Injecting the field only surfaces
+      // a weight-shape mismatch (640 vs 1536), so no serving flag can load it — needs an
+      // upstream sglang model-def / checkpoint fix. Verified broken on H200/B200/B300 @ 0.5.16.
       match: { hw: "b200", variant: "12b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -664,7 +706,7 @@ python3 -m sglang.test.run_eval \\
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
         "--speculative-eagle-topk 1",
-        "--mem-fraction-static 0.9",
+        "--mem-fraction-static 0.75",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -674,7 +716,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--mem-fraction-static 0.9",
+        "--mem-fraction-static 0.75",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -690,7 +732,7 @@ python3 -m sglang.test.run_eval \\
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
         "--speculative-eagle-topk 1",
-        "--mem-fraction-static 0.9",
+        "--mem-fraction-static 0.75",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -700,6 +742,292 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--mem-fraction-static 0.75",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e2b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path google/gemma-4-E2B-it-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e2b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e2b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path google/gemma-4-E4B-it-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e4b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e4b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "12b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path google/gemma-4-12B-it-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "12b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Pending — the upstream QAT checkpoint (google/gemma-4-12B-it-qat-q4_0-unquantized)
+      // is erroneous vs current sglang: its vision_config omits `model_patch_size` (the bf16
+      // sibling ships 48), and its vision-embedder weights are 640-wide while sglang's
+      // gemma4_unified builds them as model_patch_size**2*3. Injecting the field only surfaces
+      // a weight-shape mismatch (640 vs 1536), so no serving flag can load it — needs an
+      // upstream sglang model-def / checkpoint fix. Verified broken on H200/B200/B300 @ 0.5.16.
+      match: { hw: "b300", variant: "12b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path google/gemma-4-12B-it-qat-q4_0-unquantized-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Pending — the upstream QAT checkpoint (google/gemma-4-12B-it-qat-q4_0-unquantized)
+      // is erroneous vs current sglang: its vision_config omits `model_patch_size` (the bf16
+      // sibling ships 48), and its vision-embedder weights are 640-wide while sglang's
+      // gemma4_unified builds them as model_patch_size**2*3. Injecting the field only surfaces
+      // a weight-shape mismatch (640 vs 1536), so no serving flag can load it — needs an
+      // upstream sglang model-def / checkpoint fix. Verified broken on H200/B200/B300 @ 0.5.16.
+      match: { hw: "b300", variant: "12b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "31b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path google/gemma-4-31B-it-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "31b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "31b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path google/gemma-4-31B-it-qat-q4_0-unquantized-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "31b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "26b-a4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path google/gemma-4-26B-A4B-it-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "26b-a4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "26b-a4b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path google/gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "26b-a4b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
         "--mem-fraction-static 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
