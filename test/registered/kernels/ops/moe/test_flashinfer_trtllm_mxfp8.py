@@ -35,6 +35,7 @@ def _reference_moe(
     alpha: float,
     beta: float,
     limit: float,
+    routed_scaling_factor: float,
 ) -> torch.Tensor:
     from flashinfer import mxfp8_quantize
 
@@ -54,7 +55,8 @@ def _reference_moe(
     )
     act = _dequant_mxfp8(act_q, act_scale)
     expert_out = torch.einsum("tki,tkhi->tkh", act, w2[topk_ids])
-    return (expert_out * expert_weights[..., None]).sum(dim=1).to(torch.bfloat16)
+    routed_output = (expert_out * expert_weights[..., None]).sum(dim=1)
+    return (routed_output * routed_scaling_factor).to(torch.bfloat16)
 
 
 def _shuffle_mxfp8_weights(
@@ -104,6 +106,7 @@ def test_flashinfer_trtllm_mxfp8_minimax_swiglu(num_tokens: int):
     num_experts, top_k = 4, 2
     hidden_size = intermediate_size = 256
     alpha, beta, limit = 1.702, 1.0, 7.0
+    routed_scaling_factor = 2.0
 
     hidden_states = (
         torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 4
@@ -156,6 +159,7 @@ def test_flashinfer_trtllm_mxfp8_minimax_swiglu(num_tokens: int):
         alpha,
         beta,
         limit,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
     w31_kernel, w31_scale_kernel, w2_kernel, w2_scale_kernel = _shuffle_mxfp8_weights(
@@ -183,7 +187,7 @@ def test_flashinfer_trtllm_mxfp8_minimax_swiglu(num_tokens: int):
         intermediate_size=intermediate_size,
         local_expert_offset=0,
         local_num_experts=num_experts,
-        routed_scaling_factor=None,
+        routed_scaling_factor=routed_scaling_factor,
         routing_method_type=int(RoutingMethodType.MiniMax2),
         use_shuffled_weight=True,
         tune_max_num_tokens=8,
