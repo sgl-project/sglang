@@ -647,7 +647,12 @@ class MMEncoder:
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, False)
+                gpu_image_decode = (
+                    "nvjpeg_fancy"
+                    if self.use_image_processor_gpu and self.model_type == "kimi_k3"
+                    else False
+                )
+                img, _ = load_image(data, gpu_image_decode)
                 if (
                     discard_alpha_channel
                     and not isinstance(img, torch.Tensor)

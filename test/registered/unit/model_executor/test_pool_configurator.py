@@ -645,5 +645,67 @@ class TestFactory(unittest.TestCase):
         self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
 
 
+class TestDflashDraftKvBudget(unittest.TestCase):
+    """DFLASH draft KV pool as a flat bytes/token term on the target's budget."""
+
+    def test_bytes_per_token_from_draft_geometry(self):
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_draft_cell_size_per_token,
+        )
+
+        draft = SimpleNamespace(
+            get_num_kv_heads=lambda tp: 4, head_dim=128, v_head_dim=128
+        )
+        # 4 kv heads * (128 + 128) dims * 5 layers * 2 bytes
+        self.assertEqual(
+            dflash_draft_cell_size_per_token(
+                draft_model_config=draft,
+                draft_num_layers=5,
+                draft_kv_cache_dtype=torch.bfloat16,
+                tp_size=1,
+            ),
+            10240,
+        )
+        self.assertEqual(
+            dflash_draft_cell_size_per_token(
+                draft_model_config=draft,
+                draft_num_layers=0,
+                draft_kv_cache_dtype=torch.bfloat16,
+                tp_size=1,
+            ),
+            0,
+        )
+
+    def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
+        """HybridSWA carried no draft term, so the draft pool fell outside the budget."""
+        available = 10_000_000
+
+        def _tokens(draft_kv_per_token):
+            mr = _make_model_runner(
+                is_hybrid_swa=True,
+                full_attention_layer_ids=list(range(16)),
+                swa_attention_layer_ids=list(range(16, 32)),
+                swa_num_kv_heads=4,
+            )
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+                dflash_draft_cell_size_per_token=draft_kv_per_token,
+            )
+            with mock_cpu_env():
+                from sglang.srt.model_executor.pool_configurator import (
+                    create_memory_pool_configurator,
+                )
+
+                cfg = create_memory_pool_configurator(mr)
+                config = cfg.calculate_pool_sizes(available, mr.server_args.page_size)
+            return config.full_max_total_num_tokens
+
+        self.assertLess(_tokens(10240), _tokens(None))
+
+
 if __name__ == "__main__":
     unittest.main()

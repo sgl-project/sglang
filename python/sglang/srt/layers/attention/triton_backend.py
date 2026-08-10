@@ -1527,9 +1527,19 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
         )
 
-        # Current chunk K/V is still local before masked cache write, so it can
-        # use the original extend kernel's current-token stage directly.
+        # Select the replicated K/V heads matching this rank's Q shard.
         if k.numel() > 0:
+            if layer.tp_k_head_num > 1:
+                kv_head_start = (
+                    group.rank_in_group * layer.tp_k_head_num // group.world_size
+                )
+                kv_head_end = max(
+                    (group.rank_in_group + 1) * layer.tp_k_head_num // group.world_size,
+                    kv_head_start + 1,
+                )
+                k = k[:, kv_head_start:kv_head_end]
+                v = v[:, kv_head_start:kv_head_end]
+
             empty_kv_indptr = torch.zeros_like(kv_indptr)
             self.extend_attention_fwd(
                 q_local,

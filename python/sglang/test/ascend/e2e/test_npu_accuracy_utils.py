@@ -61,6 +61,7 @@ DATASET_FLUCTUATION = {
     "aime25": 2,
     "aime26": 2,
     "gpqa_diamond": 5,
+    "gsm8k": 3,
 }
 
 MAX_RETRY_COUNT = 3
@@ -291,7 +292,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
-    max_attempts = 2
     n_runs = 3
     accuracy = 0.1
     test_type = "accuracy"
@@ -549,7 +549,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
-    max_attempts = 2
     accuracy = 0.1
 
     @classmethod
@@ -651,7 +650,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     eval_type = "openai_api"
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-    max_attempts = 2
     accuracy = 0.1
 
     @classmethod
