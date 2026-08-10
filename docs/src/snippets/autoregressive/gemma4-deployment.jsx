@@ -89,7 +89,7 @@ export const Gemma4Deployment = () => {
       '31b': { tp: 1, mem: 0.80 },
       '26b-a4b': { tp: 1, mem: 0.80 },
     },
-    'arc_b': {
+    arc_b: {
       '31b': { tp: 4, mem: 0.80 },
       '26b-a4b': { tp: 4, mem: 0.75 },
     },
@@ -222,6 +222,9 @@ export const Gemma4Deployment = () => {
       if (prev.hardware === 'arc_b' && optionName === 'checkpoint' && value !== 'standard') {
         return prev;
       }
+      if (prev.hardware === 'arc_b' && optionName === 'speculative' && value !== 'disabled') {
+        return prev;
+      }
 
       const next = { ...prev, [optionName]: value };
       if (optionName === 'hardware' && value === 'arc_b') {
@@ -229,6 +232,7 @@ export const Gemma4Deployment = () => {
           next.modelSize = '31b';
         }
         next.checkpoint = 'standard';
+        next.speculative = 'disabled';
       }
       return next;
     });
@@ -413,7 +417,13 @@ export const Gemma4Deployment = () => {
                     values.hardware === 'arc_b' &&
                     option.name === 'checkpoint' &&
                     item.id !== 'standard';
-                  const isDisabled = Boolean(item.disabled || isArcBModelLocked || isArcBCheckpointLocked);
+                  const isArcBSpeculativeLocked =
+                    values.hardware === 'arc_b' &&
+                    option.name === 'speculative' &&
+                    item.id !== 'disabled';
+                  const isDisabled = Boolean(
+                    item.disabled || isArcBModelLocked || isArcBCheckpointLocked || isArcBSpeculativeLocked
+                  );
                   return (
                     <label
                       key={item.id}

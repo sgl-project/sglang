@@ -176,7 +176,7 @@ export const Qwen35Deployment = () => {
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       xeon:   { bf16: { tp: 3 }, fp8: { tp: 3 } },
-      'arc_b': { bf16: { tp: 4, mem: 0.8 } }
+      arc_b:{ bf16: { tp: 4, mem: 0.8 } }
     },
     '27b': {
       h100:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -197,7 +197,7 @@ export const Qwen35Deployment = () => {
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
       xeon:   { bf16: { tp: 3 } },
-      'arc_b': { bf16: { tp: 1, mem: 0.8 } }
+      arc_b:{ bf16: { tp: 1, mem: 0.8 } }
     },
     '4b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
@@ -208,7 +208,7 @@ export const Qwen35Deployment = () => {
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
       xeon:   { bf16: { tp: 3 } },
-      'arc_b': { bf16: { tp: 1, mem: 0.8 } }
+      arc_b:{ bf16: { tp: 1, mem: 0.8 } }
     },
     '2b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
