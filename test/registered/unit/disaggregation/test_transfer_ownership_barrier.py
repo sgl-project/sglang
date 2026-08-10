@@ -1370,6 +1370,53 @@ class TestPollGating(unittest.TestCase):
         self.assertFalse(gated.advance_failure_quiescence())
         self.assertTrue(gated.is_failure_quiescing())
 
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    def test_failed_restore_aborts_through_the_barrier_instead_of_releasing(
+        self, mock_poll, mock_release
+    ):
+        # A failed HiCache restore says nothing about the KV transfer: a
+        # prefill rank may still be writing into this request's pages. The
+        # request must be failed through the ownership barrier (abort, then
+        # wait for KVPoll.Failed) -- never released directly from the queue.
+        from sglang.srt.disaggregation.decode import (
+            DecodeTransferQueue,
+            HiCacheRestoreResult,
+        )
+
+        decode_req = SimpleNamespace(
+            req=SimpleNamespace(rid="r1", bootstrap_room=ROOM, return_logprob=False),
+            kv_receiver=Mock(),
+            metadata_buffer_index=3,
+            hicache_restore_status=HiCacheRestoreResult.FAILED,
+        )
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [decode_req]
+        queue.enable_staging = False
+        queue.gloo_group = Mock()
+        queue.req_to_metadata_buffer_idx_allocator = Mock()
+        queue.tp_rank = 0
+        queue.tree_cache = Mock()
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+        queue.spec_algorithm = Mock()
+        queue.spec_algorithm.is_none.return_value = True
+        queue._clean_hicache_prefetch_resources = Mock()
+        queue._process_hicache_local_restores = Mock()
+        queue.scheduler = Mock()
+        queue.scheduler.enable_decode_hicache = True
+        queue.scheduler.enable_hisparse = False
+        queue.scheduler.metrics_reporter.enable_metrics = False
+        mock_poll.return_value = [KVPoll.Transferring]
+
+        transferred = queue.pop_transferred()
+
+        self.assertEqual(transferred, [])
+        self.assertEqual(queue.queue, [decode_req], "request must stay queued")
+        decode_req.kv_receiver.abort.assert_called_once()
+        decode_req.kv_receiver.kv_mgr.record_failure.assert_called_once()
+        mock_release.assert_not_called()
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+
 
 class TestChunkedPrefillAbort(unittest.TestCase):
     """Aborting a chunked prefill must not free pages an earlier chunk is reading."""
