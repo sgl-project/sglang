@@ -37,7 +37,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=7200, suite="nightly-8-gpu-b200", nightly=True)
+register_cuda_ci(est_time=7200, stage="nightly", runner_config="8-gpu-b200")
 
 DSV4_FLASH_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
