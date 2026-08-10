@@ -8,7 +8,6 @@ import numpy.typing as npt
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
@@ -120,104 +119,20 @@ class AscendKVManager(MooncakeKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
-        # Group by indices
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
+        # Hybrid MLA pools expose PP-local source entries but PP=1 decode
+        # registers all model layers. Pair entries by their global layer ids
+        # instead of interpreting the hybrid buffers as MHA K/V lists.
+        return self._send_kvcache_generic(
+            mooncake_session_id=mooncake_session_id,
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=self.kv_args.kv_item_lens,
+            prefill_data_indices=prefill_kv_indices,
+            dst_data_indices=dst_kv_indices,
+            executor=executor,
+            src_layer_ids=self.kv_args.kv_layer_ids,
+            dst_layer_ids=dst_layer_ids,
         )
-
-        if self.pp_size > 1:
-            if self.is_mla_backend:
-                src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
-                    self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-                )
-                layers_params = [
-                    (
-                        src_kv_ptrs[layer_id],
-                        sliced_dst_kv_ptrs[layer_id],
-                        self.kv_args.kv_item_lens[layer_id],
-                    )
-                    for layer_id in range(layers_current_pp_stage)
-                ]
-            else:
-                (
-                    src_k_ptrs,
-                    src_v_ptrs,
-                    dst_k_ptrs,
-                    dst_v_ptrs,
-                    layers_current_pp_stage,
-                ) = self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-
-                layers_params = [
-                    (
-                        src_k_ptrs[layer_id],
-                        dst_k_ptrs[layer_id],
-                        self.kv_args.kv_item_lens[layer_id],
-                    )
-                    for layer_id in range(layers_current_pp_stage)
-                ] + [
-                    (
-                        src_v_ptrs[layer_id],
-                        dst_v_ptrs[layer_id],
-                        self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id],
-                    )
-                    for layer_id in range(layers_current_pp_stage)
-                ]
-        else:
-            num_layers = len(self.kv_args.kv_data_ptrs)
-            layers_params = [
-                (
-                    self.kv_args.kv_data_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    self.kv_args.kv_item_lens[layer_id],
-                )
-                for layer_id in range(num_layers)
-            ]
-
-        def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, item_len: int
-        ) -> List[Tuple[int, int, int]]:
-            transfer_blocks = []
-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-            return transfer_blocks
-
-        # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
-
-        # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
-            transfer_blocks = []
-            for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
-
-        if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
-                )
-                for (src_ptr, dst_ptr, item_len) in layers_params
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    return status
-        else:
-            # Combining all layers' params in one batch transfer is more efficient
-            # compared to using multiple threads
-            return process_layers(layers_params)
-
-        return 0
 
     def _is_generic_kvcache_state_type(self, st) -> bool:
         # DSV4 per-pool components also use the page-indexed send path.
