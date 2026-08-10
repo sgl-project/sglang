@@ -119,6 +119,18 @@ if is_npu():
     )
 
 
+if is_cpu():
+    # Plain GPTQ is CUDA-only in name: the kernel is gone, but the Intel AMX
+    # path below is untouched. `get_quantization_config` rejects anything
+    # missing from this registry before it can consult CPU_QUANTIZATION_METHODS,
+    # so the key has to exist here for the CPU path to stay reachable.
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": CPUGPTQConfig,
+        }
+    )
+
+
 if is_mps():
     BASE_QUANTIZATION_METHODS.update(
         {
