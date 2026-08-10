@@ -686,10 +686,10 @@ class TestCompare(_WeightCheckerTestBase):
         snapshot = {k: v.clone() for k, v in self.checker._snapshot_tensors.items()}
         self.checker._reset_tensors()
         with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                param.data.copy_(snapshot[name].to(param.device))
-            for name, buffer in self.model.named_buffers():
-                buffer.data.copy_(snapshot[name].to(buffer.device))
+            for name, tensor in self.model.named_parameters():
+                tensor.data.copy_(snapshot[name].to(tensor.device))
+            for name, tensor in self.model.named_buffers():
+                tensor.data.copy_(snapshot[name].to(tensor.device))
         self.checker._compare()
 
 
