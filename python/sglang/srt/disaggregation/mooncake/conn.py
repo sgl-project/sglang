@@ -146,6 +146,15 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
+    # Trailing single-frame field (wire position 18, after staging's two
+    # frames at 14/15 and the DCP fields at 16/17). Number of TARGET-model
+    # K/V layers on the decode side, captured before any MTP/NEXTN draft KV
+    # pointers were appended to dst_kv_ptrs. Prefill uses this to compute
+    # the correct V-pointer offset instead of the unsafe
+    # `len(dst_kv_ptrs) // 2`. -1 sentinel = "not sent by receiver" (older
+    # decodes, or non-MTP layouts) -> prefill falls back to `len // 2`,
+    # which agrees with the correct value when draft KV is absent.
+    dst_num_target_kv_layers: int = -1
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -185,6 +194,15 @@ class KVArgsRegisterInfo:
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            # Optional trailing field, wire position 18 (after the two
+            # staging frames at 14/15 and the DCP fields at 16/17).
+            # Missing / empty -> -1 sentinel so older receivers stay
+            # backward-compatible.
+            dst_num_target_kv_layers=(
+                int(msg[18].decode("ascii"))
+                if len(msg) > 18 and msg[18] != b""
+                else -1
+            ),
         )
 
 
@@ -629,6 +647,7 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         state_type: Optional[StateType] = None,
         force_flat: bool = False,
+        num_dst_target_kv_layers: Optional[int] = None,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
@@ -688,7 +707,11 @@ class MooncakeKVManager(CommonKVManager):
                 ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mha_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_data_ptrs,
+                    num_dst_target_kv_layers=num_dst_target_kv_layers,
+                )
             )
             # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
             # Use correct item lengths for K and V separately
@@ -780,6 +803,7 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        num_dst_target_kv_layers: Optional[int] = None,
     ):
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
@@ -804,6 +828,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            num_dst_target_kv_layers=num_dst_target_kv_layers,
         )
 
     def send_kvcache_dcp(
@@ -916,6 +941,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        num_dst_target_kv_layers: Optional[int] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -969,7 +995,11 @@ class MooncakeKVManager(CommonKVManager):
             dst_head_start_offset = 0
 
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            self.get_mha_kv_ptrs_with_pp(
+                self.kv_args.kv_data_ptrs,
+                dst_kv_ptrs,
+                num_dst_target_kv_layers=num_dst_target_kv_layers,
+            )
         )
 
         # Calculate precise byte offset and length for the sub-slice within the token
@@ -1689,6 +1719,7 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                                 dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
+                                num_dst_target_kv_layers=target_rank_registration_info.dst_num_target_kv_layers,
                             )
                         elif (
                             self.enable_staging
@@ -1719,6 +1750,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
+                                num_dst_target_kv_layers=target_rank_registration_info.dst_num_target_kv_layers,
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -2311,6 +2343,15 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
 
+            # Trailing wire frame (position 18, after staging at 14/15 and
+            # DCP at 16/17): number of target-model K/V layers captured
+            # before any MTP draft KV was appended. -1 sentinel keeps
+            # parity with older prefill instances that ignore trailing
+            # frames.
+            num_target_kv_layers_str = str(
+                getattr(self.kv_mgr.kv_args, "num_target_kv_layers", -1)
+            ).encode("ascii")
+
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             try:
                 with lock:
@@ -2334,6 +2375,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            num_target_kv_layers_str,
                         ]
                     )
             except zmq.ZMQError:
