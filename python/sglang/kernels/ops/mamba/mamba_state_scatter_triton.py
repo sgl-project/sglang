@@ -11,6 +11,25 @@ import triton
 import triton.language as tl
 
 
+def _require_entry_contiguous_dst(
+    dst: torch.Tensor, entry_start_dim: int, fn_name: str
+) -> None:
+    """dst layout contract: the kernels index through the real layer/slot
+    strides (int64) plus a FLAT element offset within one (layer, slot)
+    entry — layer/slot strides may be arbitrary (envelope-strided unified
+    pool views), but the trailing entry dims must be contiguous.
+    """
+    expected = 1
+    for i in range(dst.ndim - 1, entry_start_dim - 1, -1):
+        if dst.shape[i] != 1 and dst.stride(i) != expected:
+            raise ValueError(
+                f"{fn_name}: dst entry dims (dims {entry_start_dim}.."
+                f"{dst.ndim - 1}) must be contiguous; got "
+                f"shape={tuple(dst.shape)} strides={tuple(dst.stride())}"
+            )
+        expected *= dst.shape[i]
+
+
 @triton.jit
 def track_mamba_state_if_needed_kernel(
     conv_states_ptr,
@@ -271,9 +290,7 @@ def fused_mamba_state_scatter_with_mask(
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
 
-    # Ensure tensors are contiguous
-    if not dst.is_contiguous():
-        raise ValueError("dst tensor must be contiguous")
+    _require_entry_contiguous_dst(dst, 2, "fused_mamba_state_scatter_with_mask")
     if not src.is_contiguous():
         raise ValueError("src tensor must be contiguous")
 
@@ -420,12 +437,10 @@ def fused_conv_window_scatter_with_mask(
     src_step_size = src.shape[2]
     dst_req_size = dst.shape[1]
 
-    # `dst` stays contiguous; `src` is an intentionally non-contiguous (overlapping)
-    # view, so we do NOT assert src contiguity here (unlike the dense scatter).
-    if not dst.is_contiguous():
-        raise ValueError(
-            "dst tensor in fused_conv_window_scatter_with_mask must be contiguous"
-        )
+    # `src` is an intentionally non-contiguous (overlapping) view indexed per
+    # dim through its real strides, so we do NOT assert src contiguity here
+    # (unlike the dense scatter).
+    _require_entry_contiguous_dst(dst, 2, "fused_conv_window_scatter_with_mask")
 
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
@@ -501,3 +516,101 @@ def scatter_mamba_states_after_mtp_verify(
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
+
+
+@triton.jit
+def track_mamba_states_all_layers_kernel(
+    conv_states_ptr,  # [num_layers, pool_size, ...] full conv pool
+    ssm_states_ptr,  # [num_layers, pool_size, ...] full ssm pool
+    cache_indices_ptr,
+    mamba_track_mask_ptr,
+    mamba_track_indices_ptr,
+    conv_layer_stride,
+    conv_row_stride,
+    ssm_layer_stride,
+    ssm_row_stride,
+    batch_size,
+    conv_state_numel_per_row: tl.constexpr,
+    ssm_state_numel_per_row: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    check_freed_slots: tl.constexpr,
+):
+    """All-layers variant of track_mamba_state_if_needed_kernel: one launch
+    covers every mamba layer (grid = num_layers * batch_size) instead of one
+    launch per layer. The track mask / source / destination indices are shared
+    across layers, so a single launch at the end of the step is equivalent to
+    the per-layer launches (each layer's state is final by then)."""
+    pid = tl.program_id(0)
+    layer_idx = (pid // batch_size).to(tl.int64)
+    batch_idx = pid % batch_size
+
+    track_mask = tl.load(mamba_track_mask_ptr + batch_idx)
+    if not track_mask:
+        return
+
+    src_idx = tl.load(cache_indices_ptr + batch_idx).to(tl.int64)
+    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx).to(tl.int64)
+    if check_freed_slots:
+        if src_idx < 0 or dst_idx < 0:
+            return
+
+    conv_base = conv_states_ptr + layer_idx * conv_layer_stride
+    for offset in range(0, conv_state_numel_per_row, BLOCK_SIZE):
+        element_indices = offset + tl.arange(0, BLOCK_SIZE)
+        mask = element_indices < conv_state_numel_per_row
+        data = tl.load(
+            conv_base + src_idx * conv_row_stride + element_indices,
+            mask=mask,
+            other=0.0,
+        )
+        tl.store(
+            conv_base + dst_idx * conv_row_stride + element_indices, data, mask=mask
+        )
+
+    ssm_base = ssm_states_ptr + layer_idx * ssm_layer_stride
+    for offset in range(0, ssm_state_numel_per_row, BLOCK_SIZE):
+        element_indices = offset + tl.arange(0, BLOCK_SIZE)
+        mask = element_indices < ssm_state_numel_per_row
+        data = tl.load(
+            ssm_base + src_idx * ssm_row_stride + element_indices, mask=mask, other=0.0
+        )
+        tl.store(ssm_base + dst_idx * ssm_row_stride + element_indices, data, mask=mask)
+
+
+def track_mamba_states_all_layers(
+    conv_states_pool: torch.Tensor,
+    ssm_states_pool: torch.Tensor,
+    cache_indices: torch.Tensor,
+    mamba_track_mask: torch.Tensor,
+    mamba_track_indices: torch.Tensor,
+    batch_size: int,
+    check_freed_slots: bool = False,
+):
+    """Track conv/ssm states for ALL mamba layers in one launch.
+
+    conv_states_pool / ssm_states_pool are the full [num_layers, pool_size,
+    ...] pools; per-row copy semantics are identical to
+    track_mamba_states_if_needed applied per layer.
+    """
+    num_layers = conv_states_pool.shape[0]
+    conv_state_numel_per_row = conv_states_pool[0, 0].numel()
+    ssm_state_numel_per_row = ssm_states_pool[0, 0].numel()
+
+    BLOCK_SIZE = 1024
+    grid = (num_layers * batch_size,)
+    track_mamba_states_all_layers_kernel[grid](
+        conv_states_pool,
+        ssm_states_pool,
+        cache_indices,
+        mamba_track_mask,
+        mamba_track_indices,
+        conv_states_pool.stride(0),
+        conv_states_pool.stride(1),
+        ssm_states_pool.stride(0),
+        ssm_states_pool.stride(1),
+        batch_size,
+        conv_state_numel_per_row,
+        ssm_state_numel_per_row,
+        BLOCK_SIZE,
+        check_freed_slots,
+    )

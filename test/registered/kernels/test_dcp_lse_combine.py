@@ -93,6 +93,27 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
     def test_n4_large_head_dim(self):
         self._run_combine_test(N=4, B=8, H_local=8, D=512, is_base_e=True)
 
+    def test_flashmla_natural_log_lse_correction(self):
+        """Natural-log LSEs log(2), log(8) give an 8/10 local weight."""
+        from sglang.kernels.ops.attention.dcp_kernels import correct_attn_out
+
+        local_output = torch.tensor(
+            [[[10.0]]], device=self.device, dtype=torch.bfloat16
+        )
+        lses = torch.log(torch.tensor([[[2.0]], [[8.0]]], device=self.device))
+        corrected, _ = correct_attn_out(
+            local_output,
+            lses,
+            cp_rank=1,
+            ctx=None,
+            new_output=torch.empty((1, 1, 1), device=self.device),
+            is_lse_base_on_e=True,
+        )
+
+        torch.testing.assert_close(
+            corrected.cpu(), torch.tensor([[[8.0]]]), atol=1e-5, rtol=1e-5
+        )
+
 
 class TestLSECombineSingleShard(CustomTestCase):
     """N=1 should return input unchanged."""
@@ -243,6 +264,14 @@ class TestCPUReference(CustomTestCase):
         result_2 = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=False)
 
         self.assertFalse(torch.allclose(result_e, result_2, atol=1e-3))
+
+    def test_flashmla_selects_natural_log_lse(self):
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+            is_mla_dcp_lse_base_on_e,
+        )
+
+        self.assertTrue(is_mla_dcp_lse_base_on_e("flashmla"))
+        self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))
 
     def test_nan_lse_handled(self):
         from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu

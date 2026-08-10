@@ -103,14 +103,12 @@ class TestMambaPathStateCap(unittest.TestCase):
 
     def test_server_arg_rejects_zero_and_values_below_negative_one(self):
         for value in (0, -2):
+            args = ServerArgs(model_path="dummy", mamba_max_states_per_path=value)
             with self.subTest(value=value), self.assertRaisesRegex(
                 ValueError,
                 "must be -1 \\(unlimited\\) or a positive integer",
             ):
-                ServerArgs(
-                    model_path="dummy",
-                    mamba_max_states_per_path=value,
-                )
+                args._handle_mamba_backend()
 
     def test_unified_cache_removes_only_shallow_mamba_state(self):
         component, nodes, core, cache = _build_unified_chain(cap=2)

@@ -354,6 +354,11 @@ class BaseFormatDetector(ABC):
         """Return True if this detector supports structural tag format."""
         return True
 
+    def parses_required_natively(self) -> bool:
+        """Return True if ``tool_choice="required"`` must skip grammar
+        constraints and parse the model's native output format instead."""
+        return False
+
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """
@@ -377,6 +382,7 @@ class BaseFormatDetector(ABC):
         tools: Union[List[Tool], None] = None,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
         thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
     ) -> Optional[StructuralTag]:
         """
         Return a model-native XGrammar structural tag when supported.
@@ -389,6 +395,11 @@ class BaseFormatDetector(ABC):
                 ReasonerGrammarBackend will own the <think>...</think> prefix
                 (the typical case when --reasoning-parser is configured) so
                 only one layer constrains the reasoning section.
+            parallel_tool_calls: Whether multiple tool calls may appear in one
+                assistant response. xgrammar's get_model_structural_tag does
+                not expose this knob, so this base implementation ignores it;
+                only detectors that build their own tags (e.g. Kimi K3)
+                honor it.
 
         Returns:
             StructuralTag if this detector supports model-native tags, otherwise None
@@ -411,7 +422,10 @@ class BaseFormatDetector(ABC):
         )
 
     def get_auto_tool_call_structural_tag(
-        self, tools: Union[List[Tool], None] = None
+        self,
+        tools: Union[List[Tool], None] = None,
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
     ) -> Optional[StructuralTag]:
         """Return an always-on structural tag for automatic tool choice.
 

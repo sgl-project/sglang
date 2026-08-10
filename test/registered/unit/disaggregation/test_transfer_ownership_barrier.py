@@ -14,7 +14,7 @@ import concurrent.futures
 import threading
 import time
 import unittest
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -70,6 +70,7 @@ def make_prefill_manager(room_sweep_ttl=300.0):
     mgr.enable_trace = False
     mgr.enable_staging = False
     mgr.bootstrap_port = 0
+    mgr._staging_outstanding = defaultdict(int)
     # Minimal KVArgs surface the transfer worker dereferences.
     mgr.kv_args = SimpleNamespace(
         kv_data_ptrs=[0x1000],
@@ -173,6 +174,7 @@ class TestPageReuseRace(unittest.TestCase):
                     dst_port=1,
                     mooncake_session_id="session:1",
                     dst_kv_indices=np.array([0], dtype=np.int32),
+                    dst_device_kv_indices=None,
                     is_dummy=False,
                 )
             }
@@ -183,6 +185,7 @@ class TestPageReuseRace(unittest.TestCase):
                 dst_kv_ptrs=[0xDEAD0000],
                 dst_kv_layer_ids=[0],
                 dst_state_layer_ids=[],
+                requires_dcp_relayout=False,
             )
         }
         mgr.session_lock, mgr.failed_sessions = threading.Lock(), set()
@@ -465,6 +468,7 @@ class TestPrefillAbortProtocol(unittest.TestCase):
             b"",
             str(required).encode("ascii"),
             b"0",
+            b"",  # device_kv_indices (HiSparse split-index transfers only)
             token,
         ]
 
@@ -881,6 +885,38 @@ class TestStrictBarrier(unittest.TestCase):
             "a local escalation must be coordinated before it reaches the scheduler",
         )
 
+    def test_escalation_is_not_swallowed_by_the_inflight_queue_sweep(self):
+        # The whole strict guarantee hangs on this exception reaching the
+        # scheduler's top-level handler, which tears the worker down. A
+        # defensive try/except added to the sweep would silently convert
+        # refuse-and-restart into leak-forever.
+        from sglang.srt.disaggregation.prefill import (
+            SchedulerDisaggregationPrefillMixin,
+        )
+
+        poller = SimpleNamespace(
+            poll=Mock(return_value=KVPoll.Failed),
+            advance_failure_quiescence=Mock(
+                side_effect=KVTransferBarrierEscalation("cannot prove idle")
+            ),
+            is_failure_quiescing=Mock(return_value=True),
+        )
+        scheduler = SimpleNamespace(
+            disagg_prefill_inflight_queue=[
+                SimpleNamespace(rid="r", disagg_kv_sender=poller)
+            ],
+            attn_cp_cpu_group=object(),
+            attn_tp_cpu_group=object(),
+        )
+        with patch(
+            "sglang.srt.disaggregation.utils.dist.all_reduce",
+            side_effect=lambda tensor, **kw: None,
+        ):
+            with self.assertRaises(KVTransferBarrierEscalation):
+                SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                    scheduler
+                )
+
     def test_a_peer_escalation_reaches_every_scheduler(self):
         poller = SimpleNamespace(
             poll=Mock(return_value=KVPoll.Failed),
@@ -923,6 +959,7 @@ class TestRoomStateRetirement(unittest.TestCase):
                 b"",
                 b"1",
                 b"0",
+                b"",  # device_kv_indices (HiSparse split-index transfers only)
                 b"token",
             ]
         )
@@ -1394,8 +1431,9 @@ class TestTransferInfoWire(unittest.TestCase):
         info = TransferInfo.from_zmq(msg)
         self.assertEqual(info.room, 7)
         self.assertEqual(info.abort_token, b"", "a peer may omit the token frame")
+        # The token rides behind the (also optional) device_kv_indices frame.
         self.assertEqual(
-            TransferInfo.from_zmq(msg + [b"nonce"]).abort_token,
+            TransferInfo.from_zmq(msg + [b"", b"nonce"]).abort_token,
             b"nonce",
         )
 

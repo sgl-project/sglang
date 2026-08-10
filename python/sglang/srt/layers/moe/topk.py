@@ -32,10 +32,12 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.runtime_context import get_parallel
+if TYPE_CHECKING:
+    from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
+
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 
 try:
-    from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
     from triton_kernels.tensor import make_ragged_tensor_metadata
     from triton_kernels.topk import topk as triton_kernels_topk
 
@@ -49,7 +51,7 @@ try:
     ):
         if simulated_ep != 1:
             raise NotImplementedError(
-                "simulated_ep routing is not supported with triton_kernels 3.6.0"
+                "simulated_ep routing is not supported with triton_kernels 3.7.1"
             )
 
         if sm_first:
@@ -64,24 +66,18 @@ try:
         )
         dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
         combine_indx = sparse_logits.mask_metadata.col_sorted_indx
+        gather_indx = torch.div(combine_indx, n_expts_act, rounding_mode="trunc")
+        scatter_indx = combine_indx
         ragged_metadata = make_ragged_tensor_metadata(
             sparse_logits.mask_metadata.col_sum, dispatch_indx.shape[0]
         )
         gate_scal = sparse_logits.vals.flatten()[combine_indx]
-        routing_data = RoutingData(
-            gate_scal,
-            ragged_metadata.slice_sizes,
-            logits.shape[-1],
-            n_expts_act,
-            ragged_metadata,
-        )
-        gather_indx = GatherIndx(combine_indx, dispatch_indx)
-        scatter_indx = ScatterIndx(dispatch_indx, combine_indx)
-        return routing_data, gather_indx, scatter_indx
+        return ragged_metadata, gather_indx, scatter_indx, gate_scal, n_expts_act
 
 except ImportError:
     pass
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
 from sglang.srt.distributed import (
     get_tp_group,
@@ -101,7 +97,6 @@ from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
 )
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -319,9 +314,11 @@ class StandardTopKOutputPacked(NamedTuple):
 class TritonKernelTopKOutput(NamedTuple):
     """Triton kernel top-k output format."""
 
-    routing_data: RoutingData
-    gather_indx: GatherIndx
-    scatter_indx: ScatterIndx
+    a_ragged_metadata: RaggedTensorMetadata
+    gather_indx: torch.Tensor
+    scatter_indx: torch.Tensor
+    gate_scal: torch.Tensor
+    n_expts_act: int
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -392,7 +389,7 @@ def _make_round_robin_expert_ids(
 # -------------------------------- TopK ---------------------------------------
 
 
-class TopK(MultiPlatformOp):
+class TopK(BaseFusedOp):
     """
     Parameters:
     --top_k: The all number of top experts selected per token, including the fused shared expert(s).
@@ -430,10 +427,9 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        from sglang.srt.runtime_context import get_server_args
 
         self.enable_waterfill = (
-            num_fused_shared_experts > 0 and get_server_args().enable_waterfill
+            num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
         )
 
         self.waterfill_balancer = None
@@ -473,6 +469,18 @@ class TopK(MultiPlatformOp):
         assert TopKOutputChecker.format_is_standard(topk_output)
         return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
 
+    def forward_musa(self, *args, **kwargs) -> TopKOutput:
+        # MUSA follows the CUDA path explicitly: select_experts branches on
+        # _is_musa internally (hardware_backend.musa topk kernels), so the
+        # native path would bypass them.
+        return self.forward_cuda(*args, **kwargs)
+
+    def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
+        # torch.compile of the native TopK only pays off at bs=1; for larger
+        # batches keep the current optimized dispatch (see MultiPlatformOp
+        # history: the compiled path regressed bs > 1).
+        return self.forward_native if num_tokens == 1 else None
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -507,9 +515,8 @@ class TopK(MultiPlatformOp):
         # ===== TO BE REFACTORED ====
         elif get_moe_runner_backend().is_experimental_sgl_trtllm():
             try:
-                from sglang.srt.runtime_context import get_server_args
 
-                use_standard_for_lora = bool(get_server_args().enable_lora)
+                use_standard_for_lora = bool(get_lora().enable_lora)
             except ValueError:
                 use_standard_for_lora = False
             output_format = (
@@ -527,12 +534,24 @@ class TopK(MultiPlatformOp):
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
-            routing_data, gather_idx, scatter_idx = routing(
+            (
+                a_ragged_metadata,
+                gather_idx,
+                scatter_idx,
+                gate_scal,
+                n_expts_act,
+            ) = routing(
                 router_logits,
                 self.topk_config.top_k,
                 sm_first=not self.topk_config.renormalize,
             )
-            return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
+            return TritonKernelTopKOutput(
+                a_ragged_metadata,
+                gather_idx,
+                scatter_idx,
+                gate_scal,
+                n_expts_act,
+            )
         elif output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
@@ -1355,16 +1374,16 @@ def _eplb_remap_enabled() -> bool:
     from sglang.srt.runtime_context import get_server_args
 
     try:
-        server_args = get_server_args()
+        get_server_args()  # probes that a config is published
     except ValueError:
         # Global server args are not initialized outside the server runtime
         # (e.g. in unit tests that call select_experts directly). In that case
         # there is no EPLB mapping, so the remap must be skipped.
         return False
     return (
-        server_args.enable_eplb
-        or server_args.init_expert_location != "trivial"
-        or server_args.ep_num_redundant_experts > 0
+        get_exec().moe.enable_eplb
+        or get_exec().moe.init_expert_location != "trivial"
+        or get_exec().moe.ep_num_redundant_experts > 0
     )
 
 
@@ -1576,7 +1595,22 @@ def biased_grouped_topk_gpu(
         return topk_weights, topk_ids
     else:
         num_experts = gating_output.shape[1]
-        if _is_cuda and num_experts == 384 and num_expert_group == 1:
+        # The JIT triton router (single fused kernel: scoring + bias + topk +
+        # renorm) handles the ungrouped case with arbitrary num_experts/topk.
+        # Original user: Kimi K2 (384 experts). Also dispatch shapes the other
+        # fused kernels cannot cover, e.g. Kimi K3 (896 experts, top-16):
+        # fused_topk_deepseek needs pow2 experts + topk<=8, jit_grouped_topk
+        # needs experts<=512 + topk<=8.
+        _jit_gate_ok = (
+            _is_cuda
+            and num_expert_group == 1
+            and (topk_group is None or topk_group == 1)
+            and (
+                num_experts == 384
+                or (num_experts <= 1024 and (num_experts > 512 or topk > 8))
+            )
+        )
+        if _jit_gate_ok:
             # ===== TO BE REFACTORED ====
             _use_jit_bf16_gate = False
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -1603,9 +1637,36 @@ def biased_grouped_topk_gpu(
             # ===== END TO BE REFACTORED ====
             from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate as jit_gate
 
+            # Pass BF16 logits through untouched for the automatic radix-select
+            # fast path. BF16 -> FP32 is exact, and unsupported shapes fall back
+            # inside moe_fused_gate.
+            _gating = (
+                gating_output
+                if gating_output.dtype == torch.bfloat16
+                else gating_output.to(dtype=torch.float32)
+            )
+            # K3 staged fusion: when the model layer staged the routed
+            # activations (route_quant_handoff), the radix route, the trtllm id
+            # pack and the mxfp8 quant run as one launch. Bit-identical
+            # (weights, ids); a miss falls through to the unfused router.
+            from sglang.srt.layers.moe import route_quant_handoff
+
+            fused = route_quant_handoff.try_route_quant_fused(
+                _gating,
+                correction_bias.to(dtype=torch.float32),
+                topk,
+                num_fused_shared_experts=num_fused_shared_experts,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=bool(
+                    apply_routed_scaling_factor_on_output
+                ),
+            )
+            if fused is not None:
+                return fused
             return jit_gate(
-                gating_output.to(dtype=torch.float32),
-                correction_bias,
+                _gating,
+                correction_bias.to(dtype=torch.float32),
                 topk=topk,
                 scoring_func="sigmoid",
                 num_fused_shared_experts=num_fused_shared_experts,
@@ -2255,6 +2316,49 @@ def select_experts(
         )
     # ===== END TO BE REFACTORED ====
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
+
+def precomputed_topk_postprocess_is_noop(
+    topk_config: TopKConfig,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+) -> bool:
+    """Whether :func:`build_precomputed_topk_output` can stand in for
+    :func:`select_experts`' post-processing.
+
+    A router that produces (weights, ids) itself -- e.g. K3's fused gate+top-k
+    kernel -- skips select_experts entirely, so it must not skip the work
+    select_experts does *after* the top-k: the EPLB logical->physical remap, the
+    padded-region mask, and the shared-expert append.  This returns True only
+    when all of those reduce to no-ops, leaving just the capture hook and the
+    distribution recorder (which the builder below still runs).
+    """
+    return (
+        _is_cuda
+        and topk_config.num_fused_shared_experts == 0
+        and num_token_non_padded is None
+        and expert_location_dispatch_info is None
+        and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+        and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    )
+
+
+def build_precomputed_topk_output(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_config: TopKConfig,
+    layer_id: int,
+) -> StandardTopKOutput:
+    """Wrap a router's own (weights, ids) as a STANDARD top-k output, running the
+    capture hook and the expert-distribution recorder that select_experts would.
+
+    Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
+    """
+    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    # router_logits is only read by the BYPASSED formats and by the
+    # shared-expert append (excluded above); STANDARD consumers take ids/weights.
+    return StandardTopKOutput(topk_weights, topk_ids, None)
 
 
 # NOTE: the AOT sgl_kernel::moe_fused_gate and sgl_kernel::kimi_k2_moe_fused_gate
