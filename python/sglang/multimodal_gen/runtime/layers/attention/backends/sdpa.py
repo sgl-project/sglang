@@ -103,9 +103,8 @@ class SDPAImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
-        padding_start: int | None = None,
     ) -> torch.Tensor:
-        del max_seqlen, padding_start
+        del max_seqlen
         bounds = (
             cu_seqlens_host
             if cu_seqlens_host is not None

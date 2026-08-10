@@ -487,18 +487,23 @@ def _minimax_h3_attention_core_impl(
             ring_ws=ring_ws,
         )
     else:
+        varlen_kwargs: dict[str, Any] = {
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": max_seqlen,
+            "cu_seqlens_host": cu_seqlens_host,
+        }
+        # Only Laser skips the alignment-padding segment instead of computing it.
+        if attention._attention_backend_enum is AttentionBackendEnum.LASER_ATTN:
+            varlen_kwargs["padding_start"] = (
+                cu_seqlens_host[1]
+                if cu_seqlens_host is not None and len(cu_seqlens_host) == 3
+                else None
+            )
         out = attention._attention_impl.forward_varlen(
             q,
             k,
             v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            cu_seqlens_host=cu_seqlens_host,
-            padding_start=(
-                cu_seqlens_host[1]
-                if cu_seqlens_host is not None and len(cu_seqlens_host) == 3
-                else None
-            ),
+            **varlen_kwargs,
         )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]

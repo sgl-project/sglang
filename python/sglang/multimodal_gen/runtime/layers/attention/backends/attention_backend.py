@@ -204,7 +204,6 @@ class AttentionImpl(ABC, Generic[T]):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
-        padding_start: int | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError(
             f"{type(self).__name__} does not implement packed varlen attention"
