@@ -85,8 +85,8 @@ sgl-eval run gsm8k \\
 
   cells: [
     {
-      match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
@@ -95,8 +95,8 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: true,
+      match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
