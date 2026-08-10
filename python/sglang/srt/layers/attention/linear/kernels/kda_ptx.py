@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.runtime_context import mamba_cache_chunk_size
 
 logger = logging.getLogger(__name__)
 
@@ -194,11 +195,8 @@ class PtxKDAKernel(LinearAttnKernelBase):
             # which may be larger (for example 256 for Nemotron-H). Returning
             # the raw 64-token rows in that case would silently select the
             # wrong boundary and compute wrong offsets for later sequences.
-            from sglang.srt.runtime_context import get_server_args
 
-            intermediate_stride_supported = (
-                get_server_args().mamba_cache_chunk_size == _CHUNK
-            )
+            intermediate_stride_supported = mamba_cache_chunk_size() == _CHUNK
         seq_lens = (
             [int(length) for length in seq_lens_cpu] if seq_lens_cpu is not None else []
         )

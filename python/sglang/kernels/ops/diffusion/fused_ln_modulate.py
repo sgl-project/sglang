@@ -16,42 +16,38 @@ boundaries for ``quality="high"`` requests.
 
 from __future__ import annotations
 
-from typing import Iterator
-
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.diffusion.quality_gate import QualityGatedFusion
+
+_SITE_MARKER_ATTR = "_sgl_fused_ln_modulate_site"
 _SITE_ENABLED_ATTR = "_sgl_fused_ln_modulate_enabled"
+_FUSION = QualityGatedFusion(
+    name="fused LN+modulate",
+    marker_attr=_SITE_MARKER_ATTR,
+    enabled_attr=_SITE_ENABLED_ATTR,
+)
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 
 def mark_fused_ln_modulate_site(module: nn.Module) -> None:
     """Mark ``module`` as an LN+modulate fusion site (mounted off)."""
-    setattr(module, _SITE_ENABLED_ATTR, False)
+    _FUSION.mark(module)
 
 
 def fused_ln_modulate_active(module: nn.Module) -> bool:
-    return getattr(module, _SITE_ENABLED_ATTR, False)
-
-
-def iter_fused_ln_modulate_sites(root: nn.Module) -> Iterator[nn.Module]:
-    for module in root.modules():
-        if hasattr(module, _SITE_ENABLED_ATTR):
-            yield module
+    return _FUSION.is_enabled(module)
 
 
 def mount_fused_ln_modulate(root: nn.Module) -> bool:
-    sites = list(iter_fused_ln_modulate_sites(root))
-    for site in sites:
-        setattr(site, _SITE_ENABLED_ATTR, True)
-    return bool(sites)
+    return _FUSION.mount(root)
 
 
 def unmount_fused_ln_modulate(root: nn.Module) -> None:
-    for site in iter_fused_ln_modulate_sites(root):
-        setattr(site, _SITE_ENABLED_ATTR, False)
+    _FUSION.unmount(root)
 
 
 def can_fuse_ln_modulate(
