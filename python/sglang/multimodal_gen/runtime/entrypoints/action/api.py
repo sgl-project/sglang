@@ -128,7 +128,9 @@ async def _save_action_upload(
 
 async def _multipart_action_payload(request: Request, uploads_dir: str) -> dict:
     raw_form = await request.form()
-    request_id = raw_form.get("request_id") or raw_form.get("id") or generate_request_id()
+    request_id = (
+        raw_form.get("request_id") or raw_form.get("id") or generate_request_id()
+    )
 
     parameters: dict[str, Any] = {}
     for key, value in raw_form.multi_items():
