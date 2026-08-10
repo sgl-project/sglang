@@ -139,7 +139,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # once page ids are scaled by layer_num — `translate_kv_loc_dense` emits
         # that space. 1 for sub-pools whose kernels take real physical ids.
         self.kernel_page_multiplier = kernel_page_multiplier
-        # Zero page envelopes on hand-out — see _maybe_zero_pages.
+        # Zero page envelopes on hand-out — see _maybe_zero_pages. Deliberately
+        # MLA-only, INCLUDING the dense MHA pool: MHA kernels boundary-mask
+        # reads by seq_lens / cache_seqlens, so never-written page bytes are
+        # never dereferenced; MLA kernels arithmetically mask rows past
+        # seq_len (NaN * 0 = NaN), which is what makes unzeroed hand-outs
+        # dangerous there. Widen this isinstance only for a pool whose read
+        # kernels arithmetically mask.
         self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
         # v2p writes + move kernel serialize after the in-flight forward.
