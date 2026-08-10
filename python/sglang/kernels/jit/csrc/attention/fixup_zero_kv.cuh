@@ -11,43 +11,58 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 constexpr int kFixupBlockSize = 256;
 
 // -- vectorised zero-fill helpers ------------------------------------------
 
-// Zero-fill `n` elements of type T starting at `ptr`, using float4 stores.
-// `ptr` must be 16-byte aligned (guaranteed by PyTorch allocator).
+// Zero-fill `n` elements of type T starting at `ptr`.
 template <typename T>
 __device__ __forceinline__ void vec_zero_fill(T* ptr, int n) {
-  constexpr int kVec = 16 / sizeof(T);  // elements per float4
-  const int n_vec = n / kVec;           // full vectors
-  float4* dst4 = reinterpret_cast<float4*>(ptr);
-  const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);
-  for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
-    dst4[i] = z4;
-  }
-  // tail elements
-  const int tail_start = n_vec * kVec;
-  for (int i = tail_start + threadIdx.x; i < n; i += blockDim.x) {
-    ptr[i] = static_cast<T>(0);
+  if ((reinterpret_cast<uintptr_t>(ptr) & 0xF) == 0) {
+    // 16-byte aligned -> vectorised float4 stores
+    constexpr int kVec = 16 / sizeof(T);  // elements per float4
+    const int n_vec = n / kVec;           // full vectors
+    float4* dst4 = reinterpret_cast<float4*>(ptr);
+    const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
+      dst4[i] = z4;
+    }
+    // tail elements
+    const int tail_start = n_vec * kVec;
+    for (int i = tail_start + threadIdx.x; i < n; i += blockDim.x) {
+      ptr[i] = static_cast<T>(0);
+    }
+  } else {
+    // misaligned row base -> scalar stores
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+      ptr[i] = static_cast<T>(0);
+    }
   }
 }
 
-// Fill `n` float elements with -inf using float4 stores.
+// Fill `n` float elements with -inf.
 __device__ __forceinline__ void vec_neginf_fill(float* ptr, int n) {
-  constexpr int kVec = 4;  // float4 = 4 floats
-  const int n_vec = n / kVec;
-  float4* dst4 = reinterpret_cast<float4*>(ptr);
   const float ninf = -INFINITY;
-  const float4 inf4 = make_float4(ninf, ninf, ninf, ninf);
-  for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
-    dst4[i] = inf4;
-  }
-  const int tail_start = n_vec * kVec;
-  for (int i = tail_start + threadIdx.x; i < n; i += blockDim.x) {
-    ptr[i] = ninf;
+  if ((reinterpret_cast<uintptr_t>(ptr) & 0xF) == 0) {
+    // 16-byte aligned -> vectorised float4 stores
+    constexpr int kVec = 4;  // float4 = 4 floats
+    const int n_vec = n / kVec;
+    float4* dst4 = reinterpret_cast<float4*>(ptr);
+    const float4 inf4 = make_float4(ninf, ninf, ninf, ninf);
+    for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
+      dst4[i] = inf4;
+    }
+    const int tail_start = n_vec * kVec;
+    for (int i = tail_start + threadIdx.x; i < n; i += blockDim.x) {
+      ptr[i] = ninf;
+    }
+  } else {
+    // misaligned row base -> scalar stores
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+      ptr[i] = ninf;
+    }
   }
 }
 
@@ -121,4 +136,4 @@ void fixup_zero_kv_rows(
       nh);
 }
 
-}  // namespace
+}  // namespace sglang

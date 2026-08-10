@@ -13,10 +13,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+    from sglang.srt.mem_cache.unified_cache.components import TreeComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
         UnifiedTreeCoreInterface,
     )
-    from sglang.srt.mem_cache.unified_cache_components import TreeComponent
 
 TreeCoreFactory = Callable[
     ["CacheInitParams", "dict[ComponentType, TreeComponent]"],

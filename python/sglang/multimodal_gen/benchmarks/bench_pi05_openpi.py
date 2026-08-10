@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import dataclasses
 import json
 import sys
@@ -53,7 +54,7 @@ PROFILES = {
         openpi_checkpoint="gs://openpi-assets/checkpoints/pi05_libero",
         prompt="pick up the object",
         sglang_action_horizon=50,
-        openpi_action_horizon=10,
+        openpi_action_horizon=50,
         action_dim=32,
         output_action_dim=7,
     ),
@@ -231,15 +232,13 @@ def _make_aloha_observation(
         },
         "prompt": prompt,
     }
-    sglang_state = np.zeros((32,), dtype=np.float32)
-    sglang_state[: state.shape[0]] = state
     sglang_observation = {
         "images": {
             "base_0_rgb": np.transpose(cam_high, (1, 2, 0)),
             "left_wrist_0_rgb": np.transpose(cam_left, (1, 2, 0)),
             "right_wrist_0_rgb": np.transpose(cam_right, (1, 2, 0)),
         },
-        "state": sglang_state,
+        "state": state,
     }
     return openpi_obs, sglang_observation
 
@@ -262,6 +261,33 @@ def build_observations(
         openpi_observations.append(openpi_obs)
         sglang_observations.append(sglang_obs)
     return openpi_observations, sglang_observations
+
+
+def build_openpi_model_inputs(
+    policy,
+    observations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert raw robot observations to the exact inputs consumed by OpenPI."""
+    model_inputs = []
+    for observation in observations:
+        transformed = policy._input_transform(copy.deepcopy(observation))
+        images = {
+            name: np.asarray(value) for name, value in transformed["image"].items()
+        }
+        model_inputs.append(
+            {
+                "images": images,
+                "image_masks": {
+                    name: bool(value)
+                    for name, value in transformed["image_mask"].items()
+                },
+                "camera_order": tuple(images),
+                "state": np.asarray(transformed["state"]),
+                "tokens": np.asarray(transformed["tokenized_prompt"]),
+                "token_masks": np.asarray(transformed["tokenized_prompt_mask"]),
+            }
+        )
+    return model_inputs
 
 
 def _json_tensor(array: np.ndarray) -> dict[str, Any]:
@@ -290,6 +316,13 @@ def build_sglang_payload(
         "images": encoded_images,
         "state": _json_tensor(np.asarray(observation["state"], dtype=np.float32)),
     }
+    if "tokens" in observation:
+        encoded_observation["tokens"] = np.asarray(observation["tokens"]).tolist()
+        encoded_observation["token_masks"] = np.asarray(
+            observation["token_masks"]
+        ).tolist()
+        encoded_observation["image_masks"] = observation["image_masks"]
+        encoded_observation["camera_order"] = list(observation["camera_order"])
     if noise is not None:
         encoded_observation["noise"] = _json_tensor(noise.astype(np.float32))
     return {
@@ -326,6 +359,11 @@ def build_sglang_python_payload(
         },
         "state": np.asarray(observation["state"], dtype=np.float32),
     }
+    if "tokens" in observation:
+        encoded_observation["tokens"] = np.asarray(observation["tokens"])
+        encoded_observation["token_masks"] = np.asarray(observation["token_masks"])
+        encoded_observation["image_masks"] = observation["image_masks"]
+        encoded_observation["camera_order"] = observation["camera_order"]
     if noise is not None:
         encoded_observation["noise"] = noise.astype(np.float32)
     return {
@@ -366,6 +404,11 @@ def build_sglang_openpi_ws_payload(
     }
     for key, value in observation["images"].items():
         payload[f"observation.images.{key}"] = np.asarray(value)
+    if "tokens" in observation:
+        payload["tokens"] = np.asarray(observation["tokens"])
+        payload["token_masks"] = np.asarray(observation["token_masks"])
+        payload["image_masks"] = observation["image_masks"]
+        payload["camera_order"] = observation["camera_order"]
     if noise is not None:
         payload["observation.noise"] = noise.astype(np.float32)
     return payload
@@ -791,11 +834,11 @@ def _openpi_infer(policy, observation: dict[str, Any], noise: np.ndarray | None)
     return policy.infer(observation, noise=noise)
 
 
-def _openpi_direct_batch(
+def _openpi_model_batch(
     policy,
     observations: list[dict[str, Any]],
     noises: list[np.ndarray] | None,
-):
+) -> tuple[np.ndarray, np.ndarray]:
     import jax
     import numpy as onp
     from openpi.models import model as openpi_model
@@ -845,6 +888,15 @@ def _openpi_direct_batch(
         actions_np = onp.asarray(actions)
         states_np = onp.asarray(inputs["state"])
 
+    return actions_np, states_np
+
+
+def _openpi_direct_batch(
+    policy,
+    observations: list[dict[str, Any]],
+    noises: list[np.ndarray] | None,
+):
+    actions_np, states_np = _openpi_model_batch(policy, observations, noises)
     outputs = []
     for idx in range(actions_np.shape[0]):
         outputs.append(
@@ -856,6 +908,15 @@ def _openpi_direct_batch(
             )
         )
     return outputs
+
+
+def _openpi_model_actions(
+    policy,
+    observation: dict[str, Any],
+    noise: np.ndarray,
+) -> np.ndarray:
+    actions, _ = _openpi_model_batch(policy, [observation], [noise])
+    return actions[0]
 
 
 def run_openpi_policy(
@@ -922,6 +983,12 @@ def run_openpi_policy(
         precision["output_action_dtype"] = str(first_actions.dtype)
         precision["output_action_shape"] = list(first_actions.shape)
 
+    first_model_actions = (
+        _openpi_model_actions(policy, observations[0], noise)
+        if observations and noise is not None
+        else None
+    )
+
     return {
         "single": _stats_ms(single_latencies),
         "batch": _stats_ms(batch_latencies),
@@ -930,6 +997,7 @@ def run_openpi_policy(
             key: _stats_ms(values) for key, values in policy_timings.items()
         },
         "first_output": single_outputs[0] if single_outputs else None,
+        "first_model_actions": first_model_actions,
         "batch_mode": batch_mode,
         "precision": precision,
     }
@@ -951,10 +1019,18 @@ def _openpi_actions(output: dict[str, Any]) -> np.ndarray | None:
 
 def compare_first_actions(
     sglang_output: dict[str, Any] | None,
-    openpi_output: dict[str, Any] | None,
+    openpi_output: dict[str, Any] | np.ndarray | None,
 ) -> dict[str, Any]:
     sglang_actions = _sglang_actions(sglang_output)
-    openpi_actions = _openpi_actions(openpi_output)
+    openpi_actions = (
+        _openpi_actions(openpi_output)
+        if isinstance(openpi_output, dict)
+        else (
+            np.asarray(openpi_output, dtype=np.float32)
+            if openpi_output is not None
+            else None
+        )
+    )
     if sglang_actions is None or openpi_actions is None:
         return {"available": False}
     horizon = min(sglang_actions.shape[0], openpi_actions.shape[0])
@@ -1051,6 +1127,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-prefix-cache", action="store_true")
     parser.add_argument("--disable-cuda-graph", action="store_true")
     parser.add_argument("--deterministic-noise", action="store_true")
+    parser.add_argument("--action-max-abs-diff", type=float, default=0.05)
+    parser.add_argument("--action-mean-abs-diff", type=float, default=0.005)
     parser.add_argument("--skip-sglang", action="store_true")
     parser.add_argument("--skip-openpi", action="store_true")
     parser.add_argument("--output-file", default="")
@@ -1096,6 +1174,24 @@ def main() -> None:
             dtype=np.float32,
         )
 
+    openpi_policy = None
+    if not args.skip_openpi:
+        openpi_policy = create_openpi_policy(
+            openpi_config,
+            openpi_checkpoint,
+            pytorch_device=args.openpi_device,
+            num_inference_steps=args.num_inference_steps,
+            pytorch_compile_mode=(
+                None
+                if args.openpi_pytorch_compile_mode == "none"
+                else args.openpi_pytorch_compile_mode
+            ),
+        )
+        if not args.skip_sglang and args.deterministic_noise:
+            sglang_observations = build_openpi_model_inputs(
+                openpi_policy,
+                openpi_observations,
+            )
     payloads = []
     if args.skip_sglang:
         pass
@@ -1137,20 +1233,6 @@ def main() -> None:
             )
             for observation in sglang_observations
         ]
-
-    openpi_policy = None
-    if not args.skip_openpi:
-        openpi_policy = create_openpi_policy(
-            openpi_config,
-            openpi_checkpoint,
-            pytorch_device=args.openpi_device,
-            num_inference_steps=args.num_inference_steps,
-            pytorch_compile_mode=(
-                None
-                if args.openpi_pytorch_compile_mode == "none"
-                else args.openpi_pytorch_compile_mode
-            ),
-        )
 
     sglang_result = None
     if args.skip_sglang:
@@ -1210,9 +1292,20 @@ def main() -> None:
         "repeats": args.repeats,
         "warmup": args.warmup,
         "deterministic_noise": args.deterministic_noise,
-        "action_diff": compare_first_actions(
-            None if sglang_result is None else sglang_result.get("first_output"),
-            None if openpi_result is None else openpi_result.get("first_output"),
+        "action_diff": (
+            compare_first_actions(
+                None if sglang_result is None else sglang_result.get("first_output"),
+                (
+                    None
+                    if openpi_result is None
+                    else openpi_result.get("first_model_actions")
+                ),
+            )
+            if args.deterministic_noise
+            else {
+                "available": False,
+                "reason": "use --deterministic-noise for action comparison",
+            }
         ),
         "sglang": (
             None
@@ -1229,7 +1322,7 @@ def main() -> None:
             else {
                 key: value
                 for key, value in openpi_result.items()
-                if key not in ("first_output",)
+                if key not in ("first_output", "first_model_actions")
             }
         ),
     }
@@ -1237,6 +1330,19 @@ def main() -> None:
         with open(args.output_file, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, sort_keys=True)
     print_summary(result)
+
+    action_diff = result["action_diff"]
+    if action_diff.get("available") and (
+        action_diff["max_abs_diff"] > args.action_max_abs_diff
+        or action_diff["mean_abs_diff"] > args.action_mean_abs_diff
+    ):
+        raise AssertionError(
+            "Pi0.5 action mismatch: "
+            f"max_abs_diff={action_diff['max_abs_diff']:.6f} "
+            f"(threshold {args.action_max_abs_diff:.6f}), "
+            f"mean_abs_diff={action_diff['mean_abs_diff']:.6f} "
+            f"(threshold {args.action_mean_abs_diff:.6f})"
+        )
 
 
 if __name__ == "__main__":

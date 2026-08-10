@@ -33,6 +33,7 @@ def _server_args(config: Pi05PipelineConfig | None = None) -> SimpleNamespace:
         sp_degree=1,
         ulysses_degree=1,
         ring_degree=1,
+        kv_gather_degree=1,
         pipeline_config=config or Pi05PipelineConfig(),
     )
 
@@ -174,6 +175,7 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
     assert metadata["runtime"]["materialize_dtype"] == "bf16"
     assert metadata["runtime"]["enable_autocast"] is True
     assert metadata["runtime"]["parallelism"]["num_gpus"] == 1
+    assert metadata["runtime"]["parallelism"]["kv_gather_degree"] == 1
     assert metadata["runtime"]["parallelism"]["prefix_strategy"] == "tp"
     assert metadata["runtime"]["parallelism"]["action_strategy"] == "sp"
     assert metadata["defaults"]["prefix_cache"] is False

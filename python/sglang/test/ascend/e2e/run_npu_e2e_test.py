@@ -310,7 +310,9 @@ def create_or_update_configmap(cm_name: str, data: dict, namespace: str):
 
 def prepare_cm_data(namespace, pod_string):
     """Prepare a configmap data: {pod_name: pod_ip} by the running pod's information."""
-    pods = core_api.list_namespaced_pod(namespace=namespace)
+    pods = core_api.list_namespaced_pod(
+        namespace=namespace, label_selector="app=sgl-ascend"
+    )
     data = {}
     for pod in pods.items:
         pod_name = pod.metadata.name

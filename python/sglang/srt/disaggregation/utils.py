@@ -5,7 +5,16 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    overload,
+)
 
 import numpy as np
 import torch
@@ -27,11 +36,34 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import ServerArgs
 
+if is_npu():
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+        DSV4NPUTokenToKVPool,
+    )
+
 #########################
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+
+
+def poll_and_all_reduce_pp(
+    rids: Iterable[str],
+    ready_poll: int,
+    pp_good_rids: Optional[List[str]] = None,
+    pp_bad_rids: Optional[List[str]] = None,
+) -> List[Optional[int]]:
+    """Map authoritative PP consensus to poll states without polling again."""
+    if pp_good_rids is None or pp_bad_rids is None:
+        raise ValueError("PP consensus is required")
+
+    good_rids = set(pp_good_rids)
+    bad_rids = set(pp_bad_rids)
+    return [
+        KVPoll.Failed if rid in bad_rids else ready_poll if rid in good_rids else None
+        for rid in rids
+    ]
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
@@ -186,6 +218,13 @@ def poll_and_all_reduce_with_staging(
     receivers = [dr.kv_receiver for dr in decode_reqs]
     raw_polls = _poll_with_failure_injection(receivers)
     for i, decode_req in enumerate(decode_reqs):
+        if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
+            decode_req
+        ):
+            # Staging completion timed out; KVPoll.Failed == 0 propagates
+            # through the MIN all_reduce.
+            raw_polls[i] = int(KVPoll.Failed)
+            continue
         if raw_polls[i] == int(KVPoll.Success):
             if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
                 decode_req
@@ -902,6 +941,31 @@ def build_transfer_entry_pairs(
     return [(i, i) for i in range(n_src)]
 
 
+def resolve_dcp_dst_entry_indices(
+    src_layer_ids: List[int],
+    dst_layer_ids: List[int],
+    n_src: int,
+    n_dst: int,
+) -> List[int]:
+    """Destination entry index for each local KV entry, for a DCP relayout.
+
+    DCP re-splits the KV by context while PP re-splits it by layer, so the two
+    index spaces only line up when neither peer is pipelined. Both backends
+    need the same resolution, hence the shared helper.
+    """
+    if not src_layer_ids and not dst_layer_ids:
+        # Legacy/non-PP layout. n_dst may exceed n_src when the decode side
+        # runs speculative decoding and the prefill side does not.
+        return list(range(n_src))
+    # A one-sided mapping is rejected by build_transfer_entry_pairs itself.
+    return [
+        j
+        for _, j in build_transfer_entry_pairs(
+            src_layer_ids, dst_layer_ids, n_src, n_dst
+        )
+    ]
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
@@ -956,7 +1020,17 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
-    if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
+    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
+        # Pool ships each sub-pool as its own page-indexed component (fixed order
+        # so prefill and decode register identically); skips get_state_buf_infos.
+        for (
+            st,
+            comp_ptrs,
+            comp_lens,
+            comp_item_lens,
+        ) in token_to_kv_pool.get_pd_state_components():
+            append_state_component(kv_args, st, comp_ptrs, comp_lens, comp_item_lens)
+    elif isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(
                 "PD disaggregation for MiniMax sparse layers with index value "

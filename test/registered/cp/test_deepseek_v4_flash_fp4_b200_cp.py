@@ -1,7 +1,7 @@
-"""B200 extra CI: DeepSeek-V4-Flash FP4 with attn-CP (DSA prefill CP).
+"""B200 extra CI: DeepSeek-V4-Flash FP4 with attn-CP.
 
 Balanced recipe (TP=4, DeepEP, EAGLE) plus --attn-cp-size=4 with the
-DSA prefill-CP round-robin-split mode. Split out of
+DSA prefill-CP interleave strategy. Split out of
 models_e2e/test_deepseek_v4_flash_fp4_b200.py so the `cp` group covers
 all context-parallel tests.
 
@@ -22,13 +22,14 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=235, stage="extra-b", runner_config="deepep-4-gpu-b200")
+register_cuda_ci(est_time=235, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 _DEEPEP_ENV = {
+    "SGLANG_ENABLE_CP_V2": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
     # The draft-extend graph pool costs ~4.5 GB here (DeepEP MoE workspace is
     # captured at full dispatch capacity), which starves the eager prefill
@@ -38,6 +39,7 @@ _DEEPEP_ENV = {
 }
 
 _MEGAMOE_ENV = {
+    "SGLANG_ENABLE_CP_V2": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
@@ -81,9 +83,9 @@ class TestDSV4FlashFP4B200Balanced_CP_DeepEP(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--enable-dsa-prefill-context-parallel",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "interleave",
                 "--deepep-config",
                 DEEPEP_CONFIG,
                 "--mem-fraction-static",
@@ -132,9 +134,9 @@ class TestDSV4FlashFP4B200Balanced_CP_Megamoe(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--enable-dsa-prefill-context-parallel",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "interleave",
                 "--deepep-config",
                 DEEPEP_CONFIG,
             ],
@@ -181,12 +183,13 @@ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--enable-dsa-prefill-context-parallel",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "interleave",
                 "--moe-runner-backend",  # for fp4 checkpoint
                 "flashinfer_mxfp4",
             ],
+            env={"SGLANG_ENABLE_CP_V2": "1"},
         )
 
     @classmethod

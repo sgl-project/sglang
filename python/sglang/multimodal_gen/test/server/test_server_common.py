@@ -64,6 +64,7 @@ from sglang.multimodal_gen.test.test_utils import (
     load_action_consistency_gt,
     load_consistency_gt,
     save_consistency_failure_artifact,
+    save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
 )
 
@@ -610,6 +611,24 @@ class DiffusionServerBase:
         if not gt_exists(
             case.id, num_gpus, is_video=is_video, output_format=output_format
         ):
+            if is_video:
+                output_frames = pop_realtime_key_frames(case.id)
+                if output_frames is None:
+                    output_frames = extract_key_frames_from_video(content)
+            else:
+                output_frames = [image_bytes_to_numpy(content)]
+            artifact_path = save_missing_consistency_gt_artifact(
+                artifact_dir=os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                case_id=case.id,
+                num_gpus=num_gpus,
+                output_frames=output_frames,
+                is_video=is_video,
+                output_format=output_format,
+            )
+            if artifact_path is not None:
+                logger.info(
+                    "[Artifact] Saved missing consistency GT: %s", artifact_path
+                )
             if _get_consistency_gt_dir() is not None:
                 names = ", ".join(
                     get_consistency_gt_candidates(

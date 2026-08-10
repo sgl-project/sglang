@@ -12,7 +12,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_parallel,
+    process_model_config,
+)
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
@@ -56,40 +59,78 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
         return False
 
 
+# Tile size for the indexer FP8 K-cache preshuffle layout. Store and gather
+# kernels reorganize each page into (tile x tile) blocks so the aiter preshuffle
+# paged-MQA gather can consume the cache directly.
+INDEXER_K_CACHE_PRESHUFFLE_TILE = 16
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.server_args import ServerArgs
 
 
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
+def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
+    """Whether a PD seed should enter the allocator-local fused TopK domain."""
+    return (
+        is_cuda()
+        and envs.SGLANG_DSA_FUSE_TOPK.get()
+        and server_args.disaggregation_mode == "decode"
+        and not server_args.enable_hisparse
+        and not get_parallel().dcp_enabled
+    )
+
+
 def should_use_dsa_fused_topk(
-    server_args, seed_dsa_topk_from_draft_extend: bool
+    server_args: "ServerArgs", seed_dsa_topk_from_draft_extend: bool
 ) -> bool:
+    """Select fused TopK for PD IndexShare.
+
+    PD Prefill worker:
+    - Target prefill: fused TopK enabled.
+    - Draft extend: fused TopK disabled.
+
+    PD Decode worker:
+    - Draft decode / target verify / draft extend: fused TopK enabled.
+    """
     pd_index_share_seed = (
         server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
     )
-    # TODO(kpham-sgl): Transfer request-relative IndexShare seeds and remap them
-    # to decode-local KV slots so fused top-k can remain enabled under PD.
-    return envs.SGLANG_DSA_FUSE_TOPK.get() and not pd_index_share_seed
+    return envs.SGLANG_DSA_FUSE_TOPK.get() and (
+        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots(server_args)
+    )
 
 
 def is_dsa_enable_prefill_cp():
-    return get_server_args().enable_dsa_prefill_context_parallel
+    if not envs.SGLANG_ENABLE_CP_V2.get():
+        return get_parallel().enable_dsa_prefill_context_parallel
+
+    # Derive from the runtime CP topology + model arch rather than the legacy
+    # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
+    # DeepSeek Sparse Attention model.
+    if get_parallel().attn_cp_size <= 1:
+        return False
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+
+    hf_config = process_model_config().hf_config
+    return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_server_args().dsa_prefill_cp_mode == "in-seq-split"
+        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_server_args().dsa_prefill_cp_mode == "round-robin-split"
+        and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
     )
 
 
@@ -154,6 +195,13 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+    from sglang.srt.layers.cp.utils import is_cp_v2_active
+
+    # CP-v2 already pads each rank-local shard to its physical size
+    if is_cp_v2_active(forward_batch):
+        return forward_batch.attn_cp_metadata.per_rank_actual_token[
+            get_parallel().attn_cp_rank
+        ]
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
@@ -200,6 +248,15 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
 
 
 def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
+    if (
+        cp_size <= 1
+        or not use_dsa
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or not is_dsa_enable_prefill_cp()
+        or sum(forward_batch.extend_seq_lens_cpu) < cp_size
+    ):
+        return False
+
     if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
@@ -210,17 +267,7 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
         # the seq data needs to be divided and recombined at twice the size of cp_size.
         cur_cp_seq_len = seq_len // (cp_size * 2)
-    if (
-        cur_cp_seq_len != 0
-        and cp_size > 1
-        and use_dsa
-        and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_dsa_enable_prefill_cp()
-        and sum(forward_batch.extend_seq_lens_cpu) >= cp_size
-    ):
-        return True
-    else:
-        return False
+    return cur_cp_seq_len != 0
 
 
 from sglang.kernels.ops.attention.dsa.cp_split import (
