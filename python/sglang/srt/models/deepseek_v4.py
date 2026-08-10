@@ -2442,7 +2442,11 @@ class DeepseekV4Model(nn.Module):
                 and self._cp_children_splittable(forward_batch)
             )
         else:
-            path_ok = True
+            path_ok = (
+                not _is_hip
+                or not get_moe_a2a_backend().is_none()
+                or get_parallel().attn_dp_size > 1
+            )
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
