@@ -120,7 +120,14 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.utils.npu_ipc_transport_utils import (
+    NpuIpcTensorTransportProxy,
+)
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
+
+
+def is_ipc_tensor_transport_proxy(obj) -> bool:
+    return isinstance(obj, (CudaIpcTensorTransportProxy, NpuIpcTensorTransportProxy))
 
 if TYPE_CHECKING:
     from typing import Any, Dict
@@ -405,31 +412,29 @@ class MultimodalDataItem:
 
     def has_cuda_ipc_proxy(self):
         return (
-            isinstance(self.feature, CudaIpcTensorTransportProxy)
-            or isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
+            is_ipc_tensor_transport_proxy(self.feature)
+            or is_ipc_tensor_transport_proxy(self.precomputed_embeddings)
             or any(
-                isinstance(value, CudaIpcTensorTransportProxy)
+                is_ipc_tensor_transport_proxy(value)
                 for value in self.model_specific_data.values()
             )
         )
 
     def reconstruct(self, target_device: int, ipc_consumer_count: int = 1):
         """materialize cuda ipc proxy tensors in-place on target_device"""
-        if isinstance(self.feature, CudaIpcTensorTransportProxy):
+        if is_ipc_tensor_transport_proxy(self.feature):
             if ipc_consumer_count == 1:
                 self.feature = self.feature.reconstruct_on_target_device(target_device)
             else:
                 self.feature = self.feature.reconstruct_on_target_device(
                     target_device, consumer_count=ipc_consumer_count
                 )
-        if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
+        if is_ipc_tensor_transport_proxy(self.precomputed_embeddings):
             self.precomputed_embeddings = (
                 self.precomputed_embeddings.reconstruct_on_target_device(target_device)
             )
         for extra_key in self.model_specific_data:
-            if isinstance(
-                self.model_specific_data[extra_key], CudaIpcTensorTransportProxy
-            ):
+            if is_ipc_tensor_transport_proxy(self.model_specific_data[extra_key]):
                 extra_data = self.model_specific_data[
                     extra_key
                 ].reconstruct_on_target_device(target_device)
@@ -448,17 +453,17 @@ class MultimodalDataItem:
             )
             and self.hash is not None
             and self.pad_value is not None
-            and isinstance(self.feature, CudaIpcTensorTransportProxy)
-            and not isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
+            and is_ipc_tensor_transport_proxy(self.feature)
+            and not is_ipc_tensor_transport_proxy(self.precomputed_embeddings)
             and not any(
-                isinstance(value, CudaIpcTensorTransportProxy)
+                is_ipc_tensor_transport_proxy(value)
                 for value in self.model_specific_data.values()
             )
         )
 
     def acknowledge_deferred_cuda_ipc_feature(self, consumer_count: int = 1):
         """Release a lazy IPC feature when an embedding-cache hit skips ViT."""
-        if isinstance(self.feature, CudaIpcTensorTransportProxy):
+        if is_ipc_tensor_transport_proxy(self.feature):
             self.feature.acknowledge_consumption(consumer_count)
 
 
@@ -593,6 +598,7 @@ class MultimodalInputs:
         mm_items = [item for item in mm_items if item.is_valid()]
 
         # try reconstructing from cuda-ipc
+        from sglang.srt.utils import is_npu
         reconstruct_device = None
         for mm_item in mm_items:
             if (
@@ -600,7 +606,7 @@ class MultimodalInputs:
                 and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
             ):
                 if reconstruct_device is None:
-                    reconstruct_device = torch.cuda.current_device()
+                    reconstruct_device = torch.npu.current_device() if is_npu() else torch.cuda.current_device()
                 mm_item.reconstruct(reconstruct_device)
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:

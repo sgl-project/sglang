@@ -548,7 +548,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             if mm_items and vision_token_info:
                 mm_items[0].set("vision_token_info", vision_token_info[0])
 
-            if self.use_cuda_ipc:
+            if self.use_device_ipc:
                 for item in mm_items:
                     if isinstance(item.feature, torch.Tensor):
                         item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)

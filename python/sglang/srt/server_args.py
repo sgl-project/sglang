@@ -2702,15 +2702,16 @@ class ServerArgs:
         bool, "Adopt base image processor instead of fast image processor.", NS("mm")
     ] = False
     mm_feature_transport: A[
-        Optional[Literal["cpu", "cuda_ipc"]],
-        "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
-        "The default is CPU transport; CUDA IPC reserves GPU memory on the base GPU.",
+        Optional[Literal["cpu", "cuda_ipc", "npu_ipc"]],
+        "Transport multimodal features through CPU memory or a bounded device IPC pool. "
+        "The default is CPU transport; CUDA IPC reserves GPU memory on the base GPU; "
+        "NPU IPC reserves NPU memory on the base device.",
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
         bool,
-        "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
-        "multimodal feature transport.",
+        "Deprecated. Use --mm-feature-transport=cuda_ipc (or npu_ipc on NPU) for "
+        "bounded device-resident multimodal feature transport.",
         NS("mm"),
     ] = False
 
@@ -7507,12 +7508,13 @@ class ServerArgs:
                 raise ValueError(
                     "--keep-mm-feature-on-device conflicts with "
                     "--mm-feature-transport=cpu. Use only "
-                    "--mm-feature-transport=cuda_ipc."
+                    "--mm-feature-transport=cuda_ipc or npu_ipc."
                 )
-            requested_transport = "cuda_ipc"
+            requested_transport = "npu_ipc" if is_npu() else "cuda_ipc"
             logger.warning(
                 "--keep-mm-feature-on-device is deprecated; using "
-                "--mm-feature-transport=cuda_ipc instead."
+                "--mm-feature-transport=%s instead.",
+                requested_transport,
             )
 
         if requested_transport is None:
@@ -7549,6 +7551,26 @@ class ServerArgs:
             logger.info(
                 "Using CUDA IPC for multimodal features: reserving up to %d MiB "
                 "on base GPU %d across %d tokenizer worker(s). This reduces KV "
+                "cache headroom; a full pool falls back to CPU transport.",
+                pool_budget_mb,
+                self.base_gpu_id,
+                self.tokenizer_worker_num,
+            )
+
+        if requested_transport == "npu_ipc":
+            if not is_npu():
+                raise ValueError(
+                    "--mm-feature-transport=npu_ipc requires Ascend NPU."
+                )
+            if self.nnodes != 1:
+                raise ValueError(
+                    "--mm-feature-transport=npu_ipc only supports a single node."
+                )
+
+            pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+            logger.info(
+                "Using NPU IPC for multimodal features: reserving up to %d MiB "
+                "on base NPU %d across %d tokenizer worker(s). This reduces KV "
                 "cache headroom; a full pool falls back to CPU transport.",
                 pool_budget_mb,
                 self.base_gpu_id,

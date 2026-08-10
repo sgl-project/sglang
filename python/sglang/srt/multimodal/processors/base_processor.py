@@ -35,8 +35,12 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
-    MmItemMemoryPool,
+    MmItemMemoryPool as CudaMmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
+)
+from sglang.srt.utils.npu_ipc_transport_utils import (
+    MmItemMemoryPool as NpuMmItemMemoryPool,
+    NpuIpcTensorTransportProxy,
 )
 
 _is_cpu = is_cpu()
@@ -200,12 +204,12 @@ class BaseMultimodalProcessor(ABC):
         )
         self.mm_feature_transport = (
             configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc")
+            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "npu_ipc")
             else "cpu"
         )
-        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        self.use_device_ipc = self.mm_feature_transport in ("cuda_ipc", "npu_ipc")
         self.use_ipc_pool_handle_cache = (
-            self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
+            self.use_device_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
         self.disable_fast_image_processor = server_args.disable_fast_image_processor
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -338,30 +342,42 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
-        if self.use_cuda_ipc and not skip_mm_pool:
+        if self.use_device_ipc and not skip_mm_pool:
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
+            from sglang.srt.utils import is_npu
+            device_type = "npu" if is_npu() else "cuda"
+            device_name = "NPU" if device_type == "npu" else "GPU"
             worker_num = self.server_args.tokenizer_worker_num
             per_worker_pool_size = get_mm_feature_pool_size_per_worker(
                 MM_FEATURE_CACHE_SIZE, worker_num
             )
             total_pool_size = per_worker_pool_size * worker_num
             logger.info(
-                "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
-                "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
-                "budget %.0f MiB).",
+                f"%s IPC multimodal feature pools reserve %.0f MiB total on "
+                f"%s %d (%.0f MiB per tokenizer worker × %d; configured "
+                f"budget %.0f MiB).",
+                device_name.upper(),
                 total_pool_size / (1024 * 1024),
+                device_name,
                 self.server_args.base_gpu_id,
                 per_worker_pool_size / (1024 * 1024),
                 worker_num,
                 MM_FEATURE_CACHE_SIZE / (1024 * 1024),
             )
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
-                per_worker_pool_size,
-                MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-                self.server_args.base_gpu_id,
-            )
+            if device_type == "npu":
+                self.cudaipc_mmfeature_pool = NpuMmItemMemoryPool(
+                    per_worker_pool_size,
+                    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                    self.server_args.base_gpu_id,
+                )
+            else:
+                self.cudaipc_mmfeature_pool = CudaMmItemMemoryPool(
+                    per_worker_pool_size,
+                    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                    self.server_args.base_gpu_id,
+                )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -588,7 +604,7 @@ class BaseMultimodalProcessor(ABC):
         )
         # Deferred: the hash is computed on the GPU tensor first, and
         # _precompute_hashes_before_cpu_transfer moves it down afterwards.
-        if not self.use_cuda_ipc and not self.precompute_hash_before_cpu_transfer:
+        if not self.use_device_ipc and not self.precompute_hash_before_cpu_transfer:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result and isinstance(
@@ -1363,18 +1379,32 @@ class BaseMultimodalProcessor(ABC):
         )
         if isinstance(available_slice, torch.Tensor):
             available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
-            return CudaIpcTensorTransportProxy(
-                data=available_slice,
-                info_data=tensor,
-                sync_buffer_meta=sync_flag,
-                pool_ipc_handle=(
-                    self.cudaipc_mmfeature_pool._pool_ipc_handle
-                    if self.use_ipc_pool_handle_cache
-                    else None
-                ),
-                pool_byte_offset=byte_offset,
-                pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
-            )
+            if _is_npu:
+                return NpuIpcTensorTransportProxy(
+                    data=available_slice,
+                    info_data=tensor,
+                    sync_buffer_meta=sync_flag,
+                    pool_ipc_handle=(
+                        self.cudaipc_mmfeature_pool._pool_ipc_handle
+                        if self.use_ipc_pool_handle_cache
+                        else None
+                    ),
+                    pool_byte_offset=byte_offset,
+                    pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
+                )
+            else:
+                return CudaIpcTensorTransportProxy(
+                    data=available_slice,
+                    info_data=tensor,
+                    sync_buffer_meta=sync_flag,
+                    pool_ipc_handle=(
+                        self.cudaipc_mmfeature_pool._pool_ipc_handle
+                        if self.use_ipc_pool_handle_cache
+                        else None
+                    ),
+                    pool_byte_offset=byte_offset,
+                    pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
+                )
         return tensor.cpu()
 
     @staticmethod
@@ -1395,7 +1425,7 @@ class BaseMultimodalProcessor(ABC):
 
         for item in mm_items:
             item.set_pad_value()
-            if not self.use_cuda_ipc:
+            if not self.use_device_ipc:
                 item.feature = self._move_feature_to_cpu(item.feature)
                 item.precomputed_embeddings = self._move_feature_to_cpu(
                     item.precomputed_embeddings
@@ -1624,7 +1654,7 @@ class BaseMultimodalProcessor(ABC):
 
         # Wrap GPU features in the bounded IPC pool; pool misses fall back to a
         # plain CPU tensor. The scheduler copies out and releases each slice.
-        if self.use_cuda_ipc:
+        if self.use_device_ipc:
             # post-process, prepare for cuda-ipc transfer
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor):

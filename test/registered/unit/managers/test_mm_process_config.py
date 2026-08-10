@@ -198,7 +198,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             )
 
         self.assertEqual(processor.mm_feature_transport, "cuda_ipc")
-        self.assertTrue(processor.use_cuda_ipc)
+        self.assertTrue(processor.use_device_ipc)
         self.assertTrue(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
@@ -215,7 +215,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
                 transport_mode=None,
             )
 
-        self.assertTrue(processor.use_cuda_ipc)
+        self.assertTrue(processor.use_device_ipc)
         self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
@@ -233,7 +233,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             )
 
         self.assertEqual(processor.mm_feature_transport, "cpu")
-        self.assertFalse(processor.use_cuda_ipc)
+        self.assertFalse(processor.use_device_ipc)
         self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_not_called()
 
@@ -250,7 +250,7 @@ class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
         ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
             processor = BaseMultimodalProcessor()
         processor.precompute_hash_before_cpu_transfer = enabled
-        processor.use_cuda_ipc = False
+        processor.use_device_ipc = False
         return processor
 
     def test_enabled_path_sets_hash_and_pad_value(self):
@@ -405,7 +405,7 @@ class TestProcessMmDataKwargs(CustomTestCase):
 
         proc.server_args = server_args
         proc.mm_feature_transport = server_args.mm_feature_transport
-        proc.use_cuda_ipc = False
+        proc.use_device_ipc = False
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_processor
@@ -534,7 +534,7 @@ class TestOverrideProcessorsConfigInjection(CustomTestCase):
 
         proc.server_args = server_args
         proc.mm_feature_transport = server_args.mm_feature_transport
-        proc.use_cuda_ipc = False
+        proc.use_device_ipc = False
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
