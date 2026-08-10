@@ -13,6 +13,7 @@
 # ==============================================================================
 """The base class of a backend for grammar-guided constrained decoding."""
 
+import json
 import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -153,6 +154,44 @@ class GrammarMask(NamedTuple):
         self.grammar.apply_vocab_mask(logits=logits, vocab_mask=self.vocab_mask)
 
 
+def _grammar_key_contains_nul(key_type: str, key_string: str) -> bool:
+    """Whether a grammar spec carries a NUL byte that must never reach a backend.
+
+    xgrammar's regex converter appends its own NUL terminator and indexes past it
+    when the pattern itself carries an embedded NUL, so it segfaults instead of
+    raising -- taking down the whole process, since a signal cannot be caught by
+    an `except` clause.
+
+    For `regex` the NUL is a literal byte in the spec, but a JSON schema reaches
+    the same converter through its `pattern` keyword, where the client may spell
+    the NUL as an escaped `\\u0000` -- leaving no NUL byte in `key_string` at all.
+    So json-shaped specs are decoded and walked. A NUL has no meaning in a
+    regex/schema/grammar spec, so rejecting it costs nothing.
+    """
+    if "\x00" in key_string:
+        return True
+    if key_type not in ("json", "structural_tag"):
+        return False
+    try:
+        decoded = json.loads(key_string)
+    except ValueError:
+        # Malformed JSON: the backend's own parse reports it as a normal error.
+        return False
+
+    stack = [decoded]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            if "\x00" in node:
+                return True
+        elif isinstance(node, dict):
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
+
 class InvalidGrammarObject(BaseGrammarObject):
     """Represents a grammar that failed to compile, carrying the original error message."""
 
@@ -226,6 +265,11 @@ class BaseGrammarBackend:
     ) -> BaseGrammarObject:
         s = time.perf_counter()
         key_type, key_string = key
+        if _grammar_key_contains_nul(key_type, key_string):
+            logger.error(f"Rejecting {key_type} grammar containing a NUL byte")
+            return InvalidGrammarObject(
+                f"Invalid {key_type}: NUL bytes (\\u0000) are not allowed"
+            )
         if key_type == "json":
             grammar = self.dispatch_json(key_string)
         elif key_type == "regex":
