@@ -77,22 +77,31 @@ def _ernie_norm_scale_shift(
     first call verifies ``torch.equal`` against the eager chain and disables
     the fast path permanently on any mismatch.
     """
+    verified = _ERNIE_NORM.verified
     if (
-        _ERNIE_NORM.can_attempt_once()
+        not _ERNIE_NORM.disabled
         and norm.variance_size_override is None
         and can_use_fused_rmsnorm_scale_shift(x, norm.weight, scale, shift)
+        and (verified or _ERNIE_NORM.can_attempt_once())
     ):
-        return _ERNIE_NORM.run(
-            lambda: fused_rmsnorm_scale_shift_bitexact(
+        try:
+            out = fused_rmsnorm_scale_shift_bitexact(
                 x, norm.weight, scale, shift, norm.variance_epsilon
-            ),
-            lambda: _eager_norm_scale_shift(norm, x, scale, shift),
-            logger=logger,
-            mismatch_msg=(
-                "ERNIE fused-norm fast path is not bit-exact against this "
-                "platform's rmsnorm dispatch; falling back to eager"
-            ),
-        )
+            )
+        except Exception as exc:
+            _ERNIE_NORM.on_exception(exc, logger=logger)
+        else:
+            if verified:
+                return out
+            return _ERNIE_NORM.accept_or_fallback(
+                out,
+                _eager_norm_scale_shift(norm, x, scale, shift),
+                logger=logger,
+                mismatch_msg=(
+                    "ERNIE fused-norm fast path is not bit-exact against this "
+                    "platform's rmsnorm dispatch; falling back to eager"
+                ),
+            )
 
     return _eager_norm_scale_shift(norm, x, scale, shift)
 
@@ -111,12 +120,14 @@ def _ernie_gated_norm_scale_shift(
     (and the ``residual_gate_add_cuda`` fast path) + norm chain; first call
     self-verifies like :func:`_ernie_norm_scale_shift`.
     """
+    verified = _ERNIE_GATED_NORM.verified
     if (
-        _ERNIE_GATED_NORM.can_attempt_once()
+        not _ERNIE_GATED_NORM.disabled
         and norm.variance_size_override is None
         and can_use_fused_scale_residual_rmsnorm_scale_shift(
             residual, update, gate, norm.weight, scale, shift
         )
+        and (verified or _ERNIE_GATED_NORM.can_attempt_once())
     ):
         try:
             out, res = fused_scale_residual_rmsnorm_scale_shift_bitexact(
@@ -131,7 +142,7 @@ def _ernie_gated_norm_scale_shift(
         except Exception as exc:
             _ERNIE_GATED_NORM.on_exception(exc, logger=logger)
         else:
-            if _ERNIE_GATED_NORM.verified:
+            if verified:
                 return out, res
             res_ref = residual + gate * update
             ref = _eager_norm_scale_shift(norm, res_ref, scale, shift)

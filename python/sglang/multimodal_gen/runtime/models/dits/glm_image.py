@@ -104,22 +104,31 @@ def _glm_ln_modulate(
     the first call verifies ``torch.equal`` against the eager chain and
     disables the fast path permanently on any mismatch.
     """
+    verified = _GLM_LN_MOD.verified
     if (
-        _GLM_LN_MOD.can_attempt_once()
+        not _GLM_LN_MOD.disabled
         and _is_cuda
         and dtype is x.dtype
         and is_plain_layer_norm(norm, x.shape[-1])
         and can_use_fused_layernorm_modulate(x, scale, shift)
+        and (verified or _GLM_LN_MOD.can_attempt_once())
     ):
-        return _GLM_LN_MOD.run(
-            lambda: fused_layernorm_modulate(x, scale, shift, norm.eps),
-            lambda: _eager_ln_modulate(norm, x, scale, shift, dtype),
-            logger=logger,
-            mismatch_msg=(
-                "GLM fused LN+modulate fast path is not bit-exact against "
-                "this platform's LayerNorm dispatch; falling back to eager"
-            ),
-        )
+        try:
+            out = fused_layernorm_modulate(x, scale, shift, norm.eps)
+        except Exception as exc:
+            _GLM_LN_MOD.on_exception(exc, logger=logger)
+        else:
+            if verified:
+                return out
+            return _GLM_LN_MOD.accept_or_fallback(
+                out,
+                _eager_ln_modulate(norm, x, scale, shift, dtype),
+                logger=logger,
+                mismatch_msg=(
+                    "GLM fused LN+modulate fast path is not bit-exact against "
+                    "this platform's LayerNorm dispatch; falling back to eager"
+                ),
+            )
 
     return _eager_ln_modulate(norm, x, scale, shift, dtype)
 
@@ -136,8 +145,9 @@ def _glm_qk_layernorm(
     First call verifies ``torch.equal`` against the eager pair and falls
     back permanently on any mismatch.
     """
+    verified = _GLM_QK_LN.verified
     if (
-        _GLM_QK_LN.can_attempt_once()
+        not _GLM_QK_LN.disabled
         and _is_cuda
         and dtype is query.dtype
         and dtype is key.dtype
@@ -145,20 +155,29 @@ def _glm_qk_layernorm(
         and is_plain_layer_norm(norm_k, key.shape[-1])
         and norm_q.eps == norm_k.eps
         and can_use_fused_qk_head_layernorm(query, key)
+        and (verified or _GLM_QK_LN.can_attempt_once())
     ):
-        return _GLM_QK_LN.run(
-            lambda: fused_qk_head_layernorm(query, key, norm_q.eps),
-            lambda: (
+        try:
+            out = fused_qk_head_layernorm(query, key, norm_q.eps)
+        except Exception as exc:
+            _GLM_QK_LN.on_exception(exc, logger=logger)
+        else:
+            if verified:
+                return out
+            ref = (
                 norm_q(query).to(dtype=dtype),
                 norm_k(key).to(dtype=dtype),
-            ),
-            equal=tensors_equal,
-            logger=logger,
-            mismatch_msg=(
-                "GLM fused qk-LayerNorm fast path is not bit-exact against "
-                "this platform's LayerNorm dispatch; falling back to eager"
-            ),
-        )
+            )
+            return _GLM_QK_LN.accept_or_fallback(
+                out,
+                ref,
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "GLM fused qk-LayerNorm fast path is not bit-exact against "
+                    "this platform's LayerNorm dispatch; falling back to eager"
+                ),
+            )
 
     return norm_q(query).to(dtype=dtype), norm_k(key).to(dtype=dtype)
 

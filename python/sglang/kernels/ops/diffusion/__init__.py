@@ -1,18 +1,25 @@
-"""Registered diffusion-model kernels.
+"""Registered diffusion-model kernels and their public wrappers.
 
-Callers import concrete implementations from submodules. This package only
-registers kernel specs for the shared selector / namespace discovery path.
+Hot paths import concrete implementations from submodules. The package-level
+wrappers remain available for backward compatibility.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from sglang.kernels.registry import register_kernel
+from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
     FormatSignature,
     KernelBackend,
     KernelSpec,
 )
+
+if TYPE_CHECKING:
+    import torch
+    from torch import nn
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 
@@ -61,4 +68,55 @@ register_kernel(
     )
 )
 
-__all__: list[str] = []
+
+def apply_group_norm_silu(
+    x: torch.Tensor, norm: nn.Module, activation: nn.Module
+) -> torch.Tensor:
+    """Fused GroupNorm + SiLU (falls back to eager when unsupported)."""
+    return get_kernel("diffusion.apply_group_norm_silu", KernelBackend.TRITON)(
+        x, norm, activation
+    )
+
+
+def residual_gate_add(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    """Fused ``residual + gate * update``."""
+    return get_kernel("diffusion.residual_gate_add", KernelBackend.JIT)(
+        residual, update, gate
+    )
+
+
+def fused_inplace_qknorm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    is_neox: bool,
+    eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
+) -> None:
+    """Fused in-place QK RMS-norm + RoPE."""
+    return get_kernel("diffusion.fused_inplace_qknorm_rope", KernelBackend.JIT)(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox=is_neox,
+        eps=eps,
+        head_dim=head_dim,
+        rope_dim=rope_dim,
+    )
+
+
+__all__ = [
+    "apply_group_norm_silu",
+    "residual_gate_add",
+    "fused_inplace_qknorm_rope",
+]

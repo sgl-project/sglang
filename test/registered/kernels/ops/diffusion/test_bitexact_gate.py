@@ -24,9 +24,9 @@ def test_bitexact_gate_once_mode_verifies_then_reuses():
         calls["ref"] += 1
         return torch.tensor([1.0])
 
-    assert torch.equal(gate.run(fused, ref), torch.tensor([1.0]))
+    assert torch.equal(gate.accept_or_fallback(fused(), ref()), torch.tensor([1.0]))
     assert gate.verified and not gate.disabled and calls == {"fused": 1, "ref": 1}
-    assert torch.equal(gate.run(fused, ref), torch.tensor([1.0]))
+    assert torch.equal(fused(), torch.tensor([1.0]))
     assert calls == {"fused": 2, "ref": 1}
 
 

@@ -29,32 +29,26 @@ class BitExactFusionGate:
     compile/capture checks next to the signature lookup (see FLUX / Sana).
     """
 
-    __slots__ = ("name", "disabled", "_verified", "verified_sigs")
+    __slots__ = ("name", "disabled", "verified", "verified_sigs")
 
     def __init__(self, name: str, *, per_signature: bool = False) -> None:
         self.name = name
         self.disabled = False
-        self._verified = False
+        # This is a plain field because steady-state DiT blocks read it on
+        # every invocation; a property descriptor is measurable at this scale.
+        self.verified = False
         self.verified_sigs: set[Any] | None = set() if per_signature else None
-
-    @property
-    def verified(self) -> bool:
-        """Whether at least one successful verification has been recorded."""
-        if self.verified_sigs is not None:
-            return bool(self.verified_sigs)
-        return self._verified
 
     def is_verified(self, sig: Any = None) -> bool:
         if self.verified_sigs is not None:
             return sig in self.verified_sigs
-        return self._verified
+        return self.verified
 
     def mark_verified(self, sig: Any = None) -> None:
         if self.verified_sigs is not None:
             assert sig is not None
             self.verified_sigs.add(sig)
-        else:
-            self._verified = True
+        self.verified = True
 
     def disable(self) -> None:
         self.disabled = True
@@ -63,7 +57,7 @@ class BitExactFusionGate:
         """Once-for-all mode: may we launch the fused kernel right now?"""
         if self.disabled:
             return False
-        if self._verified:
+        if self.verified:
             return True
         # First-sight verify runs the eager reference chain and a host sync:
         # attempt neither inside compile tracing nor CUDA graph capture (the
@@ -115,33 +109,6 @@ class BitExactFusionGate:
             )
         self.disable()
         return ref
-
-    def run(
-        self,
-        fused_fn: Callable[[], T],
-        ref_fn: Callable[[], T],
-        *,
-        sig: Any = None,
-        equal: EqualFn | None = None,
-        logger: logging.Logger | None = None,
-        mismatch_msg: str | None = None,
-    ) -> T:
-        """Launch ``fused_fn``, verify on first sight, fall back via ``ref_fn``."""
-        try:
-            out = fused_fn()
-        except Exception as exc:
-            self.on_exception(exc, logger=logger)
-            return ref_fn()
-        if self.is_verified(sig):
-            return out
-        return self.accept_or_fallback(
-            out,
-            ref_fn(),
-            sig=sig,
-            equal=equal,
-            logger=logger,
-            mismatch_msg=mismatch_msg,
-        )
 
 
 def tensors_equal(a: Any, b: Any) -> bool:

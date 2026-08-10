@@ -24,6 +24,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 _SANA_LN_MOD = BitExactFusionGate("Sana fused LN+modulate", per_signature=True)
+# Direct module-level state keeps BCG warmup launch overhead equal to the
+# pre-refactor path; the gate still owns first-sight verification transitions.
+_SANA_LN_MOD_SIGS = _SANA_LN_MOD.verified_sigs
+assert _SANA_LN_MOD_SIGS is not None
+_SANA_LN_MOD_DISABLED = False
 
 
 def _eager_ln_modulate(
@@ -59,7 +64,9 @@ def _sana_ln_modulate(
     layout); aten's LayerNorm contiguizes internally, and the fast path
     issues the same copy explicitly.
     """
-    if _SANA_LN_MOD.disabled or torch.compiler.is_compiling() or not x.is_cuda:
+    global _SANA_LN_MOD_DISABLED
+
+    if _SANA_LN_MOD_DISABLED or torch.compiler.is_compiling() or not x.is_cuda:
         return _eager_ln_modulate(norm, x, scale, shift)
 
     capturing = torch.cuda.is_current_stream_capturing()
@@ -75,7 +82,7 @@ def _sana_ln_modulate(
         shift.stride(),
         norm.eps,
     )
-    if _SANA_LN_MOD.is_verified(sig):
+    if sig in _SANA_LN_MOD_SIGS:
         return fused_layernorm_modulate_raw(
             x.contiguous(), scale[:, 0], shift[:, 0], norm.eps
         )
@@ -98,8 +105,9 @@ def _sana_ln_modulate(
             out = fused_layernorm_modulate_raw(x_c, scale[:, 0], shift[:, 0], norm.eps)
         except Exception as exc:
             _SANA_LN_MOD.on_exception(exc, logger=logger)
+            _SANA_LN_MOD_DISABLED = True
         else:
-            return _SANA_LN_MOD.accept_or_fallback(
+            result = _SANA_LN_MOD.accept_or_fallback(
                 out,
                 _eager_ln_modulate(norm, x, scale, shift),
                 sig=sig,
@@ -109,6 +117,8 @@ def _sana_ln_modulate(
                     "this platform's LayerNorm dispatch; falling back to eager"
                 ),
             )
+            _SANA_LN_MOD_DISABLED = _SANA_LN_MOD.disabled
+            return result
 
     return _eager_ln_modulate(norm, x, scale, shift)
 

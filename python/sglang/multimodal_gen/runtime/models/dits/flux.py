@@ -101,6 +101,9 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 _get_qkv_projections = get_qkv_projections
 
 _FLUX_LN_MOD = BitExactFusionGate("FLUX fused LN+modulate", per_signature=True)
+# Keep the pre-refactor direct set lookup in this launch-sensitive hot path.
+_FLUX_LN_MOD_SIGS = _FLUX_LN_MOD.verified_sigs
+assert _FLUX_LN_MOD_SIGS is not None
 
 
 def _flux_fused_ln_modulate(
@@ -133,7 +136,8 @@ def _flux_fused_ln_modulate(
         shift.stride(),
         norm.eps,
     )
-    if not _FLUX_LN_MOD.is_verified(sig) and (
+    verified = sig in _FLUX_LN_MOD_SIGS
+    if not verified and (
         torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
     ):
         # The first-sight check needs the eager chain and a host sync; run
@@ -144,7 +148,7 @@ def _flux_fused_ln_modulate(
     except Exception as exc:
         _FLUX_LN_MOD.on_exception(exc, logger=logger)
         return None
-    if _FLUX_LN_MOD.is_verified(sig):
+    if verified:
         return out
     ref = modulate_scale_shift(norm(x), scale, shift)
     return _FLUX_LN_MOD.accept_or_fallback(
