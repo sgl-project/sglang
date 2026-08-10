@@ -466,10 +466,19 @@ class Lfm2Detector(BaseFormatDetector):
 
         arguments = _restore_reserved_kwarg_names(arguments)
 
+        try:
+            # allow_nan=False: a non-finite float (e.g. the literal 1e999
+            # overflowing to inf) would otherwise serialize as Infinity,
+            # which is not valid JSON for downstream clients.
+            parameters = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Arguments of {function_name} are not valid JSON: {e}")
+            return None
+
         return ToolCallItem(
             tool_index=call_index,  # Use the call index in the response, not tool position
             name=function_name,
-            parameters=json.dumps(arguments, ensure_ascii=False),
+            parameters=parameters,
         )
 
     def _parse_pythonic_content(
