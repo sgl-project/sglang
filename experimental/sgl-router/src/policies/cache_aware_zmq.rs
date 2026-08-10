@@ -118,6 +118,7 @@ static HASH_CONFIG_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MATCHED_FALLBACK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static QUEUE_GATE_BLIND_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SATURATION_PIN_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SPILL_OVERLAP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn should_log(counter: &AtomicU64) -> bool {
     counter
@@ -416,6 +417,66 @@ impl CacheAwareZmqPolicy {
         use rand::seq::SliceRandom;
         let (sample, _) = pool.partial_shuffle(&mut rand::thread_rng(), k);
         min_of(sample)
+    }
+
+    /// Among the workers a cold [`Self::pick_min_load`] spill would consider
+    /// (tier 1: those not already queueing), the one holding the most of THIS
+    /// request's prefix, ties broken by lower load then pool order. Returns
+    /// `(worker, overlap_blocks)` with `overlap_blocks > 0`, or `None` when no
+    /// sampled candidate holds any prefix (a cold pick then loses nothing more)
+    /// or every worker is queueing (the all-queued path owns that case).
+    ///
+    /// The candidate set is a `choices`-sized uniform sample drawn exactly like
+    /// `pick_min_load`'s tier-1 pool, so the added cost is at most `choices`
+    /// per-worker tree re-descents (`selected_overlap`) — the same sampling
+    /// budget the min-load fallback already pays — and it inherits the same
+    /// cross-replica divergence property. It is deliberately NOT the whole
+    /// matched owner set: those already failed the queue gate upstream; this
+    /// looks for a *shallower* prefix holder that is still unqueued. The
+    /// caller establishes that precondition by gating on `owners_present` —
+    /// with the owners absent from the candidate slice entirely, nothing
+    /// here was diverted by the queue gate and this helper must not run.
+    fn best_overlap_spill_candidate(
+        &self,
+        workers: &[Arc<Worker>],
+        loads: &WorkerLoads,
+        gate: &LoadGate,
+        choices: usize,
+        outcome: &MatchOutcome,
+    ) -> Option<(Arc<Worker>, usize)> {
+        let mut pool: Vec<usize> = workers
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| gate.admits_affinity(loads.waiting_of(w)))
+            .map(|(i, _)| i)
+            .collect();
+        if pool.is_empty() {
+            return None;
+        }
+        let k = choices.max(1).min(pool.len());
+        let sample: &[usize] = if k == pool.len() {
+            &pool
+        } else {
+            use rand::seq::SliceRandom;
+            let (s, _) = pool.partial_shuffle(&mut rand::thread_rng(), k);
+            s
+        };
+        sample
+            .iter()
+            .map(|&i| (i, self.selected_overlap(outcome, workers[i].url.as_str())))
+            .filter(|(_, overlap)| *overlap > 0)
+            // Most overlap wins; tie → lower load (reverse cmp on load so
+            // `max_by` keeps the smaller); final tie → earlier pool index.
+            .max_by(|(ai, ao), (bi, bo)| {
+                ao.cmp(bo)
+                    .then_with(|| {
+                        loads
+                            .load_of(&workers[*bi])
+                            .cmp(&loads.load_of(&workers[*ai]))
+                    })
+                    .then_with(|| bi.cmp(ai))
+            })
+            .map(|(i, overlap)| (Arc::clone(&workers[i]), overlap))
     }
 
     /// True when some worker has a fresh queue reading strictly below
@@ -934,6 +995,39 @@ impl Policy for CacheAwareZmqPolicy {
                             return Some(w);
                         }
                     }
+                }
+            }
+            // Measure-only (issue-2 prep, no routing change yet): before the
+            // cold spill, quantify how much of this request's prefix a partial-
+            // overlap spill WOULD preserve. Compared in prod against
+            // `sgl_router_overlap_blocks` this proves whether routing to a
+            // shallower unqueued prefix holder is worth doing — which is what
+            // the follow-up change acts on. Sampled so the extra tree
+            // re-descents stay within pick_min_load's budget.
+            //
+            // `owners_present` scopes the measurement to actual queued-owner
+            // spills. Without it this would also fire when the owners were
+            // never candidates at all (`MatchedWorkersIneligible`: drained or
+            // admission-filtered — reachable under either gate, and the ONLY
+            // way here under `FleetSpread`, whose `admits_affinity` is always
+            // true), counting requests the queue gate never diverted and
+            // inflating the evidence the follow-up routing change stands on.
+            if owners_present && should_log(&SPILL_OVERLAP_LOG_COUNTER) {
+                if let Some((cand, recoverable)) = self.best_overlap_spill_candidate(
+                    workers,
+                    &loads,
+                    &self.config.load_gate,
+                    self.config.min_load_choices,
+                    &outcome,
+                ) {
+                    tracing::info!(
+                        model = %ctx.model(),
+                        candidate = %cand.url,
+                        recoverable_overlap_blocks = recoverable,
+                        matched_blocks = outcome.matched_blocks,
+                        n_blocks = outcome.query_blocks,
+                        "cache-aware-zmq: queued-owner spill could preserve partial overlap on an unqueued worker (measure-only; not yet routed)",
+                    );
                 }
             }
             // The fallback prefers an unqueued worker but is never queue-
