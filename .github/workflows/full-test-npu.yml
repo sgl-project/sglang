@@ -88,7 +88,7 @@ jobs:
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
 
-          # branch_label identifies the run origin; explicit input > PR head label > ref name.
+          # branch_label identifies the run origin; PR head label > ref name.
           # Only keep safe characters for use as a filesystem path segment.
           BRANCH_LABEL="$HEAD_LABEL"
           if [ -z "${BRANCH_LABEL}" ]; then
