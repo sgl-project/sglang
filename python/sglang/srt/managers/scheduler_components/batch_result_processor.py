@@ -1261,17 +1261,7 @@ class SchedulerBatchResultProcessor:
     def mamba_lazy_post_decode_at_boundary(
         self, req: Req, batch: ScheduleBatch, track_idx: int
     ):
-        """Post-decode cleanup at a lazy-mode track boundary.
-
-        Finished reqs: if prealloc failed (other slot is -1), the forward
-        overwrote the only slot with corrupted state, so mark
-        is_insert=False to skip the cache insert.  If the other slot is
-        occupied (stale prealloc from an overlap extra forward), free it
-        so the prealloc assert in the next prepare_for_decode holds.
-
-        Running reqs: free the old ping-pong slot so we go back to
-        holding only 1 slot until the next boundary.
-        """
+        """Commit a completed lazy-mode boundary and free its old slot."""
         req.mamba_last_track_idx = track_idx
         req.mamba_next_track_idx = track_idx
         other_idx = 1 - track_idx
@@ -1282,5 +1272,3 @@ class SchedulerBatchResultProcessor:
                 req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)
-        elif req.finished():
-            req.mamba_lazy_is_insert = False
