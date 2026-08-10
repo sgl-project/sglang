@@ -247,7 +247,7 @@ def _jit_trtllm_gen_moe_module() -> Module:
         for root in src_roots:
             cand = root / rel
             if cand.is_file():
-                return str(cand)
+                return str(cand.resolve())
         raise RuntimeError(f"trtllm-gen MoE source not found in any root: {rel}")
 
     staged = _stage_headers(pool)
@@ -274,8 +274,8 @@ def _jit_trtllm_gen_moe_module() -> Module:
             "trtllm_gen_moe",
             meta_tag,
             path_tag,
-            external_cpp_files=cpp_files,
-            external_cuda_files=cuda_files,
+            cpp_files=cpp_files,
+            cuda_files=cuda_files,
             header_only=False,  # the launcher exports its own tvm-ffi functions
             extra_cflags=["-fvisibility=hidden"],
             extra_cuda_cflags=[

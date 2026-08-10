@@ -302,6 +302,16 @@ class Envs:
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
 
+    # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
+    # point it at a persistent mount to share builds across CI jobs.
+    SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # Log, at INFO, which dependency changed whenever a module is rebuilt.
+    SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
+    # How many builds to keep per module variant. None = unset = keep all, which
+    # is what makes reverting an edit an instant hit instead of a rebuild; set
+    # it to trade that away for disk (1 keeps only the most recent build).
+    SGLANG_JIT_CACHE_KEEP = EnvInt(None)
+
     # Constrained Decoding (Grammar)
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
