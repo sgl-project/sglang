@@ -54,6 +54,8 @@ class QuantizedWeight(NamedTuple):
 
 _NON_PERSISTENT_BUFFER_PATTERNS = (
     "cos_sin_cache",
+    "cos_cache",
+    "sin_cache",
     "inv_freq",
     "freqs_cis",
     "_weight_fp32",
@@ -203,12 +205,7 @@ class WeightChecker:
     def _model_state(self):
         model = self._get_model()
         yield from model.named_parameters()
-        for name, buffer in model.named_buffers():
-            module_name, _, buffer_name = name.rpartition(".")
-            owner = model.get_submodule(module_name) if module_name else model
-            if buffer_name in owner._non_persistent_buffers_set:
-                continue
-            yield name, buffer
+        yield from model.named_buffers()
 
 
 def _hash_tensor(t: torch.Tensor) -> str:
