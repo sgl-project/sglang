@@ -941,9 +941,10 @@ class DataParallelController:
         self.dp_budget.total_tokens[rank] += self._estimated_tokens(req)
 
     def _rank_load(self, rank: int) -> float:
-        if self._affinity_fallback == LoadBalanceMethod.TOTAL_REQUESTS:
-            return float(self.dp_budget.total_requests[rank])
-        return float(self.dp_budget.total_tokens[rank])
+        # Request count, not resident KV tokens: a rank decoding one long
+        # context looks "overloaded" by token footprint but has headroom, and
+        # rerouting it evicts the very radix-cache prefix we're preserving.
+        return float(self.dp_budget.total_requests[rank])
 
     def event_loop(self):
         while True:

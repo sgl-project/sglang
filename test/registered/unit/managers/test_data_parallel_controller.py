@@ -412,8 +412,7 @@ class TestPrefixAffinityOverloadGuard(CustomTestCase):
         # Make only the preferred rank overloaded (>1.5x average).
         loads = [0, 0, 0, 0]
         loads[preferred] = 100
-        ctl.dp_budget.total_tokens = list(loads)
-        ctl.dp_budget.total_requests = [0, 0, 0, 0]
+        ctl.dp_budget.total_requests = list(loads)
 
         ctl.prefix_affinity_scheduler(_areq(routing_key=key, input_ids=[1, 2, 3]))
 
@@ -432,6 +431,22 @@ class TestPrefixAffinityOverloadGuard(CustomTestCase):
         ctl.dp_budget.total_tokens = [10_000, 0, 0, 0]
         ctl.prefix_affinity_scheduler(_areq(routing_key="k", input_ids=[1]))
         ctl.workers[0].send_pyobj.assert_called_once()
+
+    def test_huge_token_footprint_zero_requests_keeps_affinity(self):
+        """Regression: a rank decoding one long-context session (huge resident
+        KV tokens, zero active requests) must NOT be treated as overloaded.
+        Using total_tokens for the load signal would reroute the session's
+        next turn and evict the very prefix affinity preserves."""
+        ctl = _make_affinity_controller(dp_size=8)
+        key = "long-context-session"
+        order = ctl._rendezvous_ranked(key, list(range(8)))
+        preferred = order[0]
+        # Huge resident KV footprint on the preferred rank, but zero requests.
+        ctl.dp_budget.total_tokens[preferred] = 800_000
+        ctl.dp_budget.total_requests = [0] * 8
+
+        ctl.prefix_affinity_scheduler(_areq(routing_key=key, input_ids=[1, 2, 3]))
+        ctl.workers[preferred].send_pyobj.assert_called_once()
 
 
 class TestPrefixAffinityFallback(CustomTestCase):
