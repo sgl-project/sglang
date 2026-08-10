@@ -513,7 +513,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         **kwargs,
     ) -> None:
         super().__init__(config, hf_config, **kwargs)
-        cfg = config.arch_config
+        cfg = self.config
         use_weight_only_fp8_linears = config.use_weight_only_fp8_linears
         self._supported_attention_backends = cfg._supported_attention_backends
         hidden_size = cfg.num_attention_heads * cfg.attention_head_dim
@@ -586,7 +586,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     def post_load_weights(self) -> None:
         if not self.rotary_emb.inv_freq.is_meta:
             return
-        cfg = self.config.arch_config
+        cfg = self.config
         inv_freq = 1.0 / (
             cfg.rope_theta
             ** (

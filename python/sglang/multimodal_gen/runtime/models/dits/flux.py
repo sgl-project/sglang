@@ -1202,7 +1202,6 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        self.config = config.arch_config
 
         self.out_channels = (
             getattr(self.config, "out_channels", None) or self.config.in_channels

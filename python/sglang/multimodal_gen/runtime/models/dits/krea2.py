@@ -522,7 +522,7 @@ class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: Optional[Any] = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        ac = config.arch_config
+        ac = self.config
         self.arch_config = ac
 
         self.hidden_size = ac.features

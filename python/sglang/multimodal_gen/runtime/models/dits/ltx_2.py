@@ -1518,7 +1518,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         return timestep.amax(dim=tuple(range(1, timestep.ndim)))
 
     def _scale_timestep_for_adaln(self, timestep: torch.Tensor) -> torch.Tensor:
-        ltx_variant = str(getattr(self.config.arch_config, "ltx_variant", "ltx_2"))
+        ltx_variant = str(getattr(self.config, "ltx_variant", "ltx_2"))
         if ltx_variant == "ltx_2_3" and bool(
             getattr(self, "_sglang_use_ltx23_hq_timestep_semantics", False)
         ):
@@ -1583,7 +1583,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
-        arch = config.arch_config
+        arch = self.config
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.audio_hidden_size = arch.audio_hidden_size
@@ -1844,7 +1844,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         return video_coords.to(device=hidden_device)
 
     def _get_av_ca_gate_timestep_factor(self) -> float:
-        ltx_variant = str(getattr(self.config.arch_config, "ltx_variant", "ltx_2"))
+        ltx_variant = str(getattr(self.config, "ltx_variant", "ltx_2"))
         if ltx_variant == "ltx_2_3":
             return self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
         return float(self.av_ca_timestep_scale_multiplier)
@@ -1856,7 +1856,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         prompt_timestep: torch.Tensor | None,
         audio_prompt_timestep: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        ltx_variant = str(getattr(self.config.arch_config, "ltx_variant", "ltx_2"))
+        ltx_variant = str(getattr(self.config, "ltx_variant", "ltx_2"))
         if ltx_variant != "ltx_2_3":
             return timestep, audio_timestep
 

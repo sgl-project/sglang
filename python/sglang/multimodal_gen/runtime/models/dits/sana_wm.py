@@ -353,7 +353,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     def __init__(self, config: SanaWMConfig, hf_config=None, **kwargs) -> None:
         super().__init__(config, hf_config=hf_config or {}, **kwargs)
-        arch = config.arch_config
+        arch = self.config
 
         self.patch_size = (arch.patch_size_t, arch.patch_size, arch.patch_size)
         self.inner_dim = arch.num_attention_heads * arch.attention_head_dim

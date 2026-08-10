@@ -226,7 +226,7 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(config, hf_config=hf_config)
-        arch = config.arch_config
+        arch = self.config
 
         self.in_channels = int(arch.in_channels)
         self.out_channels = int(arch.out_channels)

@@ -487,7 +487,7 @@ class Hunyuan3D2DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         **kwargs,
     ):
         super().__init__(config=config, hf_config=hf_config or {}, **kwargs)
-        arch = config.arch_config
+        arch = self.config
 
         in_channels = arch.in_channels
         context_in_dim = arch.context_in_dim

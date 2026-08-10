@@ -933,7 +933,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
-        arch = config.arch_config
+        arch = self.config
         self.hidden_size = arch.hidden_size
         self.num_hidden_layers = arch.num_hidden_layers
         self.num_attention_heads = arch.num_attention_heads

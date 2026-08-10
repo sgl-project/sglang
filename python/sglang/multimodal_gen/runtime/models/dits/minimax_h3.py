@@ -1109,7 +1109,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        arch = config.arch_config
+        arch = self.config
         self.arch = arch
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads

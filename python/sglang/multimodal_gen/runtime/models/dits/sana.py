@@ -401,7 +401,7 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     def __init__(self, config: SanaConfig, hf_config=None, **kwargs):
         super().__init__(config, hf_config=hf_config or {}, **kwargs)
 
-        arch = config.arch_config
+        arch = self.config
         self.out_channels = arch.out_channels
         self.patch_size = arch.patch_size
         self.inner_dim = arch.num_attention_heads * arch.attention_head_dim

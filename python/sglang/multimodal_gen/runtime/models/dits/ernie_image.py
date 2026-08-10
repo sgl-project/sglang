@@ -427,7 +427,7 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
     ):
         super().__init__(config=config, hf_config=hf_config)
 
-        arch = config.arch_config
+        arch = self.config
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.out_channels

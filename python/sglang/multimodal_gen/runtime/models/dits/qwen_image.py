@@ -1371,23 +1371,24 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
-        patch_size = config.arch_config.patch_size
-        in_channels = config.arch_config.in_channels
-        out_channels = config.arch_config.out_channels
-        num_layers = config.arch_config.num_layers
-        attention_head_dim = config.arch_config.attention_head_dim
-        num_attention_heads = config.arch_config.num_attention_heads
-        joint_attention_dim = config.arch_config.joint_attention_dim
-        axes_dims_rope = config.arch_config.axes_dims_rope
-        self.zero_cond_t = getattr(config.arch_config, "zero_cond_t", False)
+        arch = self.config
+        patch_size = arch.patch_size
+        in_channels = arch.in_channels
+        out_channels = arch.out_channels
+        num_layers = arch.num_layers
+        attention_head_dim = arch.attention_head_dim
+        num_attention_heads = arch.num_attention_heads
+        joint_attention_dim = arch.joint_attention_dim
+        axes_dims_rope = arch.axes_dims_rope
+        self.zero_cond_t = getattr(arch, "zero_cond_t", False)
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
 
         self.use_additional_t_cond: bool = getattr(
-            config.arch_config, "use_additional_t_cond", False
+            arch, "use_additional_t_cond", False
         )  # For qwen-image-layered now
         self.use_layer3d_rope: bool = getattr(
-            config.arch_config, "use_layer3d_rope", False
+            arch, "use_layer3d_rope", False
         )  # For qwen-image-layered now
 
         if not self.use_layer3d_rope:
