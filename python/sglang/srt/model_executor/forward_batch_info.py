@@ -1301,9 +1301,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         self.seq_lens_cpu, self.extend_seq_lens_cpu
                     )
                 ]
-                self.extend_logprob_start_lens_cpu = (
-                    self.extend_prefix_lens_cpu
-                )
+                self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 self.extend_prefix_lens_cpu = None
                 self.extend_logprob_start_lens_cpu = None
@@ -1743,9 +1741,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
-                ragged_layout = getattr(
-                    self.spec_info, "ragged_verify_layout", None
-                )
+                ragged_layout = getattr(self.spec_info, "ragged_verify_layout", None)
                 if ragged_layout is not None:
                     num_tokens = (
                         int(ragged_layout.total_verify_tokens)
