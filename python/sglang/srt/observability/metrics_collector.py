@@ -482,6 +482,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         # =================================================================
+        # Rejection
+        # =================================================================
+        self.num_queue_rejected_requests_total = Counter(
+            # The name is `requests` instead of `reqs` to avoid dup name error
+            name="sglang:num_queue_rejected_requests_total",
+            documentation=(
+                "Total number of requests rejected from the waiting queue before "
+                "generation began, labelled by reason."
+            ),
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+
+        # =================================================================
         # PD disaggregation
         # =================================================================
         self.num_prefill_bootstrap_queue_reqs = Gauge(
@@ -1210,6 +1223,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             output_reason=output_reason,
             actual_execution=str(actual_execution).lower(),
         ).inc(1)
+
+    def increment_queue_rejected_reqs(self, reason: str, count: int = 1) -> None:
+        self.num_queue_rejected_requests_total.labels(**self.labels, reason=reason).inc(
+            count
+        )
 
     def increment_retracted_reqs(
         self,

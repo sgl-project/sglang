@@ -3,6 +3,9 @@ import os
 import re
 import unittest
 
+import requests
+from prometheus_client.parser import text_string_to_metric_families
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -17,8 +20,8 @@ from sglang.test.test_utils import (
     send_generate_requests,
 )
 
-register_cuda_ci(est_time=53, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=70, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=70, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=87, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestMaxQueuedRequests(CustomTestCase):
@@ -42,6 +45,7 @@ class TestMaxQueuedRequests(CustomTestCase):
                 "1",
                 "--attention-backend",
                 "triton",
+                "--enable-metrics",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -73,6 +77,38 @@ class TestMaxQueuedRequests(CustomTestCase):
 
         # expected_status_codes = [200, 200, 503, 503, 503, 503, 503, 503, 503, 503]
         # self.assertEqual(status_codes, expected_status_codes)
+
+    def _queue_full_rejections(self) -> float:
+        """Sum sglang:num_queue_rejected_requests_total{reason="queue_full"} over all label sets."""
+        response = requests.get(f"{self.base_url}/metrics")
+        self.assertEqual(response.status_code, 200)
+
+        total = 0.0
+        for family in text_string_to_metric_families(response.text):
+            for sample in family.samples:
+                if (
+                    sample.name == "sglang:num_queue_rejected_requests_total"
+                    and sample.labels.get("reason") == "queue_full"
+                ):
+                    total += sample.value
+        return total
+
+    def test_queue_full_rejections_are_counted(self):
+        """Verify queue-full rejections are exported as a metric.
+
+        Streaming clients never observe the 503, because the 200 is committed
+        before the scheduler rejects, so this counter is the only server-side
+        signal that the queue cap shed load.
+        """
+        before = self._queue_full_rejections()
+
+        status_codes = asyncio.run(
+            send_concurrent_generate_requests(self.base_url, num_requests=10)
+        )
+        num_rejected = status_codes.count(503)
+        self.assertGreater(num_rejected, 0, "expected the queue cap to reject requests")
+
+        self.assertEqual(self._queue_full_rejections() - before, num_rejected)
 
     def test_max_running_requests_and_max_queued_request_validation(self):
         """Verify running request and queued request numbers based on server logs."""
