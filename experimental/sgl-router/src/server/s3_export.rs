@@ -714,13 +714,15 @@ async fn run_pump(
 }
 
 /// Dispatch all ready batches from the batcher as concurrent upload jobs.
-/// When `force` is true, flushes all remaining slugs.
+/// When `force` is true (drain/close), flushes every remaining batch and is
+/// exempt from the pending-job cap, so shutdown loses nothing (upload
+/// completion is separately bounded by the shutdown budget in `main.rs`).
 ///
 /// This function is synchronous (no `.await`): the pump never blocks on
 /// permit acquisition. Jobs self-acquire their semaphore permits, so a
-/// stalled S3 upload does not freeze the tick or the drain path. Pending
-/// job count is bounded by `MAX_PENDING_UPLOADS`; excess batches are dropped
-/// and metered as `dropped_upload_backlog`.
+/// stalled S3 upload does not freeze the tick or the drain path. In steady
+/// state (`force=false`) pending job count is bounded by `MAX_PENDING_UPLOADS`;
+/// excess batches are dropped and metered as `dropped_upload_backlog`.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_ready(
     batcher: &mut SlugBatcher,
@@ -737,7 +739,10 @@ fn dispatch_ready(
         let current_seq = *seq;
         *seq += 1;
 
-        if join_set.len() >= MAX_PENDING_UPLOADS {
+        // Steady-state backpressure only: cap pending jobs to bound memory.
+        // The drain/close path (`force`) is exempt — shutdown must flush every
+        // remaining batch.
+        if !force && join_set.len() >= MAX_PENDING_UPLOADS {
             metrics.record_s3_export("dropped_upload_backlog");
             continue;
         }
