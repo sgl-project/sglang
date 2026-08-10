@@ -55,43 +55,12 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.ops.diffusion.triton.numerics import (
+    mul_rn_f32,
+    round_bf16_to_fp32,
+    rsqrt_approx_f32,
+)
 from sglang.srt.utils.custom_op import register_custom_op
-
-
-@triton.jit
-def _round_bf16_to_fp32(value):
-    # RNE round of an fp32 value to bf16 precision, staying in fp32 registers
-    # (also blocks any fmul+fadd contraction across the boundary).
-    bits = value.to(tl.int32, bitcast=True)
-    rounding_bias = 0x7FFF + ((bits >> 16) & 1)
-    rounded_bits = (bits + rounding_bias) & -65536
-    return rounded_bits.to(tl.float32, bitcast=True)
-
-
-@triton.jit
-def _mul_rn_f32(x, y):
-    # opaque mul.rn.f32: keeps the square a separately rounded fp32 op and
-    # blocks contraction with the following add.
-    return tl.inline_asm_elementwise(
-        asm="mul.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[x, y],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _rsqrt_approx_f32(x):
-    return tl.inline_asm_elementwise(
-        asm="rsqrt.approx.f32 $0, $1;",
-        constraints="=f,f",
-        args=[x],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
 
 
 @triton.jit
@@ -138,10 +107,10 @@ def _rmsnorm_scale_shift_kernel(
                 uj = tl.load(x_ptr + row_base + col).to(tl.float32)
                 gj = tl.load(gate_ptr + vec_base + col).to(tl.float32)
                 # eager pair: bf16 round after gate*update and after the add
-                xj = _round_bf16_to_fp32(rj + _round_bf16_to_fp32(gj * uj))
+                xj = round_bf16_to_fp32(rj + round_bf16_to_fp32(gj * uj))
             else:
                 xj = tl.load(x_ptr + row_base + col).to(tl.float32)
-            acc = acc + _mul_rn_f32(xj, xj)
+            acc = acc + mul_rn_f32(xj, xj)
 
     # warp butterfly (offsets 1,2,4,8,16) == adjacent-pairs fold tree,
     # then the WPR warp sums are combined the same way.
@@ -154,7 +123,7 @@ def _rmsnorm_scale_shift_kernel(
     s = tl.reshape(p, (1, WPR))
     if WPR == 2:
         s = _fold_adjacent(s, 1, 1)
-    rcp = tl.sum(_rsqrt_approx_f32(s / D + eps))  # single element, exact
+    rcp = tl.sum(rsqrt_approx_f32(s / D + eps))  # single element, exact
 
     # ----- pass 2: normalize + modulate, contiguous chunks -----
     for i in tl.static_range(D // 1024):
@@ -163,16 +132,16 @@ def _rmsnorm_scale_shift_kernel(
             r = tl.load(residual_ptr + row_base + cols).to(tl.float32)
             u = tl.load(x_ptr + row_base + cols).to(tl.float32)
             g = tl.load(gate_ptr + vec_base + cols).to(tl.float32)
-            xin = _round_bf16_to_fp32(r + _round_bf16_to_fp32(g * u))
+            xin = round_bf16_to_fp32(r + round_bf16_to_fp32(g * u))
             tl.store(res_out_ptr + row_base + cols, xin)
         else:
             xin = tl.load(x_ptr + row_base + cols).to(tl.float32)
         w = tl.load(weight_ptr + cols).to(tl.float32)
         sc = tl.load(scale_ptr + vec_base + cols).to(tl.float32)
         sh = tl.load(shift_ptr + vec_base + cols).to(tl.float32)
-        y = _round_bf16_to_fp32(xin * rcp * w)  # (bf16)(x * rstd * w)
-        one_plus = _round_bf16_to_fp32(1.0 + sc)
-        prod = _round_bf16_to_fp32(y * one_plus)
+        y = round_bf16_to_fp32(xin * rcp * w)  # (bf16)(x * rstd * w)
+        one_plus = round_bf16_to_fp32(1.0 + sc)
+        prod = round_bf16_to_fp32(y * one_plus)
         tl.store(out_ptr + row_base + cols, prod + sh)  # store rounds to bf16
 
 

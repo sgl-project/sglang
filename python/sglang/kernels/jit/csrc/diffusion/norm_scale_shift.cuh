@@ -23,9 +23,9 @@
 
 #include <cstdint>
 
-namespace sglang_norm_scale_shift {
+namespace sglang {
 
-namespace {
+namespace norm_scale_shift {
 
 constexpr int kHidden = 3072;
 constexpr int kVecElems = 16;  // 32B/thread for bf16 on Blackwell.
@@ -142,8 +142,6 @@ inline uint32_t verify_qwen_geometry(host::SymbolicSize& num_rows) {
   return static_cast<uint32_t>(num_rows.unwrap());
 }
 
-}  // namespace
-
 struct QwenImageNormScaleShiftKernel {
   static void
   run(tvm::ffi::TensorView y,
@@ -213,4 +211,6 @@ struct QwenImageScaleResidualNormScaleShiftKernel {
   }
 };
 
-}  // namespace sglang_norm_scale_shift
+}  // namespace norm_scale_shift
+
+}  // namespace sglang

@@ -31,7 +31,10 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    get_compress_state_ring_size,
+    get_compress_state_write_pad,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
@@ -177,7 +180,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
+                    draft_num_layers=int(draft_num_layers)
+                    * get_parallel().attn_dcp_size,
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
@@ -195,6 +199,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
+        dcp_size = get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
             from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -288,8 +293,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes
         else:
+            n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (
-                model_config.get_num_kv_heads(tp_size)
+                n
                 * (model_config.head_dim + model_config.v_head_dim)
                 * effective_num_layers
                 * kv_size
@@ -298,7 +304,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
-                n = model_config.get_num_kv_heads(tp_size)
                 k = model_config.head_dim
                 cell_size = (cell_size // 2) + (
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
@@ -307,7 +312,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size += n * k * 2 * kv_size
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
-                n = model_config.get_num_kv_heads(tp_size)
                 cell_size += (
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
@@ -666,6 +670,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
+        if self.is_speculative:
+            # Ring is sized once here, so it must serve the largest adaptive tier.
+            self._assert_ring_serves_draft_tokens(
+                kvc.server_args.max_speculative_num_draft_tokens or 0
+            )
+
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
             # Reserve memory for the speculative draft worker by inflating
@@ -705,6 +715,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 logger.info(
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
+
+    def _assert_ring_serves_draft_tokens(self, num_draft_tokens: int) -> None:
+        """A verify batch writes its whole optimistic tail into the ring, so ring
+        capacity bounds the draft count."""
+        for compress_ratio, ring_size, num_layers in (
+            (4, self.c4_ring_size, self.num_layers_ca4),
+            (128, self.c128_ring_size, self.num_layers_ca128),
+        ):
+            if num_layers == 0:
+                continue
+            if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+                # Online c128 keeps per-draft state instead of a ring; sized separately.
+                continue
+            max_draft_tokens = get_compress_state_write_pad(compress_ratio, ring_size)
+            assert num_draft_tokens <= max_draft_tokens, (
+                f"speculative_num_draft_tokens={num_draft_tokens} exceeds what the c{compress_ratio} "
+                f"compress state ring can keep resident (ring_size={ring_size} serves at most "
+                f"{max_draft_tokens} draft tokens). Lower the draft count, or grow the ring in "
+                f"get_compress_state_ring_size()."
+            )
 
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
