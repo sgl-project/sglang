@@ -26,6 +26,7 @@ def _server_args(config: Pi05PipelineConfig | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         model_id=None,
         model_path="lerobot/pi05_base",
+        served_model_name="pi05-production",
         output_path=None,
         comfyui_mode=False,
         num_gpus=1,
@@ -165,6 +166,7 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
     metadata = action_metadata(_server_args(config))
 
     assert metadata["object"] == "action.metadata"
+    assert metadata["model"] == "pi05-production"
     assert metadata["policy_family"] == "pi05"
     assert metadata["input"]["image_keys"] == ["front", "wrist"]
     assert metadata["input"]["image_size"] == [256, 256]
@@ -197,6 +199,7 @@ def test_action_generation_response_uses_actual_output_parameters():
 
     assert response["id"] == "action-response-1"
     assert response["object"] == "action.generation"
+    assert response["model"] == "pi05-production"
     assert response["data"][0]["action"]["shape"] == [2, 2]
     assert response["data"][0]["action"]["values"] == output["actions"]
     assert response["usage"]["action_horizon"] == 2

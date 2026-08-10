@@ -306,21 +306,37 @@ class TestServerArgsPathExpansion(unittest.TestCase):
     def test_served_model_name_cli_arg(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--served-model-name",
-            "my-served-name",
+        cases = [
+            (
+                [
+                    "--model-path",
+                    "/fake",
+                    "--model-id",
+                    "Qwen-Image",
+                    "--served-model-name",
+                    "my-served-name",
+                ],
+                "my-served-name",
+            ),
+            (
+                ["--model-path", "/fake", "--model-id", "Qwen-Image"],
+                "Qwen-Image",
+            ),
+            (["--model-path", "/fake"], "/fake"),
         ]
 
-        with patch.object(sys, "argv", ["sglang"] + argv):
-            args, unknown_args = parser.parse_known_args(argv)
-            with patch.object(
-                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-            ):
-                server_args = ServerArgs.from_cli_args(args, unknown_args)
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                with patch.object(sys, "argv", ["sglang"] + argv):
+                    args, unknown_args = parser.parse_known_args(argv)
+                    with patch.object(
+                        PipelineConfig,
+                        "from_kwargs",
+                        return_value=QwenImagePipelineConfig(),
+                    ):
+                        server_args = ServerArgs.from_cli_args(args, unknown_args)
 
-        self.assertEqual(server_args.served_model_name, "my-served-name")
+                self.assertEqual(server_args.served_model_name, expected)
 
     def test_dit_layerwise_offload_cli_arg(self):
         parser = FlexibleArgumentParser()
