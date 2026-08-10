@@ -4,6 +4,9 @@ Focus: device resolution so the ZMQ handshake key matches checkpoint-engine's
 ParameterServer (ps.py::_get_physical_gpu_id) on every backend -- ``GPU-<uuid>``
 for CUDA/XPU and ``NPU-<uuid>`` for NPU. These paths are pure namespace routing
 (``get_device`` / ``get_device_module`` / ``is_npu``) and are fully mockable on CPU.
+
+Skipped entirely unless the ``checkpoint-engine`` extra is installed, since the
+worker module refuses to import without it.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
@@ -11,20 +14,31 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
+import importlib.util
 import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
-    SGLangCheckpointEngineWorkerExtensionImpl,
-)
 from sglang.srt.utils import is_xpu
 from sglang.test.test_utils import CustomTestCase
 
+# checkpoint-engine is an optional extra (sglang[checkpoint-engine]) that CI does
+# not install, and the worker module raises ImportError at import time without it.
+# Probe first so this file stays importable: an unguarded import would fail
+# collection and take the whole file down rather than skipping.
+_HAS_CHECKPOINT_ENGINE = importlib.util.find_spec("checkpoint_engine") is not None
+
+if _HAS_CHECKPOINT_ENGINE:
+    from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
+        SGLangCheckpointEngineWorkerExtensionImpl,
+    )
+
 _WORKER_MOD = "sglang.srt.checkpoint_engine.checkpoint_engine_worker"
+_NO_CKPT_ENGINE = "requires the checkpoint-engine optional dependency"
 
 
+@unittest.skipUnless(_HAS_CHECKPOINT_ENGINE, _NO_CKPT_ENGINE)
 class TestWorkerDeviceResolution(CustomTestCase):
     """get_device_uuid / get_device_id must route through the active accelerator
     namespace and emit the key the ParameterServer expects."""
@@ -88,6 +102,7 @@ class TestWorkerDeviceResolution(CustomTestCase):
             worker.get_device_uuid()
 
 
+@unittest.skipUnless(_HAS_CHECKPOINT_ENGINE, _NO_CKPT_ENGINE)
 @unittest.skipUnless(is_xpu(), "requires an Intel XPU")
 class TestWorkerDeviceUuidOnXpu(CustomTestCase):
     """Hardware-gated: the real XPU key must match what checkpoint-engine's
