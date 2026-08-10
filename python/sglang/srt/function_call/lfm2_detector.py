@@ -46,6 +46,89 @@ _PYTHONIC_NAME_LITERALS = {
     "null": None,
 }
 
+_QUOTE_FOLLOWERS = {",", ")", "]", "}", ":"}
+
+
+def _is_escaped(text: str, index: int) -> bool:
+    """Whether the char at ``index`` follows an odd run of backslashes."""
+    backslashes = 0
+    j = index - 1
+    while j >= 0 and text[j] == "\\":
+        backslashes += 1
+        j -= 1
+    return backslashes % 2 == 1
+
+
+def _escape_nested_quotes_in_strings(text: str) -> Tuple[str, bool]:
+    """Close a broken string literal at the only closing quote that works.
+
+    Shell commands nest unescaped same-style quotes inside a string argument
+    (``command='sed -n '360,450p' f.py'`` or a quoted ``python3 -c`` payload),
+    which Python reads as juxtaposed garbage, so the call is dropped even
+    though the intent is unambiguous. A string is broken when its first
+    unescaped quote cannot syntactically close it (what follows is none of
+    ``,)]}:``). For a broken string, every syntactically plausible closing
+    quote is tried — interior quotes escaped, the rest kept verbatim — and
+    the result validated with ``ast.parse``. Exactly one parsing candidate
+    means recovery; zero or several means genuine ambiguity and the text is
+    returned unchanged rather than guessed at.
+
+    Returns (rewritten_text, changed).
+    """
+
+    def unescaped_quotes(start: int, quote: str) -> List[int]:
+        positions = []
+        j = start
+        while j < len(text):
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == quote:
+                positions.append(j)
+            j += 1
+        return positions
+
+    def is_closer(pos: int) -> bool:
+        k = pos + 1
+        while k < len(text) and text[k].isspace():
+            k += 1
+        return k < len(text) and text[k] in _QUOTE_FOLLOWERS
+
+    prefix: List[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char not in {"'", '"'}:
+            prefix.append(char)
+            index += 1
+            continue
+        quotes = unescaped_quotes(index + 1, char)
+        if not quotes:
+            return text, False
+        if is_closer(quotes[0]):
+            prefix.append(text[index : quotes[0] + 1])
+            index = quotes[0] + 1
+            continue
+        winners = []
+        for close in (j for j in quotes if is_closer(j)):
+            interior: List[str] = []
+            for j in range(index + 1, close):
+                if text[j] == char and not _is_escaped(text, j):
+                    interior.append("\\")
+                interior.append(text[j])
+            candidate = "".join(
+                ["".join(prefix), char, "".join(interior), char, text[close + 1 :]]
+            )
+            try:
+                safe_ast_parse(_escape_ctrl_chars_in_strings(candidate))
+            except (SyntaxError, ValueError):
+                continue
+            winners.append(candidate)
+        if len(winners) == 1:
+            return winners[0], True
+        return text, False
+    return text, False
+
 
 def _escape_ctrl_chars_in_strings(text: str) -> str:
     """Escape raw control chars inside string literals of pythonic text.
@@ -150,9 +233,15 @@ def _recovery_candidates(content: str) -> List[str]:
     """Progressive rewrites for content that failed to parse.
 
     Each rewrite is a no-op on already-valid text; the first candidate whose
-    result parses wins.
+    result parses wins. Nested-quote recovery is re-escaped, since requoting
+    can move raw newlines inside the string.
     """
-    return [_escape_ctrl_chars_in_strings(_normalize_leading_zero_ints(content))]
+    escaped = _escape_ctrl_chars_in_strings(_normalize_leading_zero_ints(content))
+    candidates = [escaped]
+    requoted, requote_changed = _escape_nested_quotes_in_strings(escaped)
+    if requote_changed:
+        candidates.append(_escape_ctrl_chars_in_strings(requoted))
+    return candidates
 
 
 class Lfm2Detector(BaseFormatDetector):

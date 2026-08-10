@@ -4077,6 +4077,33 @@ class TestLfm2Detector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["query"], "printf a\x00b")
 
+    def test_nested_quotes_recovered(self):
+        """Unescaped same-style quotes nested in a shell command
+        (sed -n '360,450p') read as string/number juxtaposition, a
+        SyntaxError, so the call was dropped even though only one closing
+        quote yields parseable text."""
+        text = (
+            "<|tool_call_start|>[search(query='sed -n '360,450p' f.py')]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "sed -n '360,450p' f.py")
+
+    def test_ambiguous_nested_quotes_not_guessed(self):
+        """When a later string argument's closing quote is also a plausible
+        closer, the nesting is genuinely ambiguous; recovery must NOT guess
+        a reading (guards the recovery predicate degrading to greedy)."""
+        text = (
+            "<|tool_call_start|>[get_weather(city='echo 'hi', unit='celsius')]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+
     def test_zero_padded_int_recovered(self):
         """Zero-padded ints (day=07) are a SyntaxError ("leading zeros in
         decimal integer literals"); the call was dropped."""
