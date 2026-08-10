@@ -781,7 +781,7 @@ jobs:
       max-parallel: 1
       matrix:
         runner: [linux-mi300-2gpu-sglang]
-        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
+        part: [0, 1, 2]  # run_suite.py load-balances the suite's parametrized cases and standalone files over these 3 partitions
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
