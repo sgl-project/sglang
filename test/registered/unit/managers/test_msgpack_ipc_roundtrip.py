@@ -63,9 +63,17 @@ def _contains_dataclass(obj) -> bool:
     return False
 
 
-def _parallelism_info() -> ParallelismInfo:
+def _parallelism_info(role: str = "target") -> ParallelismInfo:
     return ParallelismInfo(
-        tp_rank=0, tp_size=2, dp_rank=0, dp_size=1, pp_rank=0, pp_size=1, rank=0, size=2
+        role=role,
+        tp_rank=0,
+        tp_size=2,
+        dp_rank=0,
+        dp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        rank=0,
+        size=2,
     )
 
 
@@ -73,7 +81,8 @@ def _checksum_info(tag: str) -> ChecksumInfo:
     return ChecksumInfo(
         checksums={f"model.layers.{tag}": "deadbeef"},
         per_gpu_checksum="cafef00d",
-        parallelism_info=_parallelism_info(),
+        # One entry per role: the target model plus each speculative draft runner.
+        parallelism_info=[_parallelism_info("target"), _parallelism_info("draft")],
     )
 
 
@@ -192,29 +201,46 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         self.assertEqual(len(decoded.payload), 2)
         as_dict = msgspec_to_builtins(decoded.payload[0])
         self.assertEqual(as_dict["per_gpu_checksum"], "cafef00d")
-        self.assertIn("tp_rank", as_dict["parallelism_info"])
+        self.assertEqual(
+            [pi["role"] for pi in as_dict["parallelism_info"]], ["target", "draft"]
+        )
+        self.assertIn("tp_rank", as_dict["parallelism_info"][0])
 
     def test_check_weights_producer_conversion(self):
-        # Mirrors weight_updater.check_weights: WeightChecker returns
-        # ChecksumInfo.model_dump() (a dict), converted to the msgspec struct via
-        # msgspec.convert, and the result round-trips as the payload.
-        pydantic_checksum = PydanticChecksumInfo(
-            checksums={"model.layers.0": "deadbeef"},
-            per_gpu_checksum="cafef00d",
-            parallelism_info=PydanticParallelismInfo(
-                tp_rank=0,
-                tp_size=2,
-                dp_rank=0,
-                dp_size=1,
-                pp_rank=0,
-                pp_size=1,
-                rank=0,
-                size=2,
-            ),
+        # Mirrors weight_updater.check_weights end to end: each runner's
+        # WeightChecker returns a single-role ChecksumInfo.model_dump(),
+        # _merge_checksum_payloads folds the roles into one per-role payload, and
+        # that is what msgspec.convert has to accept.
+        from sglang.srt.managers.scheduler_components.weight_updater import (
+            _merge_checksum_payloads,
         )
-        converted = msgspec.convert(pydantic_checksum.model_dump(), ChecksumInfo)
-        self.assertEqual(converted.per_gpu_checksum, "cafef00d")
-        self.assertEqual(converted.parallelism_info.tp_rank, 0)
+
+        def _dump(role_tag):
+            return PydanticChecksumInfo(
+                checksums={f"model.layers.0{role_tag}": "deadbeef"},
+                per_gpu_checksum="cafef00d",
+                parallelism_info=PydanticParallelismInfo(
+                    tp_rank=0,
+                    tp_size=2,
+                    dp_rank=0,
+                    dp_size=1,
+                    pp_rank=0,
+                    pp_size=1,
+                    rank=0,
+                    size=2,
+                ),
+            ).model_dump()
+
+        merged = _merge_checksum_payloads([("", _dump("")), ("draft", _dump(""))])
+        converted = msgspec.convert(merged, ChecksumInfo)
+        # Draft keys are role-prefixed so they never collide with the target's.
+        self.assertEqual(
+            sorted(converted.checksums), ["draft.model.layers.0", "model.layers.0"]
+        )
+        self.assertEqual(
+            [pi.role for pi in converted.parallelism_info], ["target", "draft"]
+        )
+        self.assertEqual(converted.parallelism_info[0].tp_rank, 0)
         output = CheckWeightsReqOutput(success=True, message="ok", payload=[converted])
         self.assertEqual(_round_trip(output), output)
 
