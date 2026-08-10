@@ -822,6 +822,34 @@ class SchedulerPPMixin:
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
+    def _pp_filter_hicache_ready_rids(
+        self: Scheduler, candidate_rids: List[str]
+    ) -> List[str]:
+        """Keep only requests whose HiCache prefetch is locally ready.
+
+        In PP disaggregated prefill, the existing bootstrap protocol computes a
+        stage-by-stage intersection and then circulates the final result back to
+        every stage. Folding HiCache readiness into that protocol guarantees
+        that a request enters ``waiting_queue`` only after every PP stage is
+        ready, without inserting a barrier-like collective into the skewed PP
+        event loop.
+        """
+        if (
+            not self.enable_hicache_storage
+            or self.ps.pp_size <= 1
+            or not candidate_rids
+        ):
+            return candidate_rids
+
+        candidate_set = set(candidate_rids)
+        locally_ready_rids = {
+            req.rid
+            for req in self.disagg_prefill_bootstrap_queue.queue
+            if req.rid in candidate_set
+            and self.tree_cache.check_prefetch_progress(req.rid)
+        }
+        return [rid for rid in candidate_rids if rid in locally_ready_rids]
+
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
@@ -831,6 +859,9 @@ class SchedulerPPMixin:
                 True,
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
+            )
+            good_bootstrapped_rids = self._pp_filter_hicache_ready_rids(
+                good_bootstrapped_rids
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
@@ -844,11 +875,17 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
+            curr_good_bootstrapped_rids = self._pp_filter_hicache_ready_rids(
+                curr_good_bootstrapped_rids
             )
+            curr_good_bootstrapped_rid_set = set(curr_good_bootstrapped_rids)
+            good_bootstrapped_rids = [
+                rid
+                for rid in prev_good_bootstrapped_rids
+                if rid in curr_good_bootstrapped_rid_set
+            ]
             bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
+                dict.fromkeys(prev_bad_bootstrapped_rids + curr_bad_bootstrapped_rids)
             )
         # Route locally-aborted reqs through the bad-union consensus so every PP
         # rank flushes them in the same consensus round, regardless of when the
