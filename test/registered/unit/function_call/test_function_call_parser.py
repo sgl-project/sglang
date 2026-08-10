@@ -4125,6 +4125,16 @@ class TestLfm2Detector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["day"], 7)
 
+    def test_explicit_positive_number(self):
+        """An explicitly signed positive number (+7) is UnaryOp(UAdd), which
+        only had a USub branch, so the call was dropped."""
+        text = "<|tool_call_start|>[search(query='x', limit=+7)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["limit"], 7)
+
     def test_streaming_recovers_multiline(self):
         """Streaming buffers the block and delegates to detect_and_parse;
         an incremental rewrite of the streaming path would bypass the
