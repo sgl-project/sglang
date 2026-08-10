@@ -21,8 +21,8 @@ export const DiffusionFeatureGuide = ({ serveFeatures = [], requestFeatures = []
   );
 
   const copy = async (event, code) => {
-    await navigator.clipboard.writeText(code);
     const button = event.currentTarget;
+    await navigator.clipboard.writeText(code);
     button.textContent = "Copied";
     window.setTimeout(() => {
       button.textContent = "Copy overlay";
