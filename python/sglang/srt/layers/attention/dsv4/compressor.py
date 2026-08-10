@@ -437,6 +437,8 @@ class Compressor(BaseFusedOp):
         guarantee a matching compute_kv_score in the same op (see
         DeepseekV4Attention._forward_prepare).
         """
+        if not _is_hip:
+            return
         comm_stream = getattr(forward_batch, "_cp_prefetch_comm_stream", None)
         if comm_stream is None or not dsa_use_prefill_cp(forward_batch):
             return

@@ -2470,7 +2470,7 @@ class DeepseekV4Model(nn.Module):
             _model_forward_tbo_merge_outputs,
         )
 
-        if dsa_use_prefill_cp(forward_batch):
+        if _is_hip and dsa_use_prefill_cp(forward_batch):
             return self._forward_layers_tbo_cp(
                 positions=positions,
                 hidden_states=hidden_states,

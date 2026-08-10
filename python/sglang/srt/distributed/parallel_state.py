@@ -2419,7 +2419,6 @@ def initialize_model_parallel(
     assert (
         _ATTN_CP is None
     ), "attention context model parallel group is already initialized"
-
     if attn_cp_size == tensor_model_parallel_size:
         _ATTN_CP = _TP
     else:
