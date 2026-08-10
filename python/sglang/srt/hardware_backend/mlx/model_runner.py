@@ -699,23 +699,10 @@ class MlxModelRunner:
             return
         num_pool_layers = self._cache_layout.num_full_attention_layers
         if self._cache_layout.has_sliding_window_layers:
-            # The pool exists to serve radix prefix hits, and an SWA prefix hit
-            # recomputes the prefix instead of gathering it (see prefill_start),
-            # so on any SWA model the pool has no reader: its sole consumer is
-            # PoolBackedAttentionKVCache, reachable only when
-            # trusted_prefix_len > 0, which requires no SWA layers. Allocating
-            # it anyway would burn the whole auto-sized KV budget
-            # (_compute_pool_size fills mem_fraction_static) on a buffer that is
-            # only ever written. Skipping it also disables the fused AOT
-            # RoPE + pool-scatter kernel for the full layers, whose scatter half
-            # is dead work here; that kernel is opt-in
-            # (SGLANG_MLX_USE_CUSTOM_ROPE, default off), so the default path
-            # loses nothing.
-            #
-            # Un-gate this together with the window-aware shared SWA pool that
-            # restores fast prefix hits: the seams it needs (the layout
-            # partition, the full-pool index, layer-type dispatch) are already
-            # in place.
+            # Allocating it anyway would burn the whole auto-sized KV budget
+            # (_compute_pool_size fills mem_fraction_static) on a write-only
+            # buffer.  This also disables the fused AOT RoPE + pool-scatter
+            # kernel, which is opt-in (SGLANG_MLX_USE_CUSTOM_ROPE, default off).
             logger.info(
                 "Model has %d sliding-window attention layers; skipping the "
                 "shared attention KV pool (an SWA prefix hit recomputes the "
@@ -1165,16 +1152,13 @@ class MlxModelRunner:
     ) -> tuple[mx.array, MlxLazyLogprobs | None]:
         """Pick one token per row of ``last_logits`` — lazily, inside the graph.
 
-        Greedy behavior (sampling disabled, or every row greedy with no
-        logit edits) is exactly the pre-sampling ``mx.argmax`` and consumes
-        no RNG state.  ``edit_rows`` is the worker's pre-combined additive
-        [B, vocab] array (grammar mask + logit_bias), applied before token
-        selection and logprobs, mirroring the CUDA
-        ``ModelRunner._preprocess_logits`` order.  Positions for seeded rows
-        come from the attention cache offsets, which the just-built forward
-        has already advanced past the token being sampled — the same
-        ``seq_len - 1`` the pytorch path feeds its sampler.  They are
-        build-time Python ints, so this is chained-decode safe.
+        Greedy behavior (sampling disabled, or every row greedy with no logit
+        edits) is exactly the pre-sampling ``mx.argmax``.  ``edit_rows`` is the
+        worker's pre-combined additive [B, vocab] array (grammar mask +
+        logit_bias), applied before token selection and logprobs, mirroring the
+        CUDA ``ModelRunner._preprocess_logits`` order.  Positions for seeded
+        rows come from the attention cache offsets; they are build-time Python
+        ints, so this is chained-decode safe.
         """
         if not self._enable_sampling:
             return mx.argmax(last_logits, axis=-1), None

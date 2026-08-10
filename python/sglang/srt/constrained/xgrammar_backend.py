@@ -59,11 +59,9 @@ MAX_ROLLBACK_TOKENS = 200
 
 
 def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
-    # Allocate a pinned bitmask where pinning exists so the later H2D to the
-    # device can be a genuine non_blocking copy (a pageable source silently
-    # downgrades it to a blocking copy). MPS torch has no pin-memory kernel
-    # and asserts on pin_memory=True; the MLX path consumes the mask on the
-    # CPU anyway.
+    # Pin where pinning exists, so the later H2D can be a genuine non_blocking
+    # copy (a pageable source silently downgrades it).  MPS torch has no
+    # pin-memory kernel and asserts on pin_memory=True.
     return torch.full(
         get_bitmask_shape(batch_size, vocab_size),
         -1,

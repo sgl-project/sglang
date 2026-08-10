@@ -389,13 +389,9 @@ class MlxTpModelWorker(TpModelWorker):
         Reachable only under ``--disable-overlap-schedule``: the default MLX
         loop drives :meth:`async_forward_batch_generation_mlx` /
         :meth:`finalize_mlx_result` directly and never calls ``run_batch``.
-        Launching and finalising back-to-back IS the synchronous path — the
-        lazy graph is built exactly the same way, then blocked on
-        immediately — so routing, logit edits, logprob collection and
-        chunk-head skipping have one implementation rather than two that
-        must be kept in step.  It is also strictly cheaper than evaluating
-        each request as it is queued: one ``mx.async_eval`` covers the whole
-        batch.
+        Launching and finalising back-to-back builds the same lazy graph, so
+        routing, logit edits, logprob collection and chunk-head skipping keep
+        one implementation instead of two.
         """
         launch = self.async_forward_batch_generation_mlx(batch)
         return self.finalize_mlx_result(launch, batch.reqs)

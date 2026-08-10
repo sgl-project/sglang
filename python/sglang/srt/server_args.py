@@ -5378,12 +5378,10 @@ class ServerArgs:
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
             # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
-            # None of these backends exist on MPS, and under MLX attention
-            # runs inside the MLX runner, so attention_backend is still unset
-            # at this point (the torch_native default fills later). macOS
-            # *without* MLX is not exempt: it has no runner of its own, so it
-            # must still be held to the supported-backend list instead of
-            # silently landing on torch_native (no SWA, no sinks).
+            # Exempt MLX only: none of these backends exist on MPS, and MLX runs
+            # attention inside its own runner, so attention_backend is still
+            # unset here.  Plain macOS stays on the list -- torch_native has
+            # neither sliding window nor attention sinks.
             if not (is_mps() and use_mlx()):
                 supported_backends = [
                     "triton",

@@ -23,17 +23,13 @@ def make_attention_mask(N, offset, return_array=False, window_size=None):
     """
     if window_size is not None and offset + N > window_size:
         return create_causal_mask(N, offset, window_size=window_size)
-    # Either no window, or a window that cannot bind.  The lowest query
-    # position is ``offset``, so ``offset + N <= window_size`` means every
-    # causally visible key is inside the band and the banded mask is
-    # elementwise identical to a plain causal one -- the shortcut mlx_lm's own
-    # RotatingKVCache.make_mask takes, and these shims stand in for exactly
-    # that cache on sliding layers.  Worth the branch because a materialised
-    # mask forces mx.fast.scaled_dot_product_attention off its fused causal
-    # path: ~2x slower per layer, plus an N x (offset + N) allocation.
-    # It also survives a window-bounded store: offset + N <= window_size
-    # implies N + window_size - 1 >= offset + N, so no keys are dropped and
-    # the mask width still matches the returned key length.
+    # Either no window, or a window that cannot bind: the lowest query position
+    # is ``offset``, so ``offset + N <= window_size`` puts every causally
+    # visible key inside the band and the banded mask is elementwise identical
+    # to a plain causal one (the same shortcut mlx_lm's RotatingKVCache takes).
+    # Worth the branch because a materialised mask forces
+    # mx.fast.scaled_dot_product_attention off its fused causal path: ~2x
+    # slower per layer, plus an N x (offset + N) allocation.
     if N == 1:
         return None
     if return_array:
@@ -209,11 +205,10 @@ class WindowedAttentionKVCache:
                 "WindowedAttentionKVCache holds only the trailing window and "
                 "cannot serve a full-context attention mask"
             )
-        # No N == 1 shortcut here, tempting as it looks: mlx_lm's banded mask is
+        # No N == 1 shortcut here: mlx_lm's banded mask is
         # ``linds < rinds + window_size`` (strict), so a window of W admits
-        # exactly W keys.  Once ``kept == window`` this buffer returns W + 1 of
-        # them -- the trailing window plus the token just written -- and the
-        # oldest must still be masked out.
+        # exactly W keys, while this buffer returns W + 1 once ``kept ==
+        # window`` -- the trailing window plus the token just written.
         return make_attention_mask(
             N, kept, return_array=return_array, window_size=window_size
         )
