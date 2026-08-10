@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 DCP_SIZES = [1, 2, 3, 4, 8]
 LENS = list(range(0, 41))

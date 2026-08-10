@@ -23,7 +23,7 @@ from sglang.test.test_utils import CustomTestCase
 # base-a + base-c dual-registration convention -- but base-c-test-cpu currently
 # has no runner job in any workflow (it was carved out of base-b in #28623 to
 # *reduce* CPU CI scope), so base-a-test-cpu is what actually executes.
-register_cpu_ci(est_time=300, suite="base-a-test-cpu")
+register_cpu_ci(est_time=148, suite="base-a-test-cpu")
 
 # repo root: test/registered/rust/<this file>
 RUST_WORKSPACE = Path(__file__).resolve().parents[3] / "rust"

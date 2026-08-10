@@ -40,7 +40,7 @@ from sglang.srt.managers.tokenizer_manager import (
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 # Synthetic per-position top-k rows (k=2). The leading None mirrors the first
 # prompt position, which has no top logprobs.
