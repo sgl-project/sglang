@@ -20,7 +20,9 @@
 
 #include "../../distributed/custom_all_reduce.cuh"
 
-namespace sglang::sp_collective {
+namespace sglang {
+
+namespace sp_collective {
 
 using device::distributed::Counter;
 using device::distributed::Semaphore;
@@ -292,9 +294,7 @@ __global__ void reduce_scatter_pull_kernel(const __grid_constant__ Params params
   }
 }
 
-}  // namespace sglang::sp_collective
-
-using namespace sglang;
+}  // namespace sp_collective
 using host::distributed::CommunicatorRef;
 
 template <uint32_t kWorldSize, bool kUsePDL>
@@ -437,3 +437,5 @@ struct SPCollectiveKernel {
     host::LaunchKernel(num_blocks, block_size, input.device()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
+
+}  // namespace sglang
