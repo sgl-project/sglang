@@ -61,6 +61,7 @@ from sglang.srt.utils.common import (
     is_xpu,
     xpu_has_xmx_support,
 )
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 logger = logging.getLogger(__name__)
 
@@ -933,8 +934,12 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_xpu"
         elif is_hip():
             overrides["attention_backend"] = "aiter"
-        elif not is_mps():
-            # No triton on macOS; MPS keeps the platform default.
+        elif not (is_mps() and use_mlx()):
+            # No triton on macOS, but only the MLX runner can actually serve
+            # gpt-oss there -- it owns attention, so it keeps the platform
+            # default. macOS *without* MLX must still fall through to triton
+            # and fail fast below: torch_native has neither sliding-window nor
+            # attention-sink support, so accepting it would silently mis-serve.
             overrides["attention_backend"] = "triton"
     if is_xpu():
         # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,

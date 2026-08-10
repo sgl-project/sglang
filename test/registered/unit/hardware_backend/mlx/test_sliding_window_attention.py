@@ -7,10 +7,13 @@ pin the three seams that make such models work on the MLX backend:
 1. The attention contract accepts ``sm_scale`` and exposes per-layer window
    sizes read from the mlx-lm container convention (``layer_types`` +
    ``window_size``).
-2. The cache shims' ``make_mask`` mirrors mlx_lm's
-   ``cache.create_attention_mask`` exactly — in particular ``window_size``
+2. The cache shims' ``make_mask`` matches mlx_lm's
+   ``cache.create_attention_mask`` semantically — in particular ``window_size``
    must produce a banded mask (including for N == 1) instead of being
    silently dropped, or sliding-window layers degrade to full attention.
+   Where the window provably cannot bind (``offset + N <= window_size``) the
+   band equals plain causal, and the shims return the cheap form instead, as
+   mlx_lm's own ``RotatingKVCache.make_mask`` does.
 3. ``MLXAttentionWrapper._batched_decode`` applies the window by truncating
    each request's KV to the trailing window, passes ``sinks`` through, and
    uses the contract scale helper.
@@ -173,7 +176,22 @@ class TestGptOssAttentionContract(CustomTestCase):
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestShimMakeMask(CustomTestCase):
-    """The shims must return exactly what mlx_lm's own KVCache.make_mask returns."""
+    """The shims must be semantically equal to mlx_lm's own KVCache.make_mask.
+
+    Equal *content*, not equal representation: where the window provably
+    cannot bind the shims return the cheap ``"causal"`` / ``None`` form that
+    mlx_lm's RotatingKVCache.make_mask also returns, so the comparison
+    densifies both sides first.
+    """
+
+    def _dense(self, mask, N, offset):
+        """Dense boolean form of any of the three mask representations."""
+        if mask is None:
+            return mx.ones((N, offset + N), dtype=mx.bool_)
+        if isinstance(mask, str):
+            self.assertEqual(mask, "causal")
+            return create_causal_mask(N, offset)
+        return mask
 
     def _shims(self, offset):
         contig = ContiguousAttentionKVCache(
@@ -185,14 +203,13 @@ class TestShimMakeMask(CustomTestCase):
         )
         return (AttentionOffsetCache(offset=offset), contig, pool_backed)
 
-    def _assert_same_mask(self, got, ref, msg):
-        if ref is None or isinstance(ref, str):
-            self.assertEqual(got, ref, msg)
-        else:
-            self.assertTrue(
-                isinstance(got, mx.array) and mx.array_equal(got, ref).item(),
-                msg,
-            )
+    def _assert_same_mask(self, got, ref, msg, N, offset):
+        self.assertTrue(
+            mx.array_equal(
+                self._dense(got, N, offset), self._dense(ref, N, offset)
+            ).item(),
+            msg,
+        )
 
     def test_shims_match_mlx_lm_reference(self):
         cases = [
@@ -213,7 +230,33 @@ class TestShimMakeMask(CustomTestCase):
                     ref,
                     f"{type(shim).__name__} mismatch for N={N} offset={offset} "
                     f"window={window} return_array={return_array}",
+                    N,
+                    offset,
                 )
+
+    def test_non_binding_window_returns_the_cheap_mask(self):
+        # offset + N <= window: no query can reach past the window, so the
+        # band equals plain causal and materialising it only costs time (a
+        # mask array forces sdpa off its fused causal path, ~2x per layer).
+        self.assertIsNone(make_attention_mask(1, 0, window_size=4))
+        self.assertIsNone(make_attention_mask(1, 3, window_size=4))
+        self.assertEqual(make_attention_mask(4, 0, window_size=4), "causal")
+        # ...and one position past the boundary the band is required again.
+        self.assertIsInstance(make_attention_mask(4, 1, window_size=4), mx.array)
+        self.assertIsInstance(make_attention_mask(1, 4, window_size=4), mx.array)
+
+    def test_non_binding_window_matches_the_band_it_replaces(self):
+        # The shortcut is only legal because the two forms are elementwise
+        # identical; pin that against mlx_lm's own band builder.
+        for N, offset, window in ((1, 0, 4), (1, 3, 4), (4, 0, 4), (8, 0, 16)):
+            band = create_causal_mask(N, offset, window_size=window)
+            cheap = self._dense(
+                make_attention_mask(N, offset, window_size=window), N, offset
+            )
+            self.assertTrue(
+                mx.array_equal(band, cheap).item(),
+                f"N={N} offset={offset} window={window}",
+            )
 
     def test_windowed_mask_is_banded_including_self(self):
         # Query at absolute position 6 with W=4 may attend to keys 3..6
