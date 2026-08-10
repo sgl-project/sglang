@@ -127,12 +127,17 @@ async fn non_streaming_returns_200() {
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    // Non-streaming 2xx: neither the `router.ttfb` header nor the overhead
-    // metric applies — there is no first token to be early for, so the whole
-    // TTFT family is streaming-gated.
+    // Non-streaming 2xx: the `router.ttfb` timing and the overhead metric are
+    // streaming-gated (no first token to be early for), so neither applies.
+    // `router.pod` IS present — it is stamped on every response at the edge
+    // (`app.rs`) — so assert specifically that no `router.ttfb` entry rides
+    // along, mirroring `streaming_error_response_omits_server_timing_header`.
     assert!(
-        res.headers().get("server-timing").is_none(),
-        "non-streaming responses must not carry a router.ttfb Server-Timing header",
+        res.headers()
+            .get_all("server-timing")
+            .iter()
+            .all(|v| !v.to_str().unwrap_or("").contains("router.ttfb")),
+        "non-streaming responses must not carry a router.ttfb Server-Timing entry",
     );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&bytes).unwrap();
