@@ -287,12 +287,8 @@ async fn main() -> Result<()> {
     // shutdown_drain_secs.
     if let Some(sink) = ctx.s3_export_sink.as_ref() {
         let budget = std::time::Duration::from_secs(cfg.server.shutdown_drain_secs.min(60));
-        sgl_router::server::shutdown::await_with_timeout(
-            sink.drain(),
-            budget,
-            "s3 export drain",
-        )
-        .await;
+        sgl_router::server::shutdown::await_with_timeout(sink.drain(), budget, "s3 export drain")
+            .await;
     }
 
     // Best-effort: cancel discovery + manager + janitor on shutdown.

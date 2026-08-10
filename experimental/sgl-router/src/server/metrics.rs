@@ -1140,7 +1140,8 @@ impl MetricsRegistry {
     /// record count of a successfully uploaded S3 object. Compare against
     /// `s3_export_total{result="enqueued"}` (records-in) to detect silent loss.
     pub fn add_s3_export_records_uploaded(&self, n: u64) {
-        self.s3_export_records_uploaded.fetch_add(n, Ordering::Relaxed);
+        self.s3_export_records_uploaded
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     /// Bump `sgl_router_engine_aborts_total{reason}` — one increment per

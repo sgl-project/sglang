@@ -87,7 +87,8 @@ fn safe_slug(slug: Option<&str>) -> String {
         Some(s)
             if !s.is_empty()
                 && s.len() <= 64
-                && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) =>
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) =>
         {
             s.to_string()
         }
@@ -123,7 +124,11 @@ pub(crate) struct SlugBatcher {
 
 impl SlugBatcher {
     pub(crate) fn new(max_bytes: usize, max_age: Duration) -> Self {
-        Self { max_bytes, max_age, bufs: HashMap::new() }
+        Self {
+            max_bytes,
+            max_age,
+            bufs: HashMap::new(),
+        }
     }
 
     pub(crate) fn push(&mut self, slug: &str, line: &str, now: Instant) {
@@ -158,15 +163,19 @@ impl SlugBatcher {
             if buf.raw.is_empty() {
                 continue;
             }
-            out.push(ReadyObject { slug, raw_bytes: buf.raw, records: buf.records });
+            out.push(ReadyObject {
+                slug,
+                raw_bytes: buf.raw,
+                records: buf.records,
+            });
         }
         out
     }
 }
 
+use crate::server::metrics::MetricsRegistry;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use crate::server::metrics::MetricsRegistry;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -181,7 +190,10 @@ pub(crate) struct FakeStore {
 #[cfg_attr(not(test), allow(dead_code))]
 impl FakeStore {
     pub(crate) fn new(fail_first: u64) -> Self {
-        Self { puts: Mutex::new(Vec::new()), fail_first: AtomicU64::new(fail_first) }
+        Self {
+            puts: Mutex::new(Vec::new()),
+            fail_first: AtomicU64::new(fail_first),
+        }
     }
 }
 
@@ -247,7 +259,9 @@ pub(crate) fn string_to_sign(
     service: &str,
     creq_hash: &str,
 ) -> String {
-    format!("AWS4-HMAC-SHA256\n{amz_date}\n{date_stamp}/{region}/{service}/aws4_request\n{creq_hash}")
+    format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{date_stamp}/{region}/{service}/aws4_request\n{creq_hash}"
+    )
 }
 
 pub(crate) enum Uploader {
@@ -266,7 +280,13 @@ pub(crate) enum Uploader {
 impl Uploader {
     async fn put(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
         match self {
-            Uploader::S3 { http, access_key, secret_key, region, bucket } => {
+            Uploader::S3 {
+                http,
+                access_key,
+                secret_key,
+                region,
+                bucket,
+            } => {
                 // Virtual-hosted-style URL (bucket names without dots have no
                 // TLS SNI issue).
                 let host = format!("{bucket}.s3.{region}.amazonaws.com");
@@ -407,7 +427,11 @@ impl S3ExportSink {
         // never legitimately contain surrounding whitespace, so trimming is safe.
         let clean = |v: String| {
             let t = v.trim().to_string();
-            if t.is_empty() { None } else { Some(t) }
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
         };
         let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok().and_then(clean);
         let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok().and_then(clean);
@@ -429,7 +453,10 @@ impl S3ExportSink {
         // host;x-amz-content-sha256;x-amz-date, so STS/SSO creds would produce
         // a 403 SignatureDoesNotMatch on every PUT because the unsigned
         // x-amz-security-token header is not in SignedHeaders.
-        if std::env::var("AWS_SESSION_TOKEN").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        if std::env::var("AWS_SESSION_TOKEN")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
             tracing::error!(
                 "token export: AWS_SESSION_TOKEN is set (temporary credentials) but the signer \
                  only supports static keys; disabling s3 export"
@@ -440,16 +467,35 @@ impl S3ExportSink {
             .timeout(Duration::from_secs(30))
             .build()
             .ok()?;
-        let uploader = Uploader::S3 { http, access_key, secret_key, region, bucket };
+        let uploader = Uploader::S3 {
+            http,
+            access_key,
+            secret_key,
+            region,
+            bucket,
+        };
 
         let metrics2 = Arc::clone(&metrics);
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let join = tokio::spawn(async move {
-            run_pump(rx, Arc::new(uploader), prefix, pod, metrics2, DEFAULT_MAX_BATCH_BYTES).await;
+            run_pump(
+                rx,
+                Arc::new(uploader),
+                prefix,
+                pod,
+                metrics2,
+                DEFAULT_MAX_BATCH_BYTES,
+            )
+            .await;
         });
         let capture_sem = Arc::new(tokio::sync::Semaphore::new(max_captures.max(1)));
         tracing::info!("s3 token export enabled");
-        Some(Arc::new(Self { tx, metrics, join: AsyncMutex::new(Some(join)), capture_sem }))
+        Some(Arc::new(Self {
+            tx,
+            metrics,
+            join: AsyncMutex::new(Some(join)),
+            capture_sem,
+        }))
     }
 
     /// Try to acquire one capture permit. Returns `None` when the pool is
@@ -487,7 +533,12 @@ impl S3ExportSink {
             run_pump(rx, uploader, prefix, pod, metrics2, max_batch_bytes).await;
         });
         let capture_sem = Arc::new(tokio::sync::Semaphore::new(64));
-        Arc::new(Self { tx, metrics, join: AsyncMutex::new(Some(join)), capture_sem })
+        Arc::new(Self {
+            tx,
+            metrics,
+            join: AsyncMutex::new(Some(join)),
+            capture_sem,
+        })
     }
 
     fn enqueue(&self, rec: ExportRecord) {
@@ -829,7 +880,10 @@ mod tests {
             parse_s3_uri("s3://b/a/b/c"),
             Some(("b".into(), "a/b/c".into()))
         );
-        assert_eq!(parse_s3_uri("s3://only-bucket"), Some(("only-bucket".into(), "".into())));
+        assert_eq!(
+            parse_s3_uri("s3://only-bucket"),
+            Some(("only-bucket".into(), "".into()))
+        );
         assert_eq!(parse_s3_uri("https://x"), None);
         assert_eq!(parse_s3_uri("s3://"), None);
     }
@@ -874,8 +928,7 @@ mod tests {
             choice_count: Some(3),
             ts: "2026-08-10T00:00:00Z".into(),
         };
-        let v: serde_json::Value =
-            serde_json::from_str(r.to_ndjson_line().trim_end()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r.to_ndjson_line().trim_end()).unwrap();
         assert_eq!(v["choice_index"], 0);
         assert_eq!(v["choice_count"], 3);
     }
@@ -894,8 +947,7 @@ mod tests {
             choice_count: None,
             ts: "2026-08-10T00:00:00Z".into(),
         };
-        let v: serde_json::Value =
-            serde_json::from_str(r.to_ndjson_line().trim_end()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r.to_ndjson_line().trim_end()).unwrap();
         assert_eq!(v["kind"], "extend");
         assert_eq!(v["prompt_len"], 2);
         assert_eq!(v["output_tokens"], 9);
@@ -964,14 +1016,23 @@ mod tests {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("build reqwest client");
-        if std::env::var("AWS_SESSION_TOKEN").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("AWS_SESSION_TOKEN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             eprintln!(
                 "WARNING: AWS_SESSION_TOKEN is set — these are TEMPORARY/SSO credentials. \
                  Our SigV4 signer does NOT send x-amz-security-token, so S3 will reject them. \
                  Use STATIC IAM user keys (not temporary/SSO credentials)."
             );
         }
-        let up = Uploader::S3 { http, access_key: ak, secret_key: sk, region, bucket };
+        let up = Uploader::S3 {
+            http,
+            access_key: ak,
+            secret_key: sk,
+            region,
+            bucket,
+        };
         let key = if prefix.is_empty() {
             "roundtrip-check.txt".to_string()
         } else {
@@ -981,7 +1042,10 @@ mod tests {
         // Retry a few times to tolerate fresh-IAM propagation.
         let mut last_err = None;
         for attempt in 1..=6u32 {
-            match up.put(&key, b"sgl-router s3 export roundtrip\n".to_vec()).await {
+            match up
+                .put(&key, b"sgl-router s3 export roundtrip\n".to_vec())
+                .await
+            {
                 Ok(()) => {
                     eprintln!("real_s3_roundtrip OK -> s3://.../{key}");
                     return;
@@ -1057,7 +1121,13 @@ mod tests {
 
     #[test]
     fn string_to_sign_has_exact_shape() {
-        let sts = string_to_sign("20260810T000000Z", "20260810", "us-west-2", "s3", "deadbeef");
+        let sts = string_to_sign(
+            "20260810T000000Z",
+            "20260810",
+            "us-west-2",
+            "s3",
+            "deadbeef",
+        );
         assert_eq!(
             sts,
             "AWS4-HMAC-SHA256\n20260810T000000Z\n20260810/us-west-2/s3/aws4_request\ndeadbeef"
@@ -1072,14 +1142,19 @@ mod tests {
     async fn drain_flushes_offered_records_to_uploader() {
         let store = Arc::new(FakeStore::new(0));
         let up = Uploader::Fake(Arc::clone(&store));
-        let sink = S3ExportSink::spawn_with_uploader(
-            up,
-            "pfx".into(),
-            "pod-1".into(),
-            test_metrics(),
-        );
+        let sink =
+            S3ExportSink::spawn_with_uploader(up, "pfx".into(), "pod-1".into(), test_metrics());
         sink.offer_ingest("m", &[1, 2, 3], "rid", Some("slugA"));
-        sink.offer_extend("m", &[1, 2, 3, 4], "rid", Some(3), Some(1), None, None, Some("slugA"));
+        sink.offer_extend(
+            "m",
+            &[1, 2, 3, 4],
+            "rid",
+            Some(3),
+            Some(1),
+            None,
+            None,
+            Some("slugA"),
+        );
         sink.drain().await;
 
         let puts = store.puts.lock().unwrap();
@@ -1136,7 +1211,10 @@ mod tests {
 
         // All objects are under the correct prefix.
         for (key, _) in puts.iter() {
-            assert!(key.starts_with("pfx/slug=slugA/date="), "unexpected key: {key}");
+            assert!(
+                key.starts_with("pfx/slug=slugA/date="),
+                "unexpected key: {key}"
+            );
         }
 
         // Total decompressed line count must equal N.

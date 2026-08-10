@@ -409,12 +409,7 @@ async fn chat_completions_inner(
     // exactly when the fleet is shedding, i.e. anti-correlated with health.
     let tee_attr = tee_attribution(&headers);
     if let (Some(tee), Some(t)) = (ctx.cache_sim_tee.as_ref(), request_tokens.as_ref()) {
-        tee.offer(
-            &model_str,
-            &t.ids,
-            &derived_request_id,
-            tee_attr.clone(),
-        );
+        tee.offer(&model_str, &t.ids, &derived_request_id, tee_attr.clone());
     }
     if let (Some(sink), Some(t)) = (ctx.s3_export_sink.as_ref(), request_tokens.as_ref()) {
         sink.offer_ingest(
