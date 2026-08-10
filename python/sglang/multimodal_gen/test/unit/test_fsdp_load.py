@@ -9,7 +9,9 @@ import torch
 from safetensors.torch import safe_open, save_file
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.loader import fsdp_load, rank_local_checkpoint
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 
 
 class _UniformDtypeModel(nn.Module):
@@ -24,6 +26,12 @@ class _UniformDtypeModel(nn.Module):
 
 class _MixedDtypeModel(_UniformDtypeModel):
     _fsdp_mixed_dtype_params = True
+
+
+class _ReplicatedLinearModel(_UniformDtypeModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = ReplicatedLinear(4, 4, bias=False)
 
 
 class TestFSDPMixedPrecisionPolicy(unittest.TestCase):
@@ -95,6 +103,61 @@ class TestFSDPMixedPrecisionPolicy(unittest.TestCase):
         self.assertEqual(policy.param_dtype, torch.bfloat16)
         self.assertEqual(state_kwargs["param_dtype"], torch.bfloat16)
         shard_model.assert_not_called()
+
+
+class TestOrdinaryWeightLoading(unittest.TestCase):
+    def test_direct_device_loading_skips_rank_local_cpu_checkpoint(self):
+        load_plan = WeightLoadPlan(
+            checkpoint_load_device=torch.device("cuda:0"),
+            load_full_state_dict_on_device=True,
+        )
+        with (
+            patch.object(fsdp_load.current_platform, "is_mps", return_value=False),
+            patch.object(
+                rank_local_checkpoint,
+                "try_load_rank_local_tp_state_dict",
+            ) as rank_local_load,
+            patch.object(
+                fsdp_load,
+                "safetensors_weights_iterator",
+                return_value=iter(()),
+            ) as weight_iterator,
+            patch.object(fsdp_load, "load_model_from_full_model_state_dict"),
+        ):
+            fsdp_load.maybe_load_fsdp_model(
+                model_cls=_UniformDtypeModel,
+                init_params={},
+                weight_dir_list=["model.safetensors"],
+                device=torch.device("cuda:0"),
+                hsdp_replicate_dim=1,
+                hsdp_shard_dim=1,
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                weight_load_plan=load_plan,
+            )
+
+        rank_local_load.assert_not_called()
+        weight_iterator.assert_called_once_with(
+            ["model.safetensors"],
+            weight_load_plan=load_plan,
+        )
+
+    def test_tp1_unquantized_linear_assigns_checkpoint_tensor_without_copy(self):
+        with torch.device("meta"):
+            model = _ReplicatedLinearModel()
+        checkpoint_weight = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+        fsdp_load.load_model_from_full_model_state_dict(
+            model,
+            iter((("proj.weight", checkpoint_weight),)),
+            checkpoint_load_device=torch.device("cpu"),
+            param_dtype=torch.float32,
+            strict=True,
+            param_names_mapping=fsdp_load.get_param_names_mapping({}),
+        )
+
+        self.assertEqual(model.proj.weight.data_ptr(), checkpoint_weight.data_ptr())
+        torch.testing.assert_close(model.proj.weight, checkpoint_weight)
 
 
 class TestRankLocalSafetensorsRead(unittest.TestCase):
