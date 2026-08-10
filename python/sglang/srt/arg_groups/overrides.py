@@ -51,6 +51,7 @@ from sglang.srt.utils.common import (
     is_gfx95_supported,
     is_hip,
     is_mnnvl_fabric_device,
+    is_mps,
     is_musa,
     is_npu,
     is_sm90_supported,
@@ -290,23 +291,23 @@ def attention_backends_of(cfg: Any) -> tuple:
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Mid-resolution equivalent of runtime_context.mamba_extra_buffer_enabled:
-    reads the (possibly overlaid) strategy from a config-shaped object."""
+    reads the (possibly overlaid) strategy from a config-shaped object.
+
+    This is the one definition of the predicate: ``ServerArgs`` delegates its
+    member to it, and the runtime_context accessor is its post-publish sibling
+    (which cannot reuse it, because the two leaves land in different bags)."""
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",
     )
 
 
-def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
-    """Declare a load-time resolved field (model-file config overrides,
-    weight-resolved dtypes): validated against the resolvable whitelist, then
-    written to the config bags via ``get_context().override``; ``server_args``
-    stays the pristine startup record."""
-    from sglang.srt.runtime_context import get_context
-
-    context = get_context()
-    validate_declarations(context.server_args, [(source, dict(declared))])
-    context.override(source, **declared)
+def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
+    """The lazy variant of :func:`mamba_extra_buffer_of`."""
+    return (
+        cfg.disable_radix_cache is False
+        and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
+    )
 
 
 def collect_model_override_declarations(
@@ -921,7 +922,8 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_xpu"
         elif is_hip():
             overrides["attention_backend"] = "aiter"
-        else:
+        elif not is_mps():
+            # No triton on macOS; MPS keeps the platform default.
             overrides["attention_backend"] = "triton"
     if is_xpu():
         # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,
@@ -1292,6 +1294,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     "Qwen3NextForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
+    "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
 )
 def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
@@ -1320,6 +1323,14 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
         "attention_backend": sm100_default_attn_backend,
         "page_size": 64 if sm100_default_attn_backend == "trtllm_mha" else 1,
     }
+
+
+@_register_for("InternS2MobiusForConditionalGeneration")
+def _interns2_mobius_baseline_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Select the only MoE runner validated for the 2,560-expert baseline."""
+    if server_args.moe_runner_backend == "auto":
+        return {"moe_runner_backend": "triton_kernel"}
+    return {}
 
 
 @_register_for("Qwen3VLForConditionalGeneration")
@@ -1470,6 +1481,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
+        "InternS2MobiusForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
