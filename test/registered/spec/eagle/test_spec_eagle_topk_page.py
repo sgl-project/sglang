@@ -31,6 +31,8 @@ class TestEagle3Page4Topk8(Eagle3Base, SpecAccuracyKit, SpecLogprobKit, SpecFeat
     # Preset accept-length values are topk=1 numbers -- loose for a topk=8
     # tree; tighten once CI reports the actuals.
     gsm8k_accept_len_thres = 2.0
+    # Same fp32 logits budget as the topk=16 classes (bs * spec_tokens * vocab).
+    max_running_requests = 16
     cuda_graph_max_bs_decode = 5
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 

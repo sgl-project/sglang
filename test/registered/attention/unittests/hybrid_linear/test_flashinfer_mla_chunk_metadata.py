@@ -45,13 +45,15 @@ class _ChunkKVMLARunner(MockMLAModelRunner):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # The fixture's config is already published; adjust it through the
-        # audited entry point (bare writes raise under the strict guard).
-        self.server_args.override(
-            source="attention-unittest",
+        from sglang.srt.runtime_context import get_context
+        from sglang.test.test_utils import server_args_variant
+
+        self.server_args = server_args_variant(
+            self.server_args,
             disable_chunked_prefix_cache=False,
             flashinfer_mla_disable_ragged=False,
         )
+        get_context().set_server_args(self.server_args)
 
 
 def _make_case() -> MLAAttentionCase:

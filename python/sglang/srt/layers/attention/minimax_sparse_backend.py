@@ -565,6 +565,9 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
         self.sparse.dense_backend = dense_backend
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
+        ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata(forward_batch)

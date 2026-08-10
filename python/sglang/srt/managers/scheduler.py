@@ -268,6 +268,7 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
+    flush_trace_batch,
     set_schedule_time_batch,
     set_time_batch,
 )
@@ -276,7 +277,12 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, get_parallel, publish
+from sglang.srt.runtime_context import (
+    get_context,
+    get_device,
+    get_parallel,
+    publish,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -420,7 +426,7 @@ class Scheduler(
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
-        self.skip_tokenizer_init = server_args.skip_tokenizer_init
+        self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -460,13 +466,14 @@ class Scheduler(
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=server_args.attn_cp_size,
+            attn_dcp_rank=tp_rank % server_args.dcp_size,
+            attn_dcp_size=server_args.dcp_size,
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
             moe_ep_size=server_args.ep_size,
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=server_args.moe_dp_size,
-            dcp_size=server_args.dcp_size,
             gpu_id=gpu_id,
         )
 
@@ -527,6 +534,11 @@ class Scheduler(
             tp_group=self.tp_group,
             pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
+            hicache_draft_plan=(
+                self.draft_worker.hicache_draft_plan
+                if self.draft_worker is not None
+                else None
+            ),
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -562,16 +574,6 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
-
-        # Register draft KV pool (when spec + HiCache co-enabled).
-        kv_cache_builder.maybe_register_hicache_draft(
-            tree_cache=self.tree_cache,
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-            page_size=self.page_size,
-        )
 
         # Init running status
         self.init_running_status()
@@ -735,7 +737,10 @@ class Scheduler(
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
-            skip_tokenizer_init=self.server_args.skip_tokenizer_init,
+            # The snapshot taken at construction, not a second bag read: this
+            # scheduler gates its tokenizer init on the same value, and the two
+            # must not be able to disagree.
+            skip_tokenizer_init=self.skip_tokenizer_init,
             metrics_enabled=get_observability().enable_metrics
             and (
                 self.ps.attn_tp_rank == 0
@@ -797,7 +802,7 @@ class Scheduler(
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
 
-        if server_args.skip_tokenizer_init:
+        if self.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
@@ -911,27 +916,20 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
-        from sglang.srt.speculative.draft_worker_common import (
-            draft_server_args_copy,
-        )
-
-        # Launch a draft worker for speculative decoding
-        draft_server_args = draft_server_args_copy(
-            server_args=self.server_args,
-            target_model_config=self.tp_worker.model_runner.model_config,
-        )
+        # Launch a draft worker for speculative decoding. It builds its draft
+        # from this process's own config: what differs for the draft — the
+        # target's context length, the draft load format, its attention backend
+        # — is resolved per runner, not on a config copy.
         draft_worker_kwargs = dict(
-            server_args=draft_server_args,
+            server_args=self.server_args,
             gpu_id=self.ps.gpu_id,
             ps=self.ps,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
         )
 
-        DraftWorkerClass = self.spec_algorithm.create_worker(draft_server_args)
-        with get_context().preserve_config():
-            get_context().set_server_args(draft_server_args)
-            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -965,6 +963,7 @@ class Scheduler(
                 req_to_token_pool=pool,
                 token_to_kv_pool_allocator=allocator,
             )
+            self.draft_worker.init_hicache_draft_plan()
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -1223,6 +1222,7 @@ class Scheduler(
                     max_delay_passes=get_schedule().prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=get_schedule().prefill_delayer_token_usage_low_watermark,
                     device=self.tp_group.device,
+                    debug_log_enabled=self.ps.attn_tp_rank == 0,
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
@@ -1291,11 +1291,10 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-        # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
+        draft_token_to_kv_pool = (
+            self.draft_worker.primary_draft_kv_pool
+            if self.draft_worker is not None
+            else None
         )
 
         if self.spec_algorithm.carries_draft_hidden_states():
@@ -1494,7 +1493,7 @@ class Scheduler(
             "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
         }
         env_var, default_size = backend_sizes.get(
-            self.server_args.attention_backend, (None, None)
+            get_exec().kernel.attention_backend, (None, None)
         )
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
@@ -1852,6 +1851,10 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        if self.server_args.mm_feature_transport == "cuda_vmm":
+            for recv_req in recv_reqs:
+                self._materialize_cuda_vmm_inputs(recv_req)
+
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -1878,6 +1881,28 @@ class Scheduler(
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+
+    def _materialize_cuda_vmm_inputs(self, recv_req):
+        """Release VMM slices before request handling can reject the request."""
+        if isinstance(
+            recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+        ):
+            tokenized_reqs = (recv_req,)
+        elif isinstance(
+            recv_req,
+            (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+        ):
+            tokenized_reqs = recv_req
+        else:
+            return
+
+        for tokenized_req in tokenized_reqs:
+            if tokenized_req.mm_inputs is not None and not isinstance(
+                tokenized_req.mm_inputs, MultimodalInputs
+            ):
+                tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
+                    tokenized_req.mm_inputs
+                )
 
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
@@ -2016,7 +2041,8 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
+            max_total_num_tokens=self.max_total_num_tokens
+            * get_parallel().attn_dcp_size,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2030,7 +2056,6 @@ class Scheduler(
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             max_total_num_tokens=self.max_total_num_tokens,
-            server_args=self.server_args,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -2149,7 +2174,7 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * self.server_args.dcp_size
+                self.max_total_num_tokens * get_parallel().attn_dcp_size
                 - paged_input_len
                 - self.page_size
                 - 1,
@@ -2228,11 +2253,13 @@ class Scheduler(
 
         return image_inputs
 
-    def _get_multimodal_inputs(self, mm_inputs_dict):
+    def _get_multimodal_inputs(self, mm_inputs):
+        if isinstance(mm_inputs, MultimodalInputs):
+            return mm_inputs
+
         if get_mm().enable_broadcast_mm_inputs_process:
-            return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
-        else:
-            return MultimodalInputs.from_processor_output(mm_inputs_dict)
+            return self._process_and_broadcast_mm_inputs(mm_inputs)
+        return MultimodalInputs.from_processor_output(mm_inputs)
 
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
@@ -2579,6 +2606,24 @@ class Scheduler(
 
         if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
+            req.logprob_start_len = -1
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            get_device().mlx_enable_sampling
+            and req.return_logprob
+            and 0 <= req.logprob_start_len < len(req.origin_input_ids)
+        ):
+            # The MLX sampling path computes output logprobs only; the
+            # prefill result carries no input_token_logprobs, so letting
+            # this through would crash output processing.
+            error_msg = (
+                "Prompt input logprobs (logprob_start_len) are not supported "
+                "on the MLX sampling path; omit logprob_start_len to get "
+                "output logprobs."
+            )
             req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
@@ -3175,6 +3220,13 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        # Get BLOCK_M from the backend for tile-budget admission logic
+        attn_backend = self.tp_worker.model_runner.attn_backend
+        if hasattr(attn_backend, "extend_attention_block_m"):
+            prefill_tile_block_m = attn_backend.extend_attention_block_m
+        else:
+            prefill_tile_block_m = 64  # Fallback for non-Triton backends
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -3191,6 +3243,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            prefill_tile_block_m=prefill_tile_block_m,
         )
 
         if self.chunked_req is not None:
@@ -3837,6 +3890,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # Flush async trace ops here: in overlap mode this CPU work runs while
+        # the next batch's GPU forward is in flight, giving free overlap.
+        flush_trace_batch(batch.reqs)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
