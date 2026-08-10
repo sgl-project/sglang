@@ -437,6 +437,7 @@ at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight);
 
 at::Tensor conv3d_embed_cpu(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, bool is_vnni);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
@@ -451,6 +452,7 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data);
 
 // shared memory reduce_scatter_tensor
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op);
+#endif
 
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
@@ -822,6 +824,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("conv3d_embed_cpu(Tensor input, Tensor weight, Tensor bias, bool is_vnni) -> Tensor");
   m.impl("conv3d_embed_cpu", torch::kCPU, &conv3d_embed_cpu);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // all reduce
   m.def("initialize(int size, int rank) -> ()");
   m.def("shm_allreduce(Tensor(a!) data, int reduce_op) -> ()");
@@ -832,6 +835,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("shm_allgather_into_tensor", torch::kCPU, &shm_allgather_into_tensor);
   m.def("shm_reduce_scatter_tensor(Tensor(a!) output_tensor, Tensor data, int reduce_op) -> ()");
   m.impl("shm_reduce_scatter_tensor", torch::kCPU, &shm_reduce_scatter_tensor);
+#endif
 
   // rope
   m.def(

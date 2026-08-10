@@ -103,9 +103,9 @@ set(SGLANG_CPU_X86_ONLY_SOURCES
 )
 
 # SHM-based AllReduce is not yet implemented for aarch64 or ppc64le.
-# VSX/MMA-optimized ppc64le implementation is planned for Phase 2.
 set(SGLANG_CPU_NO_SHM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/shm.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/interface.cpp
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ppc64le|ppc64")
