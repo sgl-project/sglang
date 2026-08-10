@@ -14,7 +14,10 @@ def create_flashinfer_kv_indices_triton(
     kv_indptr,
     kv_start_idx,
     kv_indices_ptr,
-    req_to_token_ptr_stride: tl.constexpr,
+    # Runtime, not constexpr: the choke point's eager canonical is allocated at
+    # the batch's live width, so a constexpr stride would JIT-specialize per
+    # width (a recompile every few decode steps at small page sizes).
+    req_to_token_ptr_stride,
     SRC_PAGE_SIZE: tl.constexpr = 1,
 ):
     """Gather per-request token ids into a flat CSR kv_indices stream.
@@ -30,7 +33,7 @@ def create_flashinfer_kv_indices_triton(
     pid = tl.program_id(axis=0)
 
     # find the req pool idx, this is for batch to token
-    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
     kv_indices_offset = tl.load(kv_indptr + pid)
 
     kv_start = 0
