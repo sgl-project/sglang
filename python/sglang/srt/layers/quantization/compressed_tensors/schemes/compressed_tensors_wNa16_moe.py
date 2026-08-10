@@ -498,7 +498,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
 
 class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
-    """ROCm/HIP-compatible W4A16 MoE method using Triton kernels instead of Marlin.
+    """W4A16 MoE method using Triton kernels instead of Marlin.
 
     Inherits weight creation from CompressedTensorsWNA16MoE but converts
     weights to the uint8-packed format expected by the Triton fused MoE kernel
