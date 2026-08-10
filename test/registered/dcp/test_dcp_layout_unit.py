@@ -96,6 +96,42 @@ class TestGetDcpLens(CustomTestCase):
         lens = torch.tensor(LENS, dtype=torch.int32)
         self.assertTrue(torch.equal(get_dcp_lens(lens, 1, 0), lens))
 
+    def test_dense_q_indptr_matches_the_arange_it_replaces(self):
+        """``_dense_q_indptr`` feeds the zero-KV fixup's cum_seq_lens, which
+        decides which token rows get out=0 / lse=-inf before the cross-rank
+        merge. A wrong offset or width there corrupts a real row's merged
+        output with no shape error to catch it, so pin both the precomputed
+        buffer and the general fallback to the arange formula."""
+        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+        max_bs = 16
+        for num_draft_tokens in (1, 2, 8):
+            backend = object.__new__(TRTLLMMLABackend)
+            backend.q_indptr_decode = torch.arange(0, max_bs + 1, dtype=torch.int32)
+            backend.num_draft_tokens = num_draft_tokens
+            backend.dense_q_indptr_verify = backend.q_indptr_decode * num_draft_tokens
+            # draft_token_num == num_draft_tokens takes the buffer; the other
+            # value exercises the fallback that scales q_indptr_decode.
+            for draft_token_num in (num_draft_tokens, num_draft_tokens + 1):
+                for bs in (1, 3, max_bs):
+                    with self.subTest(
+                        num_draft_tokens=num_draft_tokens,
+                        draft_token_num=draft_token_num,
+                        bs=bs,
+                    ):
+                        got = backend._dense_q_indptr(bs, draft_token_num)
+                        expected = torch.arange(
+                            0,
+                            (bs + 1) * draft_token_num,
+                            draft_token_num,
+                            dtype=torch.int32,
+                        )
+                        self.assertEqual(got.dtype, torch.int32)
+                        self.assertTrue(
+                            torch.equal(got, expected),
+                            f"{got.tolist()} != {expected.tolist()}",
+                        )
+
     def test_paged_allocator_exposes_dcp_virtual_capacity(self):
         real_kv_size = 1024
         dcp_size = 4
