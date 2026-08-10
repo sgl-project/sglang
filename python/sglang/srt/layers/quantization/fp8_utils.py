@@ -757,14 +757,6 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     backend = Fp8GemmRunnerBackend(backend)
 
-    if (
-        backend.is_auto()
-        and server_args.quantization == "mxfp8"
-        and _is_sm100_supported
-        and is_flashinfer_available()
-    ):
-        backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
-
     FP8_GEMM_RUNNER_BACKEND = backend
 
 
