@@ -5,7 +5,7 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 
 on:
   schedule:
-    - cron: '0 */12 * * *' # Run every 12 hours (UTC)
+    - cron: '30 17 * * *' # Daily ROCm 7.0 rollback shadow
   workflow_dispatch:
     inputs:
       target_stage_select:

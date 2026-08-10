@@ -222,8 +222,8 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # leak into AITER's version when AITER uses setuptools_scm)
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-# Keep the base image's Torch-compatible Triton by default. Override with
-# AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
+# Keep the Triton selected for this image: ROCm 7.0 retains its base package;
+# ROCm 7.2 installs and validates AITER's pin below before compiling AITER.
 ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -236,6 +236,15 @@ RUN git clone ${AITER_REPO} \
  && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
+
+# AITER's installer selects the ROCm-specific 3.7 wheel. Validate its exact
+# local revision before AITER compilation; a mutable index result must fail.
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        cd aiter \
+     && test -f .github/scripts/install_triton.sh \
+     && bash .github/scripts/install_triton.sh \
+     && python3 -c "from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); expected = '${TRITON_COMMIT}'[:8]; assert v.startswith('3.7.0'), v; assert expected in v, f'expected build-time Triton revision {expected}, found {v}'; assert k == '1.0.0', k; print(f'[AITER] validated build-time Triton {v}, triton-kernels {k}')"; \
+    fi
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
@@ -631,10 +640,7 @@ RUN cd /tmp/whl \
 
 # -----------------------
 # Hot patch: Triton
-# For ROCm 7.2, this custom build breaks pip dependency management,
-# so future `pip install` will break the ROCm stack.
-# A workaround for this is to reinstall the default triton
-# wheel with the `rocm/pytorch` image in the root directory.
+# Finalize ROCm 7.2 on AITER's pinned Triton 3.7 source revision.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         pip uninstall -y triton \
      && apt install -y cmake \
@@ -643,7 +649,8 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && git checkout ${TRITON_COMMIT} \
      && pip install -r python/requirements.txt \
      && pip install -e . \
-     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
+     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi \
+     && python3 -c "from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); expected = '${TRITON_COMMIT}'[:8]; assert v.startswith('3.7.0'), v; assert expected in v, f'expected Triton revision {expected}, found {v}'; assert k == '1.0.0', k; print(f'[Triton] validated {v}, triton-kernels {k}')"; \
     fi
 
 # -----------------------
