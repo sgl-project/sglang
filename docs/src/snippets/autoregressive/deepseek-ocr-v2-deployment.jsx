@@ -10,7 +10,7 @@ export const DeepSeekOCR2Deployment = () => {
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
         { id: 'xeon', label: 'XEON', default: false },
-        { id: 'Arc B', label: 'BMG', default: false },
+        { id: 'arc_b', label: 'BMG', default: false },
       ]
     },
     quantization: {
@@ -26,8 +26,8 @@ export const DeepSeekOCR2Deployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' || v.hardware === 'Arc B', disabledReason: 'Only Tensor Parallel (TP) is supported on this hardware' },
-        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' || v.hardware === 'Arc B', disabledReason: 'Only Tensor Parallel (TP) is supported on this hardware' }
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' || v.hardware === 'arc_b', disabledReason: 'Only Tensor Parallel (TP) is supported on this hardware' },
+        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' || v.hardware === 'arc_b', disabledReason: 'Only Tensor Parallel (TP) is supported on this hardware' }
       ]
     },
   };
@@ -43,7 +43,7 @@ export const DeepSeekOCR2Deployment = () => {
     cmd += `  --model-path ${modelPath}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule \\\n  --trust-remote-code`;
-    } else if (hardware === 'Arc B') {
+    } else if (hardware === 'arc_b') {
       cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
       cmd += ` \\\n  --device xpu`;
     }

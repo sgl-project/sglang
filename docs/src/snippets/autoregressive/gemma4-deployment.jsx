@@ -30,7 +30,7 @@ export const Gemma4Deployment = () => {
           { id: 'b200', label: 'B200', default: false },
           { id: 'b300', label: 'B300', default: false },
           { id: 'mi300x', label: 'MI300X', default: false, disabled: !showMI300X },
-          { id: 'Arc B', label: 'BMG', default: false },
+          { id: 'arc_b', label: 'BMG', default: false },
         ];
       }
     },
@@ -89,7 +89,7 @@ export const Gemma4Deployment = () => {
       '31b': { tp: 1, mem: 0.80 },
       '26b-a4b': { tp: 1, mem: 0.80 },
     },
-    'Arc B': {
+    'arc_b': {
       '31b': { tp: 4, mem: 0.80 },
       '26b-a4b': { tp: 4, mem: 0.75 },
     },
@@ -146,7 +146,7 @@ export const Gemma4Deployment = () => {
       cmd += ` \\\n  --attention-backend triton`;
     }
 
-    if (hardware === 'Arc B') {
+    if (hardware === 'arc_b') {
       cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd; 
       cmd += ` \\\n  --device xpu`;
     }
@@ -216,15 +216,15 @@ export const Gemma4Deployment = () => {
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => {
-      if (prev.hardware === 'Arc B' && optionName === 'modelSize' && !['31b', '26b-a4b'].includes(value)) {
+      if (prev.hardware === 'arc_b' && optionName === 'modelSize' && !['31b', '26b-a4b'].includes(value)) {
         return prev;
       }
-      if (prev.hardware === 'Arc B' && optionName === 'checkpoint' && value !== 'standard') {
+      if (prev.hardware === 'arc_b' && optionName === 'checkpoint' && value !== 'standard') {
         return prev;
       }
 
       const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware' && value === 'Arc B') {
+      if (optionName === 'hardware' && value === 'arc_b') {
         if (!['31b', '26b-a4b'].includes(next.modelSize)) {
           next.modelSize = '31b';
         }
@@ -406,11 +406,11 @@ export const Gemma4Deployment = () => {
                 items.map((item) => {
                   const isChecked = values[option.name] === item.id;
                   const isArcBModelLocked =
-                    values.hardware === 'Arc B' &&
+                    values.hardware === 'arc_b' &&
                     option.name === 'modelSize' &&
                     !['31b', '26b-a4b'].includes(item.id);
                   const isArcBCheckpointLocked =
-                    values.hardware === 'Arc B' &&
+                    values.hardware === 'arc_b' &&
                     option.name === 'checkpoint' &&
                     item.id !== 'standard';
                   const isDisabled = Boolean(item.disabled || isArcBModelLocked || isArcBCheckpointLocked);
