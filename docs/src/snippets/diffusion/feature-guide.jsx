@@ -1,5 +1,3 @@
-import { useState } from "react";
-
 const GROUPS = {
   serve: {
     step: "02",
