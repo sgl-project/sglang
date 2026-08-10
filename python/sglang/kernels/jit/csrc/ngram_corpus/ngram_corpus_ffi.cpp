@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <vector>
 
+namespace sglang {
+
 struct NgramCorpusObj : public tvm::ffi::Object {
  public:
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.NgramCorpus", NgramCorpusObj, tvm::ffi::Object);
@@ -169,3 +171,5 @@ void register_ngram_corpus() {
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(register_once, register_ngram_corpus);
+
+}  // namespace sglang

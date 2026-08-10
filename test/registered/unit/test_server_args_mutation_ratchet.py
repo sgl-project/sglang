@@ -10,9 +10,9 @@ baseline to lock in the progress.
 
 There is no post-resolution mutation entry point on the instance any more:
 resolved config changes go to the context bags via
-``get_context().override(source, **fields)``, and a config that differs for one
-runner or worker is a separate object built with ``ServerArgs.derive(source,
-**fields)``. The baseline is therefore zero. ``ServerArgs.__setattr__`` raises
+``get_context().override(source, **fields)``, and a value that differs for one
+runner or worker travels as a constructor argument to it. The baseline is
+therefore zero. ``ServerArgs.__setattr__`` raises
 on a bare assignment after resolution; this ratchet catches the sites the tests
 never execute.
 """
@@ -69,9 +69,9 @@ class TestServerArgsMutationRatchet(CustomTestCase):
                 f"server_args mutations outside the resolution pipeline grew: "
                 f"{count} > baseline {_BASELINE}. Configuration is resolved in "
                 "ServerArgs.__post_init__; declare through the pipeline "
-                "(passes / declare_load_time_override), change resolved config "
-                "with get_context().override(source, ...), or build a variant "
-                "with server_args.derive(source, ...) — do not assign fields."
+                "(passes / declare_late_resolution), change resolved config "
+                "with get_context().override(source, ...), or hand the value "
+                "to its runner as a constructor argument — do not assign fields."
             )
         if count < _BASELINE:
             self.fail(

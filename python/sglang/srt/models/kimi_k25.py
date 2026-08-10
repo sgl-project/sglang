@@ -46,10 +46,9 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import (
+    configured_tp_size,
     get_exec,
     get_mm,
-    get_parallel,
-    get_server_args,
 )
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
@@ -637,6 +636,8 @@ def mm_projection_auto(
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
+    supports_cuda_vmm_feature_transport = True
+
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
     # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json
@@ -645,6 +646,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
             "language_model.layers.": "language_model.model.layers.",
         }
     )
+
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if hf_config.encoder_only:
+            return None
+        return DeepseekV3ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config.text_config, quant_config
+        )
 
     def __init__(
         self,
@@ -721,13 +730,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
             acknowledges the entire TP group so the bounded IPC pool remains
             recyclable.
             """
-            parallel = get_parallel()
-            server_args = get_server_args()
-            # Match MmItemMemoryPool.try_to_recycle(), which waits for the
-            # server TP size rather than the attention subgroup size.
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
+            # Same source as MmItemMemoryPool.try_to_recycle(), which waits on
+            # configured_tp_size(): the live world size agrees once dist is up,
+            # but a refcount that disagrees with the waiter would strand items.
+            ipc_consumer_count = max(configured_tp_size(), 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()

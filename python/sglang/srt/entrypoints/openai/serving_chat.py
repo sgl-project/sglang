@@ -2220,6 +2220,12 @@ class OpenAIServingChat(OpenAIServingBase):
             request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
+        if self.reasoning_parser == "inkling":
+            # Effort-conditioned, not toggled: "none" (0.0) is the off switch.
+            if not enabled:
+                request.reasoning_effort = "none"
+                return
+
         config = self.template_manager.reasoning_config
         is_mistral = (config is not None and config.special_case == "mistral") or (
             config is None and self._reasoning_default_mode() == "mistral"
