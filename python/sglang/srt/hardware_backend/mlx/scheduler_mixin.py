@@ -16,8 +16,11 @@ the GPU runs both steps back-to-back with no idle gap.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, List, Optional
+
+import mlx.core as mx
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
@@ -89,17 +92,18 @@ class SchedulerMlxOverlapMixin:
         # populated at forward launch (see _build_logit_edit_rows).
         return not (batch.has_grammar or sampling_info.has_custom_logit_processor)
 
-    def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
-        # Account for this completed forward step. The standard scheduler does
-        # this inside run_batch(), but the MLX overlap loop bypasses run_batch,
-        # so without this forward_ct never advances on MLX. That stalls the
-        # watchdog liveness counter and, more importantly, breaks step-bounded
-        # profiling: _profile_batch_predicate auto-starts/stops based on
-        # forward_ct, so `--profile-steps` (and the server /start_profile
-        # num_steps path) only takes effect once the counter moves here.
+    def _prepare_mlx_launch(self: Scheduler, batch: ScheduleBatch):
+        """Stamp scheduler bookkeeping before an MLX forward is launched."""
+        # Match run_batch's launch boundary. In particular, the profiler
+        # predicate must run before graph construction / mx.async_eval; running
+        # it while finalizing the previous step profiles at least one queued
+        # decode beyond the requested step count.
         self.forward_ct += 1
-        self.profiler_manager._profile_batch_predicate(pending.schedule_batch)
+        batch.forward_iter = self.forward_ct
+        batch.launch_ts = time.monotonic()
+        self.profiler_manager._profile_batch_predicate(batch)
 
+    def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
         result = self.tp_worker.finalize_mlx_result(pending.launch, pending.reqs)
         result.extend_input_len_per_req = pending.extend_input_len_per_req
         result.extend_logprob_start_len_per_req = (
@@ -155,6 +159,7 @@ class SchedulerMlxOverlapMixin:
         pending_next: Optional[MlxPendingJob] = None
 
         def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
+            self._prepare_mlx_launch(batch)
             # Materialize batch.input_ids from CPU staging (prefill) or the
             # FutureMap relay (decode) before the forward. With deferred input
             # materialization, get_next_batch_to_run leaves input_ids unset; the
@@ -188,13 +193,26 @@ class SchedulerMlxOverlapMixin:
             # carries over, and only a fresh batch copy of the same
             # underlying ScheduleBatch is needed so process_batch_result
             # updates the same req objects with the new token.
+            batch_copy = prev.batch_copy.copy()
+            self._prepare_mlx_launch(batch_copy)
+            # Keep the live scheduler batch's iteration aligned: when the
+            # chain breaks, prepare_for_decode() may run SWA maintenance
+            # before the next fresh launch gets a chance to re-stamp it.
+            prev.schedule_batch.forward_iter = batch_copy.forward_iter
             return replace(
                 prev,
                 launch=self.tp_worker.async_chained_decode_mlx(prev.launch.decode),
-                batch_copy=prev.batch_copy.copy(),
+                batch_copy=batch_copy,
             )
 
         while True:
+            if self.gracefully_exit:
+                # A lookahead job may already be queued by mx.async_eval but
+                # not finalized. Drain Metal work before the scheduler starts
+                # releasing host resources during graceful teardown.
+                mx.synchronize()
+                break
+
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:

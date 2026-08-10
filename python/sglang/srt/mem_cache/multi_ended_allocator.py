@@ -111,6 +111,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
+        kernel_page_multiplier: int = 1,
     ):
         spec = unified_buffer.spec(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
@@ -130,6 +131,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.entry_bytes = spec.entry_bytes()
         self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
         self.is_id_owner = is_id_owner
+        # Dense (kernel-facing) index space scale: the page-major envelope of a
+        # multi-layer uniform-entry sub-pool (MLA) is a valid dense paged pool
+        # once page ids are scaled by layer_num — `translate_kv_loc_dense` emits
+        # that space. 1 for sub-pools whose kernels take real physical ids.
+        self.kernel_page_multiplier = kernel_page_multiplier
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
         # v2p writes + move kernel serialize after the in-flight forward.
         self.forward_stream = forward_stream
@@ -284,33 +290,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.live_page_count = 0
         self._inflight_forward = None
         self._latest_forward_done_event = None
-
-    def backup_state(self):
-        # Spec-decode allocates only inside a backup window (no free), so
-        # `_inverse_history` doesn't grow under correct usage.
-        return (
-            self.watermark_physical,
-            (len(self.free_virtual_ids) if self.is_id_owner else None),
-            len(self._inverse_history),
-        )
-
-    def restore_state(self, state):
-        watermark, n_free_virtual, n_inverse = state
-        self.watermark_physical = watermark
-        if self.is_id_owner and n_free_virtual is not None:
-            pass  # spec asserted off; no free-list rollback.
-        new_entries = self._inverse_history[n_inverse:]
-        if new_entries:
-            logger.warning(
-                "MultiEndedAllocator.restore_state: %d relocation(s) recorded inside "
-                "a backup window (sub_pool=%s). Eager compaction is not fully "
-                "reversible; SGLang's spec path should not produce a free() inside a "
-                "backup window.",
-                len(new_entries),
-                self.sub_pool_name,
-            )
-        del self._inverse_history[n_inverse:]
-        return new_entries
 
     def clear_inverse_history(self) -> None:
         self._inverse_history.clear()
@@ -708,6 +687,59 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         result = phys_pages * self.page_size + offsets
         return torch.clamp_min(result, 0)
 
+    def translate_kv_loc_dense(
+        self,
+        virt_tokens: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Translate virtual token ids to DENSE (kernel-facing) ids.
+
+        dense(t) = (t // ps) * (ps * kernel_page_multiplier) + t % ps for the
+        physical token t — i.e. `translate_kv_loc` with the page stride scaled by
+        `kernel_page_multiplier` (= layer_num for a dense-view MLA sub-pool; see
+        `build_dense_mla_views`). Internal machinery (compaction, in-flight write
+        sets) MUST keep using `translate_kv_loc`: dense ids are for kernels only.
+
+        The tombstone clamp routes -1 entries to dense id 0 — inside the page-0
+        reserved sink for every layer view. Supports ``out=`` like
+        `translate_kv_loc` for cuda-graph buffer stability.
+        """
+        if self.kernel_page_multiplier == 1:
+            return self.translate_kv_loc(virt_tokens, out=out)
+        if out is not None:
+            assert out.dtype == torch.int64, (
+                f"translate_kv_loc_dense: out= dtype must be int64 (matches v2p), "
+                f"got {out.dtype}"
+            )
+            assert out.shape == virt_tokens.shape, (
+                f"translate_kv_loc_dense: out= shape {tuple(out.shape)} must "
+                f"match virt_tokens shape {tuple(virt_tokens.shape)}"
+            )
+        with record_function("MultiEndedAlloc.translate_kv_loc_dense"):
+            dense_page_stride = self.page_size * self.kernel_page_multiplier
+            if self.page_size == 1:
+                # dense = phys * multiplier; tombstone -1 scales negative → clamp 0.
+                if out is not None:
+                    tmp = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
+                    tmp = torch.clamp_min(tmp * dense_page_stride, 0)
+                    out.copy_(tmp)
+                    return out
+                result = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
+                return torch.clamp_min(result * dense_page_stride, 0)
+            virt_pages = virt_tokens // self.page_size
+            offsets = virt_tokens % self.page_size
+            if out is not None:
+                torch.index_select(self.virtual_to_physical, 0, virt_pages, out=out)
+                out.mul_(dense_page_stride)
+                out.add_(offsets)
+                # tombstoned page: -1*dense_page_stride + offset < 0
+                out.clamp_(min=0)
+                return out
+            phys_pages = self.virtual_to_physical[virt_pages]
+            result = phys_pages * dense_page_stride + offsets
+            return torch.clamp_min(result, 0)
+
     # -- alloc --
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -922,7 +954,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if free_index is None or free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
-                self.free_group.append(free_index)
+                self.free_group.append(self._copy_for_free_group(free_index))
                 return
             if self.lazy_compaction:
                 self._free_lazy(free_index)
@@ -1681,12 +1713,13 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
+        full_kernel_page_multiplier: int = 1,
     ):
         full_max = unified_buffer.max_slots("full")
         super().__init__(
             size=full_max - 1,
             page_size=page_size,
-            dtype=unified_buffer.mha_spec("full").store_dtype,
+            dtype=unified_buffer.spec("full").get_dtype(),
             device=device,
             kvcache=kvcache,
             need_sort=need_sort,
@@ -1708,6 +1741,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
+            kernel_page_multiplier=full_kernel_page_multiplier,
         )
         self.mamba_allocator = MultiEndedAllocator(
             kvcache=kvcache.mamba_pool,
@@ -1860,6 +1894,29 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
         return result
 
+    @property
+    def kernel_page_multiplier(self) -> int:
+        return self.full_attn_allocator.kernel_page_multiplier
+
+    @property
+    def full_v2p_page_table(self) -> torch.Tensor:
+        """Page-level virtual->physical table of the full sub-pool. Kernels that
+        build the MLA block table directly from req_to_token (e.g. trtllm_mla,
+        flashmla) gather through this to turn a VIRTUAL page into a physical one,
+        then scale by `kernel_page_multiplier` to reach the dense per-page block.
+        """
+        return self.full_attn_allocator.virtual_to_physical
+
+    def translate_kv_loc_dense(
+        self,
+        loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids. Falls back
+        to the physical translate when `kernel_page_multiplier == 1` (MHA)."""
+        return self.full_attn_allocator.translate_kv_loc_dense(loc, out=out)
+
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)
 
@@ -1871,7 +1928,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             if free_index is None or free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
-                self.free_group.append(free_index)
+                self.free_group.append(self._copy_for_free_group(free_index))
                 return
             self.full_attn_allocator.free(free_index)
             self.full_attn_allocator.clear_inverse_history()
@@ -1889,18 +1946,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.free(merged)
             self.full_attn_allocator.clear_inverse_history()
             self.mamba_allocator.clear_inverse_history()
-
-    def backup_state(self):
-        return [
-            self.full_attn_allocator.backup_state(),
-            self.mamba_allocator.backup_state(),
-        ]
-
-    def restore_state(self, state):
-        assert len(state) == 2
-        full_rollback = self.full_attn_allocator.restore_state(state[0])
-        mamba_rollback = self.mamba_allocator.restore_state(state[1])
-        return full_rollback + mamba_rollback
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
@@ -2352,7 +2397,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             if free_index is None or free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
-                self.free_group.append(free_index)
+                self.free_group.append(self._copy_for_free_group(free_index))
                 return
             # Free both peers; the per-sub-pool v2p IS the mapping, so order isn't
             # load-bearing. Filter the swa side to skip already-tombstoned virtuals
@@ -2411,20 +2456,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.free(merged)
-
-    # -- spec-decode hooks (asserted off; preserved for future use) --
-
-    def backup_state(self):
-        return [
-            self.full_attn_allocator.backup_state(),
-            self.swa_attn_allocator.backup_state(),
-        ]
-
-    def restore_state(self, state):
-        assert len(state) == 2
-        full_rollback = self.full_attn_allocator.restore_state(state[0])
-        swa_rollback = self.swa_attn_allocator.restore_state(state[1])
-        return full_rollback + swa_rollback
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
