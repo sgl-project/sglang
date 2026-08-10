@@ -4,7 +4,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    get_jit_cuda_arch,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -17,12 +22,17 @@ def _jit_per_token_quant_fp8_module(dtype: torch.dtype) -> Module:
         raise RuntimeError(
             f"Unsupported dtype {dtype}. Supported: float16, bfloat16, float32"
         )
+    arch = get_jit_cuda_arch()
+    use_fast_math = (arch.major, arch.minor) == (9, 0)
+    math_mode = "fast_math" if use_fast_math else "precise_math"
     args = make_cpp_args(dtype)
     return load_jit(
         "per_token_quant_fp8",
+        math_mode,
         *args,
         cuda_files=["gemm/per_token_quant_fp8.cuh"],
         cuda_wrappers=[("per_token_quant_fp8", f"per_token_quant_fp8<{args}>")],
+        extra_cuda_cflags=["--use_fast_math"] if use_fast_math else [],
     )
 
 
