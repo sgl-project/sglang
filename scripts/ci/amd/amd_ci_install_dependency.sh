@@ -381,9 +381,14 @@ if expected_sha not in triton_version:
     raise SystemExit(
         f"Expected Triton revision {expected_sha}, found {triton_version}"
     )
-if triton_kernels_version != "1.0.0":
+if not triton_kernels_version.startswith("1.0.0"):
     raise SystemExit(
-        f"Expected triton-kernels 1.0.0, found {triton_kernels_version}"
+        f"Expected triton-kernels 1.0.0-compatible build, found {triton_kernels_version}"
+    )
+if expected_sha not in triton_kernels_version:
+    raise SystemExit(
+        f"Expected triton-kernels revision {expected_sha}, "
+        f"found {triton_kernels_version}"
     )
 print(
     f"[CI-AITER-CHECK] Validated Triton {triton_version}, "

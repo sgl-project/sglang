@@ -243,7 +243,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
         cd aiter \
      && test -f .github/scripts/install_triton.sh \
      && bash .github/scripts/install_triton.sh \
-     && python3 -c "from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); expected = '${TRITON_COMMIT}'[:8]; assert v.startswith('3.7.0'), v; assert expected in v, f'expected build-time Triton revision {expected}, found {v}'; assert k == '1.0.0', k; print(f'[AITER] validated build-time Triton {v}, triton-kernels {k}')"; \
+     && python3 -c "from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); expected = '${TRITON_COMMIT}'[:8]; assert v.startswith('3.7.0'), v; assert expected in v, f'expected build-time Triton revision {expected}, found {v}'; assert k.startswith('1.0.0'), k; assert expected in k, f'expected build-time triton-kernels revision {expected}, found {k}'; print(f'[AITER] validated build-time Triton {v}, triton-kernels {k}')"; \
     fi
 
 RUN cd aiter \
@@ -650,7 +650,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && pip install -r python/requirements.txt \
      && pip install -e . \
      && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi \
-     && python3 -c "from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); expected = '${TRITON_COMMIT}'[:8]; assert v.startswith('3.7.0'), v; assert expected in v, f'expected Triton revision {expected}, found {v}'; assert k == '1.0.0', k; print(f'[Triton] validated {v}, triton-kernels {k}')"; \
+     && python3 -c "from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); expected = '${TRITON_COMMIT}'[:8]; assert v.startswith('3.7.0'), v; assert expected in v, f'expected Triton revision {expected}, found {v}'; assert k.startswith('1.0.0'), k; print(f'[Triton] validated {v}, triton-kernels {k}')"; \
     fi
 
 # -----------------------
