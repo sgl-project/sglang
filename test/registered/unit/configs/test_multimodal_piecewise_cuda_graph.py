@@ -11,6 +11,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    Phase,
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -78,13 +79,61 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         )
         args._cuda_graph_config_locked = set()
 
-        with patch.object(
-            ServerArgs, "_disable_tc_piecewise_cudagraph_if_incompatible"
-        ) as disable_if_incompatible:
+        with (
+            patch.object(
+                ServerArgs, "_disable_tc_piecewise_cudagraph_if_incompatible"
+            ) as disable_if_incompatible,
+            patch.object(
+                args, "_resolved_attention_backends", return_value=("fa3", "fa3")
+            ),
+        ):
             args._apply_cuda_graph_compatibility()
 
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
         disable_if_incompatible.assert_called_once()
+
+    def test_trtllm_mla_stays_on_breakable(self):
+        args = ServerArgs(model_path="dummy")
+        # trtllm_mla skips the tc_piecewise upgrade and keeps breakable, which
+        # now serves MLA by falling back to the flashinfer MLA impl for extend.
+        args.model_config = SimpleNamespace(
+            is_multimodal_piecewise_cuda_graph_supported=True,
+            is_multimodal=False,
+            is_multimodal_breakable_cuda_graph_supported=False,
+            hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.BREAKABLE)
+        )
+        args._cuda_graph_config_locked = set()
+
+        with (
+            patch.object(
+                args,
+                "_resolved_attention_backends",
+                return_value=("trtllm_mla", "trtllm_mla"),
+            ),
+            patch.object(args, "use_mla_backend", return_value=True),
+        ):
+            args._apply_cuda_graph_compatibility()
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_explicit_tc_piecewise_overrides_trtllm_mla_default(self):
+        args = ServerArgs(model_path="dummy")
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
+        )
+        args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")}
+
+        with patch.object(
+            args,
+            "_resolved_attention_backends",
+            return_value=("trtllm_mla", "trtllm_mla"),
+        ):
+            args._apply_cuda_graph_compatibility()
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
 
     def test_multimodal_inputs_keep_tc_piecewise_prefill_enabled(self):
         runner = self._make_prefill_runner(Backend.TC_PIECEWISE)
@@ -96,12 +145,16 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         self.assertTrue(runner.can_run_graph(self._make_multimodal_forward_batch()))
 
-    def test_breakable_prefill_rejects_nonzero_prefix(self):
+    def test_breakable_prefill_takes_nonzero_prefix_on_cuda_only(self):
         runner = self._make_prefill_runner(Backend.BREAKABLE)
         forward_batch = self._make_multimodal_forward_batch()
         forward_batch.extend_prefix_lens_cpu = [1]
 
-        self.assertFalse(runner.can_run_graph(forward_batch))
+        target = "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda"
+        with patch(target, return_value=True):
+            self.assertTrue(runner.can_run_graph(forward_batch))
+        with patch(target, return_value=False):
+            self.assertFalse(runner.can_run_graph(forward_batch))
 
     def test_embedding_gemma_forces_breakable_prefill(self):
         args = ServerArgs(model_path="dummy")

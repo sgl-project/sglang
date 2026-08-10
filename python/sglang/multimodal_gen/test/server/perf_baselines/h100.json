@@ -2634,6 +2634,14 @@
             "expected_median_denoise_ms": 800.0,
             "estimated_full_test_time_s": 149.4
         },
+        "lingbot_video_moe_t2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 600.0
+        },
         "lingbot_world_realtime_plastic_beach": {
             "stages_ms": {},
             "denoise_step_ms": {},
@@ -2789,6 +2797,33 @@
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 55.4
+        },
+        "minimax_h3_t2va_2gpu_h100": {
+            "stages_ms": {
+                "InputValidationStage": 0.05,
+                "MiniMaxH3PartitionAdmissionStage": 0.03,
+                "MiniMaxH3TextEncodingStage": 620.13,
+                "MiniMaxH3VisualEncodingStage": 0.11,
+                "MiniMaxH3AudioEncodingStage": 0.03,
+                "MiniMaxH3LatentPreparationStage": 18.72,
+                "MiniMaxH3TimestepPreparationStage": 0.34,
+                "MiniMaxH3DenoisingStage": 16839.0,
+                "MiniMaxH3DecodingStage": 29741.66,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 211.7,
+                "1": 2427.55,
+                "2": 2344.0,
+                "3": 2332.99,
+                "4": 2332.69,
+                "5": 2343.56,
+                "6": 2326.79
+            },
+            "expected_e2e_ms": 47538.57,
+            "expected_avg_denoise_ms": 2045.61,
+            "expected_median_denoise_ms": 2332.99,
+            "estimated_full_test_time_s": 235.9
         },
         "mova_360p_tp2": {
             "stages_ms": {},

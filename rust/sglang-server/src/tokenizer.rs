@@ -24,6 +24,13 @@ use crate::tokenizer_manager::TmEvent;
 /// (read-only) across all pinned workers.
 pub trait TextTokenizer: Send + Sync {
     fn encode(&self, text: &str) -> Result<TokenIds, Error>;
+
+    /// The special tokens this tokenizer auto-prepends on every `encode` —
+    /// Python's `encode("")` probe (`serving_chat._tokenizer_auto_adds_specials`).
+    /// Empty when it adds none (tiktoken backends, no BOS/EOS post-processor).
+    fn auto_specials(&self) -> Vec<i32> {
+        Vec::new()
+    }
 }
 
 /// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
@@ -42,7 +49,6 @@ pub fn load_tokenizer(
     let path = tokenizer_path.ok_or_else(|| {
         "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
     })?;
-
     let file = resolve_model_file(path, revision, "tokenizer.json")
         .ok_or_else(|| format!("tokenizer.json not found for '{path}'"))?;
     let tokenizer = dynamo_tokenizers::Tokenizer::from_file_with_options(
@@ -124,14 +130,40 @@ impl TextTokenizer for DynamoTokenizer {
         // Vocab ids are non-negative and fit in i32.
         Ok(encoding.token_ids().iter().map(|&id| id as i32).collect())
     }
+
+    /// The post-processor prepends exactly what `encode("")` returns, so the
+    /// probe is the same prefix [`strip_auto_specials`] removes.
+    fn auto_specials(&self) -> Vec<i32> {
+        self.inner
+            .encode("")
+            .map(|encoding| encoding.token_ids().iter().map(|&id| id as i32).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Remove one leading run of auto-added specials — exactly what an
+/// `add_special_tokens=false` encode would have produced, without a second
+/// tokenizer instance (the post-processor always prepends the same prefix, so
+/// a template-rendered copy of those tokens is preserved).
+fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
+    if ids.starts_with(auto_specials) {
+        ids.drain(..auto_specials.len());
+    }
+    ids
 }
 
 /// One tokenizer worker: pulls a `Request` off the shared inbox, fills
 /// `input_ids`, returns it to the TokenizerManager. Pinned; backend shared.
+///
+/// The `auto_specials` prefix (probed once at construction, Python's
+/// `encode("")` probe) is stripped from template-rendered prompts —
+/// [`GenerateRequest`]'s `skip_special_tokens` — so chat prompts gain no
+/// extra BOS/EOS while native text keeps the post-processor specials.
 pub struct TokenizerWorker {
     rx: flume::Receiver<Request>,
     tm: flume::Sender<TmEvent>,
     tokenizer: Arc<dyn TextTokenizer>,
+    auto_specials: Vec<i32>,
 }
 
 impl TokenizerWorker {
@@ -140,7 +172,13 @@ impl TokenizerWorker {
         tm: flume::Sender<TmEvent>,
         tokenizer: Arc<dyn TextTokenizer>,
     ) -> Self {
-        Self { rx, tm, tokenizer }
+        let auto_specials = tokenizer.auto_specials();
+        Self {
+            rx,
+            tm,
+            tokenizer,
+            auto_specials,
+        }
     }
 }
 
@@ -170,7 +208,11 @@ impl Runnable for TokenizerWorker {
                 }
                 match self.tokenizer.encode(g.text.as_deref().unwrap_or("")) {
                     Ok(ids) => {
-                        g.input_ids = Some(ids);
+                        g.input_ids = Some(if g.skip_special_tokens {
+                            strip_auto_specials(ids, &self.auto_specials)
+                        } else {
+                            ids
+                        });
                         Event::TokenizeDone
                     }
                     Err(err) => Event::Error(err),
@@ -247,5 +289,63 @@ mod tests {
             g.sampling_params.stop_str_max_len, 3,
             "must be the max TOKEN count (3), not the byte count (8)"
         );
+    }
+
+    /// The strip reproduces `add_special_tokens=false`: one leading run of
+    /// auto-added specials is removed, a template-rendered copy is kept, and
+    /// tokenizers with no auto specials (empty probe) are untouched.
+    #[test]
+    fn strip_auto_specials_matches_add_special_tokens_false() {
+        assert_eq!(strip_auto_specials(vec![0, 0, 1, 2], &[0]), vec![0, 1, 2]);
+        assert_eq!(strip_auto_specials(vec![1, 2], &[0]), vec![1, 2]);
+        assert_eq!(strip_auto_specials(vec![1, 2], &[]), vec![1, 2]);
+        assert_eq!(strip_auto_specials(vec![0], &[0, 9]), vec![0]);
+    }
+
+    /// Word tokens plus a prepended BOS marker (id 0) — like an HF tokenizer
+    /// whose post-processor adds specials.
+    struct MarkedTokenizer;
+    impl TextTokenizer for MarkedTokenizer {
+        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+            Ok(vec![0, text.len() as i32])
+        }
+        fn auto_specials(&self) -> Vec<i32> {
+            vec![0]
+        }
+    }
+
+    /// `skip_special_tokens` strips the probed prefix: template-rendered
+    /// prompts (chat) must not gain a BOS the template didn't render — Python's
+    /// `add_special_tokens=False` at the chat-template encode site.
+    #[test]
+    fn skip_special_tokens_strips_the_auto_added_specials() {
+        let run = |skip_special_tokens: bool| {
+            let (req_tx, req_rx) = flume::unbounded::<Request>();
+            let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+            req_tx
+                .send(Request {
+                    rid: "1".into(),
+                    state: RequestState::Tokenizing,
+                    sink: EgressSink::Local(tokio::sync::mpsc::channel(4).0),
+                    kind: RequestKind::Generate(Box::new(GenerateRequest {
+                        rid: "1".into(),
+                        text: Some("hi".into()),
+                        skip_special_tokens,
+                        ..Default::default()
+                    })),
+                })
+                .expect("send");
+            drop(req_tx);
+            TokenizerWorker::new(req_rx, tm_tx, Arc::new(MarkedTokenizer)).run();
+            let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned") else {
+                panic!("expected Tokenized");
+            };
+            let RequestKind::Generate(g) = &req.kind else {
+                panic!("expected generate");
+            };
+            g.input_ids.clone().expect("tokenized")
+        };
+        assert_eq!(run(false), vec![0, 2], "native prompts keep specials");
+        assert_eq!(run(true), vec![2], "rendered prompts lose the auto BOS");
     }
 }

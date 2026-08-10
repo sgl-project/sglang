@@ -1,0 +1,70 @@
+name: PR Test (Rust extensions)
+
+# In-crate checks for the Rust extensions bundled with the `sglang` wheel
+# (rust/sglang-mm). The pyo3 bindings themselves are exercised by the Python
+# unit suite (base-a-test-cpu), which builds the extensions from source; this
+# job covers the pure-Rust core, exactly as sglang-server links it, plus lints.
+#
+# Scoped to sglang-mm on purpose: sglang-server and sglang-grpc have no
+# in-crate test suite yet, so a `rust/**` trigger would spawn a job that does
+# not actually cover the changed crate. Widen the paths together with the job.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "rust/sglang-mm/**"
+      - "rust/Cargo.toml"
+      - ".github/workflows/pr-test-rust-exts.yml"
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "rust/sglang-mm/**"
+      - "rust/Cargo.toml"
+      - ".github/workflows/pr-test-rust-exts.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-exts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sglang-mm-unit:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: rust/sglang-mm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The workspace root owns Cargo.lock and target/.
+          workspaces: rust
+
+      # rustfmt and non-test clippy for rust/ are already gated by the Lint
+      # workflow's pre-commit hooks; `--all-targets` is the part it misses, so
+      # this lints the test code too rather than duplicating that gate.
+      - name: cargo clippy (test targets)
+        run: |
+          rustup component add clippy
+          cargo clippy --all-targets -- -D warnings
+
+      # Default features are exactly what sglang-server links: no pyo3, no
+      # rayon. `rlib_is_single_threaded` only runs in this shape.
+      - name: cargo test (rlib shape — no pyo3, no rayon)
+        run: cargo test
+
+      # The wheel's shape (minus pyo3, whose extension-module crates cannot
+      # link test binaries). Both shapes must pass: `common::par` has two
+      # implementations and results are required to be identical.
+      - name: cargo test (parallel shape)
+        run: cargo test --features parallel
