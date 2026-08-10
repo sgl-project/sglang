@@ -1,4 +1,4 @@
-"""Core checks for the quality-gated fused gate-RMSNorm (Z-Image suite reuse)."""
+"""Core checks for the quality-gated fused gate-RMSNorm path."""
 
 import sys
 
@@ -44,10 +44,10 @@ def test_fused_matches_ideogram_reference():
 def test_mount_guards_all_or_nothing():
     good, bad = _Site(), _Site(torch.float32)
     assert not fgn.mount_fused_gate_rmsnorm(nn.ModuleList([good, bad]))
-    assert not good._sgl_fused_gate_rmsnorm_enabled
+    assert not fgn.fused_gate_rmsnorm_active(good)
     assert fgn.mount_fused_gate_rmsnorm(good)
     fgn.unmount_fused_gate_rmsnorm(good)
-    assert not good._sgl_fused_gate_rmsnorm_enabled
+    assert not fgn.fused_gate_rmsnorm_active(good)
 
 
 if __name__ == "__main__":

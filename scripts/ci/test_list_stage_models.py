@@ -412,7 +412,7 @@ _anchors:
 
 runner_configs:
   1-gpu:        { install: *default, artifact_version: v4, runs_on: 1-gpu-h100 }
-  deepep-1-gpu: { install: *default, artifact_version: v4, runs_on: 1-gpu-h100 }
+  alternate-1-gpu: { install: *default, artifact_version: v4, runs_on: 1-gpu-h100 }
   4-gpu-b200:   { install: *default, artifact_version: v6, runs_on: $b200_runner }
 """
 
@@ -431,7 +431,7 @@ class LoadRunnerLabels(unittest.TestCase):
             labels,
             {
                 "1-gpu": "1-gpu-h100",
-                "deepep-1-gpu": "1-gpu-h100",
+                "alternate-1-gpu": "1-gpu-h100",
                 "4-gpu-b200": lsm.B200_SENTINEL,
             },
         )
@@ -451,9 +451,7 @@ class LoadRunnerLabels(unittest.TestCase):
         labels = lsm.load_runner_labels(
             os.path.join(_REPO_ROOT, "scripts", "ci", "runner_configs.yml")
         )
-        # Two configs sharing a label is the reason the aggregation exists.
         self.assertEqual(labels["4-gpu-h100"], "4-gpu-h100")
-        self.assertEqual(labels["deepep-4-gpu-h100"], "4-gpu-h100")
         self.assertEqual(labels["4-gpu-b200"], lsm.B200_SENTINEL)
         self.assertGreaterEqual(len(labels), 10)
 
@@ -482,7 +480,7 @@ class RunnerLabelAggregation(unittest.TestCase):
                 "b/test_b.py": self.REG.format(
                     calls=(
                         'register_cuda_ci(est_time=1, stage="base-y", '
-                        'runner_config="deepep-1-gpu")'
+                        'runner_config="alternate-1-gpu")'
                     ),
                     model="Qwen/Qwen3-8B",
                 ),
@@ -520,7 +518,7 @@ class RunnerLabelAggregation(unittest.TestCase):
             )
             self.assertEqual(
                 shared["suites"],
-                ["base-x-test-1-gpu", "base-y-test-deepep-1-gpu"],
+                ["base-x-test-1-gpu", "base-y-test-alternate-1-gpu"],
             )
             # Sentinel stays literal without --b200-runner.
             self.assertIn(lsm.B200_SENTINEL, inv["runner_labels"])

@@ -15,8 +15,21 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    DEFERRED_PREPROCESSING_KEY,
+)
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    fill_transparent_bg as _fill_transparent_bg,
+)
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    to_chw_uint8,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -28,8 +41,10 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
     _gpu_preprocess_images,
+    _grid_thw_from_resize_config,
     navit_resize_config,
 )
+from sglang.srt.utils import is_cuda
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
@@ -124,15 +139,7 @@ def _expand_k3_image_prompt_text(
 
 def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
     if isinstance(image, Image.Image):
-        # The checkpoint's fill_transparent_bg_with() returns RGB-mode images
-        # untouched before it ever inspects the alpha bands, so an RGB image
-        # carrying a stray "transparency" info key must NOT be promoted to
-        # RGBA here.
-        has_alpha = image.mode != "RGB" and (
-            "A" in image.getbands() or "transparency" in image.info
-        )
-        arr = np.asarray(image.convert("RGBA" if has_alpha else "RGB"))
-        return torch.from_numpy(arr).permute(2, 0, 1).cuda()
+        return to_chw_uint8(image, device="cuda")
 
     image = image.cuda()
     if image.dim() == 2:
@@ -140,51 +147,6 @@ def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
     if image.shape[0] == 1:
         image = image.repeat(3, 1, 1)
     return image
-
-
-def _chessboard_background(
-    height: int, width: int, cfg: dict, device: torch.device
-) -> torch.Tensor:
-    square = cfg.get("chessboard_square_size", 16)
-    white = float(cfg.get("chessboard_white_value", 255))
-    gray = float(cfg.get("chessboard_gray_value", 200))
-    on_top_left = cfg.get("chessboard_square_on_top_left", True)
-
-    ys = torch.arange(height, device=device) // square
-    xs = torch.arange(width, device=device) // square
-    parity = (ys.unsqueeze(1) + xs.unsqueeze(0)) % 2
-    gray_parity = 1 if on_top_left else 0
-    bg = torch.where(parity == gray_parity, gray, white)
-    return bg.unsqueeze(0).expand(3, height, width)
-
-
-def _fill_transparent_bg(x: torch.Tensor, bg_cfg: Union[dict, None]) -> torch.Tensor:
-    """Composite a resized (1, 4, H, W) float image in [0, 255] onto the
-    configured background; 3-channel input passes through."""
-    if x.shape[1] == 3:
-        return x
-    rgb = x[:, :3]
-    if bg_cfg is None:
-        return rgb
-
-    _, _, height, width = x.shape
-    pattern = bg_cfg.get("pattern", "black")
-    if pattern == "chessboard":
-        bg = _chessboard_background(height, width, bg_cfg, x.device)
-    elif pattern == "white":
-        bg = torch.full((3, height, width), 255.0, device=x.device)
-    elif pattern == "black":
-        bg = torch.zeros(3, height, width, device=x.device)
-    elif pattern == "gray":
-        bg = torch.full((3, height, width), 128.0, device=x.device)
-    else:
-        raise ValueError(f"Invalid background pattern: {pattern}")
-
-    alpha = (x[:, 3:4] / 255.0).clamp(0.0, 1.0)
-    # The checkpoint processor casts the composited float result back with
-    # numpy's astype(np.uint8), which truncates; floor matches that exactly
-    # (a composite of [0, 255] inputs is always non-negative).
-    return (alpha * rgb + (1.0 - alpha) * bg).clamp(0.0, 255.0).floor_()
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
@@ -292,10 +254,38 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             out["image_grid_thw"] = grid_thws
         return out
 
+    def prepare_deferred(self, text, images, original_input_ids=None):
+        input_text = text[0] if isinstance(text, list) else text
+        image_sizes = [_get_image_dimensions(image) for image in images]
+        resize_configs = [
+            navit_resize_config(
+                width,
+                height,
+                self._patch_size,
+                self._merge_kernel_size,
+                self._in_patch_limit,
+                self._patch_limit_on_one_side,
+                self._fixed_output_tokens,
+            )
+            for width, height in image_sizes
+        ]
+        input_ids = self._prepare_input_ids(
+            input_text, resize_configs, original_input_ids, image_sizes
+        )
+        deferred_config = {
+            "image_mean": list(self._image_mean),
+            "image_std": list(self._image_std),
+            "transparent_bg_config": self._transparent_bg_config,
+        }
+        return input_ids, resize_configs, deferred_config
+
 
 class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK3ForConditionalGeneration]
-    gpu_image_decode = True
+    # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0
+    # JPEG inputs. This mode uses interpolated nvJPEG upsampling when the K3
+    # image dependency is installed and otherwise falls back to PIL.
+    gpu_image_decode = "nvjpeg_fancy"
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
     auto_mm_processor_worker_num = 2
@@ -327,6 +317,91 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         )
         super().__init__(hf_config, server_args, processor, *args, **kwargs)
         self.mm_tokens = mm_tokens
+
+    def _should_defer_gpu_preprocessing(self, images) -> bool:
+        if (
+            not images
+            or self.mm_feature_transport != "cpu"
+            or not is_cuda()
+            or not all(
+                isinstance(image, Image.Image)
+                or (isinstance(image, torch.Tensor) and image.dtype == torch.uint8)
+                for image in images
+            )
+        ):
+            return False
+
+        raw_bytes = 0
+        processed_bytes = 0
+        patch_size = self._processor._patch_size
+        for image in images:
+            width, height = _get_image_dimensions(image)
+            resize_config = navit_resize_config(
+                width,
+                height,
+                patch_size,
+                self._processor._merge_kernel_size,
+                self._processor._in_patch_limit,
+                self._processor._patch_limit_on_one_side,
+                self._processor._fixed_output_tokens,
+            )
+            if isinstance(image, torch.Tensor):
+                channels = (
+                    3 if image.dim() == 2 or image.shape[0] == 1 else image.shape[0]
+                )
+            else:
+                channels = (
+                    4
+                    if image.mode != "RGB"
+                    and ("A" in image.getbands() or "transparency" in image.info)
+                    else 3
+                )
+            raw_bytes += channels * width * height
+            padded_width = resize_config["new_width"] + resize_config["pad_width"]
+            padded_height = resize_config["new_height"] + resize_config["pad_height"]
+            processed_bytes += 3 * padded_width * padded_height * torch.float32.itemsize
+
+        return raw_bytes <= processed_bytes
+
+    def _build_deferred_output(self, base_output):
+        input_ids, resize_configs, deferred_config = self._processor.prepare_deferred(
+            base_output.input_text,
+            base_output.images,
+            base_output.input_ids,
+        )
+        offsets = self.get_mm_items_offset(
+            input_ids.flatten(), self.mm_tokens.image_token_id
+        )
+        if len(offsets) != len(base_output.images):
+            raise ValueError("Expected one Kimi-K3 image span for each image")
+
+        items = []
+        for image, resize_config, offset in zip(
+            base_output.images, resize_configs, offsets
+        ):
+            grid_thw = _grid_thw_from_resize_config(
+                resize_config, self._processor._patch_size
+            )
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=to_chw_uint8(image),
+                offsets=[offset],
+                model_specific_data={
+                    "image_grid_thw": torch.tensor([grid_thw], dtype=torch.int64),
+                    DEFERRED_PREPROCESSING_KEY: {
+                        **deferred_config,
+                        "resize_config": resize_config,
+                    },
+                },
+            )
+            items.append(item)
+
+        self._precompute_hashes_before_cpu_transfer(items)
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.flatten().tolist(),
+            mm_items=items,
+            im_token_id=self.mm_tokens.image_token_id,
+        )
 
     async def process_mm_data_async(
         self,
@@ -378,6 +453,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 f"expected {expected_image_count}, loaded {len(base_output.images)}"
             )
 
+        if self._should_defer_gpu_preprocessing(base_output.images):
+            return self._build_deferred_output(base_output)
+
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,
             self.mm_tokens,
@@ -389,7 +467,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         # that assignment is known: one tokenizer/scheduler crossing per
         # image instead of one per rank. K2.5 gates this on
         # --mm-enable-dp-encoder; K3 needs no flag.
-        if getattr(self, "use_cuda_ipc", False):
+        if self.keep_mm_features_on_device:
             for item in mm_items:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True
