@@ -45,6 +45,7 @@ __all__ = [
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
     "break_graph",
+    "is_in_breakable_cuda_graph_capture",
 ]
 
 
