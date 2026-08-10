@@ -13,10 +13,6 @@ on:
       output_tag:
         description: "Tag to publish as. Overwrites it if it already exists."
         required: true
-      platforms:
-        description: "Platforms to build. The base tag must have a manifest for each one."
-        required: false
-        default: "linux/amd64,linux/arm64"
 
 concurrency:
   # Keyed on the tag being written, which is the only resource two runs contend for.
@@ -133,8 +129,6 @@ jobs:
           fi
 
       - name: Build and push patched image
-        env:
-          PLATFORMS: ${{ inputs.platforms }}
         run: |
           cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
           ARG BASE_IMAGE
@@ -157,8 +151,10 @@ jobs:
 
           # One multi-platform build: the base tag is a manifest list, so each
           # platform patches its own arch and the output stays a manifest list.
+          # A base without both arches fails here, which is the point - a
+          # single-arch output would not be pullable on the other arch.
           docker buildx build \
-            --platform "${PLATFORMS}" \
+            --platform linux/amd64,linux/arm64 \
             --no-cache \
             --build-arg BASE_IMAGE="${BASE_IMAGE}" \
             -t "${OUT_IMAGE}" \
@@ -168,7 +164,6 @@ jobs:
       - name: Write summary
         env:
           PR_NUMBERS: ${{ inputs.pr_numbers }}
-          PLATFORMS: ${{ inputs.platforms }}
         run: |
           if [ -n "${PR_NUMBERS}" ]; then
             SOURCE="PRs: ${PR_NUMBERS}"
@@ -180,7 +175,7 @@ jobs:
             echo "- **Base image:** \`${BASE_IMAGE}\`"
             echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`"
             echo "- **Source:** ${SOURCE}"
-            echo "- **Platforms:** \`${PLATFORMS}\`"
+            echo "- **Platforms:** \`linux/amd64,linux/arm64\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Prune builder cache
