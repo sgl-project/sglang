@@ -31,7 +31,10 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    get_compress_state_ring_size,
+    get_compress_state_write_pad,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
@@ -666,6 +669,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
+        if self.is_speculative:
+            # Ring is sized once here, so it must serve the largest adaptive tier.
+            self._assert_ring_serves_draft_tokens(
+                kvc.server_args.max_speculative_num_draft_tokens or 0
+            )
+
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
             # Reserve memory for the speculative draft worker by inflating
@@ -705,6 +714,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 logger.info(
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
+
+    def _assert_ring_serves_draft_tokens(self, num_draft_tokens: int) -> None:
+        """A verify batch writes its whole optimistic tail into the ring, so ring
+        capacity bounds the draft count."""
+        for compress_ratio, ring_size, num_layers in (
+            (4, self.c4_ring_size, self.num_layers_ca4),
+            (128, self.c128_ring_size, self.num_layers_ca128),
+        ):
+            if num_layers == 0:
+                continue
+            if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+                # Online c128 keeps per-draft state instead of a ring; sized separately.
+                continue
+            max_draft_tokens = get_compress_state_write_pad(compress_ratio, ring_size)
+            assert num_draft_tokens <= max_draft_tokens, (
+                f"speculative_num_draft_tokens={num_draft_tokens} exceeds what the c{compress_ratio} "
+                f"compress state ring can keep resident (ring_size={ring_size} serves at most "
+                f"{max_draft_tokens} draft tokens). Lower the draft count, or grow the ring in "
+                f"get_compress_state_ring_size()."
+            )
 
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
