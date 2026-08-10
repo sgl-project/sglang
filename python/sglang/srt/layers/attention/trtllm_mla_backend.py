@@ -270,9 +270,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
-        # Query indptr of a dense [bs, num_draft_tokens] verify batch. Constant
-        # for a given num_draft_tokens, so materialize it here rather than
-        # rebuilding it per layer inside the captured verify graph.
         self.dense_q_indptr_verify = (
             self.q_indptr_decode * self.num_draft_tokens
             if self.num_draft_tokens

@@ -55,14 +55,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The flashinfer cute-dsl MLA decode kernel returns a natural-log (base-e) LSE.
-# CONFIRMED base-e (not base-2): the flashinfer-dcp-backport public-API unit test
-# asserts the public trtllm_batch_decode_with_kv_cache_mla LSE against a
-# torch.logsumexp (natural-log) reference at atol=1e-2 and passes (a base-2 LSE
-# would be off by 1/ln2 ~= 44%). GPU job 467640:
-# tests/attention/test_cute_dsl_mla_dcp*.py 27/27 + 17/17 pass.
-# The DCP merge consumes it as-is via forward_mla._MLA_DCP_BASE_E_LSE_BACKENDS.
-
 
 class CuteDslMLABackend(TRTLLMMLABackend):
     """flashinfer cute-dsl MLA decode backend with decode context parallelism."""

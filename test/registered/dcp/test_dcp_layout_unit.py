@@ -97,11 +97,6 @@ class TestGetDcpLens(CustomTestCase):
         self.assertTrue(torch.equal(get_dcp_lens(lens, 1, 0), lens))
 
     def test_dense_q_indptr_matches_the_arange_it_replaces(self):
-        """``_dense_q_indptr`` feeds the zero-KV fixup's cum_seq_lens, which
-        decides which token rows get out=0 / lse=-inf before the cross-rank
-        merge. A wrong offset or width there corrupts a real row's merged
-        output with no shape error to catch it, so pin both the precomputed
-        buffer and the general fallback to the arange formula."""
         from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
         max_bs = 16
@@ -110,8 +105,7 @@ class TestGetDcpLens(CustomTestCase):
             backend.q_indptr_decode = torch.arange(0, max_bs + 1, dtype=torch.int32)
             backend.num_draft_tokens = num_draft_tokens
             backend.dense_q_indptr_verify = backend.q_indptr_decode * num_draft_tokens
-            # draft_token_num == num_draft_tokens takes the buffer; the other
-            # value exercises the fallback that scales q_indptr_decode.
+            # Equal hits the precomputed buffer, +1 hits the fallback.
             for draft_token_num in (num_draft_tokens, num_draft_tokens + 1):
                 for bs in (1, 3, max_bs):
                     with self.subTest(

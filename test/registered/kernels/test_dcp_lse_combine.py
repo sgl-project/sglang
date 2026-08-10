@@ -266,9 +266,6 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.allclose(result_e, result_2, atol=1e-3))
 
     def test_natural_log_lse_backends(self):
-        """The merge reads each backend's LSE in the base its kernel emits, so a
-        misdeclared backend silently applies exp2 to a natural-log LSE (or vice
-        versa) and skews the cross-rank weights by 1/ln2."""
         from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
             is_mla_dcp_lse_base_on_e,
         )
