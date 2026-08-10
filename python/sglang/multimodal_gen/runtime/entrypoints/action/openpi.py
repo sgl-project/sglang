@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket
 
-from sglang.multimodal_gen.runtime.entrypoints.vla.ws_utils import (
+from sglang.multimodal_gen.runtime.entrypoints.action.ws_utils import (
     run_action_msgpack_ws,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs

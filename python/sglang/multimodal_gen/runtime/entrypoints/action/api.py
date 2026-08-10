@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 
-from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
+from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_generation_response,
     action_metadata,
     action_raw_response,
@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
     pack_msgpack,
     unpack_msgpack,
 )
-from sglang.multimodal_gen.runtime.entrypoints.vla.ws_utils import (
+from sglang.multimodal_gen.runtime.entrypoints.action.ws_utils import (
     run_action_msgpack_ws,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs

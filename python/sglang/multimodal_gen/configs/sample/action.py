@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class VLASamplingParams:
-    """Sampling parameters for VLA/action-generation policies."""
+class ActionSamplingParams:
+    """Sampling parameters for policies that generate continuous actions."""
 
     data_type: DataType = DataType.ACTION
     request_id: str | None = field(default=None, metadata={"batch_sig_exclude": True})
@@ -120,7 +120,7 @@ class VLASamplingParams:
     def _validate_with_pipeline_config(self, pipeline_config):
         if not pipeline_config.task_type.is_action_gen():
             raise ValueError(
-                f"VLASamplingParams requires an ACTION pipeline, got {pipeline_config.task_type.name}"
+                f"ActionSamplingParams requires an ACTION pipeline, got {pipeline_config.task_type.name}"
             )
 
     def _adjust(self, server_args: "ServerArgs"):
@@ -140,7 +140,7 @@ class VLASamplingParams:
 
     def _set_output_file_name(self):
         if self.output_file_name is None:
-            self.output_file_name = "vla_action"
+            self.output_file_name = "action"
         self.output_file_name = _sanitize_filename(self.output_file_name)
         self._set_output_file_ext()
 
@@ -151,7 +151,7 @@ class VLASamplingParams:
 
     def _merge_with_user_params(
         self,
-        user_params: "VLASamplingParams",
+        user_params: "ActionSamplingParams",
         explicit_fields: set[str] | None = None,
     ):
         if user_params is None:
@@ -193,7 +193,7 @@ class VLASamplingParams:
             "--prompt",
             type=str,
             nargs="+",
-            help="Language instruction(s) for the VLA policy.",
+            help="Language instruction(s) for the action policy.",
         )
         add_argument(
             "--num-inference-steps",

@@ -18,6 +18,11 @@ from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
 )
+from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+    action_generation_response,
+    action_metadata,
+    build_action_sampling_params,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     VideoGenerationsRequest,
@@ -26,11 +31,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _cosmos3_sampling_param_kwargs,
     _resolve_sound_duration,
     _resolve_video_path,
-)
-from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
-    action_generation_response,
-    action_metadata,
-    build_action_sampling_params,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (

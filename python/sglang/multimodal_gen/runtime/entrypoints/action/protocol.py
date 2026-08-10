@@ -14,9 +14,9 @@ import numpy as np
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -291,14 +291,14 @@ def _resolve_action_sampling_params_cls_cached(
     backend: str | None,
     model_id: str | None,
     pipeline_class_name: str | None,
-) -> type[SamplingParams] | type[VLASamplingParams]:
+) -> type[SamplingParams] | type[ActionSamplingParams]:
     if pipeline_class_name:
         from sglang.multimodal_gen.registry import get_pipeline_config_classes
 
         config_classes = get_pipeline_config_classes(pipeline_class_name)
         if config_classes is not None:
             _, sampling_params_cls = config_classes
-            if issubclass(sampling_params_cls, (SamplingParams, VLASamplingParams)):
+            if issubclass(sampling_params_cls, (SamplingParams, ActionSamplingParams)):
                 return sampling_params_cls
 
     from sglang.multimodal_gen.registry import get_model_info
@@ -309,9 +309,9 @@ def _resolve_action_sampling_params_cls_cached(
         model_id=model_id,
     )
     sampling_params_cls = model_info.sampling_param_cls
-    if not issubclass(sampling_params_cls, (SamplingParams, VLASamplingParams)):
+    if not issubclass(sampling_params_cls, (SamplingParams, ActionSamplingParams)):
         raise ValueError(
-            "Action endpoint requires SamplingParams or VLASamplingParams, got "
+            "Action endpoint requires SamplingParams or ActionSamplingParams, got "
             f"{sampling_params_cls.__name__}"
         )
     return sampling_params_cls
@@ -319,7 +319,7 @@ def _resolve_action_sampling_params_cls_cached(
 
 def _resolve_action_sampling_params_cls(
     server_args: ServerArgs,
-) -> type[SamplingParams] | type[VLASamplingParams]:
+) -> type[SamplingParams] | type[ActionSamplingParams]:
     return _resolve_action_sampling_params_cls_cached(
         server_args.model_path,
         getattr(server_args, "backend", None),
@@ -330,16 +330,16 @@ def _resolve_action_sampling_params_cls(
 
 @lru_cache(maxsize=32)
 def _sampling_params_field_names(
-    sampling_params_cls: type[SamplingParams] | type[VLASamplingParams],
+    sampling_params_cls: type[SamplingParams] | type[ActionSamplingParams],
 ) -> frozenset[str]:
     return frozenset(field.name for field in dataclasses.fields(sampling_params_cls))
 
 
-def _build_vla_action_sampling_params(
+def _build_action_model_sampling_params(
     payload: dict[str, Any],
     server_args: ServerArgs,
-    sampling_params_cls: type[VLASamplingParams],
-) -> VLASamplingParams:
+    sampling_params_cls: type[ActionSamplingParams],
+) -> ActionSamplingParams:
     pipeline_config = server_args.pipeline_config
     observation = _action_request_to_observation(payload)
     parameters = dict(payload.get("parameters") or {})
@@ -554,10 +554,10 @@ def _build_cosmos3_action_sampling_params(
 def build_action_sampling_params(
     payload: dict[str, Any],
     server_args: ServerArgs,
-) -> SamplingParams | VLASamplingParams:
+) -> SamplingParams | ActionSamplingParams:
     sampling_params_cls = _resolve_action_sampling_params_cls(server_args)
-    if issubclass(sampling_params_cls, VLASamplingParams):
-        return _build_vla_action_sampling_params(
+    if issubclass(sampling_params_cls, ActionSamplingParams):
+        return _build_action_model_sampling_params(
             payload,
             server_args,
             sampling_params_cls,
