@@ -1004,7 +1004,6 @@ _STATE_VARLEN_CONFIG = helion.Config(
     range_multi_buffers=[None, False],
     range_num_stages=[],
     range_unroll_factors=[0, 2],
-    range_warp_specializes=[None, False],
 )
 
 # Packed small-head workloads benefit from a wider V tile during state propagation.
@@ -1022,7 +1021,6 @@ _STATE_VARLEN_SMALL_HEAD_CONFIG = helion.Config(
     range_multi_buffers=[None, True],
     range_num_stages=[],
     range_unroll_factors=[0, 0],
-    range_warp_specializes=[None, None],
 )
 
 

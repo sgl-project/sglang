@@ -97,7 +97,6 @@ _KDA_REPLAYSSM_FP32_CONFIG = helion.Config(
     range_multi_buffers=[None, False],
     range_num_stages=[0, 3],
     range_unroll_factors=[0, 0],
-    range_warp_specializes=[None, None],
 )
 
 _KDA_REPLAYSSM_BF16_CONFIG = helion.Config(
@@ -172,7 +171,6 @@ _KDA_REPLAYSSM_BF16_CONFIG = helion.Config(
     range_multi_buffers=[None, False],
     range_num_stages=[0, 0],
     range_unroll_factors=[0, 4],
-    range_warp_specializes=[None, False],
 )
 
 # Small-head BF16 ReplaySSM uses the FP32 tile schedule with direct PID order.

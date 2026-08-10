@@ -49,7 +49,6 @@ _KDA_BF16_CONFIG = helion.Config(
     range_multi_buffers=[None],
     range_num_stages=[],
     range_unroll_factors=[0],
-    range_warp_specializes=[None],
 )
 
 # The bounded sigmoid gate has lower ALU and register pressure than the
