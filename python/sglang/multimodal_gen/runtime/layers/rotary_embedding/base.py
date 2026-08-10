@@ -101,8 +101,7 @@ class RotaryEmbedding(CustomOp):
                 f"got query: {tuple(query.shape)}, key: {tuple(key.shape)}"
             )
 
-        batch_size, seq_len, num_heads, head_dim = query.shape
-        total_tokens = batch_size * seq_len
+        seq_len = query.shape[1]
 
         can_use_complex = (
             complex_freqs is not None
@@ -137,13 +136,19 @@ class RotaryEmbedding(CustomOp):
             )
 
         if cos is not None and sin is not None:
-            q_flat = query.reshape(total_tokens, num_heads, self.head_size)
-            q_rot = q_flat[..., : self.rotary_dim]
-            q_pass = q_flat[..., self.rotary_dim :]
+            # Keep batch and sequence as separate axes (don't flatten to
+            # [batch*seq, ...]) so that cos/sin — shaped [seq_len,
+            # rotary_dim // 2] and shared across the batch — broadcast
+            # correctly for batch_size > 1. self.use_precomputed_cache is
+            # already False here (checked at the top of this method), so
+            # query/key are guaranteed to be the caller's original 4D
+            # [batch, seq, heads, head_dim] tensors, not the legacy
+            # positions-indexed [num_tokens, hidden] layout.
+            q_rot = query[..., : self.rotary_dim]
+            q_pass = query[..., self.rotary_dim :]
 
-            k_flat = key.reshape(total_tokens, num_heads, self.head_size)
-            k_rot = k_flat[..., : self.rotary_dim]
-            k_pass = k_flat[..., self.rotary_dim :]
+            k_rot = key[..., : self.rotary_dim]
+            k_pass = key[..., self.rotary_dim :]
 
             q_rotated = _apply_rotary_emb(
                 q_rot,
@@ -152,7 +157,6 @@ class RotaryEmbedding(CustomOp):
                 is_neox_style=self.is_neox_style,
                 interleaved=not self.is_neox_style,
             )
-            q = torch.cat((q_rotated, q_pass), dim=-1)
             k_rotated = _apply_rotary_emb(
                 k_rot,
                 cos,
@@ -160,9 +164,9 @@ class RotaryEmbedding(CustomOp):
                 is_neox_style=self.is_neox_style,
                 interleaved=not self.is_neox_style,
             )
-            k = torch.cat((k_rotated, k_pass), dim=-1)
-            return q.view(batch_size, seq_len, num_heads, head_dim), k.view(
-                batch_size, seq_len, num_heads, head_dim
+            return (
+                torch.cat((q_rotated, q_pass), dim=-1),
+                torch.cat((k_rotated, k_pass), dim=-1),
             )
 
         if cos_sin_cache is not None:
@@ -273,8 +277,6 @@ class RotaryEmbedding(CustomOp):
             num_tokens = positions.shape[0]
             cos_sin = self.cos_sin_cache.index_select(0, positions)
             cos, sin = cos_sin.chunk(2, dim=-1)
-        else:
-            num_tokens = query.shape[:-2].numel()
 
         can_derive_complex_from_cos_sin = (
             not self.use_precomputed_cache
@@ -303,15 +305,49 @@ class RotaryEmbedding(CustomOp):
             )
 
         if cos is not None and sin is not None:
-            q_shape = query.shape
-            q_flat = query.reshape(num_tokens, -1, self.head_size)
-            q_rot = q_flat[..., : self.rotary_dim]
-            q_pass = q_flat[..., self.rotary_dim :]
+            if self.use_precomputed_cache:
+                # Legacy positions-indexed callers (e.g. llama/qwen3/gemma2/
+                # gemma3 via get_rope()) pass query/key as 3D [batch, seq,
+                # hidden], and cos/sin above were already index_select'd
+                # per-token via positions.flatten(), so they match
+                # num_tokens = batch*seq row-for-row. Flattening here is
+                # required to split the hidden dim into heads.
+                q_shape = query.shape
+                q_flat = query.reshape(num_tokens, -1, self.head_size)
+                q_rot = q_flat[..., : self.rotary_dim]
+                q_pass = q_flat[..., self.rotary_dim :]
 
-            k_shape = key.shape
-            k_flat = key.reshape(num_tokens, -1, self.head_size)
-            k_rot = k_flat[..., : self.rotary_dim]
-            k_pass = k_flat[..., self.rotary_dim :]
+                k_shape = key.shape
+                k_flat = key.reshape(num_tokens, -1, self.head_size)
+                k_rot = k_flat[..., : self.rotary_dim]
+                k_pass = k_flat[..., self.rotary_dim :]
+
+                q_rotated = _apply_rotary_emb(
+                    q_rot,
+                    cos,
+                    sin,
+                    is_neox_style=self.is_neox_style,
+                    interleaved=not self.is_neox_style,
+                )
+                q = torch.cat((q_rotated, q_pass), dim=-1).reshape(q_shape)
+                k_rotated = _apply_rotary_emb(
+                    k_rot,
+                    cos,
+                    sin,
+                    is_neox_style=self.is_neox_style,
+                    interleaved=not self.is_neox_style,
+                )
+                k = torch.cat((k_rotated, k_pass), dim=-1).reshape(k_shape)
+                return q, k
+
+            # Direct DiT-style call: keep batch and sequence as separate
+            # axes (don't flatten to [batch*seq, ...]) so that cos/sin —
+            # shaped [seq_len, rotary_dim // 2] and shared across the
+            # batch — broadcast correctly for batch_size > 1.
+            q_rot = query[..., : self.rotary_dim]
+            q_pass = query[..., self.rotary_dim :]
+            k_rot = key[..., : self.rotary_dim]
+            k_pass = key[..., self.rotary_dim :]
 
             q_rotated = _apply_rotary_emb(
                 q_rot,
@@ -320,7 +356,6 @@ class RotaryEmbedding(CustomOp):
                 is_neox_style=self.is_neox_style,
                 interleaved=not self.is_neox_style,
             )
-            q = torch.cat((q_rotated, q_pass), dim=-1).reshape(q_shape)
             k_rotated = _apply_rotary_emb(
                 k_rot,
                 cos,
@@ -328,8 +363,10 @@ class RotaryEmbedding(CustomOp):
                 is_neox_style=self.is_neox_style,
                 interleaved=not self.is_neox_style,
             )
-            k = torch.cat((k_rotated, k_pass), dim=-1).reshape(k_shape)
-            return q, k
+            return (
+                torch.cat((q_rotated, q_pass), dim=-1),
+                torch.cat((k_rotated, k_pass), dim=-1),
+            )
 
         if query.dim() != 4 or key.dim() != 4:
             raise ValueError(
