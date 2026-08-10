@@ -53,6 +53,11 @@ Do not multiply the matrix for independent feature knobs. Use the shared
 - **Request-time features** are sampling fields that may change between requests on the same
   resident server. Examples include an audited Cache-DiT quality level or multiple outputs.
 
+If a verified best setting depends on the selected topology, emit it explicitly in the base
+command instead of asking the reader to remember an overlay. Encoder placement is a common
+example: the picker may emit `auto` for a single host and `replicate` across nodes. Mark that
+feature as handled by the picker; reserve copied fragments for deliberate overrides.
+
 Each feature entry must expose its default, exact incremental flag/config, quality contract,
 incompatible combinations, and verified hardware/task. Use the quality labels to distinguish
 native or lossless execution from approximate and experimental paths. Keep the collapsed
@@ -69,6 +74,7 @@ with request examples even when the guide summarizes them.
 - the first screen explains capability, strength, and boundary without marketing filler;
 - checkpoint variants and request modes are unambiguous;
 - the picker remains a small base-recipe selector;
+- topology-dependent recommended defaults are explicit in the generated command;
 - the feature guide separates serve-time startup flags from request-time sampling fields;
 - attention, quantization, caching, compile, and similar orthogonal features have explicit
   quality contracts and verified scopes;

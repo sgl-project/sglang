@@ -30,9 +30,9 @@ uv pip install "sglang[diffusion]" --prerelease=allow
 
 ## 3. Serve the model
 
-Start from the smallest verified base recipe. Keep attention, quantization, caching,
-compile, and request sampling in separate feature recipes unless they define the base
-checkpoint or hardware topology.
+Start from the smallest verified base recipe. Include topology-dependent recommended
+defaults in the generated command. Keep optional attention, quantization, caching,
+compile, and request sampling trade-offs in separate feature recipes.
 
 ```bash Command
 sglang serve \
@@ -50,7 +50,6 @@ __REQUEST_EXAMPLES__
 <DiffusionFeatureGuide
   serveFeatures={[{
     id: "__SERVE_FEATURE_ID__",
-    marker: "SV",
     title: "__SERVE_FEATURE_TITLE__",
     summary: "__SERVE_FEATURE_SUMMARY__",
     quality: { label: "__QUALITY_LABEL__", tone: "__QUALITY_TONE__" },
@@ -66,7 +65,6 @@ __REQUEST_EXAMPLES__
   }]}
   requestFeatures={[{
     id: "__REQUEST_FEATURE_ID__",
-    marker: "RQ",
     title: "__REQUEST_FEATURE_TITLE__",
     summary: "__REQUEST_FEATURE_SUMMARY__",
     quality: { label: "__QUALITY_LABEL__", tone: "__QUALITY_TONE__" },

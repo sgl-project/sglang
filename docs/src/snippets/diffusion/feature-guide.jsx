@@ -1,16 +1,14 @@
 export const DiffusionFeatureGuide = ({ serveFeatures = [], requestFeatures = [] }) => {
   const groups = {
     serve: {
-      step: "02",
-      eyebrow: "Serve-time overlays",
-      title: "Tune the loaded pipeline",
-      description: "Startup flags that change kernels, precision, or execution policy without creating another base topology.",
+      eyebrow: "Serve-time · restart required",
+      title: "Server options",
+      description: "Add a startup flag, then restart the server.",
     },
     request: {
-      step: "03",
-      eyebrow: "Request-time features",
-      title: "Choose per generation",
-      description: "Sampling fields that can change from one request to the next while the same server stays resident.",
+      eyebrow: "Request-time · no restart",
+      title: "Generation options",
+      description: "Add a field to one request without reloading the model.",
     },
   };
 
@@ -25,16 +23,13 @@ export const DiffusionFeatureGuide = ({ serveFeatures = [], requestFeatures = []
     await navigator.clipboard.writeText(code);
     button.textContent = "Copied";
     window.setTimeout(() => {
-      button.textContent = "Copy overlay";
+      button.textContent = "Copy setting";
     }, 1400);
   };
 
   const featureView = (feature) => (
     <details className="sgd-feature-item" key={feature.id}>
       <summary>
-        <span className="sgd-feature-marker" aria-hidden="true">
-          {feature.marker}
-        </span>
         <span className="sgd-feature-summary-copy">
           <strong>{feature.title}</strong>
           <span>{feature.summary}</span>
@@ -43,21 +38,23 @@ export const DiffusionFeatureGuide = ({ serveFeatures = [], requestFeatures = []
           {qualityBadge(feature.quality)}
           <span className="sgd-feature-scope">{feature.scope}</span>
         </span>
-        <span className="sgd-feature-chevron" aria-hidden="true">↘</span>
+        <span className="sgd-feature-action" aria-hidden="true">
+          Details <span>↘</span>
+        </span>
       </summary>
 
       <div className="sgd-feature-body">
         <dl className="sgd-feature-contract">
           <div>
-            <dt>Default</dt>
+            <dt>Default setting</dt>
             <dd>{feature.defaultValue}</dd>
           </div>
           <div>
-            <dt>Quality contract</dt>
+            <dt>Quality</dt>
             <dd>{feature.contract}</dd>
           </div>
           <div>
-            <dt>Compatibility</dt>
+            <dt>Works with</dt>
             <dd>{feature.compatibility}</dd>
           </div>
         </dl>
@@ -78,9 +75,9 @@ export const DiffusionFeatureGuide = ({ serveFeatures = [], requestFeatures = []
                     <button
                       type="button"
                       onClick={(event) => copy(event, recipe.code)}
-                      aria-label={`Copy ${recipe.label} overlay`}
+                      aria-label={`Copy ${recipe.label} setting`}
                     >
-                      Copy overlay
+                      Copy setting
                     </button>
                   </div>
                 )}
@@ -110,25 +107,6 @@ export const DiffusionFeatureGuide = ({ serveFeatures = [], requestFeatures = []
 
   return (
     <section className="not-prose sgd-feature-guide" aria-label="Feature configuration guide">
-      <div className="sgd-feature-flow" aria-label="Configuration order">
-        <div className="sgd-feature-step" data-step="base">
-          <span>01</span>
-          <strong>Base recipe</strong>
-          <small>topology · weights · mode</small>
-        </div>
-        <span className="sgd-feature-connector" aria-hidden="true">→</span>
-        {Object.entries(groups).map(([type, group], index) => (
-          <div key={type} className="sgd-feature-flow-fragment">
-            <div className="sgd-feature-step" data-step={type}>
-              <span>{group.step}</span>
-              <strong>{group.eyebrow}</strong>
-              <small>{type === "serve" ? "startup flags" : "sampling fields"}</small>
-            </div>
-            {index === 0 && <span className="sgd-feature-connector" aria-hidden="true">→</span>}
-          </div>
-        ))}
-      </div>
-
       <div className="sgd-feature-groups">
         {featureGroup("serve", serveFeatures)}
         {featureGroup("request", requestFeatures)}

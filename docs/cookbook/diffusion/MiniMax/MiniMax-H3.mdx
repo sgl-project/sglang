@@ -66,9 +66,10 @@ directory** in the **Env** panel for FL2VA, V2V, or Ref2VA; the picker mounts
 that directory read-only at `/data/minimax-h3` inside the container.
 
 Every hardware/topology cell in this picker has completed a real request on
-that exact GPU model. The picker deliberately emits a verified base recipe;
-orthogonal features such as attention backends, online quantization,
-Cache-DiT, and explicit encoder policy are applied separately in section 7.
+that exact GPU model. The generated command includes the recommended encoder
+policy for the selected topology. Optional attention overrides, online
+quantization, Cache-DiT, and graph execution are explained below and expanded
+in section 7.
 
 **Deployment Profile** exposes resident and FSDP placement on B200, B300,
 H200, and H100. Resident is the latency-oriented default; FSDP reduces DiT
@@ -89,10 +90,10 @@ shows always matches the serve command next to it.
 
 ### Add orthogonal features
 
-Start with the picker-generated base recipe. Apply startup flags from the
-serve-time rail, then choose request fields independently for each generation.
-The widget shows defaults, quality contracts, compatibility boundaries, and
-only the incremental configuration that must be added.
+**The generated command above is ready to run and already includes the
+recommended settings for the selected hardware, including encoder placement.**
+Open an option below only when you want a different trade-off. Server options
+require a restart; generation options change only the request.
 
 <DiffusionFeatureGuide
   serveFeatures={featureGuide.serveFeatures}
@@ -114,6 +115,7 @@ sglang serve \
   --model-variant fl2va \
   --num-gpus 4 \
   --ulysses-degree 4 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --port 30010
 ```
@@ -137,6 +139,7 @@ sglang serve \
   --num-gpus 4 \
   --tp-size 2 \
   --ulysses-degree 2 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --port 30010
 ```
@@ -152,6 +155,7 @@ sglang serve \
   --model-variant fl2va \
   --num-gpus 4 \
   --ulysses-degree 4 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --use-fsdp-inference true \
   --port 30010
@@ -169,6 +173,7 @@ sglang serve \
   --num-gpus 2 \
   --tp-size 2 \
   --ulysses-degree 1 \
+  --encoder-parallel auto \
   --performance-mode memory \
   --layerwise-offload-components dit,text_encoder,vae \
   --dit-offload-prefetch-size 1 \
@@ -474,6 +479,7 @@ sglang serve \
   --sp-degree 4 \
   --ulysses-degree 4 \
   --ring-degree 1 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --use-fsdp-inference false \
   --enable-torch-compile false \
@@ -558,6 +564,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --port 30010
 ```
@@ -573,9 +580,9 @@ path above remains fail-closed to the audited 4×H200 workload.
 
 ## 7. Optional feature overlays
 
-The feature guide beside the base command keeps the common decisions compact.
-Use the detailed reference below for installation requirements, complete
-commands, topology limits, and validation evidence.
+The generated command already contains the recommended topology and encoder
+setting. Use the detailed reference below only when applying an optional
+override or checking its installation, topology limits, and validation evidence.
 
 <Tabs>
 
@@ -611,6 +618,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --enable-breakable-cuda-graph true \
   --warmup-resolutions 1344x768 \
@@ -657,6 +665,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --quantization fp8 \
   --port 30010
@@ -672,6 +681,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --quantization fp8 \
   --quantization-ignored-layers blocks.0.attn token_refiner \
   --port 30010
@@ -689,16 +699,12 @@ H3 validation runs.
 
 <Tab title="Encoder scheduling">
 
-Keep `--encoder-parallel auto` for the base recipe. At the default request
-batch size of one, H100/H200/B200/B300 servers with peer-to-peer access fold
-the Qwen encoder across otherwise idle Ulysses ranks. A pure-TP recipe already
-shards the encoder over its TP group and does not add a world fold.
-
-Use an explicit fold for measured single-request latency:
-
-```bash Overlay
---encoder-parallel fold
-```
+The picker explicitly writes `--encoder-parallel auto` in every single-node
+recipe. At the default request batch size of one, H100/H200/B200/B300 servers
+with peer-to-peer access fold the Qwen encoder across otherwise idle Ulysses
+ranks. A pure-TP recipe keeps the encoder inside its TP group, while a
+PCIe-only host can avoid an expensive world fold. Keep `auto` unless one of
+the cases below applies.
 
 Encoder DP is a throughput policy for compatible request batches. It requires
 TP1 and DiT DP1, replicates the encoder weights, and does not improve a batch
@@ -709,8 +715,8 @@ of one:
 --batching-max-size 2
 ```
 
-Use replication for cross-node H3, where the automatic fold decision is not
-node-boundary aware:
+The cross-node picker recipe already uses replication because the automatic
+fold decision is not node-boundary aware:
 
 ```bash Overlay
 --encoder-parallel replicate
@@ -785,7 +791,7 @@ The swept axes are `--model-variant` (`fl2va` / `ref2va`), `--quantization`
 
 This is a single-request latency sweep (`batching_max_size: 1`), so encoder DP
 is intentionally excluded: it cannot distribute a batch of one. Use the
-picker’s **DP (batched throughput)** option for a multi-request throughput
+**DP for a request batch** setting above for a compatible multi-request
 deployment; the table below does not claim a measured H3 DP speedup.
 
 **Driver.**
