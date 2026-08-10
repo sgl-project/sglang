@@ -2,6 +2,7 @@ import functools
 from collections.abc import Sequence
 
 import numpy as np
+import torch
 
 
 @functools.lru_cache(maxsize=32)
@@ -96,3 +97,59 @@ def normalize_and_navit_patchify_uint8(
     for channel in range(channels):
         output[:, channel] = normalization_lut[channel][patches[:, channel]]
     return output
+
+
+def materialize_exact_navit_image_features(
+    medias: Sequence[dict], image_processor
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Resize and patchify image media with checkpoint-exact CPU numerics.
+
+    Model adapters remain responsible for canonicalizing each media object to
+    the checkpoint's expected color mode. The shared path only requires the
+    small NaViT capability contract exposed by both Kimi-K2.5 and Kimi-K3
+    processors, so future compatible checkpoints need no encoder-server branch.
+    """
+    config = image_processor.media_proc_cfg
+    patch_size = int(config["patch_size"])
+    normalization_lut = build_uint8_normalization_lut(
+        config["image_mean"], config["image_std"]
+    )
+    features = []
+    grids = []
+    for media in medias:
+        resize_config = image_processor.get_resize_config(media)
+        image_np = image_processor.resize_image(
+            media["image"],
+            resize_config["new_width"],
+            resize_config["new_height"],
+            resize_config["pad_width"],
+            resize_config["pad_height"],
+        )
+        features.append(
+            torch.from_numpy(
+                normalize_and_navit_patchify_uint8(
+                    image_np,
+                    patch_size=patch_size,
+                    normalization_lut=normalization_lut,
+                )
+            )
+        )
+        grids.append(
+            [
+                1,
+                image_np.shape[0] // patch_size,
+                image_np.shape[1] // patch_size,
+            ]
+        )
+    return features, torch.tensor(grids, dtype=torch.int64)
+
+
+def supports_exact_navit_cpu_preprocessing(image_processor) -> bool:
+    """Whether a checkpoint processor exposes the shared exact fast path."""
+    config = getattr(image_processor, "media_proc_cfg", None)
+    return (
+        isinstance(config, dict)
+        and callable(getattr(image_processor, "get_resize_config", None))
+        and callable(getattr(image_processor, "resize_image", None))
+        and all(name in config for name in ("patch_size", "image_mean", "image_std"))
+    )

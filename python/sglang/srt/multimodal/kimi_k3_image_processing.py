@@ -7,8 +7,8 @@ import torch
 from PIL import Image
 
 from sglang.srt.multimodal.cpu_image_processing import (
-    build_uint8_normalization_lut,
-    normalize_and_navit_patchify_uint8,
+    materialize_exact_navit_image_features,
+    supports_exact_navit_cpu_preprocessing,
 )
 
 DEFERRED_PREPROCESSING_KEY = "kimi_k3_deferred_preprocessing"
@@ -159,54 +159,11 @@ def _kimi_k3_cpu_medias(items):
     return medias
 
 
-def _can_use_fast_kimi_k3_cpu_path(image_processor) -> bool:
-    config = getattr(image_processor, "media_proc_cfg", None)
-    return (
-        isinstance(config, dict)
-        and callable(getattr(image_processor, "get_resize_config", None))
-        and callable(getattr(image_processor, "resize_image", None))
-        and "patch_size" in config
-        and "image_mean" in config
-        and "image_std" in config
-    )
-
-
 def _materialize_kimi_k3_cpu_items_fast(items, image_processor):
     """Run K3's exact resize with fused normalization and patchification."""
-    config = image_processor.media_proc_cfg
-    patch_size = int(config["patch_size"])
-    normalization_lut = build_uint8_normalization_lut(
-        config["image_mean"], config["image_std"]
+    return materialize_exact_navit_image_features(
+        _kimi_k3_cpu_medias(items), image_processor
     )
-    features = []
-    grids = []
-    for media in _kimi_k3_cpu_medias(items):
-        resize_config = image_processor.get_resize_config(media)
-        image = media["image"]
-        image_np = image_processor.resize_image(
-            image,
-            resize_config["new_width"],
-            resize_config["new_height"],
-            resize_config["pad_width"],
-            resize_config["pad_height"],
-        )
-        features.append(
-            torch.from_numpy(
-                normalize_and_navit_patchify_uint8(
-                    image_np,
-                    patch_size=patch_size,
-                    normalization_lut=normalization_lut,
-                )
-            )
-        )
-        grids.append(
-            [
-                1,
-                image_np.shape[0] // patch_size,
-                image_np.shape[1] // patch_size,
-            ]
-        )
-    return features, torch.tensor(grids, dtype=torch.int64)
 
 
 def _materialize_kimi_k3_cpu_items_reference(items, image_processor):
@@ -235,7 +192,7 @@ def materialize_kimi_k3_cpu_item_features(items, image_processor) -> list[torch.
     the optimization an automatic capability rather than a model-name branch
     in the encoder server.
     """
-    if _can_use_fast_kimi_k3_cpu_path(image_processor):
+    if supports_exact_navit_cpu_preprocessing(image_processor):
         features, actual_grids = _materialize_kimi_k3_cpu_items_fast(
             items, image_processor
         )

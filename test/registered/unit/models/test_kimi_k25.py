@@ -22,6 +22,14 @@ from sglang.srt.models.kimi_k25 import (
     mm_projection_auto,
 )
 from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
+from sglang.srt.multimodal.encoder_preprocessing import (
+    LOCAL_PREPROCESSED_KEY,
+    EncoderPreprocessOutput,
+    get_encoder_preprocessed_items,
+)
+from sglang.srt.multimodal.kimi_k25_image_processing import (
+    prepare_kimi_k25_encoder_inputs,
+)
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
@@ -78,6 +86,71 @@ def _image_item(feature, grid_thw):
         feature=feature,
         model_specific_data={"image_grid_thw": torch.tensor(grid_thw)},
     )
+
+
+class _ExactKimiImageProcessor:
+    media_proc_cfg = {
+        "patch_size": 2,
+        "merge_kernel_size": 2,
+        "in_patch_limit": 1024,
+        "patch_limit_on_one_side": 64,
+        "fixed_output_tokens": None,
+        "image_mean": [0.5, 0.5, 0.5],
+        "image_std": [0.5, 0.5, 0.5],
+    }
+
+    def get_resize_config(self, media):
+        width, height = media["image"].size
+        return {
+            "new_width": width,
+            "new_height": height,
+            "pad_width": 0,
+            "pad_height": 0,
+        }
+
+    def resize_image(self, image, new_width, new_height, pad_width, pad_height):
+        assert (new_width, new_height, pad_width, pad_height) == (*image.size, 0, 0)
+        return np.asarray(image)
+
+    def preprocess(self, *args, **kwargs):
+        raise AssertionError("the capability-gated exact path should be used")
+
+
+def test_kimi_k25_epd_defers_exact_work_to_encoder_dp_owners():
+    processor = _ExactKimiImageProcessor()
+    output = prepare_kimi_k25_encoder_inputs(
+        [
+            Image.new("L", (4, 4), color=64),
+            Image.new("RGBA", (8, 4), color=(128, 192, 255, 0)),
+        ],
+        processor,
+    )
+
+    assert isinstance(output, EncoderPreprocessOutput)
+    items = get_encoder_preprocessed_items(output)
+    assert output["grid_thws"].tolist() == [[1, 2, 2], [1, 2, 4]]
+    assert all(item.feature.mode == "RGB" for item in items)
+
+    output.materialize_for_rank(rank=0, world_size=2)
+    local_items = [
+        item
+        for item in items
+        if item.model_specific_data.get(LOCAL_PREPROCESSED_KEY, False)
+    ]
+    assert len(local_items) == 1
+    assert isinstance(local_items[0].feature, torch.Tensor)
+    assert local_items[0].feature.dtype == torch.float32
+
+
+def test_kimi_k25_owner_preprocessing_is_gated_by_encoder_dp():
+    model = KimiK25ForConditionalGeneration.__new__(KimiK25ForConditionalGeneration)
+    nn.Module.__init__(model)
+
+    model.use_data_parallel = False
+    assert model.preprocess_mm_for_encoder is None
+
+    model.use_data_parallel = True
+    assert callable(model.preprocess_mm_for_encoder)
 
 
 def test_kimi_gpu_preprocess_batches_only_source_compatible_images():

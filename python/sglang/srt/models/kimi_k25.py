@@ -710,6 +710,33 @@ class KimiK25ForConditionalGeneration(nn.Module):
             return
         super().__setattr__(name, value)
 
+    @property
+    def preprocess_mm_for_encoder(self):
+        """Expose owner-side preprocessing only when vision DP can shard it."""
+        if not self.use_data_parallel:
+            return None
+        return self._preprocess_mm_for_encoder
+
+    def _preprocess_mm_for_encoder(
+        self,
+        mm_data,
+        modality,
+        config,
+        *,
+        image_processor=None,
+        **_,
+    ):
+        if modality != Modality.IMAGE:
+            raise ValueError("Kimi-K2.5 encoder DP preprocessing supports images only")
+        if image_processor is None:
+            raise ValueError("Kimi-K2.5 encoder preprocessing needs an image processor")
+
+        from sglang.srt.multimodal.kimi_k25_image_processing import (
+            prepare_kimi_k25_encoder_inputs,
+        )
+
+        return prepare_kimi_k25_encoder_inputs(mm_data, image_processor)
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
