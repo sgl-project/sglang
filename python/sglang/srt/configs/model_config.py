@@ -108,13 +108,20 @@ def get_deepseek_v4_compress_ratios(config) -> list[int]:
     versions. Legacy configs expose ``compress_ratios``; transformers >= 4.57
     replaces it with ``compress_rates`` (a ``{layer_type: ratio}`` map) keyed by
     ``layer_types``. Returns ``[]`` when neither representation is present.
+
+    An empty ``compress_ratios`` counts as absent: SGLang's own
+    ``DeepSeekV4Config`` defaults the field to ``[]``, and that placeholder
+    must not shadow a populated modern representation.
     """
     ratios = _hf_attr(config, "compress_ratios")
-    if ratios is not None:
+    if ratios:
         return list(ratios)
     layer_types = _hf_attr(config, "layer_types")
     compress_rates = _hf_attr(config, "compress_rates")
     if layer_types is not None and compress_rates is not None:
+        # A layer type with no entry in compress_rates is uncompressed. Keep
+        # one entry per layer: consumers index this list by layer id (see
+        # models/deepseek_v4.py) and slice it per PP rank (pool_configurator).
         return [compress_rates.get(layer_type, 0) for layer_type in layer_types]
     return []
 
@@ -255,6 +262,9 @@ def get_num_indexer_layers(config) -> int:
     if is_deepseek_dsa(config):
         return config.num_hidden_layers
     if is_deepseek_v4(config):
+        # Keep this aligned with the DeepSeek V4 attention path, which
+        # instantiates C4 indexers from the normalized per-layer
+        # compress_ratios.
         compress_ratios = get_deepseek_v4_compress_ratios(config)
         return sum(1 for ratio in compress_ratios if ratio == 4)
     return getattr(config, "num_indexer_layers", 0)
