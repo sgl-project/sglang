@@ -1,5 +1,7 @@
 """Correctness tests for the FlashInfer CAKE recurrent-KDA prefill backend."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -144,9 +146,42 @@ def test_kda_prefill_cake_matches_triton(num_heads, seq_lens):
     )
 
 
-def test_kda_prefill_cake_falls_back_for_state_tracking():
+def test_kda_prefill_cake_aligned_tracking_is_bitwise_identical():
+    seq_lens = [64, 128]
+    data = _make_inputs(seq_lens, 12)
+    cake = CakeKDAKernel()
+    initial_state = data["state"]
+    state_untracked = initial_state.clone()
+    state_tracked = initial_state.clone()
+    empty_checkpoint_source = torch.empty(0, device="cuda", dtype=torch.int64)
+
+    with patch.object(
+        CakeKDAKernel,
+        "_extend_triton",
+        side_effect=AssertionError("aligned tracking must not fall back to Triton"),
+    ):
+        output_untracked = _extend(cake, data, state_untracked, seq_lens)
+        output_tracked, intermediate_tracked = _extend(
+            cake,
+            data,
+            state_tracked,
+            seq_lens,
+            return_intermediate_states=True,
+            track_ssm_h_src=empty_checkpoint_source,
+        )
+    torch.cuda.synchronize()
+
+    assert torch.equal(output_tracked, output_untracked)
+    assert torch.equal(state_tracked, state_untracked)
+    assert intermediate_tracked.shape == (1, 0, 12, V, K)
+    assert intermediate_tracked.dtype == torch.float32
+    assert intermediate_tracked.numel() == 0
+
+
+def test_kda_prefill_cake_falls_back_for_interior_state_tracking():
     seq_lens = [96]
     data = _make_inputs(seq_lens, 12)
+    interior_checkpoint_source = torch.zeros(1, device="cuda", dtype=torch.int64)
     state_ref = data["state"].clone()
     output_ref = _extend(
         TritonKDAKernel(),
@@ -162,6 +197,7 @@ def test_kda_prefill_cake_falls_back_for_state_tracking():
         state_cake,
         seq_lens,
         return_intermediate_states=True,
+        track_ssm_h_src=interior_checkpoint_source,
     )
     torch.cuda.synchronize()
 
