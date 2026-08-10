@@ -754,6 +754,10 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
+                if is_aborted(req):
+                    req.disagg_kv_sender.abort()
+                    advance_logprob_pt(i, req)
+                    continue
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
@@ -790,6 +794,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Optimistic bootstrap can fail while this overlapped chunk is
                 # already running. Drop aborted chunks instead of sending KV.
                 if is_aborted(req):
+                    req.disagg_kv_sender.abort()
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -880,7 +885,10 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                if not isinstance(req.finished_reason, FINISH_ABORT):
+                if req.to_finish:
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
+                elif not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # FIXME: clean up req's data in transfer engine
@@ -955,6 +963,8 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
+            if isinstance(req.to_finish, FINISH_ABORT):
+                error_message = req.to_finish.to_json().get("message")
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
