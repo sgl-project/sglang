@@ -390,8 +390,8 @@ class CompressorPrefillPlan(NamedTuple):
         assert prefix_lens.device == req_pool_indices.device
         assert prefix_lens.is_cuda and req_pool_indices.is_cuda
         assert prefix_lens.is_contiguous() and req_pool_indices.is_contiguous()
-        assert prefix_lens.dtype in (torch.int32, torch.int64)
-        assert req_pool_indices.dtype in (torch.int32, torch.int64)
+        assert prefix_lens.dtype == torch.int32
+        assert req_pool_indices.dtype == torch.int64
         assert 0 < num_draft_tokens <= 8
         assert 0 <= active_batch_size <= batch_size
         assert active_batch_size * num_draft_tokens <= 1 << 16

@@ -574,8 +574,9 @@ struct FlashCompress128OnlineKernel {
 //     so the slot tensors never leave GPU memory. The online state pool keeps
 //     a single in-progress chunk per request, so each segment's load and
 //     store slot collapse to one value (the slot for the segment's own chunk).
-//     For online-c128 MTP, stage 1 keeps that write slot in `read_page_0` and
-//     stores the committed-bank load slot in `read_page_1`.
+//   - MTP prefill: a single GPU kernel reads prefix lengths and request pool
+//     indices and emits fixed-shape final PlanC/PlanW tensors. Inactive CUDA
+//     graph rows are filled with invalid plans.
 // ===========================================================================
 
 namespace host::compress {
@@ -665,7 +666,7 @@ inline void plan_online_decode(
 }
 
 // ---------------------------------------------------------------------------
-// Prefill plan builder: host or MTP GPU stage 0 + GPU stage 1.
+// Prefill plan builder: host stage 0 + GPU stage 1, or single-kernel MTP.
 // ---------------------------------------------------------------------------
 
 struct OnlinePrefillStage0Params {
@@ -725,28 +726,29 @@ inline std::tuple<uint32_t, uint32_t> _plan_prefill_partial(const OnlinePrefillS
   return std::tuple<uint32_t, uint32_t>{compress_count, write_count};
 }
 
-template <typename RID>
 struct OnlinePrefillStage1Params {
   CompressPlan* __restrict__ plan_c;
   CompressPlan* __restrict__ plan_w;
-  const RID* __restrict__ req_pool_indices;  // (batch_size,)
+  const int64_t* __restrict__ req_pool_indices;  // (batch_size,)
+  const int32_t* __restrict__ req_to_token;      // (num_reqs, max_tokens)
+  int64_t stride_r2t;
   int32_t state_slot_offset;
   uint32_t num_c;
   uint32_t num_w;
 };
 
-template <typename IDX>
-struct OnlineMTPPrefillStage0Params {
+struct OnlineMTPPrefillParams {
   CompressPlan* __restrict__ plan_c;
   CompressPlan* __restrict__ plan_w;
-  const IDX* __restrict__ prefix_lens;  // (batch_size,)
+  const int32_t* __restrict__ prefix_lens;       // (batch_size,)
+  const int64_t* __restrict__ req_pool_indices;  // (batch_size,)
+  int32_t state_slot_offset;
   uint32_t batch_size;
   uint32_t active_batch_size;
   uint32_t num_draft_tokens;
 };
 
-template <typename IDX>
-__global__ void plan_c128_online_mtp_prefill_stage0_kernel(const OnlineMTPPrefillStage0Params<IDX> params) {
+__global__ void plan_c128_online_mtp_prefill_kernel(const OnlineMTPPrefillParams params) {
   const uint32_t batch_id = blockIdx.x * blockDim.x + threadIdx.x;
   if (batch_id >= params.batch_size) return;
 
@@ -761,6 +763,8 @@ __global__ void plan_c128_online_mtp_prefill_stage0_kernel(const OnlineMTPPrefil
   const uint32_t end_pos = prefix_len + params.num_draft_tokens;
   const uint32_t chunk_end = (prefix_len / 128u + 1u) * 128u;
   const uint32_t ragged_base = batch_id * params.num_draft_tokens;
+  const int32_t main_slot = static_cast<int32_t>(params.req_pool_indices[batch_id]);
+  const int32_t state_slot = main_slot + params.state_slot_offset;
 
   if (chunk_end <= end_pos) {
     const uint32_t compress_len = chunk_end - prefix_len;
@@ -768,8 +772,8 @@ __global__ void plan_c128_online_mtp_prefill_stage0_kernel(const OnlineMTPPrefil
         .seq_len = chunk_end,
         .ragged_id = static_cast<uint16_t>(ragged_base + compress_len - 1u),
         .buffer_len = static_cast<uint16_t>(compress_len),
-        .read_page_0 = static_cast<int32_t>(batch_id),  // batch_id placeholder for stage 1
-        .read_page_1 = -1,
+        .read_page_0 = state_slot,
+        .read_page_1 = main_slot,
     };
   } else {
     params.plan_c[batch_id] = invalid;
@@ -784,16 +788,15 @@ __global__ void plan_c128_online_mtp_prefill_stage0_kernel(const OnlineMTPPrefil
         .seq_len = end_pos,
         .ragged_id = static_cast<uint16_t>(ragged_base + params.num_draft_tokens - 1u),
         .buffer_len = static_cast<uint16_t>(write_len),
-        .read_page_0 = static_cast<int32_t>(batch_id),  // batch_id placeholder for stage 1
-        .read_page_1 = -1,
+        .read_page_0 = state_slot,
+        .read_page_1 = main_slot,
     };
   } else {
     params.plan_w[batch_id] = invalid;
   }
 }
 
-template <typename RID>
-__global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params<RID> params) {
+__global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params params) {
   const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t total = params.num_c + params.num_w;
   if (idx >= total) return;
@@ -810,50 +813,6 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params<
   *plan_ptr = plan;
 }
 
-template <typename IDX>
-inline void launch_online_mtp_prefill_stage0(
-    CompressPlan* plan_c,
-    CompressPlan* plan_w,
-    const IDX* prefix_lens,
-    uint32_t batch_size,
-    uint32_t active_batch_size,
-    uint32_t num_draft_tokens,
-    DLDevice device) {
-  constexpr uint32_t kBlockSize = 128;
-  const auto params = OnlineMTPPrefillStage0Params<IDX>{
-      .plan_c = plan_c,
-      .plan_w = plan_w,
-      .prefix_lens = prefix_lens,
-      .batch_size = batch_size,
-      .active_batch_size = active_batch_size,
-      .num_draft_tokens = num_draft_tokens,
-  };
-  LaunchKernel(host::div_ceil(batch_size, kBlockSize), kBlockSize, device)(
-      plan_c128_online_mtp_prefill_stage0_kernel<IDX>, params);
-}
-
-template <typename RID>
-inline void launch_online_prefill_stage1(
-    CompressPlan* plan_c,
-    CompressPlan* plan_w,
-    const RID* req_pool_indices,
-    int32_t state_slot_offset,
-    uint32_t num_c,
-    uint32_t num_w,
-    DLDevice device) {
-  constexpr uint32_t kBlockSize = 128;
-  const auto params = OnlinePrefillStage1Params<RID>{
-      .plan_c = plan_c,
-      .plan_w = plan_w,
-      .req_pool_indices = req_pool_indices,
-      .state_slot_offset = state_slot_offset,
-      .num_c = num_c,
-      .num_w = num_w,
-  };
-  LaunchKernel(host::div_ceil(num_c + num_w, kBlockSize), kBlockSize, device)(
-      plan_c128_online_prefill_kernel<RID>, params);
-}
-
 inline void plan_online_mtp_prefill(
     const tvm::ffi::TensorView prefix_lens,
     const tvm::ffi::TensorView req_pool_indices,
@@ -864,16 +823,14 @@ inline void plan_online_mtp_prefill(
     const int32_t active_batch_size) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
-  auto prefix_dtype = SymbolicDType{};
-  auto rid_dtype = SymbolicDType{};
   device_.set_options<kDLCUDA>();
 
   TensorMatcher({B})  //
-      .with_dtype<int32_t, int64_t>(prefix_dtype)
+      .with_dtype<int32_t>()
       .with_device(device_)
       .verify(prefix_lens);
   TensorMatcher({B})  //
-      .with_dtype<int32_t, int64_t>(rid_dtype)
+      .with_dtype<int64_t>()
       .with_device(device_)
       .verify(req_pool_indices);
   TensorMatcher({B, sizeof(CompressPlan)})  //
@@ -889,48 +846,19 @@ inline void plan_online_mtp_prefill(
   RuntimeCheck(state_slot_offset >= 0);
   if (batch_size == 0) return;
 
-  auto* const plan_c = static_cast<CompressPlan*>(plan_c_dev_.data_ptr());
-  auto* const plan_w = static_cast<CompressPlan*>(plan_w_dev_.data_ptr());
   const auto device = device_.unwrap();
-  if (prefix_dtype.unwrap().bits == 32) {
-    launch_online_mtp_prefill_stage0(
-        plan_c,
-        plan_w,
-        static_cast<const int32_t*>(prefix_lens.data_ptr()),
-        batch_size,
-        static_cast<uint32_t>(active_batch_size),
-        static_cast<uint32_t>(num_draft_tokens),
-        device);
-  } else {
-    launch_online_mtp_prefill_stage0(
-        plan_c,
-        plan_w,
-        static_cast<const int64_t*>(prefix_lens.data_ptr()),
-        batch_size,
-        static_cast<uint32_t>(active_batch_size),
-        static_cast<uint32_t>(num_draft_tokens),
-        device);
-  }
-
-  if (rid_dtype.unwrap().bits == 32) {
-    launch_online_prefill_stage1(
-        plan_c,
-        plan_w,
-        static_cast<const int32_t*>(req_pool_indices.data_ptr()),
-        state_slot_offset,
-        batch_size,
-        batch_size,
-        device);
-  } else {
-    launch_online_prefill_stage1(
-        plan_c,
-        plan_w,
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()),
-        state_slot_offset,
-        batch_size,
-        batch_size,
-        device);
-  }
+  const auto params = OnlineMTPPrefillParams{
+      .plan_c = static_cast<CompressPlan*>(plan_c_dev_.data_ptr()),
+      .plan_w = static_cast<CompressPlan*>(plan_w_dev_.data_ptr()),
+      .prefix_lens = static_cast<const int32_t*>(prefix_lens.data_ptr()),
+      .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      .state_slot_offset = state_slot_offset,
+      .batch_size = batch_size,
+      .active_batch_size = static_cast<uint32_t>(active_batch_size),
+      .num_draft_tokens = static_cast<uint32_t>(num_draft_tokens),
+  };
+  constexpr uint32_t kBlockSize = 128;
+  LaunchKernel(host::div_ceil(batch_size, kBlockSize), kBlockSize, device)(plan_c128_online_mtp_prefill_kernel, params);
 }
 
 using OnlinePrefillPlan = tvm::ffi::Tuple<uint32_t, uint32_t>;
@@ -1086,14 +1014,19 @@ inline OnlinePrefillPlan plan_online_prefill(
     if (num_c_padded) copy_to_device(plan_c_dev_ptr, plan_c_pin.data_ptr(), num_c_padded);
     if (num_w_padded) copy_to_device(plan_w_dev_ptr, plan_w_pin.data_ptr(), num_w_padded);
 
-    launch_online_prefill_stage1(
-        plan_c_dev_ptr,
-        plan_w_dev_ptr,
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()),
-        state_slot_offset,
-        num_c_padded,
-        num_w_padded,
-        device);
+    const auto stage1_params = OnlinePrefillStage1Params{
+        .plan_c = plan_c_dev_ptr,
+        .plan_w = plan_w_dev_ptr,
+        .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+        .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
+        .stride_r2t = req_to_token.stride(0),
+        .state_slot_offset = state_slot_offset,
+        .num_c = num_c_padded,
+        .num_w = num_w_padded,
+    };
+    constexpr uint32_t kBlockSize = 128;
+    const auto num_blocks = host::div_ceil(total, kBlockSize);
+    LaunchKernel(num_blocks, kBlockSize, device)(plan_c128_online_prefill_kernel, stage1_params);
   }
   return OnlinePrefillPlan{num_c_padded, num_w_padded};
 }
