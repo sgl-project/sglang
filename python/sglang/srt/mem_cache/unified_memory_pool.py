@@ -33,7 +33,9 @@ import triton
 from torch.profiler import record_function
 
 from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
+from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.mamba import MAMBA_STATE_INDEX_INVARIANT
 from sglang.srt.mem_cache.layout.page_major import (
     build_dense_mla_views,
@@ -259,7 +261,16 @@ class UnifiedKVPool:
             self._raw = torch.empty(
                 total_bytes + view_tail_pad_bytes, dtype=torch.uint8, device=device
             )
-        self._raw.zero_()  # unset slots must read as zeros (matches non-shared)
+        if envs.SGLANG_DEBUG_POISON_POOL.get():
+            # Debug: bf16-NaN-fill so NaN-unsafe reads of never-written bytes
+            # fail deterministically.
+            self._raw.view(torch.int16).fill_(0x7FC1)
+            logger.warning(
+                "[unified-memory-pool] POISONED: pool filled with bf16-NaN "
+                "patterns (SGLANG_DEBUG_POISON_POOL)"
+            )
+        else:
+            self._raw.zero_()  # unset slots must read as zeros (matches non-shared)
 
         self._max_slots: Dict[str, int] = {}
         self._anchor_bytes: Dict[str, int] = {}
@@ -671,6 +682,16 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
                 self._num_pages, self._page_bytes
             )
             env[tgt_pages] = env[src_pages]
+
+    def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
+        """Zero whole page envelopes (PHYSICAL page ids) on allocator
+        hand-out."""
+        zero_pages(
+            self._unified_buffer._raw,
+            phys_pages,
+            self._num_pages,
+            self._page_bytes,
+        )
 
 
 class UnifiedMambaPool(MambaPool):
