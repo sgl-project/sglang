@@ -317,8 +317,11 @@ class ModelConfig:
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
         )
+        self.is_lm_only = getattr(self.hf_config, "language_model_only", False)
         self.model_is_mrope = (
-            rope_scaling is not None and "mrope_section" in rope_scaling
+            not self.is_lm_only
+            and rope_scaling is not None
+            and "mrope_section" in rope_scaling
         )
 
         self.hf_generation_config = get_generation_config(
@@ -435,16 +438,24 @@ class ModelConfig:
                 or hasattr(self.hf_config, "audio_config")
             )
         )
-        self.is_multimodal = enable_multimodal and (
-            is_multimodal_model(self.hf_config.architectures)
-            or has_multimodal_subconfig
+        self.is_multimodal = (
+            enable_multimodal
+            and not self.is_lm_only
+            and (
+                is_multimodal_model(self.hf_config.architectures)
+                or has_multimodal_subconfig
+            )
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
         # TODO: requires further polishing
-        self.is_image_understandable_model = enable_multimodal and hasattr(
-            self.hf_config, "vision_config"
+        # Key on the tower, not the attribute: several config classes default
+        # vision_config to None, which presence alone would read as image-capable.
+        self.is_image_understandable_model = (
+            enable_multimodal
+            and not self.is_lm_only
+            and getattr(self.hf_config, "vision_config", None) is not None
         )
 
         # Models expose audio_config at different nesting levels:
@@ -453,11 +464,17 @@ class ModelConfig:
         #   - sound_config: Nemotron AVLM with Parakeet audio encoder
         #   - is_audio_model(): Whisper, Qwen3-ASR (architecture-based fallback)
         # TODO: Handle this more robustly by standardizing the config structure in the future
-        self.is_audio_understandable_model = enable_multimodal and (
-            hasattr(self.hf_config, "audio_config")
-            or hasattr(getattr(self.hf_config, "thinker_config", None), "audio_config")
-            or getattr(self.hf_config, "sound_config", None) is not None
-            or is_audio_model(self.hf_config.architectures)
+        self.is_audio_understandable_model = (
+            enable_multimodal
+            and not self.is_lm_only
+            and (
+                hasattr(self.hf_config, "audio_config")
+                or hasattr(
+                    getattr(self.hf_config, "thinker_config", None), "audio_config"
+                )
+                or getattr(self.hf_config, "sound_config", None) is not None
+                or is_audio_model(self.hf_config.architectures)
+            )
         )
 
         self.is_multimodal_chunked_prefill_supported = (
@@ -489,9 +506,6 @@ class ModelConfig:
         )
         self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
             is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
-        )
-        self.is_mla_breakable_cuda_graph_supported = (
-            is_mla_breakable_cuda_graph_supported(self.hf_config.architectures)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -1881,15 +1895,6 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "Qwen3_5MoeForConditionalGeneration",
 ]
 
-# MLA archs validated to run breakable CUDA graph when it is explicitly
-# requested (--cuda-graph-backend-prefill=breakable bypasses the ServerArgs
-# disable rules). Dispatch pins the absorbed MLA path inside capture/replay
-# for these archs, so the prefill runner's MHA-companion prefix restrictions
-# do not apply (see PrefillCudaGraphRunner.mla_pinned_under_bcg).
-mla_breakable_cuda_graph_supported_model_archs = [
-    "KimiK3ForConditionalGeneration",
-]
-
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)
 
@@ -1960,14 +1965,6 @@ def is_multimodal_breakable_cuda_graph_supported(model_architectures: List[str])
     """Whether a multimodal arch may keep prefill breakable CUDA graph enabled."""
     return any(
         arch in multimodal_breakable_cuda_graph_supported_model_archs
-        for arch in model_architectures
-    )
-
-
-def is_mla_breakable_cuda_graph_supported(model_architectures: List[str]):
-    """Whether an MLA arch may keep prefill breakable CUDA graph enabled."""
-    return any(
-        arch in mla_breakable_cuda_graph_supported_model_archs
         for arch in model_architectures
     )
 

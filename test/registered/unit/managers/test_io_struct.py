@@ -305,8 +305,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
-    def test_parallel_sampling_keeps_one_logical_rid_per_prompt(self):
-        """Test logical RID and reasoning control preservation across parallel samples."""
+    def test_parallel_sampling_preserves_reasoning_controls(self):
         single = GenerateReqInput(
             text="Hello",
             rid="single",
@@ -316,8 +315,11 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         )
         single.normalize_batch_and_arguments()
 
-        self.assertEqual(single.rid, ["single"])
-        self.assertEqual([single[i].rid for i in range(3)], ["single"] * 3)
+        self.assertEqual(single.rid, ["single_0", "single_1", "single_2"])
+        self.assertEqual(
+            [single[i].rid for i in range(3)],
+            ["single_0", "single_1", "single_2"],
+        )
         self.assertTrue(all(single[i].require_reasoning for i in range(3)))
         self.assertEqual(
             [single[i].max_thinking_tokens for i in range(3)],
@@ -331,10 +333,10 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         )
         batch.normalize_batch_and_arguments()
 
-        self.assertEqual(batch.rid, ["batch_0", "batch_1"])
+        self.assertEqual(batch.rid, ["batch_0", "batch_1", "batch_2", "batch_3"])
         self.assertEqual(
             [batch[i].rid for i in range(4)],
-            ["batch_0", "batch_1", "batch_0", "batch_1"],
+            ["batch_0", "batch_1", "batch_2", "batch_3"],
         )
 
     def test_audio_data_handling(self):
@@ -679,15 +681,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         self.assertNotEqual(original_rid, new_rid)
         self.assertEqual(req.rid, new_rid)
-
-    def test_regenerate_rid_with_parent_prefix(self):
-        """Test RID regeneration with a logical parent prefix."""
-        req = GenerateReqInput(text="Hello", rid="logical")
-        req.normalize_batch_and_arguments()
-
-        new_rid = req.regenerate_rid(prefix="logical")
-
-        self.assertTrue(new_rid.startswith("logical_"))
 
     def test_error_cases(self):
         """Test various error cases."""
