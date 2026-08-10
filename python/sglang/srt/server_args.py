@@ -8106,9 +8106,29 @@ class ServerArgs:
     def _handle_unified_memory_pool(self):
         if not self.enable_unified_memory:
             return
-        assert self.disaggregation_mode == "null", (
-            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
-        )
+        if self.disaggregation_mode != "null":
+            # Constraints of the whole-envelope transfer; see
+            # UnifiedMLATokenToKVPool.get_contiguous_buf_infos.
+            assert self.disaggregation_transfer_backend == "mooncake", (
+                "--enable-unified-memory with PD disaggregation supports only "
+                "the mooncake transfer backend; got "
+                f"{self.disaggregation_transfer_backend!r}."
+            )
+            assert self.pp_size == 1, (
+                "--enable-unified-memory with PD disaggregation does not support "
+                "pipeline parallelism (whole-envelope transfer has no per-layer "
+                "entries to subset)."
+            )
+            assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+                "--enable-unified-memory with PD disaggregation requires lazy "
+                "compaction; unset SGLANG_DISABLE_LAZY_COMPACTION."
+            )
+            assert not self.enable_hisparse, (
+                "--enable-unified-memory with PD disaggregation is not compatible "
+                "with --enable-hisparse: the decode-side HiSparse prealloc path "
+                "ships host/C4 rows straight from the allocator, bypassing the "
+                "virtual->physical translation the unified pool needs."
+            )
         assert self.speculative_algorithm in (None, "DSPARK"), (
             "--enable-unified-memory only supports --speculative-algorithm "
             "DSPARK (chain draft); other speculative algorithms are not yet "

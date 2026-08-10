@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
     get_device,
@@ -90,6 +90,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_dsa_seed_metadata_dim,
     prepare_abort,
+    unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -1400,8 +1401,18 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+            # Requests with a sent chunk that are not yet on the inflight queue.
+            self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
+        if (
+            self.enable_unified_memory
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            self.token_to_kv_pool_allocator.set_disagg_move_gate(
+                unified_memory_disagg_move_gate(self)
+            )
 
         # Init mm receiver for EPD disaggregation mode
         if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
@@ -2932,6 +2943,7 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
