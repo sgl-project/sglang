@@ -302,10 +302,13 @@ links `libsycl.so.<N>`, which must match the installed `intel-sycl-rt`).
 `TMS_PLATFORM=xpu` forces the XPU backend, and `--no-build-isolation` lets the
 build import your installed `torch` so it can match the `libsycl` major to it:
 
+The commit below is the one that merged the XPU backend; the published wheel
+predates it, so install from git rather than PyPI.
+
 ```bash
 source /opt/intel/oneapi/setvars.sh
 TMS_PLATFORM=xpu pip install --no-build-isolation \
-    git+https://github.com/fzyzcjy/torch_memory_saver.git
+    git+https://github.com/fzyzcjy/torch_memory_saver.git@990ec133b7b178ca4e30fe7aaac921d3701bcb3a
 ```
 
 **Use it** by launching with `--enable-memory-saver` (the XPU backend is

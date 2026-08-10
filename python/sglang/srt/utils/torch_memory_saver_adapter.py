@@ -35,8 +35,8 @@ class TorchMemorySaverAdapter(ABC):
                     "enable_memory_saver is enabled, but torch-memory-saver is "
                     "not installed. On Intel XPU, build it from source with Intel "
                     "oneAPI on PATH: `TMS_PLATFORM=xpu pip3 install "
-                    "--no-build-isolation "
-                    "git+https://github.com/fzyzcjy/torch_memory_saver.git`."
+                    "--no-build-isolation git+https://github.com/fzyzcjy/"
+                    "torch_memory_saver.git@990ec133b7b178ca4e30fe7aaac921d3701bcb3a`."
                 )
             else:
                 logger.warning(
