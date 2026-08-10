@@ -5,10 +5,7 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 
 on:
   schedule:
-    # Match the former default gate's twice-daily cadence. DeepSeek-V4 claims
-    # only the 00:00 slot because its 8-GPU jobs can run for several hours.
-    - cron: '0 0 * * *'
-    - cron: '0 12 * * *'
+    - cron: '0 */12 * * *' # Run every 12 hours (UTC)
   # push:
   #   branches: [ main ]
   #   paths:
@@ -1295,9 +1292,8 @@ jobs:
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== DeepSeek-V4 (MI35x, 8-GPU) ====================================================
-  # Run only in the 00:00 scheduled slot so the long 8-GPU jobs do not occupy
-  # the MI35x pool twice daily. They remain selectable via workflow_dispatch
-  # and workflow_call full runs.
+  # Runs with the rest of the workflow on schedule, and remains selectable via
+  # workflow_dispatch and workflow_call full runs.
   dsv4-flash-fp4-fp8-amd-rocm720:
     needs: [call-gate]
     if: |
@@ -1307,7 +1303,7 @@ jobs:
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (
-            (github.event.schedule == '0 0 * * *') ||
+            (github.event_name == 'schedule') ||
             inputs.run_all_tests
           )
         )
@@ -1359,7 +1355,7 @@ jobs:
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (
-            (github.event.schedule == '0 0 * * *') ||
+            (github.event_name == 'schedule') ||
             inputs.run_all_tests
           )
         )
