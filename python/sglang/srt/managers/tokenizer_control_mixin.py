@@ -794,8 +794,8 @@ class TokenizerControlMixin:
                 )
 
             assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or DP attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter from distributed. Lora name=%s, group=%s",
                 obj.lora_name,
