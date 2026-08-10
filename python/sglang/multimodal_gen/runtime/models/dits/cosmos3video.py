@@ -223,8 +223,8 @@ def _apply_qwen3_qk_norm_rope(
     rope_cache_positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return apply_qk_norm_rope(
-        q=q.contiguous(),
-        k=k.contiguous(),
+        q=q,
+        k=k,
         q_norm=q_norm,
         k_norm=k_norm,
         head_dim=head_dim,

@@ -1007,6 +1007,12 @@ def apply_qk_norm_rope(
         "off",
         "no",
     }
+    q_has_supported_strides = (
+        q.stride(-1) == 1
+        and q.stride(-2) == k.stride(-2)
+        and q.stride(0) == seq_len * q.stride(1)
+    )
+    k_has_supported_strides = k.stride(-1) == 1 and k.stride(0) == seq_len * k.stride(1)
 
     if positions is None:
         pos_1d = torch.arange(
@@ -1030,15 +1036,16 @@ def apply_qk_norm_rope(
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
+        and k.dtype == q.dtype
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
-        and q.is_contiguous()
-        and k.is_contiguous()
+        and q_has_supported_strides
+        and k_has_supported_strides
         and can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, q.dtype)
     ):
         fused_inplace_qknorm_rope(
-            q=q.reshape(-1, q.shape[-2], head_dim),
-            k=k.reshape(-1, k.shape[-2], head_dim),
+            q=q.view(-1, q.shape[-2], head_dim),
+            k=k.view(-1, k.shape[-2], head_dim),
             q_weight=q_norm.weight,
             k_weight=k_norm.weight,
             cos_sin_cache=cos_sin_cache,
@@ -1050,8 +1057,6 @@ def apply_qk_norm_rope(
         )
         return q, k
 
-    # TODO: Once CUDA fused_inplace_qknorm_rope supports last-dimension-contiguous q/k,
-    # merge this path with the CUDA fused qknorm+rope branch.
     if (
         _is_xpu
         and allow_inplace

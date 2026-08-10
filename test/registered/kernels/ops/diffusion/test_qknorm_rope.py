@@ -216,6 +216,62 @@ def test_qknorm_rope_preserves_split_bf16_rounding() -> None:
     assert torch.equal(k_ref, k_fused)
 
 
+def test_qknorm_rope_accepts_strided_packed_gqa() -> None:
+    from sglang.kernels.ops.diffusion.qknorm_rope import (
+        fused_inplace_qknorm_rope,
+    )
+    from sglang.multimodal_gen.runtime.layers.layernorm import (
+        RMSNorm,
+        apply_qk_norm_rope,
+    )
+
+    num_tokens, num_q_heads, num_kv_heads, head_dim = 257, 32, 8, 128
+    num_heads = num_q_heads + 2 * num_kv_heads
+    qkv = torch.randn(1, num_tokens, num_heads, head_dim, device=DEVICE, dtype=DTYPE)
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=torch.int64)
+    cos_sin_cache = create_cos_sin_cache(head_dim, num_tokens)
+
+    q_ref = qkv[:, :, :num_q_heads].contiguous()
+    k_ref = qkv[:, :, num_q_heads : num_q_heads + num_kv_heads].contiguous()
+    qkv_fused = qkv.clone()
+    q_fused = qkv_fused[:, :, :num_q_heads]
+    k_fused = qkv_fused[:, :, num_q_heads : num_q_heads + num_kv_heads]
+    v_before = qkv_fused[:, :, num_q_heads + num_kv_heads :].clone()
+    q_norm = RMSNorm(head_dim, eps=1e-6).to(device=DEVICE, dtype=DTYPE)
+    k_norm = RMSNorm(head_dim, eps=1e-6).to(device=DEVICE, dtype=DTYPE)
+    q_norm.weight.data.copy_(q_weight)
+    k_norm.weight.data.copy_(k_weight)
+
+    fused_inplace_qknorm_rope(
+        q_ref.view(-1, num_q_heads, head_dim),
+        k_ref.view(-1, num_kv_heads, head_dim),
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox=True,
+        rope_dim=head_dim,
+    )
+    q_out, k_out = apply_qk_norm_rope(
+        q=q_fused,
+        k=k_fused,
+        q_norm=q_norm,
+        k_norm=k_norm,
+        head_dim=head_dim,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
+        positions=positions,
+    )
+
+    assert q_out.data_ptr() == q_fused.data_ptr()
+    assert k_out.data_ptr() == k_fused.data_ptr()
+    assert torch.equal(q_ref, q_out)
+    assert torch.equal(k_ref, k_out)
+    assert torch.equal(v_before, qkv_fused[:, :, num_q_heads + num_kv_heads :])
+
+
 def test_qknorm_rope_accepts_empty_token_dimension() -> None:
     from sglang.kernels.ops.diffusion.qknorm_rope import fused_inplace_qknorm_rope
 
