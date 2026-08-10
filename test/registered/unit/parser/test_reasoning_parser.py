@@ -128,6 +128,16 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "")
 
+    def test_no_stream_reasoning_does_not_leak_start_token(self):
+        """The buffered path must discard the opening marker before emitting."""
+        detector = BaseReasoningFormatDetector(
+            "<think>", "</think>", stream_reasoning=False
+        )
+        detector.parse_streaming_increment("<think>")
+        result = detector.parse_streaming_increment("reasoning</think>answer")
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "answer")
+
     def test_parse_streaming_increment_mixed_content(self):
         """Test streaming parse with mixed content in one chunk."""
         result = self.detector.parse_streaming_increment(
@@ -235,6 +245,26 @@ class TestDeepSeekV4Detector(CustomTestCase):
         detector = ReasoningParser(model_type="deepseek-v4").detector
         self.assertEqual(detector.reasoning_default, "explicit_thinking")
         self.assertTrue(detector.thinks_internally)
+
+    def test_tool_call_opener_ends_unclosed_reasoning_at_token_boundary(self):
+        """A split DSV4 tool-call opener must remain available to the tool parser."""
+        detector = DeepSeekV4Detector()
+        reasoning = detector.parse_streaming_increment("<think>reasoning<")
+        tool_call = detector.parse_streaming_increment("｜DSML｜tool_calls>")
+        self.assertEqual(reasoning.reasoning_text, "reasoning")
+        self.assertEqual(tool_call.normal_text, "<｜DSML｜tool_calls>")
+
+    def test_non_tool_dsml_tag_remains_reasoning(self):
+        """Only the tool-call opener may interrupt an unclosed reasoning block."""
+        detector = DeepSeekV4Detector()
+        result = detector.parse_streaming_increment(
+            '<think>reasoning<｜DSML｜parameter name="x" string="true">value'
+        )
+        self.assertEqual(
+            result.reasoning_text,
+            'reasoning<｜DSML｜parameter name="x" string="true">value',
+        )
+        self.assertEqual(result.normal_text, "")
 
 
 class TestInklingDetector(CustomTestCase):
@@ -416,13 +446,8 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "")
 
-        # Tool interruption should still work - flushes buffered reasoning.
-        # Note: when stream_reasoning=False, the <think> tag is stripped from the
-        # local `current_text` variable but NOT from `self._buffer` (which is never
-        # cleared in the non-streaming path). So the flushed reasoning content
-        # includes the raw <think> tag.
         result = detector.parse_streaming_increment("<tool_call>tool call")
-        self.assertEqual(result.reasoning_text, "<think>thinking")
+        self.assertEqual(result.reasoning_text, "thinking")
         self.assertEqual(result.normal_text, "<tool_call>tool call")
 
     def test_streaming_empty_reasoning_with_tool(self):

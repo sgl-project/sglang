@@ -1,6 +1,7 @@
 import json
 import unittest
 import warnings
+from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
@@ -2032,6 +2033,61 @@ class TestDeepSeekV4Detector(unittest.TestCase):
 
         self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
+
+    def test_streaming_preamble_is_chunk_invariant(self):
+        """Text before a tool call must not depend on the delta boundary."""
+        tool_call = (
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="search">'
+            '<｜DSML｜parameter name="query" string="true">weather'
+            "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"
+        )
+        outputs = []
+        for chunks in ([f"visible\n\n{tool_call}"], ["visible\n\n", tool_call]):
+            detector = DeepSeekV4Detector()
+            normal_text = ""
+            names = []
+            for chunk in chunks:
+                result = detector.parse_streaming_increment(chunk, self.tools)
+                normal_text += result.normal_text
+                names.extend(call.name for call in result.calls if call.name)
+            outputs.append((normal_text, names))
+
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[0], ("visible\n\n", ["search"]))
+
+    def test_streaming_non_json_parameter_does_not_leak_dsml(self):
+        """Malformed partial JSON must fall back to text without exposing markup."""
+        chunks = [
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="search">',
+            '<｜DSML｜parameter name="query" string="false">Здра',
+            "вствуйте, мир",
+            "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+        ]
+        normal_text = ""
+        arguments = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            arguments += "".join(call.parameters or "" for call in result.calls)
+
+        self.assertNotIn("｜DSML｜", normal_text)
+        self.assertEqual(json.loads(arguments), {"query": "Здравствуйте, мир"})
+
+    def test_streaming_error_clears_buffer(self):
+        """A parser failure must not leave DSML queued for the next increment."""
+        text = '<｜DSML｜tool_calls><｜DSML｜invoke name="search">'
+        with patch.object(
+            self.detector,
+            "_parse_parameters_from_xml",
+            side_effect=RuntimeError("failed"),
+        ):
+            with self.assertLogs(
+                "sglang.srt.function_call.deepseekv32_detector", level="ERROR"
+            ):
+                result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(self.detector._buffer, "")
 
     def test_detect_and_parse_xml_format(self):
         """Test parsing standard XML format (DSML)"""
