@@ -375,6 +375,157 @@ class LoRAMemoryPool:
             f"Expected dict or 3D torch.Tensor, got {type(weights).__name__}."
         )
 
+    def _row_parallel_shard_tp(
+        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
+    ) -> int:
+        """Shard count for a non-MoE row-parallel module's activation axis.
+
+        Probes the base module's ``input_size // input_size_per_partition`` so
+        the LoRA buffer matches the actual shard regardless of which TP group
+        owns it — covers DP-attention (``o_proj`` uses ``attn_tp_size``) and
+        shared-expert dense-vs-MoE per-layer-TP differences. Falls back to
+        ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
+
+        MoE-internal names go through ``self.moe_tp_size`` upstream.
+        """
+        cache = getattr(self, "_row_parallel_tp_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_row_parallel_tp_cache", cache)
+        key = (module_name, layer_idx)
+        if key in cache:
+            return cache[key]
+
+        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
+
+        def _probe(m):
+            in_size = getattr(m, "input_size", None)
+            per_part = getattr(m, "input_size_per_partition", None)
+            if in_size is not None and per_part is not None and per_part > 0:
+                return max(1, in_size // per_part)
+            inner = getattr(m, "base_layer", None)
+            if inner is not None and inner is not m:
+                return _probe(inner)
+            return None
+
+        suffix = f".{module_name}"
+        found = None
+        for _name, module in base_model.named_modules():
+            if not _name.endswith(suffix):
+                continue
+            if not any(marker in _name for marker in layer_markers):
+                continue
+            r = _probe(module)
+            if r is not None:
+                found = r
+                break
+
+        out = found if found is not None else self.tp_size
+        cache[key] = out
+        return out
+
+    def _column_parallel_shard_tp(
+        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
+    ) -> int:
+        """Shard count for a non-MoE column-parallel module's output axis.
+
+        Probes the base module's ``output_size // output_size_per_partition``.
+        The input-axis probe used for row-parallel modules is poisoned here:
+        quantized linear methods (e.g. ``Fp8LinearMethod.create_weights``)
+        stamp ``input_size_per_partition == input_size`` on column-parallel
+        layers (whose input is never sharded), which reports a shard count of
+        1 and leaves the LoRA-B buffer at the full output dim while the base
+        stays TP-sharded -- ``set_lora_info`` then fails with "LoRA B output
+        dim != base partition prefix dim" (e.g. blockwise-fp8 GLM-5.2
+        ``shared_experts.gate_up_proj``). The output-axis ratio is
+        quantization-independent: ``output_size_per_partition`` is set in
+        ``ColumnParallelLinear.__init__`` before the quant method runs. Falls
+        back to ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
+        """
+        cache = getattr(self, "_col_parallel_tp_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_col_parallel_tp_cache", cache)
+        key = (module_name, layer_idx)
+        if key in cache:
+            return cache[key]
+
+        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
+
+        def _probe(m):
+            out_size = getattr(m, "output_size", None)
+            per_part = getattr(m, "output_size_per_partition", None)
+            if out_size is not None and per_part is not None and per_part > 0:
+                return max(1, out_size // per_part)
+            inner = getattr(m, "base_layer", None)
+            if inner is not None and inner is not m:
+                return _probe(inner)
+            return None
+
+        suffix = f".{module_name}"
+        found = None
+        for _name, module in base_model.named_modules():
+            if not _name.endswith(suffix):
+                continue
+            if not any(marker in _name for marker in layer_markers):
+                continue
+            r = _probe(module)
+            if r is not None:
+                found = r
+                break
+
+        out = found if found is not None else self.tp_size
+        cache[key] = out
+        return out
+
+    def _column_parallel_out_partition(
+        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
+    ):
+        """Actual per-rank output dim of a non-MoE column-parallel base module.
+
+        Reads ``output_size_per_partition`` from the matching base linear -- the
+        ground truth that ``set_lora_info`` validates against. Critically handles
+        the dense MLP ``gate_up_proj`` that is fully REPLICATED under
+        ``--moe-dense-tp-size 1`` (``output_size_per_partition == output_size``),
+        where dividing ``get_hidden_dim``'s output by the global ``tp_size``
+        undersizes LoRA-B and raises "LoRA B output dim != base partition prefix
+        dim". Returns ``None`` if no base module is found. Cached per
+        ``(module_name, layer_idx)``.
+        """
+        cache = getattr(self, "_col_parallel_out_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_col_parallel_out_cache", cache)
+        key = (module_name, layer_idx)
+        if key in cache:
+            return cache[key]
+
+        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
+
+        def _probe(m):
+            ops = getattr(m, "output_size_per_partition", None)
+            if ops is not None and ops > 0:
+                return ops
+            inner = getattr(m, "base_layer", None)
+            if inner is not None and inner is not m:
+                return _probe(inner)
+            return None
+
+        suffix = f".{module_name}"
+        found = None
+        for _name, module in base_model.named_modules():
+            if not _name.endswith(suffix):
+                continue
+            if not any(marker in _name for marker in layer_markers):
+                continue
+            r = _probe(module)
+            if r is not None:
+                found = r
+                break
+
+        cache[key] = found
+        return found
+
     def _get_standard_shape(
         self,
         module_name: str,
@@ -387,8 +538,12 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name, base_model)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, self.tp_size)
+        # Non-MoE row-parallel modules: probe the actual shard size so o_proj /
+        # down_proj match attn_tp under DP-attention and the shared-experts
+        # dense-vs-MoE per-layer-TP differences.
+        row_tp = self._row_parallel_shard_tp(module_name, base_model, layer_idx)
+        if row_tp > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+            input_dim = divide(input_dim, row_tp)
         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
 
     def get_lora_A_shape(
@@ -513,9 +668,25 @@ class LoRAMemoryPool:
             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            output_dim = self._column_parallel_lora_b_per_rank_dim(
-                module_name, output_dim, effective_tp_size
+            # If the base column-parallel module is fully REPLICATED (its actual
+            # output_size_per_partition still equals the full output_dim -- e.g. the
+            # dense MLP gate_up under --moe-dense-tp-size 1), its output is NOT
+            # sharded, so keep LoRA-B at the full output dim. Dividing by the global
+            # tp_size here undersizes B and crashes set_lora_info ("LoRA B output dim
+            # != base partition prefix dim"). Non-MoE only; MoE shards by moe_tp_size.
+            probed_out = (
+                None
+                if self.is_moe_module(module_name)
+                else self._column_parallel_out_partition(
+                    module_name, base_model, layer_idx
+                )
             )
+            if probed_out is not None and probed_out == output_dim:
+                pass  # replicated base: keep full B output dim
+            else:
+                output_dim = self._column_parallel_lora_b_per_rank_dim(
+                    module_name, output_dim, effective_tp_size
+                )
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):
@@ -974,19 +1145,45 @@ class LoRAMemoryPool:
                         temp_B_buffer[target_module] = weights
                         temp_B_cache_keys[target_module] = name
                 elif expert_match:
-                    # Per-expert MoE weight — 2D tensors, one per expert
+                    # Per-expert MoE weight — 2D tensors, one per expert.
+                    # Init A and B INDEPENDENTLY (both buffer and cache_keys). Under
+                    # ``experts_shared_outer_loras`` one side of a projection is a
+                    # shared 3D Tensor (set by the dim()==3 branch below) and the
+                    # other is this per-expert dict: fc1 = shared A + per-expert B,
+                    # fc2 = the opposite. The old coupled init keyed every dict off
+                    # ``temp_A_buffer is None``, which either left the per-expert
+                    # side's cache_keys as None (-> TypeError at
+                    # ``[expert_id] = name``) or clobbered the shared side the 3D
+                    # branch already populated. So each side now guards its own
+                    # buffer + cache_keys and never touches the other side.
                     target_module = target_module + "_moe"
-                    if temp_A_buffer[target_module] is None:
-                        temp_A_buffer[target_module] = {}
-                        temp_B_buffer[target_module] = {}
-                        temp_A_cache_keys[target_module] = {}
-                        temp_B_cache_keys[target_module] = {}
-
                     expert_id = int(expert_match.group(1))
                     if "lora_A" in name:
+                        assert not isinstance(
+                            temp_A_buffer[target_module], torch.Tensor
+                        ), (
+                            f"{target_module} lora_A already holds a shared-outer 3D "
+                            f"tensor but also got per-expert weight '{name}'; a "
+                            f"projection side must use one layout, not both."
+                        )
+                        if temp_A_buffer[target_module] is None:
+                            temp_A_buffer[target_module] = {}
+                        if temp_A_cache_keys[target_module] is None:
+                            temp_A_cache_keys[target_module] = {}
                         temp_A_buffer[target_module][expert_id] = weights
                         temp_A_cache_keys[target_module][expert_id] = name
                     else:
+                        assert not isinstance(
+                            temp_B_buffer[target_module], torch.Tensor
+                        ), (
+                            f"{target_module} lora_B already holds a shared-outer 3D "
+                            f"tensor but also got per-expert weight '{name}'; a "
+                            f"projection side must use one layout, not both."
+                        )
+                        if temp_B_buffer[target_module] is None:
+                            temp_B_buffer[target_module] = {}
+                        if temp_B_cache_keys[target_module] is None:
+                            temp_B_cache_keys[target_module] = {}
                         temp_B_buffer[target_module][expert_id] = weights
                         temp_B_cache_keys[target_module][expert_id] = name
                 elif "experts" in name and weights.dim() == 3:
