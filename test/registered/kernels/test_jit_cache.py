@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import sys
 
 import msgspec
 import pytest
@@ -478,3 +479,7 @@ def test_relative_sources_resolve_against_csrc():
         str(KERNEL_PATH / "csrc" / "elementwise" / "activation.cuh"),
     )
     assert resolve_sources(["/usr/include/stdio.h"]) == ("/usr/include/stdio.h",)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
