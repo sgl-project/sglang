@@ -4181,6 +4181,20 @@ class TestLfm2Detector(unittest.TestCase):
             json.loads(call.parameters)
         self.assertEqual(result.calls, [])
 
+    def test_kwargs_unpack_merges_dict(self):
+        """**-unpacked kwargs were skipped silently, emitting the call with
+        arguments missing; a dict literal merges with later-binding-wins
+        semantics instead, and non-dict operands reject the call."""
+        text = "<|tool_call_start|>[search(**{'query': 'x'}, limit=2)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"query": "x", "limit": 2})
+
+        bad = "<|tool_call_start|>[search(**[1, 2])]<|tool_call_end|>"
+        self.assertEqual(self.detector.detect_and_parse(bad, self.tools).calls, [])
+
     def test_streaming_recovers_multiline(self):
         """Streaming buffers the block and delegates to detect_and_parse;
         an incremental rewrite of the streaming path would bypass the

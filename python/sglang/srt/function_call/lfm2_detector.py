@@ -455,8 +455,19 @@ class Lfm2Detector(BaseFormatDetector):
         arguments = {}
         for keyword in call.keywords:
             if keyword.arg is None:
-                # **kwargs unpacking - skip for now
-                logger.warning("Tool call with **kwargs unpacking is not supported")
+                # **-unpacking is ast.keyword(arg=None); the kwargs used to
+                # be skipped silently, emitting the call with arguments
+                # missing. Merge dict literals with Python's
+                # later-binding-wins semantics and reject anything else.
+                try:
+                    unpacked = self._get_parameter_value(keyword.value)
+                except ValueError as e:
+                    logger.warning(f"Failed to parse **-unpacked arguments: {e}")
+                    return None
+                if not isinstance(unpacked, dict):
+                    logger.warning("**-unpacked arguments must be a dict literal")
+                    return None
+                arguments.update(unpacked)
                 continue
             try:
                 arguments[keyword.arg] = self._get_parameter_value(keyword.value)
