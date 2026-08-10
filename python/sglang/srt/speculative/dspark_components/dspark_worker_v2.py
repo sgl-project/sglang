@@ -1,5 +1,6 @@
 import logging
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -17,7 +18,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -430,16 +430,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                     return capacity
                 return page_size
 
-            memory_pool_config = MemoryPoolConfig(
+            memory_pool_config = replace(
+                memory_pool_config,
                 max_total_num_tokens=page_size,
-                max_running_requests=memory_pool_config.max_running_requests,
                 full_max_total_num_tokens=_minimal_capacity(
                     memory_pool_config.full_max_total_num_tokens
                 ),
                 swa_max_total_num_tokens=_minimal_capacity(
                     memory_pool_config.swa_max_total_num_tokens
                 ),
-                mem_fraction_static=memory_pool_config.mem_fraction_static,
             )
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
@@ -564,10 +563,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
-        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
-        if pp_proxy_tensors is None:
-            pp_proxy_tensors = self._next_pp_proxy_tensors
+        pp_proxy_tensors = self._next_pp_proxy_tensors
         self._next_pp_proxy_tensors = None
 
         if getattr(batch, "return_logprob", False):
@@ -593,13 +590,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         self, *, batch: ScheduleBatch, on_publish, pp_proxy_tensors
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
-            if get_parallel().enable_dp_attention:
-                self.target_worker.forward_batch_generation(
-                    batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                    capture_hidden_mode=CaptureHiddenMode.NULL,
-                )
-            return self._decode_idle_result(on_publish=on_publish)
+            return self._forward_idle_prefill(
+                batch=batch,
+                on_publish=on_publish,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
         if not (batch.forward_mode.is_extend() or batch.is_extend_in_batch):
             raise RuntimeError(
                 "Lifecycle-only DSpark worker only supports prefill batches."
@@ -621,13 +617,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
-            if get_parallel().enable_dp_attention:
-                self.target_worker.forward_batch_generation(
-                    batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
-                )
-            return self._decode_idle_result(on_publish=on_publish)
+            return self._forward_idle_prefill(
+                batch=batch,
+                on_publish=on_publish,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
 
         batch_output = self.target_worker.forward_batch_generation(
             batch,
@@ -650,14 +645,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
-        if target_hidden is None and self.ps.pp_size > 1:
-            target_hidden = torch.empty((0, 0), dtype=torch.float16, device=self.device)
-        if target_hidden is None:
+        if target_hidden is None and self.ps.pp_size <= 1:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
             )
-        has_local_target_hidden = target_hidden.numel() > 0
+        has_local_target_hidden = (
+            target_hidden is not None and target_hidden.numel() > 0
+        )
         if batch.extend_lens is None or batch.prefix_lens is None:
             raise RuntimeError(
                 "DSpark expected extend_lens / prefix_lens in extend mode, got None."
@@ -762,6 +757,24 @@ class DSparkWorkerV2(BaseSpecWorker):
                 new_seq_lens=batch.seq_lens,
             )
         return batch_output
+
+    def _forward_idle_prefill(
+        self,
+        *,
+        batch: ScheduleBatch,
+        on_publish,
+        pp_proxy_tensors,
+        capture_hidden_mode: CaptureHiddenMode,
+    ) -> GenerationBatchResult:
+        if get_parallel().enable_dp_attention:
+            batch_output = self.target_worker.forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=capture_hidden_mode,
+            )
+            if self._is_context_only_pp_prefill_rank:
+                return batch_output
+        return self._decode_idle_result(on_publish=on_publish)
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:

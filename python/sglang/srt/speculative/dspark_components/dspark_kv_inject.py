@@ -133,16 +133,33 @@ class TargetHiddenKvInjector:
 
         pool = self.draft_model_runner.token_to_kv_pool
         if isinstance(pool, DeepSeekV4TokenToKVPool):
-            self._inject_projected_mla(
-                pool=pool,
-                projected_context=projected_context,
-                cache_loc=cache_loc,
-                positions=positions,
-                cache_loc_2d=cache_loc_2d,
-                commit_lens=commit_lens,
-                state_slot=state_slot,
-                final_pos=final_pos,
-            )
+            if is_unified_kv_triton():
+                swa_loc = self._unified_inject_loc(
+                    pool=pool,
+                    positions=positions,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                    state_slot=state_slot,
+                    final_pos=final_pos,
+                )
+            else:
+                swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+                if commit_lens is not None and cache_loc_2d is not None:
+                    bs, verify_len = cache_loc_2d.shape
+                    col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
+                    committed_mask = (
+                        col < commit_lens.to(torch.long).view(-1, 1)
+                    ).reshape(-1)
+                    swa_loc = torch.where(
+                        committed_mask, swa_loc, torch.full_like(swa_loc, -1)
+                    )
+            with torch.inference_mode():
+                self.draft_model.write_projected_context_kv(
+                    projected_context=projected_context,
+                    swa_loc=swa_loc,
+                    positions=positions,
+                    pool=pool,
+                )
             return
 
         with torch.inference_mode():
@@ -167,15 +184,27 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
     ) -> None:
-        swa_loc = self._resolve_mla_swa_loc(
-            pool=pool,
-            cache_loc=cache_loc,
-            positions=positions,
-            cache_loc_2d=cache_loc_2d,
-            commit_lens=commit_lens,
-            state_slot=state_slot,
-            final_pos=final_pos,
-        )
+        if is_unified_kv_triton():
+            swa_loc = self._unified_inject_loc(
+                pool=pool,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+                state_slot=state_slot,
+                final_pos=final_pos,
+            )
+        else:
+            swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+            if commit_lens is not None and cache_loc_2d is not None:
+                bs, verify_len = cache_loc_2d.shape
+                col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
+                committed_mask = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(
+                    -1
+                )
+                swa_loc = torch.where(
+                    committed_mask, swa_loc, torch.full_like(swa_loc, -1)
+                )
+
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 main_hidden=target_hidden,
@@ -184,93 +213,40 @@ class TargetHiddenKvInjector:
                 pool=pool,
             )
 
-    def _inject_projected_mla(
-        self,
-        *,
-        pool: DeepSeekV4TokenToKVPool,
-        projected_context: torch.Tensor,
-        cache_loc: torch.Tensor,
-        positions: torch.Tensor,
-        cache_loc_2d: Optional[torch.Tensor],
-        commit_lens: Optional[torch.Tensor],
-        state_slot: Optional[torch.Tensor] = None,
-        final_pos: Optional[torch.Tensor] = None,
-    ) -> None:
-        swa_loc = self._resolve_mla_swa_loc(
-            pool=pool,
-            cache_loc=cache_loc,
-            positions=positions,
-            cache_loc_2d=cache_loc_2d,
-            commit_lens=commit_lens,
-            state_slot=state_slot,
-            final_pos=final_pos,
-        )
-        with torch.inference_mode():
-            self.draft_model.write_projected_context_kv(
-                projected_context=projected_context,
-                swa_loc=swa_loc,
-                positions=positions,
-                pool=pool,
-            )
-
-    def _resolve_mla_swa_loc(
-        self,
-        *,
-        pool: DeepSeekV4TokenToKVPool,
-        cache_loc: torch.Tensor,
-        positions: torch.Tensor,
-        cache_loc_2d: Optional[torch.Tensor],
-        commit_lens: Optional[torch.Tensor],
-        state_slot: Optional[torch.Tensor],
-        final_pos: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if is_unified_kv_triton():
-            return self._unified_inject_loc(
-                pool=pool,
-                positions=positions,
-                cache_loc_2d=cache_loc_2d,
-                commit_lens=commit_lens,
-                state_slot=state_slot,
-                final_pos=final_pos,
-            )
-
-        swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
-        if commit_lens is not None and cache_loc_2d is not None:
-            bs, verify_len = cache_loc_2d.shape
-            col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
-            committed_mask = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
-            swa_loc = torch.where(committed_mask, swa_loc, torch.full_like(swa_loc, -1))
-        return swa_loc
-
-    @staticmethod
     def _unified_inject_loc(
+        self,
         *,
-        pool: DeepSeekV4TokenToKVPool,
+        pool,
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor],
         commit_lens: Optional[torch.Tensor],
         state_slot: Optional[torch.Tensor],
         final_pos: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        """Ring row for target-hidden injection under unified_kv.
+
+        loc = state_slot * ring + pos % ring, with two skip (-1) rules:
+          * SWA window: only the last ``win`` tokens per req land in the ring;
+            older tokens share a ring slot (pos % ring) and would race, so drop
+            them (needed for long prefill chunks).
+          * commit gate: uncommitted verify tokens (col >= commit_len) are dropped.
+        """
         if state_slot is None:
             raise RuntimeError(
                 "unified_kv target-hidden injection requires state_slot "
                 "(per-token draft req_pool_indices)."
             )
-
         ring = pool.unified_swa_ring_size
-        window = pool.unified_swa_window
-        positions = positions.to(torch.int64)
-        loc = state_slot.to(torch.int64) * ring + positions % ring
+        win = pool.unified_swa_window
+        pos = positions.to(torch.int64)
+        loc = state_slot.to(torch.int64) * ring + pos % ring
         if final_pos is not None:
-            keep = positions > (final_pos.to(torch.int64) - window)
+            keep = pos > (final_pos.to(torch.int64) - win)
             loc = torch.where(keep, loc, torch.full_like(loc, -1))
         if commit_lens is not None and cache_loc_2d is not None:
-            _, verify_len = cache_loc_2d.shape
-            column = torch.arange(verify_len, device=positions.device).view(1, -1)
-            committed = (
-                column < commit_lens.to(torch.long).view(-1, 1)
-            ).reshape(-1)
+            bs, verify_len = cache_loc_2d.shape
+            col = torch.arange(verify_len, device=positions.device).view(1, -1)
+            committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
             loc = torch.where(committed, loc, torch.full_like(loc, -1))
         return loc.to(torch.int32)
 
