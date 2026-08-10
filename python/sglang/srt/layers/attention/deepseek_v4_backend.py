@@ -1956,9 +1956,18 @@ class DeepseekV4AttnBackend(
                 return None
             pos = extra_indices[row_idx, :extra_max_tk].long()
             valid = pos >= 0
-            dq = dequantize_fp8_k_cache_paged(
-                extra_k_cache, pos.clamp(min=0), extra_page_size
-            )[:, 0, :]
+            if self.token_to_kv_pool.dsv4_kv_cache_store_mxfp4:
+                from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
+                    dequantize_dsv4_mxfp4_k_cache_paged,
+                )
+
+                dq = dequantize_dsv4_mxfp4_k_cache_paged(
+                    extra_k_cache, pos.clamp(min=0), extra_page_size
+                )[:, 0, :]
+            else:
+                dq = dequantize_fp8_k_cache_paged(
+                    extra_k_cache, pos.clamp(min=0), extra_page_size
+                )[:, 0, :]
             return dq * valid.unsqueeze(1).float()
 
         # --- fast path: bs == 1 (single dequant + batched SDPA) ---
@@ -2186,10 +2195,7 @@ class DeepseekV4AttnBackend(
             )
 
             if compressed_slice is not None:
-                # C4/C128 extra pool is FP8 (not MXFP4) — the compressor
-                # currently stores FP8 for compressed caches even when
-                # the SWA pool uses MXFP4.
-                dequantize_k_cache_paged(
+                dequantize_dsv4_mxfp4_k_cache_paged(
                     extra_k_cache,
                     flat_token_ids,
                     page_size=extra_page_size,

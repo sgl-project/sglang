@@ -810,9 +810,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 MXFP4_BYTES_PER_TOKEN,
             )
 
-            kv_bytes_swa = MXFP4_BYTES_PER_TOKEN
+            # All three DSV4 KV pools (SWA, C4, C128) use the MXFP4 layout.
+            kv_bytes = MXFP4_BYTES_PER_TOKEN
         else:
-            kv_bytes_swa = kv_bytes_fp8
+            kv_bytes = kv_bytes_fp8
 
         quant_block_size = 128
         indexer_bytes = (
@@ -841,9 +842,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            self.swa_ratio * kv_bytes_swa * self.num_layers_total
-            + c4_frac * kv_bytes_fp8 * self.num_layers_ca4
-            + 1 / 128 * kv_bytes_fp8 * self.num_layers_ca128
+            self.swa_ratio * kv_bytes * self.num_layers_total
+            + c4_frac * kv_bytes * self.num_layers_ca4
+            + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * indexer_bytes * self.num_layers_ca4
             + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128

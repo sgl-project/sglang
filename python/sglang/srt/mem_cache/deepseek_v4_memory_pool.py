@@ -79,8 +79,17 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
-        # Only SWA pool uses MXFP4; C4/C128 compressor writes FP8 data.
         self.dsv4_kv_cache_store_mxfp4 = use_mxfp4
+        if self.dsv4_kv_cache_store_mxfp4:
+            if qk_nope_head_dim != 448 or qk_rope_head_dim != 64:
+                raise ValueError(
+                    "DeepSeek V4 MXFP4 requires qk_nope_head_dim=448 and "
+                    f"qk_rope_head_dim=64, got {qk_nope_head_dim=} and "
+                    f"{qk_rope_head_dim=}."
+                )
+            # The base class only maps FP8 dtypes to a uint8 store; the MXFP4
+            # 368 B/token layout is also byte-addressed.
+            self.store_dtype = torch.uint8
 
         self.scale_pad = 1
         self.quantize_block_size = 64
@@ -665,6 +674,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=page_size,
+                use_mxfp4=self.dsv4_kv_cache_store_mxfp4,
                 cls=c4_kv_pool_type,
             )
 
@@ -676,6 +686,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=page_size,
+                use_mxfp4=self.dsv4_kv_cache_store_mxfp4,
             )
 
         indexer_size = self.c4_logical_size
