@@ -51,6 +51,7 @@ from sglang.srt.utils.common import (
     is_gfx95_supported,
     is_hip,
     is_mnnvl_fabric_device,
+    is_mps,
     is_musa,
     is_npu,
     is_sm90_supported,
@@ -921,7 +922,8 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_xpu"
         elif is_hip():
             overrides["attention_backend"] = "aiter"
-        else:
+        elif not is_mps():
+            # No triton on macOS; MPS keeps the platform default.
             overrides["attention_backend"] = "triton"
     if is_xpu():
         # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,
