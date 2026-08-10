@@ -902,7 +902,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
   m.impl("init_cpu_threads_env", init_cpu_threads_env);
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   m.impl("initialize", &initialize);
+#endif
 }
 
 REGISTER_EXTENSION(common_ops)
