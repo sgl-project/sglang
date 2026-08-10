@@ -1256,6 +1256,13 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
+      - name: Pre-build DSV4 AITER CKTile GEMM
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e GPU_ARCHS=gfx950 \
+            python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py --dsv4-cktile-only
+
       - name: Accuracy Test MI35x ROCm 7.2.4 (8-GPU DeepSeek-V4-Flash FP4 + FP8)
         timeout-minutes: 300
         run: |
