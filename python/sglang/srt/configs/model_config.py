@@ -589,7 +589,7 @@ class ModelConfig:
             "DeepseekV32ForCausalLM",
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
-            
+
         # TeleChat4 bundles a DeepSeek-V3-compatible MTP head (layer index ==
         # num_hidden_layers); reuse DeepseekV3ForCausalLMNextN as the draft arch.
         if is_draft_model and self.hf_config.architectures[0] == "TeleChat4ForCausalLM":

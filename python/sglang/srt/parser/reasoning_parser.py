@@ -1180,7 +1180,7 @@ class TeleChat4Detector(BaseReasoningFormatDetector):
             reasoning_default="enable_thinking",
             force_nonempty_content=force_nonempty_content,
         )
-        
+
 
 class Apertus2509Detector(BaseReasoningFormatDetector):
     """

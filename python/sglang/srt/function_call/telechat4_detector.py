@@ -56,9 +56,7 @@ def _iter_tool_names(tools: Sequence[Tool]) -> List[str]:
     return sorted(names, key=len, reverse=True)
 
 
-def _is_string_type(
-    tool_name: str, arg_name: str, tools: Sequence[Tool]
-) -> bool:
+def _is_string_type(tool_name: str, arg_name: str, tools: Sequence[Tool]) -> bool:
     for tool in tools:
         if tool.function.name != tool_name:
             continue
@@ -99,9 +97,7 @@ def _json_arguments(value: str) -> Dict[str, Any]:
     return {}
 
 
-def _split_payload(
-    payload: str, tools: Sequence[Tool]
-) -> tuple[str, str, str]:
+def _split_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, str, str]:
     """Split payload into (tool_name, params_text, json_text).
 
     Handles three formats:
@@ -129,9 +125,7 @@ def _split_payload(
     return payload, "", ""
 
 
-def _parse_payload(
-    payload: str, tools: Sequence[Tool]
-) -> tuple[str, Dict[str, Any]]:
+def _parse_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, Dict[str, Any]]:
     tool_name, params_text, json_text = _split_payload(payload, tools)
     arguments = _json_arguments(json_text) if json_text else {}
 
@@ -181,9 +175,7 @@ class TeleChat4Detector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
-    def detect_and_parse(
-        self, text: str, tools: List[Tool]
-    ) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
@@ -196,9 +188,7 @@ class TeleChat4Detector(BaseFormatDetector):
             for match in TOOL_CALL_REGEX.finditer(text):
                 tool_name, arguments = _parse_payload(match.group(1), tools)
                 if not tool_name or tool_name not in tool_indices:
-                    logger.warning(
-                        "TeleChat4Detector: unknown tool '%s'", tool_name
-                    )
+                    logger.warning("TeleChat4Detector: unknown tool '%s'", tool_name)
                     continue
                 calls.append(
                     ToolCallItem(
@@ -224,9 +214,7 @@ class TeleChat4Detector(BaseFormatDetector):
         while True:
             start_idx = self._buffer.find(self.bot_token)
             if start_idx == -1:
-                partial_len = _partial_suffix_len(
-                    self._buffer, self.bot_token
-                )
+                partial_len = _partial_suffix_len(self._buffer, self.bot_token)
                 if partial_len:
                     content += self._buffer[:-partial_len]
                     self._buffer = self._buffer[-partial_len:]
