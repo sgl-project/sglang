@@ -1008,8 +1008,31 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         state.phase = _InsertPhase.TAIL
 
+    def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
+        return any(
+            component.needs_incremental_backup(node)
+            for component in self.components
+            if component.component_type != BASE_COMPONENT_TYPE
+        )
+
+    def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
+        """Check whether the insert target needs a Host backup."""
+        if state.is_new_leaf:
+            return self._inc_hit_count_and_check(
+                state.target_node, state.params.chunked
+            )
+
+        node = state.target_node
+        return (
+            self.enable_hicache
+            and not self.is_write_back
+            and node.backuped
+            and node.write_through_pending_id is None
+            and self._needs_incremental_component_backup(node)
+        )
+
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
-        """Refresh the LRUs and append the terminal new-leaf backup."""
+        """Refresh the LRUs and append terminal backup actions."""
         if state.target_node is not self.root_node:
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
@@ -1018,9 +1041,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     LRURefreshPhase.INSERT_END, state.target_node, self.root_node
                 )
 
-        if state.is_new_leaf and self._inc_hit_count_and_check(
-            state.target_node, state.params.chunked
-        ):
+        if self._should_backup_after_insert(state):
             state.pending_actions.append(
                 self._build_backup_kv_action(state.target_node)
             )
@@ -1760,11 +1781,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._build_backup_spec(self.node_by_id(node_id))
 
     def _build_backup_spec(self, node: UnifiedTreeNode):
-        """Gather device value backup spec."""
+        """Gather missing Full and component transfers for Host backup."""
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        assert device_value is not None
+        if node.backuped:
+            device_value = device_value[:0]
+
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            if node.component_data[comp.component_type].host_value is not None:
                 continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
@@ -1894,13 +1921,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Commit a successful backup to the node."""
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
-        self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
-            node,
-            CacheTransferPhase.BACKUP_HOST,
-            transfers=[kv_xfer],
-            cache_actions=cache_actions,
-        )
+        if host_indices.numel() > 0:
+            kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+            self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                transfers=[kv_xfer],
+                cache_actions=cache_actions,
+            )
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,

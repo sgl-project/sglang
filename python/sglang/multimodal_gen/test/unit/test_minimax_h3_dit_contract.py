@@ -164,6 +164,8 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
         )
 
     assert model._fsdp_mixed_dtype_params
+    qkv_weight = model.blocks[0].attn.qkv_proj.weight
+    assert callable(qkv_weight.rank_local_weight_transform)
     for name, tensor in model.state_dict().items():
         if name in expected_fp32:
             assert tensor.dtype == torch.float32, name

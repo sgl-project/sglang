@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    configured_pp_size,
     get_context,
     get_disagg,
     get_exec,
@@ -71,6 +72,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    mamba_extra_buffer_enabled,
+    mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -382,6 +386,41 @@ class KVCacheConfigurator:
                 unified_memory_pool=bundle.unified_memory_pool,
             )
 
+        # The unified allocator hands out VIRTUAL token ids from the whole
+        # virtual space (> max_total_num_tokens); the direct-indexed draft
+        # pool must be sized by that space.
+        draft_virtual_id_space: Optional[int] = None
+        if self.is_draft_worker and token_to_kv_pool_allocator is not None:
+            from sglang.srt.mem_cache.multi_ended_allocator import (
+                UnifiedMambaTokenToKVPoolAllocator,
+                UnifiedSWATokenToKVPoolAllocator,
+            )
+
+            if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
+                raise ValueError(
+                    "Speculative decoding with --enable-unified-memory is only "
+                    "supported for hybrid-Mamba targets; the unified hybrid-SWA "
+                    "pool's draft sizing (virtual-id space) is not wired yet."
+                )
+            if isinstance(
+                token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+            ):
+                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                assert draft_virtual_id_space >= sizes.max_total_num_tokens, (
+                    "unified allocator virtual space smaller than the token "
+                    f"budget: size_full={draft_virtual_id_space} < "
+                    f"max_total_num_tokens={sizes.max_total_num_tokens}"
+                )
+                # Round UP to page alignment (paged draft backends view the
+                # pool as (-1, page_size, H, D); size_full is not aligned).
+                page = max(int(self.pool_page_size or 1), 1)
+                draft_virtual_id_space = (
+                    (draft_virtual_id_space + page - 1) // page * page
+                )
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
+
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
             req_to_token_pool = self._build_req_to_token_pool(
@@ -404,7 +443,7 @@ class KVCacheConfigurator:
                     mamba_spec_state_size=sizes.max_running_requests,
                     cache_params=self.mambaish_config.mamba2_cache_params,
                     device=self.device,
-                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                    enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
                     draft_model_idx=self.draft_model_idx,
                     speculative_eagle_topk=get_spec().speculative_eagle_topk,
                 )
@@ -423,6 +462,15 @@ class KVCacheConfigurator:
             is_dsv4_model=is_dsv4_model,
             req_to_token_pool=req_to_token_pool,
         )
+
+        if draft_virtual_id_space is not None:
+            assert token_to_kv_pool.size >= draft_virtual_id_space, (
+                "draft token_to_kv_pool smaller than the shared unified "
+                f"allocator's virtual-id space: pool size="
+                f"{token_to_kv_pool.size} < size_full={draft_virtual_id_space}; "
+                "verify-window writes at high virtual ids would go out of "
+                "bounds."
+            )
 
         token_to_kv_pool_allocator = self._build_token_to_kv_pool_allocator(
             sizes=sizes,
@@ -512,7 +560,7 @@ class KVCacheConfigurator:
             max_mamba_cache_size=get_schedule().max_mamba_cache_size,
             max_num_reqs=max_num_reqs,
             enable_memory_saver=get_exec().features.enable_memory_saver,
-            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
@@ -637,7 +685,7 @@ class KVCacheConfigurator:
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
         elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+            get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
         elif self.use_mla_backend and is_dsa_model:
@@ -661,7 +709,13 @@ class KVCacheConfigurator:
             )
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
-        extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
+        # The same bag-derived bound the pools below receive, so the row
+        # headroom and the speculative buffers cannot disagree after a
+        # post-publish override.
+        extra_max_context_len = get_req_to_token_extra_context_len(
+            self.server_args,
+            max_draft_tokens=max_speculative_num_draft_tokens(),
+        )
 
         if get_disagg().disaggregation_mode == "decode":
             # Extra slots for pre-allocated requests
@@ -714,9 +768,9 @@ class KVCacheConfigurator:
                     if self.layer_info.start_layer <= i < self.layer_info.end_layer
                 ]
             ),
-            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            speculative_num_draft_tokens=max_speculative_num_draft_tokens(),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
-            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
             pre_alloc_size=pre_alloc_size,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -768,7 +822,7 @@ class KVCacheConfigurator:
     ) -> ReqToTokenPool:
         # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
         # non-KDA model there would scatter a None intermediate_ssm and crash.
-        _algo = (self.server_args.speculative_algorithm or "").upper()
+        _algo = (get_spec().speculative_algorithm or "").upper()
         if (
             get_exec().mamba.enable_linear_replayssm_spec
             and _algo in ("DSPARK", "DFLASH")
@@ -793,9 +847,16 @@ class KVCacheConfigurator:
                     if self.layer_info.start_layer <= i < self.layer_info.end_layer
                 ]
             ),
-            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-            enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
-            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
+            enable_mamba_extra_buffer_lazy=mamba_extra_buffer_lazy_enabled(),
+            # A PD prefill server never runs TARGET_VERIFY, so skip the
+            # verify-only per-draft-token state snapshots (see the draft-head
+            # case above: None => the pool skips SpeculativeState).
+            speculative_num_draft_tokens=(
+                None
+                if get_disagg().disaggregation_mode == "prefill"
+                else max_speculative_num_draft_tokens()
+            ),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
@@ -853,6 +914,10 @@ class KVCacheConfigurator:
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
         # separately via `mamba_envelope_layout` on the req-to-token pool above.
         enable_page_major = get_memory().enable_page_major_kv_layout
+        if self.is_draft_worker and get_memory().enable_unified_memory:
+            # Page-major is a target-pool layout choice; the draft backend
+            # reads the plain per-layer contiguous layout.
+            enable_page_major = False
         mha_pool_class = (
             PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
         )
@@ -884,7 +949,7 @@ class KVCacheConfigurator:
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
         elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+            get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             if self.is_hybrid_swa:
                 token_to_kv_pool = self._build_ascend_swa_kv_pool(
@@ -1033,9 +1098,7 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
-            online_mtp_max_draft_tokens=(
-                self.server_args.max_speculative_num_draft_tokens or 0
-            ),
+            online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
         )
         return token_to_kv_pool
 
@@ -1496,7 +1559,7 @@ class KVCacheConfigurator:
                     need_sort=need_sort,
                 )
             elif _is_npu and (
-                self.server_args.attention_backend == "ascend"
+                get_exec().kernel.attention_backend == "ascend"
                 or is_dsv4_model
                 or self.hybrid_gdn_config is not None
             ):
@@ -1686,17 +1749,17 @@ class KVCacheConfigurator:
         )
 
         additional_ratio = 0
-        if self.server_args.enable_mamba_extra_buffer():
+        if mamba_extra_buffer_enabled():
             # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
             # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
             if not get_schedule().disable_overlap_schedule:
-                if self.server_args.enable_mamba_extra_buffer_lazy():
+                if mamba_extra_buffer_lazy_enabled():
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
                 assert (
-                    not self.server_args.enable_mamba_extra_buffer_lazy()
+                    not mamba_extra_buffer_lazy_enabled()
                 ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
         elif skip_decode_lock:
@@ -1725,7 +1788,7 @@ class KVCacheConfigurator:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
-        if self.server_args.pp_size > 1:
+        if configured_pp_size() > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
@@ -1835,7 +1898,6 @@ class KVCacheConfigurator:
 
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
-        server_args = self.server_args
         assert config is not None
 
         # mamba_cache_per_req covers every mamba layer, but under PP a rank only
@@ -1873,10 +1935,11 @@ class KVCacheConfigurator:
         if replayssm_active:
             # GDN sizes the fold window to the draft maximum; the KDA ring
             # stays --linear-replayssm-cache-len long (mirrors MambaPool).
+            max_draft_tokens = max_speculative_num_draft_tokens()
             if kimi_linear_config(self.model_config) is not None:
                 record_len = get_exec().mamba.linear_replayssm_cache_len
-            elif server_args.max_speculative_num_draft_tokens is not None:
-                record_len = server_args.max_speculative_num_draft_tokens
+            elif max_draft_tokens is not None:
+                record_len = max_draft_tokens
             else:
                 record_len = get_exec().mamba.linear_replayssm_cache_len
             replayssm_ring_per_req = (

@@ -268,6 +268,7 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
+    flush_trace_batch,
     set_schedule_time_batch,
     set_time_batch,
 )
@@ -276,7 +277,12 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, get_parallel, publish
+from sglang.srt.runtime_context import (
+    get_context,
+    get_device,
+    get_parallel,
+    publish,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -420,7 +426,7 @@ class Scheduler(
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
-        self.skip_tokenizer_init = server_args.skip_tokenizer_init
+        self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -460,13 +466,14 @@ class Scheduler(
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=server_args.attn_cp_size,
+            attn_dcp_rank=tp_rank % server_args.dcp_size,
+            attn_dcp_size=server_args.dcp_size,
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
             moe_ep_size=server_args.ep_size,
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=server_args.moe_dp_size,
-            dcp_size=server_args.dcp_size,
             gpu_id=gpu_id,
         )
 
@@ -730,7 +737,10 @@ class Scheduler(
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
-            skip_tokenizer_init=self.server_args.skip_tokenizer_init,
+            # The snapshot taken at construction, not a second bag read: this
+            # scheduler gates its tokenizer init on the same value, and the two
+            # must not be able to disagree.
+            skip_tokenizer_init=self.skip_tokenizer_init,
             metrics_enabled=get_observability().enable_metrics
             and (
                 self.ps.attn_tp_rank == 0
@@ -792,7 +802,7 @@ class Scheduler(
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
 
-        if server_args.skip_tokenizer_init:
+        if self.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
@@ -1483,7 +1493,7 @@ class Scheduler(
             "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
         }
         env_var, default_size = backend_sizes.get(
-            self.server_args.attention_backend, (None, None)
+            get_exec().kernel.attention_backend, (None, None)
         )
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
@@ -2596,6 +2606,24 @@ class Scheduler(
 
         if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
+            req.logprob_start_len = -1
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            get_device().mlx_enable_sampling
+            and req.return_logprob
+            and 0 <= req.logprob_start_len < len(req.origin_input_ids)
+        ):
+            # The MLX sampling path computes output logprobs only; the
+            # prefill result carries no input_token_logprobs, so letting
+            # this through would crash output processing.
+            error_msg = (
+                "Prompt input logprobs (logprob_start_len) are not supported "
+                "on the MLX sampling path; omit logprob_start_len to get "
+                "output logprobs."
+            )
             req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
@@ -3862,6 +3890,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # Flush async trace ops here: in overlap mode this CPU work runs while
+        # the next batch's GPU forward is in flight, giving free overlap.
+        flush_trace_batch(batch.reqs)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():

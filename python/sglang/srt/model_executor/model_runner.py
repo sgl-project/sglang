@@ -178,6 +178,8 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    is_ep_joiner,
+    is_ep_scale_joiner,
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -397,9 +399,6 @@ class ModelRunner:
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
 
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
-
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
@@ -461,10 +460,7 @@ class ModelRunner:
         self.graph_time_usage: dict[str, float] = {}
 
     def _initialize_elastic_ep_joiner(self) -> None:
-        if not (
-            get_exec().moe.elastic_ep_backend is not None
-            and self.server_args.is_ep_scale_joiner
-        ):
+        if not (get_exec().moe.elastic_ep_backend is not None and is_ep_scale_joiner()):
             return
 
         join_effective_ep_size = get_parallel().ep_join_rank_offset + self.ps.tp_size
@@ -680,9 +676,7 @@ class ModelRunner:
         if self.is_draft_worker:
             return
         expert_rank = self.ps.moe_ep_rank + (
-            get_parallel().ep_join_rank_offset
-            if self.server_args.is_ep_scale_joiner
-            else 0
+            get_parallel().ep_join_rank_offset if is_ep_scale_joiner() else 0
         )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
@@ -1017,7 +1011,7 @@ class ModelRunner:
             RoutedExpertsCapturer.create(
                 model=self.model,
                 model_config=self.model_config,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1027,7 +1021,7 @@ class ModelRunner:
         set_global_indexer_capturer(
             create_indexer_capturer(
                 model_config=self.model_config,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1137,7 +1131,15 @@ class ModelRunner:
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        load_kv_cache_scales(model=self.model, server_args=self.server_args)
+        # Same leaf `configure_kv_cache_dtype` reads: the bag, not the startup
+        # record, so the FP8 gate and the pool cannot disagree after an
+        # override. (The runner's own stamp is not set yet -- load_model runs
+        # before configure_kv_cache_dtype.)
+        load_kv_cache_scales(
+            model=self.model,
+            server_args=self.server_args,
+            kv_cache_dtype=get_model().kv_cache_dtype,
+        )
 
         self.sliding_window_size = resolve_sliding_window_size(
             self.model, self.model_config
@@ -1193,7 +1195,7 @@ class ModelRunner:
         dist_barrier_after_load(
             elastic_ep_backend=get_exec().moe.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
-            is_ep_joiner=self.server_args.is_ep_joiner,
+            is_ep_joiner=is_ep_joiner(),
         )
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
@@ -1256,6 +1258,16 @@ class ModelRunner:
         else:
             return self.max_total_num_tokens
 
+    @property
+    def max_token_pool_size(self):
+        """Return the max token pool size considering hybrid swa and hisparse settings."""
+        if self.enable_hisparse:
+            # HiSparse uses the host-backed full pool capacity.
+            size_full = getattr(self.token_to_kv_pool_allocator, "size_full", None)
+            if size_full is not None:
+                return size_full
+        return self.effective_max_total_num_tokens
+
     def _load_format_scope(self, load_format: Optional[str]):
         """Make this runner's load format the published one while it loads.
 
@@ -1285,7 +1297,7 @@ class ModelRunner:
         spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
-                server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
+                server_args_kv_cache_dtype=get_model().kv_cache_dtype,
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
@@ -1304,7 +1316,7 @@ class ModelRunner:
         self.kv_cache_dtype_str = (
             resolved_kv_cache_dtype
             if resolved_kv_cache_dtype is not None
-            else self.server_args.kv_cache_dtype
+            else get_model().kv_cache_dtype
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
@@ -1852,7 +1864,7 @@ class ModelRunner:
         self._rearm_eplb_after_elastic_scale()
 
     def _report_elastic_scale_failure(self, error: str, effective_size: int) -> None:
-        if self.ps.tp_rank != 0 or self.server_args.is_ep_scale_joiner:
+        if self.ps.tp_rank != 0 or is_ep_scale_joiner():
             return
         from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
@@ -1932,12 +1944,12 @@ class ModelRunner:
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
             target_size=target_size,
-            log_tag="JOINER" if self.server_args.is_ep_scale_joiner else "PRIMARY",
+            log_tag="JOINER" if is_ep_scale_joiner() else "PRIMARY",
         )
         ElasticEPStateManager.commit_scale()
         self._rearm_eplb_after_elastic_scale()
 
-        if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+        if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
             self._pending_elastic_scale_update = ElasticScaleUpdateReq(
@@ -1970,7 +1982,7 @@ class ModelRunner:
                 )
                 ElasticEPStateManager.fail_recovery(error)
                 self._report_elastic_scale_failure(error, effective_size)
-                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
                     logger.error("[Elastic EP] %s", error)
                 return
 
@@ -1996,7 +2008,7 @@ class ModelRunner:
             ElasticEPStateManager.fail_scale(error)
             self._reset_eplb_after_elastic_scale_failure()
             self._report_elastic_scale_failure(error, effective_size)
-            if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+            if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
                 logger.error("[Elastic EP] %s", error)
             return
 
@@ -2012,7 +2024,7 @@ class ModelRunner:
                 ElasticEPStateManager.fail_scale(error)
                 self._reset_eplb_after_elastic_scale_failure()
                 self._report_elastic_scale_failure(error, effective_size)
-                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
                     logger.error("[Elastic EP] %s", error)
                 return
             if not ElasticEPStateManager.begin_scale():

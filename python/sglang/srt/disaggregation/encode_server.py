@@ -387,14 +387,19 @@ class MMEncoder:
         ).element_size()
 
         if get_mm().enable_mm_global_cache:
-            from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
+            from sglang.srt.mem_cache.embedding_cache_controller import (
                 EmbeddingCacheController,
             )
+            from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
 
+            embedding_store = EmbeddingStoreFactory.create_backend(
+                get_mm().mm_global_cache_backend,
+            )
             hidden_dims = self._infer_embedding_dims()
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
+                embedding_store=embedding_store,
                 hidden_dims=hidden_dims,
                 tp_group=get_tp_group().cpu_group,
                 all_rank_get=False,
@@ -647,7 +652,12 @@ class MMEncoder:
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, False)
+                gpu_image_decode = (
+                    "nvjpeg_fancy"
+                    if self.use_image_processor_gpu and self.model_type == "kimi_k3"
+                    else False
+                )
+                img, _ = load_image(data, gpu_image_decode)
                 if (
                     discard_alpha_channel
                     and not isinstance(img, torch.Tensor)
