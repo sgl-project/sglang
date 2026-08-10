@@ -209,6 +209,51 @@ class TestMiniMaxGates(_FusionGateCase):
         )
 
 
+class TestBailingMoeV3Gate(_FusionGateCase):
+    def _config(self):
+        return SimpleNamespace(
+            architectures=["BailingMoeV3ForCausalLM"],
+            num_shared_experts=1,
+            moe_intermediate_size=1024,
+        )
+
+    def _compressed_tensors(self, ignore):
+        return SimpleNamespace(
+            get_name=lambda: "compressed_tensors",
+            ignore=ignore,
+            packed_modules_mapping={},
+        )
+
+    def _reason_on_cuda(self, quant_config):
+        from sglang.srt.models import bailing_moe_v3
+
+        self._seed()
+        with (
+            unittest.mock.patch.object(bailing_moe_v3, "_is_cuda", True),
+            unittest.mock.patch.object(
+                bailing_moe_v3.torch.cuda,
+                "get_device_capability",
+                return_value=(9, 0),
+            ),
+        ):
+            return self._reason(
+                bailing_moe_v3.BailingMoeV3ForCausalLM,
+                self._config(),
+                quant_config,
+            )
+
+    def test_compressed_tensors_mixed_expert_layout_cannot_fuse(self):
+        reason = self._reason_on_cuda(
+            self._compressed_tensors(
+                ["re:.*(mlp|shared_experts)\\.(gate|up|gate_up|down|eh)_proj.*"]
+            )
+        )
+        self.assertIn("different quant methods", reason)
+
+    def test_compressed_tensors_uniform_expert_layout_can_fuse(self):
+        self.assertIsNone(self._reason_on_cuda(self._compressed_tensors([])))
+
+
 class TestQwen3_5Gate(_FusionGateCase):
     def test_every_entry_class_answers(self):
         import sglang.srt.models.qwen3_5 as qwen3_5

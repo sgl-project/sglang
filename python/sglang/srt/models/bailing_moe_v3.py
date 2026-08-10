@@ -1460,6 +1460,28 @@ class BailingMoeV3ForCausalLM(nn.Module):
                 "Bailing MoE V3 uses different quant methods for routed experts "
                 "and shared experts."
             )
+        if quant_config and quant_config.get_name() == "compressed_tensors":
+            from sglang.srt.layers.quantization.compressed_tensors.utils import (
+                should_ignore_layer,
+            )
+
+            ignore = getattr(quant_config, "ignore", ())
+            fused_mapping = getattr(quant_config, "packed_modules_mapping", {})
+            shared_ignored = should_ignore_layer(
+                "model.layers.0.mlp.shared_experts.gate_proj",
+                ignore=ignore,
+                fused_mapping=fused_mapping,
+            )
+            routed_ignored = should_ignore_layer(
+                "model.layers.0.mlp.experts.0.gate_proj",
+                ignore=ignore,
+                fused_mapping=fused_mapping,
+            )
+            if shared_ignored != routed_ignored:
+                return (
+                    "Bailing MoE V3 uses different quant methods for routed experts "
+                    "and shared experts."
+                )
         shared_expert_intermediate_size = getattr(
             hf_config,
             "moe_shared_expert_intermediate_size",
