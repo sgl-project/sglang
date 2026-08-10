@@ -24,7 +24,9 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 import torch
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    defer_symmetric_memory_graph_registration,
     set_graph_pool_id,
+    set_use_dedicated_symmetric_memory_graph_pool,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
@@ -91,6 +93,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+        set_use_dedicated_symmetric_memory_graph_pool(True)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
@@ -102,6 +105,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             try:
                 self.end_cuda_graph_capture()
             finally:
+                set_graph_pool_id(None)
+                set_use_dedicated_symmetric_memory_graph_pool(False)
                 self._capture_stream = None
 
     def capture_one(
@@ -119,10 +124,22 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
+        prime_graph = None
+        with defer_symmetric_memory_graph_registration(self._tp_group) as should_prime:
+            if should_prime:
+                prime_graph = BreakableCUDAGraph(None)
+                with BreakableCUDAGraphCapture(
+                    cuda_graph=prime_graph,
+                    pool=self._pool,
+                    stream=self._capture_stream,
+                    barrier_fn=self._tp_group.barrier,
+                ):
+                    captured_fn()
+
+        graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         size = shape_key.size
         if self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
@@ -135,6 +152,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             out = captured_fn()
             out_rows = self._output_rows(out, size)
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+        del prime_graph
 
         stored = self._slice_output(self._shared_output_buffer, out_rows)
         self._graphs[shape_key] = graph

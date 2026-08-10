@@ -25,7 +25,9 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    defer_symmetric_memory_graph_registration,
     set_graph_pool_id,
+    set_use_dedicated_symmetric_memory_graph_pool,
 )
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -71,11 +73,14 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+        set_use_dedicated_symmetric_memory_graph_pool(True)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         try:
             yield
         finally:
+            set_graph_pool_id(None)
+            set_use_dedicated_symmetric_memory_graph_pool(False)
             self._capture_stream = None
 
     def capture_one(
@@ -111,8 +116,6 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = torch.cuda.CUDAGraph()
-
         graph_ctx: Callable[..., AbstractContextManager]
         if (
             self._memory_saver_adapter is not None
@@ -125,8 +128,21 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = self._device_module.graph
 
+        prime_graph = None
+        with defer_symmetric_memory_graph_registration(self._tp_group) as should_prime:
+            if should_prime:
+                prime_graph = torch.cuda.CUDAGraph()
+                with graph_ctx(
+                    cuda_graph=prime_graph,
+                    pool=self._pool,
+                    stream=self._capture_stream,
+                ):
+                    forward_fn()
+
+        graph = torch.cuda.CUDAGraph()
         with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
             out = forward_fn()
+        del prime_graph
 
         if profiler is not None:
             profiler.step()
