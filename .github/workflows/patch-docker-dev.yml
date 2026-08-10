@@ -77,29 +77,37 @@ jobs:
           # there is parsed as further NAME=VALUE lines and fails the step.
           case "${BASE_SHA}" in *[!0-9a-f]*) BASE_SHA="" ;; esac
           [ "${#BASE_SHA}" -eq 40 ] || BASE_SHA=""
-          if [ -n "${BASE_SHA}" ]; then
-            echo "Image built from commit: ${BASE_SHA}"
-          else
-            echo "::warning::Cannot read base commit from ${BASE_IMAGE} - fast-forward mode needs it"
+          if [ -z "${BASE_SHA}" ]; then
+            echo "::error::Cannot read the base commit of ${BASE_IMAGE}; the patch is computed against it"
+            exit 1
           fi
+          echo "Image built from commit: ${BASE_SHA}"
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
           # Pulled only for the rev-parse above; buildx pulls the base itself.
           docker image rm "${BASE_IMAGE}" || true
 
-      - name: Generate patches
+      - name: Generate patch
         env:
           PR_NUMBERS: ${{ inputs.pr_numbers }}
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # git merge below writes merge commits and needs an identity.
+          git config --global user.email "ci@sglang.local"
+          git config --global user.name "sglang CI"
           git fetch origin main
-          # Fixed path on a persistent runner: drop patches left by prior runs
-          # so they cannot be picked up by this run's COPY *.patch.
-          rm -rf /tmp/patch-ctx
+          git fetch origin "${BASE_SHA}"
+
+          # Fixed paths on a persistent runner: drop leftovers from prior runs.
+          rm -rf /tmp/patch-ctx /tmp/base-tree
           mkdir -p /tmp/patch-ctx
+          git worktree prune
+          # Merge onto the image's own commit so the patch context matches the
+          # image tree exactly and cannot drift. Conflicts then surface here in
+          # seconds instead of failing the build after a multi-GB pull.
+          git worktree add --detach /tmp/base-tree "${BASE_SHA}"
 
           if [ -n "${PR_NUMBERS}" ]; then
             IFS=',' read -ra PRS <<< "${PR_NUMBERS}"
-            i=0
             for pr in "${PRS[@]}"; do
               pr=$(echo "${pr}" | xargs)
               case "${pr}" in
@@ -108,50 +116,42 @@ jobs:
                   exit 1
                   ;;
               esac
-              # The image applies patches in glob order, so number them to keep
-              # the order the PRs were listed in - stacked PRs depend on it.
-              i=$((i + 1))
-              PATCH=$(printf '/tmp/patch-ctx/%02d-%s.patch' "${i}" "${pr}")
-              echo "Fetching PR #${pr}"
+              echo "Merging PR #${pr}"
               git fetch origin "pull/${pr}/head:pr-${pr}"
-              MERGE_BASE=$(git merge-base origin/main "pr-${pr}")
-              echo "  PR #${pr}: merge-base=${MERGE_BASE}"
-              git diff "${MERGE_BASE}..pr-${pr}" > "${PATCH}"
-              echo "  PR #${pr}: $(wc -l < "${PATCH}") lines -> $(basename "${PATCH}")"
+              git -C /tmp/base-tree merge --no-edit "pr-${pr}" || {
+                echo "::error::PR #${pr} conflicts with base image commit ${BASE_SHA}"
+                git -C /tmp/base-tree diff --name-only --diff-filter=U
+                exit 1
+              }
             done
-          elif [ -n "${BASE_SHA}" ]; then
-            echo "Generating diff: image ${BASE_SHA} -> latest main"
-            git fetch origin "${BASE_SHA}"
-            git diff "${BASE_SHA}..origin/main" > /tmp/patch-ctx/main.patch
-            echo "  main: $(wc -l < /tmp/patch-ctx/main.patch) lines"
           else
-            echo "::error::No PR numbers specified and image has no .git - cannot generate diff against main"
-            exit 1
+            echo "Fast-forwarding to latest main"
+            git -C /tmp/base-tree merge --no-edit origin/main || {
+              echo "::error::Cannot merge latest main into base image commit ${BASE_SHA}"
+              git -C /tmp/base-tree diff --name-only --diff-filter=U
+              exit 1
+            }
           fi
 
-          TOTAL=$(cat /tmp/patch-ctx/*.patch | wc -l)
-          if [ "${TOTAL}" -eq 0 ]; then
-            echo "::error::All patches are empty - nothing to apply on top of ${BASE_IMAGE}"
+          git -C /tmp/base-tree diff --binary "${BASE_SHA}"..HEAD > /tmp/patch-ctx/merged.patch
+          if [ ! -s /tmp/patch-ctx/merged.patch ]; then
+            echo "::error::Patch is empty - nothing to apply on top of ${BASE_IMAGE}"
             exit 1
           fi
+          git -C /tmp/base-tree diff --shortstat "${BASE_SHA}"..HEAD
 
       - name: Build and push patched image
         run: |
           cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
           ARG BASE_IMAGE
           FROM ${BASE_IMAGE}
-          COPY *.patch /tmp/patches/
+          COPY merged.patch /tmp/merged.patch
+          # The patch was diffed against this image's own commit, so it applies
+          # with exact context - no fuzz needed. git apply (not patch) also
+          # handles renames, mode changes and binary files.
           RUN cd /sgl-workspace/sglang \
-              && for p in /tmp/patches/*.patch; do \
-                   if [ ! -s "${p}" ]; then \
-                     echo "Skipping ${p} (empty)"; \
-                   else \
-                     echo "Applying ${p}..." \
-                     && patch -p1 --fuzz=2 --no-backup-if-mismatch -f < "${p}" \
-                     || { echo "ERROR: Failed to apply ${p}"; exit 1; }; \
-                   fi; \
-                 done \
-              && rm -rf /tmp/patches \
+              && git apply --binary -v -p1 /tmp/merged.patch \
+              && rm -f /tmp/merged.patch \
               && python3 -m compileall -q -f python/sglang \
               && ( find python -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true )
           DOCKERFILE
