@@ -323,6 +323,7 @@ class MiniMaxM3MoE(nn.Module):
             activation="silu",
             is_gated=True,
             gemm1_alpha=config.swiglu_alpha,
+            gemm1_beta=1.0,
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,

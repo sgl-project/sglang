@@ -73,6 +73,10 @@ class MambaComponent(TreeComponent):
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
+    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        data = node.component_data[self.component_type]
+        return data.value is not None and data.host_value is None
+
     def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         cd = leaf.component_data[self.component_type]
         cd.session_ref += 1
@@ -156,7 +160,9 @@ class MambaComponent(TreeComponent):
 
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
-        # that lies beyond the current Mamba boundary.
+        # that lies beyond the current Mamba boundary. With HiCache, incremental
+        # persistence of a new branching state is currently write-through only;
+        # write-back eviction may discard the device-only state.
         aligned_seqlen = (
             result.full_kv_hit_length // self.mamba_cache_chunk_size
         ) * self.mamba_cache_chunk_size

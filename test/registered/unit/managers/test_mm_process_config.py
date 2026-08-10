@@ -174,6 +174,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             mm_io_worker_num=0,
             tokenizer_worker_num=1,
             base_gpu_id=2,
+            tp_size=8,
         )
 
     @staticmethod
@@ -261,6 +262,93 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         self.assertEqual(processor.cpu_executor._mp_context.get_start_method(), "spawn")
         self.assertIs(result["pixel_values"], feature)
         memory_pool.assert_not_called()
+
+
+class TestStreamOrderedMmFeaturePool(CustomTestCase):
+    def test_consumer_slot_uses_global_tp_rank(self):
+        from sglang.srt.multimodal.transport.memory_pool import resolve_consumer_rank
+
+        parallel = SimpleNamespace(tp_rank=6, attn_tp_rank=2)
+        with patch("sglang.srt.runtime_context.get_parallel", return_value=parallel):
+            self.assertEqual(resolve_consumer_rank(8), 6)
+
+    def test_complete_group_acknowledges_each_consumer_slot(self):
+        from sglang.srt.multimodal.transport import memory_pool
+
+        consumer = memory_pool.StreamOrderedPoolConsumerMixin()
+        consumer._init_stream_ordered_consumer(
+            ready_byte_offset=64,
+            ack_byte_offset=68,
+            generation=3,
+            total_consumer_count=4,
+            transport_name="test",
+        )
+        with patch.object(memory_pool, "stream_write_value32") as write:
+            consumer._acknowledge_on_stream(1000, 0, consumer_count=4)
+
+        self.assertEqual(
+            [call.args[1] for call in write.call_args_list],
+            [1068, 1072, 1076, 1080],
+        )
+        self.assertEqual([call.args[2] for call in write.call_args_list], [3] * 4)
+
+    def test_reused_pool_slot_gets_new_generation(self):
+        from sglang.srt.multimodal.transport.memory_pool import (
+            StreamOrderedMmFeaturePool,
+        )
+
+        pool = object.__new__(StreamOrderedMmFeaturePool)
+        pool._available_ranges = [(256, 4096)]
+        pool._available_slots = [0]
+        pool._slot_generations = [0]
+        pool._occupied = {}
+        pool.control_words_per_slot = 2
+        pool.transport_name = "test"
+
+        first = pool._allocate_locked(512)
+        pool._release_locked(first)
+        pool._merge_ranges_locked()
+        second = pool._allocate_locked(512)
+
+        self.assertEqual(first.generation, 1)
+        self.assertEqual(second.generation, 2)
+
+    def test_pool_rejects_duplicate_release(self):
+        from sglang.srt.multimodal.transport.memory_pool import (
+            StreamOrderedMmFeaturePool,
+        )
+
+        pool = object.__new__(StreamOrderedMmFeaturePool)
+        pool._available_ranges = [(256, 4096)]
+        pool._available_slots = [0]
+        pool._slot_generations = [0]
+        pool._occupied = {}
+        pool.control_words_per_slot = 2
+        pool.transport_name = "test"
+
+        lease = pool._allocate_locked(512)
+        pool._release_locked(lease)
+
+        with self.assertRaisesRegex(RuntimeError, "inactive test pool lease"):
+            pool._release_locked(lease)
+
+    def test_pool_shutdown_wakes_recycler_before_returning(self):
+        from sglang.srt.multimodal.transport.memory_pool import (
+            StreamOrderedMmFeaturePool,
+        )
+
+        pool = object.__new__(StreamOrderedMmFeaturePool)
+        pool._recycler_stop_event = threading.Event()
+        pool._recycle_thread = threading.Thread(
+            target=pool._recycler_stop_event.wait,
+            args=(60,),
+            daemon=True,
+        )
+        pool._recycle_thread.start()
+
+        pool.shutdown()
+
+        self.assertFalse(pool._recycle_thread.is_alive())
 
 
 class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
