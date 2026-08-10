@@ -147,7 +147,7 @@ export const Gemma4Deployment = () => {
     }
 
     if (hardware === 'arc_b') {
-      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd; 
+      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
       cmd += ` \\\n  --device xpu`;
     }
 
