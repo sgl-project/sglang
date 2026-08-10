@@ -179,14 +179,16 @@ class MLPSyncBatchInfo:
             )
         tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
-        # One D2H for every field: each `.item()` / `.tolist()` on a device
-        # tensor is its own stream sync. Copy the whole tensor, not the
-        # `[:, 0, :]` slice -- that slice is non-contiguous once
-        # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        # Sanitize retiree-slot garbage (Mooncake WORLD all-reduce mask-flip race).
+        _MAX = 1 << 30
+        self.global_num_tokens = [0 if (t < 0 or t > _MAX) else t for t in self.global_num_tokens]
+        self.global_num_tokens_for_logprob = [
+            0 if (t < 0 or t > _MAX) else t for t in self.global_num_tokens_for_logprob
+        ]
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())

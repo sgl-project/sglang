@@ -360,7 +360,7 @@ def initialize_dp_attention(
 
     if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
         _ATTN_DP_RANK = tp_rank + server_args.ep_join_rank_offset
-        if server_args.is_ep_scale_joiner:
+        if server_args.is_ep_offset_joiner:
             dp.joiner_skip_all_gather = True
 
     _DpGatheredBufferWrapper.set_metadata(

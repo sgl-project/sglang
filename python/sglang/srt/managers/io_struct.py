@@ -2020,12 +2020,16 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
-    """Report asynchronous Elastic EP scale completion or failure."""
+    """Report asynchronous Elastic EP scale completion or failure.
+
+    ``direction`` is "grow" (add slots to DPC routing) or "shrink" (remove).
+    """
 
     success: bool
     effective_ep_size: int
     slot_offset: int = 0
     slot_count: int = 0
+    direction: str = "grow"
     error: Optional[str] = None
 
 
