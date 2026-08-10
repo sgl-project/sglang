@@ -213,6 +213,7 @@ def _get_nemo_venv() -> Tuple[str, dict]:
             f"{_nemo_venv_dir}/venv/bin/python",
             f"git+https://github.com/NVIDIA/NeMo-Skills.git@{nemo_skills_ref}",
             "mcp<2",
+            "typer<0.27",
         ],
         capture_output=True,
         text=True,
