@@ -63,6 +63,7 @@ from sglang.srt.layers.cp.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -536,10 +537,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = 0
 
     def _is_mamba_track_enabled(self) -> bool:
-        return (
-            self.model_runner.server_args.enable_mamba_extra_buffer()
-            and not self.model_runner.server_args.disable_radix_cache
-            and self.model_runner.spec_algorithm.is_none()
+        return self.model_runner.server_args.enable_mamba_extra_buffer() and (
+            not self.model_runner.server_args.disable_radix_cache
         )
 
     def _cache_loc_dtype(self):
@@ -1137,6 +1136,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         ):
             return False
+        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+            forward_batch
+        ):
+            assert self.prefill_cp_bcg_input is not None
+            if (
+                self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
+                    num_tokens=len(forward_batch.input_ids),
+                    extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+                    capture_num_tokens=self.capture_num_tokens,
+                    max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+                )
+                is None
+            ):
+                return False
         # Multi-req replay is supported by body-capture backends via the
         # layer_model.forward monkey-patch in replay(): the captured graph runs
         # the transformer stack, then the outer model.forward runs
@@ -1418,6 +1431,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+            forward_batch
+        ):
+            assert self.prefill_cp_bcg_input is not None
+            static_num_tokens = (
+                self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
+                    num_tokens=num_tokens,
+                    extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+                    capture_num_tokens=self.capture_num_tokens,
+                    max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+                )
+            )
+            if static_num_tokens is None:
+                raise RuntimeError(
+                    "Prefill CUDA graph replay was admitted without a fitting bucket"
+                )
         self.raw_num_tokens = num_tokens
 
         bs = forward_batch.batch_size
@@ -1579,6 +1608,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 s["extend_start_loc"][bs:r].fill_(self.raw_num_tokens)
                 s["req_pool_indices"][bs:r].zero_()
                 s["orig_seq_lens"][bs:r].zero_()
+                # The captured track scatter reads these rows too, and a stale
+                # mask row still carries a live destination slot: it would land
+                # this replay's window in an earlier request's checkpoint.
+                registry = self.buffer_registry
+                for name in ("mamba_track_mask", "mamba_track_indices"):
+                    if registry.has_slot(name):
+                        registry.get_slot(name).buffer[bs:r].zero_()
 
         # Refresh the static buffer the captured graph reads from.
         if (
