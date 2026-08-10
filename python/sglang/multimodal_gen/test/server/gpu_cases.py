@@ -22,6 +22,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     IDEOGRAM4_CI_sampling_params,
     JOY_ECHO_T2V_CI_sampling_params,
+    LINGBOT_VIDEO_T2V_CI_sampling_params,
     LONGLIVE2_I2V_CI_sampling_params,
     LONGLIVE2_T2V_CI_sampling_params,
     MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
@@ -449,6 +450,21 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "lingbot_video_moe_t2v",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-video-moe-30b-a3b",
+            modality="video",
+            num_gpus=1,
+            text_encoder_cpu_offload=True,
+        ),
+        LINGBOT_VIDEO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
         "lingbot_world_realtime_plastic_beach",
@@ -1141,6 +1157,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py",
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
@@ -1178,6 +1195,9 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ar_models.py": 600.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
+        # padded for cold-cache CI.
+        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 180.0,
         # zimage server startup dominates; six short requests after warmup
         "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
         # one capture plus three replays on a 32K-element exchange

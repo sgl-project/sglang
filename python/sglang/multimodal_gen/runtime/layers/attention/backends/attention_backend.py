@@ -46,6 +46,12 @@ class AttentionBackend(ABC):
         return cls.get_impl_cls().forward_varlen is not AttentionImpl.forward_varlen
 
     @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        """Whether this backend can serve as the ring-attention kernel; the
+        per-hop online-softmax merge needs the kernel's softmax LSE."""
+        return False
+
+    @classmethod
     def unsupported_requirements(
         cls, requirements: AttentionRequirements
     ) -> tuple[str, ...]:
