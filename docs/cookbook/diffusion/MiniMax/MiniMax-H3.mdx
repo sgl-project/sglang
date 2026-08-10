@@ -172,10 +172,18 @@ For Ascend NPU, follow the
 [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation)
 before starting the server.
 
-On an 8-NPU server, the validated topology is TP2 + SP4 with Laser Attention.
-Use Ascend Flash Attention by replacing `laser_attn` with `fa`.
+For an eight-NPU host, the validated topology is TP2 + SP4 with Laser
+Attention. Use Ascend Flash Attention by replacing `laser_attn` with `fa`.
 
 ```bash 8-NPU
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
 HCCL_BUFFSIZE=256 sglang serve \
   --model-path MiniMaxAI/MiniMax-H3 \
   --model-type diffusion \
@@ -187,11 +195,38 @@ HCCL_BUFFSIZE=256 sglang serve \
   --port 30088
 ```
 
+For a four-NPU host, use TP2 + SP2:
+
+```bash 4-NPU
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+HCCL_BUFFSIZE=256 sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-type diffusion \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --sp-degree 2 \
+  --attention-backend laser_attn \
+  --port 30088
+```
+
 The first launch downloads the model through the selected Hub. If the Hugging
 Face repository requires authentication, export a Hugging Face token in the
 server environment.
 
-For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager. The current `torch.compile` path changes the model's numerical output, so it is not enabled implicitly by any recommended lossless preset. An explicit `--enable-torch-compile true` remains available for controlled experiments, but it should not be used to generate consistency ground truth.
+The Ascend commands explicitly enable the Cache-DiT configuration used for the
+reported performance measurements. Remove these `SGLANG_CACHE_DIT_*` variables
+to use lossless denoising. The current `torch.compile` path changes the model's
+numerical output, so it should not be used to generate consistency ground truth.
+See the **Ascend NPU topology comparison** in the Benchmarks section for the
+measured eight- and four-NPU latency.
 
 ## 4. Generate video and audio
 
@@ -696,8 +731,24 @@ the configurations with collected measurements:
 | B200 | 8× Ulysses8 resident | 4× FSDP + Ulysses4 |
 | H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4; 4× TP2 + Ulysses2; 2 nodes × 8× Ulysses8×Ring2 cross-node |
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
+| Ascend NPU | 8 NPUs, TP2 + SP4, Laser Attention | 4 NPUs, TP2 + SP2, Laser Attention |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
 | RTX 5090 | 2× TP2 + layerwise offload | — |
+
+### Ascend NPU topology comparison
+
+Both topologies used Laser Attention and the explicit Cache-DiT configuration
+from the Ascend launch commands. The measured workload was one 5-second T2VA
+request at 1344×768, 124 frames, 24 fps, and 50 inference steps.
+
+| NPU count | Topology | End-to-end latency |
+| ---: | --- | ---: |
+| 8 | TP2 + SP4 | **55.07 s** |
+| 4 | TP2 + SP2 | **103.57 s** |
+
+These are individual end-to-end measurements for each topology, not averages.
+The eight-NPU topology had 46.8% lower end-to-end latency than the four-NPU
+topology.
 
 ### B300 precision and encoder placement
 
