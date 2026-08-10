@@ -150,15 +150,6 @@ __global__ __launch_bounds__(1024, 1)  //
     counter_c = 0;
     counter_w = 0;
   }
-  if (tx < kNumWarps) {
-    warp_max[tx] = 0;
-    warp_min[tx] = 0xFFFFFFFFu;
-  }
-  // Warp 0 initializes all warp_min slots; each warp then writes its own. Without
-  // this barrier, init can clobber a reduction result and make ragged extend look
-  // uniform, wrongly selecting the MTP fast path and overrunning ragged_id.
-  __syncthreads();
-
   // === Stage B: min/max(extend_len) for MTP-uniform detection ===
   // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.
   const uint32_t e_for_max = static_cast<uint32_t>(extend_len);
