@@ -24,8 +24,9 @@ Pick your hardware + recipe to generate the launch command. One serving strategy
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/inclusionAI/ling-3.0-tiny.jsx";
+import { benchmarks } from "/src/snippets/configs/inclusionAI/ling-3.0-tiny-benchmarks.jsx";
 
-<Deployment config={config} />
+<Deployment config={config} benchmarks={benchmarks} />
 
 ## Playground
 
