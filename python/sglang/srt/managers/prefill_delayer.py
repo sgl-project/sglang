@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -15,6 +16,32 @@ if TYPE_CHECKING:
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
 logger = logging.getLogger(__name__)
+
+
+class RecentPrefillBatchSizeTracker:
+    """Track the largest of the latest real prefill admissions.
+
+    The default window keeps 64 non-empty admissions. Decode-only and idle
+    scheduler passes do not age the high-watermark.
+    """
+
+    def __init__(self, window_size: int = 64):
+        if window_size <= 0:
+            raise ValueError(f"window_size must be positive, got {window_size}")
+        self._recent_admission_sizes = deque(maxlen=window_size)
+
+    @property
+    def max_prefill_bs(self) -> int:
+        return max(self._recent_admission_sizes, default=0)
+
+    def observe_admission(self, admitted_prefill_bs: int) -> int:
+        if admitted_prefill_bs <= 0:
+            raise ValueError(
+                "admitted_prefill_bs must be positive for a real admission, "
+                f"got {admitted_prefill_bs}"
+            )
+        self._recent_admission_sizes.append(admitted_prefill_bs)
+        return self.max_prefill_bs
 
 
 @dataclass(frozen=True)
