@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion.qknorm_rope import (
-    can_use_fused_qknorm_rope_pack_kv,
+    can_use_fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
 )
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
@@ -705,17 +705,15 @@ class Cosmos3CrossAttention(nn.Module):
             and get_sp_world_size() == 1
             and q.dtype == k.dtype == v.dtype == k_und.dtype == v_und.dtype
             and self.norm_q.weight.dtype == q.dtype
-        )
-        use_fused_kv_pack = (
-            use_fused_kv_pack
             and self.norm_k.weight.dtype == k.dtype
             and self.norm_q.variance_epsilon == self.norm_k.variance_epsilon
-            and can_use_fused_qknorm_rope_pack_kv(
+            and can_use_fused_inplace_qknorm_rope(
                 self.head_dim,
                 cos_sin_cache.shape[-1],
                 True,
                 q.dtype,
                 cos_sin_cache.dtype,
+                pack_kv=True,
             )
         )
         if use_fused_kv_pack:
@@ -742,11 +740,13 @@ class Cosmos3CrossAttention(nn.Module):
                 cos_sin_cache,
                 rope_cache_positions,
             )
-            out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         else:
             q, k = _apply_qwen3_qk_norm_rope_split(
                 q, k, self.norm_q, self.norm_k, self.head_dim, cos_sin_cache
             )
+        if not use_fused_kv_pack:
+            # K/V = [UND prefix (replicated on SP ranks) | GEN suffix].
+            # USPAttention applies the configured backend and SP collectives.
             out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)

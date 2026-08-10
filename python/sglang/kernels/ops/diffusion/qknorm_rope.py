@@ -31,6 +31,7 @@ def _jit_qknorm_rope_module(
     dtype: torch.dtype,
     cache_dtype: torch.dtype,
     round_norm_before_rope: bool,
+    pack_kv: bool = False,
 ) -> Module:
     args = make_cpp_args(
         head_dim,
@@ -41,49 +42,24 @@ def _jit_qknorm_rope_module(
         cache_dtype,
         round_norm_before_rope,
     )
+    op_name = "qknorm_rope_pack_kv" if pack_kv else "qknorm_rope"
+    kernel_name = "QKNormRopePackKVKernel" if pack_kv else "QKNormRopeKernel"
     return load_jit(
-        "qknorm_rope",
+        op_name,
         *args,
         cuda_files=["diffusion/qknorm_rope.cuh"],
-        cuda_wrappers=[("qknorm_rope", f"QKNormRopeKernel<{args}>::run")],
+        cuda_wrappers=[(op_name, f"{kernel_name}<{args}>::run")],
     )
 
 
-@cache_once
-def _jit_qknorm_rope_pack_kv_module(
+def _can_use_fused_qknorm_rope(
     head_dim: int,
     rope_dim: int,
     is_neox: bool,
     dtype: torch.dtype,
     cache_dtype: torch.dtype,
     round_norm_before_rope: bool,
-) -> Module:
-    args = make_cpp_args(
-        head_dim,
-        rope_dim,
-        is_neox,
-        is_arch_support_pdl(),
-        dtype,
-        cache_dtype,
-        round_norm_before_rope,
-    )
-    return load_jit(
-        "qknorm_rope_pack_kv",
-        *args,
-        cuda_files=["diffusion/qknorm_rope.cuh"],
-        cuda_wrappers=[("qknorm_rope_pack_kv", f"QKNormRopePackKVKernel<{args}>::run")],
-    )
-
-
-@torch.compiler.assume_constant_result
-@cache_once
-def can_use_fused_inplace_qknorm_rope(
-    head_dim: int,
-    rope_dim: int,
-    is_neox: bool,
-    dtype: torch.dtype,
-    cache_dtype: torch.dtype = torch.float32,
-    round_norm_before_rope: bool = False,
+    pack_kv: bool,
 ) -> bool:
     if dtype not in _SUPPORTED_DTYPES or cache_dtype not in _SUPPORTED_CACHE_DTYPES:
         logger.warning(
@@ -132,45 +108,35 @@ def can_use_fused_inplace_qknorm_rope(
             dtype,
             cache_dtype,
             round_norm_before_rope,
+            pack_kv,
         )
         return True
     except Exception as e:
-        logger.warning(f"Failed to load JIT fused QKNorm+RoPE kernel: {e}")
+        suffix = "+KV pack" if pack_kv else ""
+        logger.warning(f"Failed to load JIT fused QKNorm+RoPE{suffix} kernel: {e}")
         return False
 
 
 @torch.compiler.assume_constant_result
 @cache_once
-def can_use_fused_qknorm_rope_pack_kv(
+def can_use_fused_inplace_qknorm_rope(
     head_dim: int,
     rope_dim: int,
     is_neox: bool,
     dtype: torch.dtype,
     cache_dtype: torch.dtype = torch.float32,
     round_norm_before_rope: bool = False,
+    pack_kv: bool = False,
 ) -> bool:
-    if not can_use_fused_inplace_qknorm_rope(
+    return _can_use_fused_qknorm_rope(
         head_dim,
         rope_dim,
         is_neox,
         dtype,
         cache_dtype,
         round_norm_before_rope,
-    ):
-        return False
-    try:
-        _jit_qknorm_rope_pack_kv_module(
-            head_dim,
-            rope_dim,
-            is_neox,
-            dtype,
-            cache_dtype,
-            round_norm_before_rope,
-        )
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to load JIT fused QKNorm+RoPE+KV pack kernel: {e}")
-        return False
+        pack_kv,
+    )
 
 
 @register_custom_op(mutates_args=["q", "k"])
@@ -224,13 +190,14 @@ def fused_qknorm_rope_pack_kv(
     rope_dim = rope_dim or cos_sin_cache.size(-1)
     batch_size, suffix_tokens = q.shape[:2]
     prefix_tokens = k_prefix.shape[1]
-    module = _jit_qknorm_rope_pack_kv_module(
+    module = _jit_qknorm_rope_module(
         head_dim,
         rope_dim,
         is_neox,
         q.dtype,
         cos_sin_cache.dtype,
         round_norm_before_rope,
+        True,
     )
     module.qknorm_rope_pack_kv(
         q.view(-1, q.shape[-2], head_dim),
