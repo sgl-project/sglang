@@ -46,6 +46,7 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 
 
 class Mxfp4FlashinferTrtllmMoEMethod:
+    fuse_routed_scaling_factor_in_topk = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method

@@ -4,6 +4,9 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
 from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
     Mxfp4FlashinferCutlassMoEMethod,
 )
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    Mxfp4FlashinferTrtllmMoEMethod,
+)
 from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -14,6 +17,7 @@ def test_native_mxfp4_methods_fold_routed_scaling_into_topk_weights():
     methods = (
         Mxfp4MarlinMoEMethod.__new__(Mxfp4MarlinMoEMethod),
         Mxfp4FlashinferCutlassMoEMethod.__new__(Mxfp4FlashinferCutlassMoEMethod),
+        Mxfp4FlashinferTrtllmMoEMethod.__new__(Mxfp4FlashinferTrtllmMoEMethod),
     )
 
     assert all(_fuses_routed_scaling_factor_in_topk(method) for method in methods)
