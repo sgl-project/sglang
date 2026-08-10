@@ -628,6 +628,13 @@ class WeightsUpdater:
         updated = 0
         skipped = 0
         unknown_layers: list[str] = []
+        # Honor lora_merge_mode instead of always merging: merged (W + s*B*A)x and
+        # PEFT-trainer Wx + s*B(A*x) agree algebraically but not bitwise.
+        merge_mode = lora_pipeline._resolve_lora_merge_mode(None, None)
+        merge_weights = lora_pipeline._should_merge_lora_for_layers(
+            target_module, layer_dict, merge_mode
+        )
+
         with lora_pipeline._temporarily_disable_offload(target=target_module):
             for layer_name, (lora_a, lora_b) in pairs.items():
                 layer, _resolved_key = _resolve_lora_ipc_layer_dict_key(
@@ -654,7 +661,7 @@ class WeightsUpdater:
                 layer.lora_rank = inferred_rank
                 layer.lora_alpha = alpha
                 layer.set_lora_weights(
-                    lora_a, lora_b, merge_weights=True, clear_existing=True
+                    lora_a, lora_b, merge_weights=merge_weights, clear_existing=True
                 )
                 updated += 1
 
