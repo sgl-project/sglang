@@ -4,6 +4,9 @@ Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
+Every recipe here runs ``--dsv4-attn-backend trtllm`` (uniform-FP8 KV pool,
+trtllm-gen sparse MLA for decode and prefill).
+
 Registry: base-c-test-4-gpu-b200 (per-commit, 4x B200)
 """
 
@@ -54,6 +57,8 @@ class TestDSV4FlashFP4B200(
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
+                "--dsv4-attn-backend",
+                "trtllm",
                 "--tp",
                 "4",
                 "--moe-runner-backend",
@@ -100,6 +105,8 @@ class TestDSV4FlashFP4B200Balanced(
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
+                "--dsv4-attn-backend",
+                "trtllm",
                 "--tp",
                 "4",
                 "--dp",
@@ -144,6 +151,8 @@ class TestDSV4FlashFP4NonMTPB200(
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
+                "--dsv4-attn-backend",
+                "trtllm",
                 "--tp",
                 "4",
                 "--dp",
@@ -191,6 +200,8 @@ class TestDSV4FlashFP4BreakableCudaGraphB200(
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
+                "--dsv4-attn-backend",
+                "trtllm",
                 "--tp",
                 "4",
                 "--dp",
