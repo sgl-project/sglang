@@ -251,6 +251,41 @@ class KVIndexSource:
             full_to_swa_map=None,
         )
 
+    def build_into(
+        self,
+        *,
+        out: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fill a backend-owned padded 2-D block table's live prefix with
+        FULL-side canonical entries (trtllm_mla / flashmla consume such tables
+        directly — their rows ARE the canonical rows).
+
+        Prefix-only: columns past each row's live pages keep the backend's own
+        fill (-1 sentinel or stale-but-unread values) — that tail is the
+        consumer kernel's contract, not ours. Unified-only: callers dispatch on
+        ``self.enabled`` and keep their static builder otherwise.
+        """
+        assert self.enabled, "KVIndexSource.build_into on a passthrough source"
+        # Cap at the widest legal column: the table may be padded past the
+        # context (alignment constraints); a page can only START inside
+        # req_to_token.
+        max_pages = min(
+            out.shape[1],
+            -(-self.req_to_token.shape[1] // self.page_size),
+        )
+        return build_kernel_page_table(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            v2p=self._full_v2p,
+            multiplier=self._full_mult,
+            page_size=self.page_size,
+            max_pages=max_pages,
+            out=out,
+        )
+
     def view_for_forward_batch(self, forward_batch) -> KVIndexBatchView:
         """Eager per-batch view, stashed on the ForwardBatch so TBO children
         and multi-consumer forwards build it once. The captured path does NOT

@@ -20,20 +20,26 @@ block table filled with DENSE page ids:
 
     dense_page(virtual_page) = v2p[virtual_page] * layer_num
 
-Three backend families reach that same formula by different routes:
-  - `create_flashmla_kv_indices_triton` in-kernel via `v2p_ptr` / `PAGE_MULT`
-    (trtllm_mla / cutedsl_mla / tokenspeed_mla);
-  - the flashinfer_mla updaters, post-gathering `translate_kv_loc_dense` over the
-    token-level kv_indices;
-  - `normal_decode_set_metadata` in-kernel, for fa3's captured-decode page table.
+Since the read-path choke point, ONE builder computes that formula for every
+family — `build_kernel_page_table` (the canonical) — and the backends only
+differ in how they consume it:
+  - trtllm_mla / cutedsl_mla / tokenspeed_mla / flashmla: rows filled straight
+    into their padded block tables (`KVIndexSource.build_into`, prefix-only so
+    the backends' own -1 / stale tail sentinels survive);
+  - the flashinfer updaters: token ids reconstructed from the canonical by
+    `create_flashinfer_kv_indices_triton[SRC_PAGE_SIZE=ps]`;
+  - fa3's captured decode: `normal_decode_set_metadata` copies the canonical
+    rows' live prefixes (src_is_kernel_page_table=True).
 
 Covered here:
-  - kernel identity: `v2p_ptr=None, PAGE_MULT=1` is byte-identical to main;
-  - kernel dense mapping against the python reference, for several page sizes,
-    ragged sequence lengths and a non-identity v2p permutation;
-  - padded block-table lanes never index the v2p table out of bounds;
-  - the token-level dense translate the flashinfer updaters apply agrees with the
-    page-level block table the trtllm path builds;
+  - the static `create_flashmla_kv_indices_triton` (no id-space knowledge left)
+    still matches the plain token//ps reference;
+  - the canonical route against the python dense reference, for several page
+    sizes, ragged sequence lengths and a non-identity v2p permutation;
+  - lanes past a row's live prefix keep the backend's -1 sentinel (prefix-only
+    discipline — the trtllm/flashmla tail contract);
+  - the token-level dense translate the flashinfer updaters used to apply
+    agrees with the canonical page table (page-affinity of the id space);
   - fa3's fused metadata kernels agree with the same reference, on both the
     page_size == 1 fast path (which is what Kimi-Linear takes: fa3 imposes no
     page-size constraint) and the general path.
@@ -57,6 +63,28 @@ _LAYERS = 24  # K3 MLA full-attention layer count
 def _fill_block_table(
     req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult
 ):
+    """The unified route: canonical builder into a -1-filled block table
+    (exactly what KVIndexSource.build_into does for trtllm_mla/flashmla)."""
+    from sglang.kernels.ops.kvcache.kernel_page_table import build_kernel_page_table
+
+    bs = req_pool_indices.shape[0]
+    max_blocks = (int(seq_lens.max().item()) + page_size - 1) // page_size
+    out = torch.full((bs, max_blocks), -1, dtype=torch.int32, device=_DEV)
+    build_kernel_page_table(
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens.to(torch.int64),
+        v2p=v2p,
+        multiplier=mult,
+        page_size=page_size,
+        max_pages=max_blocks,
+        out=out,
+    )
+    return out
+
+
+def _fill_block_table_static(req_to_token, req_pool_indices, seq_lens, page_size):
+    """The static-pool route: the stripped flashmla kernel, token//ps verbatim."""
     from sglang.kernels.ops.kvcache.kv_indices import (
         create_flashmla_kv_indices_triton,
         get_num_kv_index_blocks_flashmla,
@@ -75,8 +103,6 @@ def _fill_block_table(
         req_to_token.stride(0),
         max_blocks,
         PAGED_SIZE=page_size,
-        v2p_ptr=v2p,
-        PAGE_MULT=mult,
     )
     return out
 
@@ -122,11 +148,12 @@ class TestDenseBlockTable(unittest.TestCase):
         v2p[0] = 0  # page 0 is the reserved sink
         return req_to_token, req_pool_indices, seq_lens, v2p
 
-    def test_identity_when_hooks_absent(self):
-        """v2p_ptr=None / PAGE_MULT=1 must reproduce the pre-change behaviour."""
+    def test_static_kernel_matches_reference(self):
+        """The stripped (id-space-free) flashmla kernel is byte-identical to the
+        plain token//ps reference — guards the v2p-arg removal itself."""
         for page_size in (1, 32, 64):
             rt, rpi, sl, _ = self._make_batch(page_size)
-            got = _fill_block_table(rt, rpi, sl, page_size, v2p=None, mult=1)
+            got = _fill_block_table_static(rt, rpi, sl, page_size)
             want = _reference(rt, rpi, sl, page_size, v2p=None, mult=1)
             self.assertTrue(
                 torch.equal(got.long(), want), f"page_size={page_size}: {got} != {want}"
@@ -166,8 +193,9 @@ class TestDenseBlockTable(unittest.TestCase):
             )
 
     def test_padded_lanes_stay_untouched(self):
-        """Lanes past a request's page count keep the -1 fill: the masked v2p load
-        must not write a translated value (nor read out of bounds)."""
+        """Lanes past a request's page count keep the -1 fill: the prefix-only
+        canonical build must never write a backend's tail sentinel (the
+        trtllm/flashmla block-table contract)."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
         got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS)
@@ -323,21 +351,9 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
                 "test batch degenerated: v2p is the identity on the pages used",
             )
 
-    def test_agrees_with_flashmla_block_table(self):
-        """fa3 and trtllm_mla build the same table two different ways; a
-        disagreement means one family is addressing the wrong pages."""
-        for page_size in (1, 64):
-            got, _, sl = self._run(page_size, v2p=True, mult=_LAYERS)
-            rt, rpi, sl2, v2p = TestDenseBlockTable._make_batch(self, page_size)
-            other = _fill_block_table(
-                rt, rpi, sl2, page_size, v2p=v2p, mult=_LAYERS
-            ).long()
-            for r in range(got.shape[0]):
-                n_pages = (int(sl[r].item()) + page_size - 1) // page_size
-                self.assertTrue(
-                    torch.equal(got[r, :n_pages].long(), other[r, :n_pages]),
-                    f"fa3 and flashmla block tables disagree (row {r}, ps={page_size})",
-                )
+    # (The old fa3<->flashmla agreement case is gone: both families now
+    # consume the SAME canonical builder, so cross-family agreement holds by
+    # construction and the per-family cases above cover the two consumers.)
 
 
 class TestUnifiedMLAHookDetection(unittest.TestCase):

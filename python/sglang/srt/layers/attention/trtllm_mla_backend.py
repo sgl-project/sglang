@@ -49,7 +49,6 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -282,20 +281,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        # Unified-memory dense-view hooks (None on the static pool). req_to_token
-        # holds VIRTUAL token ids; the block table needs DENSE page ids, so the
-        # kv-index kernels gather virtual->physical page through `_v2p_page_table`
-        # then scale by `_kernel_page_multiplier` (= num MLA layers). See
-        # build_dense_mla_views / create_flashmla_kv_indices_triton.
-        _hooks = unified_mla_hooks(model_runner.token_to_kv_pool_allocator)
-        self._v2p_page_table = _hooks.v2p_page_table
-        self._kernel_page_multiplier = _hooks.kernel_page_multiplier
-        self._unified_mla = _hooks.enabled
         # Per-forward dense write loc ([:n] view of a capture-stable buffer),
         # refilled by the cuda-graph out-graph hook; None on the eager path
         # (where forward_batch.out_cache_loc — already DENSE, rebound at
         # ForwardBatch construction by apply_unified_kv_loc_rebind — is passed
-        # to the pool door directly).
+        # to the pool door directly). The READ-side block tables come from the
+        # choke point (self.kv_index_source, bound by the FlashInferMLA parent).
         self._decode_dense_loc: Optional[torch.Tensor] = None
         self.cuda_graph_out_cache_loc_dense: Optional[torch.Tensor] = None
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
@@ -368,23 +359,30 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             (batch_size, max_blocks), -1, dtype=torch.int32, device=device
         )
 
-        create_flashmla_kv_indices_triton[
-            (
-                batch_size,
-                get_num_kv_index_blocks_flashmla(max_blocks, self.page_size),
+        if self.kv_index_source.enabled:
+            # Unified pool: the canonical entries ARE the dense block-table
+            # rows; prefix-only build keeps the -1 tail sentinel.
+            self.kv_index_source.build_into(
+                out=block_kv_indices,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
             )
-        ](
-            self.req_to_token,
-            req_pool_indices,
-            seq_lens,
-            None,
-            block_kv_indices,
-            self.req_to_token.stride(0),
-            max_blocks,
-            PAGED_SIZE=self.page_size,
-            v2p_ptr=self._v2p_page_table,
-            PAGE_MULT=self._kernel_page_multiplier,
-        )
+        else:
+            create_flashmla_kv_indices_triton[
+                (
+                    batch_size,
+                    get_num_kv_index_blocks_flashmla(max_blocks, self.page_size),
+                )
+            ](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                None,
+                block_kv_indices,
+                self.req_to_token.stride(0),
+                max_blocks,
+                PAGED_SIZE=self.page_size,
+            )
 
         return block_kv_indices
 
@@ -404,7 +402,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Unified pool: capture-stable buffer for the DENSE KV write loc, filled
         # out-of-graph in init_forward_metadata_out_graph so the in-graph
         # set_mla_kv_buffer captures no translate.
-        if self._unified_mla:
+        if self.kv_index_source.enabled:
             self.cuda_graph_out_cache_loc_dense = torch.zeros(
                 max_num_tokens, dtype=torch.int64, device=self.device
             )
@@ -545,25 +543,34 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens[:bs])
 
         # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[
-            (
-                bs,
-                get_num_kv_index_blocks_flashmla(
-                    metadata.block_kv_indices.shape[1], self.page_size
-                ),
+        if self.kv_index_source.enabled:
+            # Unified pool: prefix-only refresh of the capture-stable table
+            # (spec is asserted off, so `seq_lens` here is always the plain
+            # decode length; the builder takes seq_lens as a tensor, so the
+            # verify/draft-widened lengths plug in when the spec seam opens).
+            self.kv_index_source.build_into(
+                out=metadata.block_kv_indices,
+                req_pool_indices=req_pool_indices[:bs],
+                seq_lens=seq_lens,
             )
-        ](
-            self.req_to_token,
-            req_pool_indices[:bs],
-            seq_lens,
-            None,
-            metadata.block_kv_indices,
-            self.req_to_token.stride(0),
-            metadata.block_kv_indices.shape[1],
-            PAGED_SIZE=self.page_size,
-            v2p_ptr=self._v2p_page_table,
-            PAGE_MULT=self._kernel_page_multiplier,
-        )
+        else:
+            create_flashmla_kv_indices_triton[
+                (
+                    bs,
+                    get_num_kv_index_blocks_flashmla(
+                        metadata.block_kv_indices.shape[1], self.page_size
+                    ),
+                )
+            ](
+                self.req_to_token,
+                req_pool_indices[:bs],
+                seq_lens,
+                None,
+                metadata.block_kv_indices,
+                self.req_to_token.stride(0),
+                metadata.block_kv_indices.shape[1],
+                PAGED_SIZE=self.page_size,
+            )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -626,8 +633,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Unified pool: precompute the DENSE KV write loc into the capture-stable
         # buffer (both capture and each replay-prep run this out of the graph),
         # so the in-graph set_mla_kv_buffer writes a dense loc without capturing
-        # a translate.
-        if self._unified_mla and (
+        # a translate. Decode AND target-verify write KV under unified memory
+        # (upstream #33974 supports DSPARK speculative decoding here).
+        if self.kv_index_source.enabled and (
             forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
         ):
             out_cache_loc = forward_batch.out_cache_loc
@@ -1068,7 +1076,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                         self._decode_dense_loc
                         if self._decode_dense_loc is not None
                         else (
-                            None if self._unified_mla else forward_batch.out_cache_loc
+                            None
+                            if self.kv_index_source.enabled
+                            else forward_batch.out_cache_loc
                         )
                     )
                     if loc is not None:
@@ -1132,7 +1142,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 if (
                     merge_query
                     and self._fused_set_kv_concat_q
-                    and not self._unified_mla
+                    and not self.kv_index_source.enabled
                 ):
                     # Static pool only, conservatively: the unified eager loc
                     # is ALSO kernel-facing since the ForwardBatch rebind, so
