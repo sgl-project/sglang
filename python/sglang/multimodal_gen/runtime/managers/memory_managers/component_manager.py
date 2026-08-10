@@ -474,9 +474,7 @@ class ComponentResidencyManager:
             if preferred and not self.state.batch_is_warmup:
                 strategy.prepare_after_request(module, use, self.state)
             else:
-                was_on_supported_device = self._module_on_supported_device(
-                    module
-                )
+                was_on_supported_device = self._module_on_supported_device(module)
                 strategy.finish_request(module, use, self.state, preferred=preferred)
                 self._empty_cache_after_large_release(
                     use, strategy, module, was_on_supported_device
@@ -628,8 +626,7 @@ class ComponentResidencyManager:
         if not use.memory_intensive:
             return
         released_accelerator_storage = (
-            was_on_supported_device
-            and not self._module_on_supported_device(module)
+            was_on_supported_device and not self._module_on_supported_device(module)
         )
         released_layerwise_storage = isinstance(strategy, LayerwiseOffloadStrategy)
         if not (released_accelerator_storage or released_layerwise_storage):
