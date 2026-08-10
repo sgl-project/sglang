@@ -9,6 +9,7 @@ from typing import ClassVar
 
 import torch
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.srt.layers.rotary_embedding.utils import rotate_neox
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
@@ -165,12 +166,6 @@ class RotaryEmbedding(nn.Module):
         return cos, sin
 
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -180,33 +175,20 @@ def apply_rotary_pos_emb(
     if cos is None or sin is None:
         return q, k
 
-    if q.dim() == 4:
-        # [B, T, H, D]
-        rotary_dim = cos.shape[-1]
-        cos = cos.unsqueeze(2)  # [B, T, 1, rotary_dim]
-        sin = sin.unsqueeze(2)
-        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-        q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-        k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-        return torch.cat([q_embed, q_pass], dim=-1), torch.cat(
-            [k_embed, k_pass], dim=-1
-        )
+    if q.dim() not in (3, 4):
+        return q, k
 
-    if q.dim() == 3:
-        # [tokens, H, D] (varlen flattened)
-        rotary_dim = cos.shape[-1]
-        cos = cos.unsqueeze(1)  # [tokens, 1, rotary_dim]
-        sin = sin.unsqueeze(1)
-        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-        q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-        k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-        return torch.cat([q_embed, q_pass], dim=-1), torch.cat(
-            [k_embed, k_pass], dim=-1
-        )
-
-    return q, k
+    rotary_dim = cos.shape[-1]
+    unsqueeze_dim = 2 if q.dim() == 4 else 1
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_embed = (q_rot * cos) + (rotate_neox(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_neox(k_rot) * sin)
+    return torch.cat((q_embed, q_pass), dim=-1), torch.cat(
+        (k_embed, k_pass), dim=-1
+    )
 
 
 class WhisperAttention(nn.Module):

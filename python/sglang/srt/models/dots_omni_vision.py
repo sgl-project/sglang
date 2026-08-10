@@ -1,7 +1,6 @@
 import math
 from typing import Any
 
-# deep_gemm and sgl_kernel
 import deep_gemm
 import torch
 import torch.nn.functional as F
@@ -9,32 +8,17 @@ from deep_gemm import (
     get_mn_major_tma_aligned_tensor,
     per_block_cast_to_fp8,
 )
-from sgl_kernel import silu_and_mul
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.vision import VisionAttention as SGLVisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.layernorm import RMSNorm
 from torch import nn
 from torch.nn import LayerNorm
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
-
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb_vision(
-    tensor: torch.Tensor, freqs: torch.Tensor
-) -> torch.Tensor:
-    orig_dtype = tensor.dtype
-    tensor = tensor.float()
-    cos = freqs.cos().unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-    sin = freqs.sin().unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-    output = (tensor * cos) + (rotate_half(tensor) * sin)
-    return output.to(orig_dtype)
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -69,36 +53,37 @@ class VisionRotaryEmbedding(nn.Module):
         return self.freqs_cache[:seqlen]
 
 
-class _RMSNorm(nn.Module):
-    """Q/K norm matching Dots ViT's fp32 reduction semantics."""
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = x.float()
-        output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + self.eps)
-        return output.type_as(x) * self.weight
-
-
-class VisionAttention(nn.Module):
-    """QKV projection followed by SGLang varlen flash attention."""
+class VisionAttention(SGLVisionAttention):
+    """Dots checkpoint compatibility wrapper around SGLang vision attention."""
 
     def __init__(self, config: Any) -> None:
-        super().__init__()
         dim = config.embed_dim
-        self.num_heads = config.num_attention_heads
-        self.is_causal = config.is_causal
-        self.use_qk_norm = config.use_qk_norm
-        bias = config.use_bias
-        self.qkv = nn.Linear(dim, dim * 3, bias=bias)
-        self.proj = nn.Linear(dim, dim, bias=bias)
-        if self.use_qk_norm:
-            head_dim = dim // self.num_heads
-            self.q_norm = _RMSNorm(head_dim, eps=config.rms_norm_eps)
-            self.k_norm = _RMSNorm(head_dim, eps=config.rms_norm_eps)
+        super().__init__(
+            embed_dim=dim,
+            num_heads=config.num_attention_heads,
+            projection_size=dim,
+            use_qkv_parallel=True,
+            flatten_batch=True,
+            use_data_parallel=True,
+            qkv_bias=config.use_bias,
+            proj_bias=config.use_bias,
+            qk_normalization_by_head_size=config.use_qk_norm,
+            layer_norm_eps=config.rms_norm_eps,
+        )
+        self.register_load_state_dict_pre_hook(VisionAttention._map_qkv_weight)
+
+    @staticmethod
+    def _map_qkv_weight(
+        module: "VisionAttention",
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *args,
+    ) -> None:
+        for suffix in ("weight", "bias"):
+            source = f"{prefix}qkv.{suffix}"
+            target = f"{prefix}qkv_proj.{suffix}"
+            if source in state_dict and target not in state_dict:
+                state_dict[target] = state_dict.pop(source)
 
     def forward(
         self,
@@ -107,45 +92,13 @@ class VisionAttention(nn.Module):
         max_seqlen: int,
         rotary_pos_emb: torch.Tensor,
     ) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
-        q, k, v = (
-            self.qkv(hidden_states)
-            .reshape(seq_length, 3, self.num_heads, -1)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
+        output = super().forward(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=(rotary_pos_emb.cos(), rotary_pos_emb.sin()),
+            max_seqlen=max_seqlen,
         )
-        if self.use_qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
-        k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
-        attn_output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            causal=self.is_causal,
-        )
-        return self.proj(attn_output.reshape(seq_length, -1))
-
-
-def apply_vision_attention_residual(
-    attn: nn.Module,
-    norm: nn.Module,
-    hidden_states: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-    rotary_pos_emb: torch.Tensor,
-) -> torch.Tensor:
-    return hidden_states + attn(
-        norm(hidden_states),
-        cu_seqlens,
-        max_seqlen,
-        rotary_pos_emb,
-    )
+        return output.squeeze(0)
 
 
 class DotsMoEVitConfig(PretrainedConfig):
@@ -223,23 +176,6 @@ class DotsMoEVitConfig(PretrainedConfig):
         self.enable_fp8_moe = enable_fp8_moe
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
-
-    def extra_repr(self) -> str:
-        return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
-    def _norm(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-
 # ---- FFN modules ----
 
 
@@ -248,6 +184,7 @@ class DotsSwiGLUFFN(nn.Module):
         super().__init__()
         self.fc13 = nn.Linear(in_features, hidden_features * 2, bias=bias)
         self.fc2 = nn.Linear(hidden_features, in_features, bias=bias)
+        self.act = SiluAndMul()
         self.register_load_state_dict_pre_hook(
             DotsSwiGLUFFN._load_fused_fc13_from_split
         )
@@ -286,12 +223,7 @@ class DotsSwiGLUFFN(nn.Module):
             state_dict.pop(fc3_bias_key)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc13(x)
-        d = x.shape[-1] // 2
-        out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
-        x = self.fc2(out)
-        return x
+        return self.fc2(self.act(self.fc13(x)))
 
 
 def _ceil_to_multiple(v: int, multiple: int) -> int:
@@ -639,7 +571,7 @@ class DotsPatchEmbed(nn.Module):
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
         self.embed_dim = config.embed_dim
-        self.proj = nn.Conv2d(
+        self.proj = Conv2dLayer(
             config.num_channels,
             config.embed_dim,
             kernel_size=(config.patch_size, config.patch_size),
@@ -691,13 +623,8 @@ class MoEVisionBlock(nn.Module):
         rotary_pos_emb,
         max_seqlen: int,
     ) -> torch.Tensor:
-        hidden_states = apply_vision_attention_residual(
-            self.attn,
-            self.norm_1,
-            hidden_states,
-            cu_seqlens,
-            max_seqlen,
-            rotary_pos_emb,
+        hidden_states = hidden_states + self.attn(
+            self.norm_1(hidden_states), cu_seqlens, max_seqlen, rotary_pos_emb
         )
         hidden_states = hidden_states + self.mlp(self.norm_2(hidden_states))
         return hidden_states
