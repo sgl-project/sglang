@@ -930,9 +930,20 @@ def build_full_draft_pools(
     server_args: ServerArgs,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        HybridLinearKVPool,
+    )
 
     pool = draft_kv_pool
+    # Hybrid draft workers (for example Qwen3.5 MTP) are deliberately built
+    # with one full-attention layer while sharing the target request pool.  The
+    # HybridLinearKVPool wrapper therefore carries no draft-side linear state;
+    # its actual draft KV lives in the ordinary full-attention sub-pool.  Match
+    # the packed MTP path in build_hybrid_mamba_stack and register that sub-pool
+    # as the HiCache sidecar.
+    if isinstance(pool, HybridLinearKVPool):
+        pool = pool.full_kv_pool
     if pool.layer_num == 0:
         return [], []
 
