@@ -23,6 +23,7 @@ import inspect
 import logging
 import math
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -51,6 +52,31 @@ _CAKE_PACKED_QKV_WIDTH = 3 * _CAKE_PACKED_NUM_HEADS * _CAKE_PACKED_HEAD_DIM
 _CAKE_PACKED_GATE_WIDTH = _CAKE_PACKED_NUM_HEADS * _CAKE_PACKED_HEAD_DIM
 _CAKE_PACKED_SCALE = _CAKE_PACKED_HEAD_DIM**-0.5
 _CAKE_PACKED_LOWER_BOUND = -5.0
+
+
+class CakePackedDecodeReason:
+    """Stable CAKE packed-decode admission reason codes."""
+
+    ELIGIBLE = "eligible"
+    KERNEL_UNAVAILABLE = "kernel_unavailable"
+    REPLAYSSM_REQUESTED = "replayssm_requested"
+    UNSUPPORTED_CONTRACT = "unsupported_contract"
+    INNER_STRIDE = "inner_stride"
+    ZERO_ROW_STRIDE = "zero_row_stride"
+    NEGATIVE_ROW_STRIDE = "negative_row_stride"
+    OVERLAPPING_ROW_STRIDE = "overlapping_row_stride"
+    STORAGE_ALIAS = "storage_alias"
+    CACHE_INDEX_OOB = "cache_index_oob"
+    CACHE_INDEX_DUPLICATE = "cache_index_duplicate"
+
+
+@dataclass(frozen=True)
+class CakePackedDecodeAdmission:
+    """One terminal selector result for a packed CAKE decode attempt."""
+
+    eligible: bool
+    reason: str
+    detail: str = ""
 
 
 def _get_flashinfer_kda_kernel():
@@ -439,11 +465,17 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float],
         is_spec_decode: bool,
         return_intermediate_states: bool,
+        track_ssm_h_src: Optional[torch.Tensor],
     ) -> bool:
         """Check the public frozen-prefill contract without a device sync."""
+        needs_interior_snapshot = (
+            return_intermediate_states
+            and track_ssm_h_src is not None
+            and track_ssm_h_src.numel() > 0
+        )
         if (
             is_spec_decode
-            or return_intermediate_states
+            or needs_interior_snapshot
             or lower_bound is None
             or not math.isfinite(float(lower_bound))
             or float(lower_bound) >= 0.0
@@ -524,6 +556,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             return_intermediate_states=return_intermediate_states,
             **kwargs,
         )
+        track_ssm_h_src = kwargs.get("track_ssm_h_src")
         if not self._cake_prefill_is_supported(
             q,
             k,
@@ -536,6 +569,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             lower_bound=lower_bound,
             is_spec_decode=is_spec_decode,
             return_intermediate_states=return_intermediate_states,
+            track_ssm_h_src=track_ssm_h_src,
         ):
             return self._extend_triton(q, k, v, g, beta, **fallback_kwargs)
 
@@ -585,6 +619,15 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         if final_state is None:
             raise RuntimeError("FlashInfer CAKE prefill did not return final state")
         ssm_states.index_copy_(0, state_indices, final_state)
+        if return_intermediate_states:
+            # Boundary-aligned track: _track_mamba_state_extend consumes the
+            # final state already scattered above. With no interior h source,
+            # match NvidiaKDAKernel's empty stand-in while preserving the
+            # ordinary CAKE output/final-state path bit for bit.
+            h_empty = q.new_empty(
+                (1, 0) + tuple(ssm_states.shape[1:]), dtype=torch.float32
+            )
+            return output, h_empty
         return output
 
     # ---- decode ----
@@ -824,6 +867,342 @@ class CakeKDAKernel(FlashInferKDAKernel):
         super().__init__(backend="cake")
         available, packed_kda_decode = _get_flashinfer_packed_kda_kernel()
         self._packed_kda_decode = packed_kda_decode if available else None
+        self._last_packed_decode_admission = CakePackedDecodeAdmission(
+            False, CakePackedDecodeReason.KERNEL_UNAVAILABLE
+        )
+
+    @staticmethod
+    def _cake_reject(reason: str, detail: str = "") -> CakePackedDecodeAdmission:
+        return CakePackedDecodeAdmission(False, reason, detail)
+
+    @staticmethod
+    def _cake_row_stride_admission(
+        name: str, row_stride: int, row_width: int
+    ) -> Optional[CakePackedDecodeAdmission]:
+        """Validate one frozen-ABI row stride with stable failure ordering."""
+        if row_stride == 0:
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.ZERO_ROW_STRIDE, name
+            )
+        if row_stride < 0:
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.NEGATIVE_ROW_STRIDE, name
+            )
+        if row_stride < row_width:
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.OVERLAPPING_ROW_STRIDE, name
+            )
+        return None
+
+    @staticmethod
+    def _cake_packed_row_admission(
+        tensor: torch.Tensor,
+        *,
+        name: str,
+        batch_size: int,
+        row_width: int,
+    ) -> tuple[Optional[CakePackedDecodeAdmission], Optional[int]]:
+        """Admit a row view that can be formed without changing ptr/offset."""
+        shape = tuple(tensor.shape)
+        allowed_shapes = {
+            (batch_size, row_width),
+            (batch_size, 1, row_width),
+            (1, batch_size, row_width),
+        }
+        if shape not in allowed_shapes:
+            return (
+                CakeKDAKernel._cake_reject(
+                    CakePackedDecodeReason.UNSUPPORTED_CONTRACT, f"{name}.shape"
+                ),
+                None,
+            )
+        try:
+            row_view = CakeKDAKernel._cake_packed_row_view(
+                tensor, batch_size=batch_size, row_width=row_width
+            )
+        except RuntimeError:
+            return (
+                CakeKDAKernel._cake_reject(
+                    CakePackedDecodeReason.UNSUPPORTED_CONTRACT, f"{name}.view"
+                ),
+                None,
+            )
+        if row_view.stride(1) != 1:
+            return (
+                CakeKDAKernel._cake_reject(CakePackedDecodeReason.INNER_STRIDE, name),
+                None,
+            )
+        row_stride = row_view.stride(0)
+        rejected = CakeKDAKernel._cake_row_stride_admission(name, row_stride, row_width)
+        return rejected, row_stride
+
+    @staticmethod
+    def _cake_packed_row_view(
+        tensor: torch.Tensor, *, batch_size: int, row_width: int
+    ) -> torch.Tensor:
+        """Form the exact two-dimensional ABI view without canonicalizing B=1."""
+        shape = tuple(tensor.shape)
+        if shape == (batch_size, row_width):
+            row_stride = tensor.stride(0)
+        elif shape == (batch_size, 1, row_width) and shape != (
+            1,
+            batch_size,
+            row_width,
+        ):
+            row_stride = tensor.stride(0)
+        elif shape == (1, batch_size, row_width) and shape != (
+            batch_size,
+            1,
+            row_width,
+        ):
+            row_stride = tensor.stride(1)
+        else:
+            # B=1 makes the two SGLang singleton layouts shape-identical.
+            # Preserve the padded row pitch rather than letting view() replace
+            # it with the logical width.
+            row_stride = max(tensor.stride(0), tensor.stride(1))
+        return tensor.as_strided(
+            (batch_size, row_width),
+            (row_stride, tensor.stride(-1)),
+            storage_offset=tensor.storage_offset(),
+        )
+
+    @staticmethod
+    def _cake_tensor_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+        """Mirror FlashInfer's positive-stride bounding byte-range check."""
+        if tensor.numel() == 0:
+            start = int(tensor.data_ptr())
+            return start, start
+        last_element = sum(
+            (int(size) - 1) * int(stride)
+            for size, stride in zip(tensor.shape, tensor.stride())
+        )
+        start = int(tensor.data_ptr())
+        return start, start + (last_element + 1) * tensor.element_size()
+
+    @staticmethod
+    def _cake_tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+        lhs_begin, lhs_end = CakeKDAKernel._cake_tensor_byte_range(lhs)
+        rhs_begin, rhs_end = CakeKDAKernel._cake_tensor_byte_range(rhs)
+        return lhs_begin < rhs_end and rhs_begin < lhs_end
+
+    @staticmethod
+    def _cake_packed_decode_cuda_device_reason(
+        mixed_qkv: torch.Tensor, tensors: tuple[torch.Tensor, ...]
+    ) -> Optional[CakePackedDecodeAdmission]:
+        """Require one CUDA device; split out so CPU/mock canaries stay pure."""
+        if not mixed_qkv.is_cuda:
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "mixed_qkv.device"
+            )
+        device = mixed_qkv.device
+        if any(not tensor.is_cuda or tensor.device != device for tensor in tensors):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "device_mismatch"
+            )
+        return None
+
+    @staticmethod
+    def _cake_cache_index_admission(
+        values, *, batch_size: int, state_slots: int
+    ) -> Optional[CakePackedDecodeAdmission]:
+        """Validate a host-visible mirror of FlashInfer's index contract."""
+        if torch.is_tensor(values):
+            if values.device.type != "cpu" or values.numel() != batch_size:
+                return CakeKDAKernel._cake_reject(
+                    CakePackedDecodeReason.UNSUPPORTED_CONTRACT,
+                    "cache_indices_cpu",
+                )
+            values = values.reshape(-1).tolist()
+        else:
+            values = list(values)
+            if len(values) != batch_size:
+                return CakeKDAKernel._cake_reject(
+                    CakePackedDecodeReason.UNSUPPORTED_CONTRACT,
+                    "cache_indices_cpu",
+                )
+        active = []
+        for value in values:
+            value = int(value)
+            if value < -1 or value >= state_slots:
+                return CakeKDAKernel._cake_reject(
+                    CakePackedDecodeReason.CACHE_INDEX_OOB, "cache_indices"
+                )
+            if value >= 0:
+                active.append(value)
+        if len(active) != len(set(active)):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.CACHE_INDEX_DUPLICATE, "cache_indices"
+            )
+        return None
+
+    @staticmethod
+    def _cake_packed_decode_admission(
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        scale: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_v_heads: int,
+        head_v_dim: int,
+        lower_bound: Optional[float],
+        cache_indices_cpu=None,
+    ) -> CakePackedDecodeAdmission:
+        """Return the exact frozen-ABI selector result without tensor copies.
+
+        FlashInfer intentionally treats CUDA index values as a caller contract
+        to avoid a device-to-host synchronization. SGLang applies the value
+        checks whenever the tensor is already on CPU (CPU/mock canaries), or
+        when the caller supplies an existing CPU mirror.
+        """
+        batch_size = mixed_qkv.shape[0] if mixed_qkv.ndim == 2 else -1
+        state_inner_size = (
+            _CAKE_PACKED_NUM_HEADS * _CAKE_PACKED_HEAD_DIM * _CAKE_PACKED_HEAD_DIM
+        )
+        if not isinstance(scale, (int, float)) or not isinstance(
+            lower_bound, (int, float)
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "scalars"
+            )
+        if not math.isclose(
+            scale, _CAKE_PACKED_SCALE, rel_tol=0.0, abs_tol=1e-12
+        ) or not math.isclose(
+            lower_bound,
+            _CAKE_PACKED_LOWER_BOUND,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "scalars"
+            )
+        if (
+            batch_size <= 0
+            or batch_size > 65535
+            or tuple(mixed_qkv.shape) != (batch_size, _CAKE_PACKED_QKV_WIDTH)
+            or mixed_qkv.dtype != torch.bfloat16
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "mixed_qkv"
+            )
+
+        rejected, _ = CakeKDAKernel._cake_packed_row_admission(
+            mixed_qkv,
+            name="mixed_qkv",
+            batch_size=batch_size,
+            row_width=_CAKE_PACKED_QKV_WIDTH,
+        )
+        if rejected is not None:
+            return rejected
+        if a.dtype != torch.bfloat16:
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "raw_gate.dtype"
+            )
+        rejected, _ = CakeKDAKernel._cake_packed_row_admission(
+            a,
+            name="raw_gate",
+            batch_size=batch_size,
+            row_width=_CAKE_PACKED_GATE_WIDTH,
+        )
+        if rejected is not None:
+            return rejected
+        if b.dtype != torch.bfloat16:
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "raw_beta.dtype"
+            )
+        rejected, _ = CakeKDAKernel._cake_packed_row_admission(
+            b,
+            name="raw_beta",
+            batch_size=batch_size,
+            row_width=_CAKE_PACKED_NUM_HEADS,
+        )
+        if rejected is not None:
+            return rejected
+
+        if (
+            A_log.dtype != torch.float32
+            or dt_bias.dtype != torch.float32
+            or not A_log.is_contiguous()
+            or not dt_bias.is_contiguous()
+            or A_log.numel() != _CAKE_PACKED_NUM_HEADS
+            or dt_bias.numel() != _CAKE_PACKED_GATE_WIDTH
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "gate_params"
+            )
+        if (
+            ssm_states.dtype != torch.bfloat16
+            or ssm_states.ndim != 4
+            or tuple(ssm_states.shape[1:])
+            != (
+                _CAKE_PACKED_NUM_HEADS,
+                _CAKE_PACKED_HEAD_DIM,
+                _CAKE_PACKED_HEAD_DIM,
+            )
+            or ssm_states.shape[0] <= 0
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "state"
+            )
+        if ssm_states.stride()[1:] != (
+            _CAKE_PACKED_HEAD_DIM * _CAKE_PACKED_HEAD_DIM,
+            _CAKE_PACKED_HEAD_DIM,
+            1,
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.INNER_STRIDE, "state"
+            )
+        rejected = CakeKDAKernel._cake_row_stride_admission(
+            "state", ssm_states.stride(0), state_inner_size
+        )
+        if rejected is not None:
+            return rejected
+        if (
+            cache_indices.dtype != torch.int32
+            or not cache_indices.is_contiguous()
+            or tuple(cache_indices.shape) != (batch_size,)
+            or num_v_heads != _CAKE_PACKED_NUM_HEADS
+            or head_v_dim != _CAKE_PACKED_HEAD_DIM
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.UNSUPPORTED_CONTRACT, "indices_or_heads"
+            )
+
+        rejected = CakeKDAKernel._cake_packed_decode_cuda_device_reason(
+            mixed_qkv, (a, b, A_log, dt_bias, ssm_states, cache_indices)
+        )
+        if rejected is not None:
+            return rejected
+
+        for tensor_name, tensor in (
+            ("mixed_qkv", mixed_qkv),
+            ("raw_gate", a),
+            ("raw_beta", b),
+            ("A_log", A_log),
+            ("dt_bias", dt_bias),
+            ("state_indices", cache_indices),
+        ):
+            if CakeKDAKernel._cake_tensors_overlap(ssm_states, tensor):
+                return CakeKDAKernel._cake_reject(
+                    CakePackedDecodeReason.STORAGE_ALIAS, f"state:{tensor_name}"
+                )
+
+        host_indices = cache_indices_cpu
+        if host_indices is None and cache_indices.device.type == "cpu":
+            host_indices = cache_indices
+        if host_indices is not None:
+            rejected = CakeKDAKernel._cake_cache_index_admission(
+                host_indices,
+                batch_size=batch_size,
+                state_slots=ssm_states.shape[0],
+            )
+            if rejected is not None:
+                return rejected
+        return CakePackedDecodeAdmission(True, CakePackedDecodeReason.ELIGIBLE)
 
     @staticmethod
     def _cake_packed_decode_is_supported(
@@ -839,85 +1218,23 @@ class CakeKDAKernel(FlashInferKDAKernel):
         num_v_heads: int,
         head_v_dim: int,
         lower_bound: Optional[float],
+        cache_indices_cpu=None,
     ) -> bool:
-        """Check the frozen Kimi-K3 TP8 packed ABI without a device sync."""
-        batch_size = mixed_qkv.shape[0] if mixed_qkv.ndim == 2 else -1
-        state_inner_size = (
-            _CAKE_PACKED_NUM_HEADS * _CAKE_PACKED_HEAD_DIM * _CAKE_PACKED_HEAD_DIM
-        )
-        if not isinstance(scale, (int, float)) or not isinstance(
-            lower_bound, (int, float)
-        ):
-            return False
-        scale_matches = math.isclose(
-            scale, _CAKE_PACKED_SCALE, rel_tol=0.0, abs_tol=1e-12
-        )
-        lower_bound_matches = math.isclose(
-            lower_bound,
-            _CAKE_PACKED_LOWER_BOUND,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-
-        if (
-            batch_size <= 0
-            or batch_size > 65535
-            or tuple(mixed_qkv.shape) != (batch_size, _CAKE_PACKED_QKV_WIDTH)
-            or mixed_qkv.dtype != torch.bfloat16
-            or not mixed_qkv.is_cuda
-            or mixed_qkv.stride(1) != 1
-            or mixed_qkv.stride(0) < _CAKE_PACKED_QKV_WIDTH
-            or mixed_qkv.stride(0) <= 0
-            or a.dtype != torch.bfloat16
-            or b.dtype != torch.bfloat16
-            or not a.is_cuda
-            or not b.is_cuda
-            or not a.is_contiguous()
-            or not b.is_contiguous()
-            or a.numel() != batch_size * _CAKE_PACKED_GATE_WIDTH
-            or b.numel() != batch_size * _CAKE_PACKED_NUM_HEADS
-            or A_log.dtype != torch.float32
-            or dt_bias.dtype != torch.float32
-            or not A_log.is_cuda
-            or not dt_bias.is_cuda
-            or not A_log.is_contiguous()
-            or not dt_bias.is_contiguous()
-            or A_log.numel() != _CAKE_PACKED_NUM_HEADS
-            or dt_bias.numel() != _CAKE_PACKED_GATE_WIDTH
-            or ssm_states.dtype != torch.bfloat16
-            or not ssm_states.is_cuda
-            or ssm_states.ndim != 4
-            or tuple(ssm_states.shape[1:])
-            != (
-                _CAKE_PACKED_NUM_HEADS,
-                _CAKE_PACKED_HEAD_DIM,
-                _CAKE_PACKED_HEAD_DIM,
-            )
-            or ssm_states.shape[0] <= 0
-            or ssm_states.stride()[1:]
-            != (
-                _CAKE_PACKED_HEAD_DIM * _CAKE_PACKED_HEAD_DIM,
-                _CAKE_PACKED_HEAD_DIM,
-                1,
-            )
-            or ssm_states.stride(0) < state_inner_size
-            or ssm_states.stride(0) <= 0
-            or cache_indices.dtype != torch.int32
-            or not cache_indices.is_cuda
-            or not cache_indices.is_contiguous()
-            or tuple(cache_indices.shape) != (batch_size,)
-            or num_v_heads != _CAKE_PACKED_NUM_HEADS
-            or head_v_dim != _CAKE_PACKED_HEAD_DIM
-            or not scale_matches
-            or not lower_bound_matches
-        ):
-            return False
-
-        device = mixed_qkv.device
-        return all(
-            tensor.device == device
-            for tensor in (a, b, A_log, dt_bias, ssm_states, cache_indices)
-        )
+        """Compatibility boolean for callers that only need eligibility."""
+        return CakeKDAKernel._cake_packed_decode_admission(
+            mixed_qkv,
+            a,
+            b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            lower_bound=lower_bound,
+            cache_indices_cpu=cache_indices_cpu,
+        ).eligible
 
     @staticmethod
     def _packed_decode_triton(
@@ -968,6 +1285,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
         num_v_heads: int,
         head_v_dim: int,
         lower_bound: Optional[float] = None,
+        cache_indices_cpu=None,
         **kwargs,
     ) -> torch.Tensor:
         """Run CAKE's exact packed decode or explicitly retain Triton semantics."""
@@ -982,9 +1300,16 @@ class CakeKDAKernel(FlashInferKDAKernel):
                 "replayssm_force_flush",
             )
         )
-        covered = (
-            self._packed_kda_decode is not None
-            and self._cake_packed_decode_is_supported(
+        if replay_requested:
+            admission = CakePackedDecodeAdmission(
+                False, CakePackedDecodeReason.REPLAYSSM_REQUESTED
+            )
+        elif self._packed_kda_decode is None:
+            admission = CakePackedDecodeAdmission(
+                False, CakePackedDecodeReason.KERNEL_UNAVAILABLE
+            )
+        else:
+            admission = self._cake_packed_decode_admission(
                 mixed_qkv,
                 a,
                 b,
@@ -996,9 +1321,10 @@ class CakeKDAKernel(FlashInferKDAKernel):
                 num_v_heads=num_v_heads,
                 head_v_dim=head_v_dim,
                 lower_bound=lower_bound,
+                cache_indices_cpu=cache_indices_cpu,
             )
-        )
-        if replay_requested or not covered:
+        self._last_packed_decode_admission = admission
+        if not admission.eligible:
             return self._packed_decode_triton(
                 mixed_qkv,
                 a,
@@ -1015,8 +1341,15 @@ class CakeKDAKernel(FlashInferKDAKernel):
             )
 
         batch_size = mixed_qkv.shape[0]
-        raw_gate = a.view(batch_size, _CAKE_PACKED_GATE_WIDTH)
-        raw_beta = b.view(batch_size, _CAKE_PACKED_NUM_HEADS)
+        # These are metadata-only views: positive disjoint row strides are
+        # forwarded to FlashInfer unchanged, including the production beta
+        # stride (144, 1). Neither call changes data_ptr/storage_offset.
+        raw_gate = self._cake_packed_row_view(
+            a, batch_size=batch_size, row_width=_CAKE_PACKED_GATE_WIDTH
+        )
+        raw_beta = self._cake_packed_row_view(
+            b, batch_size=batch_size, row_width=_CAKE_PACKED_NUM_HEADS
+        )
         output = mixed_qkv.new_empty(
             batch_size, 1, _CAKE_PACKED_NUM_HEADS, _CAKE_PACKED_HEAD_DIM
         )

@@ -8,7 +8,11 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.layers.attention.linear.kernels import kda_flashinfer
-from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import CakeKDAKernel
+from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+    CakeKDAKernel,
+    CakePackedDecodeAdmission,
+    CakePackedDecodeReason,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -125,6 +129,144 @@ class TestFlashInferPackedKDALoader(CustomTestCase):
         self.assertEqual(first, (False, None))
         self.assertEqual(second, first)
         version_check.assert_not_called()
+
+
+class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
+    @staticmethod
+    def _selector_tensor(shape, *, dtype=torch.bfloat16, is_cuda=True):
+        tensor = Mock()
+        tensor.shape = shape
+        tensor.ndim = len(shape)
+        tensor.dtype = dtype
+        tensor.is_cuda = is_cuda
+        return tensor
+
+    def test_empty_interior_checkpoint_keeps_prefill_selector_parity(self):
+        q = self._selector_tensor((1, 5, 12, 128))
+        k = self._selector_tensor((1, 5, 12, 128))
+        v = self._selector_tensor((1, 5, 12, 128))
+        g = self._selector_tensor((1, 5, 12, 128))
+        beta = self._selector_tensor((1, 5, 12))
+        query_start_loc = Mock()
+        query_start_loc.numel.return_value = 3
+        A_log = Mock()
+        dt_bias = Mock()
+
+        with (
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+        ):
+            without_checkpoint = CakeKDAKernel._cake_prefill_is_supported(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=query_start_loc,
+                lower_bound=-5.0,
+                is_spec_decode=False,
+                return_intermediate_states=False,
+                track_ssm_h_src=None,
+            )
+            aligned_checkpoint = CakeKDAKernel._cake_prefill_is_supported(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=query_start_loc,
+                lower_bound=-5.0,
+                is_spec_decode=False,
+                return_intermediate_states=True,
+                track_ssm_h_src=torch.empty(0, dtype=torch.int64),
+            )
+            interior_checkpoint = CakeKDAKernel._cake_prefill_is_supported(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=query_start_loc,
+                lower_bound=-5.0,
+                is_spec_decode=False,
+                return_intermediate_states=True,
+                track_ssm_h_src=torch.ones(1, dtype=torch.int64),
+            )
+
+        self.assertTrue(without_checkpoint)
+        self.assertEqual(aligned_checkpoint, without_checkpoint)
+        self.assertFalse(interior_checkpoint)
+
+    @staticmethod
+    def _prefill_inputs():
+        torch.manual_seed(7)
+        tokens = 5
+        return {
+            "q": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
+            "k": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
+            "v": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
+            "g": torch.randn(1, tokens, 12, 128, dtype=torch.bfloat16),
+            "beta": torch.rand(1, tokens, 12, dtype=torch.float32),
+            "cache_indices": torch.tensor([2, 0], dtype=torch.int32),
+            "query_start_loc": torch.tensor([0, 2, 5], dtype=torch.int32),
+            "A_log": torch.randn(1, 1, 12, 1, dtype=torch.float32),
+            "dt_bias": torch.randn(12 * 128, dtype=torch.float32),
+        }
+
+    def test_aligned_checkpoint_uses_same_cake_final_state_bitwise(self):
+        kernel = object.__new__(CakeKDAKernel)
+        kernel._backend = "cake"
+        kernel._gate_cache = {}
+        cake_calls = []
+
+        def fake_recurrent_kda(**kwargs):
+            cake_calls.append(kwargs)
+            return kwargs["v"].clone(), kwargs["initial_state"] + 1
+
+        inputs = self._prefill_inputs()
+        state_false = torch.randn(4, 12, 128, 128, dtype=torch.bfloat16)
+        state_true = state_false.clone()
+        with (
+            patch.object(
+                kernel, "_cake_prefill_is_supported", return_value=True
+            ) as selector,
+            patch.object(
+                kernel,
+                "_extend_triton",
+                side_effect=AssertionError("aligned checkpoint fell back to Triton"),
+            ),
+            patch.object(
+                kda_flashinfer,
+                "_get_flashinfer_kda_prefill_kernel",
+                return_value=(True, fake_recurrent_kda),
+            ),
+        ):
+            output_false = kernel.extend(
+                **inputs,
+                ssm_states=state_false,
+                lower_bound=-5.0,
+                return_intermediate_states=False,
+            )
+            output_true, h_empty = kernel.extend(
+                **inputs,
+                ssm_states=state_true,
+                lower_bound=-5.0,
+                return_intermediate_states=True,
+                track_ssm_h_src=torch.empty(0, dtype=torch.int64),
+            )
+
+        self.assertEqual(selector.call_count, 2)
+        self.assertEqual(len(cake_calls), 2)
+        self.assertTrue(torch.equal(output_true, output_false))
+        self.assertTrue(torch.equal(state_true, state_false))
+        self.assertEqual(h_empty.shape, (1, 0, 12, 128, 128))
+        self.assertEqual(h_empty.dtype, torch.float32)
 
 
 class TestCakeKDAIndexedStateAdapter(CustomTestCase):
@@ -270,10 +412,74 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         }
 
     @staticmethod
+    def _strided_rows(batch_size, width, row_stride, *, storage_offset=7):
+        storage = torch.empty(
+            storage_offset + (batch_size - 1) * row_stride + width,
+            dtype=torch.bfloat16,
+        )
+        return storage.as_strided(
+            (batch_size, width),
+            (row_stride, 1),
+            storage_offset=storage_offset,
+        )
+
+    @classmethod
+    def _row_strided_inputs(cls, batch_size=8):
+        mixed_qkv = cls._strided_rows(batch_size, 4608, 4672)
+        raw_gate = cls._strided_rows(batch_size, 12 * 128, 1600).unsqueeze(1)
+        raw_beta = cls._strided_rows(batch_size, 12, 144).unsqueeze(0)
+        return {
+            "mixed_qkv": mixed_qkv,
+            "a": raw_gate,
+            "b": raw_beta,
+            "A_log": torch.empty(1, 1, 12, 1, dtype=torch.float32),
+            "dt_bias": torch.empty(12 * 128, dtype=torch.float32),
+            "scale": 128**-0.5,
+            "ssm_states": torch.empty(
+                batch_size + 1,
+                12,
+                128,
+                128,
+                dtype=torch.bfloat16,
+            ),
+            "cache_indices": torch.arange(batch_size, dtype=torch.int32),
+            "num_v_heads": 12,
+            "head_v_dim": 128,
+            "lower_bound": -5.0,
+        }
+
+    @staticmethod
     def _kernel(packed_decode):
         kernel = object.__new__(CakeKDAKernel)
         kernel._packed_kda_decode = packed_decode
+        kernel._last_packed_decode_admission = CakePackedDecodeAdmission(
+            False, CakePackedDecodeReason.KERNEL_UNAVAILABLE
+        )
         return kernel
+
+    @staticmethod
+    def _admission(inputs):
+        with patch.object(
+            CakeKDAKernel,
+            "_cake_packed_decode_cuda_device_reason",
+            return_value=None,
+        ):
+            return CakeKDAKernel._cake_packed_decode_admission(**inputs)
+
+    def test_selector_accepts_all_h12_batches_and_beta_stride_144(self):
+        for batch_size in (1, 8, 31, 32, 64, 128):
+            with self.subTest(batch_size=batch_size):
+                inputs = self._row_strided_inputs(batch_size)
+                admission = self._admission(inputs)
+
+                self.assertTrue(admission.eligible, admission)
+                self.assertEqual(admission.reason, CakePackedDecodeReason.ELIGIBLE)
+                self.assertEqual(
+                    CakeKDAKernel._cake_packed_row_view(
+                        inputs["b"], batch_size=batch_size, row_width=12
+                    ).stride(),
+                    (144, 1),
+                )
 
     def test_exact_contract_forwards_original_packed_inputs_and_owned_output(self):
         calls = []
@@ -284,12 +490,12 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
             return kwargs["output"]
 
         kernel = self._kernel(fake_packed_decode)
-        inputs = self._inputs()
+        inputs = self._row_strided_inputs(batch_size=8)
         with (
             patch.object(
-                kernel,
-                "_cake_packed_decode_is_supported",
-                return_value=True,
+                CakeKDAKernel,
+                "_cake_packed_decode_cuda_device_reason",
+                return_value=None,
             ),
             patch.object(
                 torch.Tensor,
@@ -316,14 +522,26 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         self.assertIs(call["state_indices"], inputs["cache_indices"])
         self.assertEqual(call["raw_gate"].data_ptr(), inputs["a"].data_ptr())
         self.assertEqual(call["raw_beta"].data_ptr(), inputs["b"].data_ptr())
+        self.assertEqual(
+            call["raw_gate"].storage_offset(), inputs["a"].storage_offset()
+        )
+        self.assertEqual(
+            call["raw_beta"].storage_offset(), inputs["b"].storage_offset()
+        )
+        self.assertEqual(call["raw_gate"].stride(), (1600, 1))
+        self.assertEqual(call["raw_beta"].stride(), (144, 1))
         self.assertEqual(call["A_log"].data_ptr(), inputs["A_log"].data_ptr())
         self.assertEqual(call["dt_bias"].data_ptr(), inputs["dt_bias"].data_ptr())
-        self.assertEqual(call["output"].shape, (2, 1, 12, 128))
+        self.assertEqual(call["output"].shape, (8, 1, 12, 128))
         self.assertEqual(call["output"].dtype, torch.bfloat16)
         self.assertTrue(call["output"].is_contiguous())
-        self.assertEqual(output.shape, (1, 2, 12, 128))
+        self.assertEqual(output.shape, (1, 8, 12, 128))
         self.assertEqual(output.data_ptr(), call["output"].data_ptr())
         self.assertTrue(torch.equal(output, torch.ones_like(output)))
+        self.assertEqual(
+            kernel._last_packed_decode_admission.reason,
+            CakePackedDecodeReason.ELIGIBLE,
+        )
 
     def test_unsupported_contract_falls_back_to_triton_packed_decode(self):
         packed_decode = Mock(
@@ -335,8 +553,10 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         with (
             patch.object(
                 kernel,
-                "_cake_packed_decode_is_supported",
-                return_value=False,
+                "_cake_packed_decode_admission",
+                return_value=CakePackedDecodeAdmission(
+                    False, CakePackedDecodeReason.INNER_STRIDE, "raw_beta"
+                ),
             ),
             patch.object(
                 kernel,
@@ -349,6 +569,108 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         self.assertIs(output, sentinel)
         fallback.assert_called_once()
         packed_decode.assert_not_called()
+        self.assertEqual(
+            kernel._last_packed_decode_admission.reason,
+            CakePackedDecodeReason.INNER_STRIDE,
+        )
+
+    def test_selector_reports_stable_stride_reasons(self):
+        batch_size = 8
+        inputs = self._row_strided_inputs(batch_size)
+
+        inner_storage = torch.empty(
+            (batch_size - 1) * 144 + (12 - 1) * 2 + 1,
+            dtype=torch.bfloat16,
+        )
+        inputs["b"] = inner_storage.as_strided((batch_size, 12), (144, 2)).unsqueeze(0)
+        self.assertEqual(
+            self._admission(inputs).reason, CakePackedDecodeReason.INNER_STRIDE
+        )
+
+        inputs = self._row_strided_inputs(batch_size)
+        inputs["b"] = (
+            torch.empty(1, 12, dtype=torch.bfloat16).expand(batch_size, 12).unsqueeze(0)
+        )
+        self.assertEqual(
+            self._admission(inputs).reason, CakePackedDecodeReason.ZERO_ROW_STRIDE
+        )
+
+        inputs = self._row_strided_inputs(batch_size)
+        overlap_storage = torch.empty((batch_size - 1) * 11 + 12, dtype=torch.bfloat16)
+        inputs["b"] = overlap_storage.as_strided((batch_size, 12), (11, 1)).unsqueeze(0)
+        self.assertEqual(
+            self._admission(inputs).reason,
+            CakePackedDecodeReason.OVERLAPPING_ROW_STRIDE,
+        )
+
+        negative = CakeKDAKernel._cake_row_stride_admission("raw_beta", -1, 12)
+        self.assertEqual(negative.reason, CakePackedDecodeReason.NEGATIVE_ROW_STRIDE)
+        self.assertEqual(CakePackedDecodeReason.INNER_STRIDE, "inner_stride")
+        self.assertEqual(CakePackedDecodeReason.ZERO_ROW_STRIDE, "zero_row_stride")
+        self.assertEqual(
+            CakePackedDecodeReason.OVERLAPPING_ROW_STRIDE,
+            "overlapping_row_stride",
+        )
+        self.assertEqual(
+            CakePackedDecodeReason.NEGATIVE_ROW_STRIDE, "negative_row_stride"
+        )
+
+    def test_selector_reports_storage_alias(self):
+        inputs = self._row_strided_inputs(batch_size=2)
+        inputs["mixed_qkv"] = (
+            inputs["ssm_states"].view(-1).as_strided((2, 4608), (4608, 1))
+        )
+
+        admission = self._admission(inputs)
+
+        self.assertEqual(admission.reason, CakePackedDecodeReason.STORAGE_ALIAS)
+        self.assertEqual(admission.detail, "state:mixed_qkv")
+
+    def test_selector_reports_oob_before_duplicate_indices(self):
+        inputs = self._row_strided_inputs(batch_size=2)
+        inputs["cache_indices"] = torch.tensor(
+            [0, inputs["ssm_states"].shape[0]], dtype=torch.int32
+        )
+        self.assertEqual(
+            self._admission(inputs).reason, CakePackedDecodeReason.CACHE_INDEX_OOB
+        )
+
+        inputs["cache_indices"] = torch.tensor([1, 1], dtype=torch.int32)
+        self.assertEqual(
+            self._admission(inputs).reason,
+            CakePackedDecodeReason.CACHE_INDEX_DUPLICATE,
+        )
+        self.assertEqual(CakePackedDecodeReason.CACHE_INDEX_OOB, "cache_index_oob")
+        self.assertEqual(
+            CakePackedDecodeReason.CACHE_INDEX_DUPLICATE,
+            "cache_index_duplicate",
+        )
+
+    def test_invalid_indices_fall_back_with_zero_cake_activity(self):
+        packed_decode = Mock(side_effect=AssertionError("invalid indices reached CAKE"))
+        kernel = self._kernel(packed_decode)
+        inputs = self._row_strided_inputs(batch_size=2)
+        inputs["cache_indices"] = torch.tensor([0, 0], dtype=torch.int32)
+        sentinel = torch.empty(1, 2, 12, 128, dtype=torch.bfloat16)
+        with (
+            patch.object(
+                CakeKDAKernel,
+                "_cake_packed_decode_cuda_device_reason",
+                return_value=None,
+            ),
+            patch.object(
+                kernel, "_packed_decode_triton", return_value=sentinel
+            ) as fallback,
+        ):
+            output = kernel.packed_decode(**inputs)
+
+        self.assertIs(output, sentinel)
+        self.assertEqual(fallback.call_count, 1)
+        packed_decode.assert_not_called()
+        self.assertEqual(
+            kernel._last_packed_decode_admission.reason,
+            CakePackedDecodeReason.CACHE_INDEX_DUPLICATE,
+        )
 
     def test_selector_rejects_batch_outside_cuda_grid_y(self):
         class OversizedMixedQKV:
@@ -389,11 +711,6 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         with (
             patch.object(
                 kernel,
-                "_cake_packed_decode_is_supported",
-                return_value=True,
-            ),
-            patch.object(
-                kernel,
                 "_packed_decode_triton",
                 side_effect=NotImplementedError(safe_gate_error),
             ) as fallback,
@@ -406,6 +723,10 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
             self.assertIs(fallback.call_args.kwargs[name], tensor)
         self.assertEqual(fallback.call_args.kwargs["lower_bound"], -5.0)
         packed_decode.assert_not_called()
+        self.assertEqual(
+            kernel._last_packed_decode_admission.reason,
+            CakePackedDecodeReason.REPLAYSSM_REQUESTED,
+        )
 
 
 if __name__ == "__main__":
