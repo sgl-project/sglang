@@ -588,6 +588,15 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa = self._resolve(enable_breakable_cuda_graph=True)
         self.assertEqual(sa.warmup_mode, "server")
 
+    def test_breakable_cuda_graph_allows_unset_resolutions(self):
+        # BCG no longer hard-requires --warmup-resolutions; the model
+        # default warmup resolution is captured at warmup instead.
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.enable_breakable_cuda_graph = True
+        sa.warmup_resolutions = None
+        sa.bcg_text_buckets = None
+        sa._validate_breakable_cuda_graph()  # must not raise
+
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
