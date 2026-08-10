@@ -14,6 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.qknorm_rope import (
+    can_use_fused_qknorm_rope_pack_kv,
+    fused_qknorm_rope_pack_kv,
+)
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
@@ -232,6 +236,48 @@ def _apply_qwen3_qk_norm_rope(
         is_neox=True,
         positions=rope_cache_positions,
     )
+
+
+def _apply_qwen3_qk_norm_rope_pack_kv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+    rope_cache_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, suffix_tokens, _, _ = q.shape
+    prefix_tokens = k_prefix.shape[1]
+    packed_kv = torch.empty(
+        2,
+        batch_size,
+        prefix_tokens + suffix_tokens,
+        k.shape[2],
+        head_dim,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    fused_qknorm_rope_pack_kv(
+        q,
+        k,
+        v,
+        k_prefix,
+        v_prefix,
+        packed_kv,
+        q_norm.weight,
+        k_norm.weight,
+        cos_sin_cache,
+        rope_cache_positions,
+        is_neox=True,
+        eps=q_norm.variance_epsilon,
+        head_dim=head_dim,
+        rope_dim=cos_sin_cache.shape[-1],
+    )
+    return q, packed_kv[0], packed_kv[1]
 
 
 def _apply_qwen3_rope_from_cache(
@@ -652,7 +698,41 @@ class Cosmos3CrossAttention(nn.Module):
             :,
         ]
 
-        if use_fused_qk_norm_rope:
+        use_fused_kv_pack = (
+            use_fused_qk_norm_rope
+            and q.device.type == "cuda"
+            and not torch.compiler.is_compiling()
+            and get_sp_world_size() == 1
+            and q.dtype == k.dtype == v.dtype == k_und.dtype == v_und.dtype
+            and self.norm_q.weight.dtype == q.dtype
+        )
+        use_fused_kv_pack = (
+            use_fused_kv_pack
+            and self.norm_k.weight.dtype == k.dtype
+            and self.norm_q.variance_epsilon == self.norm_k.variance_epsilon
+            and can_use_fused_qknorm_rope_pack_kv(
+                self.head_dim,
+                cos_sin_cache.shape[-1],
+                True,
+                q.dtype,
+                cos_sin_cache.dtype,
+            )
+        )
+        if use_fused_kv_pack:
+            q, packed_k, packed_v = _apply_qwen3_qk_norm_rope_pack_kv(
+                q,
+                k,
+                v,
+                k_und,
+                v_und,
+                self.norm_q,
+                self.norm_k,
+                self.head_dim,
+                cos_sin_cache,
+                rope_cache_positions,
+            )
+            out = self.attn.forward(q, packed_k, packed_v)
+        elif use_fused_qk_norm_rope:
             q, k = _apply_qwen3_qk_norm_rope(
                 q,
                 k,
@@ -662,15 +742,12 @@ class Cosmos3CrossAttention(nn.Module):
                 cos_sin_cache,
                 rope_cache_positions,
             )
+            out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         else:
             q, k = _apply_qwen3_qk_norm_rope_split(
                 q, k, self.norm_q, self.norm_k, self.head_dim, cos_sin_cache
             )
-
-        # K/V = [text (replicated on every SP rank) | image (sharded same as Q)].
-        # USPAttention routes through the registered attention backend (FA, sage,
-        # …) and handles the Ulysses all-to-all when SP > 1.
-        out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
+            out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out

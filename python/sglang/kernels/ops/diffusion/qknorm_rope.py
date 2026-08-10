@@ -49,6 +49,32 @@ def _jit_qknorm_rope_module(
     )
 
 
+@cache_once
+def _jit_qknorm_rope_pack_kv_module(
+    head_dim: int,
+    rope_dim: int,
+    is_neox: bool,
+    dtype: torch.dtype,
+    cache_dtype: torch.dtype,
+    round_norm_before_rope: bool,
+) -> Module:
+    args = make_cpp_args(
+        head_dim,
+        rope_dim,
+        is_neox,
+        is_arch_support_pdl(),
+        dtype,
+        cache_dtype,
+        round_norm_before_rope,
+    )
+    return load_jit(
+        "qknorm_rope_pack_kv",
+        *args,
+        cuda_files=["diffusion/qknorm_rope.cuh"],
+        cuda_wrappers=[("qknorm_rope_pack_kv", f"QKNormRopePackKVKernel<{args}>::run")],
+    )
+
+
 @torch.compiler.assume_constant_result
 @cache_once
 def can_use_fused_inplace_qknorm_rope(
@@ -113,6 +139,40 @@ def can_use_fused_inplace_qknorm_rope(
         return False
 
 
+@torch.compiler.assume_constant_result
+@cache_once
+def can_use_fused_qknorm_rope_pack_kv(
+    head_dim: int,
+    rope_dim: int,
+    is_neox: bool,
+    dtype: torch.dtype,
+    cache_dtype: torch.dtype = torch.float32,
+    round_norm_before_rope: bool = False,
+) -> bool:
+    if not can_use_fused_inplace_qknorm_rope(
+        head_dim,
+        rope_dim,
+        is_neox,
+        dtype,
+        cache_dtype,
+        round_norm_before_rope,
+    ):
+        return False
+    try:
+        _jit_qknorm_rope_pack_kv_module(
+            head_dim,
+            rope_dim,
+            is_neox,
+            dtype,
+            cache_dtype,
+            round_norm_before_rope,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load JIT fused QKNorm+RoPE+KV pack kernel: {e}")
+        return False
+
+
 @register_custom_op(mutates_args=["q", "k"])
 def fused_inplace_qknorm_rope(
     q: torch.Tensor,
@@ -139,3 +199,53 @@ def fused_inplace_qknorm_rope(
         round_norm_before_rope,
     )
     module.qknorm_rope(q, k, q_weight, k_weight, cos_sin_cache, positions, eps)
+
+
+@register_custom_op(mutates_args=["q", "packed_kv"])
+def fused_qknorm_rope_pack_kv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    packed_kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    is_neox: bool,
+    eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
+    round_norm_before_rope: bool = False,
+) -> None:
+    head_dim = head_dim or q.size(-1)
+    rope_dim = rope_dim or cos_sin_cache.size(-1)
+    batch_size, suffix_tokens = q.shape[:2]
+    prefix_tokens = k_prefix.shape[1]
+    module = _jit_qknorm_rope_pack_kv_module(
+        head_dim,
+        rope_dim,
+        is_neox,
+        q.dtype,
+        cos_sin_cache.dtype,
+        round_norm_before_rope,
+    )
+    module.qknorm_rope_pack_kv(
+        q.view(-1, q.shape[-2], head_dim),
+        k.view(-1, k.shape[-2], head_dim),
+        v.view(-1, v.shape[-2], head_dim),
+        k_prefix.view(-1, k_prefix.shape[-2], head_dim),
+        v_prefix.view(-1, v_prefix.shape[-2], head_dim),
+        packed_kv[0],
+        packed_kv[1],
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        batch_size,
+        prefix_tokens,
+        suffix_tokens,
+        eps,
+    )

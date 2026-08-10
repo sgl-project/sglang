@@ -18,16 +18,29 @@ namespace sglang {
 struct QKNormRopeParams {
   void* __restrict__ q_ptr;
   void* __restrict__ k_ptr;  // pre-offset by -num_qo_heads * head_stride_bytes
+  const void* __restrict__ v_ptr;
+  const void* __restrict__ k_prefix_ptr;
+  const void* __restrict__ v_prefix_ptr;
+  void* __restrict__ packed_k_ptr;
+  void* __restrict__ packed_v_ptr;
   const void* __restrict__ q_weight_ptr;
   const void* __restrict__ k_weight_ptr;
   const void* __restrict__ cos_sin_cache_ptr;
   const void* __restrict__ positions;
   int64_t q_stride_bytes;
   int64_t k_stride_bytes;
+  int64_t v_stride_bytes;
+  int64_t k_prefix_stride_bytes;
+  int64_t v_prefix_stride_bytes;
   int64_t head_stride_bytes;
+  int64_t packed_token_stride_bytes;
+  int64_t packed_head_stride_bytes;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
   uint32_t num_tokens;
+  uint32_t batch_size;
+  uint32_t prefix_tokens;
+  uint32_t suffix_tokens;
   float eps;
 };
 
@@ -61,6 +74,7 @@ template <
     typename DType,
     typename CacheDType,
     bool kRoundNormBeforeRope,
+    bool kPackKV,
     typename IdType>
 __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ params) {
   using namespace device;
@@ -89,33 +103,87 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
   using Packed = packed_t<DType>;
   using Storage = AlignedVector<Packed, kVecSize>;
 
-  const auto& [q_ptr, k_ptr, q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr, positions, q_stride_bytes, k_stride_bytes, head_stride_bytes, num_qo_heads, num_kv_heads, num_tokens, eps] =
-      params;
-
   const uint32_t lane_id = threadIdx.x % kWarpThreads;
   const uint32_t warp_id = threadIdx.x / kWarpThreads;
   const uint32_t start_worker_id = blockIdx.x * kWarpsPerBlock + warp_id;
   const uint32_t num_workers = gridDim.x * kWarpsPerBlock;
-  const uint32_t num_qk_heads = num_qo_heads + num_kv_heads;
-  const uint32_t num_works = num_qk_heads * num_tokens;
+  const uint32_t num_qk_heads = params.num_qo_heads + params.num_kv_heads;
+  const uint32_t num_qk_works = num_qk_heads * params.num_tokens;
+  const uint32_t num_prefix_works = params.batch_size * params.prefix_tokens * params.num_kv_heads;
+  const uint32_t num_v_suffix_works = params.num_tokens * params.num_kv_heads;
+  const uint32_t num_works = num_qk_works + (kPackKV ? 2 * num_prefix_works + num_v_suffix_works : 0);
 
   PDLWaitPrimary<kUsePDL>();
 
   for (uint32_t idx = start_worker_id; idx < num_works; idx += num_workers) {
+    if constexpr (kPackKV) {
+      if (idx >= num_qk_works) {
+        const uint32_t copy_idx = idx - num_qk_works;
+        const bool copy_k_prefix = copy_idx < num_prefix_works;
+        const bool copy_v_prefix = copy_idx >= num_prefix_works && copy_idx < 2 * num_prefix_works;
+        const uint32_t local_idx =
+            copy_k_prefix ? copy_idx : (copy_v_prefix ? copy_idx - num_prefix_works : copy_idx - 2 * num_prefix_works);
+        const uint32_t token_id = local_idx / params.num_kv_heads;
+        const uint32_t head_id = local_idx % params.num_kv_heads;
+        const bool copy_prefix = copy_k_prefix || copy_v_prefix;
+        const uint32_t batch_id = token_id / (copy_prefix ? params.prefix_tokens : params.suffix_tokens);
+        const uint32_t sequence_id = token_id % (copy_prefix ? params.prefix_tokens : params.suffix_tokens);
+        const uint32_t packed_token_id = batch_id * (params.prefix_tokens + params.suffix_tokens) +
+                                         (copy_prefix ? sequence_id : params.prefix_tokens + sequence_id);
+        const void* input = nullptr;
+        void* output = nullptr;
+        if (copy_k_prefix) {
+          input = pointer::offset(
+              params.k_prefix_ptr, token_id * params.k_prefix_stride_bytes, head_id * params.head_stride_bytes);
+          output = pointer::offset(
+              params.packed_k_ptr,
+              packed_token_id * params.packed_token_stride_bytes,
+              head_id * params.packed_head_stride_bytes);
+        } else {
+          const void* v_ptr = copy_v_prefix ? params.v_prefix_ptr : params.v_ptr;
+          const int64_t v_stride = copy_v_prefix ? params.v_prefix_stride_bytes : params.v_stride_bytes;
+          input = pointer::offset(v_ptr, token_id * v_stride, head_id * params.head_stride_bytes);
+          output = pointer::offset(
+              params.packed_v_ptr,
+              packed_token_id * params.packed_token_stride_bytes,
+              head_id * params.packed_head_stride_bytes);
+        }
+        const auto copy_vec = load_as<Storage>(input, lane_id);
+        store_as<Storage>(output, copy_vec, lane_id);
+        continue;
+      }
+    }
+
     const uint32_t token_id = idx / num_qk_heads;
     const uint32_t head_id = idx % num_qk_heads;
-    const bool load_q = head_id < num_qo_heads;
-    const void* input = load_q ? pointer::offset(q_ptr, token_id * q_stride_bytes, head_id * head_stride_bytes)
-                               : pointer::offset(k_ptr, token_id * k_stride_bytes, head_id * head_stride_bytes);
-    const void* weight_ptr = load_q ? q_weight_ptr : k_weight_ptr;
+    const bool load_q = head_id < params.num_qo_heads;
+    const void* input =
+        load_q ? pointer::offset(params.q_ptr, token_id * params.q_stride_bytes, head_id * params.head_stride_bytes)
+               : pointer::offset(params.k_ptr, token_id * params.k_stride_bytes, head_id * params.head_stride_bytes);
+    void* output = const_cast<void*>(input);
+    if constexpr (kPackKV) {
+      if (!load_q) {
+        const uint32_t batch_id = token_id / params.suffix_tokens;
+        const uint32_t sequence_id = token_id % params.suffix_tokens;
+        const uint32_t kv_head_id = head_id - params.num_qo_heads;
+        const uint32_t packed_token_id =
+            batch_id * (params.prefix_tokens + params.suffix_tokens) + params.prefix_tokens + sequence_id;
+        output = pointer::offset(
+            params.packed_k_ptr,
+            packed_token_id * params.packed_token_stride_bytes,
+            kv_head_id * params.packed_head_stride_bytes);
+      }
+    }
+    const void* weight_ptr = load_q ? params.q_weight_ptr : params.k_weight_ptr;
 
     auto input_vec = load_as<Storage>(input, lane_id);
     const auto weight_vec = load_as<Storage>(weight_ptr, lane_id);
 
     if constexpr (kRoundNormBeforeRope) {
-      auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
-      const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
-      const auto cos_ptr = static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
+      auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, params.eps);
+      const auto pos = static_cast<int64_t>(static_cast<const IdType*>(params.positions)[token_id]);
+      const auto cos_ptr =
+          static_cast<const CacheDType*>(pointer::offset(params.cos_sin_cache_ptr, pos * kCosSinStrideBytes));
       const auto sin_ptr = cos_ptr + kRopeDim / 2;
 
       if constexpr (kIsNeox) {
@@ -155,7 +223,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
           }
         }
       }
-      store_as<Storage>(const_cast<void*>(input), output_vec, lane_id);
+      store_as<Storage>(output, output_vec, lane_id);
       continue;
     }
 
@@ -171,7 +239,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
     }
 
     sum_of_squares = warp::reduce_sum(sum_of_squares);
-    const float norm_factor = math::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + eps);
+    const float norm_factor = math::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + params.eps);
 
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -182,9 +250,9 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
 
     if constexpr (kIsNeox) {
       if (lane_id < kRotaryLanes) {
-        const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
+        const auto pos = static_cast<int64_t>(static_cast<const IdType*>(params.positions)[token_id]);
         const auto cos_ptr =
-            static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
+            static_cast<const CacheDType*>(pointer::offset(params.cos_sin_cache_ptr, pos * kCosSinStrideBytes));
         const auto sin_ptr = cos_ptr + kRopeDim / 2;
         const auto partner_lane = lane_id < kHalfRotaryLanes ? lane_id + kHalfRotaryLanes : lane_id - kHalfRotaryLanes;
 
@@ -202,9 +270,9 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
       }
     } else {
       if (lane_id < kRotaryLanes) {
-        const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
+        const auto pos = static_cast<int64_t>(static_cast<const IdType*>(params.positions)[token_id]);
         const auto cos_ptr =
-            static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
+            static_cast<const CacheDType*>(pointer::offset(params.cos_sin_cache_ptr, pos * kCosSinStrideBytes));
         const auto sin_ptr = cos_ptr + kRopeDim / 2;
 
 #pragma unroll
@@ -224,7 +292,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
     for (uint32_t j = 0; j < kVecSize; ++j) {
       input_vec[j] = cast<Packed, fp32x2_t>({elems[2 * j], elems[2 * j + 1]});
     }
-    store_as<Storage>(const_cast<void*>(input), input_vec, lane_id);
+    store_as<Storage>(output, input_vec, lane_id);
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -241,8 +309,16 @@ template <
 struct QKNormRopeKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
   template <typename IdType>
-  static constexpr auto kernel =
-      fused_qknorm_rope_warp<kHeadDim, kRopeDim, kIsNeox, kUsePDL, DType, CacheDType, kRoundNormBeforeRope, IdType>;
+  static constexpr auto kernel = fused_qknorm_rope_warp<
+      kHeadDim,
+      kRopeDim,
+      kIsNeox,
+      kUsePDL,
+      DType,
+      CacheDType,
+      kRoundNormBeforeRope,
+      false,
+      IdType>;
 
   static void
   run(const tvm::ffi::TensorView q,
@@ -286,16 +362,29 @@ struct QKNormRopeKernel {
     const auto params = QKNormRopeParams{
         .q_ptr = q.data_ptr(),
         .k_ptr = pointer::offset(k.data_ptr(), -k_offset),
+        .v_ptr = nullptr,
+        .k_prefix_ptr = nullptr,
+        .v_prefix_ptr = nullptr,
+        .packed_k_ptr = nullptr,
+        .packed_v_ptr = nullptr,
         .q_weight_ptr = q_weight.data_ptr(),
         .k_weight_ptr = k_weight.data_ptr(),
         .cos_sin_cache_ptr = cos_sin_cache.data_ptr(),
         .positions = positions.data_ptr(),
         .q_stride_bytes = q_stride_bytes,
         .k_stride_bytes = k_stride_bytes,
+        .v_stride_bytes = 0,
+        .k_prefix_stride_bytes = 0,
+        .v_prefix_stride_bytes = 0,
         .head_stride_bytes = head_stride_bytes,
+        .packed_token_stride_bytes = 0,
+        .packed_head_stride_bytes = 0,
         .num_qo_heads = num_qo_heads,
         .num_kv_heads = num_kv_heads,
         .num_tokens = num_tokens,
+        .batch_size = 0,
+        .prefix_tokens = 0,
+        .suffix_tokens = 0,
         .eps = eps,
     };
 
@@ -308,6 +397,136 @@ struct QKNormRopeKernel {
     };
     const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
     const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
+    const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
+    const auto num_blocks = std::min(max_blocks, needed_blocks);
+    LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(selected_kernel, params);
+  }
+};
+
+template <
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    bool kIsNeox,
+    bool kUsePDL,
+    typename DType,
+    typename CacheDType,
+    bool kRoundNormBeforeRope>
+struct QKNormRopePackKVKernel {
+  template <typename IdType>
+  static constexpr auto kernel = fused_qknorm_rope_warp<
+      kHeadDim,
+      kRopeDim,
+      kIsNeox,
+      kUsePDL,
+      DType,
+      CacheDType,
+      kRoundNormBeforeRope,
+      true,
+      IdType>;
+
+  static void
+  run(const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView v,
+      const tvm::ffi::TensorView k_prefix,
+      const tvm::ffi::TensorView v_prefix,
+      const tvm::ffi::TensorView packed_k,
+      const tvm::ffi::TensorView packed_v,
+      const tvm::ffi::TensorView q_weight,
+      const tvm::ffi::TensorView k_weight,
+      const tvm::ffi::TensorView cos_sin_cache,
+      const tvm::ffi::TensorView positions,
+      int64_t batch_size,
+      int64_t prefix_tokens,
+      int64_t suffix_tokens,
+      float eps) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto NP = SymbolicSize{"num_prefix_tokens"};
+    auto B = SymbolicSize{"batch_size"};
+    auto T = SymbolicSize{"packed_tokens"};
+    auto Q = SymbolicSize{"num_qo_heads"};
+    auto K = SymbolicSize{"num_kv_heads"};
+    auto D = SymbolicSize{"head_dim"};
+    auto R = SymbolicSize{"rope_dim"};
+    auto Dq = SymbolicSize{"q_stride"};
+    auto Dk = SymbolicSize{"k_stride"};
+    auto Dv = SymbolicSize{"v_stride"};
+    auto Dkp = SymbolicSize{"k_prefix_stride"};
+    auto Dvp = SymbolicSize{"v_prefix_stride"};
+    auto Dd = SymbolicSize{"head_stride"};
+    auto device = SymbolicDevice{};
+    auto id_type = SymbolicDType{};
+    N.set_value(batch_size * suffix_tokens);
+    NP.set_value(batch_size * prefix_tokens);
+    B.set_value(batch_size);
+    T.set_value(prefix_tokens + suffix_tokens);
+    D.set_value(kHeadDim);
+    R.set_value(kRopeDim);
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N, Q, D}).with_strides({Dq, Dd, 1}).with_dtype<DType>().with_device(device).verify(q);
+    TensorMatcher({N, K, D}).with_strides({Dk, Dd, 1}).with_dtype<DType>().with_device(device).verify(k);
+    TensorMatcher({N, K, D}).with_strides({Dv, Dd, 1}).with_dtype<DType>().with_device(device).verify(v);
+    TensorMatcher({NP, K, D}).with_strides({Dkp, Dd, 1}).with_dtype<DType>().with_device(device).verify(k_prefix);
+    TensorMatcher({NP, K, D}).with_strides({Dvp, Dd, 1}).with_dtype<DType>().with_device(device).verify(v_prefix);
+    TensorMatcher({B, T, K, D})
+        .with_strides({T * K * D, K * D, D, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(packed_k)
+        .verify(packed_v);
+    TensorMatcher({D}).with_dtype<DType>().with_device(device).verify(q_weight).verify(k_weight);
+    TensorMatcher({-1, R}).with_dtype<CacheDType>().with_device(device).verify(cos_sin_cache);
+    TensorMatcher({N}).with_dtype<int32_t, int64_t>(id_type).with_device(device).verify(positions);
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
+    const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
+    if (num_tokens == 0 || (num_qo_heads == 0 && num_kv_heads == 0)) return;
+    const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
+    const int64_t k_offset = static_cast<int64_t>(num_qo_heads) * head_stride_bytes;
+    const auto params = QKNormRopeParams{
+        .q_ptr = q.data_ptr(),
+        .k_ptr = pointer::offset(k.data_ptr(), -k_offset),
+        .v_ptr = v.data_ptr(),
+        .k_prefix_ptr = k_prefix.data_ptr(),
+        .v_prefix_ptr = v_prefix.data_ptr(),
+        .packed_k_ptr = packed_k.data_ptr(),
+        .packed_v_ptr = packed_v.data_ptr(),
+        .q_weight_ptr = q_weight.data_ptr(),
+        .k_weight_ptr = k_weight.data_ptr(),
+        .cos_sin_cache_ptr = cos_sin_cache.data_ptr(),
+        .positions = positions.data_ptr(),
+        .q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType)),
+        .k_stride_bytes = static_cast<int64_t>(Dk.unwrap() * sizeof(DType)),
+        .v_stride_bytes = static_cast<int64_t>(Dv.unwrap() * sizeof(DType)),
+        .k_prefix_stride_bytes = static_cast<int64_t>(Dkp.unwrap() * sizeof(DType)),
+        .v_prefix_stride_bytes = static_cast<int64_t>(Dvp.unwrap() * sizeof(DType)),
+        .head_stride_bytes = head_stride_bytes,
+        .packed_token_stride_bytes = static_cast<int64_t>(num_kv_heads * kHeadDim * sizeof(DType)),
+        .packed_head_stride_bytes = static_cast<int64_t>(kHeadDim * sizeof(DType)),
+        .num_qo_heads = num_qo_heads,
+        .num_kv_heads = num_kv_heads,
+        .num_tokens = num_tokens,
+        .batch_size = static_cast<uint32_t>(batch_size),
+        .prefix_tokens = static_cast<uint32_t>(prefix_tokens),
+        .suffix_tokens = static_cast<uint32_t>(suffix_tokens),
+        .eps = eps,
+    };
+
+    const auto is_int32 = id_type.is_type<int32_t>();
+    const auto selected_kernel = is_int32 ? kernel<int32_t> : kernel<int64_t>;
+    const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
+    static const uint32_t kOccupancyTable[2] = {
+        runtime::get_blocks_per_sm(kernel<int32_t>, kThreadsPerBlock),
+        runtime::get_blocks_per_sm(kernel<int64_t>, kThreadsPerBlock),
+    };
+    const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
+    const auto num_prefix_works = batch_size * prefix_tokens * num_kv_heads;
+    const auto num_works =
+        (num_qo_heads + num_kv_heads) * num_tokens + 2 * num_prefix_works + num_tokens * num_kv_heads;
     const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
     const auto num_blocks = std::min(max_blocks, needed_blocks);
     LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(selected_kernel, params);
