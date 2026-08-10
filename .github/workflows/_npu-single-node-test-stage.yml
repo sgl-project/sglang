@@ -239,17 +239,25 @@ jobs:
           # Run creation date/time are recorded ONCE at workflow start and passed in, so a
           # task spanning midnight still uses the run creation date. Fall back to now for
           # direct/local invocations that do not pass them.
+          current_date=$(date -u -d '+8 hours' +%Y%m%d)
           create_date="${{ inputs.create_date }}"
-          if [ -z "${create_date}" ]; then create_date=$(date -u -d '+8 hours' +%Y%m%d); fi
+          if [ -z "${create_date}" ]; then create_date=${current_date}; fi
           timestamp="${{ inputs.timestamp }}"
           if [ -z "${timestamp}" ]; then timestamp=$(date -u -d '+8 hours' +%H%M%S); fi
+          # Print the persistence directory prefix vars so failures can be traced
+          # back to the exact run / branch / workflow / creation time in logs.
+          echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_date=${create_date} timestamp=${timestamp}"
           # Persist results to: .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{test_type}/{tc_name}-{timestamp}
-          test_data_output_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}-${timestamp}
-          mkdir -p ${test_data_output_path}
-          export METRICS_DATA_FILE=${test_data_output_path}
-          # Redirect the test framework's JSONL metrics dump into the new structured directory
-          export SGLANG_TEST_METRICS_OUTPUT=${test_data_output_path}/metrics
-          echo "Metrics file path: ${METRICS_DATA_FILE}"
+          # Only nightly persists structured results; PR keeps the original per-run flow.
+          if [ "${{ inputs.nightly }}" = "true" ]; then
+            test_data_output_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}-${timestamp}
+            mkdir -p ${test_data_output_path}
+            export METRICS_DATA_FILE=${test_data_output_path}
+            # Redirect the test framework's JSONL metrics dump into the new structured directory
+            export SGLANG_TEST_METRICS_OUTPUT=${test_data_output_path}/metrics
+            echo "Metrics file path: ${METRICS_DATA_FILE}"
+            echo "SGLANG_TEST_METRICS_OUTPUT=${SGLANG_TEST_METRICS_OUTPUT}"
+          fi
 
           export TRANSFORMERS_VERSION_FOR_SGLANG="${{ inputs.transformers_version }}"
           PYTHON_FOR_SGLANG="python"
@@ -296,14 +304,27 @@ jobs:
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
 
           # Set environment of cann
-          # Persist logs to: .../logs/log/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{tc_name}-{timestamp}/{HOSTNAME}
-          log_path="/root/.cache/tests/logs/log/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${tc_name}-${timestamp}/${HOSTNAME}"
-          rm -rf ${log_path}
-          mkdir -p ${log_path}
-          echo "Log path: ${log_path}"
-          # run_suite.py writes a full per-case log to {SGLANG_TEST_LOG_DIR}/{tc_name}.log
-          # and only echoes key lines to the console, keeping the web UI fast.
-          export SGLANG_TEST_LOG_DIR=${log_path}
+          if [ "${{ inputs.nightly }}" = "true" ]; then
+            # Nightly: full per-suite log under the structured run prefix.
+            # Per-case logs are grouped under the same directory scheme as
+            # metrics.json:
+            #   .../{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{test_type}/{suite}-{timestamp}/{tc_name}/
+            log_path="/root/.cache/tests/logs/log/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}-${timestamp}"
+            rm -rf ${log_path}
+            mkdir -p ${log_path}
+            echo "Log path: ${log_path}"
+            # run_suite.py writes a full per-case log to
+            # {SGLANG_TEST_LOG_DIR}/{tc_name}/test_output.log and only echoes key
+            # lines to the console, keeping the web UI fast.
+            export SGLANG_TEST_LOG_DIR=${log_path}
+            echo "SGLANG_TEST_LOG_DIR=${SGLANG_TEST_LOG_DIR}"
+          else
+            # PR (non-nightly): keep the original per-run log path {date}/{testcase}.
+            log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+            rm -rf ${log_path}
+            mkdir -p ${log_path}
+            echo "Log path: ${log_path}"
+          fi
 
           echo "Running test: ${tc_name}"
           test_exit_code=0
@@ -311,7 +332,11 @@ jobs:
           # nightly mode: collect nightly-registered tests (--nightly) and keep running
           # remaining cases even if one fails (--continue-on-error)
           NIGHTLY_FLAG="$([ "${{ inputs.nightly }}" = "true" ] && echo "--nightly --continue-on-error")"
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} --timeout-per-file 3600 2>&1 | tee /tmp/test_output.log "${log_path}/${tc_name}.log" || test_exit_code=$?
+          if [ "${{ inputs.nightly }}" = "true" ]; then
+            ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} --timeout-per-file 3600 2>&1 | tee /tmp/test_output.log "${log_path}/${tc_name}.log" || test_exit_code=$?
+          else
+            ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
+          fi
 
           echo "Finished test: ${tc_name}"
 
@@ -363,7 +388,7 @@ jobs:
           exit ${test_exit_code}
 
       - name: Upload metrics
-        if: always()
+        if: always() && inputs.nightly == true
         uses: actions/upload-artifact@v4
         with:
           name: metrics-${{ inputs.test_suite }}
@@ -372,7 +397,7 @@ jobs:
           retention-days: 7
 
       - name: Backup plog
-        if: always()
+        if: always() && inputs.nightly == true
         shell: bash
         run: |
           plog_path="/root/ascend/log/debug/plog"

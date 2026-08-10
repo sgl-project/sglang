@@ -1,7 +1,9 @@
 import argparse
 import glob
 import json
+import logging
 import os
+import re
 import sys
 from typing import Dict, List, Optional
 
@@ -182,6 +184,7 @@ NIGHTLY_SUITES = {
         "nightly-perf-4-npu-a3",
         "nightly-perf-8-npu-a3",
         "nightly-perf-16-npu-a3",
+        "nightly-mix-1-npu-a2",
         "full-1-npu-a3",
         "full-2-npu-a3",
         "full-4-npu-a3",
@@ -382,14 +385,105 @@ def run_a_suite(args):
     if args.enable_retry:
         timeout += args.retry_timeout_increase
 
+    # Nightly only: persist full per-case logs and simplify console output.
+    # The workflow exports SGLANG_TEST_LOG_DIR solely in the nightly branch, so
+    # this never affects PR / GPU / other non-nightly runs.
+    log_dir = os.environ.get("SGLANG_TEST_LOG_DIR")
+    nightly_capture = bool(nightly and log_dir)
+    if nightly_capture:
+        _install_nightly_log_handler(log_dir)
+
+    # _NightlyLogHandler can only write the full per-case output if the
+    # subprocess output flows through the ci_utils logger. In run_unittest_files
+    # that capture is coupled to enable_retry (capture_output=enable_retry), and
+    # ci_utils.py must stay community-identical, so we cannot add a separate
+    # capture flag there. Instead, when nightly needs capture but the caller did
+    # not ask for retry, we force enable_retry=True together with max_attempts=1:
+    # the retry loop still runs exactly once (1 <= 1) and never retries, so the
+    # behavior is identical to enable_retry=False while output is captured.
+    if nightly_capture and not args.enable_retry:
+        effective_enable_retry = True
+        effective_max_attempts = 1
+    else:
+        effective_enable_retry = args.enable_retry
+        effective_max_attempts = args.max_attempts
+
     return run_unittest_files(
         ci_tests,
         timeout_per_file=timeout,
         continue_on_error=args.continue_on_error,
-        enable_retry=args.enable_retry,
-        max_attempts=args.max_attempts,
+        enable_retry=effective_enable_retry,
+        max_attempts=effective_max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
     )
+
+
+# Console key-line patterns used only in the nightly flow (when
+# SGLANG_TEST_LOG_DIR is set): the full per-case output is written to
+# {SGLANG_TEST_LOG_DIR}/{tc_name}/test_output.log and only these key lines are
+# echoed to the job console so the GitHub web UI does not time out on huge
+# aggregated logs. This is implemented here in run_suite.py (nightly only)
+# instead of in the shared ci_utils.py, so PR / GPU / other jobs keep the
+# community behavior.
+_NIGHTLY_KEY_LINE_PATTERNS = re.compile(
+    r"\[METRIC\]|\[METRICS\]|^(PASSED|FAILED|ERROR|SKIPPED|Traceback|"
+    r"AssertionError|TimeoutError|ImportError|ModuleNotFoundError|RuntimeError)|"
+    r"Test Summary|Begin \(|End \(|\u2717|\u2713|\u21bb|\b(PASSED|FAILED):"
+)
+
+
+class _NightlyLogHandler(logging.Handler):
+    """Nightly-only logging handler attached to the ci_utils logger.
+
+    Writes every emitted line to the active test case's full log and forwards
+    only key lines to the console. ci_utils.py is left untouched.
+    """
+
+    def __init__(self, log_dir: str):
+        super().__init__()
+        self._log_dir = log_dir
+        self._console = logging.StreamHandler(sys.stderr)
+        self._console.setFormatter(logging.Formatter("%(message)s"))
+        self._current = None  # open file handle for the active test case
+
+    def emit(self, record: logging.LogRecord):
+        msg = record.getMessage()
+        # Switch the active per-case log when the harness logs a new
+        # "Begin (...): ... python3 <path>" record.
+        m = re.search(r"Begin\s*\([^)]*\):.*?python3\s+(\S+)", msg, re.DOTALL)
+        if m:
+            tc_name = os.path.splitext(os.path.basename(m.group(1)))[0]
+            self._switch(tc_name)
+        if self._current is not None:
+            self._current.write(msg + "\n")
+            self._current.flush()
+        if _NIGHTLY_KEY_LINE_PATTERNS.search(msg):
+            self._console.emit(record)
+
+    def _switch(self, tc_name: str):
+        if self._current is not None:
+            try:
+                self._current.close()
+            except Exception:
+                pass
+        # Group each case's full log under a per-case directory so it sits next
+        # to its metrics.json ({SGLANG_TEST_LOG_DIR}/{tc_name}/metrics.json),
+        # matching the documented run output layout.
+        case_dir = os.path.join(self._log_dir, tc_name)
+        os.makedirs(case_dir, exist_ok=True)
+        path = os.path.join(case_dir, "test_output.log")
+        self._current = open(path, "w", encoding="utf-8", errors="ignore")
+
+
+def _install_nightly_log_handler(log_dir: str):
+    """Install the nightly console/log handler on the ci_utils logger.
+
+    Only the module used by run_unittest_files is affected; the default root
+    handler (community console output) is bypassed by setting propagate=False.
+    """
+    ci_logger = logging.getLogger("sglang.test.ci.ci_utils")
+    ci_logger.handlers = [_NightlyLogHandler(log_dir)]
+    ci_logger.propagate = False
 
 
 def main():

@@ -137,9 +137,23 @@ def _repo_relative_path(p: str) -> str:
     return p[idx + len(marker) :] if idx >= 0 else p
 
 
+# Slow-run variance is largely additive (cold HF cache, slow server launch), so
+# the multiplier alone under-provisions at both ends: test_encoder_dp runs
+# 200-426s but once took over 1185s against a 1.5x budget of 765s, and
+# test_lora_deepseek_v3_base_logprob_diff (est 1800) landed on exactly 1.5 * est.
+# Every file gets the same absolute slack on top of the proportional one.
+DERIVED_TIMEOUT_SLACK = 1800.0
+DERIVED_TIMEOUT_FACTOR = 1.5
+
+
+def derive_timeout_per_file(est_time: float) -> float:
+    est = float(est_time)
+    return max(est * DERIVED_TIMEOUT_FACTOR, est + DERIVED_TIMEOUT_SLACK)
+
+
 def run_unittest_files(
     files: Union[List[TestFile], List[CIRegistry]],
-    timeout_per_file: float,
+    timeout_per_file: Optional[float] = None,
     continue_on_error: bool = False,
     enable_retry: bool = False,
     max_attempts: int = 2,
@@ -150,7 +164,8 @@ def run_unittest_files(
 
     Args:
         files: List of TestFile objects to run
-        timeout_per_file: Timeout in seconds for each test file
+        timeout_per_file: Fixed timeout in seconds for every test file, or None
+                          to derive each file's budget from its own est_time.
         continue_on_error: If True, continue running remaining tests even if one fails.
                           If False, stop at first failure (default behavior for PR tests).
         enable_retry: If True, retry failed tests that appear to be accuracy/performance
@@ -161,26 +176,6 @@ def run_unittest_files(
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
         cuda_coredump.cleanup_dump_dir()
-
-    # Directory for per-case full logs. When set (e.g. the workflow passes the
-    # structured logs/log directory), each case's complete output is written to
-    # {SGLANG_TEST_LOG_DIR}/{tc_name}.log and only key lines are echoed to the
-    # job console so the web UI does not time out on huge aggregated logs.
-    log_dir = os.environ.get("SGLANG_TEST_LOG_DIR")
-
-    # Lines that are echoed to the console in full-output mode; everything else
-    # goes to the per-case file only.
-    _KEY_LINE_PATTERNS = re.compile(
-        r"\[METRIC\]|\[METRICS\]|^(PASSED|FAILED|ERROR|SKIPPED|Traceback|"
-        r"AssertionError|TimeoutError|ImportError|ModuleNotFoundError|RuntimeError)|"
-        r"Test Summary|Begin \(|End \(|\u2717|\u2713|\u21bb|\b(PASSED|FAILED):"
-    )
-
-    def _log_console(line: str) -> bool:
-        """Return True when the line should be echoed to the job console."""
-        if log_dir is None:
-            return True
-        return bool(_KEY_LINE_PATTERNS.search(line))
 
     tic = time.perf_counter()
     success = True
@@ -198,6 +193,12 @@ def run_unittest_files(
             # FIXME: remove this branch after migrating all tests to use CIRegistry
             filename, estimated_time = file.name, file.estimated_time
 
+        file_timeout = (
+            timeout_per_file
+            if timeout_per_file is not None
+            else derive_timeout_per_file(estimated_time)
+        )
+
         process = None
         output_lines = []
 
@@ -212,43 +213,23 @@ def run_unittest_files(
 
             cmd = ["python3", full_path, "-f"]
 
-            # Always capture output so the per-case log can be persisted and the
-            # job console stays lean when SGLANG_TEST_LOG_DIR is set. The
-            # `capture_output` flag only controls whether the full output is kept
-            # in memory for retry decisions.
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
-            )
-            output_lines = []
-            # Full per-case log file (streamed line by line so memory stays bounded
-            # even when the per-case log is not needed for retry decisions).
-            case_log = None
-            if log_dir:
-                try:
-                    tc_name = os.path.splitext(os.path.basename(filename))[0]
-                    case_log = os.path.join(log_dir, f"{tc_name}.log")
-                    os.makedirs(os.path.dirname(case_log), exist_ok=True)
-                    case_log = open(case_log, "w", encoding="utf-8", errors="ignore")
-                except Exception as e:  # pragma: no cover - best effort only
-                    logger.warning(f"Failed to open per-case log: {e}")
-                    case_log = None
-            for line in process.stdout:
-                if capture_output:
-                    output_lines.append(line)
-                if case_log is not None:
-                    case_log.write(line)
-                if _log_console(line):
+            if capture_output:
+                # Capture output for retry decision
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
+                )
+                output_lines = []
+                for line in process.stdout:
                     logger.info(line.rstrip())
-            process.wait()
-            if case_log is not None:
-                try:
-                    case_log.close()
-                except Exception:  # pragma: no cover
-                    pass
+                    output_lines.append(line)
+                process.wait()
+            else:
+                process = subprocess.Popen(cmd, stdout=None, stderr=None)
+                process.wait()
 
             elapsed = time.perf_counter() - file_tic
             file_elapsed[filename] = elapsed
@@ -275,7 +256,7 @@ def run_unittest_files(
                     run_one_file,
                     args=(filename,),
                     kwargs={"capture_output": enable_retry},
-                    timeout=timeout_per_file,
+                    timeout=file_timeout,
                 )
 
                 if ret_code == 0:
@@ -321,24 +302,22 @@ def run_unittest_files(
                 # TimeoutError aborts run_one_file before its elapsed write;
                 # record the timeout cap as an upper bound so the file still
                 # appears in the TIMINGS block below.
-                file_elapsed[filename] = float(timeout_per_file)
+                file_elapsed[filename] = float(file_timeout)
                 # Retry once on timeout: usually a stuck server / hung device.
                 # A real hang times out again and is reported.
                 if enable_retry and attempt < max_attempts:
                     logger.info(
                         f"\n[CI Retry] {filename} timed out after "
-                        f"{timeout_per_file}s; waiting {retry_wait_seconds}s "
+                        f"{file_timeout}s; waiting {retry_wait_seconds}s "
                         f"before retry (attempt {attempt + 1}/{max_attempts})\n"
                     )
                     time.sleep(retry_wait_seconds)
                     attempt += 1
                     continue
-                logger.info(
-                    f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n"
-                )
+                logger.info(f"\n✗ TIMEOUT: {filename} after {file_timeout} seconds\n")
                 if was_retried:
                     retried_tests.append((filename, attempt, "timeout"))
-                failed_tests.append((filename, f"timeout after {timeout_per_file}s"))
+                failed_tests.append((filename, f"timeout after {file_timeout}s"))
                 break
 
         if not file_passed:

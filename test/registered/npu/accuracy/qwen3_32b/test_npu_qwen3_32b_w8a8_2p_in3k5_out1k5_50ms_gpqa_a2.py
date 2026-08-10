@@ -11,9 +11,8 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
-    suite="",
+    suite="nightly-mix-1-npu-a2",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 QWEN3_32B_ENVS = {

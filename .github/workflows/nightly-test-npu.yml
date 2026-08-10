@@ -61,26 +61,6 @@ on:
         required: false
         type: string
         default: ''
-      branch_label:
-        description: 'Branch label (e.g., "pllimax:pr_branch_plli_for_check_in_2" for PR, or ref_name otherwise)'
-        required: false
-        type: string
-        default: ''
-      workflow_name:
-        description: 'Name of the orchestrating workflow (e.g., "Full Test (NPU)")'
-        required: false
-        type: string
-        default: ''
-      create_date:
-        description: 'Run creation date (YYYYMMDD, Beijing time), computed once at workflow start so all jobs of one run share the same directory prefix'
-        required: false
-        type: string
-        default: ''
-      timestamp:
-        description: 'Run creation timestamp (HHMMSS, Beijing time), computed once at workflow start'
-        required: false
-        type: string
-        default: ''
 concurrency:
   group: nightly-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
@@ -131,63 +111,37 @@ jobs:
           else
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
-          # branch_label identifies the run origin; it is used as the first segment
-          # of the persistence directory: explicit input > PR head label > ref name.
+          # branch_label identifies the run origin; PR head label > ref name.
           # Only keep safe characters for use as a filesystem path segment.
-          BRANCH_LABEL="${{ inputs.branch_label }}"
-          if [ -z "${BRANCH_LABEL}" ]; then
-            BRANCH_LABEL="$HEAD_LABEL"
-          fi
+          BRANCH_LABEL="$HEAD_LABEL"
           if [ -z "${BRANCH_LABEL}" ]; then
             BRANCH_LABEL="${{ github.ref_name }}"
           fi
           BRANCH_LABEL="$(echo "${BRANCH_LABEL}" | tr -cd 'a-zA-Z0-9._/:' | tr '/:' '--')"
           echo "branch_label=${BRANCH_LABEL}" >> $GITHUB_OUTPUT
           # workflow_name identifies the orchestrating workflow (e.g. "Full Test (NPU)")
-          if [ -z "${{ inputs.workflow_name }}" ]; then
-            echo "workflow_name=${{ github.workflow }}" >> $GITHUB_OUTPUT
-          else
-            echo "workflow_name=${{ inputs.workflow_name }}" >> $GITHUB_OUTPUT
-          fi
+          echo "workflow_name=${{ github.workflow }}" >> $GITHUB_OUTPUT
           # create_date / timestamp are recorded ONCE at workflow start and shared by all
           # jobs of this run, so a task spanning midnight still uses the run creation date.
-          # Callers may pass them in (from the outermost workflow start); otherwise compute here.
-          CREATE_DATE="${{ inputs.create_date }}"
-          if [ -z "${CREATE_DATE}" ]; then
-            CREATE_DATE=$(date -u -d '+8 hours' +%Y%m%d)
-          fi
-          echo "create_date=${CREATE_DATE}" >> $GITHUB_OUTPUT
-          CREATE_TIMESTAMP="${{ inputs.timestamp }}"
-          if [ -z "${CREATE_TIMESTAMP}" ]; then
-            CREATE_TIMESTAMP=$(date -u -d '+8 hours' +%H%M%S)
-          fi
-          echo "timestamp=${CREATE_TIMESTAMP}" >> $GITHUB_OUTPUT
-  nightly-poc-single-node-a2-tests:
-    name: single-node-poc-a2
+          echo "create_date=$(date -u -d '+8 hours' +%Y%m%d)" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date -u -d '+8 hours' +%H%M%S)" >> $GITHUB_OUTPUT
+  nightly-mix-single-node-a2-tests:
+    name: single-node-mix-a2
     if: ${{ !cancelled() }}
-    needs: [ set-image-config ]
-    strategy:
-      fail-fast: false
-      max-parallel: 6
-      matrix:
-        test_config:
-          - name: qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_a2
-            runner: linux-aarch64-a2-4
-            test_case: test/registered/npu/performance/qwen3_32b/test_npu_qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_a2.py
-            test_type: 'perf'
-          - name: qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_gpqa_a2
-            runner: linux-aarch64-a2-4
-            test_case: test/registered/npu/accuracy/qwen3_32b/test_npu_qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_gpqa_a2.py
-            test_type: 'accuracy'
-    uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
+    needs: [set-image-config]
+    # Single suite job (no perf/accuracy split) that runs all a2-registered
+    # cases via run_suite.py --nightly --continue-on-error. test_type is set to
+    # 'perf' only for output-directory grouping; each test case reports its own
+    # real type in its per-case metrics.json.
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: ${{ matrix.test_config.runner }}
-      test_type: ${{ matrix.test_config.test_type || 'perf' }}
-      test_config_name: ${{ matrix.test_config.name }}
-      test_case: ${{ matrix.test_config.test_case }}
+      runner: linux-aarch64-a2-4
+      test_type: perf
+      test_suite: nightly-mix-1-npu-a2
+      nightly: true
+      skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a2 }}
-      install_sglang_from_source: false
-      transformers_version: ''
+      install_sglang_deps: false
       branch_label: ${{ needs.set-image-config.outputs.branch_label }}
       workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
       create_date: ${{ needs.set-image-config.outputs.create_date }}
@@ -400,7 +354,7 @@ jobs:
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
-      - nightly-poc-single-node-a2-tests
+      - nightly-mix-single-node-a2-tests
       - nightly-perf-2-npu-a3
       - nightly-perf-4-npu-a3
       - nightly-perf-16-npu-a3
@@ -428,7 +382,7 @@ jobs:
             esac
           }
 
-          single_result_a2="${{ needs.nightly-poc-single-node-a2-tests.result }}"
+          single_result_a2="${{ needs.nightly-mix-single-node-a2-tests.result }}"
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
 
@@ -460,7 +414,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| single-node-poc-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
+          echo "| single-node-mix-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
           for entry in \
             "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \

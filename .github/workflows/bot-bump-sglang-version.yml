@@ -72,7 +72,6 @@ jobs:
     uses: ./.github/workflows/nightly-test-npu.yml
     with:
       ref: ${{ needs.bump-sglang-version.outputs.branch_name }}
-      branch_label: ${{ needs.bump-sglang-version.outputs.branch_name }}
     secrets: inherit
 
   run-pr-tests-xeon:

@@ -17,21 +17,6 @@ on:
         required: false
         type: boolean
         default: false
-      branch_label:
-        description: 'Branch label (e.g., "pllimax:pr_branch_plli_for_check_in_2" for PR, or ref_name otherwise)'
-        required: false
-        type: string
-        default: ''
-      create_date:
-        description: 'Run creation date (YYYYMMDD, Beijing time), recorded once at workflow start'
-        required: false
-        type: string
-        default: ''
-      timestamp:
-        description: 'Run creation timestamp (HHMMSS, Beijing time), recorded once at workflow start'
-        required: false
-        type: string
-        default: ''
 
 concurrency:
   group: pr-test-npu-${{ inputs.ref || github.ref }}
@@ -97,45 +82,13 @@ jobs:
     outputs:
       CANN_image_a3: ${{ steps.set-vars.outputs.CANN_image_a3 }}
       CANN_image_910b: ${{ steps.set-vars.outputs.CANN_image_910b }}
-      branch_label: ${{ steps.set-vars.outputs.branch_label }}
-      workflow_name: ${{ steps.set-vars.outputs.workflow_name }}
-      create_date: ${{ steps.set-vars.outputs.create_date }}
-      timestamp: ${{ steps.set-vars.outputs.timestamp }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
         id: set-vars
-        env:
-          # Pass untrusted PR metadata via env vars so it is never interpolated
-          # into the shell script (prevents script injection from fork branch names)
-          HEAD_LABEL: ${{ github.event.pull_request.head.label }}
         run: |
           echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
           echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
-          # branch_label identifies the run origin; explicit input > PR head label > ref name.
-          # Only keep safe characters for use as a filesystem path segment.
-          BRANCH_LABEL="${{ inputs.branch_label }}"
-          if [ -z "${BRANCH_LABEL}" ]; then
-            BRANCH_LABEL="$HEAD_LABEL"
-          fi
-          if [ -z "${BRANCH_LABEL}" ]; then
-            BRANCH_LABEL="${{ github.ref_name }}"
-          fi
-          BRANCH_LABEL="$(echo "${BRANCH_LABEL}" | tr -cd 'a-zA-Z0-9._/:' | tr '/:' '--')"
-          echo "branch_label=${BRANCH_LABEL}" >> $GITHUB_OUTPUT
-          echo "workflow_name=${{ github.workflow }}" >> $GITHUB_OUTPUT
-          # create_date / timestamp are recorded ONCE at workflow start and shared by all
-          # jobs of this run, so a task spanning midnight still uses the run creation date.
-          CREATE_DATE="${{ inputs.create_date }}"
-          if [ -z "${CREATE_DATE}" ]; then
-            CREATE_DATE=$(date -u -d '+8 hours' +%Y%m%d)
-          fi
-          echo "create_date=${CREATE_DATE}" >> $GITHUB_OUTPUT
-          CREATE_TIMESTAMP="${{ inputs.timestamp }}"
-          if [ -z "${CREATE_TIMESTAMP}" ]; then
-            CREATE_TIMESTAMP=$(date -u -d '+8 hours' +%H%M%S)
-          fi
-          echo "timestamp=${CREATE_TIMESTAMP}" >> $GITHUB_OUTPUT
 
   base-a-test-1-npu-a2:
     needs: [check-changes, pr-gate, set-image-config]
@@ -336,10 +289,6 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      branch_label: ${{ needs.set-image-config.outputs.branch_label }}
-      workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
-      create_date: ${{ needs.set-image-config.outputs.create_date }}
-      timestamp: ${{ needs.set-image-config.outputs.timestamp }}
 
   base-c-test-acc-4-npu-a3:
     name: base-c-test-acc-4-npu-a3
@@ -353,10 +302,6 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      branch_label: ${{ needs.set-image-config.outputs.branch_label }}
-      workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
-      create_date: ${{ needs.set-image-config.outputs.create_date }}
-      timestamp: ${{ needs.set-image-config.outputs.timestamp }}
 
   base-c-test-acc-8-npu-a3:
     name: base-c-test-acc-8-npu-a3
@@ -370,10 +315,6 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      branch_label: ${{ needs.set-image-config.outputs.branch_label }}
-      workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
-      create_date: ${{ needs.set-image-config.outputs.create_date }}
-      timestamp: ${{ needs.set-image-config.outputs.timestamp }}
 
   base-c-test-acc-16-npu-a3:
     name: base-c-test-acc-16-npu-a3
@@ -387,10 +328,6 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      branch_label: ${{ needs.set-image-config.outputs.branch_label }}
-      workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
-      create_date: ${{ needs.set-image-config.outputs.create_date }}
-      timestamp: ${{ needs.set-image-config.outputs.timestamp }}
 
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
@@ -404,10 +341,6 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      branch_label: ${{ needs.set-image-config.outputs.branch_label }}
-      workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
-      create_date: ${{ needs.set-image-config.outputs.create_date }}
-      timestamp: ${{ needs.set-image-config.outputs.timestamp }}
 
   base-c-test-perf-4-npu-a3:
     name: base-c-test-perf-4-npu-a3
@@ -421,10 +354,6 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      branch_label: ${{ needs.set-image-config.outputs.branch_label }}
-      workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
-      create_date: ${{ needs.set-image-config.outputs.create_date }}
-      timestamp: ${{ needs.set-image-config.outputs.timestamp }}
 
   base-c-test-perf-8-npu-a3:
     name: base-c-test-perf-8-npu-a3
@@ -438,10 +367,6 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      branch_label: ${{ needs.set-image-config.outputs.branch_label }}
-      workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
-      create_date: ${{ needs.set-image-config.outputs.create_date }}
-      timestamp: ${{ needs.set-image-config.outputs.timestamp }}
 
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
@@ -455,10 +380,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      branch_label: ${{ needs.set-image-config.outputs.branch_label }}
-      workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
-      create_date: ${{ needs.set-image-config.outputs.create_date }}
-      timestamp: ${{ needs.set-image-config.outputs.timestamp }}
+
 
   pr-test-npu-finish:
     needs:
