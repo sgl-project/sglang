@@ -518,6 +518,8 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     model.mm_projector = lambda image_embeds: image_embeds
 
     deferred_config = {
+        "backend": "gpu",
+        "feature_layout": "chw",
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
         "transparent_bg_config": None,
