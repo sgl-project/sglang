@@ -311,7 +311,7 @@ async fn chat_completions_inner(
     // extension must be matchable at all (`extension_can_match`: DSV4 thinking
     // mode without tools re-renders history divergently, so its extensions
     // could only ever be dead blocks — mirroring the engine's own miss).
-    let extend_tee_armed = ctx.cache_sim_tee.is_some()
+    let extend_tee_armed = (ctx.cache_sim_tee.is_some() || ctx.s3_export_sink.is_some())
         && request_tokens.is_some()
         && request_value
             .as_ref()
@@ -407,12 +407,16 @@ async fn chat_completions_inner(
     // ingest record whose extend can never arrive — indistinguishable
     // downstream from a response that generated nothing. The bias would grow
     // exactly when the fleet is shedding, i.e. anti-correlated with health.
+    let tee_attr = tee_attribution(&headers);
     if let (Some(tee), Some(t)) = (ctx.cache_sim_tee.as_ref(), request_tokens.as_ref()) {
-        tee.offer(
+        tee.offer(&model_str, &t.ids, &derived_request_id, tee_attr.clone());
+    }
+    if let (Some(sink), Some(t)) = (ctx.s3_export_sink.as_ref(), request_tokens.as_ref()) {
+        sink.offer_ingest(
             &model_str,
             &t.ids,
             &derived_request_id,
-            tee_attribution(&headers),
+            tee_attr.slug.as_deref(),
         );
     }
     if let Some(p) = &phase {
@@ -612,6 +616,7 @@ async fn chat_completions_inner(
         let request_body = body.clone();
         let prompt = extend_prompt.clone();
         let request_id = derived_request_id.clone();
+        let slug = tee_attr.slug.clone();
         move || -> Option<StreamCapture> {
             if !armed {
                 return None;
@@ -621,25 +626,41 @@ async fn chat_completions_inner(
             // stay bounded under any load. Budget exhausted ⇒ don't capture this
             // stream (skip its extend tee, counted as `capture_capped`); the
             // capture is observational, so shedding it never affects serving.
-            let permit = match ctx
-                .cache_sim_tee
-                .as_ref()
-                .and_then(|t| t.try_acquire_capture_permit())
-            {
-                Some(p) => p,
-                None => {
+            //
+            // When cache-sim is on, draw from the cache-sim tee's pool and record
+            // `capture_capped` there. Also record `dropped_capture_capped` on the
+            // S3 sink so both consumers reflect the drop.
+            // When cache-sim is off but the S3 sink is on, draw from the sink's
+            // own permit pool so S3-only mode is equally memory-bounded.
+            let permit = if let Some(tee) = ctx.cache_sim_tee.as_ref() {
+                let p = tee.try_acquire_capture_permit();
+                if p.is_none() {
                     ctx.metrics.record_cache_sim_tee("capture_capped");
+                    if ctx.s3_export_sink.is_some() {
+                        ctx.metrics.record_s3_export("dropped_capture_capped");
+                    }
                     return None;
                 }
+                p
+            } else if let Some(sink) = ctx.s3_export_sink.as_ref() {
+                let p = sink.try_acquire_capture_permit();
+                if p.is_none() {
+                    ctx.metrics.record_s3_export("dropped_capture_capped");
+                    return None;
+                }
+                p
+            } else {
+                return None;
             };
             let ctx = Arc::clone(&ctx);
             let model = model.clone();
             let request_body = request_body.clone();
             let prompt = prompt.clone();
             let request_id = request_id.clone();
+            let slug = slug.clone();
             Some(StreamCapture {
                 max_bytes: cache_sim_extend::MAX_EXTEND_CAPTURE_BYTES,
-                _permit: Some(permit),
+                _permit: permit,
                 on_done: Box::new(move |buf| {
                     cache_sim_extend::spawn_extend_tee(
                         ctx,
@@ -648,6 +669,7 @@ async fn chat_completions_inner(
                         request_body,
                         prompt,
                         ReplySource::Sse(buf),
+                        slug,
                     );
                 }),
             })
@@ -1326,6 +1348,7 @@ async fn chat_completions_inner(
                     body.clone(),
                     extend_prompt,
                     ReplySource::Json(bytes.clone()),
+                    tee_attr.slug.clone(),
                 );
             }
         }

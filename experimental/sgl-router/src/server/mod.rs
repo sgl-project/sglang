@@ -10,4 +10,5 @@ pub mod error;
 pub mod header_utils;
 pub mod metrics;
 pub mod routes;
+pub mod s3_export;
 pub mod shutdown;

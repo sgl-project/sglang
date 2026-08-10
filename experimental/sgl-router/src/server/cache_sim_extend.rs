@@ -175,8 +175,9 @@ pub(crate) fn spawn_extend_tee(
     request_body: Bytes,
     prompt: Option<IngressPrompt>,
     source: ReplySource,
+    slug: Option<String>,
 ) {
-    if ctx.cache_sim_tee.is_none() {
+    if ctx.cache_sim_tee.is_none() && ctx.s3_export_sink.is_none() {
         return;
     }
     tokio::spawn(async move {
@@ -238,7 +239,7 @@ pub(crate) fn spawn_extend_tee(
                 )
                 .map(|ids| (ids, None)),
             };
-            if let (Some(tee), Some((ids, prompt_len))) = (ctx.cache_sim_tee.as_ref(), produced) {
+            if let Some((ids, prompt_len)) = produced {
                 // Only tag a genuine fan-out. A single-choice response is the
                 // common case and needs no discriminator; N>1 must have one or
                 // the N records collapse onto one join key.
@@ -254,14 +255,28 @@ pub(crate) fn spawn_extend_tee(
                 } else {
                     output_tokens
                 };
-                tee.offer_extend(
-                    &model,
-                    &ids,
-                    &request_id,
-                    prompt_len,
-                    choice,
-                    per_choice_output,
-                );
+                if let Some(tee) = ctx.cache_sim_tee.as_ref() {
+                    tee.offer_extend(
+                        &model,
+                        &ids,
+                        &request_id,
+                        prompt_len,
+                        choice,
+                        per_choice_output,
+                    );
+                }
+                if let Some(sink) = ctx.s3_export_sink.as_ref() {
+                    sink.offer_extend(
+                        &model,
+                        &ids,
+                        &request_id,
+                        prompt_len,
+                        per_choice_output,
+                        choice.as_ref().map(|c| c.index),
+                        choice.as_ref().map(|c| c.count),
+                        slug.as_deref(),
+                    );
+                }
             } else {
                 tracing::debug!(model = %model, "cache-sim extend: tokenize failed; skipping");
             }
@@ -942,6 +957,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(1, 9)),
+            None,
         );
 
         let got = wait_for(&cap, 1).await;
@@ -983,6 +999,7 @@ mod spawn_tests {
             request_body(),
             None,
             ReplySource::Json(body_with(1, 5)),
+            None,
         );
         let got = wait_for(&cap, 1).await;
         let v = &got[0];
@@ -1011,6 +1028,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(1, 5)),
+            None,
         );
         let got = wait_for(&cap, 1).await;
         assert!(got[0].get("prompt_len").is_none(), "{:?}", got[0]);
@@ -1045,6 +1063,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(3, 30)),
+            None,
         );
 
         let got = wait_for(&cap, 3).await;
@@ -1114,6 +1133,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(resp),
+            None,
         );
         let got = wait_for(&cap, 1).await;
         let v = &got[0];
@@ -1173,6 +1193,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(resp),
+            None,
         );
         let got = wait_for(&cap, 2).await;
         let mut idx: Vec<u64> = got
@@ -1213,6 +1234,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(1, 12)),
+            None,
         );
         let got = wait_for(&cap, 1).await;
         let v = &got[0];

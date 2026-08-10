@@ -361,6 +361,12 @@ pub struct Cli {
     /// capture. Only meaningful with `--cache-sim-url`.
     #[arg(long, default_value_t = default_cache_sim_max_concurrent_captures())]
     pub cache_sim_max_concurrent_captures: usize,
+    /// `s3://bucket/prefix/` target. When set, enables token-dataset export:
+    /// writes each request's ingest/extend token sequences as NDJSON+gzip.
+    /// Credentials and region come from the standard AWS environment variables.
+    /// When absent, export is disabled.
+    #[arg(long, env = "RADIXARK_TOKEN_EXPORT_S3_URI")]
+    pub token_export_s3_uri: Option<String>,
 }
 
 impl Cli {
@@ -603,6 +609,7 @@ impl Cli {
                 log_format: self.log_format,
                 cache_sim_url: self.cache_sim_url,
                 cache_sim_max_concurrent_captures: self.cache_sim_max_concurrent_captures,
+                token_export_s3_uri: self.token_export_s3_uri,
             },
             model: ModelConfig {
                 // Default the tokenizer source to the model id (treated as a
