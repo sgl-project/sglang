@@ -215,6 +215,30 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
 
             torch.testing.assert_close(tensor, torch.cat((first, second))[1:5])
 
+    def test_applies_layout_transform_before_rank_local_slice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            grouped_qkv = torch.arange(12, dtype=torch.bfloat16).reshape(6, 2)
+            save_file({"weight": grouped_qkv}, file_path)
+
+            def reorder_qkv(weight: torch.Tensor) -> torch.Tensor:
+                grouped = weight.view(2, 3, 2)
+                return grouped.permute(1, 0, 2).reshape(6, 2)
+
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                tensor = rank_local_checkpoint.read_fsdp_rank_local_tensor(
+                    [self._source(file_path, "weight", (6, 2))],
+                    {file_path: handle},
+                    global_shape=(6, 2),
+                    local_shape=(2, 2),
+                    global_offset=(2, 0),
+                    transform=reorder_qkv,
+                )
+
+            expected = reorder_qkv(grouped_qkv)[2:4]
+            torch.testing.assert_close(tensor, expected)
+            self.assertEqual(tensor.untyped_storage().nbytes(), expected.nbytes)
+
     def test_reads_zero_sized_rank_local_shard(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             file_path = str(Path(temp_dir) / "model.safetensors")
