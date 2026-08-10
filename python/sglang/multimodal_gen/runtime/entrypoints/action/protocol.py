@@ -151,7 +151,7 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
         defaults = Cosmos3SamplingParams()
         return {
             "object": "action.metadata",
-            "model": server_args.model_id or server_args.model_path,
+            "model": server_args.served_model_name,
             "model_path": server_args.model_path,
             "policy_family": "cosmos3",
             "input": {
