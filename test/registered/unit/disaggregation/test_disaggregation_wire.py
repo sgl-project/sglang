@@ -107,6 +107,37 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    def test_mha_fallback_maps_pp_entries_by_global_layer(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.is_mla_backend = False
+        manager.is_hybrid_mla_backend = False
+        manager.pp_size = 4
+        manager.enable_custom_mem_pool = False
+        manager._transfer_data = Mock(return_value=0)
+
+        ret = manager._send_kvcache_generic(
+            "peer",
+            src_data_ptrs=[1000, 2000, 3000, 4000],
+            dst_data_ptrs=[10000, 11000, 12000, 13000, 14000, 15000],
+            item_lens=[10, 20, 30, 40],
+            prefill_data_indices=np.array([2], dtype=np.int32),
+            dst_data_indices=np.array([5], dtype=np.int32),
+            executor=None,
+            src_layer_ids=[3, 7, 3, 7],
+            dst_layer_ids=[2, 3, 7, 2, 3, 7],
+        )
+
+        self.assertEqual(ret, 0)
+        manager._transfer_data.assert_called_once_with(
+            "peer",
+            [
+                (1020, 11050, 10),
+                (2040, 12100, 20),
+                (3060, 14150, 30),
+                (4080, 15200, 40),
+            ],
+        )
+
     def test_staging_response_targets_requesting_pp_rank(self):
         sock = Mock()
         receiver = SimpleNamespace(

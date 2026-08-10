@@ -713,32 +713,54 @@ class MooncakeKVManager(CommonKVManager):
                     for layer_id in range(layers_current_pp_stage)
                 ]
         else:
-            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
-            )
-            # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
-            # Use correct item lengths for K and V separately
-            if layers_current_pp_stage > len(dst_k_ptrs):
-                logger.error(
-                    "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
-                    f"layers_current_pp_stage={layers_current_pp_stage}, len(dst_k_ptrs)={len(dst_k_ptrs)}"
+            if src_layer_ids or dst_layer_ids:
+                # PP-local MHA pools contain only the K/V entries owned by the
+                # current stage, while a non-PP decode peer registers entries
+                # for every model layer. Pair the entries by global layer id;
+                # positional PP slicing can select too few destination V
+                # pointers (or the wrong layer) when stage sizes are uneven.
+                pairs = build_transfer_entry_pairs(
+                    src_layer_ids,
+                    dst_layer_ids,
+                    len(src_data_ptrs),
+                    len(dst_data_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
                 )
-                return -1
-            layers_params = [
+                layers_params = [
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
+                    for i, j in pairs
+                ]
+            else:
                 (
-                    src_k_ptrs[layer_id],
-                    dst_k_ptrs[layer_id],
-                    item_lens[layer_id],  # K item length
-                )
-                for layer_id in range(layers_current_pp_stage)
-            ] + [
-                (
-                    src_v_ptrs[layer_id],
-                    dst_v_ptrs[layer_id],
-                    item_lens[layers_current_pp_stage + layer_id],  # V item length
-                )
-                for layer_id in range(layers_current_pp_stage)
-            ]
+                    src_k_ptrs,
+                    src_v_ptrs,
+                    dst_k_ptrs,
+                    dst_v_ptrs,
+                    layers_current_pp_stage,
+                ) = self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                # item_lens structure: [k_layer0, ..., k_layerN,
+                # v_layer0, ..., v_layerN].
+                if layers_current_pp_stage > len(dst_k_ptrs):
+                    logger.error(
+                        "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
+                        f"layers_current_pp_stage={layers_current_pp_stage}, len(dst_k_ptrs)={len(dst_k_ptrs)}"
+                    )
+                    return -1
+                layers_params = [
+                    (
+                        src_k_ptrs[layer_id],
+                        dst_k_ptrs[layer_id],
+                        item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ] + [
+                    (
+                        src_v_ptrs[layer_id],
+                        dst_v_ptrs[layer_id],
+                        item_lens[layers_current_pp_stage + layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
         assert layers_params is not None
 
         def set_transfer_blocks(
