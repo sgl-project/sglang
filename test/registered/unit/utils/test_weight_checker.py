@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.weight_checker import (
     CheckEntry,
     ChecksumInfo,
@@ -43,9 +44,10 @@ from sglang.srt.utils.weight_checker_comparator import (
     RawComparable,
     _unshuffle_aiter_fp8_weight,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
@@ -84,18 +86,16 @@ def _assert_entries_close(
 
 
 def _build_fp8_quant_pair(device: str = "cuda"):
-    """Construct a real fp8-quantized weight + matching fp32 + ue8m0-packed scales.
+    """Construct a real fp8-quantized weight and matching fp32 scales.
 
-    Returns (qweight, sf_fp32, sf_packed_int32) so callers can pick which scale dtype
-    drives the _build_check_entries branch under test.
+    Returns (qweight, sf_fp32).
     """
     weight_bf16 = torch.randn((256, 128), dtype=torch.bfloat16, device=device)
     block_size = [128, 128]
     qweight, sf_fp32 = quant_weight_ue8m0(
         weight_dequant=weight_bf16, weight_block_size=block_size
     )
-    sf_packed_int32 = transform_scale_ue8m0(sf_fp32, mn=qweight.shape[-2])
-    return qweight, sf_fp32, sf_packed_int32
+    return qweight, sf_fp32
 
 
 # ---------------------------------------------------------------------------
@@ -329,8 +329,10 @@ class TestPostprocessTensors(CustomTestCase):
 
     # --- fp8 quant pair (real dequant on real fp8 tensors) ---
 
+    @unittest.skipIf(is_hip(), "DeepGEMM is not supported on ROCm")
     def test_fp8_quant_pair_yields_lazy_pair(self):
-        qweight, sf_fp32, sf_packed_int32 = _build_fp8_quant_pair()
+        qweight, sf_fp32 = _build_fp8_quant_pair()
+        sf_packed_int32 = transform_scale_ue8m0(sf_fp32, mn=qweight.shape[-2])
         raw = {"x.weight": qweight, "x.weight_scale_inv": sf_packed_int32}
 
         ref = Fp8BlockComparable(qweight, sf_packed_int32)
@@ -359,7 +361,7 @@ class TestPostprocessTensors(CustomTestCase):
         )
 
     def test_fp8_quant_pair_yield_order_alongside_other_entries(self):
-        qweight, sf_fp32, _ = _build_fp8_quant_pair()
+        qweight, sf_fp32 = _build_fp8_quant_pair()
         bias = torch.ones(4, device="cuda")
         raw = {
             "x.weight": qweight,
