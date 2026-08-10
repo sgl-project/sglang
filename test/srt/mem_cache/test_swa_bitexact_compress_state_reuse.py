@@ -25,6 +25,7 @@ import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
 )
@@ -343,8 +344,15 @@ class TestFusedStateRideProbe(unittest.TestCase):
         return hp, pools, layers
 
     def test_uniform_geometry_is_fusable(self):
+        # The fused path ships disabled, so the probe's accept case only reports
+        # whether the geometry would qualify once it is turned back on.
         hp, pools, layers = self._ride([(4, 16, 131), (4, 16, 131)])
-        self.assertTrue(SC._probe_state_ride_fusable(hp, pools, layers))
+        with envs.SGLANG_SWA_STATE_FUSED_H2D.override(True):
+            self.assertTrue(SC._probe_state_ride_fusable(hp, pools, layers))
+
+    def test_disabled_by_default_even_on_uniform_geometry(self):
+        hp, pools, layers = self._ride([(4, 16, 131), (4, 16, 131)])
+        self.assertFalse(SC._probe_state_ride_fusable(hp, pools, layers))
 
     def test_mixed_ring_size_falls_back(self):
         hp, pools, layers = self._ride([(4, 16, 131), (4, 8, 131)])
@@ -364,10 +372,16 @@ class TestFusedStateRideProbe(unittest.TestCase):
     torch.cuda.is_available(), "fused state H2D only engages on a real device pool"
 )
 class TestFusedStateRideBytes(unittest.TestCase):
-    """The fused all-layer H2D is the path a real pool takes, and the probe
-    (correctly) rejects the faked pools every other test here uses -- so this is
-    the only place it runs at all. Build the real thing and hold it to the
-    docstring's claim: byte-identical to the per-layer fallback."""
+    """The fused all-layer H2D ships disabled: it lands wrong device bytes under
+    concurrent shared-prefix prefill (see SGLANG_SWA_STATE_FUSED_H2D). This keeps
+    it honest at the geometry this test can build -- byte-identical to the
+    per-layer fallback -- which is exactly why the failure needs the real server
+    to reproduce and this test did not catch it."""
+
+    def setUp(self):
+        self._fused = envs.SGLANG_SWA_STATE_FUSED_H2D.override(True)
+        self._fused.__enter__()
+        self.addCleanup(self._fused.__exit__, None, None, None)
 
     def _build_ride(self, layer_num=4, ring=16, ratio=4, head_dim=8, page=256):
         try:
@@ -420,11 +434,9 @@ class TestFusedStateRideBytes(unittest.TestCase):
         layer_num, ring = 4, 16
         hp, pools, bufs = self._build_ride(layer_num=layer_num, ring=ring)
         layers = [(i, i) for i in range(layer_num)]
-        # The premise of this whole test: a real pool IS fusable, so production
-        # takes the fused path and the per-layer loop is only a fallback.
         self.assertTrue(
             SC._probe_state_ride_fusable(hp, pools, layers),
-            "a real device state pool must be fusable, else the fused path is dead code",
+            "a real device state pool must satisfy the probe, else this test is vacuous",
         )
 
         page_row, swa_ring, req = 3, 131, 2

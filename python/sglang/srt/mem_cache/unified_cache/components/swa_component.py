@@ -13,6 +13,7 @@ except ImportError:  # non-CUDA/ROCm builds; state rides fall back to per-layer
     transfer_kv_all_layer_mla = None
     transfer_kv_direct = None
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
@@ -310,6 +311,8 @@ def _probe_state_ride_fusable(hp, pools, layers) -> bool:
     assembler builds. Anything else (fake/CPU pools in unit tests, partial layer
     maps, mixed ratio) keeps the per-layer path."""
     if transfer_kv_direct is None or transfer_kv_all_layer_mla is None:
+        return False
+    if not envs.SGLANG_SWA_STATE_FUSED_H2D.get():
         return False
     if getattr(hp, "layout", None) != "layer_first":
         return False
