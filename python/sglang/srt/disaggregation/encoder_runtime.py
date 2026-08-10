@@ -1381,10 +1381,13 @@ async def run_dp_worker(
     )
 
     # gpu_id is the device chosen by maybe_reindex_device_id in the parent:
-    # 0 when CVD is pinned to one GPU, else the absolute id. rank=0, so
-    # MMEncoder runs set_device(base_gpu_id).
-    args = server_args.derive("encode_server.dp_worker", base_gpu_id=gpu_id, tp_size=1)
-    enc = MMEncoder(args, dist_init_method=f"tcp://127.0.0.1:{get_free_port()}", rank=0)
+    # 0 when CVD is pinned to one GPU, else the absolute id.
+    enc = MMEncoder(
+        server_args,
+        dist_init_method=f"tcp://127.0.0.1:{get_free_port()}",
+        rank=0,
+        gpu_id=gpu_id,
+    )
 
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()

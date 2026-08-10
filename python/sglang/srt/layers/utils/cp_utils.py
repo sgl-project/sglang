@@ -15,7 +15,10 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_parallel,
+    uses_mla_backend,
+)
 
 
 @dataclass
@@ -69,8 +72,7 @@ def is_prefill_cp_in_seq_split():
 
 
 def is_mla_prefill_cp_enabled() -> bool:
-    sa = get_server_args()
-    return get_parallel().enable_prefill_context_parallel and sa.use_mla_backend()
+    return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
 
 
 def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):

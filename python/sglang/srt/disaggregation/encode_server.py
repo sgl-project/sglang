@@ -431,7 +431,12 @@ class MMEncoder:
         schedule_path=None,
         dist_init_method=None,
         rank: int = 0,
+        gpu_id: Optional[int] = None,
     ):
+        """``gpu_id`` pins this encoder to a device other than
+        ``base_gpu_id + rank`` — the DP launcher's per-worker placement. It is
+        this instance's value, not a config change, so it travels as an
+        argument."""
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
         publish(server_args, role="encoder")
@@ -459,7 +464,7 @@ class MMEncoder:
         ).lower()
 
         self.device = server_args.device
-        self.gpu_id = server_args.base_gpu_id + rank
+        self.gpu_id = server_args.base_gpu_id + rank if gpu_id is None else gpu_id
 
         self.device_config = DeviceConfig(
             device=self.device,

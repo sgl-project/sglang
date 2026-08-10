@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+namespace sglang {
+
 namespace ngram {
 
 struct Param {
@@ -105,3 +107,5 @@ struct Param {
 };
 
 }  // namespace ngram
+
+}  // namespace sglang
