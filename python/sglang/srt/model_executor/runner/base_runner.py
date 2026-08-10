@@ -404,7 +404,13 @@ class BaseRunner(ABC):
             else get_server_return_hidden_states_mode(mr.server_args)
         )
         num_tokens_per_req = 1
-        if mr.spec_algorithm.is_speculative():
+        # A PD prefill target worker's pool has no SpeculativeState, so a
+        # TARGET_VERIFY dummy forward would trip the linear-attn backend's
+        # pool-type assert. Warm up in plain DECODE instead.
+        _is_pd_prefill_target = (
+            mr.server_args.disaggregation_mode == "prefill" and not mr.is_draft_worker
+        )
+        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
             if mr.is_draft_worker:
                 assert (
                     mr.spec_algorithm.supports_target_verify_for_draft()

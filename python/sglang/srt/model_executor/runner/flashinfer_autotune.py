@@ -33,8 +33,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA.
-FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
+FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
@@ -102,15 +101,18 @@ def should_run_flashinfer_autotune(
     from sglang.srt.layers.quantization.fp8_utils import (
         get_fp8_gemm_runner_backend,
     )
-    from sglang.srt.utils import is_sm100_supported
+    from sglang.srt.utils import is_sm100_supported, is_sm120_supported
 
     model_uses_modelopt_fp8 = model_quantization in (
         "modelopt",
         "modelopt_fp8",
         "modelopt_mixed",
     )
+    # SM120 satisfies is_blackwell_supported(), so resolve_mxfp8_dense_gemm_backend
+    # sends it to the same tunable FlashInfer CUTLASS MXFP8 dense GEMM as SM100;
+    # without this the kernel always runs at tactic=-1.
     fp8_gemm_needs_autotune = get_fp8_gemm_runner_backend().is_flashinfer_cutlass() or (
-        model_uses_modelopt_fp8 and is_sm100_supported()
+        model_uses_modelopt_fp8 and (is_sm100_supported() or is_sm120_supported())
     )
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
