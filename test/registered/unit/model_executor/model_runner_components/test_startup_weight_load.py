@@ -28,6 +28,7 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -647,12 +648,7 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
                 "sglang.srt.model_executor.model_runner.dist_barrier_after_load",
                 side_effect=barrier,
             ),
-            patch(
-                "sglang.srt.model_executor.model_runner.get_exec",
-                return_value=SimpleNamespace(
-                    moe=SimpleNamespace(elastic_ep_backend=None)
-                ),
-            ),
+            get_context().override_server_args(),
         ):
             runner.finalize_startup_weight_load()
 
