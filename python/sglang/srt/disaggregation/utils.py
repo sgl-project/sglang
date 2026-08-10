@@ -160,8 +160,8 @@ def _advance_quiescence(poller) -> int:
 
     A KVTransferBarrierEscalation is not such a fault. It is the barrier
     reporting that pages cannot be proven idle and must not be reused, so it is
-    propagated: swallowing it here would silently turn the strictest policy into
-    the most permissive one.
+    propagated: swallowing it here would silently release exactly the pages the
+    barrier refused to.
     """
     try:
         return int(poller.advance_failure_quiescence())

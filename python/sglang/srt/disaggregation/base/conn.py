@@ -204,9 +204,11 @@ class BaseKVSender(ABC):
         pages. Backends without out-of-band transfer work keep the default.
 
         Implementations must be idempotent, must not block the scheduler loop,
-        and must be *bounded*: a transport or peer that never confirms
-        quiescence has to eventually return ``True`` rather than pinning the
-        request, and its pages, forever.
+        and must not fail silently: a transport or peer that never confirms
+        quiescence must be reported after a bounded wait, and must eventually
+        raise ``KVTransferBarrierEscalation`` rather than pin an unbounded
+        number of requests -- a restart reclaims every withheld page safely,
+        while releasing without proof can corrupt another request's KV.
         """
         return True
 
