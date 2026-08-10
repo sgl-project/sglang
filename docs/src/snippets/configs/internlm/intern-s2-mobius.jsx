@@ -64,9 +64,12 @@ sgl-eval run gpqa \\
   },
 
   // Per-variant accuracy applied to every cell; per-cell `accuracy` overrides.
-  // Measured on 2xH200 with the low-latency (EAGLE NEXTN 3-1-4) recipe,
-  // no --temperature override — the model's own generation_config
-  // (temp=0.8, top_p=1.0, top_k=50) applies throughout.
+  // Measured on 2xH200 with the low-latency (EAGLE NEXTN 3-1-4) recipe, with no
+  // server-side sampling override, so the checkpoint's generation_config.json
+  // defaults apply throughout (temp=1.0, top_p=0.95, top_k=20). NOTE: the model
+  // card separately recommends temp=0.8 / top_p=1.0 / top_k=50 / min_p=0.0 —
+  // those are NOT what generation_config.json ships, so they only apply when the
+  // client sends them explicitly.
   // gsm8k : full 1319-example test split.
   // gpqa  : Diamond, 198 problems × 8 repeats, pass@1 avg-of-8 = 79.23% ± 1.49,
   //         pass@8 = 88.38 %, majority@8 = 80.56 %, stop_rate = 100 %.
@@ -97,16 +100,14 @@ sgl-eval run gpqa \\
       ],
     },
 
-    // ----- Card: "MoE Parallelism" (2nd MoE: the MTP nextn layer is MoE-256 / top-8) -----
-    moe: {
-      backend: {
-        options: [
-          { id: null,     label: "Inherited" },
-          { id: "deepep", label: "DeepEP",   flags: ["--moe-a2a-backend deepep"] },
-        ],
-      },
-      ep: { label: "EP", values: [null, 1, 2] },
-    },
+    // No "MoE Parallelism" card. The routed experts do not live per-layer: all 40
+    // layers query 4 globally shared expert banks (`meta_mlp`, config `num_blocks: 4`
+    // — models/interns2_mobius.py), so EP has nothing to shard. The runtime enforces
+    // that: server_args._handle_model_specific_adjustments raises for this arch on
+    // `--ep-size != 1` (and `--pp-size != 1`), so an EP chip would emit a command
+    // that cannot start. `--moe-a2a-backend deepep` is out for the same reason, and
+    // arg_groups/overrides.py pins moe_runner_backend to triton_kernel as the only
+    // runner validated for the 2,560-expert bank.
 
     // ----- Card: "Parsers" -----
     parsers: {
@@ -122,10 +123,10 @@ sgl-eval run gpqa \\
         { id: "current", label: "Inherited from base" },
         { id: "off",     label: "Off (greedy)" },
         { id: "mtp-314", label: "MTP / NEXTN 3-1-4 (recommended)",
-          flags: ["--speculative-algo NEXTN", "--speculative-num-steps 3",
+          flags: ["--speculative-algorithm NEXTN", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
         { id: "mtp-213", label: "MTP / NEXTN 2-1-3 (lighter draft)",
-          flags: ["--speculative-algo NEXTN", "--speculative-num-steps 2",
+          flags: ["--speculative-algorithm NEXTN", "--speculative-num-steps 2",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 3"] },
       ],
     },
@@ -147,7 +148,7 @@ sgl-eval run gpqa \\
         "--mem-fraction-static 0.8",
         "--context-length 262144",
         "--reasoning-parser qwen3",
-        "--speculative-algo NEXTN",
+        "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
@@ -186,7 +187,7 @@ sgl-eval run gpqa \\
         "--mem-fraction-static 0.8",
         "--context-length 262144",
         "--reasoning-parser qwen3",
-        "--speculative-algo NEXTN",
+        "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
