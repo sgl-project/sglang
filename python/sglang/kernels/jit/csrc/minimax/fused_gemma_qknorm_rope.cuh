@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 // Up to this many norm "groups" are fused into one launch. A group is a
 // contiguous run of heads (within the per-token row) that share one norm
@@ -197,4 +197,4 @@ void fused_gemma_qknorm_rope(
       .enable_pdl(kUsePDL)(fused_gemma_qknorm_rope_kernel<Trait>, params);
 }
 
-}  // namespace
+}  // namespace sglang

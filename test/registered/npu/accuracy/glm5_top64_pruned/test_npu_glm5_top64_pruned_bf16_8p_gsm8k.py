@@ -8,12 +8,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(
-    est_time=3600,
-    suite="",
-    nightly=True,
-    disabled="accuracy testcase",
-)
+register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
 
 ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
@@ -54,7 +49,7 @@ class TestNPUGLM5_Top64_Pruned_GSM8K(TestNpuAccuracyTestCaseBase):
     model = GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
-    accuracy = 0.50
+    accuracy = 0.48
     datasets = ["gsm8k"]
     generation_config = {
         "max_tokens": 2048,

@@ -9,9 +9,9 @@ from sglang.test.test_utils import (
     parse_models,
 )
 
-register_cuda_ci(est_time=3600, suite="nightly-perf-text-2-gpu", nightly=True)
+register_cuda_ci(est_time=450, stage="nightly", runner_config="2-gpu-large")
 
-PROFILE_DIR = "performance_profiles_text_models"
+RESULT_DIR = "performance_results_text_models"
 
 
 class TestNightlyTextModelsPerformance(unittest.TestCase):
@@ -31,8 +31,8 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         cls.batch_sizes = [1, 1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
 
     def test_bench_one_batch(self):
         all_model_succeed = True
