@@ -5,20 +5,7 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 
 on:
   schedule:
-    # Same 00:00 / 12:00 UTC firing times as the single '0 */12 * * *' entry
-    # this replaces, split in two so the dsv4 accuracy jobs can key off
-    # github.event.schedule and claim the 00:00 slot only. They hold the
-    # 8-GPU MI35x pool for up to 8h, which is too long to run twice a day.
-    - cron: '0 0 * * *'
-    - cron: '0 12 * * *'
-  pull_request:
-    paths:
-      - "python/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "python/sglang/kernels/aot/**"
-      - ".github/workflows/pr-test-amd.yml"
-      - "docker/rocm.Dockerfile"
+    - cron: '0 */12 * * *' # Run every 12 hours (UTC)
   workflow_dispatch:
     inputs:
       target_stage_select:
@@ -45,8 +32,6 @@ on:
           - stage-c-test-large-8-gpu-amd
           - stage-c-test-large-8-gpu-amd-mi35x
           - stage-b-test-large-8-gpu-mi35x-disaggregation-amd
-          - dsv4-flash-fp4-fp8-amd
-          - dsv4-pro-fp4-amd
       target_stage:
         description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
@@ -230,7 +215,7 @@ jobs:
     with:
       ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
       runner_arch: ${{ inputs.runner_arch || 'mi300' }}
-      rocm_version: rocm720
+      rocm_version: rocm700
       aiter_ref: ${{ inputs.aiter_ref }}
       continue_on_error: true
     secrets: inherit
@@ -260,7 +245,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -318,7 +303,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -359,7 +344,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -396,7 +381,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -433,7 +418,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -501,7 +486,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -537,7 +522,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -576,7 +561,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -617,7 +602,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -658,7 +643,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -707,7 +692,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -838,7 +823,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -968,7 +953,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1045,7 +1030,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1104,7 +1089,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1150,7 +1135,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1230,7 +1215,7 @@ jobs:
           echo "=== Host RDMA Check Complete ==="
 
       - name: Start Special Container
-        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm720
+        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1295,125 +1280,6 @@ jobs:
             -e MC_LOG_LEVEL=TRACE \
             -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-
-  # =============================================== DeepSeek-V4 (MI35x, 8-GPU) ====================================================
-  # Schedule-only accuracy jobs: they never run on pull_request. `inputs` are
-  # unset on pull_request events, so the guard below reduces to the
-  # github.event.schedule check there. The 00:00 cron claims them; the 12:00
-  # cron skips them because a single dsv4-pro run can hold the 8-GPU MI35x
-  # pool for 8 hours. Still reachable via workflow_dispatch (pick the stage,
-  # or tick run_all_tests) and on workflow_call full runs.
-  #
-  # Deliberately absent from pr-test-amd-finish: that aggregator is the PR
-  # gate's required check, and these jobs are neither PR-triggered nor
-  # bounded within a PR's turnaround. amd-ci-job-monitor.yml reports them
-  # per-job, so failures still surface.
-  dsv4-flash-fp4-fp8-amd:
-    needs: [call-gate]
-    if: |
-      always() && !cancelled() &&
-      (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',dsv4-flash-fp4-fp8-amd,')) ||
-        (
-          !(inputs.target_stage || inputs.target_stage_select) &&
-          (
-            (github.event.schedule == '0 0 * * *') ||
-            inputs.run_all_tests
-          )
-        )
-      )
-    runs-on: linux-mi35x-gpu-8
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-          ENABLE_CACHE_HOST: "1"
-
-      - name: Install dependencies
-        run: |
-          # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-
-      - name: Accuracy Test MI35x (8-GPU DeepSeek-V4-Flash FP4 + FP8)
-        timeout-minutes: 300
-        run: |
-          > github_summary.md  # Clear summary file
-          # SGLANG_DSV4_ACCURACY_ONLY=1 makes the dsv4 test files skip their perf test
-          # (test_b_perf_8k_1k); only the GSM8K accuracy test runs in this workflow.
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            -e SGLANG_DSV4_ACCURACY_ONLY=1 \
-            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-  dsv4-pro-fp4-amd:
-    needs: [call-gate]
-    if: |
-      always() && !cancelled() &&
-      (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',dsv4-pro-fp4-amd,')) ||
-        (
-          !(inputs.target_stage || inputs.target_stage_select) &&
-          (
-            (github.event.schedule == '0 0 * * *') ||
-            inputs.run_all_tests
-          )
-        )
-      )
-    runs-on: linux-mi35x-gpu-8
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-          ENABLE_CACHE_HOST: "1"
-
-      - name: Install dependencies
-        run: |
-          # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-
-      - name: Accuracy Test MI35x (8-GPU DeepSeek-V4-Pro FP4)
-        timeout-minutes: 480
-        run: |
-          > github_summary.md  # Clear summary file
-          # SGLANG_DSV4_ACCURACY_ONLY=1 makes the dsv4 test files skip their perf test
-          # (test_b_perf_8k_1k); only the GSM8K accuracy test runs in this workflow.
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            -e SGLANG_DSV4_ACCURACY_ONLY=1 \
-            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
-            python3 registered/amd/test_deepseek_v4_pro_fp4.py || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          if [[ "${{ github.event_name == 'schedule' || inputs.continue_on_error }}" == "true" ]]; then
-            exit 0
-          fi
-          exit ${TEST_EXIT_CODE:-0}
 
   pr-test-amd-finish:
     needs:

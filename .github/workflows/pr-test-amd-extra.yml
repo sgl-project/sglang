@@ -37,7 +37,7 @@ on:
           - mi300
           - mi325
       rocm_version:
-        description: 'ROCm container variant (rocm720 = ROCm 7.2.0, the gated stack; rocm700 = ROCm 7.0.0)'
+        description: 'ROCm container variant (rocm720 = ROCm 7.2.0, the PR default; rocm700 = ROCm 7.0.0)'
         required: false
         type: choice
         default: rocm720
@@ -67,7 +67,7 @@ on:
         type: string
         default: mi300
       rocm_version:
-        description: 'ROCm container variant (rocm720 = ROCm 7.2.0, the gated stack; rocm700 = ROCm 7.0.0)'
+        description: 'ROCm container variant (rocm720 = ROCm 7.2.0, the PR default; rocm700 = ROCm 7.0.0)'
         required: false
         type: string
         default: rocm720
@@ -144,11 +144,9 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        # Defaults to rocm720 so a PR's extra tier runs the same stack as the
-        # gate in pr-test-amd.yml. pr-test-amd-rocm700.yml passes rocm700 to
-        # keep its own chained extra tier on the shadow stack. Only non-default
-        # variants get a job-name suffix, so PR job names stay stable.
-        run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
+        # `inputs` is empty on pull_request events, so fall back explicitly to
+        # the ROCm 7.2 PR default. Reusable callers can still request ROCm 7.0.
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm720' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -179,7 +177,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm720' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -209,7 +207,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm720' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 

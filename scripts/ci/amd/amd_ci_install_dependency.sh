@@ -238,6 +238,13 @@ DOCKERFILE="docker/rocm.Dockerfile"
 GPU_ARCH="${GPU_ARCH:-mi30x}"
 echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
+IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
+case "${IMAGE_HIP_VERSION}" in
+    7.2*) AITER_TRITON_MODE="0" ;;
+    *) AITER_TRITON_MODE="1" ;;
+esac
+echo "[CI-AITER-CHECK] Container HIP=${IMAGE_HIP_VERSION}, AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE}"
+
 #############################################
 # 1. Extract AITER_COMMIT from correct Dockerfile block
 #############################################
@@ -332,7 +339,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # build AITER
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE} GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
