@@ -78,9 +78,7 @@ class ServerArgsAutoTuner:
                 and not args.enable_torch_compile
                 and not args.is_arg_explicitly_set("enable_torch_compile")
             ):
-                # speed means fastest: compile by default. An explicit
-                # --enable-torch-compile false still wins (e.g. models where
-                # compile is slower or changes the numerical contract).
+                # only models with a validated compile win opt in by default
                 args.enable_torch_compile = True
                 logger.info(
                     "performance_mode=speed enables torch.compile "

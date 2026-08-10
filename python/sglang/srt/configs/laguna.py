@@ -66,8 +66,18 @@ def _to_sglang_rope_scaling(rope_params: Dict[str, Any]) -> Optional[Dict[str, A
         if key in rope_params:
             out[key] = rope_params[key]
     if "attention_factor" in rope_params:
-        # HF spells it attention_factor; SGLang's factory reads attn_factor.
-        out["attn_factor"] = rope_params["attention_factor"]
+        # attention_factor is the final YaRN mscale; SGLang multiplies attn_factor
+        # onto its own default, so divide that out to avoid squaring the scale.
+        # Drop mscale/mscale_all_dim so the embedding uses that simple default as
+        # its base (yarn.py picks the mscale/mscale_all_dim ratio when both are set).
+        from sglang.srt.layers.rotary_embedding.yarn import yarn_get_mscale_simple
+
+        out.pop("mscale", None)
+        out.pop("mscale_all_dim", None)
+        factor = float(rope_params.get("factor", 1.0) or 1.0)
+        out["attn_factor"] = rope_params["attention_factor"] / yarn_get_mscale_simple(
+            factor
+        )
     return out
 
 

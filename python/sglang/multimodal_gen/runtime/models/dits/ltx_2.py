@@ -10,14 +10,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.fused_linear_gelu import (
+    can_fuse_linear_gelu,
+    fused_gelu_active,
+    fused_linear_gelu_tanh,
+    mark_fused_gelu_site,
+)
 from sglang.kernels.ops.diffusion.ltx2_qknorm_split_rope import (
     can_use_ltx2_qknorm_split_rope_cuda,
     ltx2_qknorm_split_rope_cuda,
 )
-from sglang.kernels.ops.diffusion.residual_gate_add import (
-    can_use_residual_gate_add_cuda,
-    residual_gate_add_cuda,
+from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
+    can_fuse_ltx2_rms_norm_modulate,
+    fused_ltx2_rms_norm_modulate,
+    ltx2_rms_norm_modulate_active,
+    mark_ltx2_rms_norm_modulate_site,
 )
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig, LTX2Config
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
@@ -56,29 +65,7 @@ logger = init_logger(__name__)
 
 ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
-_LTX2_RESIDUAL_GATE_CUDA_DISABLED = False
 _LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED = False
-
-
-def _ltx2_residual_gate_add(
-    residual: torch.Tensor,
-    update: torch.Tensor,
-    gate: torch.Tensor,
-) -> torch.Tensor:
-    global _LTX2_RESIDUAL_GATE_CUDA_DISABLED
-
-    if not _LTX2_RESIDUAL_GATE_CUDA_DISABLED and can_use_residual_gate_add_cuda(
-        residual, update, gate
-    ):
-        try:
-            return residual_gate_add_cuda(residual, update, gate)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling LTX2 residual-gate CUDA fast path: {exc}")
-            _LTX2_RESIDUAL_GATE_CUDA_DISABLED = True
-
-    return residual + update * gate
 
 
 def _ltx2_try_fused_qknorm_split_rope(
@@ -148,6 +135,29 @@ def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
     return ADALN_NUM_BASE_PARAMS + (
         ADALN_NUM_CROSS_ATTN_PARAMS if cross_attention_adaln else 0
     )
+
+
+def _ltx2_rms_norm_modulate(
+    block: nn.Module,
+    rms_norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """``rms_norm(x) * (1 + scale) + shift`` for the LTX-2 adaLN sites.
+
+    Folds the weightless RMSNorm and the modulate into one kernel when the
+    ``quality="high"`` fusion is mounted on ``block`` and the per-call guard
+    passes; otherwise the verbatim eager reference chain (the ``lossless``
+    default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
+    on the request-scoped mount rather than a runtime self-check.
+    """
+    if ltx2_rms_norm_modulate_active(block) and can_fuse_ltx2_rms_norm_modulate(
+        x, scale, shift
+    ):
+        return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
+    return rms_norm(x, eps) * (1 + scale) + shift
 
 
 def _ltx2_disable_fused_ada_values(exc: Exception) -> None:
@@ -847,8 +857,17 @@ class LTX2Attention(nn.Module):
             else:
                 if self.qk_norm:
                     assert self.q_norm is not None and self.k_norm is not None
-                    q = self.q_norm(q)
-                    k = self.k_norm(k)
+                    # Torch 2.12+ places rms_norm on the autocast fp32 list. A
+                    # cast after the norm preserves the attention contract but
+                    # still runs the much slower fp32 kernel. Torch 2.11 ran
+                    # this operation in the input dtype, so disable autocast
+                    # around Q/K norm to preserve both its precision path and
+                    # performance.
+                    q_dtype = q.dtype
+                    k_dtype = k.dtype
+                    with torch.autocast(device_type=q.device.type, enabled=False):
+                        q = self.q_norm(q).to(dtype=q_dtype)
+                        k = self.k_norm(k).to(dtype=k_dtype)
 
                 if pe is not None and cos.dim() == 3:
                     q = apply_interleaved_rotary_emb(q, (cos, sin))
@@ -993,10 +1012,14 @@ class LTX2FeedForward(nn.Module):
             input_is_parallel=True,
             quant_config=quant_config,
         )
+        mark_fused_gelu_site(self, "proj_in")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.proj_in(x)
-        x = self.act(x)
+        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj_in, x):
+            x = fused_linear_gelu_tanh(x, self.proj_in.weight, self.proj_in.bias)
+        else:
+            x, _ = self.proj_in(x)
+            x = self.act(x)
         x, _ = self.proj_out(x)
         return x
 
@@ -1124,6 +1147,7 @@ class LTX2TransformerBlock(nn.Module):
 
         # 4. Feedforward layers
         self.ff = LTX2FeedForward(dim, dim_out=dim, quant_config=quant_config)
+        mark_ltx2_rms_norm_modulate_site(self)
         self.audio_ff = LTX2FeedForward(
             audio_dim, dim_out=audio_dim, quant_config=quant_config
         )
@@ -1216,8 +1240,8 @@ class LTX2TransformerBlock(nn.Module):
             )
         else:
             vshift_msa, vscale_msa, vgate_msa = video_ada_values[0:3]
-        norm_hidden_states = (
-            self.rms_norm(hidden_states, self.norm_eps) * (1 + vscale_msa) + vshift_msa
+        norm_hidden_states = _ltx2_rms_norm_modulate(
+            self, self.rms_norm, hidden_states, vscale_msa, vshift_msa, self.norm_eps
         )
         attn_hidden_states = self.attn1(
             norm_hidden_states,
@@ -1228,9 +1252,7 @@ class LTX2TransformerBlock(nn.Module):
             gather_context_kv_for_sp=audio_replicated_for_sp,
             context_replicated_prefix_len=video_memory_prefix_len,
         )
-        hidden_states = _ltx2_residual_gate_add(
-            hidden_states, attn_hidden_states, vgate_msa
-        )
+        hidden_states = residual_gate_add(hidden_states, attn_hidden_states, vgate_msa)
 
         if audio_ada_values is None:
             ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
@@ -1238,9 +1260,13 @@ class LTX2TransformerBlock(nn.Module):
             )
         else:
             ashift_msa, ascale_msa, agate_msa = audio_ada_values[0:3]
-        norm_audio_hidden_states = (
-            self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_msa)
-            + ashift_msa
+        norm_audio_hidden_states = _ltx2_rms_norm_modulate(
+            self,
+            self.rms_norm,
+            audio_hidden_states,
+            ascale_msa,
+            ashift_msa,
+            self.norm_eps,
         )
         attn_audio_hidden_states = self.audio_attn1(
             norm_audio_hidden_states,
@@ -1250,7 +1276,7 @@ class LTX2TransformerBlock(nn.Module):
             all_perturbed=skip_audio_self_attn,
             skip_sequence_parallel_override=audio_replicated_for_sp,
         )
-        audio_hidden_states = _ltx2_residual_gate_add(
+        audio_hidden_states = residual_gate_add(
             audio_hidden_states, attn_audio_hidden_states, agate_msa
         )
         # 2. Prompt Cross-Attention
@@ -1269,8 +1295,8 @@ class LTX2TransformerBlock(nn.Module):
             v_prompt_shift, v_prompt_scale = self.get_ada_values(
                 self.prompt_scale_shift_table, batch_size, temb_prompt, slice(None)
             )
-            norm_hidden_states = (
-                self.rms_norm(hidden_states, self.norm_eps) * (1 + vscale_q) + vshift_q
+            norm_hidden_states = _ltx2_rms_norm_modulate(
+                self, self.rms_norm, hidden_states, vscale_q, vshift_q, self.norm_eps
             )
             mod_encoder_hidden_states = (
                 encoder_hidden_states * (1 + v_prompt_scale) + v_prompt_shift
@@ -1280,7 +1306,7 @@ class LTX2TransformerBlock(nn.Module):
                 context=mod_encoder_hidden_states,
                 mask=encoder_attention_mask,
             )
-            hidden_states = _ltx2_residual_gate_add(
+            hidden_states = residual_gate_add(
                 hidden_states, attn_hidden_states, vgate_q
             )
 
@@ -1296,9 +1322,13 @@ class LTX2TransformerBlock(nn.Module):
                 temb_audio_prompt,
                 slice(None),
             )
-            norm_audio_hidden_states = (
-                self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_q)
-                + ashift_q
+            norm_audio_hidden_states = _ltx2_rms_norm_modulate(
+                self,
+                self.rms_norm,
+                audio_hidden_states,
+                ascale_q,
+                ashift_q,
+                self.norm_eps,
             )
             mod_audio_encoder_hidden_states = (
                 audio_encoder_hidden_states * (1 + a_prompt_scale) + a_prompt_shift
@@ -1308,7 +1338,7 @@ class LTX2TransformerBlock(nn.Module):
                 context=mod_audio_encoder_hidden_states,
                 mask=audio_encoder_attention_mask,
             )
-            audio_hidden_states = _ltx2_residual_gate_add(
+            audio_hidden_states = residual_gate_add(
                 audio_hidden_states, attn_audio_hidden_states, agate_q
             )
         else:
@@ -1410,7 +1440,7 @@ class LTX2TransformerBlock(nn.Module):
                 a2v_attn_hidden_states = (
                     a2v_attn_hidden_states * a2v_cross_attn_perturbation_mask
                 )
-            hidden_states = _ltx2_residual_gate_add(
+            hidden_states = residual_gate_add(
                 hidden_states, a2v_attn_hidden_states, a2v_gate
             )
 
@@ -1436,7 +1466,7 @@ class LTX2TransformerBlock(nn.Module):
                 v2a_attn_hidden_states = (
                     v2a_attn_hidden_states * v2a_cross_attn_perturbation_mask
                 )
-            audio_hidden_states = _ltx2_residual_gate_add(
+            audio_hidden_states = residual_gate_add(
                 audio_hidden_states, v2a_attn_hidden_states, v2a_gate
             )
         # 4. Feedforward
@@ -1446,11 +1476,11 @@ class LTX2TransformerBlock(nn.Module):
             )
         else:
             vshift_mlp, vscale_mlp, vgate_mlp = video_ada_values[3:6]
-        norm_hidden_states = (
-            self.rms_norm(hidden_states, self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
+        norm_hidden_states = _ltx2_rms_norm_modulate(
+            self, self.rms_norm, hidden_states, vscale_mlp, vshift_mlp, self.norm_eps
         )
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = _ltx2_residual_gate_add(hidden_states, ff_output, vgate_mlp)
+        hidden_states = residual_gate_add(hidden_states, ff_output, vgate_mlp)
 
         if audio_ada_values is None:
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
@@ -1458,12 +1488,16 @@ class LTX2TransformerBlock(nn.Module):
             )
         else:
             ashift_mlp, ascale_mlp, agate_mlp = audio_ada_values[3:6]
-        norm_audio_hidden_states = (
-            self.rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_mlp)
-            + ashift_mlp
+        norm_audio_hidden_states = _ltx2_rms_norm_modulate(
+            self,
+            self.rms_norm,
+            audio_hidden_states,
+            ascale_mlp,
+            ashift_mlp,
+            self.norm_eps,
         )
         audio_ff_output = self.audio_ff(norm_audio_hidden_states)
-        audio_hidden_states = _ltx2_residual_gate_add(
+        audio_hidden_states = residual_gate_add(
             audio_hidden_states, audio_ff_output, agate_mlp
         )
         return hidden_states, audio_hidden_states
