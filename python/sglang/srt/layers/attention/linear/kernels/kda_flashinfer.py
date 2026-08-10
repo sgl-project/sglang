@@ -28,6 +28,10 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers.attention.linear.kda_route_telemetry import (
+    record_kda_terminal_route,
+    stable_kda_exception_detail,
+)
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -75,6 +79,32 @@ class CakePackedDecodeReason:
 @dataclass(frozen=True)
 class CakePackedDecodeAdmission:
     """One terminal selector result for a packed CAKE decode attempt."""
+
+    eligible: bool
+    reason: str
+    detail: str = ""
+
+
+class CakePrefillReason:
+    """Stable CAKE ordinary-prefill route reason codes."""
+
+    ELIGIBLE = "eligible"
+    SPEC_DECODE = "spec_decode"
+    INTERIOR_CHECKPOINT = "interior_checkpoint"
+    INVALID_LOWER_BOUND = "invalid_lower_bound"
+    MISSING_GATE_PARAMS = "missing_gate_params"
+    UNSUPPORTED_Q_CONTRACT = "unsupported_q_contract"
+    CUDA_GRAPH_ALLOCATION = "cuda_graph_allocation"
+    T1_DECODE_SHAPE = "t1_decode_shape"
+    UNSUPPORTED_HEAD_DIM = "unsupported_head_dim"
+    SHAPE_MISMATCH = "shape_mismatch"
+    UNSUPPORTED_ARCH = "unsupported_arch"
+    UNSUPPORTED_CONTRACT = "unsupported_contract"
+
+
+@dataclass(frozen=True)
+class CakePrefillAdmission:
+    """One terminal selector result for an ordinary CAKE prefill attempt."""
 
     eligible: bool
     reason: str
@@ -507,6 +537,93 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         return torch.cuda.get_device_capability(q.device) in ((10, 0), (10, 3))
 
     @staticmethod
+    def _cake_prefill_admission(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        A_log: Optional[torch.Tensor],
+        dt_bias: Optional[torch.Tensor],
+        query_start_loc: torch.Tensor,
+        lower_bound: Optional[float],
+        is_spec_decode: bool,
+        return_intermediate_states: bool,
+        track_ssm_h_src: Optional[torch.Tensor],
+    ) -> CakePrefillAdmission:
+        """Attach stable telemetry reasons without changing admission policy."""
+        supported = CakeKDAKernel._cake_prefill_is_supported(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            query_start_loc=query_start_loc,
+            lower_bound=lower_bound,
+            is_spec_decode=is_spec_decode,
+            return_intermediate_states=return_intermediate_states,
+            track_ssm_h_src=track_ssm_h_src,
+        )
+        if supported:
+            return CakePrefillAdmission(True, CakePrefillReason.ELIGIBLE)
+        if is_spec_decode:
+            return CakePrefillAdmission(False, CakePrefillReason.SPEC_DECODE)
+        # ``None`` is included so telemetry remains correct when the separate
+        # admission fix treats a missing checkpoint source as non-aligned.
+        if return_intermediate_states and (
+            track_ssm_h_src is None or track_ssm_h_src.numel() > 0
+        ):
+            return CakePrefillAdmission(
+                False,
+                CakePrefillReason.INTERIOR_CHECKPOINT,
+                "track_ssm_h_src",
+            )
+        if (
+            lower_bound is None
+            or not math.isfinite(float(lower_bound))
+            or float(lower_bound) >= 0.0
+        ):
+            return CakePrefillAdmission(
+                False, CakePrefillReason.INVALID_LOWER_BOUND, "lower_bound"
+            )
+        if A_log is None or dt_bias is None:
+            detail = "A_log" if A_log is None else "dt_bias"
+            return CakePrefillAdmission(
+                False, CakePrefillReason.MISSING_GATE_PARAMS, detail
+            )
+        if not q.is_cuda or q.ndim != 4 or q.shape[0] != 1:
+            return CakePrefillAdmission(
+                False, CakePrefillReason.UNSUPPORTED_Q_CONTRACT, "q"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            return CakePrefillAdmission(False, CakePrefillReason.CUDA_GRAPH_ALLOCATION)
+        if q.shape[1] <= query_start_loc.numel() - 1:
+            return CakePrefillAdmission(False, CakePrefillReason.T1_DECODE_SHAPE)
+        if q.shape[-1] != 128 or v.shape[-1] != 128:
+            return CakePrefillAdmission(
+                False, CakePrefillReason.UNSUPPORTED_HEAD_DIM, "q_or_v"
+            )
+        if k.shape != q.shape or v.shape != q.shape or g.shape != q.shape:
+            detail = next(
+                name
+                for name, tensor in (("k", k), ("v", v), ("g", g))
+                if tensor.shape != q.shape
+            )
+            return CakePrefillAdmission(False, CakePrefillReason.SHAPE_MISMATCH, detail)
+        if beta.shape != q.shape[:-1]:
+            return CakePrefillAdmission(False, CakePrefillReason.SHAPE_MISMATCH, "beta")
+        if torch.cuda.get_device_capability(q.device) not in ((10, 0), (10, 3)):
+            return CakePrefillAdmission(
+                False, CakePrefillReason.UNSUPPORTED_ARCH, "device_capability"
+            )
+        return CakePrefillAdmission(
+            False, CakePrefillReason.UNSUPPORTED_CONTRACT, "unclassified"
+        )
+
+    @staticmethod
     def _extend_triton(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -537,6 +654,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         is_spec_decode: bool = False,
         return_intermediate_states: bool = False,
+        layer_id: int,
         **kwargs,
     ) -> torch.Tensor:
         """Run ordinary CAKE prefill, preserving Triton-only state semantics."""
@@ -557,78 +675,149 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             **kwargs,
         )
         track_ssm_h_src = kwargs.get("track_ssm_h_src")
-        if not self._cake_prefill_is_supported(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            query_start_loc=query_start_loc,
-            lower_bound=lower_bound,
-            is_spec_decode=is_spec_decode,
-            return_intermediate_states=return_intermediate_states,
-            track_ssm_h_src=track_ssm_h_src,
-        ):
-            return self._extend_triton(q, k, v, g, beta, **fallback_kwargs)
-
-        self._check_cake_state_contract(
-            ssm_states,
-            num_v_heads=v.shape[2],
-            head_v_dim=v.shape[3],
-            head_k_dim=q.shape[3],
-        )
-        available, recurrent_kda = _get_flashinfer_kda_prefill_kernel()
-        if not available or recurrent_kda is None:
-            raise RuntimeError(
-                "FlashInfer CAKE KDA prefill is not available. Install a "
-                "FlashInfer build containing the frozen recurrent prefill backend."
+        try:
+            admission = self._cake_prefill_admission(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=query_start_loc,
+                lower_bound=lower_bound,
+                is_spec_decode=is_spec_decode,
+                return_intermediate_states=return_intermediate_states,
+                track_ssm_h_src=track_ssm_h_src,
             )
-
-        q_fi = q.to(torch.bfloat16).contiguous()
-        k_fi = k.to(torch.bfloat16).contiguous()
-        v_fi = v.to(torch.bfloat16).contiguous()
-        g_fi = g.to(torch.bfloat16).contiguous()
-        # SGLang pre-activates beta for ordinary extend. The frozen kernel fuses
-        # sigmoid, so reconstruct a logit in FP32 and round only at the handoff.
-        beta_fi = torch.logit(beta.float().clamp(1e-7, 1.0 - 1e-7)).to(torch.bfloat16)
-        beta_fi = beta_fi.contiguous()
-        A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
-        query_start_loc_fi = query_start_loc.to(torch.int64).contiguous()
-
-        state_indices = cache_indices.clamp(min=0).to(torch.int64)
-        state_batch = ssm_states.index_select(0, state_indices).contiguous()
-        output, final_state = recurrent_kda(
-            q=q_fi,
-            k=k_fi,
-            v=v_fi,
-            g=g_fi,
-            beta=beta_fi,
-            A_log=A_log_fi,
-            dt_bias=dt_bias_fi,
-            scale=None,
-            initial_state=state_batch,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            lower_bound=lower_bound,
-            cu_seqlens=query_start_loc_fi,
-            beta_is_logit=True,
-        )
-        if final_state is None:
-            raise RuntimeError("FlashInfer CAKE prefill did not return final state")
-        ssm_states.index_copy_(0, state_indices, final_state)
-        if return_intermediate_states:
-            # Boundary-aligned track: _track_mamba_state_extend consumes the
-            # final state already scattered above. With no interior h source,
-            # match NvidiaKDAKernel's empty stand-in while preserving the
-            # ordinary CAKE output/final-state path bit for bit.
-            h_empty = q.new_empty(
-                (1, 0) + tuple(ssm_states.shape[1:]), dtype=torch.float32
+        except Exception as exc:
+            record_kda_terminal_route(
+                mode="prefill",
+                layer_id=layer_id,
+                eligible=False,
+                attempted_cake=False,
+                cake_success=False,
+                triton_fallback=False,
+                fatal=True,
+                reason="prefill_selector_exception",
+                detail=stable_kda_exception_detail(exc),
             )
-            return output, h_empty
-        return output
+            raise
+
+        if not admission.eligible:
+            try:
+                output = self._extend_triton(q, k, v, g, beta, **fallback_kwargs)
+            except Exception as exc:
+                record_kda_terminal_route(
+                    mode="prefill",
+                    layer_id=layer_id,
+                    eligible=False,
+                    attempted_cake=False,
+                    cake_success=False,
+                    triton_fallback=False,
+                    fatal=True,
+                    reason="triton_fallback_exception",
+                    detail=stable_kda_exception_detail(exc),
+                )
+                raise
+            record_kda_terminal_route(
+                mode="prefill",
+                layer_id=layer_id,
+                eligible=False,
+                attempted_cake=False,
+                cake_success=False,
+                triton_fallback=True,
+                fatal=False,
+                reason=admission.reason,
+                detail=admission.detail,
+            )
+            return output
+
+        try:
+            self._check_cake_state_contract(
+                ssm_states,
+                num_v_heads=v.shape[2],
+                head_v_dim=v.shape[3],
+                head_k_dim=q.shape[3],
+            )
+            available, recurrent_kda = _get_flashinfer_kda_prefill_kernel()
+            if not available or recurrent_kda is None:
+                raise RuntimeError(
+                    "FlashInfer CAKE KDA prefill is not available. Install a "
+                    "FlashInfer build containing the frozen recurrent prefill backend."
+                )
+
+            q_fi = q.to(torch.bfloat16).contiguous()
+            k_fi = k.to(torch.bfloat16).contiguous()
+            v_fi = v.to(torch.bfloat16).contiguous()
+            g_fi = g.to(torch.bfloat16).contiguous()
+            # SGLang pre-activates beta for ordinary extend. The frozen kernel fuses
+            # sigmoid, so reconstruct a logit in FP32 and round only at the handoff.
+            beta_fi = torch.logit(beta.float().clamp(1e-7, 1.0 - 1e-7)).to(
+                torch.bfloat16
+            )
+            beta_fi = beta_fi.contiguous()
+            A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
+            query_start_loc_fi = query_start_loc.to(torch.int64).contiguous()
+
+            state_indices = cache_indices.clamp(min=0).to(torch.int64)
+            state_batch = ssm_states.index_select(0, state_indices).contiguous()
+            output, final_state = recurrent_kda(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                g=g_fi,
+                beta=beta_fi,
+                A_log=A_log_fi,
+                dt_bias=dt_bias_fi,
+                scale=None,
+                initial_state=state_batch,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                lower_bound=lower_bound,
+                cu_seqlens=query_start_loc_fi,
+                beta_is_logit=True,
+            )
+            if final_state is None:
+                raise RuntimeError("FlashInfer CAKE prefill did not return final state")
+            ssm_states.index_copy_(0, state_indices, final_state)
+            if return_intermediate_states:
+                # Boundary-aligned track: _track_mamba_state_extend consumes the
+                # final state already scattered above. With no interior h source,
+                # match NvidiaKDAKernel's empty stand-in while preserving the
+                # ordinary CAKE output/final-state path bit for bit.
+                h_empty = q.new_empty(
+                    (1, 0) + tuple(ssm_states.shape[1:]), dtype=torch.float32
+                )
+                result = output, h_empty
+            else:
+                result = output
+        except Exception as exc:
+            record_kda_terminal_route(
+                mode="prefill",
+                layer_id=layer_id,
+                eligible=True,
+                attempted_cake=True,
+                cake_success=False,
+                triton_fallback=False,
+                fatal=True,
+                reason="cake_prefill_exception",
+                detail=stable_kda_exception_detail(exc),
+            )
+            raise
+        record_kda_terminal_route(
+            mode="prefill",
+            layer_id=layer_id,
+            eligible=True,
+            attempted_cake=True,
+            cake_success=True,
+            triton_fallback=False,
+            fatal=False,
+            reason=admission.reason,
+            detail=admission.detail,
+        )
+        return result
 
     # ---- decode ----
 
@@ -862,6 +1051,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
 
     supports_k3_fused_decode = False
     supports_packed_decode = True
+    supports_cake_route_telemetry = True
 
     def __init__(self):
         super().__init__(backend="cake")
@@ -1320,88 +1510,157 @@ class CakeKDAKernel(FlashInferKDAKernel):
         lower_bound: Optional[float] = None,
         cache_indices_cpu=None,
         cache_index_contract=None,
+        layer_id: int,
         **kwargs,
     ) -> torch.Tensor:
         """Run CAKE's exact packed decode or explicitly retain Triton semantics."""
         global _cake_packed_decode_route_logged
-        replay_requested = any(
-            kwargs.get(name) is not None
-            for name in (
-                "replayssm_d",
-                "replayssm_k",
-                "replayssm_g",
-                "replayssm_write_pos",
-                "replayssm_force_flush",
+        try:
+            replay_requested = any(
+                kwargs.get(name) is not None
+                for name in (
+                    "replayssm_d",
+                    "replayssm_k",
+                    "replayssm_g",
+                    "replayssm_write_pos",
+                    "replayssm_force_flush",
+                )
             )
-        )
-        if replay_requested:
-            admission = CakePackedDecodeAdmission(
-                False, CakePackedDecodeReason.REPLAYSSM_REQUESTED
+            if replay_requested:
+                admission = CakePackedDecodeAdmission(
+                    False, CakePackedDecodeReason.REPLAYSSM_REQUESTED
+                )
+            elif self._packed_kda_decode is None:
+                admission = CakePackedDecodeAdmission(
+                    False, CakePackedDecodeReason.KERNEL_UNAVAILABLE
+                )
+            else:
+                admission = self._cake_packed_decode_admission(
+                    mixed_qkv,
+                    a,
+                    b,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    num_v_heads=num_v_heads,
+                    head_v_dim=head_v_dim,
+                    lower_bound=lower_bound,
+                    cache_indices_cpu=cache_indices_cpu,
+                    cache_index_contract=cache_index_contract,
+                )
+        except Exception as exc:
+            record_kda_terminal_route(
+                mode="decode",
+                layer_id=layer_id,
+                eligible=False,
+                attempted_cake=False,
+                cake_success=False,
+                triton_fallback=False,
+                fatal=True,
+                reason="packed_selector_exception",
+                detail=stable_kda_exception_detail(exc),
             )
-        elif self._packed_kda_decode is None:
-            admission = CakePackedDecodeAdmission(
-                False, CakePackedDecodeReason.KERNEL_UNAVAILABLE
-            )
-        else:
-            admission = self._cake_packed_decode_admission(
-                mixed_qkv,
-                a,
-                b,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                scale=scale,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                num_v_heads=num_v_heads,
-                head_v_dim=head_v_dim,
-                lower_bound=lower_bound,
-                cache_indices_cpu=cache_indices_cpu,
-                cache_index_contract=cache_index_contract,
-            )
+            raise
         self._last_packed_decode_admission = admission
         if not admission.eligible:
-            return self._packed_decode_triton(
-                mixed_qkv,
-                a,
-                b,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                scale=scale,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                num_v_heads=num_v_heads,
-                head_v_dim=head_v_dim,
-                lower_bound=lower_bound,
-                **kwargs,
+            try:
+                output = self._packed_decode_triton(
+                    mixed_qkv,
+                    a,
+                    b,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    num_v_heads=num_v_heads,
+                    head_v_dim=head_v_dim,
+                    lower_bound=lower_bound,
+                    **kwargs,
+                )
+            except Exception as exc:
+                record_kda_terminal_route(
+                    mode="decode",
+                    layer_id=layer_id,
+                    eligible=False,
+                    attempted_cake=False,
+                    cake_success=False,
+                    triton_fallback=False,
+                    fatal=True,
+                    reason="triton_fallback_exception",
+                    detail=stable_kda_exception_detail(exc),
+                )
+                raise
+            record_kda_terminal_route(
+                mode="decode",
+                layer_id=layer_id,
+                eligible=False,
+                attempted_cake=False,
+                cake_success=False,
+                triton_fallback=True,
+                fatal=False,
+                reason=admission.reason,
+                detail=admission.detail,
             )
+            return output
 
-        batch_size = mixed_qkv.shape[0]
-        # These are metadata-only views: positive disjoint row strides are
-        # forwarded to FlashInfer unchanged, including the production beta
-        # stride (144, 1). Neither call changes data_ptr/storage_offset.
-        raw_gate = self._cake_packed_row_view(
-            a, batch_size=batch_size, row_width=_CAKE_PACKED_GATE_WIDTH
-        )
-        raw_beta = self._cake_packed_row_view(
-            b, batch_size=batch_size, row_width=_CAKE_PACKED_NUM_HEADS
-        )
-        output = mixed_qkv.new_empty(
-            batch_size, 1, _CAKE_PACKED_NUM_HEADS, _CAKE_PACKED_HEAD_DIM
-        )
-        if not _cake_packed_decode_route_logged:
-            logger.info(
-                "FlashInfer CAKE packed KDA decode route active: "
-                "H=12, D=128, direct indexed BF16 state"
+        try:
+            batch_size = mixed_qkv.shape[0]
+            # These are metadata-only views: positive disjoint row strides are
+            # forwarded to FlashInfer unchanged, including the production beta
+            # stride (144, 1). Neither call changes data_ptr/storage_offset.
+            raw_gate = self._cake_packed_row_view(
+                a, batch_size=batch_size, row_width=_CAKE_PACKED_GATE_WIDTH
             )
-            _cake_packed_decode_route_logged = True
-        self._packed_kda_decode(
-            mixed_qkv=mixed_qkv,
-            raw_gate=raw_gate,
-            raw_beta=raw_beta,
-            A_log=A_log.view(_CAKE_PACKED_NUM_HEADS),
-            dt_bias=dt_bias.view(_CAKE_PACKED_GATE_WIDTH),
-            state=ssm_states,
-            state_indices=cache_indices,
-            output=output,
+            raw_beta = self._cake_packed_row_view(
+                b, batch_size=batch_size, row_width=_CAKE_PACKED_NUM_HEADS
+            )
+            output = mixed_qkv.new_empty(
+                batch_size, 1, _CAKE_PACKED_NUM_HEADS, _CAKE_PACKED_HEAD_DIM
+            )
+            if not _cake_packed_decode_route_logged:
+                logger.info(
+                    "FlashInfer CAKE packed KDA decode route active: "
+                    "H=12, D=128, direct indexed BF16 state"
+                )
+                _cake_packed_decode_route_logged = True
+            self._packed_kda_decode(
+                mixed_qkv=mixed_qkv,
+                raw_gate=raw_gate,
+                raw_beta=raw_beta,
+                A_log=A_log.view(_CAKE_PACKED_NUM_HEADS),
+                dt_bias=dt_bias.view(_CAKE_PACKED_GATE_WIDTH),
+                state=ssm_states,
+                state_indices=cache_indices,
+                output=output,
+            )
+            result = output.transpose(0, 1)
+        except Exception as exc:
+            record_kda_terminal_route(
+                mode="decode",
+                layer_id=layer_id,
+                eligible=True,
+                attempted_cake=True,
+                cake_success=False,
+                triton_fallback=False,
+                fatal=True,
+                reason="cake_packed_exception",
+                detail=stable_kda_exception_detail(exc),
+            )
+            raise
+        record_kda_terminal_route(
+            mode="decode",
+            layer_id=layer_id,
+            eligible=True,
+            attempted_cake=True,
+            cake_success=True,
+            triton_fallback=False,
+            fatal=False,
+            reason=admission.reason,
+            detail=admission.detail,
+            copy_count=0,
+            copy_count_source="static_zero_copy_row_view",
         )
-        return output.transpose(0, 1)
+        return result

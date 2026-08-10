@@ -238,6 +238,8 @@ def _packed_decode(kern, d, ssm, lower_bound=-5.0, **kwargs):
                 f"direct-kernel-request-{i}" for i in range(active_prefix)
             ),
         )
+    if getattr(kern, "supports_cake_route_telemetry", False):
+        kwargs["layer_id"] = 7
     return kern.packed_decode(
         d["mixed_qkv"],
         d["a"].unsqueeze(1),

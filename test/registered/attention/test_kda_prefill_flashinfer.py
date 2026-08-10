@@ -97,6 +97,8 @@ def _make_inputs(seq_lens, num_heads):
 
 
 def _extend(kernel, data, state, seq_lens, **kwargs):
+    if getattr(kernel, "supports_cake_route_telemetry", False):
+        kwargs["layer_id"] = 7
     return kernel.extend(
         data["q"].clone(),
         data["k"].clone(),

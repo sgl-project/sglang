@@ -46,6 +46,11 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.linear.kda_route_telemetry import (
+    KDACudaGraphRoutePlans,
+    capture_kda_route_plan,
+    replay_kda_route_plan,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -216,6 +221,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         super().__init__(model_runner)
+        self.kda_cuda_graph_route_plans = KDACudaGraphRoutePlans()
         self._war_read_done_node_planted = False
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
@@ -1146,12 +1152,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     skip_logits=False,
                 )
-                self.backend.capture_one(
+                with capture_kda_route_plan(
                     shape_key,
-                    run_once,
-                    capture_inputs=None,
-                    post_warmup_hook=post_warmup_hook,
-                )
+                    "decode",
+                    plans=self.kda_cuda_graph_route_plans,
+                ):
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        capture_inputs=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
@@ -1336,7 +1347,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             if war_record is SharedReadBoundary.PRE_REPLAY:
                 self._publish_war_read_done(in_graph=False)
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            output = replay_kda_route_plan(
+                self._replay_graph_key,
+                "decode",
+                lambda: self.backend.replay(self._replay_graph_key, forward_batch),
+                plans=self.kda_cuda_graph_route_plans,
+            )
             if war_record is SharedReadBoundary.POST_REPLAY:
                 self._publish_war_read_done(in_graph=False)
             elif war_record is SharedReadBoundary.IN_REPLAY:

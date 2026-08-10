@@ -5,6 +5,9 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
+from sglang.srt.layers.attention.linear.kda_route_telemetry import (
+    KDACudaGraphRoutePlans,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -100,6 +103,8 @@ def test_publish_war_read_done():
 
 def _execute_harness(runner, calls, mode=ForwardMode.DECODE):
     key = ShapeKey(size=1)
+    runner.kda_cuda_graph_route_plans = KDACudaGraphRoutePlans()
+    runner.kda_cuda_graph_route_plans.bind("decode", key, ())
     output = PPProxyTensors({"hidden_states": torch.ones(1, 1)})
     runner.ragged_verify_mode = False
     runner.bs = 1

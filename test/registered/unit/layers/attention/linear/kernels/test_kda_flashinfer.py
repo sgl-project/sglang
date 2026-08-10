@@ -13,6 +13,8 @@ from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     CakeKDAKernel,
     CakePackedDecodeAdmission,
     CakePackedDecodeReason,
+    CakePrefillAdmission,
+    CakePrefillReason,
 )
 from sglang.srt.mem_cache.allocator.mamba import (
     MambaSlotAllocator,
@@ -255,7 +257,9 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
         state_true = state_false.clone()
         with (
             patch.object(
-                kernel, "_cake_prefill_is_supported", return_value=True
+                kernel,
+                "_cake_prefill_admission",
+                return_value=CakePrefillAdmission(True, CakePrefillReason.ELIGIBLE),
             ) as selector,
             patch.object(
                 kernel,
@@ -267,12 +271,14 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
                 "_get_flashinfer_kda_prefill_kernel",
                 return_value=(True, fake_recurrent_kda),
             ),
+            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
         ):
             output_false = kernel.extend(
                 **inputs,
                 ssm_states=state_false,
                 lower_bound=-5.0,
                 return_intermediate_states=False,
+                layer_id=7,
             )
             output_true, h_empty = kernel.extend(
                 **inputs,
@@ -280,10 +286,21 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
                 lower_bound=-5.0,
                 return_intermediate_states=True,
                 track_ssm_h_src=torch.empty(0, dtype=torch.int64),
+                layer_id=7,
             )
 
         self.assertEqual(selector.call_count, 2)
         self.assertEqual(len(cake_calls), 2)
+        self.assertEqual(telemetry.call_count, 2)
+        for call in telemetry.call_args_list:
+            self.assertEqual(call.kwargs["mode"], "prefill")
+            self.assertEqual(call.kwargs["layer_id"], 7)
+            self.assertTrue(call.kwargs["eligible"])
+            self.assertTrue(call.kwargs["attempted_cake"])
+            self.assertTrue(call.kwargs["cake_success"])
+            self.assertFalse(call.kwargs["triton_fallback"])
+            self.assertFalse(call.kwargs["fatal"])
+            self.assertEqual(call.kwargs["reason"], CakePrefillReason.ELIGIBLE)
         self.assertTrue(torch.equal(output_true, output_false))
         self.assertTrue(torch.equal(state_true, state_false))
         self.assertEqual(h_empty.shape, (1, 0, 12, 128, 128))
@@ -542,8 +559,9 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
                 "index_copy_",
                 side_effect=AssertionError("packed CAKE decode scattered state"),
             ),
+            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
         ):
-            output = kernel.packed_decode(**inputs)
+            output = kernel.packed_decode(**inputs, layer_id=7)
 
         self.assertEqual(len(calls), 1)
         call = calls[0]
@@ -563,6 +581,19 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         self.assertEqual(call["A_log"].data_ptr(), inputs["A_log"].data_ptr())
         self.assertEqual(call["dt_bias"].data_ptr(), inputs["dt_bias"].data_ptr())
         self.assertEqual(call["output"].shape, (8, 1, 12, 128))
+        telemetry.assert_called_once_with(
+            mode="decode",
+            layer_id=7,
+            eligible=True,
+            attempted_cake=True,
+            cake_success=True,
+            triton_fallback=False,
+            fatal=False,
+            reason=CakePackedDecodeReason.ELIGIBLE,
+            detail="",
+            copy_count=0,
+            copy_count_source="static_zero_copy_row_view",
+        )
         self.assertEqual(call["output"].dtype, torch.bfloat16)
         self.assertTrue(call["output"].is_contiguous())
         self.assertEqual(output.shape, (1, 8, 12, 128))
@@ -593,8 +624,9 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
                 "_packed_decode_triton",
                 return_value=sentinel,
             ) as fallback,
+            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
         ):
-            output = kernel.packed_decode(**inputs)
+            output = kernel.packed_decode(**inputs, layer_id=7)
 
         self.assertIs(output, sentinel)
         fallback.assert_called_once()
@@ -602,6 +634,17 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         self.assertEqual(
             kernel._last_packed_decode_admission.reason,
             CakePackedDecodeReason.INNER_STRIDE,
+        )
+        telemetry.assert_called_once_with(
+            mode="decode",
+            layer_id=7,
+            eligible=False,
+            attempted_cake=False,
+            cake_success=False,
+            triton_fallback=True,
+            fatal=False,
+            reason=CakePackedDecodeReason.INNER_STRIDE,
+            detail="raw_beta",
         )
 
     def test_selector_reports_stable_stride_reasons(self):
@@ -796,7 +839,7 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
                 kernel, "_packed_decode_triton", return_value=sentinel
             ) as fallback,
         ):
-            output = kernel.packed_decode(**inputs)
+            output = kernel.packed_decode(**inputs, layer_id=7)
 
         self.assertIs(output, sentinel)
         self.assertEqual(fallback.call_count, 1)
@@ -848,9 +891,10 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
                 "_packed_decode_triton",
                 side_effect=NotImplementedError(safe_gate_error),
             ) as fallback,
+            patch.object(kda_flashinfer, "record_kda_terminal_route") as telemetry,
             self.assertRaisesRegex(NotImplementedError, "KDA safe gate"),
         ):
-            kernel.packed_decode(**replay_args, **inputs)
+            kernel.packed_decode(**replay_args, **inputs, layer_id=7)
 
         fallback.assert_called_once()
         for name, tensor in replay_args.items():
@@ -860,6 +904,17 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         self.assertEqual(
             kernel._last_packed_decode_admission.reason,
             CakePackedDecodeReason.REPLAYSSM_REQUESTED,
+        )
+        telemetry.assert_called_once_with(
+            mode="decode",
+            layer_id=7,
+            eligible=False,
+            attempted_cake=False,
+            cake_success=False,
+            triton_fallback=False,
+            fatal=True,
+            reason="triton_fallback_exception",
+            detail="builtins.NotImplementedError",
         )
 
 

@@ -218,6 +218,7 @@ class KDAKernelDispatcher:
         num_v_heads: int,
         head_v_dim: int,
         cache_index_contract=None,
+        layer_id: int,
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """Attempt packed decode. Returns output tensor or None if the decode
@@ -236,6 +237,7 @@ class KDAKernelDispatcher:
             num_v_heads=num_v_heads,
             head_v_dim=head_v_dim,
             cache_index_contract=cache_index_contract,
+            layer_id=layer_id,
             **kwargs,
         )
 
@@ -322,8 +324,11 @@ class KDAKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        layer_id: int,
         **kwargs,
     ) -> torch.Tensor:
+        if getattr(self.extend_kernel, "supports_cake_route_telemetry", False):
+            kwargs["layer_id"] = layer_id
         return self.extend_kernel.extend(
             q,
             k,
@@ -560,6 +565,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
                 cache_index_contract=(self.forward_metadata.mamba_cache_index_contract),
+                layer_id=layer.layer_id,
                 lower_bound=layer.lower_bound,
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,
@@ -695,6 +701,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            layer_id=layer.layer_id,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
