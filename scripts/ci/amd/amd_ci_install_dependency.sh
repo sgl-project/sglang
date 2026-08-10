@@ -249,20 +249,6 @@ case "${IMAGE_HIP_VERSION}" in
 esac
 echo "[CI-AITER-CHECK] Container HIP=${IMAGE_HIP_VERSION}, AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE}"
 
-REPO_TRITON_COMMIT=$(sed -n 's/^ARG TRITON_COMMIT="\([^"]*\)"/\1/p' "${DOCKERFILE}" | head -n1)
-if [[ -z "${REPO_TRITON_COMMIT}" ]]; then
-    echo "[CI-AITER-CHECK] ERROR: Failed to extract TRITON_COMMIT from ${DOCKERFILE}."
-    exit 1
-fi
-IMAGE_TRITON_VERSION=$(docker exec ci_sglang python3 -c \
-    'from importlib.metadata import version; print(version("triton"))' 2>/dev/null || echo "none")
-TRITON_NEEDS_REFRESH="false"
-if [[ "${AITER_TRITON_MODE}" == "0" && \
-      -z "${AITER_COMMIT_OVERRIDE:-}" && \
-      "${IMAGE_TRITON_VERSION}" != *"${REPO_TRITON_COMMIT:0:8}"* ]]; then
-    TRITON_NEEDS_REFRESH="true"
-fi
-
 #############################################
 # 1. Extract AITER_COMMIT from correct Dockerfile block
 #############################################
@@ -317,11 +303,6 @@ else
     NEED_REBUILD="true"
 fi
 
-if [[ "${TRITON_NEEDS_REFRESH}" == "true" ]]; then
-    echo "[CI-AITER-CHECK] Triton ${IMAGE_TRITON_VERSION} does not match ${REPO_TRITON_COMMIT:0:8} → rebuild needed"
-    NEED_REBUILD="true"
-fi
-
 #############################################
 # 4. Rebuild AITER if needed
 #############################################
@@ -367,35 +348,6 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
             test -f .github/scripts/install_triton.sh
             bash .github/scripts/install_triton.sh
         "
-        if [[ -z "${AITER_COMMIT_OVERRIDE:-}" ]]; then
-            docker exec \
-                -e EXPECTED_TRITON_SHA="${REPO_TRITON_COMMIT:0:8}" \
-                ci_sglang python3 -c '
-import os
-from importlib.metadata import version
-
-triton_version = version("triton")
-triton_kernels_version = version("triton-kernels")
-expected_sha = os.environ["EXPECTED_TRITON_SHA"]
-if expected_sha not in triton_version:
-    raise SystemExit(
-        f"Expected Triton revision {expected_sha}, found {triton_version}"
-    )
-if not triton_kernels_version.startswith("1.0.0"):
-    raise SystemExit(
-        f"Expected triton-kernels 1.0.0-compatible build, found {triton_kernels_version}"
-    )
-if expected_sha not in triton_kernels_version:
-    raise SystemExit(
-        f"Expected triton-kernels revision {expected_sha}, "
-        f"found {triton_kernels_version}"
-    )
-print(
-    f"[CI-AITER-CHECK] Validated Triton {triton_version}, "
-    f"triton-kernels {triton_kernels_version}"
-)
-'
-        fi
     fi
 
     # build AITER
