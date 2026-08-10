@@ -28,11 +28,11 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, get_device
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
-DEVICE = torch.device("cuda")
+DEVICE = get_device()
 VOCAB = 129280
 
 
