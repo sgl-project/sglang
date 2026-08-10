@@ -516,22 +516,32 @@ async fn chat_completions_handler(
     if is_stream {
         let request_id = format!("chatcmpl-{}", Uuid::new_v4());
 
-        // Model the real SGLang P/D handoff for the one-token boundary:
-        // prefill owns the sampled token while decode has only terminal
-        // metadata left to emit. This lets the integration test catch a
-        // router that always discards prefill output.
+        // Model real SGLang P/D terminal handoffs: prefill owns the sampled
+        // token while decode has only terminal metadata left to emit. A cap
+        // of one represents the explicit boundary; a cap of two represents
+        // EOS sampled immediately after prefill despite remaining budget.
         let max_tokens = payload
             .get("max_completion_tokens")
             .or_else(|| payload.get("max_tokens"))
             .and_then(|value| value.as_u64());
-        if max_tokens == Some(1)
+        if matches!(max_tokens, Some(1..=3))
             && matches!(
                 &config.worker_type,
                 WorkerType::Prefill | WorkerType::Decode
             )
         {
-            let content = matches!(&config.worker_type, WorkerType::Prefill)
-                .then_some("prefill-handoff-token");
+            let content = match (max_tokens, &config.worker_type) {
+                (Some(1 | 2), WorkerType::Prefill) => Some("prefill-handoff-token"),
+                (Some(1 | 2), WorkerType::Decode) => None,
+                (Some(3), WorkerType::Prefill) => Some("prefill-should-not-return"),
+                (Some(3), WorkerType::Decode) => Some("decode-content"),
+                _ => unreachable!(),
+            };
+            let finish_reason = if max_tokens == Some(1) {
+                "length"
+            } else {
+                "stop"
+            };
             let chunk = json!({
                 "id": request_id,
                 "object": "chat.completion.chunk",
@@ -540,7 +550,7 @@ async fn chat_completions_handler(
                 "choices": [{
                     "index": 0,
                     "delta": { "content": content },
-                    "finish_reason": "length"
+                    "finish_reason": finish_reason
                 }],
                 "usage": {
                     "prompt_tokens": 10,

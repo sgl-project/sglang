@@ -87,12 +87,12 @@ mod pd_routing_tests {
         ctx.shutdown().await;
     }
 
-    /// A one-token P/D request must return the token sampled by prefill.
-    /// Decode receives that token through the KV handoff and has no second
-    /// token to stream, so blindly forwarding only decode yields metadata and
-    /// [DONE] with empty content.
+    /// A terminal P/D request must return the token sampled by prefill.
+    /// This covers both an explicit one-token cap and early EOS with remaining
+    /// token budget. In each case decode has only metadata and [DONE], so
+    /// blindly forwarding decode would yield an empty semantic response.
     #[tokio::test]
-    async fn test_pd_streaming_one_token_returns_prefill_content() {
+    async fn test_pd_streaming_terminal_decode_returns_prefill_content() {
         let config = RouterConfig::builder()
             .prefill_decode_mode(
                 vec![("http://127.0.0.1:19804".to_string(), None)],
@@ -119,10 +119,38 @@ mod pd_routing_tests {
         .await;
         let app = ctx.create_app().await;
 
+        for max_tokens in [1, 2] {
+            let payload = json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "terminal after prefill"}],
+                "max_tokens": max_tokens,
+                "stream": true
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                body.contains("prefill-handoff-token"),
+                "max_tokens={max_tokens}, response: {body}"
+            );
+            assert!(
+                body.contains("[DONE]"),
+                "max_tokens={max_tokens}, response: {body}"
+            );
+        }
+
         let payload = json!({
             "model": "mock-model",
-            "messages": [{"role": "user", "content": "one token"}],
-            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "normal decode output"}],
+            "max_tokens": 3,
             "stream": true
         });
         let request = Request::builder()
@@ -131,13 +159,15 @@ mod pd_routing_tests {
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("prefill-handoff-token"), "response: {body}");
-        assert!(body.contains("[DONE]"), "response: {body}");
+        assert!(body.contains("decode-content"), "response: {body}");
+        assert!(
+            !body.contains("prefill-should-not-return"),
+            "response: {body}"
+        );
 
         ctx.shutdown().await;
     }

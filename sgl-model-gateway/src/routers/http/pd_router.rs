@@ -67,10 +67,6 @@ struct PDRequestContext<'a> {
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
-    /// SGLang prefill produces the handoff token. When the client requests
-    /// exactly one token, decode has no additional content to emit, so the
-    /// prefill response is the authoritative client response.
-    return_prefill_response: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
@@ -569,6 +565,7 @@ impl PDRouter {
                 error_stream,
                 status,
                 None,
+                None,
                 context.return_logprob,
                 Some(response_headers),
                 prefill,
@@ -662,14 +659,6 @@ impl PDRouter {
             (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
-        // The ordinary streaming path attaches guards to the returned body.
-        // The one-token path buffers both tiny upstream responses before it
-        // returns, so keep its load accounted for during that buffering here.
-        let _single_token_prefill_guard = (context.is_stream && context.return_prefill_response)
-            .then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _single_token_decode_guard = (context.is_stream && context.return_prefill_response)
-            .then(|| WorkerLoadGuard::new(decode.clone(), headers));
-
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
@@ -834,34 +823,17 @@ impl PDRouter {
                     return response;
                 }
 
-                if context.return_prefill_response {
-                    return self
-                        .process_single_token_response(prefill_result, res, prefill, decode)
-                        .await;
-                }
-
                 // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
+                // Streaming P/D may terminate immediately after the token sampled
+                // by prefill. Retain the small prefill response as a fallback in
+                // case decode reaches a clean terminal state without content.
+                let capture_prefill_body = context.is_stream || context.return_logprob;
+                let prefill_body = match self
+                    .process_prefill_response(prefill_result, prefill.url(), capture_prefill_body)
+                    .await
+                {
+                    Ok((_, body)) => body,
+                    Err(error_response) => return error_response,
                 };
 
                 if context.is_stream {
@@ -883,6 +855,7 @@ impl PDRouter {
                         res.bytes_stream(),
                         status,
                         prefill_logprobs,
+                        prefill_body,
                         context.return_logprob,
                         Some(response_headers),
                         prefill,
@@ -958,96 +931,69 @@ impl PDRouter {
         }
     }
 
-    /// Return the prefill response for a one-token P/D request.
-    ///
-    /// The prefill engine samples and transfers the first token. The decode
-    /// engine starts after that handoff, so a request capped at one token has
-    /// no decode-side content. Both upstream responses are fully consumed
-    /// before returning so worker load and circuit-breaker outcomes remain
-    /// accurate and neither side is cancelled mid-transfer.
-    async fn process_single_token_response(
-        &self,
-        prefill_result: Result<reqwest::Response, reqwest::Error>,
-        decode_response: reqwest::Response,
-        prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
-    ) -> Response {
-        let prefill_response = match prefill_result {
-            Ok(response) => response,
-            Err(error) => {
-                prefill.record_outcome(false);
-                decode.record_outcome(true);
-                let mut response = error::bad_gateway(
-                    "prefill_server_error",
-                    format!("Prefill server error: {error}"),
-                );
-                response.extensions_mut().insert(BreakerOutcomesRecorded);
-                return response;
-            }
-        };
-
-        let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        if !prefill_status.is_success() {
-            let (prefill_result, decode_body) = tokio::join!(
-                self.process_prefill_response(Ok(prefill_response), prefill.url(), false,),
-                decode_response.bytes()
-            );
-            prefill.record_outcome(prefill_status.is_client_error());
-            decode.record_outcome(decode_body.is_ok());
-
-            let mut response = match prefill_result {
-                Err(response) => response,
-                Ok(_) => error::bad_gateway(
-                    "prefill_server_error",
-                    "Prefill reported failure but returned a success response".to_string(),
-                ),
-            };
-            response.extensions_mut().insert(BreakerOutcomesRecorded);
-            return response;
-        }
-
-        let response_headers = header_utils::preserve_response_headers(prefill_response.headers());
-        let (prefill_body, decode_body) =
-            tokio::join!(prefill_response.bytes(), decode_response.bytes());
-
-        match (prefill_body, decode_body) {
-            (Ok(body), Ok(_)) => {
-                prefill.record_outcome(true);
-                decode.record_outcome(true);
-                let mut response = Response::new(Body::from(body));
-                *response.status_mut() = prefill_status;
-                *response.headers_mut() = response_headers;
-                response.extensions_mut().insert(BreakerOutcomesRecorded);
-                response
-            }
-            (Err(error), decode_body) => {
-                prefill.record_outcome(false);
-                decode.record_outcome(decode_body.is_ok());
-                let mut response = error::bad_gateway(
-                    "prefill_read_failed",
-                    format!("Failed to read one-token prefill response: {error}"),
-                );
-                response.extensions_mut().insert(BreakerOutcomesRecorded);
-                response
-            }
-            (Ok(_), Err(error)) => {
-                prefill.record_outcome(true);
-                decode.record_outcome(false);
-                let mut response = error::bad_gateway(
-                    "decode_read_failed",
-                    format!("Failed to drain one-token decode response: {error}"),
-                );
-                response.extensions_mut().insert(BreakerOutcomesRecorded);
-                response
-            }
-        }
-    }
-
     fn policies_need_request_text(&self) -> bool {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+    }
+
+    /// Return whether an accumulated SSE prefix contains client-visible model
+    /// output. Usage, role, finish-reason, and other metadata do not count.
+    /// Keeping the bytes accumulated means JSON split across network chunks is
+    /// parsed as soon as its complete `data:` line arrives.
+    fn sse_has_semantic_output(body: &[u8]) -> bool {
+        String::from_utf8_lossy(body).lines().any(|line| {
+            let Some(payload) = line.trim().strip_prefix("data:") else {
+                return false;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                return false;
+            }
+            serde_json::from_str::<Value>(payload)
+                .is_ok_and(|value| Self::json_has_semantic_output(&value))
+        })
+    }
+
+    fn json_has_semantic_output(value: &Value) -> bool {
+        fn meaningful(value: Option<&Value>) -> bool {
+            match value {
+                Some(Value::String(text)) => !text.is_empty(),
+                Some(Value::Array(items)) => !items.is_empty(),
+                Some(Value::Object(fields)) => !fields.is_empty(),
+                Some(Value::Bool(value)) => *value,
+                Some(Value::Number(_)) => true,
+                _ => false,
+            }
+        }
+
+        if meaningful(value.get("text")) {
+            return true;
+        }
+
+        value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    if meaningful(choice.get("text")) {
+                        return true;
+                    }
+                    let Some(delta) = choice.get("delta") else {
+                        return false;
+                    };
+                    [
+                        "content",
+                        "reasoning_content",
+                        "tool_calls",
+                        "function_call",
+                        "refusal",
+                        "audio",
+                    ]
+                    .iter()
+                    .any(|field| meaningful(delta.get(*field)))
+                })
+            })
     }
 
     /// Builds the text used for cache-aware routing of a chat request.
@@ -1209,6 +1155,7 @@ impl PDRouter {
         stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
         status: StatusCode,
         prefill_logprobs: Option<Value>,
+        prefill_fallback: Option<bytes::Bytes>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
@@ -1240,6 +1187,13 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
+            // Decode normally emits the first client-visible token. Keep only
+            // its initial metadata until semantic output appears. If decode
+            // instead finishes cleanly without content (for example, EOS was
+            // sampled by prefill), return prefill's handoff token rather than
+            // an empty metadata/[DONE] stream.
+            let mut pending_decode = Vec::new();
+            let mut semantic_output_seen = false;
             loop {
                 tokio::select! {
                     biased;
@@ -1248,12 +1202,32 @@ impl PDRouter {
                             Some(Ok(chunk)) => {
                                 let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
 
-                                let result = if return_logprob && prefill_logprobs.is_some() {
-                                    Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
-                                        .unwrap_or(chunk)
+                                let mut chunks_to_send = Vec::new();
+                                if semantic_output_seen {
+                                    chunks_to_send.push(chunk);
                                 } else {
-                                    chunk
-                                };
+                                    pending_decode.extend_from_slice(&chunk);
+                                    semantic_output_seen =
+                                        Self::sse_has_semantic_output(&pending_decode);
+
+                                    if semantic_output_seen {
+                                        chunks_to_send.push(bytes::Bytes::from(std::mem::take(
+                                            &mut pending_decode,
+                                        )));
+                                    } else if is_done {
+                                        if let Some(prefill_body) = prefill_fallback.clone() {
+                                            tracing::debug!(
+                                                decode_url = %decode_for_log.url(),
+                                                "Decode completed without semantic output; returning prefill response"
+                                            );
+                                            chunks_to_send.push(prefill_body);
+                                        } else {
+                                            chunks_to_send.push(bytes::Bytes::from(std::mem::take(
+                                                &mut pending_decode,
+                                            )));
+                                        }
+                                    }
+                                }
 
                                 // Mark the wrapper completed before the client
                                 // send: upstream finished cleanly regardless of
@@ -1265,12 +1239,24 @@ impl PDRouter {
                                     tracked.mark_completed();
                                 }
 
-                                if tx.send(Ok(result)).is_err() {
-                                    tracing::debug!(
-                                        "Receiver dropped (likely client disconnect), \
-                                        cancelling upstream PD stream"
-                                    );
-                                    break;
+                                for chunk in chunks_to_send {
+                                    let result = if return_logprob && prefill_logprobs.is_some() {
+                                        Self::merge_streaming_logprobs(
+                                            prefill_logprobs.clone(),
+                                            &chunk,
+                                        )
+                                        .unwrap_or(chunk)
+                                    } else {
+                                        chunk
+                                    };
+
+                                    if tx.send(Ok(result)).is_err() {
+                                        tracing::debug!(
+                                            "Receiver dropped (likely client disconnect), \
+                                            cancelling upstream PD stream"
+                                        );
+                                        return;
+                                    }
                                 }
 
                                 if is_done {
@@ -1284,7 +1270,18 @@ impl PDRouter {
                                 let _ = tx.send(Err(format!("Stream error: {}", e)));
                                 break;
                             }
-                            None => break,
+                            None => {
+                                tracked.mark_completed();
+                                if !semantic_output_seen {
+                                    let result = prefill_fallback.clone().unwrap_or_else(|| {
+                                        bytes::Bytes::from(std::mem::take(&mut pending_decode))
+                                    });
+                                    if !result.is_empty() {
+                                        let _ = tx.send(Ok(result));
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
                     _ = tx.closed() => {
@@ -1362,12 +1359,13 @@ impl PDRouter {
         }
     }
 
-    // Helper to process prefill response and extract body if needed for logprobs
+    // Helper to process prefill response and optionally retain its body for
+    // logprob merging or terminal-without-content streaming fallback.
     async fn process_prefill_response(
         &self,
         prefill_result: Result<reqwest::Response, reqwest::Error>,
         prefill_url: &str,
-        return_logprob: bool,
+        capture_body: bool,
     ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
         // Check prefill result first - it's critical for disaggregated mode
         let prefill_response = match prefill_result {
@@ -1436,12 +1434,12 @@ impl PDRouter {
             return Err(error_response);
         }
 
-        // Read prefill body if needed for logprob merging
-        let prefill_body = if return_logprob {
+        // Read prefill body if needed by the downstream response path.
+        let prefill_body = if capture_body {
             match prefill_response.bytes().await {
                 Ok(body) => Some(body),
                 Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
+                    warn!("Failed to read prefill response body: {}", e);
                     None
                 }
             }
@@ -1684,11 +1682,6 @@ impl RouterTrait for PDRouter {
             batch_size,
             is_stream,
             return_logprob,
-            return_prefill_response: body
-                .sampling_params
-                .as_ref()
-                .and_then(|params| params.max_new_tokens)
-                == Some(1),
             request_text,
             model_id,
             headers: headers.cloned(),
@@ -1714,15 +1707,11 @@ impl RouterTrait for PDRouter {
 
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
-        #[allow(deprecated)]
-        let return_prefill_response = body.max_completion_tokens.or(body.max_tokens) == Some(1);
-
         let context = PDRequestContext {
             route: "/v1/chat/completions",
             batch_size,
             is_stream,
             return_logprob,
-            return_prefill_response,
             request_text,
             model_id,
             headers: headers.cloned(),
@@ -1757,7 +1746,6 @@ impl RouterTrait for PDRouter {
             batch_size,
             is_stream,
             return_logprob,
-            return_prefill_response: body.max_tokens == Some(1),
             request_text,
             model_id,
             headers: headers.cloned(),
@@ -1784,7 +1772,6 @@ impl RouterTrait for PDRouter {
             batch_size: None,
             is_stream: false,
             return_logprob: false,
-            return_prefill_response: false,
             request_text: req_text,
             model_id,
             headers: headers.cloned(),
@@ -2106,6 +2093,7 @@ mod tests {
             let response = router.create_streaming_response(
                 stream.map(Ok),
                 StatusCode::OK,
+                None,
                 None,
                 false,
                 None,
