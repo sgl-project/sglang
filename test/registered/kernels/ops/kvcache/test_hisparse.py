@@ -380,6 +380,90 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
 
 
+@pytest.mark.skipif(
+    not is_hip(),
+    reason="CUDA transfer_item_warp assumes 16B-aligned items with no sub-8B remainder.",
+)
+@pytest.mark.parametrize(
+    "kv_dim,miss_token",
+    [
+        # Tokens 0..3 are resident, so the queried token must be >= 4 to miss.
+        # The destination is always slot 0, so the source offset
+        # (miss_token * item size) is what decides the 16B-alignment check.
+        (256, 4),  # 1024B, exactly the gate: one 16B step per lane, no remainder
+        (257, 4),  # 1028B: wide path + 4B byte tail
+        (258, 4),  # 1032B: wide path + one 64-bit word
+        (260, 4),  # 1040B: two wide iterations on lane 0
+        (257, 5),  # 1028B, source at 5140: unaligned, wide path skipped
+        (5, 4),  # 20B: below the gate, 64-bit loop + 4B byte tail
+    ],
+)
+def test_load_cache_to_device_buffer_miss_copy_is_byte_exact(
+    kv_dim: int, miss_token: int
+) -> None:
+    """A miss must copy the item byte-exactly for any item size and alignment.
+
+    Every other ROCm case in this file uses a 32B item, far below the
+    WARP_SIZE * 16 wide-copy gate, so none of them reaches the wide path at all,
+    let alone the seam between it and the remainder loops. These sizes sit on
+    both sides of the gate and cover each remainder shape.
+    """
+    item_size_bytes = kv_dim * torch.empty((), dtype=DTYPE).element_size()
+
+    host_cache = torch.empty(
+        (HOST_CACHE_SIZE, 1, kv_dim), dtype=DTYPE, device="cpu", pin_memory=True
+    )
+    host_cache.copy_(torch.arange(host_cache.numel(), dtype=DTYPE).view_as(host_cache))
+    device_buffer = torch.full(
+        (DEVICE_CACHE_SIZE, 1, kv_dim), -1, dtype=DTYPE, device=DEVICE
+    )
+
+    # Slots 0..3 hold tokens 0..3; slot 4 is the reserved newest slot.
+    device_buffer_locs = torch.tensor(
+        [[0, 1, 2, 3, 4]], dtype=torch.int32, device=DEVICE
+    )
+    device_buffer_tokens = torch.tensor(
+        [[0, 1, 2, 3, -1]], dtype=torch.int32, device=DEVICE
+    )
+    for slot in range(HOT_BUFFER_SIZE):
+        device_buffer[slot].copy_(host_cache[slot].to(DEVICE))
+    torch.cuda.synchronize()
+
+    top_k_tokens = torch.tensor([[miss_token]], dtype=torch.int32, device=DEVICE)
+    out = torch.full_like(top_k_tokens, -1)
+
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=torch.arange(
+            HOST_CACHE_SIZE, dtype=torch.int64, device=DEVICE
+        ).view(1, -1),
+        device_buffer_locs=device_buffer_locs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.arange(1, dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.full((1,), 8, dtype=torch.int32, device=DEVICE),
+        lru_slots=torch.arange(HOT_BUFFER_SIZE, dtype=torch.int16, device=DEVICE).view(
+            1, -1
+        ),
+        item_size_bytes=item_size_bytes,
+        num_top_k=1,
+        hot_buffer_size=HOT_BUFFER_SIZE,
+        page_size=1,
+        block_size=256,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    # The miss evicts the LRU head (slot 0, physical loc 0) and lands there.
+    assert torch.equal(out.cpu(), torch.tensor([[0]], dtype=torch.int32))
+    assert torch.equal(device_buffer[0].cpu(), host_cache[miss_token])
+    # Neighbouring slots must not be corrupted by an over-copy.
+    for slot in range(1, HOT_BUFFER_SIZE):
+        assert torch.equal(device_buffer[slot].cpu(), host_cache[slot])
+
+
 def test_load_cache_to_device_buffer_multiple_misses_copy_all_slots() -> None:
     state = _make_state(
         [[9, 7, 3, 5, 11]],
