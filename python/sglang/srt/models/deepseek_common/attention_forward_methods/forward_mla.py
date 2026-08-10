@@ -102,13 +102,8 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
     )
 
 
-# Backends whose MLA decode kernel reports a natural-log softmax LSE. The rest
-# (FlashInfer MLA, trtllm-gen, tokenspeed) report base-2.
-_MLA_DCP_BASE_E_LSE_BACKENDS = frozenset({"flashmla", "cutedsl_mla"})
-
-
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    return attention_backend in _MLA_DCP_BASE_E_LSE_BACKENDS
+    return attention_backend in {"flashmla", "cutedsl_mla"}
 
 
 if _is_cuda:
