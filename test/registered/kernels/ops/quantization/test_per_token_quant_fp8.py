@@ -9,6 +9,7 @@ from sglang.kernels.ops.quantization.per_token_quant_fp8 import per_token_quant_
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=30, stage="nightly", runner_config="1-gpu-large")
 
 
