@@ -17,6 +17,9 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
 from sglang.srt.entrypoints.anthropic.request_conversion import (  # noqa: E402
     convert_anthropic_to_openai_request,
 )
+from sglang.srt.entrypoints.anthropic.response_conversion import (  # noqa: E402
+    convert_openai_to_anthropic_response,
+)
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
@@ -808,6 +811,52 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertEqual(apply_reasoning_calls, [False])
 
+    def test_response_converter_is_reusable_without_serving(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": "inspect the workspace",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": '{"path":"README.md"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "total_tokens": 14,
+                    "prompt_tokens_details": {"cached_tokens": 3},
+                },
+            }
+        )
+
+        converted = convert_openai_to_anthropic_response(response)
+
+        self.assertEqual(
+            [block.type for block in converted.content], ["thinking", "tool_use"]
+        )
+        self.assertEqual(converted.content[1].input, {"path": "README.md"})
+        self.assertEqual(converted.stop_reason, "tool_use")
+        self.assertEqual(converted.usage.input_tokens, 7)
+        self.assertEqual(converted.usage.cache_read_input_tokens, 3)
+        self.assertEqual(converted.usage.output_tokens, 4)
+
     def test_request_thinking_disabled_invokes_apply_reasoning_enabled(self):
         """``thinking={"type": "disabled"}`` must flip the reasoning toggle off."""
         serving = self._serving()
@@ -1564,7 +1613,8 @@ class TestAnthropicServing(unittest.TestCase):
         )
         serving = self._serving()
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+            "sglang.srt.entrypoints.anthropic.response_conversion",
+            level=logging.WARNING,
         ) as log:
             anthropic_response = serving._convert_response(response)
         self.assertEqual(anthropic_response.stop_reason, "end_turn")

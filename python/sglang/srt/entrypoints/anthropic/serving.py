@@ -45,6 +45,15 @@ from sglang.srt.entrypoints.anthropic.protocol import (
 from sglang.srt.entrypoints.anthropic.request_conversion import (
     convert_anthropic_to_openai_request,
 )
+from sglang.srt.entrypoints.anthropic.response_conversion import (
+    OPENAI_TO_ANTHROPIC_STOP_REASON as STOP_REASON_MAP,
+)
+from sglang.srt.entrypoints.anthropic.response_conversion import (
+    anthropic_usage_from_openai as _anthropic_usage_from_openai,
+)
+from sglang.srt.entrypoints.anthropic.response_conversion import (
+    convert_openai_to_anthropic_response,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -58,17 +67,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Map OpenAI finish reasons to Anthropic stop reasons. Only the four
-# values in ``AnthropicMessagesResponse.stop_reason``'s Literal are valid
-# on the wire; ``content_filter`` and ``abort`` have no perfect mapping
-# so they fall through to the ``end_turn`` default with a WARNING at the
-# call site so operators don't lose the safety/abort signal in logs.
-STOP_REASON_MAP = {
-    "stop": "end_turn",
-    "length": "max_tokens",
-    "tool_calls": "tool_use",
-}
-
 ERROR_TYPE_MAP = {
     400: "invalid_request_error",
     401: "authentication_error",
@@ -81,54 +79,6 @@ ERROR_TYPE_MAP = {
     503: "overloaded_error",
     504: "api_error",
 }
-
-
-def _cached_prompt_tokens(usage) -> int:
-    prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
-    return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
-
-
-def _anthropic_input_tokens(usage) -> int:
-    prompt = getattr(usage, "prompt_tokens", 0) or 0
-    cached = _cached_prompt_tokens(usage)
-    if cached > prompt:
-        # Upstream telemetry bug: cached cannot exceed the prompt it caches.
-        # Clamping silently here would hide the discrepancy from billing
-        # dashboards, so make it visible at WARNING level.
-        logger.warning(
-            "Cached tokens (%d) exceed prompt tokens (%d); clamping "
-            "input_tokens to 0. This usually indicates an upstream "
-            "telemetry bug.",
-            cached,
-            prompt,
-        )
-    return max(prompt - cached, 0)
-
-
-def _anthropic_usage_from_openai(
-    usage,
-    *,
-    include_input: bool,
-    include_output: bool,
-    force_zero_output: bool = False,
-) -> AnthropicUsage:
-    if usage is None:
-        return AnthropicUsage(
-            input_tokens=0 if include_input else None,
-            output_tokens=0 if include_output else None,
-        )
-
-    usage_fields: dict[str, int] = {}
-    cached_tokens = _cached_prompt_tokens(usage)
-    if include_input:
-        usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
-        if cached_tokens:
-            usage_fields["cache_read_input_tokens"] = cached_tokens
-    if include_output:
-        usage_fields["output_tokens"] = (
-            0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
-        )
-    return AnthropicUsage(**usage_fields)
 
 
 def _wrap_sse_event(data: str, event_type: str) -> str:
@@ -741,80 +691,8 @@ class AnthropicServing:
     def _convert_response(
         self, response: ChatCompletionResponse
     ) -> AnthropicMessagesResponse:
-        """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
-        if not response.choices:
-            return AnthropicMessagesResponse(
-                content=[TextBlock(text="")],
-                model=response.model,
-                stop_reason="end_turn",
-                usage=AnthropicUsage(input_tokens=0, output_tokens=0),
-            )
-
-        choice = response.choices[0]
-        content: list[AnthropicContentBlock] = []
-
-        # Add reasoning content as a thinking block. signature is omitted
-        # entirely when the backend doesn't provide one — empty strings
-        # would fail downstream Anthropic signature verifiers.
-        if choice.message.reasoning_content:
-            content.append(ThinkingBlock(thinking=choice.message.reasoning_content))
-
-        # Add text content
-        if choice.message.content:
-            content.append(TextBlock(text=choice.message.content))
-
-        # Add tool calls
-        if choice.message.tool_calls:
-            for tool_call in choice.message.tool_calls:
-                raw_args = tool_call.function.arguments
-                try:
-                    tool_input = json.loads(raw_args)
-                except (json.JSONDecodeError, TypeError):
-                    # Surface invalid tool arguments so an empty-dict
-                    # tool call is never indistinguishable from a real
-                    # one when something downstream goes wrong.
-                    logger.warning(
-                        "Tool %r emitted invalid JSON arguments: %r — "
-                        "defaulting to empty input",
-                        tool_call.function.name,
-                        (raw_args or "")[:200],
-                    )
-                    tool_input = {}
-
-                content.append(
-                    ToolUseBlock(
-                        id=tool_call.id,
-                        name=tool_call.function.name,
-                        input=tool_input,
-                    )
-                )
-
-        # Map stop reason
-        finish_reason = choice.finish_reason or "stop"
-        if finish_reason not in STOP_REASON_MAP:
-            logger.warning(
-                "Unmapped OpenAI finish_reason %r; defaulting to end_turn",
-                finish_reason,
-            )
-        stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
-
-        # Anthropic requires ``content`` to contain at least one block.
-        # Empty string completions (max_tokens=1 stop, content filter, etc.)
-        # would otherwise ship ``content=[]`` and break strict SDK parsers.
-        if not content:
-            content.append(TextBlock(text=""))
-
-        return AnthropicMessagesResponse(
-            id=f"msg_{uuid.uuid4().hex}",
-            content=content,
-            model=response.model,
-            stop_reason=stop_reason,
-            usage=_anthropic_usage_from_openai(
-                response.usage,
-                include_input=True,
-                include_output=True,
-            ),
-        )
+        """Convert a complete OpenAI response using the reusable adapter."""
+        return convert_openai_to_anthropic_response(response)
 
     def _convert_openai_error_response(self, response) -> JSONResponse:
         """Forward an upstream OpenAI-handler error as an Anthropic error.
