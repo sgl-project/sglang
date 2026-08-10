@@ -374,6 +374,9 @@ class Lfm2Detector(BaseFormatDetector):
             return [self._get_parameter_value(v) for v in val.elts]
         elif isinstance(val, ast.Tuple):
             return tuple(self._get_parameter_value(v) for v in val.elts)
+        elif isinstance(val, ast.Set):
+            # JSON has no set type; decode as a list in source order.
+            return [self._get_parameter_value(v) for v in val.elts]
         elif isinstance(val, ast.Name):
             # Python True/False/None are ast.Constant on modern Python, but
             # accept their legacy node shape plus LFM2's JSON-literal spellings.

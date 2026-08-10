@@ -4135,6 +4135,16 @@ class TestLfm2Detector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["limit"], 7)
 
+    def test_set_argument_decoded_as_list(self):
+        """A set argument ({'a', 'b'}) raised in _get_parameter_value and
+        dropped the call; JSON has no set type so it decodes as a list."""
+        text = "<|tool_call_start|>[search(query={'a', 'b'})]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], ["a", "b"])
+
     def test_streaming_recovers_multiline(self):
         """Streaming buffers the block and delegates to detect_and_parse;
         an incremental rewrite of the streaming path would bypass the
