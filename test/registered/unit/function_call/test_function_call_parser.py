@@ -4104,6 +4104,17 @@ class TestLfm2Detector(unittest.TestCase):
 
         self.assertEqual(result.calls, [])
 
+    def test_reserved_keyword_parameter_recovered(self):
+        """A parameter named after a Python keyword (from=1) is a
+        SyntaxError; the call was dropped. The original parameter name must
+        be restored in the decoded arguments."""
+        text = "<|tool_call_start|>[search(query='M.md', from=1)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"query": "M.md", "from": 1})
+
     def test_zero_padded_int_recovered(self):
         """Zero-padded ints (day=07) are a SyntaxError ("leading zeros in
         decimal integer literals"); the call was dropped."""
