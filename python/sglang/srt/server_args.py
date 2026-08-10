@@ -1198,6 +1198,25 @@ class ServerArgs:
         NS("device"),
     ] = 1
     random_seed: A[Optional[int], "The random seed.", NS("device")] = None
+    mlx_enable_sampling: A[
+        bool,
+        (
+            "MLX backend only: sample decode tokens (temperature / top-k / "
+            "top-p / min-p) instead of greedy argmax. Sampling runs inside "
+            "the lazy MLX graph, so it works with the overlap scheduler; "
+            "first tokens from prefill/extend are sampled too. Greedy "
+            "requests keep exact argmax behavior. Also enables on the MLX "
+            "path: grammar vocab masks and custom logit processors (these "
+            "break decode chaining per step; custom processors run on "
+            "pure-decode steps only), logit_bias, output logprobs (sampled "
+            "token / top-k / token_ids; prompt input logprobs are not "
+            "computed), NaN sanitization (SGLANG_SANITIZE_NAN_LOGITS), and "
+            "per-request sampling_seed under "
+            "--enable-deterministic-inference (deterministic within MLX "
+            "only). Penalties are not applied."
+        ),
+        NS("device"),
+    ] = False
     watchdog_timeout: A[
         float,
         "Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
@@ -4363,11 +4382,8 @@ class ServerArgs:
         if (
             self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
             and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
-            # Keep trtllm_mla on the preferred breakable path. Its current
-            # breakable compatibility rule disables the graph, avoiding the
-            # tc_piecewise FlashInfer paged-MLA fallback; once breakable gains
-            # native support, that rule can be relaxed without re-enabling the
-            # deprecated tc_piecewise path.
+            # Keep trtllm_mla on the preferred breakable path, which now serves
+            # MLA by falling back to the flashinfer MLA impl for extend.
             and self._resolved_attention_backends()[0] != "trtllm_mla"
         ):
             logger.info(
@@ -4471,22 +4487,10 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import (
-            is_deepseek_dsa,
-            is_deepseek_v4,
-            is_nemotron_h,
-        )
+        from sglang.srt.configs.model_config import is_deepseek_v4, is_nemotron_h
         from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
-            # MLA prefill under BCG takes forward_mha, which has no eager
-            # breaks. DSA is exempt: BCG forces the sparse path, whose
-            # indexer already splits eagerly.
-            (
-                "MLA attention (non-DSA)",
-                lambda: self.use_mla_backend()
-                and not is_deepseek_dsa(self.get_model_config().hf_config),
-            ),
             # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
             # state-track write is not wired into the captured buffers, so a
             # replay can commit a cache slot it never wrote.
@@ -5359,9 +5363,11 @@ class ServerArgs:
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
             # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
-            # None of these backends exist on MPS; attention_backend is still
-            # unset there at this point (the torch_native default fills later).
-            if not is_mps():
+            # Exempt MLX only: none of these backends exist on MPS, and MLX runs
+            # attention inside its own runner, so attention_backend is still
+            # unset here.  Plain macOS stays on the list -- torch_native has
+            # neither sliding window nor attention sinks.
+            if not (is_mps() and use_mlx()):
                 supported_backends = [
                     "triton",
                     "trtllm_mha",

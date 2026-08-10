@@ -1091,6 +1091,11 @@ _AMD_READY_NESTED_UNIT_TESTS = (
     "sana_wm/test_streaming_cached.py",
     "sana_wm/test_streaming_stage.py",
     "sana_wm/test_streaming_vae.py",
+    # Enabled with small test-harness stub fixes (see this PR's test edits).
+    "progressive_resolution/test_progressive.py",
+    "sana_wm/test_streaming_realtime_path.py",
+    # Stub gap already fixed upstream; only needs enabling here.
+    "realtime/test_lingbot_causal_denoising.py",
 )
 
 

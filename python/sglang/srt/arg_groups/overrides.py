@@ -61,6 +61,7 @@ from sglang.srt.utils.common import (
     is_xpu,
     xpu_has_xmx_support,
 )
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 logger = logging.getLogger(__name__)
 
@@ -731,10 +732,21 @@ def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("MiniMaxM2ForCausalLM")
 def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides = {"enable_tf32_matmul": True}
     logger.info(
         "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
     )
-    return {"enable_tf32_matmul": True}
+    if (
+        is_sm100_supported()
+        and server_args.moe_runner_backend == "auto"
+        and server_args.get_model_config().quantization == "modelopt_fp4"
+    ):
+        overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
+        logger.info(
+            "Use flashinfer_trtllm_routed as MoE runner backend on SM10X "
+            "for MiniMaxM2ForCausalLM with modelopt_fp4."
+        )
+    return overrides
 
 
 @_register_for("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
@@ -922,8 +934,10 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_xpu"
         elif is_hip():
             overrides["attention_backend"] = "aiter"
-        elif not is_mps():
-            # No triton on macOS; MPS keeps the platform default.
+        elif not (is_mps() and use_mlx()):
+            # Exempt MLX only -- it owns attention in its own runner.  macOS
+            # without MLX still falls through to triton and fails fast below,
+            # rather than landing on torch_native (no sliding window, no sinks).
             overrides["attention_backend"] = "triton"
     if is_xpu():
         # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,

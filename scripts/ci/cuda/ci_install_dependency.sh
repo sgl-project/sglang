@@ -229,20 +229,10 @@ install_gdrcopy() {
 }
 
 clean_site_packages() {
-    # Clear torch compilation cache from every location it can be in; sglang
-    # is not installed yet, so it cannot be asked which one is in use.
-    python3 -c '
-import getpass, os, shutil, tempfile
-
-sglang_cache_dir = os.environ.get("SGLANG_CACHE_DIR") or "~/.cache/sglang"
-for cache_dir in (
-    os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
-    os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()),
-    os.path.join(os.path.expanduser(sglang_cache_dir), "inductor"),
-):
-    if cache_dir:
-        shutil.rmtree(cache_dir, ignore_errors=True)
-'
+    # The torch compilation cache is deliberately NOT wiped here: entries are
+    # content-hash addressed so stale ones are never reused, and hosts packing
+    # several runners share one cache mount - a wipe unlinks files a concurrent
+    # job is compiling against.
 
     # Remove broken dist-info directories (missing METADATA per PEP 376)
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
