@@ -420,7 +420,7 @@ class Scheduler(
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
-        self.skip_tokenizer_init = server_args.skip_tokenizer_init
+        self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -731,7 +731,10 @@ class Scheduler(
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
-            skip_tokenizer_init=self.server_args.skip_tokenizer_init,
+            # The snapshot taken at construction, not a second bag read: this
+            # scheduler gates its tokenizer init on the same value, and the two
+            # must not be able to disagree.
+            skip_tokenizer_init=self.skip_tokenizer_init,
             metrics_enabled=get_observability().enable_metrics
             and (
                 self.ps.attn_tp_rank == 0
@@ -793,7 +796,7 @@ class Scheduler(
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
 
-        if server_args.skip_tokenizer_init:
+        if self.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
@@ -1484,7 +1487,7 @@ class Scheduler(
             "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
         }
         env_var, default_size = backend_sizes.get(
-            self.server_args.attention_backend, (None, None)
+            get_exec().kernel.attention_backend, (None, None)
         )
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
