@@ -36,6 +36,7 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
     MqaAttentionBase,
     _dequant_fp8_wo_a_streaming,
     hc_head_torch,
@@ -634,6 +635,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
     uses_own_vocab_modules = _is_npu
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(
+        cls,
+        hf_config,
+        quant_config,
+    ):
+        if _is_npu:
+            return (
+                "NPU DSpark ModelSlim weight loading does not support mapping "
+                "shared experts into fused expert slots."
+            )
+
+        return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
 
     def __init__(
         self,
