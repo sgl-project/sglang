@@ -37,13 +37,13 @@ on:
           - mi300
           - mi325
       rocm_version:
-        description: 'ROCm container variant (empty = Dockerfile default; rocm720 = ROCm 7.2.0)'
+        description: 'ROCm container variant (rocm720 = ROCm 7.2.0, the gated stack; rocm700 = ROCm 7.0.0)'
         required: false
         type: choice
-        default: ''
+        default: rocm720
         options:
-          - ''
           - rocm720
+          - rocm700
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
         required: false
@@ -67,10 +67,10 @@ on:
         type: string
         default: mi300
       rocm_version:
-        description: 'ROCm container variant (empty = Dockerfile default; rocm720 = ROCm 7.2.0)'
+        description: 'ROCm container variant (rocm720 = ROCm 7.2.0, the gated stack; rocm700 = ROCm 7.0.0)'
         required: false
         type: string
-        default: ''
+        default: rocm720
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
         required: false
@@ -130,7 +130,7 @@ jobs:
   # setup across scarce AMD GPUs to shave only a couple minutes of test time,
   # so one GPU running the whole suite sequentially is the better trade.
   extra-a-test-1-gpu-small-amd:
-    name: ${{ format('extra-a-test-1-gpu-small-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-1-gpu-small-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && inputs.rocm_version != 'rocm720' && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -144,7 +144,10 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        # `rocm_version` (e.g. rocm720) selects an alternate ROCm container; empty uses the Dockerfile default.
+        # Defaults to rocm720 so a PR's extra tier runs the same stack as the
+        # gate in pr-test-amd.yml. pr-test-amd-rocm700.yml passes rocm700 to
+        # keep its own chained extra tier on the shadow stack. Only non-default
+        # variants get a job-name suffix, so PR job names stay stable.
         run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
@@ -162,7 +165,7 @@ jobs:
   # pool as small (AMD GPUs carry enough VRAM that "large" here is a CUDA
   # memory-tier label, not a separate AMD runner pool).
   extra-a-test-1-gpu-large-amd:
-    name: ${{ format('extra-a-test-1-gpu-large-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-1-gpu-large-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && inputs.rocm_version != 'rocm720' && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -192,7 +195,7 @@ jobs:
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests. Mirrors CUDA's
   # extra-a 2-gpu-large stage; runs on the 2-GPU AMD pool.
   extra-a-test-2-gpu-large-amd:
-    name: ${{ format('extra-a-test-2-gpu-large-amd{0} (linux-{1}-2gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-2-gpu-large-amd{0} (linux-{1}-2gpu-sglang)', inputs.rocm_version && inputs.rocm_version != 'rocm720' && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
