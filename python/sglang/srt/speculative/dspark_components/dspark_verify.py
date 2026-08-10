@@ -137,6 +137,18 @@ class TargetVerifyExecutor:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
+            # The simulated length replaces the real accept result, so its
+            # bonus must come from the target row at that simulated boundary.
+            # Reusing the pre-override bonus can emit a token from a later row
+            # even when simulate_acc_len=1 forces zero accepted drafts.
+            if sampling_info is None or sampling_info.is_all_greedy:
+                target_predict = torch.argmax(target_logits, dim=-1).view(
+                    bs, self.verify_num_draft_tokens
+                )
+                row_ids = torch.arange(bs, device=target_predict.device)
+                bonus = target_predict[
+                    row_ids, correct_len.to(torch.int64)
+                ].to(torch.int64)
 
         finalized = FinalizeAcceptLens.execute(
             correct_len=correct_len,

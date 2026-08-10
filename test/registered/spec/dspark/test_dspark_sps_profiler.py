@@ -1,9 +1,11 @@
 import unittest
 
 from sglang.benchmark.dspark_sps_profiler import (
+    ADDITIVE_M_BIN_WIDTH,
     LoadInfo,
     ServerContext,
     SpsRow,
+    build_additive_table_from_cells,
     build_request_count_sweep,
     build_table_from_summaries,
     count_aligned_steps,
@@ -221,6 +223,16 @@ class TestTableAssembly(CustomTestCase):
         )
         self.assertEqual(table.sample_batch_tokens, [32])
         self.assertAlmostEqual(table.sample_steps_per_sec[0], 50.0)
+
+    def test_additive_fit_keeps_low_batch_budget_resolution(self):
+        cells = [
+            {"bs": bs, "M": m, "T": 0.001 + bs * 0.0001 + m * 0.00001}
+            for bs in (1, 2)
+            for m in (8, 16, 24, 32)
+        ]
+        table = build_additive_table_from_cells(cells=cells)
+        self.assertEqual(ADDITIVE_M_BIN_WIDTH, 8)
+        self.assertEqual(table.m_probes, [8, 16, 24, 32])
 
 
 class TestSweepHelpers(CustomTestCase):
