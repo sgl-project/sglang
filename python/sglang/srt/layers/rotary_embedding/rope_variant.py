@@ -426,8 +426,15 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         return self.sin_cached_total
 
     def get_cos_sin_cache(
-        self, positions, dtype, offsets: Optional[torch.Tensor] = None
+        self,
+        positions,
+        dtype,
+        offsets: Optional[torch.Tensor] = None,
+        layer_id: int = 0,
     ):
+        if layer_id != 0:
+            return self.cos_cached, self.sin_cached
+
         self.cos_cached = (
             self.cos_cached_total[
                 torch.add(positions, offsets) if offsets is not None else positions
@@ -435,7 +442,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             .unsqueeze(-2)
             .unsqueeze(-2)
             .to(dtype)
-        )
+        ).to(positions.device)
         self.sin_cached = (
             self.sin_cached_total[
                 torch.add(positions, offsets) if offsets is not None else positions
@@ -443,10 +450,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             .unsqueeze(-2)
             .unsqueeze(-2)
             .to(dtype)
-        )
-        cos = self.cos_cached.to(positions.device)
-        sin = self.sin_cached.to(positions.device)
-        return cos, sin
+        ).to(positions.device)
+        return self.cos_cached, self.sin_cached
 
     def forward_native(
         self,
@@ -489,10 +494,11 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        layer_id: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         num_tokens, num_q_heads, _ = query.shape
         num_k_heads = key.shape[1]
-        cos, sin = self.get_cos_sin_cache(positions, query.dtype, offsets)
+        cos, sin = self.get_cos_sin_cache(positions, query.dtype, offsets, layer_id)
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
         if self.rotary_dim < self.head_size:
