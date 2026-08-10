@@ -15,7 +15,7 @@ from sglang.srt.configs.hybrid_arch import (
     kimi_linear_config,
     linear_attn_model_spec,
 )
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_kimi_k3
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -118,6 +118,10 @@ class TritonAttnBackend(AttentionBackend):
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
 
+    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
+    # can never carry more seqs than the pool.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -133,6 +137,9 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
+        from sglang.kernels.ops.attention.verify_mla import (
+            verify_mla_fwd,
+        )
         from sglang.kernels.ops.attention.verify_splitkv import (
             verify_splitkv_fwd,
         )
@@ -147,6 +154,8 @@ class TritonAttnBackend(AttentionBackend):
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
+        # MLA split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
+        self.verify_mla_fwd = torch.compiler.disable(verify_mla_fwd)
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -179,6 +188,14 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        # The MLA verify kernel (verify_mla_fwd) is tuned and validated for the
+        # Kimi-K3 absorbed-MLA shape; gate it on K3.
+        self.use_verify_mla = (
+            is_gfx95_supported()
+            and self.topk == 1
+            and self.use_mla
+            and is_kimi_k3(model_runner.model_config.hf_config)
+        )
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
@@ -186,7 +203,7 @@ class TritonAttnBackend(AttentionBackend):
             // get_parallel().attn_tp_size
         ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
@@ -205,9 +222,11 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
+            # Use start_layer instead of 0 to handle pipeline parallelism.
+            # In PP, start_layer may be > 0, so layer 0 isn't in this stage's buffer.
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
+                model_runner.token_to_kv_pool.start_layer
+            ).shape[-1]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -300,6 +319,19 @@ class TritonAttnBackend(AttentionBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
+
+        # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
+        # This is used by the scheduler's tile-budget admission logic to match
+        # the kernel's actual tile size.
+        head_dim = model_runner.model_config.head_dim
+        from sglang.kernels.ops.attention.extend_attention import (
+            _get_block_sizes_for_extend_attention,
+        )
+
+        _, _, _, block_m, _, _ = _get_block_sizes_for_extend_attention(
+            Lq=head_dim, Lv=head_dim
+        )
+        self.extend_attention_block_m = block_m
 
     def get_num_kv_splits(
         self,
@@ -465,11 +497,19 @@ class TritonAttnBackend(AttentionBackend):
         spec_info,
     ):
         """Fill all cuda-graph buffers for target_verify mode."""
+        # Prefer the spec_info's per-request query length (DSpark draft propose
+        # uses gamma < verify window); fall back to the configured verify window.
+        num_draft_tokens = self.num_draft_tokens
+        if (
+            spec_info is not None
+            and getattr(spec_info, "draft_token_num", None) is not None
+        ):
+            num_draft_tokens = int(spec_info.draft_token_num)
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
-            (1 + bs) * self.num_draft_tokens,
-            step=self.num_draft_tokens,
+            (1 + bs) * num_draft_tokens,
+            step=num_draft_tokens,
             dtype=torch.int32,
             device=self.device,
         )
@@ -506,7 +546,7 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
         else:
             custom_mask = None
-        seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
+        seq_mask_len = num_draft_tokens * (seq_lens + num_draft_tokens)
         mask_indptr = self.mask_indptr[: bs + 1]
         mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
@@ -799,10 +839,18 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
+            # self.num_draft_tokens is the verify window (gamma + 1), while
+            # DSpark draft propose runs a gamma-token TARGET_VERIFY forward.
+            num_draft_tokens = self.num_draft_tokens
+            if (
+                spec_info is not None
+                and getattr(spec_info, "draft_token_num", None) is not None
+            ):
+                num_draft_tokens = int(spec_info.draft_token_num)
             qo_indptr = torch.arange(
                 0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
+                (1 + bs) * num_draft_tokens,
+                step=num_draft_tokens,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -839,13 +887,13 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (
-                forward_batch.seq_lens + self.num_draft_tokens
+            seq_mask_len = num_draft_tokens * (
+                forward_batch.seq_lens + num_draft_tokens
             )
             mask_indptr = self.mask_indptr
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
-            max_extend_len = self.num_draft_tokens
+            max_extend_len = num_draft_tokens
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
@@ -1093,10 +1141,16 @@ class TritonAttnBackend(AttentionBackend):
                 and getattr(spec_info, "custom_mask", None) is not None
                 else None
             )
+            max_extend_len = self.num_draft_tokens
+            if (
+                spec_info is not None
+                and getattr(spec_info, "draft_token_num", None) is not None
+            ):
+                max_extend_len = int(spec_info.draft_token_num)
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
-                max_extend_len=self.num_draft_tokens,
+                max_extend_len=max_extend_len,
                 num_kv_splits=None,
                 kv_indptr=self.kv_indptr[: bs + 1],
                 kv_indices=self.cuda_graph_kv_indices,
@@ -1355,11 +1409,19 @@ class TritonAttnBackend(AttentionBackend):
         # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
+        # Route target-verify to the K3-tuned MLA kernel when eligible, else the
+        # per-head split-KV kernel.
+        if self.use_verify_mla:
+            verify_fwd = self.verify_mla_fwd
+        elif self.use_verify_splitkv:
+            verify_fwd = self.verify_splitkv_fwd
+        else:
+            verify_fwd = None
         if (
-            self.use_verify_splitkv
+            verify_fwd is not None
             and score_mod is None
             and forward_batch.forward_mode.is_target_verify()
-            and self.verify_splitkv_fwd(
+            and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
                 v.contiguous(),
@@ -1411,6 +1473,7 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
         return o
 
@@ -1464,9 +1527,19 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
         )
 
-        # Current chunk K/V is still local before masked cache write, so it can
-        # use the original extend kernel's current-token stage directly.
+        # Select the replicated K/V heads matching this rank's Q shard.
         if k.numel() > 0:
+            if layer.tp_k_head_num > 1:
+                kv_head_start = (
+                    group.rank_in_group * layer.tp_k_head_num // group.world_size
+                )
+                kv_head_end = max(
+                    (group.rank_in_group + 1) * layer.tp_k_head_num // group.world_size,
+                    kv_head_start + 1,
+                )
+                k = k[:, kv_head_start:kv_head_end]
+                v = v[:, kv_head_start:kv_head_end]
+
             empty_kv_indptr = torch.zeros_like(kv_indptr)
             self.extend_attention_fwd(
                 q_local,

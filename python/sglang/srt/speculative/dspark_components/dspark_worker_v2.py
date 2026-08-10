@@ -5,6 +5,9 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    is_unified_kv_triton,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -77,6 +80,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.ps = ps
@@ -90,8 +95,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_dp_context_enabled = (
             server_args.enable_dp_attention and not self._draft_is_moe
         )
-        attn_tp_size = server_args.tp_size // max(server_args.dp_size, 1)
-        if server_args.enable_dp_attention and self._draft_is_moe and attn_tp_size > 1:
+        self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
+        self._decode_graph_allowed = (
+            not server_args.disable_cuda_graph and not self._is_pd_prefill
+        )
+        if (
+            server_args.enable_dp_attention
+            and self._draft_is_moe
+            and ps.attn_tp_size > 1
+        ):
             raise ValueError(
                 "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
                 "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
@@ -115,12 +127,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
 
+        # The mask token needs an embedding row, not a tokenizer entry, so bound it
+        # by the embedding width. A padded vocab reserves rows past the real tokens
+        # and drafts place the mask there (Inkling: 200058 real, 201024 padded).
+        target_model_config = self.target_worker.model_runner.model_config
+        target_vocab_size = (
+            getattr(target_model_config.hf_text_config, "padded_vocab_size", None)
+            or target_model_config.vocab_size
+        )
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
-            target_vocab_size=int(
-                self.target_worker.model_runner.model_config.vocab_size
-            ),
+            target_vocab_size=int(target_vocab_size),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
@@ -171,7 +189,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             server_args.enable_dp_attention
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
-            and not server_args.disable_cuda_graph
+            and self._decode_graph_allowed
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under --enable-dp-attention does not "
@@ -199,7 +217,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._verify_epilogue = None
         if (
             self._verify_planner.is_compact_mode
-            and not server_args.disable_cuda_graph
+            and self._decode_graph_allowed
             and is_cuda()
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
@@ -260,6 +278,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
 
+        if self._is_pd_prefill and not self._draft_is_moe:
+            self.draft_model.prune_to_ctx_kv_injection()
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -309,7 +330,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not get_exec().graph.disable_cuda_graph
+        capture_decode_cuda_graph = self._decode_graph_allowed
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -418,22 +439,40 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.out_cache_loc is None:
             raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
 
+        # Must inject before prefill returns: the scheduler may update radix
+        # afterward, invalidating out_cache_loc.
         device = next_token_ids.device
         ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
         draft_seq_lens = torch.tensor(
             batch.prefix_lens, dtype=torch.int32, device=device
         )
         positions, _ = compute_position(
-            self.model_runner.server_args.attention_backend,
+            self.model_runner.prefill_attention_backend_str,
             draft_seq_lens,
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
+        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
+        # thread the per-token state_slot + the req's final position so the
+        # injector keeps only the last SWA window (older prefill tokens share a
+        # ring slot and would race). Cheap; only consumed under unified_kv.
+        state_slot = final_pos = None
+        if is_unified_kv_triton():
+            repeats = ctx_lens.to(torch.int64)
+            state_slot = torch.repeat_interleave(
+                batch.req_pool_indices.to(device=device, dtype=torch.int64), repeats
+            )
+            final_pos = torch.repeat_interleave(
+                (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
+            )
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
             positions=positions,
+            state_slot=state_slot,
+            final_pos=final_pos,
         )
+        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 
         batch_output.next_draft_input = make_next_draft_input(
