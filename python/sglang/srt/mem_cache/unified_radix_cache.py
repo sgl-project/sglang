@@ -1985,6 +1985,16 @@ class UnifiedRadixCache(BasePrefixCache):
         assert req is not None
         last_best_match_device_node_id = req.last_node
 
+        # A different request may already be restoring an ancestor or this
+        # anchor. Reusing the same host slots before that DMA is acknowledged
+        # would overlap two load-backs on one radix path. Scheduler admission
+        # normally defers such requests; keep this guard for direct callers.
+        if self.has_pending_load_back(best_match_node_id):
+            return (
+                self.tree_core.empty_match_result.device_indices,
+                last_best_match_device_node_id,
+            )
+
         if (
             self.tree_core.is_full_device_evicted(best_match_node_id)
             or params.host_hit_length > 0
@@ -2014,6 +2024,14 @@ class UnifiedRadixCache(BasePrefixCache):
             self.tree_core.empty_match_result.device_indices,
             last_best_match_device_node_id,
         )
+
+    def has_pending_load_back(self, node_id: NodeId) -> bool:
+        node = self.tree_core.node_by_id(node_id)
+        while node is not None and node is not self.tree_core.root_node:
+            if node.load_back_pending_id is not None:
+                return True
+            node = node.parent
+        return False
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""

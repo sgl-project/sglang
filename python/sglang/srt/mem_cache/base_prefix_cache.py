@@ -359,6 +359,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def has_pending_load_back(self, node: Any) -> bool:
+        """Whether a host-cache load-back already owns part of ``node``'s path."""
+        return False
+
     def ready_to_load_host_cache(self) -> Any:
         """
         Notify the cache controller to start the KV cache loading

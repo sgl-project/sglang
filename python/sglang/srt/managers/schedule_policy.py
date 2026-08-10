@@ -1297,6 +1297,12 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
+                # A shared AgentX prefix can be requested again while its
+                # asynchronous H->D restore is still in flight. Keep this
+                # request queued until the first load-back is acknowledged;
+                # otherwise two anchors can claim the same host-cache path.
+                if self.tree_cache.has_pending_load_back(req.best_match_node):
+                    return AddReqResult.OTHER
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,

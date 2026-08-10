@@ -3977,6 +3977,43 @@ class UnifiedRadixCacheSuite:
             req_to_token_pool.mamba_allocator.available_size(), avail_before
         )
 
+    def test_scheduler_hicache_defers_overlapping_load_back(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(chain)
+
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=len(leaf.key)))
+
+        req = self._make_req(req_to_token_pool)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self._apply_match_to_req(req, match)
+
+        # Model a shared ancestor that is already being restored for another
+        # request. The second request must not start another H->D transfer.
+        leaf.load_back_pending_id = leaf.parent.id
+        with mock.patch.object(cache.cache_controller, "load") as load:
+            new_indices, new_node = cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=req.best_match_node,
+                    host_hit_length=req.host_hit_length,
+                    req=req,
+                )
+            )
+
+        self.assertTrue(cache.has_pending_load_back(req.best_match_node))
+        self.assertEqual(len(new_indices), 0)
+        self.assertEqual(new_node, match.last_device_node)
+        load.assert_not_called()
+        leaf.load_back_pending_id = None
+
     def test_scheduler_hicache_load_back_rolls_back_mamba_on_load_failure(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")
