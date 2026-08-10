@@ -1247,6 +1247,12 @@ def flashinfer_mxfp8_blockscaled_linear(
         else:
             output_dtype = torch.bfloat16
 
+    # At small M the persistent CUTLASS kernel is 2-5x slower than the
+    # CuTe-DSL swap-AB/split-K kernels (both consume the same swizzled
+    # 1D scales).
+    if backend == "cutlass" and q_input.shape[0] <= 64:
+        backend = "cute-dsl"
+
     if backend == "trtllm":
         weight_scale_t = weight_scale.view(-1)
     else:
