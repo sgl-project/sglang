@@ -1222,13 +1222,16 @@ class TestMlxOverlapScheduler(unittest.TestCase):
                 set_completion_time=lambda: events.append(("completion", "r0"))
             ),
         )
-        batch = SimpleNamespace()
+        batch = SimpleNamespace(
+            mamba_track_mask_cpu=None,
+            mamba_track_mask_next_cpu=None,
+            mamba_decode_batch_idx_cpu=None,
+        )
         result = SimpleNamespace()
         i = 0
         logits_output = SimpleNamespace(customized_info=None)
         original_release = batch_result_processor_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
-        original_get_server_args = batch_result_processor_module.get_server_args
 
         def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
             events.append(("release", release_req.rid))
@@ -1236,21 +1239,26 @@ class TestMlxOverlapScheduler(unittest.TestCase):
 
         batch_result_processor_module.release_kv_cache = fake_release_kv_cache
         batch_result_processor_module.get_global_indexer_capturer = lambda: None
-        batch_result_processor_module.get_server_args = lambda: SimpleNamespace(
-            enable_mamba_extra_buffer_lazy=lambda: False
+        # The lazy predicate reads the published bags; publish the non-lazy
+        # strategy instead of stubbing the accessor.
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(
+            mamba_radix_cache_strategy="extra_buffer"
         )
+        override.install()
         try:
             SchedulerBatchResultProcessor._handle_finish_state_updated_req(
                 processor, req, batch, result, i, logits_output
             )
         finally:
+            override.restore()
             for name, original in saved.items():
                 setattr(SchedulerBatchResultProcessor, name, original)
             batch_result_processor_module.release_kv_cache = original_release
             batch_result_processor_module.get_global_indexer_capturer = (
                 original_get_indexer
             )
-            batch_result_processor_module.get_server_args = original_get_server_args
 
         self.assertEqual(
             events,

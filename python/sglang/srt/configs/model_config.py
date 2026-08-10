@@ -317,8 +317,11 @@ class ModelConfig:
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
         )
+        self.is_lm_only = getattr(self.hf_config, "language_model_only", False)
         self.model_is_mrope = (
-            rope_scaling is not None and "mrope_section" in rope_scaling
+            not self.is_lm_only
+            and rope_scaling is not None
+            and "mrope_section" in rope_scaling
         )
 
         self.hf_generation_config = get_generation_config(
@@ -435,16 +438,22 @@ class ModelConfig:
                 or hasattr(self.hf_config, "audio_config")
             )
         )
-        self.is_multimodal = enable_multimodal and (
-            is_multimodal_model(self.hf_config.architectures)
-            or has_multimodal_subconfig
+        self.is_multimodal = (
+            enable_multimodal
+            and not self.is_lm_only
+            and (
+                is_multimodal_model(self.hf_config.architectures)
+                or has_multimodal_subconfig
+            )
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
         # TODO: requires further polishing
-        self.is_image_understandable_model = enable_multimodal and hasattr(
-            self.hf_config, "vision_config"
+        self.is_image_understandable_model = (
+            enable_multimodal
+            and not self.is_lm_only
+            and hasattr(self.hf_config, "vision_config")
         )
 
         # Models expose audio_config at different nesting levels:
@@ -453,11 +462,17 @@ class ModelConfig:
         #   - sound_config: Nemotron AVLM with Parakeet audio encoder
         #   - is_audio_model(): Whisper, Qwen3-ASR (architecture-based fallback)
         # TODO: Handle this more robustly by standardizing the config structure in the future
-        self.is_audio_understandable_model = enable_multimodal and (
-            hasattr(self.hf_config, "audio_config")
-            or hasattr(getattr(self.hf_config, "thinker_config", None), "audio_config")
-            or getattr(self.hf_config, "sound_config", None) is not None
-            or is_audio_model(self.hf_config.architectures)
+        self.is_audio_understandable_model = (
+            enable_multimodal
+            and not self.is_lm_only
+            and (
+                hasattr(self.hf_config, "audio_config")
+                or hasattr(
+                    getattr(self.hf_config, "thinker_config", None), "audio_config"
+                )
+                or getattr(self.hf_config, "sound_config", None) is not None
+                or is_audio_model(self.hf_config.architectures)
+            )
         )
 
         self.is_multimodal_chunked_prefill_supported = (
