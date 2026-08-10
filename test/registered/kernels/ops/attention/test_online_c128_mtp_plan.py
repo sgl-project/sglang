@@ -9,11 +9,10 @@ from sglang.kernels.ops.attention.dsv4 import CompressorPrefillPlan
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=25, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def test_online_c128_mtp_plan() -> None:
-    prefix_lens = torch.tensor([112, 120, 124, 128], dtype=torch.int32, device="cuda")
+    prefix_lens = torch.tensor([112, 120, 124, 128], dtype=torch.int64, device="cuda")
     req_pool_indices = torch.tensor([3, 5, 7, 9], dtype=torch.int64, device="cuda")
 
     plan = CompressorPrefillPlan.generate_online_mtp(

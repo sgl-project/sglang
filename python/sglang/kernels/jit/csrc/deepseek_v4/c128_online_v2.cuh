@@ -738,7 +738,7 @@ struct OnlinePrefillStage1Params {
 struct OnlineMTPPrefillParams {
   CompressPlan* __restrict__ plan_c;
   CompressPlan* __restrict__ plan_w;
-  const int32_t* __restrict__ prefix_lens;       // (batch_size,)
+  const int64_t* __restrict__ prefix_lens;       // (batch_size,)
   const int64_t* __restrict__ req_pool_indices;  // (batch_size,)
   int32_t state_slot_offset;
   uint32_t batch_size;
@@ -824,7 +824,7 @@ inline void plan_online_mtp_prefill(
   device_.set_options<kDLCUDA>();
 
   TensorMatcher({B})  //
-      .with_dtype<int32_t>()
+      .with_dtype<int64_t>()
       .with_device(device_)
       .verify(prefix_lens);
   TensorMatcher({B})  //
@@ -848,7 +848,7 @@ inline void plan_online_mtp_prefill(
   const auto params = OnlineMTPPrefillParams{
       .plan_c = static_cast<CompressPlan*>(plan_c_dev_.data_ptr()),
       .plan_w = static_cast<CompressPlan*>(plan_w_dev_.data_ptr()),
-      .prefix_lens = static_cast<const int32_t*>(prefix_lens.data_ptr()),
+      .prefix_lens = static_cast<const int64_t*>(prefix_lens.data_ptr()),
       .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
       .state_slot_offset = state_slot_offset,
       .batch_size = batch_size,
