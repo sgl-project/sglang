@@ -36,6 +36,10 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_ctx,
+    get_ulysses_ctx,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
@@ -48,6 +52,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
@@ -116,34 +121,6 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "refiner_packed_seq_params",
     }
 )
-
-
-def _ulysses_ctx() -> tuple[int, int]:
-    """(world_size, rank) of the Ulysses sequence-parallel group.
-
-    Returns (1, 0) when model parallelism is not initialized (unit tests /
-    single-process debug paths init tp=1 sp=1 which also yields ws=1).
-    """
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_ulysses_parallel_rank,
-        get_ulysses_parallel_world_size,
-        model_parallel_is_initialized,
-    )
-
-    if not model_parallel_is_initialized():
-        return 1, 0
-    return get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
-
-
-def _ring_world_size() -> int:
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_ring_parallel_world_size,
-        model_parallel_is_initialized,
-    )
-
-    if not model_parallel_is_initialized():
-        return 1
-    return get_ring_parallel_world_size()
 
 
 def _reorder_grouped_qkv_to_qkv(
@@ -467,8 +444,9 @@ def _minimax_h3_attention_core_impl(
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
     ulysses_active: bool,
+    ring_active: bool = False,
 ) -> torch.Tensor:
-    """Dynamic varlen attention and Ulysses collectives.
+    """Dynamic varlen attention and Ulysses/Ring collectives.
 
     This is the narrow BCG break point: projections, normalization, RoPE,
     residuals, and MLPs remain captured while the dynamic packed attention
@@ -491,14 +469,33 @@ def _minimax_h3_attention_core_impl(
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
-    out = attention._attention_impl.forward_varlen(
-        q,
-        k,
-        v,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        cu_seqlens_host=cu_seqlens_host,
-    )
+
+    if ring_active:
+        ring_ws, _ = get_ring_ctx()
+        if attention._attention_backend_enum is not AttentionBackendEnum.FA:
+            raise NotImplementedError(
+                "MiniMax H3 ring parallelism requires the FlashAttention "
+                "backend (matches --ring-degree's general restriction)."
+            )
+        # max_seqlen is cu_seqlens[1] (`used`) by construction -- the real,
+        # non-padding row count ring needs, already a host int here.
+        out = _ring_attention_varlen(
+            q,
+            k,
+            v,
+            softmax_scale=attention.softmax_scale,
+            real_seq_len=max_seqlen,
+            ring_ws=ring_ws,
+        )
+    else:
+        out = attention._attention_impl.forward_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+        )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
@@ -530,7 +527,9 @@ class MiniMaxH3Attention(nn.Module):
         self.inner_dim = self.total_num_heads * self.head_dim
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
+        self.prefix = prefix
         self._attention_impl = None
+        self._attention_backend_enum: AttentionBackendEnum | None = None
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
         # matrix must be sharded independently; a plain ColumnParallelLinear
         # would instead slice across the concatenated tensor and is incorrect
@@ -578,7 +577,12 @@ class MiniMaxH3Attention(nn.Module):
             causal=False,
             softmax_scale=self.softmax_scale,
             num_kv_heads=self.num_heads,
+            prefix=self.prefix,
         )
+        # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
+        # the resolved enum alongside the impl instance instead of a second
+        # get_attn_backend() call at the ring gate.
+        self._attention_backend_enum = backend.get_enum()
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         weight = self.qkv_proj.weight
@@ -620,6 +624,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
         ulysses_active: bool = False,
+        ring_active: bool = False,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -686,6 +691,7 @@ class MiniMaxH3Attention(nn.Module):
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
+            ring_active=ring_active,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -905,6 +911,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
         ulysses_active: bool = False,
+        ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
@@ -930,6 +937,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
+            ring_active=ring_active,
         )
         x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
 
@@ -1070,12 +1078,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         if ulysses_size <= 0:
             raise ValueError("MiniMax H3 Ulysses size must be positive.")
-        if ring_size != 1:
-            raise NotImplementedError(
-                "MiniMax H3 packed multi-segment attention does not support "
-                "Ring or mixed USP. Set --ring-degree 1 and use Ulysses "
-                "sequence parallelism."
-            )
+        if ring_size <= 0:
+            raise ValueError("MiniMax H3 ring size must be positive.")
         local_heads = arch.num_attention_heads // tp_size
         if local_heads % ulysses_size:
             raise ValueError(
@@ -1083,13 +1087,19 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 f"Ulysses size {ulysses_size} (total heads="
                 f"{arch.num_attention_heads}, TP={tp_size})."
             )
-        if MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT % ulysses_size:
+        # ring never shards heads (only rows), so it has no head-divisibility
+        # constraint; the packed sequence alignment constant must still
+        # divide the *combined* sequence-parallel size, since ring adds an
+        # outer row split on top of Ulysses's inner one (see forward()).
+        sp_size = ulysses_size * ring_size
+        if MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT % sp_size:
             raise ValueError(
                 "MiniMax H3 packed sequence alignment "
                 f"{MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT} must be divisible by "
-                f"Ulysses size {ulysses_size}. Choose a Ulysses size that "
-                "divides both the TP-local attention heads and the packed "
-                "sequence alignment."
+                f"the combined sequence-parallel size {sp_size} "
+                f"(ulysses={ulysses_size} x ring={ring_size}). Choose degrees "
+                "whose product divides both the TP-local attention heads and "
+                "the packed sequence alignment."
             )
 
     def __init__(
@@ -1105,13 +1115,13 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
         tp_size = get_tp_world_size()
-        ulysses_size, _ = _ulysses_ctx()
+        ulysses_size, _ = get_ulysses_ctx()
         self._validate_tp_config(arch=arch, tp_size=tp_size)
         self._validate_sequence_parallel_config(
             arch=arch,
             tp_size=tp_size,
             ulysses_size=ulysses_size,
-            ring_size=_ring_world_size(),
+            ring_size=get_ring_ctx()[0],
         )
 
         self.video_patch_proj = ColumnParallelLinear(
@@ -1266,20 +1276,31 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         *,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build request-static RoPE inputs for this Ulysses rank."""
+        """Build request-static RoPE inputs for this rank's row shard.
+
+        Same 2D row split as forward(): ring first (outer, contiguous
+        ring_chunk_len slice), Ulysses second (inner slice within that
+        chunk) -- see forward()'s row_start derivation for the identity
+        this must stay in sync with.
+        """
         if img_position_ids.dim() != 3 or img_position_ids.shape[0] != 1:
             raise ValueError(
                 "img_position_ids must be [1, S, 3], got "
                 f"{list(img_position_ids.shape)}"
             )
         seq_len = int(img_position_ids.shape[1])
-        sp_ws, sp_rank = _ulysses_ctx()
+        ulysses_ws, ulysses_rank = get_ulysses_ctx()
+        ring_ws, ring_rank = get_ring_ctx()
+        sp_ws = ulysses_ws * ring_ws
         if seq_len % sp_ws:
             raise ValueError(
-                f"packed seq_len {seq_len} not divisible by ulysses world size {sp_ws}"
+                f"packed seq_len {seq_len} not divisible by the combined "
+                f"sequence-parallel world size {sp_ws} "
+                f"(ulysses={ulysses_ws} x ring={ring_ws})"
             )
         local_seq_len = seq_len // sp_ws
-        row_start = sp_rank * local_seq_len
+        ring_chunk_len = local_seq_len * ulysses_ws
+        row_start = ring_rank * ring_chunk_len + ulysses_rank * local_seq_len
         rope_freqs = self.rope(
             img_position_ids[:, row_start : row_start + local_seq_len]
         ).to(device)
@@ -1505,6 +1526,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 else raw_cu_seqlens_host
             )
         )
+        # max_seqlen_q is set to cu_seqlens[1] (`used`, the real/non-padding
+        # row count) by construction -- already a plain host int here, so
+        # ring can reuse it as real_seq_len below with no new device sync.
         max_seqlen = int(self._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(
@@ -1528,29 +1552,34 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
         device = x.device
         self._resolve_attention_backend_once()
-        if _ring_world_size() != 1:
-            raise NotImplementedError(
-                "MiniMax H3 packed multi-segment attention requires "
-                "--ring-degree 1; Ring and mixed USP are unsupported."
-            )
 
-        sp_ws, sp_rank = _ulysses_ctx()
+        # Row split is 2D: ring first (an outer, contiguous ring_chunk_len
+        # slice of the packed sequence), Ulysses second (an inner slice
+        # within this rank's ring chunk). Only Ulysses shards heads inside
+        # attention -- ring instead ring-rotates each rank's local KV chunk
+        # and online-softmax merges partial outputs (see
+        # _minimax_h3_attention_core_impl), so it has no head constraint.
+        ulysses_ws, ulysses_rank = get_ulysses_ctx()
+        ring_ws, ring_rank = get_ring_ctx()
+        sp_ws = ulysses_ws * ring_ws
         local_seq_len = seq_len
         if sp_ws > 1:
             if seq_len % sp_ws:
                 raise ValueError(
-                    f"packed seq_len {seq_len} not divisible by ulysses "
-                    f"world size {sp_ws}"
+                    f"packed seq_len {seq_len} not divisible by the combined "
+                    f"sequence-parallel world size {sp_ws} "
+                    f"(ulysses={ulysses_ws} x ring={ring_ws})"
                 )
             local_heads = self.num_attention_heads // get_tp_world_size()
-            if local_heads % sp_ws:
+            if local_heads % ulysses_ws:
                 raise ValueError(
                     f"TP-local heads {local_heads} not divisible by Ulysses "
-                    f"world size {sp_ws} (total heads={self.num_attention_heads}, "
-                    f"TP={get_tp_world_size()})"
+                    f"world size {ulysses_ws} (total heads="
+                    f"{self.num_attention_heads}, TP={get_tp_world_size()})"
                 )
             local_seq_len = seq_len // sp_ws
-        row_start = sp_rank * local_seq_len
+        ring_chunk_len = local_seq_len * ulysses_ws
+        row_start = ring_rank * ring_chunk_len + ulysses_rank * local_seq_len
         row_stop = row_start + local_seq_len
 
         # RoPE and latent projections are row-local before Ulysses exchanges
@@ -1622,9 +1651,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 block.adaln_proj.split_output(output)
                 for block, output in zip(self.blocks, gathered_adaln)
             )
-        # With Ulysses sequence parallelism, shard rows across the group for
-        # the block stack. Attention trades sequence for heads internally;
-        # everything else, including the final layer, is row-local.
+        # With sequence parallelism, shard rows across the group for the
+        # block stack. Attention trades sequence for heads internally
+        # (Ulysses) and/or ring-rotates KV across ring ranks; everything
+        # else, including the final layer, is row-local. Only the narrow
+        # video/audio logits are gathered after the final layer.
         for index, block in enumerate(self.blocks):
             hidden = block(
                 hidden,
@@ -1634,7 +1665,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 cu_seqlens=cu_seqlens,
                 cu_seqlens_host=cu_seqlens_host,
                 max_seqlen=max_seqlen,
-                ulysses_active=sp_ws > 1,
+                ulysses_active=ulysses_ws > 1,
+                ring_active=ring_ws > 1,
                 adaln_params=(
                     None if block_adaln_params is None else block_adaln_params[index]
                 ),

@@ -4,15 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       pr_numbers:
-        description: "Comma-separated PR numbers to apply (e.g. 18962,19010)"
+        description: "Comma-separated PR numbers to apply (e.g. 18962,19010). Empty = fast-forward the base image to latest main."
         required: false
         default: ""
       image_tag:
-        description: "Base image tag to patch (e.g. dev-x86, dev-x86-cu13)"
+        description: "Base image tag to patch (e.g. dev, dev-cu13, dev-cu12)"
+        required: true
+      output_tag:
+        description: "Tag to publish as. Must start with 'patch-' (e.g. patch-myfeature)."
         required: true
 
 concurrency:
-  group: patch-docker-${{ inputs.image_tag }}
+  group: patch-docker-${{ inputs.image_tag }}-${{ inputs.output_tag }}
   cancel-in-progress: true
 
 jobs:
@@ -20,6 +23,40 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: x64-docker-build-node
     steps:
+      - name: Resolve and validate image tags
+        env:
+          # Inject via env so a crafted input cannot break out of the script.
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          OUTPUT_TAG: ${{ inputs.output_tag }}
+        run: |
+          # Whole-string checks. A '^...$' regex anchors per LINE, so a
+          # multi-line value would pass and then inject extra GITHUB_ENV lines.
+          validate_tag() {
+            case "$2" in
+              ""|[!a-zA-Z0-9_]*|*[!a-zA-Z0-9._-]*)
+                echo "::error::${1} is not a valid Docker tag"
+                exit 1
+                ;;
+            esac
+          }
+          validate_tag image_tag "${IMAGE_TAG}"
+          validate_tag output_tag "${OUTPUT_TAG}"
+
+          # Released tags belong to release-docker*.yml, which builds them as
+          # multi-arch manifests. This job is x64-only, so it publishes under a
+          # prefix those builders never emit rather than denylisting their
+          # current names, which would rot as the release tag scheme changes.
+          case "${OUTPUT_TAG}" in
+            patch-?*) ;;
+            *)
+              echo "::error::output_tag must start with 'patch-' (e.g. patch-myfeature)"
+              exit 1
+              ;;
+          esac
+
+          echo "BASE_IMAGE=lmsysorg/sglang:${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "OUT_IMAGE=lmsysorg/sglang:${OUTPUT_TAG}" >> "$GITHUB_ENV"
+
       - name: Cleanup workspace (remove root-owned files from prior runs)
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
@@ -36,24 +73,28 @@ jobs:
 
       - name: Pull base image and extract commit
         run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
-          docker pull "${IMAGE}"
-          if BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
+          docker pull "${BASE_IMAGE}"
+          if BASE_SHA=$(docker run --rm "${BASE_IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
             echo "Image built from commit: ${BASE_SHA}"
           else
             BASE_SHA=""
-            echo "::warning::Image has no .git directory — cannot extract base commit"
+            echo "::warning::Image has no .git directory - cannot extract base commit"
           fi
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
 
       - name: Generate patches
+        env:
+          PR_NUMBERS: ${{ inputs.pr_numbers }}
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git fetch origin main
+          # Fixed path on a persistent runner: drop patches left by prior runs
+          # so they cannot be picked up by this run's COPY *.patch.
+          rm -rf /tmp/patch-ctx
           mkdir -p /tmp/patch-ctx
 
-          if [ -n "${{ inputs.pr_numbers }}" ]; then
-            IFS=',' read -ra PRS <<< "${{ inputs.pr_numbers }}"
+          if [ -n "${PR_NUMBERS}" ]; then
+            IFS=',' read -ra PRS <<< "${PR_NUMBERS}"
             for pr in "${PRS[@]}"; do
               pr=$(echo "${pr}" | xargs)
               echo "Fetching PR #${pr}"
@@ -64,26 +105,23 @@ jobs:
               echo "  PR #${pr}: $(wc -l < /tmp/patch-ctx/${pr}.patch) lines"
             done
           elif [ -n "${BASE_SHA}" ]; then
-            echo "Generating diff: image ${BASE_SHA} → latest main"
+            echo "Generating diff: image ${BASE_SHA} -> latest main"
             git fetch origin "${BASE_SHA}"
             git diff "${BASE_SHA}..origin/main" > /tmp/patch-ctx/main.patch
             echo "  main: $(wc -l < /tmp/patch-ctx/main.patch) lines"
           else
-            echo "::error::No PR numbers specified and image has no .git — cannot generate diff against main"
+            echo "::error::No PR numbers specified and image has no .git - cannot generate diff against main"
             exit 1
           fi
 
           TOTAL=$(cat /tmp/patch-ctx/*.patch | wc -l)
           if [ "${TOTAL}" -eq 0 ]; then
-            echo "::warning::All patches are empty — image is already up to date"
-            echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
+            echo "::error::All patches are empty - nothing to apply on top of ${BASE_IMAGE}"
+            exit 1
           fi
 
       - name: Build patched image
-        if: env.SKIP_BUILD != 'true'
         run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
-
           cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
           ARG BASE_IMAGE
           FROM ${BASE_IMAGE}
@@ -103,16 +141,25 @@ jobs:
 
           docker build \
             --no-cache \
-            --build-arg BASE_IMAGE="${IMAGE}" \
-            -t "${IMAGE}" \
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            -t "${OUT_IMAGE}" \
             /tmp/patch-ctx/
 
       - name: Push patched image
-        if: env.SKIP_BUILD != 'true'
+        env:
+          PR_NUMBERS: ${{ inputs.pr_numbers }}
         run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
-          docker push "${IMAGE}"
+          docker push "${OUT_IMAGE}"
 
-          echo "### Patched \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Source:** ${{ inputs.pr_numbers && format('PRs: {0}', inputs.pr_numbers) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${PR_NUMBERS}" ]; then
+            SOURCE="PRs: ${PR_NUMBERS}"
+          else
+            SOURCE="latest main"
+          fi
+          {
+            echo "### Patched \`${OUT_IMAGE}\`"
+            echo "- **Base image:** \`${BASE_IMAGE}\`"
+            echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`"
+            echo "- **Source:** ${SOURCE}"
+            echo "- **Platform:** \`linux/amd64\` only - patched on an x64 runner, so the base image's multi-arch manifest is not carried over"
+          } >> "$GITHUB_STEP_SUMMARY"

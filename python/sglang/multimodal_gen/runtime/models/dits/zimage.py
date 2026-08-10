@@ -6,13 +6,8 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import (
-    get_sp_parallel_rank,
     get_sp_world_size,
     get_tp_world_size,
-    sequence_model_parallel_all_gather,
-)
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_ring_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
@@ -88,11 +83,11 @@ def zimage_rmsnorm_tanh_mul_add(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
-            zimage_rmsnorm_tanh_residual,
+        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
+            rmsnorm_tanh_residual,
         )
 
-        y = zimage_rmsnorm_tanh_residual(
+        y = rmsnorm_tanh_residual(
             x,
             gate,
             residual,
@@ -111,11 +106,11 @@ def zimage_rmsnorm_scale(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
-            zimage_rmsnorm_scale as fused_zimage_rmsnorm_scale,
+        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
+            rmsnorm_scale,
         )
 
-        y = fused_zimage_rmsnorm_scale(
+        y = rmsnorm_scale(
             x,
             norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
             scale,
@@ -1575,24 +1570,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
 
         cap_seq_len = cap_feats.shape[1]
-        use_full_unified_sequence = (
-            get_sp_world_size() > 1 and get_ring_parallel_world_size() > 1
-        )
-        if use_full_unified_sequence:
-            # Ring support for this attention layout is not implemented; the
-            # full-sequence gather is correct but gives up ring's memory and
-            # overlap benefits.
-            logger.warning_once(
-                "zimage under ring_degree > 1 falls back to a full-sequence "
-                "K/V gather"
-            )
-        x_local_seq_len = x.shape[1]
-        if use_full_unified_sequence:
-            x = sequence_model_parallel_all_gather(x.contiguous(), dim=1)
-            x_freqs_cis = (
-                sequence_model_parallel_all_gather(x_freqs_cis[0].contiguous(), dim=0),
-                sequence_model_parallel_all_gather(x_freqs_cis[1].contiguous(), dim=0),
-            )
         unified = torch.cat([x, cap_feats], dim=1)
         unified_freqs_cis = (
             torch.cat([x_freqs_cis[0], cap_freqs_cis[0]], dim=-2),
@@ -1608,7 +1585,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         unified_rope_cos_sin_cache, unified_rope_positions = self._get_rope_cache(
             "_cached_unified_rope_cache", unified_freqs_cis
         )
-        num_replicated_suffix = cap_seq_len if not use_full_unified_sequence else 0
+        num_replicated_suffix = cap_seq_len
 
         for layer in self.layers:
             unified = layer(
@@ -1620,17 +1597,11 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 attn_mask=unified_attn_mask,
                 attn_mask_meta=unified_attn_mask_meta,
                 num_replicated_suffix=num_replicated_suffix,
-                skip_sequence_parallel_override=use_full_unified_sequence,
             )
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
         )
-        if use_full_unified_sequence:
-            sp_rank = get_sp_parallel_rank()
-            start = sp_rank * x_local_seq_len
-            end = start + x_local_seq_len
-            unified = unified[:, start:end]
         x = list(unified.unbind(dim=0))
         x = self.unpatchify(x, x_size, patch_size, f_patch_size)
 

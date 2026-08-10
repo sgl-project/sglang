@@ -105,6 +105,9 @@ async def _run_server_warmup_after_http_live(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
+        shutdown_video_jobs,
+    )
     from sglang.multimodal_gen.runtime.scheduler_client import (
         async_scheduler_client,
         run_zeromq_broker,
@@ -136,7 +139,10 @@ async def lifespan(app: FastAPI):
 
         # On shutdown
         logger.info("FastAPI app is shutting down...")
+        await shutdown_video_jobs()
         broker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await broker_task
         async_scheduler_client.close()
 
 

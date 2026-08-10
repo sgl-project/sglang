@@ -16,7 +16,7 @@ static constexpr unsigned long long kWarpSyncMask = 0xFFFFFFFFFFFFFFFFull;
 static constexpr unsigned int kWarpSyncMask = 0xFFFFFFFFu;
 #endif
 
-namespace {
+namespace sglang {
 
 // Block top-k selection over a per-(head, batch) row of block scores, run by one
 // CTA of TopKTrait::kCTASize threads. Picks the `topk` highest-scoring block ids
@@ -579,4 +579,4 @@ void minimax_decode_topk_page_table(
           max_sparse_pages);
 }
 
-}  // namespace
+}  // namespace sglang
