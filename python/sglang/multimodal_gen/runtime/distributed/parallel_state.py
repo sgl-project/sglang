@@ -154,6 +154,20 @@ def _clear_srt_world_group() -> None:
         srt_parallel_state._WORLD = None
 
 
+def _sync_srt_tp_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._TP is None:
+        srt_parallel_state._TP = _TP
+
+
+def _clear_srt_tp_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._TP is _TP:
+        srt_parallel_state._TP = None
+
+
 def init_parallel_group_coordinator(
     group_ranks: List[List[int]],
     local_rank: int,
@@ -466,6 +480,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
+    _sync_srt_tp_group()
 
     global _VAE_DECODE
     assert _VAE_DECODE is None, "VAE decode parallel group is already initialized"
@@ -544,6 +559,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         main_process_only=False,
     )
 
+    current_platform.set_device(device)
     init_distributed_environment(
         world_size=world_size,
         rank=rank,
@@ -561,14 +577,6 @@ def maybe_init_distributed_environment_and_model_parallel(
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
     )
-
-    # Only set CUDA device if we're on a CUDA platform
-    if current_platform.is_cuda_alike():
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-    elif current_platform.is_npu():
-        device = torch.device(f"npu:{local_rank}")
-        torch.npu.set_device(device)
 
 
 def model_parallel_is_initialized() -> bool:
@@ -766,6 +774,21 @@ def get_ring_parallel_rank() -> int:
     return get_sp_group().ring_rank
 
 
+def get_ulysses_ctx() -> tuple[int, int]:
+    """(world_size, rank) of the Ulysses group; (1, 0) when uninitialized
+    (unit tests / single-process debug paths)."""
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
+
+
+def get_ring_ctx() -> tuple[int, int]:
+    """(world_size, rank) of the Ring group; (1, 0) when uninitialized."""
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ring_parallel_world_size(), get_ring_parallel_rank()
+
+
 # PP
 def get_pp_group() -> PipelineGroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
@@ -901,6 +924,7 @@ def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
     global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE
 
+    _clear_srt_tp_group()
     # The IPC transport keeps CUDA mappings associated with the current
     # Ulysses group. Drop them before tearing down the process groups.
     from .device_communicators.ipc_a2a import IPC_A2A

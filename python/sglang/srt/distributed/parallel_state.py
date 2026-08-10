@@ -368,12 +368,14 @@ class GroupCoordinator:
                     backend="mooncake",
                     pg_options=dev_opts,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:device",
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
                     pg_options=cpu_opts,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:cpu",
                 )
             else:
                 active_ranks = torch.ones(
@@ -386,11 +388,15 @@ class GroupCoordinator:
                     backend=torch_distributed_backend,
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:device",
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
                 cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
+                    ranks,
+                    backend="gloo",
+                    timeout=gloo_timeout,
+                    group_desc=f"{group_name}:cpu",
                 )
             if self.rank in ranks:
                 self.ranks = ranks
@@ -1123,7 +1129,10 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                ca_comm.reduce_scatter(input, output, registered=True)
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    ca_comm.reduce_scatter(input, output, registered=False)
+                else:
+                    ca_comm.reduce_scatter(input, output, registered=True)
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
             else:

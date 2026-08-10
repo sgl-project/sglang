@@ -5,6 +5,9 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    is_unified_kv_triton,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -123,13 +126,27 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._linear_accept_index_cache = None
 
+        # The mask token is input-only (it is embedded, never sampled), so its
+        # bound is the embedding-table row count: the PADDED vocab when the
+        # target pads its embedding (e.g. Inkling true vocab 200058, padded
+        # 201024, mask 200064), else the plain vocab size.
+        target_model_config = self.target_worker.model_runner.model_config
+        target_embed_rows = (
+            getattr(target_model_config.hf_text_config, "padded_vocab_size", None)
+            or target_model_config.vocab_size
+        )
+        # muP targets declare logits_mup_width_multiplier; the draft was
+        # trained against the folded head, so compute_base_logits divides.
+        self.draft_model.logits_mup_width_multiplier = getattr(
+            target_model_config.hf_text_config, "logits_mup_width_multiplier", None
+        )
+        self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
-            target_vocab_size=int(
-                self.target_worker.model_runner.model_config.vocab_size
-            ),
+            target_vocab_size=int(target_embed_rows),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
@@ -438,15 +455,30 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch.prefix_lens, dtype=torch.int32, device=device
         )
         positions, _ = compute_position(
-            self.model_runner.server_args.attention_backend,
+            self.model_runner.prefill_attention_backend_str,
             draft_seq_lens,
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
+        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
+        # thread the per-token state_slot + the req's final position so the
+        # injector keeps only the last SWA window (older prefill tokens share a
+        # ring slot and would race). Cheap; only consumed under unified_kv.
+        state_slot = final_pos = None
+        if is_unified_kv_triton():
+            repeats = ctx_lens.to(torch.int64)
+            state_slot = torch.repeat_interleave(
+                batch.req_pool_indices.to(device=device, dtype=torch.int64), repeats
+            )
+            final_pos = torch.repeat_interleave(
+                (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
+            )
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
             positions=positions,
+            state_slot=state_slot,
+            final_pos=final_pos,
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
@@ -782,6 +814,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
+            req_pool_indices=batch.req_pool_indices,
         )
 
     def get_confidence_budget_prepare(self):
