@@ -6,6 +6,12 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.layers.attention.linear.kda_route_telemetry import (
+    KDACudaGraphRoutePlans,
+    capture_kda_route_plan,
+    replay_kda_route_plan,
+    suppress_kda_route_recording,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -111,6 +117,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.kda_cuda_graph_route_plans = KDACudaGraphRoutePlans()
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.LAST
@@ -201,7 +208,12 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         return ShapeKey(size=bs)
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        return replay_kda_route_plan(
+            shape_key,
+            "decode",
+            lambda: self.backend.replay(shape_key, forward_batch),
+            plans=self.kda_cuda_graph_route_plans,
+        )
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Uniform-width replay invariant: the batch's actual per-request width
@@ -359,18 +371,25 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                 post_warmup_hook = getattr(
                     self.draft_attn_backend, "on_after_cuda_graph_warmup", None
                 )
-                maybe_flashinfer_autotune_speculative_draft(
-                    self,
-                    run_once,
-                    post_warmup_hook=post_warmup_hook,
-                    skip_logits=False,
-                )
-                self.backend.capture_one(
+                with suppress_kda_route_recording():
+                    maybe_flashinfer_autotune_speculative_draft(
+                        self,
+                        run_once,
+                        post_warmup_hook=post_warmup_hook,
+                        skip_logits=False,
+                    )
+                with capture_kda_route_plan(
                     shape_key,
-                    run_once,
-                    capture_inputs=None,
-                    post_warmup_hook=post_warmup_hook,
-                )
+                    "decode",
+                    capture_probe=self.backend.is_actual_capture_pass,
+                    plans=self.kda_cuda_graph_route_plans,
+                ):
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        capture_inputs=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
         finally:
             self.draft_attn_backend.token_to_kv_pool = saved_backend_pool
 

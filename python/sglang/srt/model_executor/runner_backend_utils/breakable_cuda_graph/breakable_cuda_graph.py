@@ -269,6 +269,11 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
     return decorator
 
 
+def is_in_breakable_cuda_graph_capture() -> bool:
+    """True for the actual BCG recording body, including eager seams."""
+    return _current_capture_var.get() is not None
+
+
 class BreakableCUDAGraph:
     """Container holding one torch.cuda.CUDAGraph per segment plus an
     eager break function between consecutive segments."""

@@ -56,6 +56,7 @@ from sglang.srt.layers.attention.linear.kda_route_telemetry import (
     KDACudaGraphRoutePlans,
     capture_kda_route_plan,
     replay_kda_route_plan,
+    suppress_kda_route_recording,
 )
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -364,7 +365,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
-            self.backend = resolve_prefill_backend(self)
+            with suppress_kda_route_recording():
+                self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
             if self.prefill_backend_name != Backend.TC_PIECEWISE:
                 raise
@@ -1401,6 +1403,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with capture_kda_route_plan(
             shape_key,
             "prefill",
+            capture_probe=self.backend.is_actual_capture_pass,
             plans=self.kda_cuda_graph_route_plans,
         ):
             self.backend.capture_one(

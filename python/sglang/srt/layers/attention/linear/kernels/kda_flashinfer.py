@@ -29,6 +29,13 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.attention.linear.kda_route_telemetry import (
+    CAKE_PACKED_EXCEPTION,
+    CAKE_PREFILL_EXCEPTION,
+    PACKED_SELECTOR_EXCEPTION,
+    PREFILL_SELECTOR_EXCEPTION,
+    TRITON_FALLBACK_EXCEPTION,
+    CakePackedDecodeReason,
+    CakePrefillReason,
     record_kda_terminal_route,
     stable_kda_exception_detail,
 )
@@ -59,23 +66,6 @@ _CAKE_PACKED_SCALE = _CAKE_PACKED_HEAD_DIM**-0.5
 _CAKE_PACKED_LOWER_BOUND = -5.0
 
 
-class CakePackedDecodeReason:
-    """Stable CAKE packed-decode admission reason codes."""
-
-    ELIGIBLE = "eligible"
-    KERNEL_UNAVAILABLE = "kernel_unavailable"
-    REPLAYSSM_REQUESTED = "replayssm_requested"
-    UNSUPPORTED_CONTRACT = "unsupported_contract"
-    INNER_STRIDE = "inner_stride"
-    ZERO_ROW_STRIDE = "zero_row_stride"
-    NEGATIVE_ROW_STRIDE = "negative_row_stride"
-    OVERLAPPING_ROW_STRIDE = "overlapping_row_stride"
-    STORAGE_ALIAS = "storage_alias"
-    CACHE_INDEX_UNVERIFIED = "cache_index_unverified"
-    CACHE_INDEX_OOB = "cache_index_oob"
-    CACHE_INDEX_DUPLICATE = "cache_index_duplicate"
-
-
 @dataclass(frozen=True)
 class CakePackedDecodeAdmission:
     """One terminal selector result for a packed CAKE decode attempt."""
@@ -83,23 +73,6 @@ class CakePackedDecodeAdmission:
     eligible: bool
     reason: str
     detail: str = ""
-
-
-class CakePrefillReason:
-    """Stable CAKE ordinary-prefill route reason codes."""
-
-    ELIGIBLE = "eligible"
-    SPEC_DECODE = "spec_decode"
-    INTERIOR_CHECKPOINT = "interior_checkpoint"
-    INVALID_LOWER_BOUND = "invalid_lower_bound"
-    MISSING_GATE_PARAMS = "missing_gate_params"
-    UNSUPPORTED_Q_CONTRACT = "unsupported_q_contract"
-    CUDA_GRAPH_ALLOCATION = "cuda_graph_allocation"
-    T1_DECODE_SHAPE = "t1_decode_shape"
-    UNSUPPORTED_HEAD_DIM = "unsupported_head_dim"
-    SHAPE_MISMATCH = "shape_mismatch"
-    UNSUPPORTED_ARCH = "unsupported_arch"
-    UNSUPPORTED_CONTRACT = "unsupported_contract"
 
 
 @dataclass(frozen=True)
@@ -699,7 +672,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 cake_success=False,
                 triton_fallback=False,
                 fatal=True,
-                reason="prefill_selector_exception",
+                reason=PREFILL_SELECTOR_EXCEPTION,
                 detail=stable_kda_exception_detail(exc),
             )
             raise
@@ -716,7 +689,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                     cake_success=False,
                     triton_fallback=False,
                     fatal=True,
-                    reason="triton_fallback_exception",
+                    reason=TRITON_FALLBACK_EXCEPTION,
                     detail=stable_kda_exception_detail(exc),
                 )
                 raise
@@ -802,7 +775,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 cake_success=False,
                 triton_fallback=False,
                 fatal=True,
-                reason="cake_prefill_exception",
+                reason=CAKE_PREFILL_EXCEPTION,
                 detail=stable_kda_exception_detail(exc),
             )
             raise
@@ -1559,7 +1532,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
                 cake_success=False,
                 triton_fallback=False,
                 fatal=True,
-                reason="packed_selector_exception",
+                reason=PACKED_SELECTOR_EXCEPTION,
                 detail=stable_kda_exception_detail(exc),
             )
             raise
@@ -1589,7 +1562,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
                     cake_success=False,
                     triton_fallback=False,
                     fatal=True,
-                    reason="triton_fallback_exception",
+                    reason=TRITON_FALLBACK_EXCEPTION,
                     detail=stable_kda_exception_detail(exc),
                 )
                 raise
@@ -1646,7 +1619,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
                 cake_success=False,
                 triton_fallback=False,
                 fatal=True,
-                reason="cake_packed_exception",
+                reason=CAKE_PACKED_EXCEPTION,
                 detail=stable_kda_exception_detail(exc),
             )
             raise

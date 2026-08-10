@@ -5,14 +5,16 @@ terminal outcomes are mutually exclusive and exhaustive::
 
     considered == cake_success + triton_fallback + fatal
 
-CUDA graph capture needs special handling because Python executes during graph
-construction but does not execute during replay.  Graph runners therefore wrap
-``backend.capture_one`` in :func:`capture_kda_route_plan`.  Backend warmups are
-ignored; only records made while ``torch.cuda.is_current_stream_capturing()`` is
-true enter the immutable per-``ShapeKey`` plan.  A successful capture emits the
-capture events once.  :func:`replay_kda_route_plan` emits that exact plan after
-each successful ``backend.replay`` without pretending that the Python KDA
-wrapper ran again.
+CUDA graph capture needs special handling because a route can belong either to
+a physically captured graph segment or to live Python in a breakable/piecewise
+replay seam.  Graph runners therefore wrap ``backend.capture_one`` in
+:func:`capture_kda_route_plan`.  Backend warmups are ignored; only the backend's
+actual capture pass enters an immutable per-``ShapeKey`` plan, with replay
+ownership recorded for every route.  A successful capture emits the capture
+events once.  :func:`replay_kda_route_plan` stages live-Python events, merges
+them with synthesized captured-segment events, and commits only after the whole
+backend replay returns.  A later segment or bridge exception therefore
+fatalizes the transaction instead of leaving a false success receipt.
 
 ``copy_count`` is a host-side, statically audited materialization count, *not* a
 CUPTI activity count.  It is zero only for the packed row-strided CAKE ABI,
@@ -52,6 +54,94 @@ _VALID_PHASES = frozenset(("direct", "capture", "replay"))
 _VALID_COPY_COUNT_SOURCES = frozenset(
     ("static_zero_copy_row_view", "unknown_requires_cupti")
 )
+
+
+class CakePackedDecodeReason:
+    """Stable CAKE packed-decode admission reason codes for schema v1."""
+
+    ELIGIBLE = "eligible"
+    KERNEL_UNAVAILABLE = "kernel_unavailable"
+    REPLAYSSM_REQUESTED = "replayssm_requested"
+    UNSUPPORTED_CONTRACT = "unsupported_contract"
+    INNER_STRIDE = "inner_stride"
+    ZERO_ROW_STRIDE = "zero_row_stride"
+    NEGATIVE_ROW_STRIDE = "negative_row_stride"
+    OVERLAPPING_ROW_STRIDE = "overlapping_row_stride"
+    STORAGE_ALIAS = "storage_alias"
+    CACHE_INDEX_UNVERIFIED = "cache_index_unverified"
+    CACHE_INDEX_OOB = "cache_index_oob"
+    CACHE_INDEX_DUPLICATE = "cache_index_duplicate"
+
+
+class CakePrefillReason:
+    """Stable CAKE ordinary-prefill admission reason codes for schema v1."""
+
+    ELIGIBLE = "eligible"
+    SPEC_DECODE = "spec_decode"
+    INTERIOR_CHECKPOINT = "interior_checkpoint"
+    INVALID_LOWER_BOUND = "invalid_lower_bound"
+    MISSING_GATE_PARAMS = "missing_gate_params"
+    UNSUPPORTED_Q_CONTRACT = "unsupported_q_contract"
+    CUDA_GRAPH_ALLOCATION = "cuda_graph_allocation"
+    T1_DECODE_SHAPE = "t1_decode_shape"
+    UNSUPPORTED_HEAD_DIM = "unsupported_head_dim"
+    SHAPE_MISMATCH = "shape_mismatch"
+    UNSUPPORTED_ARCH = "unsupported_arch"
+    UNSUPPORTED_CONTRACT = "unsupported_contract"
+
+
+PREFILL_SELECTOR_EXCEPTION = "prefill_selector_exception"
+PACKED_SELECTOR_EXCEPTION = "packed_selector_exception"
+TRITON_FALLBACK_EXCEPTION = "triton_fallback_exception"
+CAKE_PREFILL_EXCEPTION = "cake_prefill_exception"
+CAKE_PACKED_EXCEPTION = "cake_packed_exception"
+CUDA_GRAPH_CAPTURE_EXCEPTION = "cuda_graph_capture_exception"
+CUDA_GRAPH_PLAN_BIND_EXCEPTION = "cuda_graph_plan_bind_exception"
+CUDA_GRAPH_REPLAY_EXCEPTION = "cuda_graph_replay_exception"
+CUDA_GRAPH_REPLAY_PLAN_MISMATCH = "cuda_graph_replay_plan_mismatch"
+
+_DECODE_FALLBACK_REASONS = frozenset(
+    (
+        CakePackedDecodeReason.KERNEL_UNAVAILABLE,
+        CakePackedDecodeReason.REPLAYSSM_REQUESTED,
+        CakePackedDecodeReason.UNSUPPORTED_CONTRACT,
+        CakePackedDecodeReason.INNER_STRIDE,
+        CakePackedDecodeReason.ZERO_ROW_STRIDE,
+        CakePackedDecodeReason.NEGATIVE_ROW_STRIDE,
+        CakePackedDecodeReason.OVERLAPPING_ROW_STRIDE,
+        CakePackedDecodeReason.STORAGE_ALIAS,
+        CakePackedDecodeReason.CACHE_INDEX_UNVERIFIED,
+        CakePackedDecodeReason.CACHE_INDEX_OOB,
+        CakePackedDecodeReason.CACHE_INDEX_DUPLICATE,
+    )
+)
+_PREFILL_FALLBACK_REASONS = frozenset(
+    (
+        CakePrefillReason.SPEC_DECODE,
+        CakePrefillReason.INTERIOR_CHECKPOINT,
+        CakePrefillReason.INVALID_LOWER_BOUND,
+        CakePrefillReason.MISSING_GATE_PARAMS,
+        CakePrefillReason.UNSUPPORTED_Q_CONTRACT,
+        CakePrefillReason.CUDA_GRAPH_ALLOCATION,
+        CakePrefillReason.T1_DECODE_SHAPE,
+        CakePrefillReason.UNSUPPORTED_HEAD_DIM,
+        CakePrefillReason.SHAPE_MISMATCH,
+        CakePrefillReason.UNSUPPORTED_ARCH,
+        CakePrefillReason.UNSUPPORTED_CONTRACT,
+    )
+)
+_DIRECT_FATAL_REASONS = {
+    ("decode", 0): frozenset((PACKED_SELECTOR_EXCEPTION, TRITON_FALLBACK_EXCEPTION)),
+    ("decode", 1): frozenset((CAKE_PACKED_EXCEPTION,)),
+    ("prefill", 0): frozenset((PREFILL_SELECTOR_EXCEPTION, TRITON_FALLBACK_EXCEPTION)),
+    ("prefill", 1): frozenset((CAKE_PREFILL_EXCEPTION,)),
+}
+_GRAPH_FATAL_PHASES = {
+    CUDA_GRAPH_CAPTURE_EXCEPTION: "capture",
+    CUDA_GRAPH_PLAN_BIND_EXCEPTION: "capture",
+    CUDA_GRAPH_REPLAY_EXCEPTION: "replay",
+    CUDA_GRAPH_REPLAY_PLAN_MISMATCH: "replay",
+}
 
 
 class KDATelemetryError(RuntimeError):
@@ -110,16 +200,56 @@ class KDATerminalRouteEvent:
                 "KDA route terminal invariant failed: considered must equal "
                 "cake_success + triton_fallback + fatal"
             )
-        if self.cake_success and not (self.eligible and self.attempted_cake):
+        if self.eligible != self.attempted_cake:
+            raise ValueError(
+                "KDA route funnel invariant failed: eligible must equal attempted_cake"
+            )
+        route_bits = (self.eligible, self.attempted_cake)
+        if self.cake_success and route_bits != (1, 1):
             raise ValueError("cake_success requires eligible=1 and attempted_cake=1")
-        if self.triton_fallback and self.attempted_cake:
-            raise ValueError("successful Triton fallback cannot attempt CAKE")
-        if not self.reason or not isinstance(self.reason, str):
+        if self.triton_fallback and route_bits != (0, 0):
+            raise ValueError(
+                "successful Triton fallback requires eligible=0 and attempted_cake=0"
+            )
+        if self.fatal and route_bits not in ((0, 0), (1, 1)):
+            raise ValueError("fatal KDA route has invalid eligibility/attempt bits")
+        if not isinstance(self.reason, str) or not self.reason:
             raise ValueError("KDA route reason must be a stable non-empty string")
         if not isinstance(self.detail, str):
             raise TypeError("KDA route detail must be a string")
         if self.graph_phase not in _VALID_PHASES:
             raise ValueError(f"invalid KDA graph phase: {self.graph_phase!r}")
+
+        if self.cake_success:
+            allowed_reasons = frozenset((CakePackedDecodeReason.ELIGIBLE,))
+        elif self.triton_fallback:
+            allowed_reasons = (
+                _DECODE_FALLBACK_REASONS
+                if self.mode == "decode"
+                else _PREFILL_FALLBACK_REASONS
+            )
+        else:
+            allowed_reasons = _DIRECT_FATAL_REASONS[
+                (self.mode, self.eligible)
+            ] | frozenset(_GRAPH_FATAL_PHASES)
+        if self.reason not in allowed_reasons:
+            outcome = (
+                "cake_success"
+                if self.cake_success
+                else "triton_fallback" if self.triton_fallback else "fatal"
+            )
+            raise ValueError(
+                "invalid KDA route reason for mode/outcome/funnel: "
+                f"mode={self.mode!r}, outcome={outcome!r}, "
+                f"eligible={self.eligible}, reason={self.reason!r}"
+            )
+        required_phase = _GRAPH_FATAL_PHASES.get(self.reason)
+        if required_phase is not None and self.graph_phase != required_phase:
+            raise ValueError(
+                f"KDA graph reason {self.reason!r} requires "
+                f"graph_phase={required_phase!r}"
+            )
+
         if self.copy_count is not None and (
             isinstance(self.copy_count, bool)
             or not isinstance(self.copy_count, int)
@@ -128,16 +258,22 @@ class KDATerminalRouteEvent:
             raise ValueError("copy_count must be a non-negative int or None")
         if self.copy_count_source not in _VALID_COPY_COUNT_SOURCES:
             raise ValueError(f"invalid copy_count_source: {self.copy_count_source!r}")
-        if self.copy_count is None and self.copy_count_source != (
-            "unknown_requires_cupti"
-        ):
+        packed_zero_copy_success = bool(
+            self.mode == "decode"
+            and self.cake_success
+            and self.reason == CakePackedDecodeReason.ELIGIBLE
+        )
+        expected_copy_state = (
+            (0, "static_zero_copy_row_view")
+            if packed_zero_copy_success
+            else (None, "unknown_requires_cupti")
+        )
+        if (self.copy_count, self.copy_count_source) != expected_copy_state:
             raise ValueError(
-                "unknown copy_count must use copy_count_source='unknown_requires_cupti'"
+                "invalid KDA copy-count state for route: expected "
+                f"{expected_copy_state!r}, got "
+                f"{(self.copy_count, self.copy_count_source)!r}"
             )
-        if self.copy_count is not None and self.copy_count_source == (
-            "unknown_requires_cupti"
-        ):
-            raise ValueError("known copy_count needs a statically audited source")
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable machine-readable event mapping."""
@@ -212,13 +348,19 @@ class KDATerminalRouteTelemetry:
 
     def emit(self, event: KDATerminalRouteEvent) -> None:
         """Atomically retain and count one already-validated event."""
-        key = (event.mode, event.layer_id, event.graph_phase, event.reason)
+        self.emit_many((event,))
+
+    def emit_many(self, events: tuple[KDATerminalRouteEvent, ...]) -> None:
+        """Atomically retain and count one committed event transaction."""
         with self._lock:
-            self._events.append(event)
-            self._event_count += 1
-            self._counters[key].add(event)
+            for event in events:
+                key = (event.mode, event.layer_id, event.graph_phase, event.reason)
+                self._events.append(event)
+                self._event_count += 1
+                self._counters[key].add(event)
         if self._emit_log:
-            self._logger.info("%s%s", KDA_ROUTE_EVENT_PREFIX, event.to_json())
+            for event in events:
+                self._logger.info("%s%s", KDA_ROUTE_EVENT_PREFIX, event.to_json())
 
     def raw_events_snapshot(self) -> tuple[KDATerminalRouteEvent, ...]:
         with self._lock:
@@ -248,9 +390,42 @@ class KDATerminalRouteTelemetry:
                         "KDA route counter closure failed for "
                         f"{(mode, layer_id, phase, reason)!r}"
                     )
+                if row["eligible"] != row["attempted_cake"]:
+                    raise KDATelemetryError(
+                        "KDA route counter funnel failed for "
+                        f"{(mode, layer_id, phase, reason)!r}"
+                    )
+                if row["cake_success"] > row["attempted_cake"]:
+                    raise KDATelemetryError(
+                        "KDA route counter success funnel failed for "
+                        f"{(mode, layer_id, phase, reason)!r}"
+                    )
+                if row["triton_fallback"] > (row["considered"] - row["eligible"]):
+                    raise KDATelemetryError(
+                        "KDA route counter fallback funnel failed for "
+                        f"{(mode, layer_id, phase, reason)!r}"
+                    )
+                if (
+                    row["known_copy_calls"] + row["unknown_copy_calls"]
+                    != row["considered"]
+                ):
+                    raise KDATelemetryError(
+                        "KDA route counter copy-call closure failed for "
+                        f"{(mode, layer_id, phase, reason)!r}"
+                    )
+                if row["known_copy_count"] != 0:
+                    raise KDATelemetryError(
+                        "KDA route schema v1 only permits a statically known zero "
+                        "copy count for "
+                        f"{(mode, layer_id, phase, reason)!r}"
+                    )
                 rows.append(row)
             retained = len(self._events)
             total = self._event_count
+            if sum(row["considered"] for row in rows) != total:
+                raise KDATelemetryError(
+                    "KDA route counter total does not match emitted event total"
+                )
         return {
             "schema_version": KDA_ROUTE_SCHEMA_VERSION,
             "key_fields": ["mode", "layer_id", "graph_phase", "reason"],
@@ -266,16 +441,49 @@ class KDATerminalRouteTelemetry:
         )
 
 
+_REPLAY_OWNER_CAPTURED_GRAPH = "captured_graph"
+_REPLAY_OWNER_LIVE_PYTHON = "live_python"
+_VALID_REPLAY_OWNERS = frozenset(
+    (_REPLAY_OWNER_CAPTURED_GRAPH, _REPLAY_OWNER_LIVE_PYTHON)
+)
+
+
+@dataclass(frozen=True)
+class _KDAPlannedRoute:
+    event: KDATerminalRouteEvent
+    replay_owner: str
+
+    def __post_init__(self) -> None:
+        if self.replay_owner not in _VALID_REPLAY_OWNERS:
+            raise ValueError(f"invalid KDA replay owner: {self.replay_owner!r}")
+
+
 @dataclass
 class _CaptureSession:
     mode: str
     shape_key: Hashable
-    capture_probe: Callable[[], bool]
+    actual_capture_probe: Callable[[], bool]
+    physical_capture_probe: Callable[[], bool]
+    telemetry: KDATerminalRouteTelemetry
+    records: list[_KDAPlannedRoute]
+
+
+@dataclass
+class _ReplaySession:
+    mode: str
+    shape_key: Hashable
+    telemetry: KDATerminalRouteTelemetry
     records: list[KDATerminalRouteEvent]
 
 
 _ACTIVE_CAPTURE: ContextVar[Optional[_CaptureSession]] = ContextVar(
     "sglang_kda_active_capture", default=None
+)
+_ACTIVE_REPLAY: ContextVar[Optional[_ReplaySession]] = ContextVar(
+    "sglang_kda_active_replay", default=None
+)
+_SUPPRESS_RECORDING: ContextVar[bool] = ContextVar(
+    "sglang_kda_suppress_recording", default=False
 )
 
 
@@ -284,7 +492,7 @@ class KDACudaGraphRoutePlans:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._plans: dict[str, dict[Hashable, tuple[KDATerminalRouteEvent, ...]]] = {
+        self._plans: dict[str, dict[Hashable, tuple[_KDAPlannedRoute, ...]]] = {
             mode: {} for mode in _VALID_MODES
         }
 
@@ -292,7 +500,7 @@ class KDACudaGraphRoutePlans:
         self,
         mode: str,
         shape_key: Hashable,
-        plan: tuple[KDATerminalRouteEvent, ...],
+        plan: tuple[_KDAPlannedRoute, ...],
     ) -> bool:
         """Bind once. Return true only for the first identical binding."""
         _validate_mode(mode)
@@ -308,9 +516,7 @@ class KDACudaGraphRoutePlans:
                 )
             return False
 
-    def require(
-        self, mode: str, shape_key: Hashable
-    ) -> tuple[KDATerminalRouteEvent, ...]:
+    def require(self, mode: str, shape_key: Hashable) -> tuple[_KDAPlannedRoute, ...]:
         _validate_mode(mode)
         with self._lock:
             try:
@@ -321,9 +527,7 @@ class KDACudaGraphRoutePlans:
                     f"mode={mode!r}, shape_key={shape_key!r}"
                 ) from exc
 
-    def snapshot(
-        self, mode: str, shape_key: Hashable
-    ) -> tuple[KDATerminalRouteEvent, ...]:
+    def snapshot(self, mode: str, shape_key: Hashable) -> tuple[_KDAPlannedRoute, ...]:
         return self.require(mode, shape_key)
 
 
@@ -364,6 +568,16 @@ def _torch_capture_probe() -> bool:
     return bool(torch.cuda.is_current_stream_capturing())
 
 
+@contextmanager
+def suppress_kda_route_recording() -> Iterator[None]:
+    """Suppress non-serving warmup/compile calls without touching GPU state."""
+    token = _SUPPRESS_RECORDING.set(True)
+    try:
+        yield
+    finally:
+        _SUPPRESS_RECORDING.reset(token)
+
+
 def record_kda_terminal_route(
     *,
     mode: str,
@@ -384,8 +598,19 @@ def record_kda_terminal_route(
     ``None`` means the call was a backend warmup inside an explicit capture
     context and was intentionally suppressed.
     """
-    session = _ACTIVE_CAPTURE.get()
-    graph_phase = "capture" if session is not None else "direct"
+    if _SUPPRESS_RECORDING.get():
+        return None
+    capture_session = _ACTIVE_CAPTURE.get()
+    replay_session = _ACTIVE_REPLAY.get()
+    if capture_session is not None and replay_session is not None:
+        raise KDACudaGraphPlanError(
+            "overlapping KDA CUDA graph capture and replay contexts"
+        )
+    graph_phase = (
+        "capture"
+        if capture_session is not None
+        else "replay" if replay_session is not None else "direct"
+    )
     event = KDATerminalRouteEvent(
         schema_version=KDA_ROUTE_SCHEMA_VERSION,
         mode=mode,
@@ -402,17 +627,30 @@ def record_kda_terminal_route(
         copy_count=copy_count,
         copy_count_source=copy_count_source,
     )
+    session = capture_session or replay_session
     if session is None:
         telemetry.emit(event)
         return event
     if session.mode != mode:
         raise KDATelemetryError(
-            "KDA route mode does not match active CUDA graph capture: "
-            f"record={mode!r}, capture={session.mode!r}"
+            "KDA route mode does not match active CUDA graph transaction: "
+            f"record={mode!r}, transaction={session.mode!r}"
         )
-    if not session.capture_probe():
-        return None
-    session.records.append(event)
+    if session.telemetry is not telemetry:
+        raise KDATelemetryError(
+            "KDA route telemetry sink does not match active graph transaction"
+        )
+    if capture_session is not None:
+        if not capture_session.actual_capture_probe():
+            return None
+        replay_owner = (
+            _REPLAY_OWNER_CAPTURED_GRAPH
+            if capture_session.physical_capture_probe()
+            else _REPLAY_OWNER_LIVE_PYTHON
+        )
+        capture_session.records.append(_KDAPlannedRoute(event, replay_owner))
+    else:
+        replay_session.records.append(event)
     return event
 
 
@@ -422,28 +660,40 @@ def capture_kda_route_plan(
     mode: str,
     *,
     capture_probe: Callable[[], bool] = _torch_capture_probe,
+    physical_capture_probe: Callable[[], bool] = _torch_capture_probe,
     telemetry: KDATerminalRouteTelemetry = KDA_ROUTE_TELEMETRY,
     plans: KDACudaGraphRoutePlans = KDA_CUDA_GRAPH_ROUTE_PLANS,
 ) -> Iterator[None]:
     """Collect only the actual capture pass and bind an immutable route plan."""
     _validate_mode(mode)
-    if _ACTIVE_CAPTURE.get() is not None:
-        raise KDACudaGraphPlanError("nested KDA CUDA graph capture contexts")
-    session = _CaptureSession(mode, shape_key, capture_probe, [])
+    if _ACTIVE_CAPTURE.get() is not None or _ACTIVE_REPLAY.get() is not None:
+        raise KDACudaGraphPlanError("nested KDA CUDA graph telemetry transaction")
+    session = _CaptureSession(
+        mode,
+        shape_key,
+        capture_probe,
+        physical_capture_probe,
+        telemetry,
+        [],
+    )
     token = _ACTIVE_CAPTURE.set(session)
     try:
         try:
             yield
         except BaseException as exc:
             detail = stable_kda_exception_detail(exc)
-            for event in session.records:
-                telemetry.emit(
-                    event
-                    if event.fatal
-                    else event.as_fatal(
-                        reason="cuda_graph_capture_exception", detail=detail
+            telemetry.emit_many(
+                tuple(
+                    (
+                        entry.event
+                        if entry.event.fatal
+                        else entry.event.as_fatal(
+                            reason=CUDA_GRAPH_CAPTURE_EXCEPTION, detail=detail
+                        )
                     )
+                    for entry in session.records
                 )
+            )
             raise
         else:
             plan = tuple(session.records)
@@ -451,23 +701,82 @@ def capture_kda_route_plan(
                 first_binding = plans.bind(mode, shape_key, plan)
             except BaseException as exc:
                 detail = stable_kda_exception_detail(exc)
-                for event in session.records:
-                    telemetry.emit(
-                        event
-                        if event.fatal
-                        else event.as_fatal(
-                            reason="cuda_graph_plan_bind_exception", detail=detail
+                telemetry.emit_many(
+                    tuple(
+                        (
+                            entry.event
+                            if entry.event.fatal
+                            else entry.event.as_fatal(
+                                reason=CUDA_GRAPH_PLAN_BIND_EXCEPTION, detail=detail
+                            )
                         )
+                        for entry in session.records
                     )
+                )
                 raise
             if first_binding:
-                for event in plan:
-                    telemetry.emit(event)
+                telemetry.emit_many(tuple(entry.event for entry in plan))
     finally:
         _ACTIVE_CAPTURE.reset(token)
 
 
 _ReplayResult = TypeVar("_ReplayResult")
+
+
+def _fatal_replay_events(
+    plan: tuple[_KDAPlannedRoute, ...],
+    live_records: tuple[KDATerminalRouteEvent, ...],
+    *,
+    reason: str,
+    detail: str,
+) -> tuple[KDATerminalRouteEvent, ...]:
+    """Fatalize a replay transaction without retaining staged successes."""
+    output: list[KDATerminalRouteEvent] = []
+    live_index = 0
+    for entry in plan:
+        basis = entry.event.for_phase("replay")
+        if entry.replay_owner == _REPLAY_OWNER_LIVE_PYTHON:
+            if live_index < len(live_records):
+                basis = live_records[live_index]
+            live_index += 1
+        output.append(
+            basis if basis.fatal else basis.as_fatal(reason=reason, detail=detail)
+        )
+    for extra in live_records[live_index:]:
+        output.append(
+            extra if extra.fatal else extra.as_fatal(reason=reason, detail=detail)
+        )
+    return tuple(output)
+
+
+def _merge_successful_replay(
+    plan: tuple[_KDAPlannedRoute, ...],
+    live_records: tuple[KDATerminalRouteEvent, ...],
+) -> tuple[KDATerminalRouteEvent, ...]:
+    expected_live = sum(
+        entry.replay_owner == _REPLAY_OWNER_LIVE_PYTHON for entry in plan
+    )
+    if len(live_records) != expected_live:
+        raise KDACudaGraphPlanError(
+            "KDA live replay event count changed for immutable graph plan: "
+            f"expected={expected_live}, actual={len(live_records)}"
+        )
+
+    output: list[KDATerminalRouteEvent] = []
+    live_index = 0
+    for entry in plan:
+        if entry.replay_owner == _REPLAY_OWNER_CAPTURED_GRAPH:
+            output.append(entry.event.for_phase("replay"))
+            continue
+        actual = live_records[live_index]
+        live_index += 1
+        if actual.for_phase("capture") != entry.event:
+            raise KDACudaGraphPlanError(
+                "KDA live replay route changed for immutable graph plan: "
+                f"expected={entry.event.to_json()}, actual={actual.to_json()}"
+            )
+        output.append(actual)
+    return tuple(output)
 
 
 def replay_kda_route_plan(
@@ -478,21 +787,42 @@ def replay_kda_route_plan(
     telemetry: KDATerminalRouteTelemetry = KDA_ROUTE_TELEMETRY,
     plans: KDACudaGraphRoutePlans = KDA_CUDA_GRAPH_ROUTE_PLANS,
 ) -> _ReplayResult:
-    """Replay the backend, then emit its exact captured KDA route plan."""
+    """Replay atomically, then commit one terminal event per planned layer."""
     plan = plans.require(mode, shape_key)
+    if _ACTIVE_CAPTURE.get() is not None or _ACTIVE_REPLAY.get() is not None:
+        raise KDACudaGraphPlanError("nested KDA CUDA graph telemetry transaction")
+    session = _ReplaySession(mode, shape_key, telemetry, [])
     try:
-        result = replay()
+        token = _ACTIVE_REPLAY.set(session)
+        try:
+            result = replay()
+        finally:
+            _ACTIVE_REPLAY.reset(token)
     except BaseException as exc:
         detail = stable_kda_exception_detail(exc)
-        for event in plan:
-            telemetry.emit(
-                event.for_phase("replay").as_fatal(
-                    reason="cuda_graph_replay_exception", detail=detail
-                )
+        telemetry.emit_many(
+            _fatal_replay_events(
+                plan,
+                tuple(session.records),
+                reason=CUDA_GRAPH_REPLAY_EXCEPTION,
+                detail=detail,
             )
+        )
         raise
-    for event in plan:
-        telemetry.emit(event.for_phase("replay"))
+
+    try:
+        committed = _merge_successful_replay(plan, tuple(session.records))
+    except KDACudaGraphPlanError as exc:
+        telemetry.emit_many(
+            _fatal_replay_events(
+                plan,
+                tuple(session.records),
+                reason=CUDA_GRAPH_REPLAY_PLAN_MISMATCH,
+                detail=stable_kda_exception_detail(exc),
+            )
+        )
+        raise
+    telemetry.emit_many(committed)
     return result
 
 

@@ -38,6 +38,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     BreakableCUDAGraphCapture,
     eager_on_graph,
     enable_breakable_cuda_graph,
+    is_in_breakable_cuda_graph_capture,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
@@ -57,6 +58,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
     """
+
+    def is_actual_capture_pass(self) -> bool:
+        return is_in_breakable_cuda_graph_capture()
 
     def __init__(
         self,

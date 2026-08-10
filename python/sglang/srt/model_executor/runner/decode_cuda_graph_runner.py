@@ -50,6 +50,7 @@ from sglang.srt.layers.attention.linear.kda_route_telemetry import (
     KDACudaGraphRoutePlans,
     capture_kda_route_plan,
     replay_kda_route_plan,
+    suppress_kda_route_recording,
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -1146,15 +1147,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     "on_after_cuda_graph_warmup",
                     None,
                 )
-                maybe_flashinfer_autotune_speculative_draft(
-                    self,
-                    run_once,
-                    post_warmup_hook=post_warmup_hook,
-                    skip_logits=False,
-                )
+                with suppress_kda_route_recording():
+                    maybe_flashinfer_autotune_speculative_draft(
+                        self,
+                        run_once,
+                        post_warmup_hook=post_warmup_hook,
+                        skip_logits=False,
+                    )
                 with capture_kda_route_plan(
                     shape_key,
                     "decode",
+                    capture_probe=self.backend.is_actual_capture_pass,
                     plans=self.kda_cuda_graph_route_plans,
                 ):
                     self.backend.capture_one(
