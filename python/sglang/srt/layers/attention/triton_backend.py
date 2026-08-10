@@ -1014,8 +1014,10 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 # Non-unified SWA pool: out_cache_loc is physical-full; the
                 # static full->swa mapping applies (upstream-verbatim).
-                swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+                swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
                 )
 
         # Unified pool full-attention WRITE loc: ALREADY PHYSICAL (rebound at
@@ -1366,12 +1368,21 @@ class TritonAttnBackend(AttentionBackend):
             pool = self.token_to_kv_pool
             cache_loc = forward_batch.out_cache_loc
             if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
-                cache_loc = pool.translate_loc_from_full_to_swa(cache_loc)
-            # Unified pool: `cache_loc` (= forward_batch.out_cache_loc) is
-            # ALREADY in the kernel-facing id space — rebound once at
-            # ForwardBatch construction (apply_unified_kv_loc_rebind).
-            # Translating it again here would gather through v2p with
-            # kernel-facing ids as if virtual: silent wrong-slot reads.
+                if forward_batch.swa_out_cache_loc is not None:
+                    # Unified pool: `out_cache_loc` is ALREADY kernel-facing
+                    # FULL-side (rebound once at ForwardBatch construction);
+                    # running the full->swa map on it would re-translate a
+                    # kernel-facing id as if virtual — silent wrong slots.
+                    # The swa rail was computed from the still-VIRTUAL loc at
+                    # rebind time; consume it.
+                    cache_loc = forward_batch.swa_out_cache_loc
+                else:
+                    cache_loc = pool.translate_loc_from_full_to_swa(cache_loc)
+            # Direct row indexing assumes the per-layer buffers are 3-D
+            # token-major: true for the static pools and the unified DENSE
+            # views (where `cache_loc` is a dense id). The strided 4-D
+            # envelope views cannot serve this path — dense mode is what
+            # makes cross-layer KV reads work under the unified pool.
             k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
             k = k_buffer[cache_loc]
             v = v_buffer[cache_loc]

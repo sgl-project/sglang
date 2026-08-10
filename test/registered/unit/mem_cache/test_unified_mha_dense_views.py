@@ -40,12 +40,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
-import os
 import unittest
 from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.page_major import (
     build_dense_mha_views,
     build_page_major_mha_views,
@@ -128,9 +128,7 @@ class TestMHADenseSpecSurface(unittest.TestCase):
         for ps in (1, 4):
             row = spec.k_row_bytes()
             for l in range(_L):
-                self.assertEqual(
-                    spec.layer_k_offset_in_page(l, ps), (2 * l) * ps * row
-                )
+                self.assertEqual(spec.layer_k_offset_in_page(l, ps), (2 * l) * ps * row)
                 self.assertEqual(
                     spec.layer_v_offset_in_page(l, ps), (2 * l + 1) * ps * row
                 )
@@ -313,8 +311,7 @@ class TestUnifiedKVPoolDenseDispatch(unittest.TestCase):
         swa = _swa_spec()
         with self.assertRaises(AssertionError):
             UnifiedKVPool(
-                total_bytes=full.entry_bytes() * _N_FULL
-                + swa.entry_bytes() * _N_SWA,
+                total_bytes=full.entry_bytes() * _N_FULL + swa.entry_bytes() * _N_SWA,
                 sub_pool_specs=[full, swa],
                 device=_DEV,
                 enable_memory_saver=False,
@@ -391,13 +388,17 @@ class TestUnifiedDenseMHATokenToKVPool(unittest.TestCase):
         moves. Red if the override is lost (inherited move_kv_cache_native
         would apply physical ids to the dense row space)."""
         ps = 4
-        dense_kv, strided_kv, dense_pool, strided_pool = (
-            _make_dense_and_strided_twins(ps)
+        dense_kv, strided_kv, dense_pool, strided_pool = _make_dense_and_strided_twins(
+            ps
         )
         # Seed identical distinguishable content in both raw buffers.
-        seed = torch.arange(
-            dense_kv._raw.numel() - dense_kv.view_tail_pad_bytes, dtype=torch.float32
-        ) % 251
+        seed = (
+            torch.arange(
+                dense_kv._raw.numel() - dense_kv.view_tail_pad_bytes,
+                dtype=torch.float32,
+            )
+            % 251
+        )
         dense_kv._raw[: seed.numel()] = seed.to(torch.uint8)
         strided_kv._raw[: seed.numel()] = seed.to(torch.uint8)
         # Move pages 5,6 -> 2,3 as page-major token runs (the compaction shape).
@@ -439,17 +440,103 @@ class TestUnifiedDenseMHATokenToKVPool(unittest.TestCase):
         """SGLANG_USE_HND_KVCACHE=1 used to flip the inherited env-driven
         layout selector under the unified pools, silently mis-indexing the
         envelope; the pinned kv_cache_layout label must win for BOTH modes."""
-        os.environ["SGLANG_USE_HND_KVCACHE"] = "1"
-        try:
+        with envs.SGLANG_USE_HND_KVCACHE.override(True):
             _, _, dense_pool, strided_pool = _make_dense_and_strided_twins(1)
             self.assertFalse(dense_pool.use_hnd)
             self.assertFalse(strided_pool.use_hnd)
             self.assertEqual(dense_pool.kv_cache_layout, "page_major_dense")
-            self.assertEqual(
-                strided_pool.kv_cache_layout, "page_major_layer_major"
-            )
-        finally:
-            del os.environ["SGLANG_USE_HND_KVCACHE"]
+            self.assertEqual(strided_pool.kv_cache_layout, "page_major_layer_major")
+
+
+class TestFactoryDenseFlip(unittest.TestCase):
+    """The real SWA factory flips dense on for uniform-row specs, the env
+    escape hatch forces strided, and the rebind emits the matching
+    kernel-facing id spaces — full-dense loc plus swa-dense rail, both derived
+    from the STILL-VIRTUAL ids."""
+
+    # _swa_factory geometry: L_full = L_swa = 2, uniform 8/8 dims, ps = 1.
+    FULL_MULT = 4  # 2 * L_full
+    SWA_MULT = 4  # 2 * L_swa
+
+    def _bundle(self):
+        # Self-contained tiny SWA-factory bundle (L_full = L_swa = 2, uniform
+        # 8/8 dims, ps = 1) — small enough that dense views build on CPU.
+        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+
+        return init_unified_swa_pools(
+            device="cpu",
+            kv_cache_dtype=torch.float16,
+            head_num=2,
+            head_dim=8,
+            v_head_dim=8,
+            swa_head_num=2,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
+            page_size=1,
+            start_layer=0,
+            end_layer=4,
+            swa_attention_layer_ids=[1, 3],
+            full_attention_layer_ids=[0, 2],
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=32,
+            enable_memory_saver=False,
+            need_sort=False,
+        )
+
+    def test_factory_builds_dense_with_multipliers(self):
+        b = self._bundle()
+        pool = b.unified_memory_pool
+        self.assertTrue(pool.is_dense_mha("full"))
+        self.assertTrue(pool.is_dense_mha("swa"))
+        alloc = b.token_to_kv_pool_allocator
+        self.assertEqual(alloc.kernel_page_multiplier, self.FULL_MULT)
+        self.assertEqual(alloc.swa_kernel_page_multiplier, self.SWA_MULT)
+        # Sub-pools are the dense class exposing stock 3-D per-layer views.
+        self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 3)
+        self.assertEqual(b.token_to_kv_pool.swa_kv_pool.k_buffer[0].dim(), 3)
+        self.assertGreater(pool.view_tail_pad_bytes, 0)
+
+    def test_env_escape_forces_strided(self):
+        with envs.SGLANG_FORCE_STRIDED_UNIFIED_MHA.override(True):
+            b = self._bundle()
+        pool = b.unified_memory_pool
+        self.assertFalse(pool.is_dense_mha("full"))
+        self.assertFalse(pool.is_dense_mha("swa"))
+        alloc = b.token_to_kv_pool_allocator
+        self.assertEqual(alloc.kernel_page_multiplier, 1)
+        self.assertEqual(alloc.swa_kernel_page_multiplier, 1)
+        self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 4)
+
+    def test_rebind_emits_dense_rails_from_virtual(self):
+        """End-to-end over the real factory: apply_unified_kv_loc_rebind must
+        rebind out_cache_loc to FULL-DENSE ids and fill the swa rail with
+        SWA-DENSE ids — the swa formula over the VIRTUAL ids proves the
+        order-critical rule (a rail computed after the rebind would gather
+        v2p_swa at full-dense ids: garbage)."""
+        from sglang.srt.model_executor.forward_batch_info import (
+            apply_unified_kv_loc_rebind,
+        )
+
+        b = self._bundle()
+        alloc = b.token_to_kv_pool_allocator
+        v = alloc.alloc(4)
+        self.assertIsNotNone(v)
+        expected_full = alloc.full_v2p_page_table[v] * self.FULL_MULT  # ps=1
+        expected_swa = (alloc.swa_v2p_page_table[v] * self.SWA_MULT).to(torch.int32)
+        fb = SimpleNamespace(
+            out_cache_loc=v.clone(),
+            swa_out_cache_loc=None,
+            out_cache_loc_is_physical=False,
+            _unified_kv_loc_translate=None,
+        )
+        runner = SimpleNamespace(
+            token_to_kv_pool_allocator=alloc,
+            token_to_kv_pool=b.token_to_kv_pool,
+        )
+        apply_unified_kv_loc_rebind(fb, runner)
+        self.assertTrue(fb.out_cache_loc_is_physical)
+        self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
+        self.assertTrue(torch.equal(fb.swa_out_cache_loc, expected_swa))
 
 
 if __name__ == "__main__":

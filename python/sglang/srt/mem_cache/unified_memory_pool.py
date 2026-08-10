@@ -232,6 +232,21 @@ class MambaSubPoolSpec(SubPoolSpec):
 # ---------------------------------------------------------------------------
 
 
+def unified_dense_mha_enabled(*specs: MHASubPoolSpec) -> bool:
+    """ONE decision for "do the MHA/SWA sub-pools get dense views?".
+
+    The factories derive everything from it (view kind, pool class,
+    kernel_page_multiplier, tail pad), and the server_args backend allow-list
+    must agree with it — it evaluates the same predicate through
+    `ModelConfig.has_asymmetric_kv` (uniform rows per sub-pool) plus the same
+    env escape hatch. Dense iff EVERY KV sub-pool has uniform rows and the
+    strided A/B escape is off.
+    """
+    if envs.SGLANG_FORCE_STRIDED_UNIFIED_MHA.get():
+        return False
+    return all(s.is_uniform_row() for s in specs)
+
+
 def _assert_dense_id_bound(*, sub_pool_name: str, n_dense: int) -> None:
     """Dense ids flow through int32 read-index buffers (flashinfer kv_indices,
     block tables, the canonical page tables); the multiplier-scaled id space
@@ -242,6 +257,8 @@ def _assert_dense_id_bound(*, sub_pool_name: str, n_dense: int) -> None:
         f"exceeding the int32 bound (2^31) that read-index buffers assume. "
         "Reduce max_total_num_tokens or the layer count."
     )
+
+
 class UnifiedKVPool:
     """One physical `uint8` byte buffer shared by 2 sub-pools, each exposing
     strided per-layer views. Allocators keep byte ranges disjoint; no usage tracking here.
@@ -1394,9 +1411,15 @@ def init_unified_mamba_pools(
         max_total_num_tokens * full_spec.entry_bytes()
         + max_mamba_cache_size * mamba_spec.entry_bytes()
     )
-    # Dense MLA views are per-layer shifted, so the last layer's view reaches one
-    # page envelope past the final page — allocation-only tail pad (~page bytes).
-    view_tail_pad_bytes = page_size * full_spec.entry_bytes() if use_mla_backend else 0
+    # Uniform-row MHA full sides get DENSE views (the MLA mechanism at 2L
+    # blocks/page), letting the stock paged backends read the pool; asymmetric
+    # rows or the A/B escape keep the strided Triton-only views.
+    dense_mha = (not use_mla_backend) and unified_dense_mha_enabled(full_spec)
+    # Dense views are per-block shifted, so the last view reaches one page
+    # envelope past the final page — allocation-only tail pad (~page bytes).
+    view_tail_pad_bytes = (
+        page_size * full_spec.entry_bytes() if (use_mla_backend or dense_mha) else 0
+    )
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, mamba_spec],
@@ -1404,6 +1427,7 @@ def init_unified_mamba_pools(
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
         view_tail_pad_bytes=view_tail_pad_bytes,
+        dense_mha_sub_pool_names=("full",) if dense_mha else (),
     )
     req_to_token_pool = UnifiedHybridReqToTokenPool(
         unified_buffer=shared_pool,
@@ -1431,7 +1455,10 @@ def init_unified_mamba_pools(
             page_size=page_size,
         )
     else:
-        unified_full_kv_pool = UnifiedMHATokenToKVPool(
+        mha_pool_cls = (
+            UnifiedDenseMHATokenToKVPool if dense_mha else UnifiedMHATokenToKVPool
+        )
+        unified_full_kv_pool = mha_pool_cls(
             unified_buffer=shared_pool,
             sub_pool_name="full",
             page_size=page_size,
@@ -1464,7 +1491,9 @@ def init_unified_mamba_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
         full_kernel_page_multiplier=(
-            len(full_attention_layer_ids) if use_mla_backend else 1
+            len(full_attention_layer_ids)
+            if use_mla_backend
+            else full_spec.dense_blocks_per_page() if dense_mha else 1
         ),
     )
 
@@ -1507,13 +1536,19 @@ def init_unified_mamba_pools(
     else:
         logger.info(
             "[unified-memory-pool]   full_layers=%d, mamba_layers=%d, head_num=%d, head_dim=%d, "
-            "page_size=%d, is_draft_worker=%s",
+            "page_size=%d, is_draft_worker=%s (%s)",
             len(full_attention_layer_ids),
             len(mamba_layer_ids),
             head_num,
             head_dim,
             page_size,
             is_draft_worker,
+            (
+                "dense views, kernel_page_multiplier=%d, view_tail_pad=%d B"
+                % (full_spec.dense_blocks_per_page(), view_tail_pad_bytes)
+                if dense_mha
+                else "strided views"
+            ),
         )
     logger.info(
         "[unified-memory-pool]   total_bytes=%d, max_total_num_tokens=%d, max_mamba_cache_size=%d, "
@@ -1589,14 +1624,24 @@ class UnifiedSWAKVPool(SWAKVPool):
         self.head_dim = full_spec.head_dim
         self.device = unified_buffer.device
 
-        self.full_kv_pool = UnifiedMHATokenToKVPool(
+        # Per-sub-pool view kind was decided at UnifiedKVPool construction
+        # (dense_mha_sub_pool_names); pick the matching pool class here. The
+        # factories keep full/swa coherent (both dense or both strided).
+        def _sub_pool_cls(name: str):
+            return (
+                UnifiedDenseMHATokenToKVPool
+                if unified_buffer.is_dense_mha(name)
+                else UnifiedMHATokenToKVPool
+            )
+
+        self.full_kv_pool = _sub_pool_cls("full")(
             unified_buffer=unified_buffer,
             sub_pool_name="full",
             page_size=page_size,
             start_layer=start_layer,
             end_layer=end_layer,
         )
-        self.swa_kv_pool = UnifiedMHATokenToKVPool(
+        self.swa_kv_pool = _sub_pool_cls("swa")(
             unified_buffer=unified_buffer,
             sub_pool_name="swa",
             page_size=page_size,
@@ -1870,12 +1915,21 @@ def init_unified_swa_pools(
         full_max_total_num_tokens * full_spec.entry_bytes()
         + swa_max_total_num_tokens * swa_spec.entry_bytes()
     )
+    # Uniform-row full AND swa sub-pools get DENSE views (kept coherent: the
+    # backend allow-list gates on has_asymmetric_kv, which spans both).
+    dense_mha = unified_dense_mha_enabled(full_spec, swa_spec)
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, swa_spec],
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        view_tail_pad_bytes=(
+            page_size * max(full_spec.entry_bytes(), swa_spec.entry_bytes())
+            if dense_mha
+            else 0
+        ),
+        dense_mha_sub_pool_names=("full", "swa") if dense_mha else (),
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,
@@ -1896,12 +1950,31 @@ def init_unified_swa_pools(
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
+        full_kernel_page_multiplier=(
+            full_spec.dense_blocks_per_page() if dense_mha else 1
+        ),
+        swa_kernel_page_multiplier=(
+            swa_spec.dense_blocks_per_page() if dense_mha else 1
+        ),
     )
 
     logger.info(
         "[unified-memory-pool] ============================================================"
     )
     logger.info("[unified-memory-pool] UNIFIED MEMORY POOL ENABLED -- path=SWA hybrid")
+    logger.info(
+        "[unified-memory-pool]   %s",
+        (
+            "dense views, kernel_page_multiplier full=%d swa=%d, view_tail_pad=%d B"
+            % (
+                full_spec.dense_blocks_per_page(),
+                swa_spec.dense_blocks_per_page(),
+                shared_pool.view_tail_pad_bytes,
+            )
+            if dense_mha
+            else "strided views"
+        ),
+    )
     logger.info(
         "[unified-memory-pool]   full_layers=%d, swa_layers=%d, head_num=%d, head_dim=%d, "
         "v_head_dim=%d, swa_head_num=%d, swa_head_dim=%d, swa_v_head_dim=%d, "
