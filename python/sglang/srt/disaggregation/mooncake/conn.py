@@ -1479,17 +1479,13 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
-                for src_ptr, dst_ptr, token_item_len in layers_params
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for pending in futures:
-                        pending.cancel()
-                    return status
-            return 0
+            return submit_transfer_calls(
+                executor,
+                [
+                    (process_layer, (src_ptr, dst_ptr, token_item_len))
+                    for (src_ptr, dst_ptr, token_item_len) in layers_params
+                ],
+            )
 
         transfer_blocks = []
         for src_ptr, dst_ptr, token_item_len in layers_params:

@@ -382,6 +382,74 @@ class TestExecutorDrain(unittest.TestCase):
             with self.assertRaises(ValueError):
                 drain_transfer_futures(futures)
 
+    def test_dcp_send_failure_waits_for_a_running_sibling(self):
+        # Per-call-site guard: send_kvcache_dcp's custom-mem-pool branch must
+        # route through submit_transfer_calls like the other send paths. An
+        # early return on the first failed layer would end the worker's room
+        # lease while a sibling layer is still writing into decode's pages.
+        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.enable_custom_mem_pool = True
+        mgr.kv_args = SimpleNamespace(
+            page_size=1, kv_data_ptrs=[0x1, 0x2], kv_layer_ids=[]
+        )
+        mgr.get_mla_kv_ptrs_with_pp = lambda src, dst: (src, dst, None)
+
+        sibling_running = threading.Event()
+        release_sibling = threading.Event()
+        returned = threading.Event()
+        result = []
+        FAILING_LAYER_PTR = 0x1
+
+        def transfer_data(session_id, blocks):
+            if blocks[0][0] == FAILING_LAYER_PTR:
+                # Fail only once the sibling layer is genuinely mid-write, so
+                # cancelling a still-pending future cannot pass this trivially.
+                sibling_running.wait(5)
+                return -1
+            sibling_running.set()
+            release_sibling.wait(5)
+            return 0
+
+        mgr._transfer_data = transfer_data
+        plan = SimpleNamespace(
+            src_token_indices=np.array([0]), dst_token_indices=np.array([0])
+        )
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.build_dcp_token_transfer_plan",
+            return_value=plan,
+        ), concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+
+            def send():
+                result.append(
+                    mgr.send_kvcache_dcp(
+                        "session",
+                        np.array([0], dtype=np.int32),
+                        [0x11, 0x22],
+                        np.array([0], dtype=np.int32),
+                        dcp_token_item_lens=[16, 16],
+                        dst_dcp_size=1,
+                        dst_dcp_rank=0,
+                        src_page_offset=0,
+                        decode_prefix_len=0,
+                        num_kv_tokens=1,
+                        executor=executor,
+                        dst_layer_ids=[],
+                    )
+                )
+                returned.set()
+
+            sender = threading.Thread(target=send)
+            sender.start()
+            self.assertTrue(sibling_running.wait(1))
+            self.assertFalse(
+                returned.wait(0.05), "returned while a sibling layer still ran"
+            )
+            release_sibling.set()
+            self.assertTrue(returned.wait(1))
+            sender.join()
+
+        self.assertEqual(result, [-1], "the failing layer status must be reported")
+
 
 class TestPrefillOwnership(unittest.TestCase):
     """The prefill's pages are the transfer source."""
