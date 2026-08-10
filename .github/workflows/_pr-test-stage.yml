@@ -156,6 +156,22 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 
+      # Before the warmups on purpose: those launch real servers, which would
+      # pull the same weights inside a step that is measuring compile time.
+      # Scheduled only for now -- per-commit suites reuse a small model set that
+      # stays warm on its own.
+      #
+      # 20 minutes, and whatever is left is the tests' problem again (the step
+      # never fails the job). At CI link speed that is already a lot of weights;
+      # a suite that cannot get through it is not short of budget, it is fetching
+      # something it should not be. Each run also leaves the cache warmer than it
+      # found it, so the steady state is an etag check.
+      - name: Ensure model cache
+        if: inputs.scheduled
+        timeout-minutes: 20
+        continue-on-error: true
+        run: python3 scripts/ci/cuda/ensure_model_cache.py --suite ${{ inputs.self_name }}
+
       - name: Warmup DeepGEMM JIT Compilation
         if: inputs.warmup_deep_gemm_models != ''
         timeout-minutes: ${{ fromJson(inputs.warmup_timeout_minutes) }}
