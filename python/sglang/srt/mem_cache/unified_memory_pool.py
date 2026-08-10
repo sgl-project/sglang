@@ -1649,18 +1649,31 @@ class UnifiedSWAKVPool(SWAKVPool):
         return  # no-op in shared mode (the swa-side v2p IS the mapping)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        """Virtual token ids -> swa-physical token ids (int32)."""
+        """Virtual token ids -> swa kernel-facing ids (int32; physical for
+        strided views, swa-DENSE for dense views).
+
+        Matches the composite allocator's method of the same name — including
+        its tombstone clamp, which this path previously lacked: a tombstoned
+        (-1) v2p_swa entry produced a NEGATIVE id that a captured graph would
+        read out of bounds. Both now route it to the reserved padding sink (0).
+        """
         assert self._swa_allocator is not None, (
             "UnifiedSWAKVPool.translate_loc_from_full_to_swa called before "
             "attach_allocators"
         )
+        # The swa side's dense scale (1x for strided views, 2*L_swa for dense
+        # views) — must match the composite allocator's method of the same name.
         ps = self._swa_allocator.page_size
+        mult = self._swa_allocator.kernel_page_multiplier
         if ps == 1:
-            return self._swa_allocator.virtual_to_physical[kv_indices].to(torch.int32)
+            result = self._swa_allocator.virtual_to_physical[kv_indices]
+            result = torch.clamp_min(result, 0) * mult
+            return result.to(torch.int32)
         virt_pages = kv_indices // ps
         offsets = kv_indices % ps
         swa_phys_pages = self._swa_allocator.virtual_to_physical[virt_pages]
-        return (swa_phys_pages * ps + offsets).to(torch.int32)
+        result = (swa_phys_pages * ps * mult + offsets).to(torch.int32)
+        return torch.clamp_min(result, 0)
 
     def get_state_buf_infos(self):
         return self.swa_kv_pool.get_contiguous_buf_infos()

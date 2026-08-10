@@ -955,13 +955,9 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         zeros32 = torch.zeros(4, dtype=torch.int32)
 
         def check():
+            self.assertTrue(torch.equal(allocator.translate_kv_loc(zeros64), zeros64))
             self.assertTrue(
-                torch.equal(allocator.translate_kv_loc(zeros64), zeros64)
-            )
-            self.assertTrue(
-                torch.equal(
-                    allocator.translate_loc_from_full_to_swa(zeros64), zeros32
-                )
+                torch.equal(allocator.translate_loc_from_full_to_swa(zeros64), zeros32)
             )
 
         check()
@@ -2554,6 +2550,114 @@ class TestO3FusedAllocBind(unittest.TestCase):
         for v, p in zip(v_pages.tolist(), expected.tolist()):
             self.assertEqual(int(sa.virtual_to_physical[v].item()), p)
             self.assertEqual(int(sa.physical_to_virtual[p].item()), v)
+
+
+class TestSWACompositeDenseSurface(unittest.TestCase):
+    """The SWA composite's dense (kernel-facing) id surface.
+
+    Presence of `translate_kv_loc_dense` / `full_v2p_page_table` is what flips
+    the dense-first probes (the write-loc rebind and the attention backends'
+    read hooks), and the `page_stride` scale in `translate_loc_from_full_to_swa`
+    is what carries the swa dense space. Everything must collapse
+    byte-identically at multiplier 1 — the strided arm every existing SWA model
+    runs — and follow `dense(t) = v2p[t//ps]*(ps*mult) + t%ps` otherwise.
+    """
+
+    PS = 4
+    FULL_L = 4
+    SWA_L = 2
+
+    def _build(self, full_mult=1, swa_mult=1):
+        full_spec = MHASubPoolSpec(
+            name="full",
+            layer_num=self.FULL_L,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.float16,
+            grow_direction="up",
+        )
+        swa_spec = MHASubPoolSpec(
+            name="swa",
+            layer_num=self.SWA_L,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.float16,
+            grow_direction="down",
+        )
+        n_full, n_swa = 64, 32  # tokens = 16 / 8 pages at PS=4
+        total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full_spec, swa_spec],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+        )
+        kvcache = _FakeUnifiedSWAKVPool(pool)
+        return UnifiedSWATokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=kvcache,
+            device=_DEV,
+            full_max_total_num_tokens=n_full,
+            swa_max_total_num_tokens=n_swa,
+            page_size=self.PS,
+            need_sort=False,
+            forward_stream=None,
+            full_kernel_page_multiplier=full_mult,
+            swa_kernel_page_multiplier=swa_mult,
+        )
+
+    def test_surface_collapses_at_multiplier_one(self):
+        """Strided-arm guard: with both multipliers 1, the new surface must be
+        byte-identical to the physical translate and expose the raw v2p
+        tables — a drift here silently changes every existing SWA model."""
+        a = self._build()
+        self.assertEqual(a.kernel_page_multiplier, 1)
+        self.assertEqual(a.swa_kernel_page_multiplier, 1)
+        self.assertIs(a.full_v2p_page_table, a.full_attn_allocator.virtual_to_physical)
+        self.assertIs(a.swa_v2p_page_table, a.swa_attn_allocator.virtual_to_physical)
+        v = a.alloc(2 * self.PS)
+        self.assertIsNotNone(v)
+        self.assertTrue(torch.equal(a.translate_kv_loc_dense(v), a.translate_kv_loc(v)))
+
+    def test_full_dense_translate_matches_formula(self):
+        mult = 2 * self.FULL_L
+        a = self._build(full_mult=mult)
+        v = a.alloc(3 * self.PS)
+        self.assertIsNotNone(v)
+        v2p = a.full_attn_allocator.virtual_to_physical
+        expected = v2p[v // self.PS] * (self.PS * mult) + v % self.PS
+        self.assertTrue(torch.equal(a.translate_kv_loc_dense(v), expected))
+        # The PHYSICAL translate must stay unscaled — compaction and the byte
+        # machinery depend on it staying in physical space.
+        phys = v2p[v // self.PS] * self.PS + v % self.PS
+        self.assertTrue(torch.equal(a.translate_kv_loc(v), phys))
+
+    def test_swa_translate_scales_page_stride(self):
+        mult = 2 * self.SWA_L
+        a = self._build(swa_mult=mult)
+        v = a.alloc(3 * self.PS)
+        self.assertIsNotNone(v)
+        v2p_swa = a.swa_attn_allocator.virtual_to_physical
+        expected = (v2p_swa[v // self.PS] * (self.PS * mult) + v % self.PS).to(
+            torch.int32
+        )
+        self.assertTrue(torch.equal(a.translate_loc_from_full_to_swa(v), expected))
+
+    def test_swa_dense_tombstone_still_lands_on_sink(self):
+        """The scaled stride must not break the tombstone clamp: a tombstoned
+        page's ids (v2p == -1 -> -stride + offset, negative for every in-page
+        offset) still land on the sink, never negative."""
+        mult = 2 * self.SWA_L
+        a = self._build(swa_mult=mult)
+        v = a.alloc(2 * self.PS)
+        self.assertIsNotNone(v)
+        tomb_page = int(v[0].item()) // self.PS
+        a.swa_attn_allocator.virtual_to_physical[tomb_page] = -1
+        got = a.translate_loc_from_full_to_swa(v)
+        self.assertTrue(bool((got >= 0).all().item()))
+        in_tomb = v // self.PS == tomb_page
+        self.assertTrue(bool((got[in_tomb] == 0).all().item()))
 
 
 if __name__ == "__main__":

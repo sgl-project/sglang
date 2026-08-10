@@ -2092,6 +2092,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
+        full_kernel_page_multiplier: int = 1,
+        swa_kernel_page_multiplier: int = 1,
     ):
         # Set _size_full / _size_swa BEFORE base init (read during it). STATIC
         # partition caps — the slot-conservation value the leak invariant expects.
@@ -2126,6 +2128,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
+            kernel_page_multiplier=full_kernel_page_multiplier,
         )
         self.swa_attn_allocator = MultiEndedAllocator(
             kvcache=kvcache.swa_kv_pool,
@@ -2137,6 +2140,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
+            kernel_page_multiplier=swa_kernel_page_multiplier,
         )
         self.full_attn_allocator.bind_peer(self.swa_attn_allocator)
         self.swa_attn_allocator.bind_peer(self.full_attn_allocator)
@@ -2323,31 +2327,77 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 f"{tuple(out.shape)} must match kv_indices shape "
                 f"{tuple(kv_indices.shape)}"
             )
+        # Dense-view scale: multiplier 1 (strided views) collapses to plain
+        # swa-physical ids; multiplier 2*L_swa (dense views) emits swa-DENSE
+        # ids (phys_page * page_size * multiplier + offset). int32 stays safe
+        # by construction: emitted ids are < the swa sub-pool's n_dense, which
+        # the pool asserts < 2^31 when building dense views.
+        #
         # Tombstone-safety clamp (mirrors the full-side clamp): tombstoned (-1)
         # v2p_swa entries must not reach `swa_k_buffer[-1]` (illegal under replay).
         # Clamp to 0 routes them to the reserved padding sink (slot 0).
-        if self.swa_attn_allocator.page_size == 1:
+        sa = self.swa_attn_allocator
+        mult = sa.kernel_page_multiplier
+        if sa.page_size == 1:
             if out is not None:
                 # Gather into a transient int64, then cast into out (`out.copy_`).
-                tmp = torch.index_select(
-                    self.swa_attn_allocator.virtual_to_physical, 0, kv_indices
-                )
-                tmp = torch.clamp_min(tmp, 0)
+                tmp = torch.index_select(sa.virtual_to_physical, 0, kv_indices)
+                tmp = torch.clamp_min(tmp, 0) * mult
                 out.copy_(tmp.to(torch.int32))
                 return out
-            result = self.swa_attn_allocator.virtual_to_physical[kv_indices]
-            result = torch.clamp_min(result, 0)
+            result = sa.virtual_to_physical[kv_indices]
+            result = torch.clamp_min(result, 0) * mult
             return result.to(torch.int32)
-        ps = self.swa_attn_allocator.page_size
+        ps = sa.page_size
+        page_stride = ps * mult
         virt_pages = kv_indices // ps
         offsets = kv_indices % ps
-        swa_phys_pages = self.swa_attn_allocator.virtual_to_physical[virt_pages]
-        result = (swa_phys_pages * ps + offsets).to(torch.int32)
+        swa_phys_pages = sa.virtual_to_physical[virt_pages]
+        result = (swa_phys_pages * page_stride + offsets).to(torch.int32)
         result = torch.clamp_min(result, 0)
         if out is not None:
             out.copy_(result)
             return out
         return result
+
+    # -- dense (kernel-facing) id surface --
+    #
+    # Mirrors the mamba composite: presence of `translate_kv_loc_dense` /
+    # `full_v2p_page_table` is what flips the dense-first probes in
+    # `apply_unified_kv_loc_rebind` and the attention backends. With both
+    # multipliers left at 1 (strided views) every entry point below collapses
+    # to the physical translate, byte-identical to the pre-dense composite.
+
+    @property
+    def kernel_page_multiplier(self) -> int:
+        return self.full_attn_allocator.kernel_page_multiplier
+
+    @property
+    def full_v2p_page_table(self) -> torch.Tensor:
+        """Page-level virtual->physical table of the full sub-pool; block-table
+        builders gather through this then scale by `kernel_page_multiplier`."""
+        return self.full_attn_allocator.virtual_to_physical
+
+    def translate_kv_loc_dense(
+        self,
+        loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids. Falls back
+        to the physical translate when `kernel_page_multiplier == 1` (strided)."""
+        return self.full_attn_allocator.translate_kv_loc_dense(loc, out=out)
+
+    @property
+    def swa_kernel_page_multiplier(self) -> int:
+        return self.swa_attn_allocator.kernel_page_multiplier
+
+    @property
+    def swa_v2p_page_table(self) -> torch.Tensor:
+        """Page-level virtual->physical table of the SWA sub-pool. The swa read
+        table is built DIRECTLY from virtual ids through this (never chained
+        through full-physical), scaled by `swa_kernel_page_multiplier`."""
+        return self.swa_attn_allocator.virtual_to_physical
 
     # -- alloc --
 
