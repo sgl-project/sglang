@@ -120,12 +120,36 @@ def test_tp_and_ulysses_admission_uses_tp_local_shapes():
             ulysses_size=4,
             ring_size=1,
         )
-    with pytest.raises(NotImplementedError):
+    # ring is implemented now: it splits rows, not heads, so it carries no
+    # head-divisibility constraint of its own
+    MiniMaxH3DiTModel._validate_sequence_parallel_config(
+        arch=arch,
+        tp_size=1,
+        ulysses_size=1,
+        ring_size=2,
+    )
+    MiniMaxH3DiTModel._validate_sequence_parallel_config(
+        arch=arch,
+        tp_size=1,
+        ulysses_size=8,
+        ring_size=2,
+    )
+    # what ring does constrain is the packed-sequence alignment, which has to
+    # divide by the *combined* degree because ring adds an outer row split on
+    # top of Ulysses's inner one
+    with pytest.raises(ValueError):
+        MiniMaxH3DiTModel._validate_sequence_parallel_config(
+            arch=arch,
+            tp_size=1,
+            ulysses_size=8,
+            ring_size=3,
+        )
+    with pytest.raises(ValueError):
         MiniMaxH3DiTModel._validate_sequence_parallel_config(
             arch=arch,
             tp_size=1,
             ulysses_size=1,
-            ring_size=2,
+            ring_size=0,
         )
 
 
@@ -223,7 +247,7 @@ def test_packed_qkv_exchange_preserves_rank_and_head_order(_):
         head_slice = slice(destination * 2, (destination + 1) * 2)
         return torch.cat((q[:, head_slice], k[:, head_slice], v[:, head_slice]), dim=-1)
 
-    def fake_all_to_all(actual):
+    def fake_all_to_all(actual, role=None):
         expected_input = torch.stack(
             [
                 packet(q_ranks[0], k_ranks[0], v_ranks[0], destination)

@@ -924,7 +924,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
-                model_runner.server_args.attention_backend,
+                model_runner.prefill_attention_backend_str,
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
@@ -962,12 +962,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         if (
-            getattr(model_runner, "dcp_size", 1) > 1
+            model_runner.ps.attn_dcp_size > 1
             and ret.out_cache_loc is not None
             and is_hip()
         ):
             ret.dcp_kv_mask = (
-                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
+                ret.positions % model_runner.ps.attn_dcp_size
+                == model_runner.ps.attn_dcp_rank
             )
 
         return ret

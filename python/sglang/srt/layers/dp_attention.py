@@ -27,7 +27,11 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import (
+    configured_attn_cp_size,
+    configured_moe_dp_size,
+    get_flags,
+)
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -979,11 +983,14 @@ def get_moe_cp_size() -> int:
 
 
 def is_enable_moe_cp_allgather() -> bool:
-    """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE."""
-    from sglang.srt.runtime_context import get_server_args
+    """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE.
 
-    sa = get_server_args()
-    return sa.attn_cp_size > sa.moe_dp_size
+    Reads the configured sizes, not the live groups: that very configuration makes
+    ``initialize_model_parallel`` alias ``_MOE_DP`` to ``_ATTN_CP``
+    (``parallel_state.py``), so the live sizes are equal and the comparison would
+    always be false.
+    """
+    return configured_attn_cp_size() > configured_moe_dp_size()
 
 
 def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
