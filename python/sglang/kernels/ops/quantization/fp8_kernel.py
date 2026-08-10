@@ -1256,6 +1256,55 @@ def get_w8a8_block_fp8_configs(
     return None
 
 
+@functools.lru_cache
+def get_w8a8_channelwise_fp8_configs(N: int, K: int) -> Optional[Dict[int, Any]]:
+    """
+    Return tuned Triton configurations for the per-token/per-channel w8a8 fp8
+    GEMM (`triton_scaled_mm`), for one weight shape on the current device.
+
+    The return value maps an irregular grid of token counts M to
+    `triton_scaled_mm` tile configs; the closest M in the grid should be picked
+    for a given batch. A null entry means CUTLASS was faster at that M, so the
+    grid keeps the point (to stop a neighbouring M snapping onto it) but the
+    caller must fall back. A missing file / shape likewise means "keep the
+    default".
+    """
+    # Skip config lookup during torch.compile to avoid non-Tensor ops (e.g. device name).
+    if torch._dynamo.is_compiling():
+        return None
+
+    device_name = get_device_name().replace(" ", "_")
+    json_file_name = (
+        f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8_channelwise.json"
+    )
+    config_file_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+    )
+    if not os.path.exists(config_file_path):
+        return None
+
+    with open(config_file_path) as f:
+        log_info_on_rank0(
+            logger,
+            f"Using configuration from {config_file_path} for W8A8 channelwise FP8 GEMM.",
+        )
+        return {int(key): val for key, val in json.load(f).items()}
+
+
+def get_w8a8_channelwise_fp8_config(N: int, K: int, M: int) -> Optional[Dict[str, int]]:
+    """Tuned `triton_scaled_mm` config for this GEMM, or None to keep the default.
+
+    N / K are the weight's output / contraction dims and M the token count. None
+    means no tuned config applies -- the caller keeps its existing kernel choice
+    -- either because this device / shape was never tuned, or the nearest tuned
+    M is a point where CUTLASS won. The caller gates on the feature flag.
+    """
+    configs = get_w8a8_channelwise_fp8_configs(N, K)
+    if not configs:
+        return None
+    return configs[min(configs.keys(), key=lambda x: abs(x - M))]
+
+
 def select_w8a8_block_fp8_matmul_kernel(M, N, META):
     return _w8a8_block_fp8_matmul
 
@@ -2117,6 +2166,8 @@ def triton_scaled_mm(
     block_size_n: int = 32,
     block_size_k: int = 32,
     use_heuristic=True,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
 ) -> torch.Tensor:
     M, K = input.shape
     N = weight.shape[1]
@@ -2156,13 +2207,22 @@ def triton_scaled_mm(
             tile_shape = (64, 128, 128)
         else:
             tile_shape = (128, 128, 128)
-
-    block_size_m, block_size_n, block_size_k = tile_shape
+        block_size_m, block_size_n, block_size_k = tile_shape
+    # else: use the block_size_{m,n,k} the caller passed (e.g. a tuned config).
 
     block_size_sa = 1 if has_scalar(scale_a) else block_size_m
     block_size_sb = 1 if has_scalar(scale_b) else block_size_n
 
     accumulator_dtype = tl.float32 if input.is_floating_point() else tl.int32
+
+    # num_warps / num_stages are triton.jit launch kwargs, and triton rejects an
+    # explicit None -- pass them only when the caller set them, so the default
+    # path keeps triton's own defaults.
+    launch_kwargs = {}
+    if num_warps is not None:
+        launch_kwargs["num_warps"] = num_warps
+    if num_stages is not None:
+        launch_kwargs["num_stages"] = num_stages
 
     # A = input, B = weight, C = result
     # A = M x K, B = K x N, C = M x N
@@ -2188,6 +2248,7 @@ def triton_scaled_mm(
         BLOCK_SIZE_K=block_size_k,
         BLOCK_SIZE_SCALE_A=block_size_sa,
         BLOCK_SIZE_SCALE_B=block_size_sb,
+        **launch_kwargs,
     )
 
     return result.to(out_dtype)
