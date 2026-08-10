@@ -1,6 +1,6 @@
 ---
 title: Nemotron3.5-Lightning
-description: "Deploy NVIDIA Nemotron 3.5 Lightning with SGLang — NVFP4 (W4A4) hybrid Mamba + MoE serving on a single H100, with reasoning, tool calling, and a tunable thinking budget."
+description: "Deploy NVIDIA Nemotron 3.5 Lightning with SGLang — NVFP4 hybrid Mamba + MoE serving on a single B200 or H100, with MTP / DFlash / DSpark speculative decoding, reasoning, tool calling, and a tunable thinking budget."
 tag: NEW
 ---
 
@@ -40,7 +40,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware + recipe to generate the launch command. One operating point is published today — **Balanced**, a single-H100 NVFP4 recipe suitable for typical multi-user serving. Use the Playground below to explore knobs beyond it.
+Pick your hardware + recipe to generate the launch command. Both **B200** and **H100** publish four single-GPU NVFP4 operating points: **Balanced** (no speculation) plus the three validated speculative decoders — **MTP**, **DFlash**, and **DSpark**. Use the Playground below to explore knobs beyond them.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/nvidia/nemotron-3.5-lightning.jsx";
@@ -58,9 +58,9 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**NVIDIA Nemotron 3.5 Lightning** is a hybrid reasoning LLM that interleaves Mamba sequence-modeling layers with Mixture-of-Experts feed-forward layers and standard self-attention, rather than a uniform "attention + MLP" transformer stack. It ships a post-training-quantized **NVFP4 (W4A4)** checkpoint that serves on a **single H100 80GB** at TP=1, and supports thinking-on / thinking-off modes plus structured tool calling.
+**NVIDIA Nemotron 3.5 Lightning** is a 30B-A3B hybrid reasoning LLM that interleaves Mamba sequence-modeling layers with Mixture-of-Experts feed-forward layers and standard self-attention, rather than a uniform "attention + MLP" transformer stack. It ships a post-training-quantized **NVFP4** checkpoint that serves on a **single B200 or H100 80GB** at TP=1, and supports thinking-on / thinking-off modes plus structured tool calling.
 
-The model is published as two checkpoints:
+The model is published as two checkpoints, plus two standalone speculative draft models:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -72,19 +72,31 @@ The model is published as two checkpoints:
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/nemotron-nano-3.5-ea2-W4A4-PTQ-20260723">nemotron-nano-3.5-ea2-W4A4-PTQ-20260723</a></strong></td>
-      <td style={{padding: "9px 12px"}}>NVFP4 (W4A4)</td>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4">NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4</a></strong></td>
+      <td style={{padding: "9px 12px"}}>NVFP4</td>
       <td style={{padding: "9px 12px"}}>Serving — the checkpoint this page deploys</td>
     </tr>
     <tr style={{background: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/nemotron-nano-3.5-ea2">nemotron-nano-3.5-ea2</a></strong></td>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16">NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16</a></strong></td>
       <td style={{padding: "9px 12px"}}>BF16</td>
       <td style={{padding: "9px 12px"}}>Full-precision accuracy reference</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/nemotron-3.5-dflash-w4a16-preview">nemotron-3.5-dflash-w4a16-preview</a></strong></td>
+      <td style={{padding: "9px 12px"}}>W4A16</td>
+      <td style={{padding: "9px 12px"}}>DFlash speculative draft model</td>
+    </tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/nemotron-3.5-dspark-w4a16-preview">nemotron-3.5-dspark-w4a16-preview</a></strong></td>
+      <td style={{padding: "9px 12px"}}>W4A16</td>
+      <td style={{padding: "9px 12px"}}>DSpark speculative draft model</td>
     </tr>
   </tbody>
 </table>
 
-**Resources:** [HuggingFace](https://huggingface.co/nvidia/nemotron-nano-3.5-ea2-W4A4-PTQ-20260723).
+MTP needs no separate download — the draft head is embedded in the target checkpoint.
+
+**Resources:** [HuggingFace](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4).
 
 ## 2. Configuration Tips
 
@@ -95,6 +107,10 @@ The model is published as two checkpoints:
 - **Hybrid Mamba memory pool.** This is a Mamba + attention hybrid, so GPU memory is split between the KV cache and the Mamba state pool. If concurrency is clamped lower than expected, or you hit a "not enough space for mamba cache" error, tune `--mamba-full-memory-ratio` (or pin `--max-mamba-cache-size`).
 
 - **Tool calling with reasoning on** requires `"force_nonempty_content": true` inside `chat_template_kwargs`. Without it, the server may not correctly surface both the reasoning trace and the tool-call output in the same response.
+
+- **DSpark requires `SGLANG_RAGGED_VERIFY_MODE=static` in the environment.** Without it, the ragged verification path picks its own mode and `--speculative-dspark-block-size` is not honored. The Deploy panel emits this as an inline environment variable on the DSpark cells.
+
+- **Platform backends differ.** B200 runs flashinfer attention *and* flashinfer Mamba with `--mamba-radix-cache-strategy no_buffer`, stochastic Mamba-cache rounding, and overlap scheduling off; H100 uses the platform-default attention path with `extra_buffer`. Don't cross-apply these — the Deploy panel already picks the right set per platform.
 
 ## 3. Advanced Usage
 
@@ -110,7 +126,7 @@ The model supports two modes — Reasoning ON (default) and Reasoning OFF, toggl
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
-MODEL = "nvidia/nemotron-nano-3.5-ea2-W4A4-PTQ-20260723"
+MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
 
 # Reasoning on (default)
 resp = client.chat.completions.create(
@@ -158,7 +174,7 @@ Enable the `qwen3_coder` tool-call parser (toggle **Tool Call Parser** in the **
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
-MODEL = "nvidia/nemotron-nano-3.5-ea2-W4A4-PTQ-20260723"
+MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
 
 TOOLS = [
     {
@@ -214,7 +230,7 @@ from typing import Any, Dict, List
 import openai
 from transformers import AutoTokenizer
 
-MODEL = "nvidia/nemotron-nano-3.5-ea2-W4A4-PTQ-20260723"
+MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
 
 
 class ThinkingBudgetClient:
@@ -285,3 +301,44 @@ Pending update...
 ```
 
 </Accordion>
+
+### 3.4 Speculative Decoding
+
+Three speculative decoders are validated for this model. Pick one in the **Deploy** panel's recipe selector, or layer one on top of the current cell from the **Speculative Decoding** card in the [Playground above](#playground).
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Decoder</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Draft source</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Shape</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>MTP</strong></td>
+      <td style={{padding: "9px 12px"}}>Embedded in the target checkpoint</td>
+      <td style={{padding: "9px 12px"}}>5 steps, top-k 1, 6 draft tokens</td>
+    </tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong>DFlash</strong></td>
+      <td style={{padding: "9px 12px"}}>Standalone W4A16 draft model</td>
+      <td style={{padding: "9px 12px"}}>Depth 5 &rarr; block/verify width 6</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>DSpark</strong></td>
+      <td style={{padding: "9px 12px"}}>Standalone W4A16 draft model</td>
+      <td style={{padding: "9px 12px"}}>Gamma 7 &rarr; verify width 8</td>
+    </tr>
+  </tbody>
+</table>
+
+**MTP** (Multi-Token Prediction) uses a small draft layer built into the model to guess several tokens ahead, which the model then verifies in one step. SGLang reaches that layer through its EAGLE path, so `--speculative-draft-model-path` points at the target checkpoint itself.
+
+**DFlash** does the same thing, but the guesses come from a separate draft model rather than a layer inside the model.
+
+**DSpark** also uses a separate draft model, but it proposes a whole block of tokens at once rather than one at a time. It requires `SGLANG_RAGGED_VERIFY_MODE=static` in the environment. The public draft checkpoint uses `sample_from_anchor=false` and works with static ragged verification without SPS or STS calibration tables.
+
+<Note>
+Measure acceptance length with **representative text prompts** at temperature 1. Random token IDs are useful for fixed-shape throughput measurements, but are not a valid stochastic draft-quality workload — they will understate acceptance for all three decoders.
+</Note>
