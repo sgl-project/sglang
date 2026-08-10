@@ -9,12 +9,59 @@ timeouts during actual tests when kernels need to be compiled on first use.
 Run this after clearing pre-built AITER kernels from the Docker image.
 """
 
+import argparse
 import os
 import sys
 import time
+from pathlib import Path
 
 # Ensure AITER is enabled
 os.environ["SGLANG_USE_AITER"] = "1"
+
+DSV4_CKTILE_MODULE = "module_gemm_a8w8_blockscale_bpreshuffle_cktile"
+
+
+def warmup_dsv4_cktile_module():
+    """Build the AITER CKTile module that DSV4 first-token inference requires."""
+    from aiter.jit.core import build_module, get_args_of_build, get_user_jit_dir
+
+    module_path = Path(get_user_jit_dir()) / f"{DSV4_CKTILE_MODULE}.so"
+    if module_path.is_file():
+        print(f"{DSV4_CKTILE_MODULE} already exists: {module_path}")
+        return
+
+    print(f"Building {DSV4_CKTILE_MODULE} outside the scheduler watchdog...")
+    start_time = time.time()
+    build_args = get_args_of_build(DSV4_CKTILE_MODULE)
+    build_module(
+        DSV4_CKTILE_MODULE,
+        build_args["srcs"],
+        build_args["flags_extra_cc"],
+        build_args["flags_extra_hip"],
+        build_args["blob_gen_cmd"],
+        build_args["extra_include"],
+        build_args["extra_ldflags"],
+        build_args["verbose"],
+        build_args["is_python_module"],
+        build_args["is_standalone"],
+        build_args["torch_exclude"],
+        build_args.get("third_party", []),
+        build_args.get("hipify", False),
+        flags_extra_hip_per_source=build_args.get(
+            "flags_extra_hip_per_source", {}
+        ),
+    )
+
+    if not module_path.is_file():
+        raise RuntimeError(
+            f"{DSV4_CKTILE_MODULE} build completed without producing {module_path}"
+        )
+
+    elapsed = time.time() - start_time
+    print(
+        f"{DSV4_CKTILE_MODULE} compiled successfully in {elapsed:.1f}s: "
+        f"{module_path}"
+    )
 
 
 def warmup_aiter_kernels():
@@ -148,4 +195,15 @@ def warmup_aiter_kernels():
 
 
 if __name__ == "__main__":
-    warmup_aiter_kernels()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dsv4-cktile-only",
+        action="store_true",
+        help="Only pre-build the CKTile GEMM module required by DSV4.",
+    )
+    args = parser.parse_args()
+
+    if args.dsv4_cktile_only:
+        warmup_dsv4_cktile_module()
+    else:
+        warmup_aiter_kernels()

@@ -1311,6 +1311,13 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
+      - name: Pre-build DSV4 AITER CKTile GEMM
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e GPU_ARCHS=gfx950 \
+            python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py --dsv4-cktile-only
+
       - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4, unified_kv_triton)
         timeout-minutes: 300
         run: |
@@ -1412,6 +1419,13 @@ jobs:
           # --skip-test-time-deps: GSM8K + send_one don't need lmms-eval / human-eval.
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Pre-build DSV4 AITER CKTile GEMM
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e GPU_ARCHS=gfx950 \
+            python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py --dsv4-cktile-only
 
       - name: Accuracy + MTP Accept Length Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 MTP, unified_kv_triton)
         timeout-minutes: 240
