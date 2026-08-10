@@ -852,9 +852,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 forward_batch.token_to_kv_pool = self.draft_runner_list[
                     step
                 ].token_to_kv_pool
-                self.draft_runner_list[step].attn_backend.init_forward_metadata(
-                    forward_batch
-                )
+                if not forward_batch.forward_mode.is_idle():
+                    # An idle round (DP attention: this rank has no requests) has nothing
+                    # to plan pre-pad. Avoid raising when seq_lens is empty here.
+                    self.draft_runner_list[step].attn_backend.init_forward_metadata(
+                        forward_batch
+                    )
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch
                 )
