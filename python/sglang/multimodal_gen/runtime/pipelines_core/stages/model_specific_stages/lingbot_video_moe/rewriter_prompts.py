@@ -296,3 +296,40 @@ IMAGE_STEP2_MAP = (
     "- Copy named entities verbatim into world_knowledge.\n"
     "- No actions, no timestamps, no camera-movement fields — this is a still image."
 )
+
+NEGATIVE_PRUNE = (
+    "You build a per-sample negative prompt for a video / image generation model.\n"
+    "\n"
+    "You are given (1) the INTENDED content — a structured caption describing what the user wants\n"
+    "(and optionally its first frame) — and (2) a DEFAULT NEGATIVE: a deliberately over-complete JSON\n"
+    "list of generic defects, written to cover many scenarios at once, so it INTENTIONALLY contains\n"
+    'mutually contradictory terms (both "static object with sudden jump" and "motion blur", both\n'
+    '"underexposed" and "overexposed").\n'
+    "\n"
+    "A negative prompt is a CFG anchor the model is pushed AWAY from, so it must NEVER contain\n"
+    "anything the intended content legitimately wants.\n"
+    "\n"
+    "TASK: produce a customized negative for THIS sample by DELETING any term that CONTRADICTS or\n"
+    "would SUPPRESS something the intended content legitimately wants. Keep everything else.\n"
+    "\n"
+    "RULES:\n"
+    "- DELETE ONLY. Keep the surviving terms verbatim, in the SAME JSON structure. Never add,\n"
+    "  reword, or merge.\n"
+    "- Delete a term only when it clearly clashes with the intended content. When in doubt, KEEP it.\n"
+    "- Judge every category against the intent. For example: wants shot cuts or montage removes\n"
+    '  "jump cuts" and "hard cut"; an intentionally still scene removes "static object with sudden\n'
+    '  jump"; deliberate motion blur or long exposure removes "motion blur"; a dark or night scene\n'
+    '  removes "underexposed" and "subject hidden in darkness"; a painting or cartoon by design\n'
+    '  removes the matching artistic_style terms; flickering neon by design removes "flickering".\n'
+    "- Removing a WHOLE category is rare and needs explicit evidence in the caption: drop all of\n"
+    "  physical_plausibility only for fantasy, surreal, dreamlike, magical or zero-gravity content,\n"
+    "  and all of artistic_style only when a non-photoreal style is requested. Ordinary cinematic,\n"
+    "  moody, sci-fi or live-action scenes keep both.\n"
+    '- NEVER delete defects no legitimate content wants: "low quality", "worst quality", "blurry",\n'
+    '  "jpeg artifacts", "low resolution", "pixelated", "text", "watermark", "logo", "subtitles",\n'
+    '  "pillarboxed", "side bars", "warping", "morphing".\n'
+    "\n"
+    "OUTPUT: return ONLY a valid JSON object in the SAME structure as the default negative, with the\n"
+    "contradicting terms removed from their category arrays. Strict parseable JSON — double quotes,\n"
+    "no trailing commas, no comments, no code fence, no text before or after the object."
+)

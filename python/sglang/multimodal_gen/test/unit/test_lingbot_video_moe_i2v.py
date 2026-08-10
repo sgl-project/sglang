@@ -30,6 +30,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
     refiner_stages as refiner_stages_module,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.auto_negative import (
+    LingBotVideoAutoNegativeStage,
+    prune_negative,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.i2v import (
     COND_LATENT_KEY,
     VLM_IMAGE_KEY,
@@ -550,17 +554,19 @@ def test_caption_parsing_tolerates_fences_and_prose():
     assert parse_caption('["not", "an", "object"]') is None
 
 
+class _FakeBackend:
+    def __init__(self, replies):
+        self.replies = replies
+        self.calls = []
+
+    def generate(self, text, image, use_lora):
+        self.calls.append((use_lora, image))
+        return self.replies.pop(0)
+
+
 def _rewrite_stage(replies):
     stage = object.__new__(LingBotVideoPromptRewriteStage)
-    stage.expand_model = "expand"
-    stage.map_model = "map"
-    stage.calls = []
-
-    def chat(model, text, image):
-        stage.calls.append((model, image))
-        return replies.pop(0)
-
-    stage._chat = chat
+    stage.backend = _FakeBackend(replies)
     return stage
 
 
@@ -571,17 +577,17 @@ def test_rewriting_replaces_the_prompt_with_a_compact_caption():
     stage.forward(batch, None)
 
     assert batch.prompt == '{"b":2,"a":1}'
-    assert [model for model, _ in stage.calls] == ["expand", "map"]
-    assert all(image is None for _, image in stage.calls)
+    # Only the mapping turn enables the adapter.
+    assert [use_lora for use_lora, _ in stage.backend.calls] == [False, True]
+    assert all(image is None for _, image in stage.backend.calls)
 
 
-def test_rewriting_keeps_the_prompt_when_no_caption_comes_back():
+def test_rewriting_refuses_to_fall_back_to_the_free_text_prompt():
     stage = _rewrite_stage(["expanded", "sorry, I cannot"])
     batch = SimpleNamespace(prompt="a red fox", num_frames=121, fps=24, image_path=None)
 
-    stage.forward(batch, None)
-
-    assert batch.prompt == "a red fox"
+    with pytest.raises(ValueError, match="structured caption"):
+        stage.forward(batch, None)
 
 
 def test_rewriting_leaves_a_structured_caption_alone():
@@ -592,7 +598,176 @@ def test_rewriting_leaves_a_structured_caption_alone():
     stage.forward(batch, None)
 
     assert batch.prompt == caption
-    assert stage.calls == []
+    assert stage.backend.calls == []
+
+
+_DEFAULT_NEGATIVE = {
+    "universal_negative": {
+        "visual_quality": ["low quality", "underexposed", "crushed blacks"],
+        "artistic_style": ["painting", "cartoon"],
+        "physical_plausibility": ["objects defying gravity"],
+        "temporal_and_motion_stability": ["motion blur", "warping"],
+    }
+}
+
+
+def test_auto_negative_keeps_the_default_order_and_drops_only_deletions():
+    pruned = {
+        "universal_negative": {
+            # Reordered, with an invented term the model must not be able to add.
+            "visual_quality": ["invented", "low quality"],
+            "artistic_style": ["painting", "cartoon"],
+            "physical_plausibility": ["objects defying gravity"],
+            "temporal_and_motion_stability": ["warping", "motion blur"],
+        }
+    }
+
+    out = prune_negative(_DEFAULT_NEGATIVE, pruned, "a bright meadow at noon")
+
+    assert out["universal_negative"]["visual_quality"] == ["low quality"]
+    assert out["universal_negative"]["temporal_and_motion_stability"] == [
+        "motion blur",
+        "warping",
+    ]
+
+
+def test_auto_negative_restores_a_block_the_caption_never_asked_to_drop():
+    emptied = {
+        "universal_negative": {"physical_plausibility": [], "artistic_style": []}
+    }
+
+    live_action = prune_negative(_DEFAULT_NEGATIVE, emptied, "a cinematic car chase")
+    assert live_action["universal_negative"]["physical_plausibility"] == [
+        "objects defying gravity"
+    ]
+    assert live_action["universal_negative"]["artistic_style"] == [
+        "painting",
+        "cartoon",
+    ]
+
+    surreal = prune_negative(
+        _DEFAULT_NEGATIVE, emptied, "a surreal dreamlike watercolor painting"
+    )
+    assert surreal["universal_negative"]["physical_plausibility"] == []
+    assert surreal["universal_negative"]["artistic_style"] == []
+
+
+def test_auto_negative_deletes_terms_the_caption_clearly_wants():
+    kept = {"universal_negative": dict(_DEFAULT_NEGATIVE["universal_negative"])}
+
+    out = prune_negative(
+        _DEFAULT_NEGATIVE, kept, "a moody night scene with deep shadows"
+    )
+
+    assert out["universal_negative"]["visual_quality"] == ["low quality"]
+
+
+def test_auto_negative_turns_dynamic_batching_off():
+    # A merged request carries one negative for several captions, so pruning it
+    # per request is only possible while merging is off.
+    config = LingBotVideoMoEPipelineConfig()
+    assert config.supports_dynamic_batching()
+
+    config.rewriter_auto_negative = True
+    assert not config.supports_dynamic_batching()
+
+
+def test_auto_negative_needs_a_rewriter_backend():
+    config = LingBotVideoMoEPipelineConfig()
+    config.check_pipeline_config()
+
+    config.rewriter_auto_negative = True
+    with pytest.raises(ValueError, match="rewriter_auto_negative"):
+        config.check_pipeline_config()
+
+    config.rewriter_url = "http://host:30000"
+    config.check_pipeline_config()
+
+    local = LingBotVideoMoEPipelineConfig()
+    local.rewriter_auto_negative = True
+    local.rewriter_model_path = "/models/base"
+    local.rewriter_adapter_path = "/models/adapter"
+    local.check_pipeline_config()
+
+
+@pytest.mark.parametrize(
+    "negative_prompt",
+    [
+        "blurry, low quality",
+        '{"universal_negative": []}',
+        '{"universal_negative": "bad"}',
+        '{"universal_negative": {"visual_quality": "not a list"}}',
+        '{"universal_negative": {"visual_quality": [1, 2]}}',
+    ],
+)
+def test_auto_negative_skips_a_negative_it_cannot_prune(negative_prompt):
+    # A request may send any string here, so an unprunable one is passed through
+    # rather than indexed as categories.
+    stage = object.__new__(LingBotVideoAutoNegativeStage)
+    stage.backend = _FakeBackend([])
+    batch = SimpleNamespace(
+        prompt='{"comprehensive_description": "a night scene"}',
+        negative_prompt=negative_prompt,
+        num_frames=121,
+        fps=24,
+        image_path=None,
+    )
+
+    stage.forward(batch, None)
+
+    assert batch.negative_prompt == negative_prompt
+    assert stage.backend.calls == []
+
+
+def test_auto_negative_hints_match_whole_words_only():
+    default = {
+        "universal_negative": {
+            "visual_quality": [
+                "low quality",
+                "underexposed",
+                "subject hidden in darkness",
+                "crushed blacks",
+            ]
+        }
+    }
+
+    def survivors(caption):
+        return prune_negative(default, default, caption)["universal_negative"][
+            "visual_quality"
+        ]
+
+    # "knight" contains "night" and "three-dimensional" contains "dim".
+    assert (
+        survivors("A knight in bright daylight")
+        == default["universal_negative"]["visual_quality"]
+    )
+    assert (
+        survivors("A bright three-dimensional sculpture")
+        == default["universal_negative"]["visual_quality"]
+    )
+
+    assert survivors("A dim night scene") == ["low quality"]
+    assert survivors("dimly lit room") == ["low quality"]
+    # Multi-word and hyphenated hints still match.
+    assert survivors("shot in low-light") == ["low quality"]
+    assert survivors("a low light interior") == ["low quality"]
+
+
+def test_auto_negative_leaves_a_free_text_negative_alone():
+    stage = object.__new__(LingBotVideoAutoNegativeStage)
+    stage.backend = _FakeBackend([])
+    batch = SimpleNamespace(
+        prompt='{"comprehensive_description": "a fox"}',
+        negative_prompt="blurry, low quality",
+        num_frames=121,
+        fps=24,
+        image_path=None,
+    )
+
+    stage.forward(batch, None)
+
+    assert batch.negative_prompt == "blurry, low quality"
+    assert stage.backend.calls == []
 
 
 def test_rewriting_is_off_until_a_server_is_configured():

@@ -29,13 +29,7 @@ Please refer to the [official SGLang-diffusion installation guide](/docs/sglang-
 sglang serve --model-path robbyant/lingbot-video-moe-30b-a3b
 ```
 
-The DiT uses layer-wise offload by default, so a single GPU is enough to bring the model up. If the GPU is still short on memory, move the text encoder out between stages:
-
-```bash Command
-sglang serve \
-  --model-path robbyant/lingbot-video-moe-30b-a3b \
-  --text-encoder-cpu-offload
-```
+One GPU is enough to bring the model up: the DiT is offloaded to CPU between uses by default, and the text encoder, image encoder, and VAE are offloaded layer by layer. `--performance-mode speed` keeps the DiT resident instead, which needs enough memory for all 30B parameters.
 
 Across multiple GPUs, sequence parallelism splits the joint video and text sequence:
 
@@ -64,18 +58,9 @@ The model is trained on structured JSON captions. A raw natural-language prompt 
 
 ### 4.1 Prompt rewriter
 
-Rather than writing the JSON by hand, point SGLang at the rewriter the model was released with. It runs in two turns: expand the free-text prompt into a detailed caption on the base VLM, then map that caption to JSON with the rewriter LoRA enabled. The weights are Qwen3.6-27B plus `robbyant/lingbot-video-rewriter-lora`, so this is a second model rather than part of the checkpoint — serve it separately and SGLang will call it over an OpenAI-compatible API.
+Rather than writing the JSON by hand, use the rewriter the model was released with. It runs in two turns: expand the free-text prompt into a detailed caption on the base VLM, then map that caption to JSON with the rewriter LoRA enabled. The weights are `Qwen/Qwen3.6-27B` plus `robbyant/lingbot-video-rewriter-lora`, a second model rather than part of the checkpoint.
 
-One SGLang server can cover both turns, selecting the adapter per request:
-
-```bash Command
-sglang serve \
-  --model-path Qwen/Qwen3.6-27B \
-  --lora-paths rewriter-lora=<path to lingbot-video-rewriter-lora> \
-  --port 30000
-```
-
-Then point the pipeline at it. `rewriter_url` has no CLI flag, so pass it in a config file:
+The rewriter has no CLI flags, so configure it in a config file:
 
 ```bash Command
 cat > /tmp/lingbot_rewriter.json <<'EOF'
@@ -83,16 +68,31 @@ cat > /tmp/lingbot_rewriter.json <<'EOF'
   "model_path": "robbyant/lingbot-video-moe-30b-a3b",
   "prompt": "A red fox trots across fresh snow in a pine forest.",
   "num_frames": 81,
-  "rewriter_url": "http://127.0.0.1:30000",
-  "rewriter_expand_model": "Qwen/Qwen3.6-27B",
-  "rewriter_map_model": "Qwen/Qwen3.6-27B:rewriter-lora"
+  "rewriter_model_path": "Qwen/Qwen3.6-27B",
+  "rewriter_adapter_path": "<path to lingbot-video-rewriter-lora>"
 }
 EOF
 
 sglang generate --config /tmp/lingbot_rewriter.json --save-output
 ```
 
-The `base:adapter` suffix on `rewriter_map_model` is what enables the LoRA for the mapping turn; a plain model name runs the base weights for both turns and produces a weaker caption without failing. Prompts that already start with `{` are passed through untouched, and if the mapping turn returns nothing parseable the original prompt is used. Leaving `rewriter_url` unset, which is the default, skips the stage.
+This loads the VLM in the diffusion process and switches the adapter between turns, which is what the reference implementation does. It holds roughly 54 GB in bf16 on top of the DiT, and it has no offload path, so give it its own GPUs through `rewriter_device_map` or use the served option below. Note that an under-provisioned VLM degrades quietly rather than failing.
+
+To serve the rewriter separately instead, set `rewriter_url` and name a model per turn:
+
+```json
+{
+  "rewriter_url": "http://127.0.0.1:30000",
+  "rewriter_expand_model": "Qwen/Qwen3.6-27B",
+  "rewriter_map_model": "lingbot-rewriter"
+}
+```
+
+The mapping turn needs the adapter applied. `--lora-paths` does not accept this adapter: `Qwen/Qwen3.6-27B` is a `qwen3_5`-architecture checkpoint whose attention projections SGLang loads fused, while the adapter targets them unfused through a regex. So serve a checkpoint with the adapter already merged in, as its own endpoint via `rewriter_map_url` when one server cannot hold both.
+
+Prompts that already start with `{` are passed through untouched. If the mapping turn returns nothing parseable the request fails rather than falling back to the free-text prompt, which the DiT would render as a broken video. Setting `rewriter_model_path` without `rewriter_adapter_path` is rejected at startup, since the mapping turn would otherwise silently run base weights. Leaving both `rewriter_url` and `rewriter_model_path` unset, the default, skips the stage.
+
+Set `"rewriter_auto_negative": true` to also prune the negative prompt per request, which requires one of the two backends above. The shipped negative is deliberately over-complete and self-contradictory, so terms this caption legitimately wants push the sample away from the request. The rewriter deletes those terms and keeps the rest verbatim; a few, such as `underexposed` for a night scene and `motion blur` for a long exposure, are also deleted by rule afterwards because the model tends to leave them in. Because a merged request carries one negative prompt for several captions, enabling this turns dynamic batching off for the server.
 
 ## 5. Generation
 
@@ -148,7 +148,7 @@ sglang serve \
   --pipeline-class-name LingBotVideoRefinerPipeline
 ```
 
-This keeps both sets of DiT weights resident, so it costs roughly twice the DiT memory of the single-pass pipeline. Defaults for the second pass are 1088x1920, 8 steps, guidance scale 3.0, flow shift 3.0, and `t_thresh` 0.85. The refiner is trained on video and rejects single-frame requests; serve the base pipeline for text-to-image.
+This loads a second set of DiT weights, so the checkpoint on disk and the peak memory both roughly double. Defaults for the second pass are 1088x1920, guidance scale 3.0, flow shift 3.0, and `t_thresh` 0.85. The step count is 8: `refiner_num_inference_steps` lays out a grid from which only the sigmas at or below `t_thresh` are kept, 6 at these defaults, and `refiner_sigma_tail_steps` appends 2 more at the low end. The refiner is trained on video and rejects single-frame requests; serve the base pipeline for text-to-image.
 
 ## 6. Benchmark
 
@@ -163,11 +163,12 @@ Both stacks ran the same caption, resolution, frame count, schedule, and seed, a
 
 | Stack | Parallelism | Denoise | Per step | End to end |
 | --- | --- | --- | --- | --- |
-| upstream diffusers | FSDP 8 | 409 s | 10.25 s | 469 s |
-| SGLang | `--tp-size 8` | 139 s | 3.47 s | - |
+| upstream diffusers | FSDP 8 | 409 s | 10.23 s | 469 s |
 | SGLang | `--ulysses-degree 8` | 73 s | 1.83 s | 175 s |
 
-The middle row shards weights on both sides, where SGLang denoises 2.9x faster. Sharding the sequence as well takes the denoise gap to 5.6x and end to end to 2.7x.
+SGLang denoises 5.6x faster and completes the request 2.7x faster. End to end covers text encoding, denoising, and VAE decode, so it closes less than denoise alone: both stacks decode the same 121 frames.
+
+The two rows shard differently, so for a weights-only comparison against upstream FSDP, SGLang `--tp-size 8` denoises the same workload in 139 s, 3.48 s per step — still 2.9x faster.
 
 Output matches the reference in subject, composition, and motion without being bit-identical: PSNR 20.7 dB and SSIM 0.82 on the luma plane. Switching only the sharding layout within SGLang moves the result by the same margin, so the difference is the bf16 reduction-order floor across 40 steps.
 
@@ -179,13 +180,15 @@ Other tasks, same hardware and schedule:
 | Image-to-video (121 frames) | `--tp-size 8` | 134 s | 4.7 s |
 | Refiner, both passes | `--ulysses-degree 8` + FSDP | 57 s + 100 s | 7.5 s |
 
+Tensor parallelism is the slower layout because the MoE experts are replicated on every rank rather than sharded: `--tp-size 8` splits the attention projections, but each rank still runs all 128 experts. Prefer sequence parallelism, and use tensor parallelism for image-to-video, where sequence parallelism is unavailable.
+
 ### 6.1 Recommended configuration
 
 On 8 GPUs:
 
 - Text-to-video and text-to-image: `--ulysses-degree 8`.
 - Image-to-video: `--tp-size 8`. Sequence parallelism is rejected for image conditioning, so tensor parallelism is the way to shard.
-- Refiner: `--ulysses-degree 8 --use-fsdp-inference true --vae-tiling true`. Sequence parallelism alone leaves both DiTs fully resident on every GPU, and the second pass then runs out of memory upscaling 121 frames to 1088x1920.
+- Refiner: `--ulysses-degree 8 --use-fsdp-inference true`. Sequence parallelism replicates both sets of DiT weights on every GPU; FSDP shards them, which is what keeps the second pass inside memory at 1088x1920. The refiner tiles the VAE for its own decode and re-encode regardless of `--vae-tiling`.
 
 ## 7. Notes
 

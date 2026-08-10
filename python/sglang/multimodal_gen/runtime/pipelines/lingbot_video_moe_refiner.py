@@ -23,14 +23,14 @@ class LingBotVideoRefinerPipeline(LingBotVideoPipeline):
 
     pipeline_name = "LingBotVideoRefinerPipeline"
 
-    _required_config_modules = (
+    _required_config_modules = [
         "text_encoder",
         "processor",
         "vae",
         "transformer",
         "transformer_2",
         "scheduler",
-    )
+    ]
 
     _refiner_subfolder = "refiner"
 

@@ -57,18 +57,42 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
     refiner_flow_shift: float = 3.0
     refiner_t_thresh: float = 0.85
     refiner_sigma_tail_steps: int = 2
+    # Prompt rewriter, off unless a URL or a local base model is configured.
     rewriter_url: str | None = None
+    # The mapping turn can live on a second endpoint when one server cannot hold
+    # both the base weights and the adapter.
+    rewriter_map_url: str | None = None
     rewriter_expand_model: str = "lingbot-rewriter-base"
     rewriter_map_model: str = "lingbot-rewriter-lora"
     rewriter_timeout: float = 300.0
+    rewriter_model_path: str | None = None
+    rewriter_adapter_path: str | None = None
+    rewriter_device_map: str = "auto"
+    rewriter_max_new_tokens: int = 6144
+    rewriter_auto_negative: bool = False
 
     def __post_init__(self):
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
 
+    def check_pipeline_config(self) -> None:
+        super().check_pipeline_config()
+        if self.rewriter_auto_negative and not self.has_rewriter:
+            raise ValueError(
+                "rewriter_auto_negative needs a rewriter backend: set rewriter_url "
+                "to serve one, or rewriter_model_path and rewriter_adapter_path to "
+                "load it in this process."
+            )
+
+    @property
+    def has_rewriter(self) -> bool:
+        return self.rewriter_url is not None or self.rewriter_model_path is not None
+
     def supports_dynamic_batching(self) -> bool:
-        # The scheduler already keeps image requests out of batches, so TI2V can batch.
-        return True
+        # The scheduler already keeps image requests out of batches, so TI2V can
+        # batch. Auto-negative is the exception: a merged request carries one
+        # negative prompt for several captions, which cannot be pruned per request.
+        return not self.rewriter_auto_negative
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # torch.compile is left opt-in: the fp32-pinned norms and the per-block

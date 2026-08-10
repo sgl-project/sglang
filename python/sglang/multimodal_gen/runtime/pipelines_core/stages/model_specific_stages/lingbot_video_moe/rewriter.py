@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import base64
-import io
 import json
 import re
 
 import PIL.Image
-import requests
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -20,10 +17,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     VIDEO_STEP2_MAP,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
-
-logger = init_logger(__name__)
 
 _CJK = re.compile(r"[　-〿㐀-䶿一-鿿＀-￯]")
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
@@ -78,19 +72,27 @@ def needs_rewrite(prompt: str) -> bool:
     return not prompt.lstrip().startswith("{")
 
 
+def condition_image(batch: Req) -> PIL.Image.Image:
+    """The condition frame as a PIL image, loading it if the stage runs first."""
+
+    image = batch.condition_image
+    if isinstance(image, list):
+        image = image[0]
+    if not isinstance(image, PIL.Image.Image):
+        image = load_image(batch.image_path)
+    return image.convert("RGB")
+
+
 class LingBotVideoPromptRewriteStage(PipelineStage):
     """Expand a plain prompt into the structured caption the DiT was trained on.
 
-    Two turns against one OpenAI-compatible endpoint: expand without the rewriter
-    adapter, then map that expansion to JSON with the adapter enabled.
+    Two turns against the rewriter backend: expand without the rewriter adapter,
+    then map that expansion to JSON with the adapter enabled.
     """
 
-    def __init__(self, url: str, expand_model: str, map_model: str, timeout: float):
+    def __init__(self, backend):
         super().__init__()
-        self.url = url.rstrip("/")
-        self.expand_model = expand_model
-        self.map_model = map_model
-        self.timeout = timeout
+        self.backend = backend
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -104,55 +106,29 @@ class LingBotVideoPromptRewriteStage(PipelineStage):
 
         mode = resolve_mode(batch)
         duration = max(1, round(int(batch.num_frames) / max(int(batch.fps), 1)))
-        image = self._condition_image(batch) if mode == "ti2v" else None
+        image = condition_image(batch) if mode == "ti2v" else None
         rewritten = [self._rewrite(p, mode, duration, image) for p in prompts]
 
         batch.prompt = rewritten if batched else rewritten[0]
         return batch
 
-    def _rewrite(self, prompt: str, mode: str, duration: int, image: str | None) -> str:
+    def _rewrite(
+        self, prompt: str, mode: str, duration: int, image: PIL.Image.Image | None
+    ) -> str:
         if not needs_rewrite(prompt):
             return prompt
-        detailed = self._chat(
-            self.expand_model, build_expand_prompt(mode, prompt, duration), image
+        detailed = self.backend.generate(
+            build_expand_prompt(mode, prompt, duration), image, use_lora=False
         )
-        raw = self._chat(
-            self.map_model, build_map_prompt(mode, detailed, duration), image
+        raw = self.backend.generate(
+            build_map_prompt(mode, detailed, duration), image, use_lora=True
         )
         caption = parse_caption(raw)
         if caption is None:
-            logger.warning(
-                "Prompt rewriting returned no usable caption, keeping the original prompt"
+            # Falling back to the plain prompt would denoise out of distribution
+            # and emit a broken video rather than fail.
+            raise ValueError(
+                "Prompt rewriting produced no parseable structured caption. "
+                "Pass a structured JSON caption directly, or check the rewriter backend."
             )
-            return prompt
         return json.dumps(caption, ensure_ascii=False, separators=(",", ":"))
-
-    @staticmethod
-    def _condition_image(batch: Req) -> str:
-        image = batch.condition_image
-        if isinstance(image, list):
-            image = image[0]
-        if not isinstance(image, PIL.Image.Image):
-            image = load_image(batch.image_path)
-        buffer = io.BytesIO()
-        image.convert("RGB").save(buffer, format="PNG")
-        encoded = base64.b64encode(buffer.getvalue()).decode()
-        return f"data:image/png;base64,{encoded}"
-
-    def _chat(self, model: str, text: str, image: str | None) -> str:
-        content: list[dict] = [{"type": "text", "text": text}]
-        if image is not None:
-            content.insert(0, {"type": "image_url", "image_url": {"url": image}})
-        response = requests.post(
-            f"{self.url}/v1/chat/completions",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": content}],
-                "temperature": 0.0,
-                # The mapping turn must answer with JSON and nothing else.
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()

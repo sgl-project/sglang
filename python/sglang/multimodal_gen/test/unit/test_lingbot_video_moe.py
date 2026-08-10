@@ -39,6 +39,17 @@ from sglang.multimodal_gen.runtime.pipelines.lingbot_video_moe import (
     LingBotVideoPipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.auto_negative import (
+    LingBotVideoAutoNegativeStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter import (
+    LingBotVideoPromptRewriteStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter_backends import (
+    HTTPRewriterBackend,
+    TransformersRewriterBackend,
+    build_rewriter_backend,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     PROMPT_TEMPLATE,
     LingBotVideoTextEncodingStage,
@@ -444,26 +455,86 @@ def test_single_output_requests_are_left_unsplit():
     assert params.expand_video_request_outputs_for_queue(batch) == [batch]
 
 
-def test_pipeline_stages_skip_the_rewriter_when_no_url_is_configured(monkeypatch):
-    # add_stage_if evaluates its argument eagerly, so the guard has to come first.
-    def refuse(*args, **kwargs):
-        raise AssertionError("the rewriter stage must not be constructed")
+def test_rewriter_backend_is_off_until_a_url_or_local_model_is_set():
+    config = LingBotVideoMoEPipelineConfig()
+    assert build_rewriter_backend(config) is None
 
-    monkeypatch.setattr(
-        pipeline_lingbot_video_moe, "LingBotVideoPromptRewriteStage", refuse
-    )
+    config.rewriter_url = "http://host:30000"
+    assert isinstance(build_rewriter_backend(config), HTTPRewriterBackend)
+
+    local = LingBotVideoMoEPipelineConfig()
+    local.rewriter_model_path = "/models/base"
+    with pytest.raises(ValueError, match="rewriter_adapter_path"):
+        build_rewriter_backend(local)
+
+    local.rewriter_adapter_path = "/models/adapter"
+    assert isinstance(build_rewriter_backend(local), TransformersRewriterBackend)
+
+
+def _added_stages(**config_overrides) -> list:
+    config = LingBotVideoMoEPipelineConfig()
+    for name, value in config_overrides.items():
+        setattr(config, name, value)
     added = []
     pipeline = object.__new__(LingBotVideoPipeline)
-    pipeline.add_stage = lambda stage, *a, **k: added.append(type(stage).__name__)
+    pipeline.add_stage = lambda stage, *a, **k: added.append(stage)
     pipeline.get_module = lambda name, default=None: SimpleNamespace(
         modules=lambda: iter(())
     )
     pipeline.add_standard_latent_preparation_stage = lambda *a, **k: None
     pipeline.add_standard_timestep_preparation_stage = lambda *a, **k: None
     pipeline.add_standard_decoding_stage = lambda *a, **k: None
-    config = LingBotVideoMoEPipelineConfig()
-    assert config.rewriter_url is None
 
     pipeline.create_pipeline_stages(SimpleNamespace(pipeline_config=config))
+    return added
+
+
+def _added_stage_names(**config_overrides) -> list[str]:
+    return [type(stage).__name__ for stage in _added_stages(**config_overrides)]
+
+
+def test_pipeline_skips_the_rewriter_stages_by_default(monkeypatch):
+    # add_stage_if evaluates its argument eagerly, so the guard has to come first.
+    def refuse(*args, **kwargs):
+        raise AssertionError("the rewriter stages must not be constructed")
+
+    monkeypatch.setattr(
+        pipeline_lingbot_video_moe, "LingBotVideoPromptRewriteStage", refuse
+    )
+    monkeypatch.setattr(
+        pipeline_lingbot_video_moe, "LingBotVideoAutoNegativeStage", refuse
+    )
+    assert LingBotVideoMoEPipelineConfig().rewriter_url is None
+
+    added = _added_stage_names()
 
     assert "InputValidationStage" in added
+
+
+def test_auto_negative_follows_the_rewriter_only_when_asked():
+    served = dict(rewriter_url="http://host:30000")
+
+    assert "LingBotVideoPromptRewriteStage" in _added_stage_names(**served)
+    assert "LingBotVideoAutoNegativeStage" not in _added_stage_names(**served)
+
+    both = _added_stage_names(**served, rewriter_auto_negative=True)
+    assert both.index("LingBotVideoAutoNegativeStage") == (
+        both.index("LingBotVideoPromptRewriteStage") + 1
+    )
+
+
+def test_rewriter_stages_share_one_backend():
+    stages = _added_stages(
+        rewriter_model_path="/models/base",
+        rewriter_adapter_path="/models/adapter",
+        rewriter_auto_negative=True,
+    )
+
+    backends = {
+        id(stage.backend)
+        for stage in stages
+        if isinstance(
+            stage, (LingBotVideoPromptRewriteStage, LingBotVideoAutoNegativeStage)
+        )
+    }
+    assert len(backends) == 1

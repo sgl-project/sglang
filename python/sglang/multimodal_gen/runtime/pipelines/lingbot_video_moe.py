@@ -6,10 +6,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
+    LingBotVideoAutoNegativeStage,
     LingBotVideoDenoisingStage,
     LingBotVideoImageConditioningStage,
     LingBotVideoPromptRewriteStage,
     LingBotVideoTextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter_backends import (
+    build_rewriter_backend,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -27,26 +31,23 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "LingBotVideoPipeline"
     is_video_pipeline = True
 
-    _required_config_modules = (
+    _required_config_modules = [
         "text_encoder",
         "processor",
         "vae",
         "transformer",
         "scheduler",
-    )
+    ]
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
         config = server_args.pipeline_config
-        if config.rewriter_url is not None:
-            self.add_stage(
-                LingBotVideoPromptRewriteStage(
-                    url=config.rewriter_url,
-                    expand_model=config.rewriter_expand_model,
-                    map_model=config.rewriter_map_model,
-                    timeout=config.rewriter_timeout,
-                ),
-            )
+        # One backend for both stages, so an in-process rewriter loads once.
+        rewriter_backend = build_rewriter_backend(config)
+        if rewriter_backend is not None:
+            self.add_stage(LingBotVideoPromptRewriteStage(backend=rewriter_backend))
+            if config.rewriter_auto_negative:
+                self.add_stage(LingBotVideoAutoNegativeStage(backend=rewriter_backend))
         # Must precede text encoding, which reads the condition frame.
         self.add_stage(
             LingBotVideoImageConditioningStage(vae=self.get_module("vae")),
