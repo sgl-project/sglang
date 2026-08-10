@@ -62,13 +62,17 @@ class TestEnsureRemoteCodeAllowed(CustomTestCase):
         )
 
     def test_refuses_model_file_without_trust(self):
-        _make_checkpoint(self.dir, {"model_type": "onyx", "model_file": "evil.py"})
+        _make_checkpoint(
+            self.dir, {"model_type": "muse_glimmer_text", "model_file": "evil.py"}
+        )
         with self.assertRaisesRegex(RemoteCodeGateError, "--trust-remote-code"):
             ensure_remote_code_allowed(self.dir, trust_remote_code=False)
         self._assert_sentinel_not_executed()
 
     def test_allows_model_file_with_trust(self):
-        _make_checkpoint(self.dir, {"model_type": "onyx", "model_file": "evil.py"})
+        _make_checkpoint(
+            self.dir, {"model_type": "muse_glimmer_text", "model_file": "evil.py"}
+        )
         ensure_remote_code_allowed(self.dir, trust_remote_code=True)
         # The gate itself never imports the file either way.
         self._assert_sentinel_not_executed()
@@ -94,7 +98,7 @@ class TestEnsureRemoteCodeAllowed(CustomTestCase):
     def test_missing_model_file_target_rejected(self):
         _make_checkpoint(
             self.dir,
-            {"model_type": "onyx", "model_file": "nope.py"},
+            {"model_type": "muse_glimmer_text", "model_file": "nope.py"},
             with_sentinel=False,
         )
         with self.assertRaisesRegex(RemoteCodeGateError, "does not exist"):
@@ -103,7 +107,7 @@ class TestEnsureRemoteCodeAllowed(CustomTestCase):
     def test_absolute_model_file_rejected(self):
         _make_checkpoint(
             self.dir,
-            {"model_type": "onyx", "model_file": "/etc/anything.py"},
+            {"model_type": "muse_glimmer_text", "model_file": "/etc/anything.py"},
             with_sentinel=False,
         )
         with self.assertRaisesRegex(RemoteCodeGateError, "relative path"):
@@ -112,7 +116,7 @@ class TestEnsureRemoteCodeAllowed(CustomTestCase):
     def test_traversal_model_file_rejected(self):
         _make_checkpoint(
             self.dir,
-            {"model_type": "onyx", "model_file": "../outside.py"},
+            {"model_type": "muse_glimmer_text", "model_file": "../outside.py"},
             with_sentinel=False,
         )
         with self.assertRaisesRegex(RemoteCodeGateError, "relative path"):
@@ -121,7 +125,7 @@ class TestEnsureRemoteCodeAllowed(CustomTestCase):
     def test_non_string_model_file_rejected(self):
         _make_checkpoint(
             self.dir,
-            {"model_type": "onyx", "model_file": 42},
+            {"model_type": "muse_glimmer_text", "model_file": 42},
             with_sentinel=False,
         )
         with self.assertRaisesRegex(RemoteCodeGateError, "non-string"):
@@ -146,7 +150,9 @@ class TestModelRunnerGateWiring(CustomTestCase):
     def test_refusal_precedes_loader_call(self):
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
-        _make_checkpoint(self.dir, {"model_type": "onyx", "model_file": "evil.py"})
+        _make_checkpoint(
+            self.dir, {"model_type": "muse_glimmer_text", "model_file": "evil.py"}
+        )
         with patch(
             "sglang.srt.hardware_backend.mlx.model_runner.mlx_lm_load"
         ) as loader:
@@ -158,7 +164,9 @@ class TestModelRunnerGateWiring(CustomTestCase):
     def test_trusted_load_uses_resolved_directory(self):
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
-        _make_checkpoint(self.dir, {"model_type": "onyx", "model_file": "evil.py"})
+        _make_checkpoint(
+            self.dir, {"model_type": "muse_glimmer_text", "model_file": "evil.py"}
+        )
         with patch(
             "sglang.srt.hardware_backend.mlx.model_runner.mlx_lm_load",
             side_effect=self._StopInit,

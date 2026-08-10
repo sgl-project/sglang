@@ -143,7 +143,7 @@ def _rc_weights(args):
 class TestFlattenRcConfig(CustomTestCase):
     def test_field_mapping_and_conversions(self):
         flat = flatten_rc_config({"text_config": dict(_RC_TEXT_CONFIG)})
-        self.assertEqual(flat["model_type"], "onyx")
+        self.assertEqual(flat["model_type"], "muse_glimmer_text")
         # RC qk_scale_factor is against SDPA's 1/sqrt(head_dim).
         self.assertAlmostEqual(flat["qk_scale_factor"], 0.5 * 4**0.5)
         self.assertEqual(flat["output_soft_cap_temp"], 20.0)

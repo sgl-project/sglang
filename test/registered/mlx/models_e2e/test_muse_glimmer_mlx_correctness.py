@@ -16,7 +16,7 @@ banded-mask paths end to end. Two guards:
    chunkings.
 
 The artifact is weight-derived and private: its path comes exclusively from the
-``SGLANG_MLX_TEST_ONYX_ARTIFACT`` environment variable and the whole module SKIPS
+``SGLANG_MLX_TEST_MUSE_GLIMMER_ARTIFACT`` environment variable and the whole module SKIPS
 cleanly when it is unset or missing — CI has no dependency on private
 assets. Window-engagement prompt lengths are derived from the artifact's
 own config, so the suite also runs against tiny packaged fixtures.
@@ -52,7 +52,7 @@ _HAS_MLX = (
     and importlib.util.find_spec("mlx_lm") is not None
 )
 
-ARTIFACT = os.environ.get("SGLANG_MLX_TEST_ONYX_ARTIFACT")
+ARTIFACT = os.environ.get("SGLANG_MLX_TEST_MUSE_GLIMMER_ARTIFACT")
 MEM_FRACTION_STATIC = os.environ.get("SGLANG_MLX_TEST_MEM_FRACTION", "0.85")
 MIN_FREE_GB = float(os.environ.get("SGLANG_MLX_TEST_MIN_FREE_GB", "20"))
 MAX_NEW_TOKENS = 32
@@ -63,7 +63,7 @@ def _artifact_or_skip() -> Path:
         raise unittest.SkipTest("requires mlx + mlx_lm (Apple Silicon only)")
     if not ARTIFACT:
         raise unittest.SkipTest(
-            "SGLANG_MLX_TEST_ONYX_ARTIFACT is not set; the Muse Glimmer artifact is private "
+            "SGLANG_MLX_TEST_MUSE_GLIMMER_ARTIFACT is not set; the Muse Glimmer artifact is private "
             "and must be supplied via the environment"
         )
     path = Path(ARTIFACT).expanduser()

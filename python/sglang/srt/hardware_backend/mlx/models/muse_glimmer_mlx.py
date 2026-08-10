@@ -116,7 +116,7 @@ from mlx_lm.models.base import (
 from mlx_lm.models.cache import KVCache
 
 # Version of the packaged (fused/folded) weight layout this file understands.
-ONYX_MLX_FORMAT_VERSION = 1
+MUSE_GLIMMER_MLX_FORMAT_VERSION = 1
 
 # The four per-layer norms whose checkpoint weight is an offset from 1.0.
 # model.norm (MuseGlimmerFinalRMSNorm) is NOT in this list and must not be offset.
@@ -191,7 +191,7 @@ def flatten_rc_config(config: dict) -> dict:
     layer_rope_theta = text.get("layer_rope_theta")
 
     flat = {
-        "model_type": "onyx",
+        "model_type": "muse_glimmer_text",
         "hidden_size": text["hidden_size"],
         "num_hidden_layers": text["num_hidden_layers"],
         "num_attention_heads": text["num_attention_heads"],
@@ -218,7 +218,7 @@ def flatten_rc_config(config: dict) -> dict:
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "onyx"
+    model_type: str = "muse_glimmer_text"
     hidden_size: int = 6656
     num_hidden_layers: int = 52
     num_attention_heads: int = 32
@@ -321,11 +321,11 @@ class ModelArgs(BaseModelArgs):
                 )
 
         if self.onyx_mlx_format is not None and (
-            self.onyx_mlx_format != ONYX_MLX_FORMAT_VERSION
+            self.onyx_mlx_format != MUSE_GLIMMER_MLX_FORMAT_VERSION
         ):
             raise ValueError(
                 f"onyx_mlx_format {self.onyx_mlx_format} is not supported by "
-                f"this model file (expected {ONYX_MLX_FORMAT_VERSION}); "
+                f"this model file (expected {MUSE_GLIMMER_MLX_FORMAT_VERSION}); "
                 "regenerate the artifact with a matching packager"
             )
 
@@ -611,7 +611,7 @@ class Model(nn.Module):
         return keys
 
     def sanitize(self, weights: dict) -> dict:
-        if self.args.onyx_mlx_format == ONYX_MLX_FORMAT_VERSION:
+        if self.args.onyx_mlx_format == MUSE_GLIMMER_MLX_FORMAT_VERSION:
             # Packaged artifact: weights are already fused/folded.  A raw-only
             # key here means the marker was stamped on the wrong directory.
             stray = sorted(
@@ -622,7 +622,7 @@ class Model(nn.Module):
             if stray:
                 raise ValueError(
                     "config.json claims a packaged Muse Glimmer MLX artifact "
-                    f"(onyx_mlx_format={ONYX_MLX_FORMAT_VERSION}) but the "
+                    f"(onyx_mlx_format={MUSE_GLIMMER_MLX_FORMAT_VERSION}) but the "
                     f"weights contain raw-checkpoint keys {stray[:4]}"
                     f"{'...' if len(stray) > 4 else ''}; the marker belongs "
                     "on packaged artifacts only — repackage from the raw HF export"
@@ -650,7 +650,7 @@ class Model(nn.Module):
                 hint = (
                     " (weights look already fused: if this is a packaged "
                     'artifact, its config.json must carry "onyx_mlx_format": '
-                    f"{ONYX_MLX_FORMAT_VERSION})"
+                    f"{MUSE_GLIMMER_MLX_FORMAT_VERSION})"
                 )
             raise ValueError(
                 "not a complete raw Muse Glimmer HF checkpoint: "
@@ -676,7 +676,7 @@ class Model(nn.Module):
                 f"raw q_proj.weight has shape {raw_q_shape}, expected "
                 f"({H * D}, {hidden}); a width of {2 * H * D} means the gate "
                 "is already fused — such artifacts must carry "
-                f'"onyx_mlx_format": {ONYX_MLX_FORMAT_VERSION} in config.json'
+                f'"onyx_mlx_format": {MUSE_GLIMMER_MLX_FORMAT_VERSION} in config.json'
             )
 
         new_weights = {}
