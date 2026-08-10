@@ -134,29 +134,105 @@ cleanup_stale_shm() {
 }
 
 install_apt_packages() {
-    apt-get update || true
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
+        build-essential cmake rdma-core infiniband-diags perftest libibumad3
         libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
+        libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
-    apt-get install -y --no-install-recommends "${CI_APT_PACKAGES[@]}" || {
-        echo "Warning: apt-get install failed, checking if required packages are available..."
-        for pkg in "${CI_APT_PACKAGES[@]}"; do
-            if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
-                echo "ERROR: Required package $pkg is not installed and apt-get failed"
+
+    # The images bake these in, so the usual run pays apt-get update's round
+    # trips to install nothing. Skipping it costs no currency either: apt-get
+    # install only ever considers the packages named above, and a passing run
+    # leaves 100+ others un-upgraded - the image is what pins these versions.
+    local pkg
+    local -a MISSING_APT_PACKAGES=()
+    for pkg in "${CI_APT_PACKAGES[@]}"; do
+        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || MISSING_APT_PACKAGES+=("$pkg")
+    done
+
+    if [ ${#MISSING_APT_PACKAGES[@]} -eq 0 ]; then
+        echo "All required apt packages are already installed, skipping apt-get"
+    else
+        echo "Installing missing apt packages: ${MISSING_APT_PACKAGES[*]}"
+        apt-get update || true
+        apt-get install -y --no-install-recommends "${MISSING_APT_PACKAGES[@]}" || {
+            echo "ERROR: apt-get failed to install: ${MISSING_APT_PACKAGES[*]}"
+            exit 1
+        }
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_gdrcopy() {
+    # DeepEP tests only run on 4+ GPU hosts. Keep GDRCopy in the shared CUDA
+    # bootstrap while avoiding a DKMS/package build on the 1- and 2-GPU jobs.
+    local gpu_count=0
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        gpu_count=$(
+            (nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true) |
+                awk 'NF {count++} END {print count + 0}'
+        )
+    fi
+    if [ "${gpu_count}" -lt 4 ]; then
+        echo "Skipping GDRCopy install on ${gpu_count}-GPU runner"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    if ldconfig -p 2>/dev/null | grep 'libgdrapi\.so' >/dev/null; then
+        echo "GDRCopy userspace library is already installed"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    local gdrcopy_root=/opt/gdrcopy
+    local gdrcopy_version=2.5.1
+    local -a gdrcopy_packages=(
+        nvidia-dkms-580 devscripts debhelper fakeroot dkms
+        check libsubunit0 libsubunit-dev python3-venv
+    )
+
+    apt-get update || true
+    apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
+        echo "Warning: apt-get failed while installing GDRCopy build dependencies; checking installed packages"
+        local package
+        for package in "${gdrcopy_packages[@]}"; do
+            if ! dpkg -l "${package}" 2>/dev/null | grep -q '^ii'; then
+                echo "ERROR: Required GDRCopy package ${package} is unavailable"
                 exit 1
             fi
         done
-        echo "All required packages are already installed, continuing..."
     }
+
+    rm -rf "${gdrcopy_root}"
+    git clone --branch "v${gdrcopy_version}" --depth 1 \
+        https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}"
+    (
+        cd "${gdrcopy_root}/packages"
+        CUDA=/usr/local/cuda ./build-deb-packages.sh
+        dpkg -i gdrdrv-dkms_*.deb
+        dpkg -i libgdrapi_*.deb
+        dpkg -i gdrcopy-tests_*.deb
+        dpkg -i gdrcopy_*.deb
+    )
+
+    local lib_path="/usr/lib/${ARCH}-linux-gnu"
+    if [ ! -e "${lib_path}/libmlx5.so" ] && [ -e "${lib_path}/libmlx5.so.1" ]; then
+        ln -s "${lib_path}/libmlx5.so.1" "${lib_path}/libmlx5.so"
+    fi
+    ldconfig
 
     mark_step_done "${FUNCNAME[0]}"
 }
 
 clean_site_packages() {
-    # Clear torch compilation cache
-    python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
+    # The torch compilation cache is deliberately NOT wiped here: entries are
+    # content-hash addressed so stale ones are never reused, and hosts packing
+    # several runners share one cache mount - a wipe unlinks files a concurrent
+    # job is compiling against.
 
     # Remove broken dist-info directories (missing METADATA per PEP 376)
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
@@ -237,6 +313,11 @@ setup_pip_toolchain() {
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
     PIP_UNINSTALL_CMD="uv pip uninstall"
     PIP_UNINSTALL_SUFFIX=""
+
+    # Remove both the legacy source distribution and the SGLang wheel before
+    # resolving the pyproject pin. They own the same deep_ep module files, so
+    # leaving either installed can make pip preserve a mixed installation.
+    $PIP_UNINSTALL_CMD deep-ep sgl-deep-ep $PIP_UNINSTALL_SUFFIX || true
 
     # sglang-kernel stays: install_sglang_kernel version-gates and reinstalls it.
     $PIP_UNINSTALL_CMD sgl-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
@@ -326,6 +407,46 @@ uninstall_stale_flashinfer() {
     [ "$UNINSTALL_JIT_CACHE" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache"
     $PIP_UNINSTALL_CMD $FLASHINFER_UNINSTALL $PIP_UNINSTALL_SUFFIX || true
     $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_pytorch_stack() {
+    PYTORCH_SPECS=()
+    for package in torch torchaudio torchvision torchao torchcodec; do
+        spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
+        if [ -n "$spec" ]; then
+            PYTORCH_SPECS+=("$spec")
+        fi
+    done
+
+    $PIP_CMD install \
+        "${PYTORCH_SPECS[@]}" \
+        --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_cuda12_deepep_wheel() {
+    if [ "$CU_MAJOR" = "13" ]; then
+        echo "CUDA 13 uses the public sgl-deep-ep wheel declared in python/pyproject.toml"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    local version
+    version=$(grep -Po -m1 '"sgl-deep-ep==\K[^"]+' python/pyproject.toml || true)
+    if [ -z "$version" ]; then
+        echo "ERROR: python/pyproject.toml must pin sgl-deep-ep"
+        exit 1
+    fi
+
+    # CUDA 12 wheels intentionally live only on the SGLang wheel index. Their
+    # local version satisfies the public-version pyproject pin, so the later
+    # editable SGLang install keeps this CUDA-matched wheel.
+    $PIP_CMD install "sgl-deep-ep==${version}+${CU_VERSION}" \
+        --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" \
+        --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -446,43 +567,6 @@ install_sglang_kernel() {
             echo "Please re-run the full workflow using /tag-and-rerun-ci to rebuild the kernel."
             exit 1
         fi
-    fi
-
-    # Reinstall torch with matching CUDA version if needed
-    # TODO: Remove after torch 2.11 where cu13 is enabled by default
-    REINSTALL_TORCH=false
-    if TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')" 2>&1); then
-        echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
-    else
-        TORCH_IMPORT_ERROR="${TORCH_CUDA_VER}"
-        TORCH_CUDA_VER=""
-        echo "WARNING: importing torch failed while probing CUDA version; force-reinstalling torch packages."
-        printf '%s\n' "${TORCH_IMPORT_ERROR}"
-        REINSTALL_TORCH=true
-    fi
-    TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
-        REINSTALL_TORCH=true
-    else
-        for cuda_ver in "${TORCHAUDIO_CUDA_VER}" "${TORCHVISION_CUDA_VER}"; do
-            if [ -n "${cuda_ver}" ] && [ "${cuda_ver}" != "${CU_VERSION}" ]; then
-                REINSTALL_TORCH=true
-                break
-            fi
-        done
-    fi
-    if [ "${REINSTALL_TORCH}" = true ]; then
-        TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        if [ -z "${TORCH_VER}" ] || [ -z "${TORCHAUDIO_VER}" ] || [ -z "${TORCHVISION_VER}" ]; then
-            echo "ERROR: could not determine installed torch package versions before reinstall."
-            pip show torch torchaudio torchvision || true
-            exit 1
-        fi
-        echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
-        $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
 
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
@@ -707,6 +791,8 @@ verify_imports() {
     SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
 import torch
 print(torch.version.cuda)
+import deep_ep
+print(f"deep_ep loads from {deep_ep.__file__}")
 import cutlass
 import cutlass.cute
 
@@ -751,12 +837,15 @@ main() {
     kill_existing_processes
     cleanup_stale_shm
     install_apt_packages
+    install_gdrcopy
     clean_site_packages
     setup_cargo_cache
     require_prebuilt_rust_exts
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
+    install_pytorch_stack
+    install_cuda12_deepep_wheel
     install_sglang
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.

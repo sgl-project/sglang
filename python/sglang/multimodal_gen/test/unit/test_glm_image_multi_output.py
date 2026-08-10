@@ -30,7 +30,7 @@ class _RecordingGlmImageAR(GlmImageAR):
     def generate_prior_tokens(self, **kwargs):
         self.initial_seeds.append(torch.initial_seed())
         output_idx = len(self.initial_seeds)
-        return torch.full((1, 4), output_idx, dtype=torch.long), None
+        return torch.full((1, 4), output_idx, dtype=torch.long), None, None
 
 
 class _DummySchedulerConfig(dict):
@@ -105,6 +105,7 @@ def test_ar_stage_generates_one_prior_per_requested_output():
         image_path=None,
         num_outputs_per_prompt=2,
         seed=11,
+        extra={},
     )
 
     with patch.object(
