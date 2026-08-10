@@ -25,7 +25,7 @@ from sglang.kernels.ops.moe.inkling_moe import (
     post_reorder,
     pre_reorder,
     select_grouped_gemm_block_m,
-    silu_and_mul_helion,
+    silu_and_mul,
 )
 from sglang.kernels.ops.moe.sigmoid_gate_topk_renorm import (
     sigmoid_gate_topk_renorm,
@@ -572,7 +572,7 @@ def activation(
                 *gateup_output.shape[:-1], gateup_output.shape[-1] // 2, dtype=out_dtype
             )
 
-        return silu_and_mul_helion(
+        return silu_and_mul(
             gateup_output, topk_weights, out_dtype, use_interleaved=use_interleaved
         )
     raise ValueError(f"Unsupported activation: {activation_type}")
