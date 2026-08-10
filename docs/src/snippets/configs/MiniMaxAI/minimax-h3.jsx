@@ -1,9 +1,9 @@
 // MiniMax-H3 diffusion deployment matrix. Consumed by _deployment.jsx.
 //
-// The mode, quantization, and encoder choices are deployment overlays because
-// they do not change which base hardware topology fits. Request sampling
-// controls remain in the generated cURL instead of being mixed into this
-// deployment matrix.
+// Checkpoint and request-mode choices stay in the picker because they determine
+// the model partition and generated cURL. Orthogonal runtime features such as
+// attention, quantization, and encoder scheduling live in the cookbook recipes
+// instead of multiplying the deployment matrix.
 // Hardware/profile cells remain deliberately small and carry an honest
 // verification state for the exact platform, rather than inheriting a result
 // measured on a different GPU.
@@ -128,74 +128,6 @@ export const config = {
         },
       ],
     },
-    {
-      id: "quant",
-      title: "Online Quantization",
-      default: "bf16",
-      showWhen: (s) => ["b200", "b300"].includes(s.hw),
-      options: [
-        { id: "bf16", label: "Off — Native BF16/FP32" },
-        {
-          id: "fp8",
-          label: "FP8 — Approximate",
-          showWhen: (s) => ["b200", "b300"].includes(s.hw),
-          disabled: (s) => s.profile !== "resident",
-          disableReason:
-            "The documented FP8 operating point keeps the transformer resident; FSDP combinations have not been validated.",
-          flags: ["--quantization fp8"],
-          hints: [
-            "Online FP8 is approximate. Validate both video and audio quality;",
-            "verified B200 and B300 runs reduced memory; re-benchmark latency on the target workload.",
-          ],
-        },
-      ],
-    },
-    {
-      id: "encoder",
-      title: "Text Encoder Parallel",
-      default: "auto",
-      options: [
-        {
-          id: "auto",
-          label: "Auto (recommended)",
-          hints: [
-            "Auto uses folding for the single-request recipes below and can",
-            "select data parallel encoding for a compatible TP1 request batch.",
-          ],
-        },
-        {
-          id: "fold",
-          label: "Fold (single-request)",
-          flags: ["--encoder-parallel fold"],
-          hints: [
-            "Fold shards the resident Qwen3-VL encoder across the replica and is",
-            "best suited to single-node GPUs with fast peer-to-peer links.",
-          ],
-        },
-        {
-          id: "dp",
-          label: "DP (batched throughput)",
-          disabled: (s) =>
-            s.hw === "rtx5090" ||
-            (s.hw === "h100" && s.profile === "resident"),
-          disableReason:
-            "Encoder DP requires TP1 and DiT DP1; this verified recipe uses TP2.",
-          flags: [
-            "--encoder-parallel dp",
-            "--batching-max-size {{BATCHING_MAX_SIZE}}",
-          ],
-          hints: [
-            "DP distributes a compatible multi-request text batch across ranks;",
-            "it does not improve a batch of one and replicates encoder weights.",
-          ],
-        },
-        {
-          id: "replicate",
-          label: "Replicate (compatibility)",
-          flags: ["--encoder-parallel replicate"],
-        },
-      ],
-    },
   ],
 
   modelNames: {
@@ -237,11 +169,6 @@ export const config = {
       target: "curl",
       label: "Outputs per prompt (1-10)",
       default: "1",
-    },
-    BATCHING_MAX_SIZE: {
-      target: "command",
-      label: "Maximum request batch size",
-      default: "2",
     },
     DURATION_SECONDS: {
       target: "curl",

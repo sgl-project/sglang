@@ -168,15 +168,22 @@ html.dark table tbody tr:nth-child(even) td,
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  margin: -1.5rem 0 0;
+  margin: 8px 0 30px;
 }
 
 .sgd-model-tags .sgd-chip {
   margin: 0;
+  padding: 4px 9px;
+  border: 0;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.4;
 }
 
 .sgd-model-tags + h2 {
-  margin-top: 0.75rem;
+  margin-top: 0;
 }
 
 .prose:has(.sgd-model-tags) {
@@ -217,6 +224,13 @@ html.dark .sgd-chip,
   border-color: rgba(251, 146, 60, 0.3);
   background: rgba(251, 146, 60, 0.12);
   color: rgb(253, 186, 116);
+}
+
+html.dark .sgd-model-tags .sgd-chip,
+[data-theme="dark"] .sgd-model-tags .sgd-chip {
+  border: 0;
+  background: rgba(129, 140, 248, 0.18);
+  color: rgb(199, 210, 254);
 }
 
 html.dark .sgd-muted,

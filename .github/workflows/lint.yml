@@ -63,6 +63,9 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Check cookbook authoring contracts
+        run: node docs/scripts/check_cookbook_configs.mjs
+
       # Hard gate: docs internal links/anchors/redirects must resolve.
       # mint is pinned for reproducibility (its heading-slug rules are
       # version-sensitive); bump deliberately after re-verifying locally.

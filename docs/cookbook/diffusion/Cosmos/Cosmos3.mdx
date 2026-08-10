@@ -6,11 +6,13 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["image", "video", "sound/action", "world model", "policy"]} />
+<DiffusionModelTags tags={["omnimodal", "image + video", "sound + action", "world model", "robot policy"]} />
 
 ## 1. Model Introduction
 
-[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family for image, video, sound, and action generation. SGLang Diffusion serves the public checkpoints with the native `Cosmos3OmniDiffusersPipeline`.
+[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family spanning text/image/video generation, optional synchronized sound, and robot action prediction. Its main advantage is breadth: the same native SGLang pipeline can serve media-generation checkpoints and the DROID policy checkpoint without routing through an LLM sampler.
+
+Choose Nano for the broadest modality coverage and lower deployment cost, Super for the larger 64B image/video model, and a specialized checkpoint when only T2I or I2V is needed. Sound and action are checkpoint-specific heads, so they are not available from every Cosmos3 repository.
 
 | Model | Status | Notes |
 | --- | --- | --- |
@@ -20,7 +22,7 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 | `nvidia/Cosmos3-Super-Image2Video` | Supported | I2V-specialized checkpoint |
 | `nvidia/Cosmos3-Nano-Policy-DROID` | Supported | DROID policy action generation |
 
-Sound and action generation require the corresponding checkpoint heads. SGLang uses the flow-native `FlowUniPCMultistepScheduler` for Cosmos3 even if the checkpoint metadata names another scheduler. The default `flow_shift` is `3.0` for T2I and `10.0` for video and action modes.
+SGLang uses the flow-native `FlowUniPCMultistepScheduler` for Cosmos3 even if the checkpoint metadata names another scheduler. The default `flow_shift` is `3.0` for T2I and `10.0` for video and action modes.
 
 ## 2. Installation
 

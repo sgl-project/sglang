@@ -8,13 +8,15 @@ metatags:
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { LTXDeployment } from '/src/snippets/diffusion/ltx-deployment.jsx';
 
-<DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "two-stage"]} />
+<DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "one/two-stage", "1088p HQ"]} />
 
 ## 1. Model Introduction
 
-[LTX-2](https://huggingface.co/Lightricks/LTX-2) and [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) are video generation models from Lightricks. SGLang Diffusion supports the LTX series through native one-stage and two-stage pipelines for text-to-video and image-conditioned video generation.
+[LTX-2](https://huggingface.co/Lightricks/LTX-2) and [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) are Lightricks video models for text-to-video and image-conditioned generation. Their defining deployment choice is the pipeline: one-stage minimizes latency, standard two-stage refines quality, and LTX-2.3 adds a 1920×1088 HQ path.
 
-Use `Lightricks/LTX-2` or `Lightricks/LTX-2.3` as `--model-path`. For two-stage generation, SGLang uses the spatial upsampler and distilled LoRA components from the model snapshot by default. LTX-2.3 also supports the HQ two-stage variant.
+Choose LTX when one model family must span fast generation, higher-quality refinement, and LoRA adaptation. Two-stage quality costs substantially more memory and startup work because both DiTs and the spatial upsampler participate; use the one-stage path when latency or capacity matters more than final detail.
+
+Use `Lightricks/LTX-2` or `Lightricks/LTX-2.3` as `--model-path`. SGLang loads the two-stage upsampler and distilled components from the selected snapshot.
 
 <Warning>
 **License notice:** LTX-2 and LTX-2.3 are released under the LTX-2 Community License Agreement, not Apache 2.0. The license includes commercial-use restrictions for some entities. Review the [official Lightricks license](https://huggingface.co/Lightricks/LTX-2.3/blob/main/LICENSE) before production or commercial use; SGLang support does not grant additional model usage rights.

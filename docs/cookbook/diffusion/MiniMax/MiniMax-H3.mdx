@@ -5,9 +5,15 @@ metatags:
     description: "Serve MiniMax-H3 with SGLang Diffusion for text-to-video-and-audio, first/last-frame conditioning, video-to-video, and multimodal reference conditioning."
 ---
 
-## 1. Model introduction
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-[MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) generates a video and a synchronized stereo audio track in one request. SGLang Diffusion provides a native pipeline for the three public task profiles, split across the released FL2VA (First-and-Last-Frame-to-Video-and-Audio) and Ref2VA (Reference-to-Video-and-Audio) checkpoint partitions:
+<DiffusionModelTags tags={["video + audio", "T2VA / FL2VA / Ref2VA", "multimodal references", "4–15 seconds", "768p"]} />
+
+## 1. Model Introduction
+
+[MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) is a native joint video-and-audio model for text-to-video-and-audio, first/last-frame control, and multimodal reference conditioning. Its main strength is producing the picture and stereo soundtrack together, so speech, music, ambient sound, and visible events can stay aligned without a separate audio-generation pass.
+
+Choose H3 when synchronized audiovisual output or reference-driven generation matters more than a lightweight deployment. The released recipe targets a 768-pixel short edge at 24 fps for 4–15 seconds, and its capabilities are split across two checkpoint partitions; serving every mode therefore requires separate FL2VA and Ref2VA deployments.
 
 | Task | `task` value | Conditioning |
 | --- | --- | --- |
@@ -42,7 +48,7 @@ For platform-specific setup, see the [SGLang Diffusion installation guide](/docs
 ## 3. Serve MiniMax-H3
 
 Use the interactive selector to choose a hardware platform, deployment profile,
-one of the two checkpoint partitions, a request mode, and deployment features.
+one of the two checkpoint partitions, and a request mode.
 It generates Python and, where available, Docker launch forms. AMD selections
 use the Python form until an H3-capable ROCm image is validated. The **$ cURL**
 button follows the selected request mode and switches the payload across
@@ -59,16 +65,15 @@ directory** in the **Env** panel for FL2VA, V2V, or Ref2VA; the picker mounts
 that directory read-only at `/data/minimax-h3` inside the container.
 
 Every hardware/topology cell in this picker has completed a real request on
-that exact GPU model. Approximate load-time features such as online
-quantization are called out separately in the generated command. Sampling
-behavior such as Cache-DiT is documented separately below.
+that exact GPU model. The picker deliberately emits a verified base recipe;
+orthogonal features such as attention backends, online quantization,
+Cache-DiT, and explicit encoder policy are applied separately in section 7.
 
 **Deployment Profile** exposes resident and FSDP placement on B200, B300,
 H200, and H100. Resident is the latency-oriented default; FSDP reduces DiT
 weight residency at the cost of per-block parameter collectives. On H200 it
-also selects the verified 2-node cross-node topology. **Online
-Quantization** appears only on B200 and B300. AMD keeps its resident AITER
-recipe, while RTX 5090 uses its dedicated layerwise-offload profile.
+also selects the verified 2-node cross-node topology. AMD keeps its resident
+AITER recipe, while RTX 5090 uses its dedicated layerwise-offload profile.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
@@ -553,7 +558,21 @@ task profile. A real B200 request has completed, but the `quality: "high"`
 path above remains fail-closed to the audited 4×H200 workload.
 </Warning>
 
-## 7. Runtime feature recipes
+## 7. Optional feature overlays
+
+Start from the picker-generated base command, then add only the overlays that
+match the deployment goal. These controls are intentionally outside the
+hardware matrix: changing an attention kernel, weight precision, cache policy,
+or encoder scheduling does not create a new base topology.
+
+| Goal | Overlay | Quality contract | Recommendation |
+| --- | --- | --- | --- |
+| Production baseline | Leave attention and quantization unset | Native BF16/FP32 weights; platform-selected dense attention | Start here and use it for consistency ground truth. |
+| Force FlashAttention | `--attention-backend fa` | Native input precision with backend-level floating-point differences | Use only when comparing kernels; auto selection is the default. |
+| SageAttention | `--attention-backend sage_attn` | Quantized, approximate attention | Benchmark latency and inspect both video and audio quality. Hopper requires the fixed installation described below. |
+| Online FP8 weights | `--quantization fp8` | Approximate transformer weights; required H3 projections remain FP32 | Verified on resident B200/B300; do not infer support for other cells. |
+| Cache-DiT | Sampling configuration from section 6 | Approximate block reuse | Tune per task and do not combine with FSDP or DiT layerwise offload. |
+| Encoder scheduling | `--encoder-parallel auto|fold|dp|replicate` | Placement/scheduling choice; `fold` and `replicate` preserve single-request encoding | Keep `auto` unless optimizing a measured batch or cross-node topology. |
 
 <Tabs>
 
@@ -567,7 +586,6 @@ listed hardware and topology; it is not inherited by a similar GPU family.
 | --- | --- | --- |
 | Ulysses sequence parallelism | Verified: 8× B200, 4× H200, 4× H100, and Ulysses1/2/4/8 on MI300X and MI355X | Use `--ulysses-degree`. Combine with Ring for cross-node scaling; see the next row. |
 | Ring sequence parallelism (cross-node) | Verified: 2 nodes of 8× H200 each (Ulysses8 × Ring2) | Use `--ring-degree` together with `--nnodes`/`--node-rank`/`--dist-init-addr`. Ring shards the sequence across nodes while Ulysses shards heads within a node; H3's packed multi-segment attention only supports Ring across the node boundary, not within a single node's Ulysses group. Requires `--encoder-parallel replicate` — `auto`'s fold decision is not node-boundary aware. See the benchmark section below. |
-| SageAttention | Supported | Use `--attention-backend sage_attn` to select the native packed varlen path; install the SageAttention dependency first. |
 | Tensor parallelism | Verified: B200 TP2 + Ulysses4; H100 TP2 + Ulysses2 and TP4 + Ulysses1 | `--tp-size` may be combined with Ulysses when the TP-local head count remains divisible by the Ulysses degree. On 4×H100, TP2 + Ulysses2 is the measured speed default. |
 | FSDP inference | Verified: 4× B200 and 4× H100 + Ulysses4 | Preserves H3's mixed BF16/FP32 parameter policy. B200 completed the exact eager comparison; H100 completed consecutive real requests at about 57 GB peak memory per GPU. |
 | Resident components | Verified: B200, H200, 4×H100 with TP, and 1/2/4/8× MI300X and MI355X | This is the recommended single-request latency path when the complete workload fits. |
@@ -600,6 +618,29 @@ sglang serve \
 BCG is lossless for a matching captured signature, but capture reserves extra
 GPU memory. Re-measure the live H3 text length before reusing this bucket for a
 different task profile, reference set, resolution, or prompt template.
+
+</Tab>
+
+<Tab title="Attention backends">
+
+Leave `--attention-backend` unset for the platform default. Use
+`--attention-backend fa` only for an explicit FlashAttention comparison.
+
+SageAttention uses quantized attention math and is not a consistency mode. To
+select H3's native packed-varlen Sage path, install the dependency and add
+`--attention-backend sage_attn`. On Hopper, install the upstream SM90 binding
+fix rather than the PyPI 2.2.0 build:
+
+```bash Command
+pip install --force-reinstall \
+  git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 \
+  --no-build-isolation
+```
+
+The backend is a server-wide default. Use
+`--component-attention-backends` only when a measured component needs a
+different kernel, and keep the platform default for every component not named
+in the override.
 
 </Tab>
 
@@ -637,8 +678,8 @@ sglang serve \
 Online FP8 is approximate and is not a consistency ground-truth mode. It can
 be combined with Cache-DiT, but the two approximations compound. Validate
 visual quality, audio quality, memory use, and latency on the target workload.
-The picker exposes this option only on the B200 and B300 topologies used for
-real H3 validation runs.
+This recipe is limited to the resident B200 and B300 topologies used for real
+H3 validation runs.
 </Warning>
 
 </Tab>

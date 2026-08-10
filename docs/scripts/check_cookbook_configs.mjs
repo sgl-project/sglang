@@ -18,11 +18,12 @@
 //      author never clicked through; a throw there blanks the whole widget.
 
 import { readFileSync, readdirSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SNIPPETS = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "snippets");
 const CONFIGS = join(SNIPPETS, "configs");
+const DIFFUSION_COOKBOOK = join(SNIPPETS, "..", "..", "cookbook", "diffusion");
 const LEGACY_DIMS = ["variants", "quantizations", "strategies", "nodesOptions"];
 
 const failures = [];
@@ -192,6 +193,61 @@ for (const path of walk(CONFIGS)) {
         throw new Error(`curl returned ${typeof out}, expected a string`);
       }
     }, "curl");
+  }
+}
+
+// ----------------------------------------------------- Diffusion page opening
+// Keep the first screen consistent across model pages. This check intentionally
+// guards structure, not editorial judgment; the authoring skill carries the
+// capability/strength/boundary rubric that cannot be reduced to keywords.
+const walkMdx = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+  e.isDirectory() ? walkMdx(join(dir, e.name))
+    : (e.name.endsWith(".mdx") ? [join(dir, e.name)] : []));
+
+for (const path of walkMdx(DIFFUSION_COOKBOOK)) {
+  if (["README.mdx", "intro.mdx"].includes(basename(path))) continue;
+
+  const where = relative(join(SNIPPETS, "..", ".."), path);
+  const src = readFileSync(path, "utf8");
+  const heading = /^## 1\. Model Introduction\s*$/m.exec(src);
+  if (!heading) {
+    fail(where, "missing exact `## 1. Model Introduction` heading");
+    continue;
+  }
+
+  const importPattern = /import\s+\{\s*DiffusionModelTags\s*\}\s+from\s+['"]\/src\/snippets\/diffusion\/model-tags\.jsx['"]/;
+  if (!importPattern.test(src.slice(0, heading.index))) {
+    fail(where, "missing the shared DiffusionModelTags import before section 1");
+  }
+
+  const tagMatch = /<DiffusionModelTags\s+tags=\{\[([^\]]+)]}\s*\/>/.exec(src.slice(0, heading.index));
+  if (!tagMatch) {
+    fail(where, "missing `<DiffusionModelTags tags={[...]} />` before section 1");
+  } else {
+    const tags = [...tagMatch[1].matchAll(/["']([^"']+)["']/g)].map((m) => m[1].trim());
+    if (tags.length < 4 || tags.length > 6) {
+      fail(where, `tag widget has ${tags.length} tags; expected 4–6`);
+    }
+    if (tags.some((tag) => !tag)) fail(where, "tag widget contains an empty tag");
+  }
+
+  const introStart = heading.index + heading[0].length;
+  const rest = src.slice(introStart);
+  const boundaries = ["\n|", "\n<Warning", "\n<Note", "\n## 2"]
+    .map((marker) => rest.indexOf(marker))
+    .filter((i) => i >= 0);
+  const lead = rest.slice(0, boundaries.length ? Math.min(...boundaries) : rest.length).trim();
+  const paragraphs = lead.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  if (paragraphs.length < 2) {
+    fail(where, "model introduction needs at least two lead paragraphs");
+  }
+  const prose = lead
+    .replace(/\[([^\]]+)]\([^)]+\)/g, "$1")
+    .replace(/`[^`]+`/g, "value")
+    .replace(/[*_#]/g, " ");
+  const words = prose.match(/[A-Za-z0-9][A-Za-z0-9+./@–—-]*/g) || [];
+  if (words.length < 45 || words.length > 180) {
+    fail(where, `lead introduction has ${words.length} words; expected 45–180`);
   }
 }
 

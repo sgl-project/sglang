@@ -6,24 +6,18 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["image", "text-to-image", "turbo", "raw"]} />
+<DiffusionModelTags tags={["image", "text-to-image", "8-step Turbo", "high-fidelity Raw", "Qwen3-VL"]} />
 
 ## 1. Model Introduction
 
-[Krea-2](https://huggingface.co/krea/Krea-2-Turbo) is a high-quality text-to-image diffusion model from [Krea](https://www.krea.ai/). It ships in two variants that share the same backbone and differ only in their sampling recipe:
+[Krea-2](https://huggingface.co/krea/Krea-2-Turbo) is Krea's photorealistic text-to-image family, built as a single-stream MMDiT with a Qwen3-VL text encoder and Qwen-Image VAE. Both public variants use the same native SGLang pipeline and differ mainly in their sampling target.
 
-- **[Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo)** - a distilled, few-step model that produces photorealistic images in only **8 inference steps** with no classifier-free guidance (`guidance_scale = 1.0`), ideal for fast and interactive generation.
-- **[Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw)** - the base (non-distilled) model that trades speed for maximum fidelity, using a longer schedule (~52 steps) with classifier-free guidance (`guidance_scale ≈ 4.5`).
+Choose Turbo for interactive generation: it is distilled to 8 steps with `guidance_scale=1.0`. Choose Raw when maximum fidelity matters more than latency: it uses roughly 52 steps with classifier-free guidance. Neither checkpoint is an image-editing model; use the Qwen-Image-Edit or FLUX.2 path when an input image must be preserved or transformed.
 
-Both variants are built on a single-stream MMDiT with a Qwen3-VL text encoder and the Qwen-Image VAE, and are distributed in the standard diffusers layout (a `model_index.json` plus sharded `transformer/`, `text_encoder/`, `vae/`, `tokenizer/`, and `scheduler/` folders). SGLang loads them **natively** - just point `--model-path` at the repo, no conversion step required.
-
-**Key Features:**
-
-- **Two variants, one pipeline**: switch between fast (Turbo) and high-fidelity (Raw) by changing only the model path and the sampling settings.
-- **Photorealistic generation** at 1024x1024 and other resolutions.
-- **Native diffusers loading**: components (DiT, text encoder, VAE, scheduler) are read straight from the repo's `model_index.json`.
-
-For more details, see the [Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) and [Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) HuggingFace pages.
+| Variant | Model ID | Sampling profile |
+| --- | --- | --- |
+| Turbo | `krea/Krea-2-Turbo` | 8 steps, no CFG; fastest path |
+| Raw | `krea/Krea-2-Raw` | About 52 steps with CFG; higher-fidelity path |
 
 ## 2. SGLang-diffusion Installation
 

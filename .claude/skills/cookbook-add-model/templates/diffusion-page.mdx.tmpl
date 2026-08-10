@@ -1,0 +1,51 @@
+---
+title: __MODEL_DISPLAY__
+description: "Deploy __MODEL_DISPLAY__ with SGLang Diffusion."
+metatags:
+    description: "Serve __MODEL_DISPLAY__ for __PRIMARY_CAPABILITY__ with SGLang Diffusion."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["__MODALITY__", "__PRIMARY_TASK__", "__DIFFERENTIATOR__", "__IMPORTANT_BOUNDARY__"]} />
+
+## 1. Model Introduction
+
+[__MODEL_DISPLAY__](__MODEL_URL__) is __CONCRETE_MODEL_DESCRIPTION__. Its strongest use case is __MEASURED_OR_DOCUMENTED_STRENGTH__.
+
+Choose it when __SELECTION_GUIDANCE__. The main tradeoff is __CAPABILITY_OR_DEPLOYMENT_BOUNDARY__.
+
+| Checkpoint or mode | Best fit | Important boundary |
+| --- | --- | --- |
+| `__MODEL_ID__` | __USE_CASE__ | __LIMIT__ |
+
+## 2. Installation
+
+Install SGLang with the diffusion dependencies:
+
+```bash Command
+uv pip install "sglang[diffusion]" --prerelease=allow
+```
+
+## 3. Serve the model
+
+Start from the smallest verified base recipe. Keep attention, quantization, caching,
+compile, and request sampling in separate feature recipes unless they define the base
+checkpoint or hardware topology.
+
+```bash Command
+sglang serve \
+  --model-path __MODEL_ID__ \
+  --num-gpus __NUM_GPUS__ \
+  --port 30010
+```
+
+## 4. Request examples
+
+__REQUEST_EXAMPLES__
+
+## 5. Optional feature overlays
+
+| Goal | Overlay | Quality contract | Verified scope |
+| --- | --- | --- | --- |
+| __FEATURE_GOAL__ | `__FEATURE_FLAG__` | __QUALITY_CONTRACT__ | __VERIFIED_SCOPE__ |
