@@ -18,6 +18,7 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.cache_consistency_jitter import get_jitter_engine, run_jitter_test
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Aliased so pytest does not collect the imported `test_`-prefixed helper as a test.
@@ -31,7 +32,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=250, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=450, stage="base-b", runner_config="1-gpu-large")
 
 # Defaults to the HF `test` revision; override MODEL/REVISION to point at a
 # local checkpoint. Empty REVISION drops the flag (for local paths).
@@ -185,6 +186,43 @@ class TestInklingServer(CustomTestCase):
             max_new_tokens=256,
             trust_remote_code=True,
         )
+
+
+class TestInklingCacheConsistency(CustomTestCase):
+    """Bitwise version of the KL check above: the same context is scored under
+    different batch shapes, cache histories and retraction timing, and every
+    overlapping observation must agree. Boots its own in-process engine because
+    the harness patches the scheduler process to inject stream-sync jitter."""
+
+    def test_scored_contexts_are_bitwise_identical(self):
+        engine_kwargs = {
+            "model_path": _MODEL_PATH,
+            "trust_remote_code": True,
+            "attention_backend": "fa4",
+            "page_size": 128,
+            "mamba_radix_cache_strategy": "extra_buffer",
+            "swa_full_tokens_ratio": 0.1,
+            "mamba_full_memory_ratio": 0.1,
+            "mem_fraction_static": 0.5,
+            "enable_deterministic_inference": True,
+        }
+        if _MODEL_REVISION:
+            engine_kwargs["revision"] = _MODEL_REVISION
+
+        with get_jitter_engine(**engine_kwargs) as engine:
+            # Sized to the 20480-token pool the harness pins: large enough to
+            # force retraction, small enough that the batch still admits.
+            run_jitter_test(
+                engine,
+                num_unique_prefixes=4,
+                requests_per_prefix=5,
+                prefix_len_min=384,
+                prefix_len_max=512,
+                new_tokens=256,
+                # How many requests get retracted tracks pool size, hence GPU
+                # memory, so only assert the path ran at all.
+                min_retracted_requests=1,
+            )
 
 
 if __name__ == "__main__":
