@@ -83,6 +83,7 @@ jobs:
             rust
             python/setup.py
             .github
+            scripts/ci/run_rust_workspace_tests.sh
             scripts/ci/utils
           sparse-checkout-cone-mode: false
 
@@ -93,16 +94,16 @@ jobs:
       - name: Ensure zstd so the saved entry is readable
         run: bash scripts/ci/utils/ensure_zstd.sh
 
-      # setup.py counts because it selects which crates get built. pyproject.toml
-      # is left out - it churns on bumps that cannot affect these modules.
+      # setup.py selects which crates get built; the workspace test script is
+      # part of the gate represented by a successful cache entry.
       - name: Restore built modules
         id: cache
         uses: actions/cache/restore@v4
         with:
           path: python/sglang/srt/*/_core*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'scripts/ci/run_rust_workspace_tests.sh') }}
 
-      # On a miss: different hash = rust/setup.py moved; no entries = evicted.
+      # On a miss: an input changed or the matching entry was evicted.
       - name: Report cache lookup
         env:
           GH_TOKEN: ${{ github.token }}
@@ -210,6 +211,7 @@ jobs:
               (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
               deactivate
           done
+          bash scripts/ci/run_rust_workspace_tests.sh
 
       - name: Verify modules and stage for upload
         env:
@@ -227,7 +229,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: python/sglang/srt/*/_core*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'scripts/ci/run_rust_workspace_tests.sh') }}
 
       - name: Upload extension modules
         uses: actions/upload-artifact@v4

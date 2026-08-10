@@ -109,6 +109,17 @@ repos:
         language: system
         files: ^(\.github/actions/download-rust-ext/action\.yml|\.github/workflows/_pr-test-rust-ext-build\.yml)$
         pass_filenames: false
+      - id: check-no-bare-pytest-main
+        name: reject bare pytest.main calls in __main__ blocks
+        entry: python3 scripts/ci/check_no_bare_pytest_main.py
+        language: system
+        files: ^(python|test)/.*\.py$
+      - id: check-static-ratchets
+        name: validate static runtime ratchets
+        entry: python3 scripts/ci/check_static_ratchets.py
+        language: system
+        files: ^(python/sglang/.*\.py|scripts/ci/check_.*ratchet.*\.py)$
+        pass_filenames: false
       - id: check-registered-tests
         name: validate registered test CI registries
         entry: python3 scripts/ci/check_registered_tests.py

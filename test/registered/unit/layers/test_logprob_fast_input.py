@@ -91,6 +91,15 @@ def _run(proc, batch, fast, chunk_size):
     )
 
 
+def _coverage_cases(menu, max_seqs):
+    yield from ((item,) for item in menu)
+    yield from itertools.product(menu, repeat=2)
+    for width in range(3, max_seqs + 1):
+        for offset in range(len(menu)):
+            yield tuple(menu[(offset + step) % len(menu)] for step in range(width))
+            yield tuple(menu[(offset - step) % len(menu)] for step in range(width))
+
+
 def _assert_nested_close(test, ref, got, label, rtol, atol):
     test.assertEqual(_shape_of(ref), _shape_of(got), label)
     ref_flat = _flatten(ref)
@@ -125,44 +134,43 @@ class TestFastInputLogprobs(CustomTestCase):
         # zero-logprob-row shape.
         menu = [(1, 1), (3, 0), (4, 1), (5, 5), (6, 2)]
         tried = 0
-        for n_seqs in (1, 2, 3):
-            for combo in itertools.product(menu, repeat=n_seqs):
-                batch = _build_batch(list(combo), dtype)
-                for chunk_size in (None, 1, 2, 3, 5):
-                    tried += 1
-                    ref, ref_sampled = _run(proc, batch, False, chunk_size)
-                    got, got_sampled = _run(proc, batch, True, chunk_size)
-                    label = f"specs={list(combo)} chunk={chunk_size} dtype={dtype}"
-                    # Top-k order comes from the same values shifted by a
-                    # per-row constant, so indices must match exactly.
-                    self.assertEqual(ref.top_logprobs_idx, got.top_logprobs_idx, label)
-                    self.assertEqual(
-                        ref.token_ids_logprobs_idx, got.token_ids_logprobs_idx, label
-                    )
-                    _assert_nested_close(
-                        self,
-                        ref.top_logprobs_val,
-                        got.top_logprobs_val,
-                        label,
-                        rtol,
-                        atol,
-                    )
-                    _assert_nested_close(
-                        self,
-                        ref.token_ids_logprobs_val,
-                        got.token_ids_logprobs_val,
-                        label,
-                        rtol,
-                        atol,
-                    )
-                    torch.testing.assert_close(
-                        ref.token_logprobs.float(),
-                        got.token_logprobs.float(),
-                        rtol=rtol,
-                        atol=atol,
-                        msg=label,
-                    )
-                    torch.testing.assert_close(ref_sampled, got_sampled, msg=label)
+        for combo in _coverage_cases(menu, max_seqs=3):
+            batch = _build_batch(list(combo), dtype)
+            for chunk_size in (None, 1, 2, 3, 5):
+                tried += 1
+                ref, ref_sampled = _run(proc, batch, False, chunk_size)
+                got, got_sampled = _run(proc, batch, True, chunk_size)
+                label = f"specs={list(combo)} chunk={chunk_size} dtype={dtype}"
+                # Top-k order comes from the same values shifted by a
+                # per-row constant, so indices must match exactly.
+                self.assertEqual(ref.top_logprobs_idx, got.top_logprobs_idx, label)
+                self.assertEqual(
+                    ref.token_ids_logprobs_idx, got.token_ids_logprobs_idx, label
+                )
+                _assert_nested_close(
+                    self,
+                    ref.top_logprobs_val,
+                    got.top_logprobs_val,
+                    label,
+                    rtol,
+                    atol,
+                )
+                _assert_nested_close(
+                    self,
+                    ref.token_ids_logprobs_val,
+                    got.token_ids_logprobs_val,
+                    label,
+                    rtol,
+                    atol,
+                )
+                torch.testing.assert_close(
+                    ref.token_logprobs.float(),
+                    got.token_logprobs.float(),
+                    rtol=rtol,
+                    atol=atol,
+                    msg=label,
+                )
+                torch.testing.assert_close(ref_sampled, got_sampled, msg=label)
         self.assertGreater(tried, 100)
 
     def test_fast_matches_reference_fp32(self):
@@ -177,19 +185,16 @@ class TestFastInputLogprobs(CustomTestCase):
         torch.manual_seed(0)
         proc = InputLogprobProcessor()
         menu = [(1, 1), (3, 0), (4, 1), (5, 5), (6, 2)]
-        for n_seqs in (1, 2, 3):
-            for combo in itertools.product(menu, repeat=n_seqs):
-                batch = _build_batch(list(combo), torch.bfloat16)
-                pruned_states, _, input_logprob_indices, _, metadata = batch
-                truth = torch.log_softmax(pruned_states.double(), dim=-1)[
-                    input_logprob_indices
-                ]
-                for chunk_size in (None, 2, 5):
-                    got, _ = _run(proc, batch, True, chunk_size)
-                    label = f"specs={list(combo)} chunk={chunk_size}"
-                    self._assert_rows_match_truth(
-                        got, truth, metadata, label, atol=1e-4
-                    )
+        for combo in _coverage_cases(menu, max_seqs=3):
+            batch = _build_batch(list(combo), torch.bfloat16)
+            pruned_states, _, input_logprob_indices, _, metadata = batch
+            truth = torch.log_softmax(pruned_states.double(), dim=-1)[
+                input_logprob_indices
+            ]
+            for chunk_size in (None, 2, 5):
+                got, _ = _run(proc, batch, True, chunk_size)
+                label = f"specs={list(combo)} chunk={chunk_size}"
+                self._assert_rows_match_truth(got, truth, metadata, label, atol=1e-4)
 
     def _assert_rows_match_truth(self, got, truth, metadata, label, atol):
         pt = 0

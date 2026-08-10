@@ -17,18 +17,10 @@ on a bare assignment after resolution; this ratchet catches the sites the tests
 never execute.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
 import re
-import unittest
 from pathlib import Path
 
-import sglang
-from sglang.test.test_utils import CustomTestCase
-
-_SGLANG_ROOT = Path(next(iter(sglang.__path__)))
+_SGLANG_ROOT = Path(__file__).resolve().parents[2] / "python" / "sglang"
 
 # Assignments to a server_args attribute (``server_args.x = ...``,
 # ``self.server_args.x = ...``, and the ``sa`` alias used by a few helpers).
@@ -55,31 +47,30 @@ _EXCLUDED = (
 _BASELINE = 0
 
 
-class TestServerArgsMutationRatchet(CustomTestCase):
-    def test_out_of_pipeline_mutations_match_the_baseline(self):
-        count = 0
-        for path in sorted(_SGLANG_ROOT.rglob("*.py")):
-            rel = path.relative_to(_SGLANG_ROOT).as_posix()
-            if rel.startswith(_EXCLUDED):
-                continue
-            source = path.read_text()
-            count += sum(len(p.findall(source)) for p in _MUTATION_PATTERNS)
-        if count > _BASELINE:
-            self.fail(
-                f"server_args mutations outside the resolution pipeline grew: "
-                f"{count} > baseline {_BASELINE}. Configuration is resolved in "
-                "ServerArgs.__post_init__; declare through the pipeline "
-                "(passes / declare_late_resolution), change resolved config "
-                "with get_context().override(source, ...), or hand the value "
-                "to its runner as a constructor argument — do not assign fields."
-            )
-        if count < _BASELINE:
-            self.fail(
-                f"server_args mutations outside the resolution pipeline "
-                f"shrank: {count} < baseline {_BASELINE}. Lower the baseline "
-                "in this file to lock in the progress."
-            )
+def check_server_args_mutation_ratchet():
+    count = 0
+    for path in sorted(_SGLANG_ROOT.rglob("*.py")):
+        rel = path.relative_to(_SGLANG_ROOT).as_posix()
+        if rel.startswith(_EXCLUDED):
+            continue
+        source = path.read_text()
+        count += sum(len(pattern.findall(source)) for pattern in _MUTATION_PATTERNS)
+    if count > _BASELINE:
+        raise AssertionError(
+            f"server_args mutations outside the resolution pipeline grew: "
+            f"{count} > baseline {_BASELINE}. Configuration is resolved in "
+            "ServerArgs.__post_init__; declare through the pipeline "
+            "(passes / declare_late_resolution), change resolved config "
+            "with get_context().override(source, ...), or hand the value "
+            "to its runner as a constructor argument — do not assign fields."
+        )
+    if count < _BASELINE:
+        raise AssertionError(
+            f"server_args mutations outside the resolution pipeline "
+            f"shrank: {count} < baseline {_BASELINE}. Lower the baseline "
+            "in this file to lock in the progress."
+        )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    check_server_args_mutation_ratchet()

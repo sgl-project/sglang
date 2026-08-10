@@ -14,18 +14,10 @@ resources vertical). Migrating one of them must shrink its pin; adding a name
 fails the ratchet.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
 import ast
-import unittest
 from pathlib import Path
 
-import sglang.srt
-from sglang.test.test_utils import CustomTestCase
-
-_SRT_ROOT = Path(next(iter(sglang.srt.__path__)))
+_SRT_ROOT = Path(__file__).resolve().parents[2] / "python" / "sglang" / "srt"
 
 _PINNED_GLOBALS = {
     "layers/moe/utils.py": frozenset(),
@@ -39,30 +31,29 @@ _PINNED_GLOBALS = {
 }
 
 
-class TestModuleStateRatchet(CustomTestCase):
-    def test_global_statements_match_the_pins(self):
-        for rel, pinned in _PINNED_GLOBALS.items():
-            tree = ast.parse((_SRT_ROOT / rel).read_text())
-            declared = {
-                name
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Global)
-                for name in node.names
-            }
-            grown = declared - pinned
-            self.assertFalse(
-                grown,
+def check_module_state_ratchet():
+    for rel, pinned in _PINNED_GLOBALS.items():
+        tree = ast.parse((_SRT_ROOT / rel).read_text())
+        declared = {
+            name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Global)
+            for name in node.names
+        }
+        grown = declared - pinned
+        if grown:
+            raise AssertionError(
                 f"{rel} declares new module-level runtime state {sorted(grown)}; "
                 "put runtime flags on a get_flags() group instead "
                 "(see runtime_context.MoeFlags / DpFlags).",
             )
-            shrunk = pinned - declared
-            self.assertFalse(
-                shrunk,
+        shrunk = pinned - declared
+        if shrunk:
+            raise AssertionError(
                 f"{rel} no longer declares {sorted(shrunk)}; "
                 "shrink the pin in this file to lock in the progress.",
             )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    check_module_state_ratchet()
