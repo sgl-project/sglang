@@ -89,7 +89,6 @@ sgl-eval run gsm8k \\
       verified: true,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -99,7 +98,6 @@ sgl-eval run gsm8k \\
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -109,7 +107,6 @@ sgl-eval run gsm8k \\
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -119,7 +116,6 @@ sgl-eval run gsm8k \\
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -129,7 +125,6 @@ sgl-eval run gsm8k \\
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -139,7 +134,6 @@ sgl-eval run gsm8k \\
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -149,7 +143,6 @@ sgl-eval run gsm8k \\
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -159,7 +152,6 @@ sgl-eval run gsm8k \\
       verified: true,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -169,7 +161,6 @@ sgl-eval run gsm8k \\
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -179,7 +170,6 @@ sgl-eval run gsm8k \\
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -189,7 +179,6 @@ sgl-eval run gsm8k \\
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -199,7 +188,6 @@ sgl-eval run gsm8k \\
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
