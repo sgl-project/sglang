@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import numpy as np
 import pytest
 import torch
 import zmq
@@ -27,6 +28,10 @@ from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.multimodal.cpu_image_processing import (
+    build_uint8_normalization_lut,
+    normalize_and_navit_patchify_uint8,
+)
 from sglang.srt.multimodal.encoder_preprocessing import (
     LOCAL_PREPROCESSED_KEY,
     EncoderPreprocessOutput,
@@ -37,6 +42,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     materialize_kimi_k3_cpu_features,
+    materialize_kimi_k3_cpu_item_features,
     prepare_kimi_k3_encoder_inputs,
 )
 from sglang.srt.runtime_context import get_context
@@ -290,6 +296,67 @@ def test_kimi_k3_epd_default_cpu_materialization_is_owner_only_and_exact():
     assert processor.calls[0][0]["image"].getpixel((0, 0)) == (11, 0, 0)
     assert torch.all(materialized == 11)
     assert items[0].model_specific_data[DEFERRED_PREPROCESSING_KEY]["backend"] == "cpu"
+
+
+def test_uint8_normalize_patchify_matches_k3_reference_order_bitwise():
+    rng = np.random.default_rng(20260810)
+    image = rng.integers(0, 256, size=(12, 20, 3), dtype=np.uint8)
+    image_mean = np.array([0.48145466, 0.4578275, 0.40821073])
+    image_std = np.array([0.26862954, 0.26130258, 0.27577711])
+
+    reference = (image[None] / 255.0).astype(np.float32)
+    reference -= image_mean
+    reference *= 1.0 / image_std
+    reference = reference.reshape(1, 3, 4, 5, 4, 3)
+    reference = reference.transpose(0, 1, 3, 5, 2, 4).reshape(-1, 3, 4, 4)
+
+    actual = normalize_and_navit_patchify_uint8(
+        image,
+        patch_size=4,
+        normalization_lut=build_uint8_normalization_lut(image_mean, image_std),
+    )
+
+    assert np.array_equal(actual, reference)
+
+
+def test_kimi_k3_cpu_materializer_uses_exact_fast_processor_capability():
+    class FastImageProcessor:
+        media_proc_cfg = _kimi_k3_image_processor().media_proc_cfg
+
+        def get_resize_config(self, media):
+            width, height = media["image"].size
+            return {
+                "new_width": width,
+                "new_height": height,
+                "pad_width": (-width) % 4,
+                "pad_height": (-height) % 4,
+            }
+
+        def resize_image(self, image, new_width, new_height, pad_width, pad_height):
+            image = np.asarray(image.resize((new_width, new_height)))
+            return np.pad(image, ((0, pad_height), (0, pad_width), (0, 0)))
+
+        def preprocess(self, *_args, **_kwargs):
+            raise AssertionError("fast-capable processors must skip the reference call")
+
+    image = Image.fromarray(
+        np.arange(5 * 7 * 3, dtype=np.uint8).reshape(5, 7, 3), mode="RGB"
+    )
+    processor = FastImageProcessor()
+    output = prepare_kimi_k3_encoder_inputs([image], processor)
+
+    (actual,) = materialize_kimi_k3_cpu_item_features(output.mm_items, processor)
+    padded = processor.resize_image(image, 7, 5, 1, 3)
+    expected = normalize_and_navit_patchify_uint8(
+        padded,
+        patch_size=2,
+        normalization_lut=build_uint8_normalization_lut(
+            processor.media_proc_cfg["image_mean"],
+            processor.media_proc_cfg["image_std"],
+        ),
+    )
+
+    assert np.array_equal(actual.numpy(), expected)
 
 
 def test_encoder_preprocess_materializes_only_local_size_balanced_items():

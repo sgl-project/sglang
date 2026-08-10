@@ -6,6 +6,11 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.multimodal.cpu_image_processing import (
+    build_uint8_normalization_lut,
+    normalize_and_navit_patchify_uint8,
+)
+
 DEFERRED_PREPROCESSING_KEY = "kimi_k3_deferred_preprocessing"
 
 
@@ -128,8 +133,7 @@ def prepare_kimi_k3_encoder_inputs(
     )
 
 
-def materialize_kimi_k3_cpu_features(items, image_processor) -> torch.Tensor:
-    """Run the checkpoint's exact processor only on locally owned images."""
+def _kimi_k3_cpu_medias(items):
     medias = []
     for item in items:
         image = item.feature
@@ -152,28 +156,100 @@ def materialize_kimi_k3_cpu_features(items, image_processor) -> torch.Tensor:
             else:
                 raise ValueError(f"Unsupported Kimi-K3 image channel count: {channels}")
         medias.append({"type": "image", "image": image})
+    return medias
 
-    output = image_processor.preprocess(medias, return_tensors="pt")
-    expected_grids = torch.cat(
-        [item.model_specific_data["grid_thws"] for item in items], dim=0
+
+def _can_use_fast_kimi_k3_cpu_path(image_processor) -> bool:
+    config = getattr(image_processor, "media_proc_cfg", None)
+    return (
+        isinstance(config, dict)
+        and callable(getattr(image_processor, "get_resize_config", None))
+        and callable(getattr(image_processor, "resize_image", None))
+        and "patch_size" in config
+        and "image_mean" in config
+        and "image_std" in config
     )
-    if not torch.equal(output["grid_thws"].cpu(), expected_grids.cpu()):
-        raise ValueError("Kimi-K3 deferred CPU preprocessing produced wrong grids")
-    return output["pixel_values"]
 
 
-def materialize_kimi_k3_cpu_item_features(items, image_processor) -> list[torch.Tensor]:
-    """Return exact checkpoint-processor features split by logical image."""
-    pixel_values = materialize_kimi_k3_cpu_features(items, image_processor)
+def _materialize_kimi_k3_cpu_items_fast(items, image_processor):
+    """Run K3's exact resize with fused normalization and patchification."""
+    config = image_processor.media_proc_cfg
+    patch_size = int(config["patch_size"])
+    normalization_lut = build_uint8_normalization_lut(
+        config["image_mean"], config["image_std"]
+    )
+    features = []
+    grids = []
+    for media in _kimi_k3_cpu_medias(items):
+        resize_config = image_processor.get_resize_config(media)
+        image = media["image"]
+        image_np = image_processor.resize_image(
+            image,
+            resize_config["new_width"],
+            resize_config["new_height"],
+            resize_config["pad_width"],
+            resize_config["pad_height"],
+        )
+        features.append(
+            torch.from_numpy(
+                normalize_and_navit_patchify_uint8(
+                    image_np,
+                    patch_size=patch_size,
+                    normalization_lut=normalization_lut,
+                )
+            )
+        )
+        grids.append(
+            [
+                1,
+                image_np.shape[0] // patch_size,
+                image_np.shape[1] // patch_size,
+            ]
+        )
+    return features, torch.tensor(grids, dtype=torch.int64)
+
+
+def _materialize_kimi_k3_cpu_items_reference(items, image_processor):
+    output = image_processor.preprocess(_kimi_k3_cpu_medias(items), return_tensors="pt")
     patch_counts = [
         math.prod(item.model_specific_data["grid_thws"][0].tolist()) for item in items
     ]
-    if sum(patch_counts) != pixel_values.shape[0]:
+    if sum(patch_counts) != output["pixel_values"].shape[0]:
         raise ValueError(
             "Kimi-K3 processor feature length does not match image grids: "
-            f"{pixel_values.shape[0]} != {sum(patch_counts)}"
+            f"{output['pixel_values'].shape[0]} != {sum(patch_counts)}"
         )
-    return list(pixel_values.split(patch_counts))
+    return list(output["pixel_values"].split(patch_counts)), output["grid_thws"]
+
+
+def materialize_kimi_k3_cpu_features(items, image_processor) -> torch.Tensor:
+    """Run exact CPU preprocessing only on locally owned K3 images."""
+    return torch.cat(materialize_kimi_k3_cpu_item_features(items, image_processor))
+
+
+def materialize_kimi_k3_cpu_item_features(items, image_processor) -> list[torch.Tensor]:
+    """Return exact checkpoint features split by logical image.
+
+    Checkpoint processors exposing K3's resize helpers use a shared fast CPU
+    primitive. Lightweight/custom processors keep the reference call, making
+    the optimization an automatic capability rather than a model-name branch
+    in the encoder server.
+    """
+    if _can_use_fast_kimi_k3_cpu_path(image_processor):
+        features, actual_grids = _materialize_kimi_k3_cpu_items_fast(
+            items, image_processor
+        )
+    else:
+        features, actual_grids = _materialize_kimi_k3_cpu_items_reference(
+            items, image_processor
+        )
+
+    expected_grids = torch.cat(
+        [item.model_specific_data["grid_thws"] for item in items], dim=0
+    )
+    if not torch.equal(actual_grids.cpu(), expected_grids.cpu()):
+        raise ValueError("Kimi-K3 deferred CPU preprocessing produced wrong grids")
+    return features
 
 
 def to_hwc_uint8(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
