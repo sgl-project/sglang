@@ -1,9 +1,13 @@
 import asyncio
+import base64
+import hashlib
 import logging
+import os
 import re
+import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -24,17 +28,162 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.dots_note_omni_video import (
-    preprocess_dots_video,
-)
+from sglang.srt.utils import VideoData, get_video_bytes
 
 logger = logging.getLogger(__name__)
+
+_VIDEO_TOKEN_RE = re.compile(r"(<image_\d+>|<audio_\d+>)")
+_VIDEO_PREPROCESS_LOCK = threading.Lock()
+
+
+def _build_video_cfg(
+    *,
+    seq: int,
+    output_reserve: int | None,
+    audio_cap: float,
+    audio_sr: int,
+    max_new_tokens: int,
+) -> dict[str, Any]:
+    if seq <= 0:
+        raise ValueError(f"seq must be positive, got {seq}")
+    if max_new_tokens < 0:
+        raise ValueError(f"max_new_tokens must be non-negative, got {max_new_tokens}")
+    configured_reserve = seq // 4 if output_reserve is None else output_reserve
+    effective_reserve = max(configured_reserve, max_new_tokens)
+    if effective_reserve >= seq:
+        raise ValueError(
+            "output_reserve/max_new_tokens must leave room for input: "
+            f"reserve={effective_reserve}, seq={seq}"
+        )
+    if audio_cap < 0:
+        raise ValueError(f"audio_cap must be non-negative, got {audio_cap}")
+    if audio_sr <= 0:
+        raise ValueError(f"audio_sr must be positive, got {audio_sr}")
+
+    return {
+        "process_audio": audio_cap > 0,
+        "seq_length": seq - effective_reserve,
+        "reserve_interleave": True,
+        "audio_token_ratio_cap": float(audio_cap),
+        "audio_sample_rate": int(audio_sr),
+        "video_jpeg_quality": int(os.environ.get("XHS_VIDEO_JPEG_QUALITY", "85")),
+    }
+
+
+def _video_payload(raw_video) -> tuple[bytes, str]:
+    if isinstance(raw_video, VideoData):
+        raw_video = raw_video.url
+    raw_url = raw_video.get("url") if isinstance(raw_video, dict) else raw_video
+    video_bytes = get_video_bytes(raw_url)
+    return video_bytes, hashlib.sha1(video_bytes).hexdigest()
+
+
+def _cfg_for_pure_visual(cfg: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(cfg)
+    cfg["process_audio"] = False
+    return cfg
+
+
+def _flat_video_to_content(flat: dict[str, Any]) -> list[dict[str, Any]]:
+    meta = flat.get("meta", {})
+    user_value = next(
+        (
+            conv.get("value", "")
+            for conv in flat.get("conversations", [])
+            if (conv.get("from") or conv.get("role")) == "user"
+        ),
+        "",
+    )
+    content: list[dict[str, Any]] = []
+    last = 0
+    for match in _VIDEO_TOKEN_RE.finditer(user_value):
+        if match.start() > last:
+            content.append({"type": "text", "text": user_value[last : match.start()]})
+        key = match.group(1)[1:-1]
+        encoded = meta.get(key)
+        if encoded and key.startswith("image_"):
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                }
+            )
+        elif encoded:
+            content.append(
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": f"data:audio/wav;base64,{encoded}"},
+                }
+            )
+        last = match.end()
+    if last < len(user_value):
+        content.append({"type": "text", "text": user_value[last:]})
+    return content
+
+
+def preprocess_dots_video(
+    raw_video,
+    question: str,
+    *,
+    tokenizer,
+    seq: int = 131072,
+    output_reserve: int | None = None,
+    audio_cap: float = 1.0,
+    audio_sr: int = 16000,
+    k_mode: str = "eval_ek",
+    max_new_tokens: int = 0,
+) -> list[dict[str, Any]]:
+    """Return in-memory timestamp/image/audio content using the server tokenizer."""
+    if not k_mode:
+        raise ValueError("k_mode must not be empty")
+    with _VIDEO_PREPROCESS_LOCK:
+        video_bytes, video_id = _video_payload(raw_video)
+        cfg = _build_video_cfg(
+            seq=seq,
+            output_reserve=output_reserve,
+            audio_cap=audio_cap,
+            audio_sr=audio_sr,
+            max_new_tokens=max_new_tokens,
+        )
+        from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
+            flatten_runner,
+        )
+        from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
+            preprocess as pp,
+        )
+
+        pp.set_tokenizer(tokenizer)
+        video_b64 = base64.b64encode(video_bytes).decode()
+        sample = {
+            "meta": {"video_0": video_b64},
+            "conversations": [{"from": "user", "value": f"<video_0>{question}"}],
+        }
+        record_key = hashlib.sha1(f"{video_id}|{question}".encode()).hexdigest()
+
+        def run(run_cfg):
+            new_meta, conversations = pp.process_sample_video(sample, run_cfg)
+            plan = flatten_runner.build_plan(
+                new_meta,
+                conversations,
+                record_key,
+                k_mode=k_mode,
+                process_audio=run_cfg["process_audio"],
+                audio_sample_rate=audio_sr,
+            )
+            return _flat_video_to_content(flatten_runner.render_flat(plan))
+
+        try:
+            return run(cfg)
+        except pp.SkipSample as exc:
+            if "audio_token_ratio_exceed" not in str(exc):
+                raise
+            return run(_cfg_for_pure_visual(cfg))
 
 
 class DotsNoteOmniProcessor(BaseMultimodalProcessor):
     """Native image/audio processor for dots.note.omni."""
 
-    models = [Dots3NoteForCausalLM]
+    models: ClassVar[list] = [Dots3NoteForCausalLM]
     gpu_image_decode = False
 
     def __init__(self, hf_config, server_args, processor, transport_mode, **kwargs):
@@ -139,12 +288,12 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
 
     async def process_mm_data_async(
         self,
-        input_text: Union[List[int], str],
+        input_text: list[int] | str,
         request_obj: GenerateReqInput,
         max_req_input_len: int,
         *args,
-        image_data: Optional[list] = None,
-        audio_data: Optional[list] = None,
+        image_data: list | None = None,
+        audio_data: list | None = None,
         video_data=None,
         **kwargs,
     ):
@@ -162,7 +311,7 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
                     "Dots note omni currently supports one video per request"
                 )
         if not isinstance(input_text, str):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004 - preserve the processor API contract
                 "Dots note omni requires a text prompt for multimodal requests"
             )
 
