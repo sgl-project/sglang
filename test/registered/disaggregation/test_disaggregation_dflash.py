@@ -22,6 +22,11 @@ register_cuda_ci(est_time=500, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationDFlash(PDDisaggregationServerBase):
+    # The DFlash draft's max_position_embeddings (40960) is shorter than the
+    # Llama-3.1-8B target's (131072); allow the shorter draft context.
+    extra_prefill_env = {"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"}
+    extra_decode_env = {"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"}
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
