@@ -805,7 +805,14 @@ class KVCacheConfigurator:
             ),
             enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
             enable_mamba_extra_buffer_lazy=mamba_extra_buffer_lazy_enabled(),
-            speculative_num_draft_tokens=max_speculative_num_draft_tokens(),
+            # A PD prefill server never runs TARGET_VERIFY, so skip the
+            # verify-only per-draft-token state snapshots (see the draft-head
+            # case above: None => the pool skips SpeculativeState).
+            speculative_num_draft_tokens=(
+                None
+                if get_disagg().disaggregation_mode == "prefill"
+                else max_speculative_num_draft_tokens()
+            ),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
