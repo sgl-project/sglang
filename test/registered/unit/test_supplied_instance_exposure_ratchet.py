@@ -78,7 +78,6 @@ _PASSED = frozenset(
 _EXPOSED = {
     ("configs/model_config.py", "_speculative_draft_quantization_explicitly_set"),
     ("constrained/base_grammar_backend.py", "grammar_backend"),
-    ("disaggregation/decode_kvcache_offload_manager.py", "page_size"),
     ("disaggregation/encode_receiver.py", "encoder_transfer_backend"),
     ("disaggregation/encode_server.py", "mm_process_config"),
     (
@@ -93,14 +92,12 @@ _EXPOSED = {
     ("layers/moe/utils.py", "speculative_moe_runner_backend"),
     ("managers/data_parallel_controller.py", "load_balance_method"),
     ("managers/load_snapshot.py", "load_balance_method"),
-    ("managers/scheduler.py", "page_size"),
     (
         "managers/scheduler_components/new_token_ratio_tracker.py",
         "schedule_conservativeness",
     ),
     ("managers/tokenizer_manager.py", "encoder_transfer_backend"),
     ("mem_cache/allocation_sizing.py", "page_size"),
-    ("model_executor/model_runner.py", "page_size"),
     (
         "model_executor/runner_backend/tc_piecewise_cuda_graph_backend.py",
         "cuda_graph_config",

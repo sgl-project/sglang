@@ -43,7 +43,7 @@ class DecodeKVCacheOffloadManager:
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.server_args = server_args
         self.request_counter = 0
         self.tree_cache = tree_cache
