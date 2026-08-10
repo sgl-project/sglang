@@ -1,6 +1,6 @@
 // Intern-S2-Mobius per-cell benchmark numbers, keyed by the same `match` tuple as
 // intern-s2-mobius.jsx cells. All H200 numbers measured in this work on 2xH200
-// (TP=2, sglang main @ e0828ee3 + PR #33691 head). Speed workload = random 8K-in /
+// (TP=2, sglang main @ e0828ee3 + PR #33691 head — model landed in main 2026-08-08, so lmsysorg/sglang:dev is equivalent now). Speed workload = random 8K-in /
 // 1K-out, --random-range-ratio 1.0, --flush-cache, warmup 8-16 prompts, varied seed.
 // ttft_ms / tpot_ms are P50. tokens_per_sec_per_gpu = total (in+out)/GPU.
 export const benchmarks = [

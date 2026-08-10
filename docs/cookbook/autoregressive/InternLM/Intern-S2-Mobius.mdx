@@ -29,10 +29,10 @@ Then run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:latest
+docker pull lmsysorg/sglang:dev
 ```
 
-For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+Intern-S2-Mobius was upstreamed in PR [#33691](https://github.com/sgl-project/sglang/pull/33691) (merged 2026-08-08) — it lives on `lmsysorg/sglang:dev` (nightly) until the next release cut. For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
 
 </Tab>
 
@@ -52,7 +52,7 @@ import { benchmarks } from "/src/snippets/configs/internlm/intern-s2-mobius-benc
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
-  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on `main @ e0828ee3` (2×H200, TP=2) using PR [#33691](https://github.com/sgl-project/sglang/pull/33691) (Intern-S2-Mobius model support). GSM8K is the full 1319-example test split; GPQA is Diamond 198 problems × 8 repeats (pass@1 avg-of-8). Both use the checkpoint's `generation_config.json` sampling (temperature 0.8, top_p 1.0, top_k 50) — no CLI sampling override. The B200 recipes are inferred from the H200 ones and unverified — same flags, just a TP=2 or TP=1 Blackwell equivalent.
+  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on 2×H200 TP=2 against `main @ e0828ee3` + PR [#33691](https://github.com/sgl-project/sglang/pull/33691) head (since merged 2026-08-08 — `lmsysorg/sglang:dev` is the live equivalent). GSM8K is the full 1319-example test split; GPQA is Diamond 198 problems × 8 repeats (pass@1 avg-of-8). Both use the checkpoint's `generation_config.json` sampling (temperature 0.8, top_p 1.0, top_k 50) — no CLI sampling override. The B200 recipes are inferred from the H200 ones and unverified — same flags, just a TP=2 or TP=1 Blackwell equivalent.
 </Note>
 
 ## Playground
