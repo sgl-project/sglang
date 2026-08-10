@@ -12,7 +12,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_parallel,
+    process_model_config,
+)
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
@@ -64,21 +67,42 @@ INDEXER_K_CACHE_PRESHUFFLE_TILE = 16
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.server_args import ServerArgs
 
 
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
+def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
+    """Whether a PD seed should enter the allocator-local fused TopK domain."""
+    return (
+        is_cuda()
+        and envs.SGLANG_DSA_FUSE_TOPK.get()
+        and server_args.disaggregation_mode == "decode"
+        and not server_args.enable_hisparse
+        and not get_parallel().dcp_enabled
+    )
+
+
 def should_use_dsa_fused_topk(
-    server_args, seed_dsa_topk_from_draft_extend: bool
+    server_args: "ServerArgs", seed_dsa_topk_from_draft_extend: bool
 ) -> bool:
+    """Select fused TopK for PD IndexShare.
+
+    PD Prefill worker:
+    - Target prefill: fused TopK enabled.
+    - Draft extend: fused TopK disabled.
+
+    PD Decode worker:
+    - Draft decode / target verify / draft extend: fused TopK enabled.
+    """
     pd_index_share_seed = (
         server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
     )
-    # TODO(kpham-sgl): Transfer request-relative IndexShare seeds and remap them
-    # to decode-local KV slots so fused top-k can remain enabled under PD.
-    return envs.SGLANG_DSA_FUSE_TOPK.get() and not pd_index_share_seed
+    return envs.SGLANG_DSA_FUSE_TOPK.get() and (
+        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots(server_args)
+    )
 
 
 def is_dsa_enable_prefill_cp():
@@ -90,9 +114,10 @@ def is_dsa_enable_prefill_cp():
     # DeepSeek Sparse Attention model.
     if get_parallel().attn_cp_size <= 1:
         return False
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
-    return is_deepseek_dsa(get_server_args().get_model_config().hf_config)
+    hf_config = process_model_config().hf_config
+    return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
 def is_dsa_prefill_cp_in_seq_split():
