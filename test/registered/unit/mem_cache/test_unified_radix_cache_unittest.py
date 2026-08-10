@@ -3828,6 +3828,10 @@ class UnifiedRadixCacheSuite:
             leaf, device_frees, host_frees, target=EvictLayer.HOST
         )
         cache._free_values(device_frees, host_frees)
+        full_host_pool = cache.cache_controller.mem_pool_host
+        mamba_host_pool = cache.components[ComponentType.MAMBA]._mamba_pool_host
+        full_available_before = full_host_pool.available_size()
+        mamba_available_before = mamba_host_pool.available_size()
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
@@ -3845,12 +3849,27 @@ class UnifiedRadixCacheSuite:
             req_to_token_pool,
             tokens[:branching_seqlen],
         )
+        cache.writing_check(write_back=True)
+        # Full was already backed up, so only one Mamba slot is allocated.
+        self.assertEqual(
+            full_host_pool.available_size(),
+            full_available_before,
+        )
+        self.assertEqual(
+            mamba_host_pool.available_size(),
+            mamba_available_before - 1,
+        )
+
         second_match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
 
         self.assertEqual(len(second_match.device_indices), branching_seqlen)
         self.assertIsNone(second_match.mamba_branching_seqlen)
+        branching_node = cache.resolve_node_handle(second_match.last_device_node)
+        self.assertIsNotNone(
+            branching_node.component_data[ComponentType.MAMBA].host_value
+        )
 
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:

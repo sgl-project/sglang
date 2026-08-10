@@ -299,6 +299,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
+    # trade checkpoint-loading peak memory for faster ordinary DiT startup
+    direct_gpu_weight_loading: bool = False
     # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
@@ -508,6 +510,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_scheduler_rpc_timeout()
         self._validate_pipeline()
         self._validate_offload()
+        self._validate_direct_gpu_weight_loading()
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
@@ -549,11 +552,16 @@ class ServerArgs(DisaggServerArgsMixin):
         # latent shape, so the user must declare the resolutions up front. We
         # capture every one of them at warmup; serving then never re-captures.
         if not self.warmup_resolutions:
-            raise ValueError(
-                "--enable-breakable-cuda-graph requires --warmup-resolutions: "
-                "diffusion CUDA graphs only replay for a fixed resolution, so "
-                "every served resolution must be declared and captured at "
-                "warmup, e.g. --warmup-resolutions 1024x1024 1328x1328."
+            # No explicit resolutions: capture the model's default warmup
+            # resolution (derived by build_warmup_reqs) so
+            # --enable-breakable-cuda-graph works standalone. BCG graphs are
+            # resolution-specific; a request at any other resolution simply
+            # falls back to eager (the runner never re-captures at serving
+            # time). Pass --warmup-resolutions to capture additional shapes.
+            logger.info(
+                "[Diffusion BCG] --warmup-resolutions unset; capturing the "
+                "model default warmup resolution. Requests at other "
+                "resolutions run eager."
             )
         if self.bcg_text_buckets is not None and not any(
             int(b) > 0 for b in self.bcg_text_buckets
@@ -572,6 +580,8 @@ class ServerArgs(DisaggServerArgsMixin):
             pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
             and self._is_breakable_cuda_graph_supported_model()
         ):
+            if not self.warmup_resolutions:
+                self._default_bcg_warmup_resolution()
             return
 
         logger.warning(
@@ -587,6 +597,39 @@ class ServerArgs(DisaggServerArgsMixin):
         refs = _normalized_bcg_model_refs(self.model_id)
         refs.update(_normalized_bcg_model_refs(self.model_path))
         return bool(refs & BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
+
+    def _default_bcg_warmup_resolution(self) -> None:
+        """Seed --warmup-resolutions with the model default for BCG.
+
+        BCG graphs are resolution-specific and captured at warmup. When the
+        user does not pre-declare resolutions we capture the model's default
+        warmup resolution so --enable-breakable-cuda-graph works standalone;
+        requests at any other resolution fall back to eager.
+        """
+        from sglang.multimodal_gen.runtime.warmup_request_builder import (
+            _resolve_default_warmup_resolution,
+            get_model_sampling_defaults,
+        )
+
+        try:
+            sampling_defaults = get_model_sampling_defaults(self)
+            width, height = _resolve_default_warmup_resolution(
+                self, sampling_defaults, server_based_warmup=True
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[Diffusion BCG] could not derive a default warmup resolution "
+                "(%s); no graph will be captured and serving runs eager.",
+                exc,
+            )
+            return
+        self.warmup_resolutions = [f"{width}x{height}"]
+        logger.info(
+            "[Diffusion BCG] --warmup-resolutions unset; capturing the model "
+            "default %dx%d. Requests at other resolutions run eager.",
+            width,
+            height,
+        )
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -1732,6 +1775,15 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
         )
         parser.add_argument(
+            "--direct-gpu-weight-loading",
+            action=StoreBoolean,
+            default=ServerArgs.direct_gpu_weight_loading,
+            help="Load the full unquantized DiT checkpoint state dict directly "
+            "onto GPU before assigning model parameters. This may reduce startup "
+            "time depending on the model, but temporarily requires checkpoint "
+            "weights and model weights to coexist on GPU. Disabled by default.",
+        )
+        parser.add_argument(
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
@@ -2593,6 +2645,23 @@ class ServerArgs(DisaggServerArgsMixin):
                     "This reduces peak GPU memory and can increase latency; use "
                     "--performance-mode speed for GPU-resident defaults when memory allows."
                 )
+
+    def _validate_direct_gpu_weight_loading(self) -> None:
+        if not self.direct_gpu_weight_loading:
+            return
+        if not current_platform.is_cuda():
+            raise ValueError("--direct-gpu-weight-loading requires CUDA")
+        if self.dit_cpu_offload or self.is_dit_layerwise_offload_selected:
+            raise ValueError(
+                "--direct-gpu-weight-loading requires a GPU-resident DiT; disable "
+                "DiT CPU and layerwise offload"
+            )
+        if self.use_fsdp_inference:
+            raise ValueError(
+                "--direct-gpu-weight-loading does not support FSDP inference"
+            )
+        if self.tp_size != 1:
+            raise ValueError("--direct-gpu-weight-loading requires --tp-size 1")
 
     def _validate_parallelism(self):
         if self.kv_gather_degree < 1:
