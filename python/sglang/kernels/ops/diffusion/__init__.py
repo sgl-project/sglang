@@ -1,6 +1,7 @@
 """Registered diffusion-model kernels and their public wrappers.
 
-Implementations use the backend recorded by each kernel specification.
+Hot paths import concrete implementations from submodules. The package-level
+wrappers remain available for backward compatibility.
 """
 
 from __future__ import annotations
@@ -36,22 +37,10 @@ register_kernel(
     KernelSpec(
         op="diffusion.residual_gate_add",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.diffusion.residual_gate_add:residual_gate_add_cuda",
+        target="sglang.kernels.ops.diffusion.residual_gate_add:residual_gate_add",
         capabilities=_CUDA,
         format_signature=FormatSignature(description="residual + gate * update"),
         description="Fused residual gate-add (sglang.kernels.jit).",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="diffusion.fused_linear_gelu_tanh",
-        backend=KernelBackend.TORCH,
-        target="sglang.kernels.ops.diffusion.fused_linear_gelu:fused_linear_gelu_tanh",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            description="linear + tanh-GELU via the cublasLt GELU epilogue"
-        ),
-        description="Fused up-proj GEMM + tanh-GELU (torch._addmm_activation).",
     )
 )
 register_kernel(
@@ -64,6 +53,18 @@ register_kernel(
             in_place=True, description="fused in-place QK-norm + RoPE"
         ),
         description="Fused QK-norm + RoPE (sglang.kernels.jit).",
+    )
+)
+# Migrated from multimodal_gen (RFC #29630, Phase 2.5). Hot paths import the
+# Triton symbol directly; the registry entry remains for namespace discovery.
+register_kernel(
+    KernelSpec(
+        op="diffusion.sparse_linear_attn_fwd",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.diffusion.sparse_linear_attn_kernels:_attn_fwd",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(description="sparse linear attention fwd"),
+        description="Sparse linear attention forward (Triton).",
     )
 )
 
@@ -119,13 +120,3 @@ __all__ = [
     "residual_gate_add",
     "fused_inplace_qknorm_rope",
 ]
-
-
-# Migrated from multimodal_gen (RFC #29630, Phase 2.5).
-register_kernel(
-    KernelSpec(
-        op="diffusion.sparse_linear_attn_fwd",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.diffusion.sparse_linear_attn_kernels:_attn_fwd",
-    )
-)

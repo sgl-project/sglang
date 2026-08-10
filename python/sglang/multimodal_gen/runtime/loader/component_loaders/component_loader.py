@@ -422,6 +422,9 @@ class ComponentLoader(ABC):
         ):
             transformers_or_diffusers = "diffusers"
 
+        if transformers_or_diffusers.startswith("lingbot_video"):
+            transformers_or_diffusers = "diffusers"
+
         return transformers_or_diffusers
 
     @classmethod
