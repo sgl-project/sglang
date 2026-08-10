@@ -7321,12 +7321,26 @@ class ServerArgs:
         from sglang.srt.utils.hf_transformers_utils import resolve_hf_gguf_reference
 
         resolved = resolve_hf_gguf_reference(self.model_path, revision=self.revision)
-        if resolved is None:
-            return
-        logger.info("Resolved GGUF %s -> %s", self.model_path, resolved)
-        if self.tokenizer_path == self.model_path:
-            self.tokenizer_path = resolved
-        self.model_path = resolved
+        if resolved is not None:
+            logger.info("Resolved GGUF %s -> %s", self.model_path, resolved)
+            if self.tokenizer_path == self.model_path:
+                self.tokenizer_path = resolved
+            self.model_path = resolved
+
+        # A speculative draft can be a .gguf too, and it is loaded by path, so it
+        # needs the same Hub-reference resolution as the target.
+        if self.speculative_draft_model_path:
+            resolved_draft = resolve_hf_gguf_reference(
+                self.speculative_draft_model_path,
+                revision=self.speculative_draft_model_revision,
+            )
+            if resolved_draft is not None:
+                logger.info(
+                    "Resolved draft GGUF %s -> %s",
+                    self.speculative_draft_model_path,
+                    resolved_draft,
+                )
+                self.speculative_draft_model_path = resolved_draft
 
     def _handle_load_format(self):
         # The quantization side of the gguf coupling moved to the pipeline

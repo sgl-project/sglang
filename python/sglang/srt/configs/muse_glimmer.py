@@ -209,6 +209,18 @@ def muse_glimmer_vision_config_kwargs_from_hf(
     return kwargs
 
 
+def _f(v):
+    return None if v is None else float(v)
+
+
+def _i(v):
+    return None if v is None else int(v)
+
+
+def _mul_sqrt(v, head_dim):
+    return None if v is None else float(v) * math.sqrt(head_dim)
+
+
 def muse_glimmer_config_kwargs_from_gguf(gguf_path: str) -> Dict[str, Any]:
     from gguf import GGUFReader
 
@@ -219,6 +231,10 @@ def muse_glimmer_config_kwargs_from_gguf(gguf_path: str) -> Dict[str, Any]:
 
     def get(suffix):
         return meta[f"{_ARCH}.{suffix}"]
+
+    def opt(suffix):
+        """None when this converter generation did not emit the key."""
+        return meta.get(f"{_ARCH}.{suffix}")
 
     head_dim = int(get("attention.key_length"))
     swa_pattern = [bool(x) for x in get("attention.sliding_window_pattern")]
@@ -234,23 +250,31 @@ def muse_glimmer_config_kwargs_from_gguf(gguf_path: str) -> Dict[str, Any]:
         head_dim=head_dim,
         max_position_embeddings=int(get("context_length")),
         rms_norm_eps=float(get("attention.layer_norm_rms_epsilon")),
-        post_norm_eps=float(get("attention.post_norm_rms_epsilon")),
         rope_theta=float(get("rope.freq_base")),
         sliding_window=int(get("attention.sliding_window")),
         layer_types=[
             "sliding_attention" if s else "full_attention" for s in swa_pattern
         ],
         no_rope_layers=[1 if s else 0 for s in swa_pattern],
-        qk_scale_factor=float(get("attention.scale")) * math.sqrt(head_dim),
-        output_multiplier=float(get("output_multiplier")),
-        output_soft_cap_temp=float(get("final_logit_softcapping")),
         use_qk_norm=any(n.endswith("attn_q_norm.weight") for n in tensor_names),
-        use_attn_output_gate=any(
-            n.endswith("attn_output_gate.weight") for n in tensor_names
-        ),
+        use_attn_output_gate=any(n.endswith("attn_gate.weight") for n in tensor_names),
         tie_word_embeddings="output.weight" not in tensor_names,
-        bos_token_id=int(meta["tokenizer.ggml.bos_token_id"]),
-        eos_token_id=int(meta["tokenizer.ggml.eos_token_id"]),
         architectures=["MuseGlimmerForCausalLM"],
         dtype="bfloat16",
+        # Converter generations differ in which of these they emit, and every one
+        # is an architecture constant that MuseGlimmerConfig already defaults to,
+        # so an absent key falls back rather than raising. attention.scale is
+        # stored pre-divided by sqrt(head_dim); the class stores it before that.
+        **{
+            k: v
+            for k, v in (
+                ("post_norm_eps", _f(opt("attention.post_norm_rms_epsilon"))),
+                ("qk_scale_factor", _mul_sqrt(opt("attention.scale"), head_dim)),
+                ("output_multiplier", _f(opt("logit_scale"))),
+                ("output_soft_cap_temp", _f(opt("final_logit_softcapping"))),
+                ("bos_token_id", _i(meta.get("tokenizer.ggml.bos_token_id"))),
+                ("eos_token_id", _i(meta.get("tokenizer.ggml.eos_token_id"))),
+            )
+            if v is not None
+        },
     )

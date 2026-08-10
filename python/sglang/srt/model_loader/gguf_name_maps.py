@@ -38,7 +38,7 @@ _MUSE_GLIMMER_LAYER_TENSORS = {
     "attn_k": "self_attn.k_proj",
     "attn_v": "self_attn.v_proj",
     "attn_output": "self_attn.o_proj",
-    "attn_output_gate": "self_attn.output_gate_proj",
+    "attn_gate": "self_attn.output_gate_proj",
     "ffn_gate": "mlp.gate_proj",
     "ffn_up": "mlp.up_proj",
     "ffn_down": "mlp.down_proj",
@@ -64,6 +64,9 @@ def build_muse_glimmer_name_map(config: PretrainedConfig) -> Dict[str, str]:
     return name_map
 
 
+# Keyed by HF ``config.model_type`` (loader.py looks it up with that), which is
+# not the GGUF ``general.architecture`` that GGUF_NATIVE_CONFIG_BUILDERS uses:
+# llama.cpp spells the arch "muse-glimmer" while the HF config says "muse_glimmer".
 GGUF_HF_NAME_MAP_BUILDERS: Dict[str, Callable[[PretrainedConfig], Dict[str, str]]] = {
-    "muse-glimmer": build_muse_glimmer_name_map,
+    "muse_glimmer": build_muse_glimmer_name_map,
 }
