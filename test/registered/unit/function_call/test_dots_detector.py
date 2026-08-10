@@ -128,3 +128,75 @@ def test_streaming_buffers_partial_marker_and_emits_all_complete_calls():
         {"query": "chairs"},
         {"query": "tables"},
     ]
+
+
+def test_streaming_filters_unknown_tools_and_surfaces_the_content():
+    tools = [_tool("search", {"query": {"type": "string"}})]
+    detector = DotsToolDetector()
+    text = (
+        "<dots_function_call>"
+        '<invoke name="ghost"><parameter name="query">chairs</parameter></invoke>'
+        "</dots_function_call>"
+    )
+
+    result = detector.parse_streaming_increment(text, tools)
+
+    assert result.calls == []
+    assert "ghost" in result.normal_text
+    assert detector._buffer == ""
+
+
+def test_streaming_malformed_block_does_not_block_a_later_valid_call():
+    tools = [_tool("search", {"query": {"type": "string"}})]
+    detector = DotsToolDetector()
+
+    malformed = detector.parse_streaming_increment(
+        "<dots_function_call>garbage</dots_function_call>", tools
+    )
+    valid = detector.parse_streaming_increment(
+        "<dots_function_call>"
+        '<invoke name="search"><parameter name="query">chairs</parameter></invoke>'
+        "</dots_function_call>",
+        tools,
+    )
+
+    assert malformed.calls == []
+    assert malformed.normal_text == "garbage"
+    assert [call.name for call in valid.calls] == ["search"]
+
+
+def test_streaming_strips_stray_end_marker_from_normal_text():
+    detector = DotsToolDetector()
+
+    result = detector.parse_streaming_increment("some text </dots_function_call>", [])
+
+    assert result.calls == []
+    assert result.normal_text == "some text "
+
+
+def test_streaming_flushes_partial_opening_marker_at_eof():
+    tools = [_tool("search", {"query": {"type": "string"}})]
+    detector = DotsToolDetector()
+
+    result = detector.parse_streaming_increment("answer <dots_func", tools)
+
+    assert result.calls == []
+    assert result.normal_text == "answer "
+    assert detector.flush_pending_normal_text() == "<dots_func"
+    assert detector.flush_pending_normal_text() == ""
+
+
+def test_streaming_emits_complete_json_body_before_end_marker_without_duplication():
+    tools = [_tool("search", {"query": {"type": "string"}})]
+    detector = DotsToolDetector()
+
+    opening = detector.parse_streaming_increment("<dots_function_call>", tools)
+    body = detector.parse_streaming_increment(
+        '{"name":"search","arguments":{"query":"chairs"}}', tools
+    )
+    closing = detector.parse_streaming_increment("</dots_function_call>", tools)
+
+    assert opening.calls == []
+    assert [call.name for call in body.calls] == ["search", None]
+    assert "".join(call.parameters for call in body.calls) == '{"query": "chairs"}'
+    assert closing.calls == []

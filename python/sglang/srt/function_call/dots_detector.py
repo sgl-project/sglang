@@ -4,9 +4,9 @@ import re
 from typing import Any
 
 try:
-    from json_repair import loads as repair_json_loads
+    import json_repair
 except ImportError:
-    repair_json_loads = None
+    json_repair = None
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -16,6 +16,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class DotsToolDetector(BaseFormatDetector):
             r"<parameter\s+name\s*=\s*(?P<name>[^>]+)>(?P<value>.*?)</parameter>",
             re.DOTALL,
         )
+        self._last_arguments = ""
 
     @staticmethod
     def _extract_name(value: str) -> str:
@@ -65,9 +67,9 @@ class DotsToolDetector(BaseFormatDetector):
         try:
             return json.loads(value)
         except (json.JSONDecodeError, ValueError):
-            if repair_json_loads is None:
+            if json_repair is None:
                 raise
-            return repair_json_loads(value)
+            return json_repair.loads(value)
 
     @classmethod
     def _convert_param_value(cls, value: str, param_type: Any) -> Any:
@@ -194,7 +196,9 @@ class DotsToolDetector(BaseFormatDetector):
             normal_text=text[:marker_index].strip(), calls=calls
         )
 
-    def _append_stream_call(self, parsed: dict[str, Any]) -> ToolCallItem:
+    def _append_stream_call(
+        self, parsed: dict[str, Any], item: ToolCallItem
+    ) -> ToolCallItem:
         self.current_tool_id += 1
         arguments = parsed.get("arguments", parsed.get("parameters", {})) or {}
         serialized = json.dumps(arguments, ensure_ascii=False)
@@ -202,11 +206,9 @@ class DotsToolDetector(BaseFormatDetector):
             {"name": parsed.get("name"), "arguments": arguments}
         )
         self.streamed_args_for_tool.append(serialized)
-        return ToolCallItem(
-            tool_index=self.current_tool_id,
-            name=parsed.get("name"),
-            parameters=serialized,
-        )
+        item.tool_index = self.current_tool_id
+        item.parameters = serialized
+        return item
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
@@ -228,6 +230,9 @@ class DotsToolDetector(BaseFormatDetector):
                 else:
                     normal_parts.append(self._buffer)
                     self._buffer = ""
+                normal_parts = [
+                    part.replace(self.eot_token, "") for part in normal_parts
+                ]
                 break
 
             if marker_index > 0:
@@ -236,6 +241,7 @@ class DotsToolDetector(BaseFormatDetector):
 
             end_index = self._buffer.find(self.eot_token, len(self.bot_token))
             if end_index == -1:
+                self._stream_complete_json_body(tools, calls)
                 break
 
             content = self._buffer[len(self.bot_token) : end_index]
@@ -244,11 +250,98 @@ class DotsToolDetector(BaseFormatDetector):
                 parsed_calls = self._parse_block(content, tools)
                 if not parsed_calls:
                     raise ValueError("dots tool-call block contains no invoke")
-                calls.extend(self._append_stream_call(call) for call in parsed_calls)
+                block_calls: list[ToolCallItem] = []
+                for index, parsed in enumerate(parsed_calls):
+                    validated = self.parse_base_json(parsed, tools)
+                    if index == 0 and self.current_tool_name_sent and validated:
+                        item = validated[0]
+                        arguments = item.parameters or ""
+                        streamed = self.streamed_args_for_tool[self.current_tool_id]
+                        remaining = arguments.removeprefix(streamed)
+                        if remaining:
+                            block_calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    name=None,
+                                    parameters=remaining,
+                                )
+                            )
+                        self.prev_tool_call_arr[self.current_tool_id] = parsed
+                        self.streamed_args_for_tool[self.current_tool_id] = arguments
+                    else:
+                        block_calls.extend(
+                            self._append_stream_call(parsed, item) for item in validated
+                        )
+                if block_calls:
+                    calls.extend(block_calls)
+                elif not self.current_tool_name_sent:
+                    normal_parts.append(content.strip())
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
                 logger.warning("Failed to parse streamed dots tool call: %s", exc)
+                normal_parts.append(content.strip())
+
+            self._last_arguments = ""
+            self.current_tool_name_sent = False
 
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def _stream_complete_json_body(
+        self, tools: list[Tool], calls: list[ToolCallItem]
+    ) -> None:
+        """Emit a complete JSON body while its closing XML tag is pending."""
+        content = self._buffer[len(self.bot_token) :].strip()
+        if not content or not _is_complete_json(content):
+            return
+
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return
+        if not isinstance(parsed, dict):
+            return
+
+        validated = self.parse_base_json(parsed, tools)
+        if not validated:
+            return
+
+        item = validated[0]
+        arguments = item.parameters or ""
+        if not self.current_tool_name_sent:
+            self.current_tool_id += 1
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    name=item.name,
+                    parameters="",
+                )
+            )
+            self.prev_tool_call_arr.append(
+                {"name": item.name, "arguments": parsed.get("arguments", {})}
+            )
+            self.streamed_args_for_tool.append("")
+            self.current_tool_name_sent = True
+
+        streamed = self.streamed_args_for_tool[self.current_tool_id]
+        argument_diff = arguments.removeprefix(streamed)
+        if argument_diff:
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    name=None,
+                    parameters=argument_diff,
+                )
+            )
+            self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+            self._last_arguments = arguments
+
+    def flush_pending_normal_text(self) -> str:
+        """Flush a partial opening marker as plain text at end of stream."""
+        if not self._buffer or self.bot_token in self._buffer:
+            return ""
+
+        normal_text = self._buffer.replace(self.eot_token, "")
+        self._buffer = ""
+        return normal_text
 
     def supports_structural_tag(self) -> bool:
         return False
