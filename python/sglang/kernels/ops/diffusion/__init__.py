@@ -36,22 +36,10 @@ register_kernel(
     KernelSpec(
         op="diffusion.residual_gate_add",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.diffusion.residual_gate_add:residual_gate_add_cuda",
+        target="sglang.kernels.ops.diffusion.residual_gate_add:residual_gate_add",
         capabilities=_CUDA,
         format_signature=FormatSignature(description="residual + gate * update"),
         description="Fused residual gate-add (sglang.kernels.jit).",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="diffusion.fused_linear_gelu_tanh",
-        backend=KernelBackend.TORCH,
-        target="sglang.kernels.ops.diffusion.fused_linear_gelu:fused_linear_gelu_tanh",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            description="linear + tanh-GELU via the cublasLt GELU epilogue"
-        ),
-        description="Fused up-proj GEMM + tanh-GELU (torch._addmm_activation).",
     )
 )
 register_kernel(

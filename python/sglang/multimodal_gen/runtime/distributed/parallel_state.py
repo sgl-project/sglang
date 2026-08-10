@@ -774,6 +774,21 @@ def get_ring_parallel_rank() -> int:
     return get_sp_group().ring_rank
 
 
+def get_ulysses_ctx() -> tuple[int, int]:
+    """(world_size, rank) of the Ulysses group; (1, 0) when uninitialized
+    (unit tests / single-process debug paths)."""
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
+
+
+def get_ring_ctx() -> tuple[int, int]:
+    """(world_size, rank) of the Ring group; (1, 0) when uninitialized."""
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ring_parallel_world_size(), get_ring_parallel_rank()
+
+
 # PP
 def get_pp_group() -> PipelineGroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"

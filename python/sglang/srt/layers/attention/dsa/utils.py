@@ -12,7 +12,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_parallel,
+    process_model_config,
+)
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
@@ -78,7 +81,7 @@ def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
         and envs.SGLANG_DSA_FUSE_TOPK.get()
         and server_args.disaggregation_mode == "decode"
         and not server_args.enable_hisparse
-        and server_args.dcp_size == 1
+        and not get_parallel().dcp_enabled
     )
 
 
@@ -111,9 +114,10 @@ def is_dsa_enable_prefill_cp():
     # DeepSeek Sparse Attention model.
     if get_parallel().attn_cp_size <= 1:
         return False
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
-    return is_deepseek_dsa(get_server_args().get_model_config().hf_config)
+    hf_config = process_model_config().hf_config
+    return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
 def is_dsa_prefill_cp_in_seq_split():

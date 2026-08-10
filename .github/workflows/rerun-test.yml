@@ -31,11 +31,6 @@ on:
         required: false
         type: string
         default: "20"
-      grace_blackwell:
-        description: "Set GRACE_BLACKWELL for the install step (cuda only)"
-        required: false
-        type: string
-        default: "0"
       rdma_devices:
         description: "SGLANG_CI_RDMA_ALL_DEVICES csv (cuda only; empty = unset)"
         required: false
@@ -62,8 +57,6 @@ env:
   SGLANG_ENABLE_ASYNC_ASSERT: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  # TEMP: force DeepEP rebuilds during the initial Torch 2.13 rollout so every CI runner replaces its Torch 2.11 build; remove after the runner fleet has cycled.
-  FORCE_REBUILD_DEEPEP: '1'
 
 permissions:
   actions: write
@@ -109,8 +102,6 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
-        env:
-          GRACE_BLACKWELL: ${{ inputs.grace_blackwell }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
@@ -120,7 +111,7 @@ jobs:
           # then dies with `ModuleNotFoundError: No module named 'sglang'`.
           # /rerun-test resolves install_script from runner_configs.yml; a manual
           # workflow_dispatch must pass it explicitly (it can't be derived from
-          # runs_on, which is shared across configs, e.g. default vs deepep).
+          # runs_on, which can be shared across runner configs).
           if [ -z "${{ inputs.install_script }}" ]; then
             echo "::error::install_script is required for cuda mode (empty would silently skip installing sglang). Pass e.g. scripts/ci/cuda/ci_install_dependency.sh"
             exit 1

@@ -69,7 +69,11 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -158,23 +162,25 @@ class PrefillBootstrapQueue:
                     "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                     "(e.g. GQA, MHA). MLA models should not set this flag."
                 )
-            server_args = self.scheduler.server_args
             page_size = self.scheduler.token_to_kv_pool_allocator.page_size
-            cps = server_args.chunked_prefill_size or 8192
+            # Same source as send_kv_chunk's staging grid below, so validation
+            # and the grid cannot disagree after a post-publish override.
+            chunked_prefill_size = get_schedule().chunked_prefill_size
+            cps = chunked_prefill_size or 8192
             # Staging slices each send into a fixed page-aligned grid, so an
             # unbounded (-1) or non-page-aligned chunk size has no valid grid.
             if cps <= 0 or cps % page_size != 0:
                 raise RuntimeError(
                     f"SGLANG_DISAGG_STAGING_BUFFER requires a positive "
                     f"chunked_prefill_size that is a multiple of page_size "
-                    f"({page_size}); got {server_args.chunked_prefill_size}."
+                    f"({page_size}); got {chunked_prefill_size}."
                 )
             if self.pp_size > 1:
                 # Staging writer accounting has no pp dimension.
                 raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
                 )
-            if server_args.enable_prefill_context_parallel:
+            if get_parallel().enable_prefill_context_parallel:
                 # CP rewrites index_slice per rank, breaking the chunk grid.
                 raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER does not support "
@@ -1145,7 +1151,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # prefetched grid, so non-last sends must end on a grid
                 # boundary; the remainder rides with the next send.
                 grid_tokens = staging_grid_tokens(
-                    self.server_args.chunked_prefill_size, page_size
+                    get_schedule().chunked_prefill_size, page_size
                 )
                 base = req.disagg_decode_prefix_len
                 end_idx = base + ((end_idx - base) // grid_tokens) * grid_tokens
@@ -1271,7 +1277,7 @@ class SchedulerDisaggregationPrefillMixin:
                 start_idx,
                 end_idx,
                 req.disagg_decode_prefix_len,
-                staging_grid_tokens(self.server_args.chunked_prefill_size, page_size),
+                staging_grid_tokens(get_schedule().chunked_prefill_size, page_size),
             )
         else:
             segments = [(start_idx, end_idx)]

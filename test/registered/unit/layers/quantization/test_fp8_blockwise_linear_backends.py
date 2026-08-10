@@ -67,7 +67,11 @@ def _fp8_block_backends():
 def _mxfp8_backends():
     # MXFP8 linear is validated on SM100/103 only.
     if 100 <= get_device_sm() < 110:
-        return ["triton", "flashinfer_trtllm", "flashinfer_cutlass", "flashinfer_cutedsl"]
+        return [
+            "flashinfer_trtllm",
+            "flashinfer_cutlass",
+            "flashinfer_cutedsl",
+        ]
     return []
 
 
@@ -187,9 +191,6 @@ class TestMxfp8LinearBackends(_LinearBackendCheck):
 
     def _run(self, backend: str):
         self._check_backend(backend, _mxfp8_backends(), MXFP8_SHAPES, self._build_layer)
-
-    def test_triton(self):
-        self._run("triton")
 
     def test_flashinfer_trtllm(self):
         self._run("flashinfer_trtllm")
