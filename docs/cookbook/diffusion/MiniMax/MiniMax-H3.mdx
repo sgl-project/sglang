@@ -565,14 +565,17 @@ match the deployment goal. These controls are intentionally outside the
 hardware matrix: changing an attention kernel, weight precision, cache policy,
 or encoder scheduling does not create a new base topology.
 
-| Feature | Contract and recommendation |
-| --- | --- |
-| Production baseline | Leave attention and quantization unset. This keeps native BF16/FP32 weights and platform-selected dense attention; start here and use it for consistency ground truth. |
-| Force FlashAttention | Add `--attention-backend fa`. Inputs keep their native precision, but backend-level floating-point differences remain; use it for an explicit kernel comparison rather than as a second default. |
-| SageAttention | Add `--attention-backend sage_attn`. Its attention math is quantized and approximate; benchmark latency and inspect both video and audio quality. Hopper requires the fixed installation below. |
-| Online FP8 weights | Add `--quantization fp8`. Transformer weights are approximate while required H3 projections remain FP32. This is verified only on resident B200/B300; do not infer support for other cells. |
-| Cache-DiT | Use the sampling configuration from section 6. Block reuse is approximate, task-dependent, and incompatible with FSDP or DiT layerwise offload. |
-| Encoder scheduling | Use `--encoder-parallel auto|fold|dp|replicate`. Keep `auto` for the base recipe; `fold` and `replicate` preserve single-request encoding, while DP is a separately measured throughput choice. |
+- **Production baseline** — Leave attention and quantization unset. This keeps native BF16/FP32 weights and platform-selected dense attention; start here and use it for consistency ground truth.
+
+- **Force FlashAttention** — Add `--attention-backend fa`. Inputs keep their native precision, but backend-level floating-point differences remain; use it for an explicit kernel comparison rather than as a second default.
+
+- **SageAttention** — Add `--attention-backend sage_attn`. Its attention math is quantized and approximate; benchmark latency and inspect both video and audio quality. Hopper requires the fixed installation below.
+
+- **Online FP8 weights** — Add `--quantization fp8`. Transformer weights are approximate while required H3 projections remain FP32. This is verified only on resident B200/B300; do not infer support for other cells.
+
+- **Cache-DiT** — Use the sampling configuration from section 6. Block reuse is approximate, task-dependent, and incompatible with FSDP or DiT layerwise offload.
+
+- **Encoder scheduling** — Use `--encoder-parallel auto|fold|dp|replicate`. Keep `auto` for the base recipe; `fold` and `replicate` preserve single-request encoding, while DP is a separately measured throughput choice.
 
 <Tabs>
 
