@@ -19,7 +19,7 @@ const qualityBadge = (quality) => (
   </span>
 );
 
-const featureView = ({ feature, copied, onCopy }) => (
+const featureView = ({ feature, onCopy }) => (
   <details className="sgd-feature-item" key={feature.id}>
     <summary>
       <span className="sgd-feature-marker" aria-hidden="true">
@@ -67,10 +67,10 @@ const featureView = ({ feature, copied, onCopy }) => (
                   <pre><code>{recipe.code}</code></pre>
                   <button
                     type="button"
-                    onClick={() => onCopy(copyId, recipe.code)}
+                    onClick={(event) => onCopy(event, recipe.code)}
                     aria-label={`Copy ${recipe.label} overlay`}
                   >
-                    {copied === copyId ? "Copied" : "Copy overlay"}
+                    Copy overlay
                   </button>
                 </div>
               )}
@@ -82,7 +82,7 @@ const featureView = ({ feature, copied, onCopy }) => (
   </details>
 );
 
-const featureGroup = ({ type, features, copied, onCopy }) => {
+const featureGroup = ({ type, features, onCopy }) => {
   const group = GROUPS[type];
   return (
     <section className="sgd-feature-group" data-group={type}>
@@ -92,19 +92,20 @@ const featureGroup = ({ type, features, copied, onCopy }) => {
         <p>{group.description}</p>
       </header>
       <div className="sgd-feature-list">
-        {features.map((feature) => featureView({ feature, copied, onCopy }))}
+        {features.map((feature) => featureView({ feature, onCopy }))}
       </div>
     </section>
   );
 };
 
 export const DiffusionFeatureGuide = ({ serveFeatures = [], requestFeatures = [] }) => {
-  const [copied, setCopied] = useState("");
-
-  const copy = (id, code) => {
-    navigator.clipboard.writeText(code);
-    setCopied(id);
-    window.setTimeout(() => setCopied(""), 1400);
+  const copy = async (event, code) => {
+    await navigator.clipboard.writeText(code);
+    const button = event.currentTarget;
+    button.textContent = "Copied";
+    window.setTimeout(() => {
+      button.textContent = "Copy overlay";
+    }, 1400);
   };
 
   return (
@@ -129,8 +130,8 @@ export const DiffusionFeatureGuide = ({ serveFeatures = [], requestFeatures = []
       </div>
 
       <div className="sgd-feature-groups">
-        {featureGroup({ type: "serve", features: serveFeatures, copied, onCopy: copy })}
-        {featureGroup({ type: "request", features: requestFeatures, copied, onCopy: copy })}
+        {featureGroup({ type: "serve", features: serveFeatures, onCopy: copy })}
+        {featureGroup({ type: "request", features: requestFeatures, onCopy: copy })}
       </div>
     </section>
   );
