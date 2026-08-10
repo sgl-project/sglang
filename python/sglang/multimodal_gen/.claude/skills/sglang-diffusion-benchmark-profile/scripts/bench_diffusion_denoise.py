@@ -77,8 +77,9 @@ NIGHTLY_PRESET_ORDER = (
     "zimage",
     "wan-t2v",
     "wan-ti2v",
-    "ltx2",
     "ltx23-ti2v-two-stage",
+    "ideogram4-fp8",
+    "cosmos3-super-t2v",
     "wan-i2v",
 )
 
@@ -184,21 +185,7 @@ MODELS = {
             "--num-frames=81",
         ],
     },
-    # 8. Nightly: ltx2_twostage_t2v
-    "ltx2": {
-        "nightly_case_id": "ltx2_twostage_t2v",
-        "path": "Lightricks/LTX-2",
-        "prompt": "A cat and a dog baking a cake together in a kitchen.",
-        "extra_args": [
-            "--pipeline-class-name=LTX2TwoStagePipeline",
-            "--width=768",
-            "--height=512",
-            "--num-frames=121",
-            "--num-gpus=2",
-            "--enable-cfg-parallel",
-        ],
-    },
-    # 9. Nightly: ltx2.3_twostage_ti2v_2gpus
+    # 8. Nightly: ltx2.3_twostage_ti2v_2gpus
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "ltx23-ti2v-two-stage": {
         "nightly_case_id": "ltx2.3_twostage_ti2v_2gpus",
@@ -214,7 +201,36 @@ MODELS = {
             "--cfg-parallel-size=2",
         ],
     },
-    # 10. Nightly: wan22_i2v_a14b_720p
+    # 9. Nightly: ideogram4_fp8_t2i_2gpu
+    "ideogram4-fp8": {
+        "nightly_case_id": "ideogram4_fp8_t2i_2gpu",
+        "path": "ideogram-ai/ideogram-4-fp8",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-gpus=2",
+            "--tp-size=2",
+            "--attention-backend=fa",
+        ],
+    },
+    # 10. Nightly: cosmos3_super_t2v_2gpu
+    "cosmos3-super-t2v": {
+        "nightly_case_id": "cosmos3_super_t2v_2gpu",
+        "path": "nvidia/Cosmos3-Super",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=81",
+            "--num-gpus=2",
+            "--tp-size=2",
+        ],
+    },
+    # 11. Nightly: wan22_i2v_a14b_720p
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "wan-i2v": {
         "nightly_case_id": "wan22_i2v_a14b_720p",
@@ -233,6 +249,50 @@ MODELS = {
         ],
     },
     # Source-tracked extras from current registry / GPU test coverage.
+    # MiniMax-H3 owns its temporal canvas through target.duration_seconds, so
+    # the model-specific sampling fields are passed through --config instead
+    # of generic --width/--height/--num-frames flags.
+    "minimax-h3-t2va": {
+        "path": "MiniMaxAI/MiniMax-H3",
+        "prompt": "At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out.",
+        "seed": 1101,
+        "config_overrides": {
+            "task": "t2va",
+            "conditions": [],
+            "target": {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 5.0,
+            },
+            "audio_flow_shift": 3.0,
+            "flow_shift": 12.0,
+            "num_inference_steps": 50,
+        },
+        "extra_args": [
+            "--model-variant=fl2va",
+            "--num-gpus=4",
+            "--tp-size=2",
+            "--ulysses-degree=2",
+            "--performance-mode=speed",
+            "--enable-torch-compile=false",
+        ],
+        # H3 eager BF16/FP32 is the consistency ground truth. Current
+        # torch.compile changes numerical output, so never add the global
+        # helper default --enable-torch-compile flag for this preset.
+        "force_eager": True,
+    },
+    "ltx2": {
+        "path": "Lightricks/LTX-2",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStagePipeline",
+            "--width=768",
+            "--height=512",
+            "--num-frames=121",
+            "--num-gpus=2",
+            "--enable-cfg-parallel",
+        ],
+    },
     "qwen-image": {
         "path": "Qwen/Qwen-Image",
         "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
@@ -303,14 +363,6 @@ MODELS = {
             "--height=480",
             "--num-frames=9",
             "--num-inference-steps=4",
-        ],
-    },
-    "ideogram4-fp8": {
-        "path": "ideogram-ai/ideogram-4-fp8",
-        "prompt": "A clean product poster for a new open-source inference engine",
-        "extra_args": [
-            "--width=1024",
-            "--height=1024",
         ],
     },
     "ernie-image-turbo": {
@@ -613,7 +665,11 @@ def _expected_nightly_cli_args(case: dict) -> dict[str, str]:
     serve_args = shlex.split(case["frameworks"]["sglang"].get("serve_args", ""))
     parsed_serve_args = _parse_cli_args(serve_args)
     for flag, value in parsed_serve_args.items():
-        if flag in {"enable-torch-compile", "warmup"}:
+        # Nightly's comparison driver still owns its legacy ``--warmup``
+        # switch.  It is not a valid ``sglang generate`` flag after the
+        # warmup-mode migration, so exclude both spellings from preset drift
+        # validation.
+        if flag in {"enable-torch-compile", "warmup", "warmup-mode"}:
             continue
         expected[flag] = _normalize_cli_value(value)
 
@@ -657,6 +713,8 @@ def validate_nightly_alignment() -> int:
             errors.append(f"{model_key}: reference image presence differs")
         if preset.get("seed", 42) != case.get("seed"):
             errors.append(f"{model_key}: seed differs")
+        if preset.get("env", {}) != case["frameworks"]["sglang"].get("extra_env", {}):
+            errors.append(f"{model_key}: environment differs")
 
         actual_args = {
             key: _normalize_cli_value(value)
@@ -708,6 +766,7 @@ def build_sglang_cmd(
     torch_compile: bool = True,
     seed: int = 42,
     save_output: bool = True,
+    artifact_dir: Optional[Path] = None,
 ) -> list[str]:
     """
     Build the `sglang generate` command for the given model.
@@ -734,9 +793,12 @@ def build_sglang_cmd(
         cmd.append(f"--image-path={cfg['image_path']}")
 
     if "config_overrides" in cfg:
-        config_dir = ensure_dir(
-            get_output_dir("benchmarks", REPO_ROOT) / "generated_configs"
+        config_root = (
+            Path(artifact_dir)
+            if artifact_dir is not None
+            else get_output_dir("benchmarks", REPO_ROOT)
         )
+        config_dir = ensure_dir(config_root / "generated_configs")
         config_path = config_dir / f"{model_key}.json"
         with open(config_path, "w") as f:
             json.dump(cfg["config_overrides"], f, indent=2, sort_keys=True)
@@ -747,8 +809,8 @@ def build_sglang_cmd(
     if save_output:
         cmd.append("--save-output")
     if warmup:
-        cmd.append("--warmup")
-    if torch_compile:
+        cmd.extend(["--warmup-mode", "request"])
+    if torch_compile and not cfg.get("force_eager", False):
         cmd.append("--enable-torch-compile")
     if perf_dump_path:
         cmd.extend(["--perf-dump-path", perf_dump_path])
@@ -771,10 +833,16 @@ def run_benchmark_once(
         perf_dump_path=str(perf_path),
         warmup=warmup,
         torch_compile=torch_compile,
+        artifact_dir=output_dir,
     )
 
     env = os.environ.copy()
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    # Perf dumps are consumed as stage-attributed denoise measurements.  Drain
+    # the device queue at stage boundaries so asynchronous denoise work cannot
+    # leak into a later stage (most visibly DecodingStage).  An explicit 0 in
+    # the caller's environment still opts out for e2e-only experiments.
+    env.setdefault("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "1")
     cfg = MODELS[model_key]
     for key, value in cfg.get("env", {}).items():
         env.setdefault(key, str(value))

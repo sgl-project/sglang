@@ -67,17 +67,20 @@ class CPAttentionBackendKind(IntEnum):
     """Attention backend calling convention used by CP strategy dispatch."""
 
     FLASH_ATTENTION = 0
-    TRTLLM_MHA = 1
+    DSA = 1
+    TRTLLM_MHA = 2
 
     @classmethod
     def from_string(cls, value: str) -> CPAttentionBackendKind:
         if value in ("fa3", "fa4", "flashinfer"):
             return cls.FLASH_ATTENTION
+        if value in ("dsa"):
+            return cls.DSA
         if value == "trtllm_mha":
             return cls.TRTLLM_MHA
         raise ValueError(
             f"Unsupported attention_backend={value!r} for CP strategy; expected one "
-            "of {'fa3', 'fa4', 'flashinfer', 'trtllm_mha'}"
+            "of {'fa3', 'fa4', 'flashinfer', 'dsa', 'trtllm_mha'}"
         )
 
 
@@ -153,6 +156,25 @@ class ContextParallelStrategy(ABC):
             f"{self.name} strategy does not support per-request sharding"
         )
 
+    def shard_local_tokens(self, input_: Any) -> Any:
+        raise NotImplementedError(
+            f"{self.name} strategy does not support local-token sharding"
+        )
+
+    def materialize_full_indexer_k_cache(
+        self, key: Any, forward_batch: ForwardBatch
+    ) -> Any:
+        raise NotImplementedError(
+            f"{self.name} strategy does not support DSA indexer key gather"
+        )
+
+    def all_gather_dsa_trtllm_fp8_kv(
+        self, forward_batch: ForwardBatch, k: Any, k_rope: Any
+    ) -> Any:
+        raise NotImplementedError(
+            f"{self.name} strategy does not support DSA trtllm FP8 KV gather"
+        )
+
     def split_before_forward(
         self,
         forward_batch: ForwardBatch,
@@ -185,12 +207,22 @@ class ContextParallelStrategy(ABC):
     def materialize_full_kv(
         self,
         forward_batch: ForwardBatch,
-        layer: Any,
-        k: Any,
-        v: Any,
+        layer: Any = None,
+        k: Any = None,
+        v: Any = None,
         swa_loc: Optional[Any] = None,
-    ) -> None:
+    ) -> Any:
         """Write full-layout K/V to the backend cache if needed."""
+
+    @abstractmethod
+    def materialize_full_mla_kv(
+        self,
+        forward_batch: ForwardBatch,
+        layer: Any,
+        k_nope: Any,
+        k_rope: Any,
+    ) -> Any:
+        """Materialize full-layout MLA K/V for the strategy."""
 
     def reindex_attn_metadata(self, core_attn_metadata: Any) -> None:
         """Optional attention metadata rewrite for strategies that need it."""
@@ -198,12 +230,15 @@ class ContextParallelStrategy(ABC):
 
 
 def _is_dsa_active() -> bool:
-    from sglang.srt.runtime_context import get_server_args
+    from sglang.srt.runtime_context import get_parallel, get_server_args
 
-    sa = get_server_args()
+    # `_is_dsa_model_arch` is set nowhere in the tree, so this predicate is
+    # inert today (the getattr default makes it False). Kept verbatim rather
+    # than "fixed" here, because deciding what it should name is the CP path's
+    # call; the ratchet exempts it with that reason.
     return bool(
-        getattr(sa, "enable_prefill_cp", False)
-        and getattr(sa, "_is_dsa_model_arch", False)
+        get_parallel().enable_prefill_cp
+        and getattr(get_server_args(), "_is_dsa_model_arch", False)
     )
 
 
@@ -256,7 +291,7 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
             server_args = get_server_args()
         except ValueError:
             return None
-        if server_args is not None and getattr(server_args, "enable_prefill_cp", False):
+        if server_args is not None and get_parallel().enable_prefill_cp:
             init_cp_strategy(server_args)
     return _STRATEGY
 
