@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -30,6 +30,7 @@ def make_config(
     threshold=0.5,
     edit_threshold=0,
     max_post_edit_steps=2,
+    fdfo=False,
     delete_token_id=DELETE,
     split_token_id=SPLIT,
 ):
@@ -43,6 +44,7 @@ def make_config(
         block_size=block_size,
         mask_id=MASK,
         max_running_requests=8,
+        first_done_first_out_mode=fdfo,
         delete_token_id=delete_token_id,
         split_token_id=split_token_id,
     )
@@ -63,6 +65,13 @@ def make_logits(rows, vocab_size=VOCAB_SIZE):
         for rank, token_id in enumerate(candidates):
             logits[row_index, token_id] = 10.0 - rank
     return logits
+
+
+def make_model_output(logits):
+    return SimpleNamespace(
+        logits_output=SimpleNamespace(full_logits=logits),
+        can_run_graph=False,
+    )
 
 
 class TestJointThresholdInDelInitialization(CustomTestCase):
@@ -376,14 +385,24 @@ class TestJointThresholdInDelTermination(CustomTestCase):
         self.assertEqual(done, [True])
         self.assertTrue(torch.equal(batch.input_ids, confirmed_ids))
 
-    def test_hard_limit_runs_one_separate_final_cleanup_update(self):
+    def test_hard_limit_final_cleanup_resolves_all_mask_tokens(self):
         algorithm = JointThresholdInDel(
             make_config(block_size=3, max_post_edit_steps=2)
         )
         batch = make_batch([[3, MASK, MASK]])
         state = algorithm.init_step_state(batch)[0]
         state["num_update_steps"] = algorithm.max_regular_update_steps
-        logits = make_logits([[3], [MASK, SPLIT, 5], [MASK, DELETE, 6]])
+        logits = torch.zeros((3, VOCAB_SIZE))
+        logits[0, 3] = 1.0
+        logits[1, MASK] = 0.3
+        logits[1, SPLIT] = 0.2
+        logits[1, 5] = 0.1
+        logits[2, MASK] = 0.4
+        logits[2, DELETE] = 0.3
+        logits[2, 6] = 0.2
+
+        mask_confidence = logits[1:].softmax(dim=-1).max(dim=-1).values
+        self.assertTrue((mask_confidence < algorithm.threshold).all())
 
         done = algorithm.step(batch, logits, [state])
 
@@ -392,6 +411,7 @@ class TestJointThresholdInDelTermination(CustomTestCase):
         )
         self.assertEqual(done, [False])
         self.assertEqual(batch.input_ids.tolist(), [3, 5, 6])
+        self.assertNotIn(MASK, batch.input_ids.tolist())
         self.assertTrue(state["finished"])
 
     def test_stable_terminal_step_finishes_immediately(self):
@@ -429,6 +449,61 @@ class TestJointThresholdInDelTermination(CustomTestCase):
         self.assertTrue(states[0]["finished"])
         self.assertTrue(states[1]["finished"])
         self.assertEqual(batch.input_ids.view(2, 3)[1].tolist(), [3, 6, 4])
+
+
+class TestJointThresholdInDelFdfo(CustomTestCase):
+    def test_fdfo_run_preserves_state_across_request_retirement(self):
+        algorithm = JointThresholdInDel(
+            make_config(block_size=3, max_post_edit_steps=0, fdfo=True)
+        )
+        model_runner = Mock()
+        model_runner.forward.side_effect = [
+            make_model_output(
+                make_logits(
+                    [
+                        [3],
+                        [4],
+                        [5],
+                        [3],
+                        [6],
+                        [4],
+                    ]
+                )
+            ),
+            make_model_output(make_logits([[3], [7], [4]])),
+            make_model_output(make_logits([[3], [7], [4]])),
+        ]
+
+        batch = make_batch([[3, 4, 5], [3, MASK, 4]])
+        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
+            model_runner, batch
+        )
+
+        self.assertEqual(accept_lengths, [3, 0])
+        self.assertIsNone(algo_states[0])
+        self.assertEqual(next_token_ids[1], [3, 6, 4])
+        surviving_state = algo_states[1]
+        self.assertEqual(surviving_state["num_update_steps"], 1)
+
+        batch = make_batch([next_token_ids[1]])
+        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
+            model_runner, batch, [surviving_state]
+        )
+
+        self.assertEqual(accept_lengths, [0])
+        self.assertEqual(next_token_ids, [[3, 7, 4]])
+        self.assertIs(algo_states[0], surviving_state)
+        self.assertTrue(surviving_state["finished"])
+
+        batch = make_batch(next_token_ids)
+        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
+            model_runner, batch, algo_states
+        )
+
+        self.assertEqual(accept_lengths, [3])
+        self.assertEqual(next_token_ids, [[3, 7, 4]])
+        self.assertEqual(algo_states, [None])
+        self.assertEqual(model_runner.forward.call_count, 3)
 
 
 class TestJointThresholdInDelAntiLoop(CustomTestCase):

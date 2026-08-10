@@ -143,6 +143,8 @@ class JointThresholdInDel(DllmAlgorithm):
             introduced_mask_count = total_mask_count - original_mask_count
 
             state["num_update_steps"] += 1
+            # Consume a cumulative post-edit budget on rounds with no unresolved
+            # original masks; a later MASK reappearance does not reset this budget.
             if original_mask_count == 0:
                 state["post_edit_steps"] += 1
 
