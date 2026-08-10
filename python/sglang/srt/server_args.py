@@ -266,12 +266,8 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+    "megamoe",
 ]
-
-# MegaMoE is an A2A backend, but --moe-runner-backend accepts it as a
-# compatibility alias. Keep it out of the real runner choices used by the
-# speculative model.
-MOE_RUNNER_BACKEND_CLI_CHOICES = [*MOE_RUNNER_BACKEND_CHOICES, "megamoe"]
 
 MOE_A2A_BACKEND_CHOICES = [
     "none",
@@ -418,7 +414,6 @@ def add_grammar_backend_choices(choices):
 
 def add_moe_runner_backend_choices(choices):
     MOE_RUNNER_BACKEND_CHOICES.extend(choices)
-    MOE_RUNNER_BACKEND_CLI_CHOICES.extend(choices)
 
 
 def add_mxfp8_moe_runner_backend_choices(choices):
@@ -2332,7 +2327,7 @@ class ServerArgs:
         str,
         Arg(
             help="Choose the runner backend for MoE.",
-            choices=MOE_RUNNER_BACKEND_CLI_CHOICES,
+            choices=MOE_RUNNER_BACKEND_CHOICES,
             resolvable=True,
         ),
         NS("exec.moe"),
