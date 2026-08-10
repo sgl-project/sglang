@@ -453,8 +453,9 @@ class FlashAttentionImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        padding_start: int | None = None,
     ) -> torch.Tensor:
-        del cu_seqlens_host
+        del cu_seqlens_host, padding_start
         output = flash_attn_varlen_func(
             query,
             key,

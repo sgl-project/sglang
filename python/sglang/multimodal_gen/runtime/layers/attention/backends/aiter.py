@@ -220,8 +220,9 @@ class AITerImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        padding_start: int | None = None,
     ) -> torch.Tensor:
-        del cu_seqlens_host
+        del cu_seqlens_host, padding_start
         if USE_AITER_GFX942:
             # The grouped-varlen ASM kernel hangs on H3's ~64K packed
             # sequences on gfx942; AITER's Triton path handles this shape.

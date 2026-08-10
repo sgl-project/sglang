@@ -498,6 +498,11 @@ def _minimax_h3_attention_core_impl(
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
         cu_seqlens_host=cu_seqlens_host,
+        padding_start=(
+            cu_seqlens_host[1]
+            if cu_seqlens_host is not None and len(cu_seqlens_host) == 3
+            else None
+        ),
     )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]

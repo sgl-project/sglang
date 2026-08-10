@@ -246,19 +246,13 @@ class LaserAttentionImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        padding_start: int | None = None,
     ) -> torch.Tensor:
+        del max_seqlen
         bounds = (
             cu_seqlens_host
             if cu_seqlens_host is not None
             else tuple(int(item) for item in cu_seqlens.tolist())
-        )
-        padding_start = (
-            bounds[1]
-            if len(bounds) == 3
-            and bounds[0] == 0
-            and bounds[1] == max_seqlen
-            and bounds[-1] == query.shape[0]
-            else None
         )
         # Packed segments are independent; a single dense call would let real
         # tokens attend alignment padding in MiniMax-H3.

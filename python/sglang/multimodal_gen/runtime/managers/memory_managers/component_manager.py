@@ -447,10 +447,10 @@ class ComponentResidencyManager:
         if should_keep:
             return
         strategy = self.strategy_for(use.component_name, module)
-        was_on_supported_accelerator = self._module_on_supported_accelerator(module)
+        was_on_supported_device = self._module_on_supported_device(module)
         strategy.finish_use(module, use, self.state)
         self._empty_cache_after_large_release(
-            use, strategy, module, was_on_supported_accelerator
+            use, strategy, module, was_on_supported_device
         )
 
     def finish_request(self) -> None:
@@ -474,12 +474,12 @@ class ComponentResidencyManager:
             if preferred and not self.state.batch_is_warmup:
                 strategy.prepare_after_request(module, use, self.state)
             else:
-                was_on_supported_accelerator = self._module_on_supported_accelerator(
+                was_on_supported_device = self._module_on_supported_device(
                     module
                 )
                 strategy.finish_request(module, use, self.state, preferred=preferred)
                 self._empty_cache_after_large_release(
-                    use, strategy, module, was_on_supported_accelerator
+                    use, strategy, module, was_on_supported_device
                 )
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
@@ -607,7 +607,7 @@ class ComponentResidencyManager:
         buffer = next(module.buffers(), None)
         return buffer.device.type if buffer is not None else None
 
-    def _module_on_supported_accelerator(self, module: nn.Module | None) -> bool:
+    def _module_on_supported_device(self, module: nn.Module | None) -> bool:
         return current_platform.is_accelerator_device_type(self._module_device(module))
 
     def _empty_cache_after_large_release(
@@ -615,14 +615,14 @@ class ComponentResidencyManager:
         use: ComponentUse,
         strategy: ComponentResidencyStrategy,
         module: nn.Module,
-        was_on_supported_accelerator: bool,
+        was_on_supported_device: bool,
     ) -> None:
         """explicitly empty cache after potential release of large component"""
         if not use.memory_intensive:
             return
         released_accelerator_storage = (
-            was_on_supported_accelerator
-            and not self._module_on_supported_accelerator(module)
+            was_on_supported_device
+            and not self._module_on_supported_device(module)
         )
         released_layerwise_storage = isinstance(strategy, LayerwiseOffloadStrategy)
         if not (released_accelerator_storage or released_layerwise_storage):

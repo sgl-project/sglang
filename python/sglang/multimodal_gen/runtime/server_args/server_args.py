@@ -770,18 +770,6 @@ class ServerArgs(DisaggServerArgsMixin):
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
-        if (
-            self.backend != Backend.DIFFUSERS
-            and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend == "laser_attn"
-            and "text_encoder" not in self.component_attention_backends
-        ):
-            logger.info(
-                "Automatically set torch_sdpa backend for the MiniMax H3 text "
-                "encoder; laser_attn applies to the transformer"
-            )
-            self.component_attention_backends["text_encoder"] = "torch_sdpa"
-
         if self.ring_degree > 1:
             if self.attention_backend is not None and self.attention_backend not in (
                 "fa",
