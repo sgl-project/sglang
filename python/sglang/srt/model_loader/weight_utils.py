@@ -341,7 +341,9 @@ def get_quant_config(
     # TODO: standardize the handling of online quantization with custom handlenames (mxfp8, quark_mxfp4, etc.)
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
-            return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+            if not issubclass(quant_cls, Fp8Config):
+                quant_cls = Fp8Config
+            return quant_cls(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         if model_config.quantization == "quark_mxfp4":
             return quant_cls(
                 online_scheme=model_config.quantization,
@@ -358,9 +360,9 @@ def get_quant_config(
         if model_config.quantization == "modelopt_fp4":
             # Without serialized metadata, quantize MoE expert weights online;
             # leave dense layers in source precision.
-            return ModelOptFp4Config.for_online_weight_quantization(
-                packed_modules_mapping
-            )
+            if not issubclass(quant_cls, ModelOptFp4Config):
+                quant_cls = ModelOptFp4Config
+            return quant_cls.for_online_weight_quantization(packed_modules_mapping)
         raise ValueError(f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
         raise ValueError(
@@ -394,10 +396,14 @@ def get_quant_config(
                     )
                 return None
             elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
-                return ModelOptFp8Config.from_config(config)
+                if not issubclass(quant_cls, ModelOptFp8Config):
+                    quant_cls = ModelOptFp8Config
+                return quant_cls.from_config(config)
             elif "FP4" in quant_algo:
+                if not issubclass(quant_cls, ModelOptFp4Config):
+                    quant_cls = ModelOptFp4Config
                 return _resolve_explicit_draft_quant_config(
-                    model_config, ModelOptFp4Config.from_config(config)
+                    model_config, quant_cls.from_config(config)
                 )
         return _resolve_explicit_draft_quant_config(
             model_config, quant_cls.from_config(config)
