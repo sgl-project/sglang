@@ -67,16 +67,17 @@ def _get_state() -> Optional[_State]:
 
         if get_device_sm() not in (100, 103):
             return None
-        server_args = ctx.get_server_args()
-        if server_args.enable_symm_mem or server_args.moe_a2a_backend != "none":
+        symm_mem = ctx.get_exec().comm.enable_symm_mem
+        a2a_backend = ctx.get_exec().moe.moe_a2a_backend
+        if symm_mem or a2a_backend != "none":
             logger.info(
                 "K3 all-reduce fusion auto-probe: skipping "
                 "(enable_symm_mem=%s, moe_a2a_backend=%s; under symm-mem the "
                 "allocator contexts conflict, and under EP a2a the model's "
                 "symm-pool allocation contract does not hold on every AR "
                 "call-site. Set SGLANG_K3_AR_FUSION=1 to force.)",
-                server_args.enable_symm_mem,
-                server_args.moe_a2a_backend,
+                symm_mem,
+                a2a_backend,
             )
             return None
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -131,11 +132,11 @@ _BUFS: List[_Buffer] = []
 @cache_once
 def _max_buffer_rows() -> int:
     """Rows to reserve per buffer: the largest batch the server args allow."""
-    server_args = ctx.get_server_args()
-    chunked = server_args.chunked_prefill_size
+    schedule = ctx.get_schedule()
+    chunked = schedule.chunked_prefill_size
     if chunked is not None and chunked > 0:
         return int(chunked)
-    return int(server_args.max_prefill_tokens or 0)
+    return int(schedule.max_prefill_tokens or 0)
 
 
 def _create_buffer(

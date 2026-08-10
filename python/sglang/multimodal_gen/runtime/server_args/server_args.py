@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -133,6 +134,8 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
+        "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
+        "sana1.5_1.6b_1024px_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "glm-image",
@@ -143,6 +146,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
+        "lightricks/ltx-2",
+        "ltx-2",
         "minimax-h3",
         "minimaxai/minimax-h3",
         "qwen/qwen-image",
@@ -161,8 +166,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
+        "LTX2PipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
+        "SanaPipelineConfig",
         "ZImagePipelineConfig",
     }
 )
@@ -218,6 +225,12 @@ class ServerArgs(DisaggServerArgsMixin):
     performance_mode: str = "auto"
     base_gpu_id: int = 0
     gpu_ids: list[int] | None = None
+    # cross-node: num_gpus is the total world size across all nodes; each
+    # node runs num_gpus // nnodes local GPU workers (mirrors srt's
+    # tp_size_per_node convention)
+    nnodes: int = 1
+    node_rank: int = 0
+    dist_init_addr: str | None = None
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -344,6 +357,12 @@ class ServerArgs(DisaggServerArgsMixin):
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
+    )
+
+    # KV-cache quantization (Quant-VideoGen PRQ). Off by default; mirrors the
+    # SRT --kv-cache-dtype pattern (typed config, not a pile of env vars).
+    kv_cache_quant_config: QVGKVQuantArgs = field(
+        default_factory=QVGKVQuantArgs, repr=False
     )
 
     # Master port for distributed inference
@@ -530,11 +549,16 @@ class ServerArgs(DisaggServerArgsMixin):
         # latent shape, so the user must declare the resolutions up front. We
         # capture every one of them at warmup; serving then never re-captures.
         if not self.warmup_resolutions:
-            raise ValueError(
-                "--enable-breakable-cuda-graph requires --warmup-resolutions: "
-                "diffusion CUDA graphs only replay for a fixed resolution, so "
-                "every served resolution must be declared and captured at "
-                "warmup, e.g. --warmup-resolutions 1024x1024 1328x1328."
+            # No explicit resolutions: capture the model's default warmup
+            # resolution (derived by build_warmup_reqs) so
+            # --enable-breakable-cuda-graph works standalone. BCG graphs are
+            # resolution-specific; a request at any other resolution simply
+            # falls back to eager (the runner never re-captures at serving
+            # time). Pass --warmup-resolutions to capture additional shapes.
+            logger.info(
+                "[Diffusion BCG] --warmup-resolutions unset; capturing the "
+                "model default warmup resolution. Requests at other "
+                "resolutions run eager."
             )
         if self.bcg_text_buckets is not None and not any(
             int(b) > 0 for b in self.bcg_text_buckets
@@ -553,11 +577,13 @@ class ServerArgs(DisaggServerArgsMixin):
             pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
             and self._is_breakable_cuda_graph_supported_model()
         ):
+            if not self.warmup_resolutions:
+                self._default_bcg_warmup_resolution()
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+            "[Diffusion BCG] disabled for %s: only Ideogram-4, Lightricks/LTX-2, MiniMax-H3, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
             "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
             "currently supported.",
             pipeline_config_name,
@@ -568,6 +594,39 @@ class ServerArgs(DisaggServerArgsMixin):
         refs = _normalized_bcg_model_refs(self.model_id)
         refs.update(_normalized_bcg_model_refs(self.model_path))
         return bool(refs & BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
+
+    def _default_bcg_warmup_resolution(self) -> None:
+        """Seed --warmup-resolutions with the model default for BCG.
+
+        BCG graphs are resolution-specific and captured at warmup. When the
+        user does not pre-declare resolutions we capture the model's default
+        warmup resolution so --enable-breakable-cuda-graph works standalone;
+        requests at any other resolution fall back to eager.
+        """
+        from sglang.multimodal_gen.runtime.warmup_request_builder import (
+            _resolve_default_warmup_resolution,
+            get_model_sampling_defaults,
+        )
+
+        try:
+            sampling_defaults = get_model_sampling_defaults(self)
+            width, height = _resolve_default_warmup_resolution(
+                self, sampling_defaults, server_based_warmup=True
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[Diffusion BCG] could not derive a default warmup resolution "
+                "(%s); no graph will be captured and serving runs eager.",
+                exc,
+            )
+            return
+        self.warmup_resolutions = [f"{width}x{height}"]
+        logger.info(
+            "[Diffusion BCG] --warmup-resolutions unset; capturing the model "
+            "default %dx%d. Requests at other resolutions run eager.",
+            width,
+            height,
+        )
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -1462,6 +1521,27 @@ class ServerArgs(DisaggServerArgsMixin):
             "to place role instances on specific GPUs without CUDA_VISIBLE_DEVICES.",
         )
         parser.add_argument(
+            "--nnodes",
+            type=int,
+            default=ServerArgs.nnodes,
+            help="The number of nodes for cross-node parallelism. --num-gpus is "
+            "the total GPU count across all nodes; each node runs "
+            "num_gpus // nnodes local workers.",
+        )
+        parser.add_argument(
+            "--node-rank",
+            type=int,
+            default=ServerArgs.node_rank,
+            help="The rank of this node among --nnodes nodes, in [0, nnodes).",
+        )
+        parser.add_argument(
+            "--dist-init-addr",
+            type=str,
+            default=ServerArgs.dist_init_addr,
+            help="The host:port distributed rendezvous address, reachable from "
+            "every node. Required when --nnodes > 1.",
+        )
+        parser.add_argument(
             "--gpu-ids",
             nargs="+",
             default=None,
@@ -1779,6 +1859,67 @@ class ServerArgs(DisaggServerArgsMixin):
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
+        )
+
+        # KV-cache quantization (Quant-VideoGen PRQ)
+        parser.add_argument(
+            "--kv-cache-quant",
+            type=str,
+            default=None,
+            choices=["off", "int4", "int2"],
+            help="Enable Quant-VideoGen PRQ KV-cache quantization (off|int4|int2). "
+            "Defaults reproduce the tuned per-chunk config (stages=1, "
+            "centroids=128, block=64, symmetric, iters=2, recent=1, "
+            "per-chunk sink).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-centroids",
+            type=int,
+            default=None,
+            help="PRQ k-means centroids per stage (default 128).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-block-size",
+            type=int,
+            default=None,
+            help="PRQ residual scale block size (default 64).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-stages",
+            type=int,
+            default=None,
+            help="PRQ k-means stages (default 1).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-iters",
+            type=int,
+            default=None,
+            help="PRQ k-means iterations (default 2).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-asymmetric",
+            action="store_true",
+            default=None,
+            help="Use KIVI-style asymmetric residual quantization.",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-keep-recent",
+            type=int,
+            default=None,
+            help="Completed chunks kept bf16 before quantizing (default 1).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-sink",
+            type=int,
+            default=None,
+            choices=[0, 1],
+            help="Quantize the attention sink too (1, default) " "or keep it bf16 (0).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-sink-keep",
+            type=int,
+            default=None,
+            help="Leading sink chunks kept bf16 forever (default 0).",
         )
 
         # quantization
@@ -2278,6 +2419,19 @@ class ServerArgs(DisaggServerArgsMixin):
             elif attr == "nunchaku_config":
                 nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
                 server_args_kwargs["nunchaku_config"] = nunchaku_config
+            elif attr == "kv_cache_quant_config":
+                kv_quant_config = kwargs.get("kv_cache_quant_config")
+                if kv_quant_config is None:
+                    kv_quant_config = QVGKVQuantArgs.from_dict(kwargs)
+                elif isinstance(kv_quant_config, dict):
+                    kv_quant_config = QVGKVQuantArgs(**kv_quant_config).validate()
+                elif isinstance(kv_quant_config, QVGKVQuantArgs):
+                    kv_quant_config.validate()
+                else:
+                    raise TypeError(
+                        "kv_cache_quant_config must be QVGKVQuantArgs or a dict"
+                    )
+                server_args_kwargs["kv_cache_quant_config"] = kv_quant_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
@@ -2488,6 +2642,19 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"kv_gather_degree ({self.kv_gather_degree}) must equal "
                 f"sp_degree ({self.sp_degree}); check how many GPUs remain for "
                 "sequence parallelism after dp/tp/cfg"
+            )
+
+        if self.nnodes < 1:
+            raise ValueError("--nnodes must be a natural number")
+        if not (0 <= self.node_rank < self.nnodes):
+            raise ValueError(
+                f"--node-rank ({self.node_rank}) must be in [0, nnodes={self.nnodes})"
+            )
+        if self.nnodes > 1 and self.dist_init_addr is None:
+            raise ValueError("--dist-init-addr is required when --nnodes > 1")
+        if self.num_gpus % self.nnodes != 0:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be divisible by nnodes ({self.nnodes})"
             )
 
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:

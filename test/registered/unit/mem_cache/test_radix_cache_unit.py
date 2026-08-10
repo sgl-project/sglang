@@ -31,6 +31,7 @@ from array import array
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -391,23 +392,7 @@ class TestRadixCache(unittest.TestCase):
         )
         self.assertEqual(cache.total_size(), 5)
 
-    def test_cache_unfinished_req_deferred_free_keeps_original_indices(self):
-        class DeferredFreeAllocator:
-            device = torch.device("cpu")
-
-            def __init__(self):
-                self.free_group = []
-                self.freed = None
-
-            def free_group_begin(self):
-                self.free_group = []
-
-            def free_segment(self, free_index, *, start_pos):
-                self.free_group.append(free_index)
-
-            def free_group_end(self):
-                self.freed = torch.cat(self.free_group)
-
+    def test_cache_unfinished_req_deferred_free_owns_original_indices(self):
         class ReqToTokenPool:
             def __init__(self, row):
                 self.req_to_token = row.unsqueeze(0)
@@ -415,11 +400,19 @@ class TestRadixCache(unittest.TestCase):
             def write(self, indices, values):
                 self.req_to_token[indices] = values
 
-        allocator = DeferredFreeAllocator()
+        allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
         cache = RadixCache.create_simulated(mock_allocator=allocator)
         token_ids = array("q", [1, 2, 3])
-        tree_indices = torch.tensor([10, 11, 12], dtype=torch.int64)
-        request_indices = torch.tensor([20, 21, 22], dtype=torch.int64)
+        tree_indices = allocator.alloc(3)
+        request_indices = allocator.alloc(3)
+        assert tree_indices is not None
+        assert request_indices is not None
         cache.insert(
             InsertParams(
                 key=RadixKey(array("q", token_ids)),
@@ -436,11 +429,16 @@ class TestRadixCache(unittest.TestCase):
         )
         req.get_fill_ids.return_value = token_ids
 
+        available_before_free = allocator.available_size()
         allocator.free_group_begin()
         cache.cache_unfinished_req(req)
         allocator.free_group_end()
 
-        torch.testing.assert_close(allocator.freed, request_indices)
+        self.assertEqual(
+            allocator.available_size(),
+            available_before_free + request_indices.numel(),
+        )
+        torch.testing.assert_close(allocator.free_pages[-3:], request_indices)
         torch.testing.assert_close(
             cache.req_to_token_pool.req_to_token[0], tree_indices
         )

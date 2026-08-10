@@ -309,6 +309,8 @@ class DeepseekModelNextN(nn.Module):
 
 
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
+    # The draft checkpoint reports the NextN architecture name.
+    fused_shared_experts_architecture = "DeepseekV3ForCausalLMNextN"
 
     # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
     # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
@@ -343,7 +345,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
-        self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
+        self.determine_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.mla_enable_prefill_cp = is_mla_prefill_cp_enabled() and not self.use_dsa
