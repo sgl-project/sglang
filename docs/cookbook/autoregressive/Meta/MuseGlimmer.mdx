@@ -19,9 +19,11 @@ See the [official SGLang installation guide](../../../docs/get-started/install) 
 ```bash Command
 pip install --upgrade pip
 pip install uv
-# Muse Glimmer support is not in a release yet -- install the commit from
+# Muse Glimmer support is not in a release yet -- build the PR branch:
 # https://github.com/sgl-project/sglang/pull/34262
-uv pip install "sglang[all] @ git+https://github.com/sgl-project/sglang@caa91b7d01ca610bb2e37bc095af6e427aa7e358#subdirectory=python"
+git clone -b muse-glimmer https://github.com/sgl-project/sglang.git
+cd sglang
+uv pip install -e "python[all]"
 ```
 
 Run the **Python** output of the command panel below in that environment.
