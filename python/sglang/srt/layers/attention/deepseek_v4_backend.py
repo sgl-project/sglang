@@ -279,6 +279,13 @@ class DSV4AttnMetadata:
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
+                # Built lazily by the eager _forward_trtllm_prefill, so they
+                # are None on every metadata that reaches a graph replay; two
+                # of them are tuples, which content-copy cannot handle.
+                "trtllm_prefill_qmeta",
+                "trtllm_prefill_swa_lens",
+                "trtllm_prefill_c4_indices",
+                "trtllm_prefill_c128",
             ],
         )
 
