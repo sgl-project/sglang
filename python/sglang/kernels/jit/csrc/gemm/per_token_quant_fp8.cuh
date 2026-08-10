@@ -99,7 +99,7 @@ __global__ void per_token_quant_fp8_cta_kernel(
     output_s[token_id] = scale_smem;
   }
   __syncthreads();
-  const float scale_inv = scale_smem == 0.0f ? 0.0f : 1.0f / scale_smem;
+  const float scale_inv = 1.0f / scale_smem;
 
   for (uint32_t i = threadIdx.x; i < num_vecs; i += blockDim.x) {
     input_vec_t input_vec;
@@ -135,15 +135,18 @@ template <typename T>
 void per_token_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
   using namespace host;
   auto M = SymbolicSize{"num_tokens"};
+  auto MOutput = SymbolicSize{"output_num_tokens"};
   auto K = SymbolicSize{"hidden_dim"};
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
 
   TensorMatcher({M, K}).with_dtype<T>().with_device(device).verify(input);
-  TensorMatcher({M, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(output_q);
-  TensorMatcher({M, 1}).with_dtype<float>().with_device(device).verify(output_s);
+  TensorMatcher({MOutput, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(output_q);
+  TensorMatcher({MOutput, 1}).with_dtype<float>().with_device(device).verify(output_s);
 
   CHECK_HOST(M.unwrap() > 0) << "per_token_quant_fp8: num_tokens must be positive";
+  CHECK_HOST(MOutput.unwrap() >= M.unwrap())
+      << "per_token_quant_fp8: output buffers must have at least " << M.unwrap() << " rows, got " << MOutput.unwrap();
   CHECK_HOST(K.unwrap() > 0 && K.unwrap() % 4 == 0)
       << "per_token_quant_fp8: hidden_dim must be positive and divisible by 4, got " << K.unwrap();
   CHECK_HOST(M.unwrap() <= UINT32_MAX && K.unwrap() <= UINT32_MAX)
