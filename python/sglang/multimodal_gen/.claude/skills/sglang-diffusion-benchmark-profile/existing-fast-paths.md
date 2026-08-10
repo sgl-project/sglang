@@ -25,6 +25,8 @@ framework-specific optimization workflow.
 - `python/sglang/kernels/ops/diffusion/triton/zimage_native_norm.py`
 - `python/sglang/kernels/ops/diffusion/triton/rotary.py`
 - `python/sglang/kernels/ops/diffusion/triton/ltx2_rotary.py`
+- `python/sglang/kernels/ops/diffusion/ltx2_qknorm_split_rope.py`
+- `python/sglang/kernels/ops/diffusion/ltx2_rmsnorm_modulate.py`
 - `python/sglang/kernels/ops/diffusion/triton/indexed_modulation.py`
 - `python/sglang/kernels/ops/diffusion/triton/ulysses_qkv.py`
 - `python/sglang/kernels/ops/diffusion/usp_relayout.py`
@@ -49,6 +51,7 @@ framework-specific optimization workflow.
 - `test/registered/kernels/ops/diffusion/test_glm_image_ln_modulate.py`
 - `test/registered/kernels/ops/diffusion/test_sana_ln_modulate.py`
 - `test/registered/kernels/ops/diffusion/test_quality_gate.py`
+- `test/registered/kernels/ops/diffusion/test_ltx2_rms_norm_modulate.py`
 - `test/registered/kernels/ops/diffusion/test_bitexact_gate.py`
 - `test/registered/kernels/ops/diffusion/test_wan_causal_cache.py`
 - `test/registered/kernels/ops/diffusion/test_stage_profiler_sync.py`
@@ -305,6 +308,12 @@ framework-specific optimization workflow.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.
 - LTX2 split RoPE: `apply_ltx2_split_rotary_emb` in `ltx_2.py`.
+- LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="high"`:
+  `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
+  `kernels/ops/diffusion/ltx2_rmsnorm_modulate.py` (mount-based
+  `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
+  kernel is <=1 ULP off aten, so it is request-gated instead of verified),
+  wired at the six `LTX2TransformerBlock` adaLN sites in `ltx_2.py`.
 - LTX2 residual-gate add: `ltx_2.py` calls `residual_gate_add` from
   `kernels/ops/diffusion/residual_gate_add.py` directly for attention,
   cross-attention, and MLP residual updates.
