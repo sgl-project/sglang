@@ -29,7 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import LazyValue, add_prefix
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,13 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     packed_modules_mapping = qwen3_5.Qwen3_5ForCausalLM.packed_modules_mapping
     supported_lora_modules = qwen3_5.Qwen3_5ForCausalLM.supported_lora_modules
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # The body decides; it is handed this config and quantization verbatim.
+        return cls.body_cls.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
 
     def __init__(
         self,
@@ -73,7 +80,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     quant_config=quant_config,
                     org_num_embeddings=config.vocab_size,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()

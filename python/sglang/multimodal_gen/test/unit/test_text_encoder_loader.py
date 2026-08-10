@@ -7,6 +7,9 @@ import transformers
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
 )
+from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
+    MiniMaxH3Qwen3VLEncoder,
+)
 
 
 class TestTextEncoderClassResolution(unittest.TestCase):
@@ -77,6 +80,26 @@ class TestTextEncoderClassResolution(unittest.TestCase):
                 "dummy/path", self.server_args
             )
         self.assertIs(cls, transformers.AutoModel)
+
+
+class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
+    def test_only_known_unconsumed_weights_are_filtered(self):
+        should_load = MiniMaxH3Qwen3VLEncoder.should_materialize_checkpoint_weight
+        expected = {
+            "model.language_model.layers.49.self_attn.q_proj.weight": True,
+            "model.language_model.layers.50.self_attn.q_proj.weight": False,
+            "model.language_model.layers.63.mlp.down_proj.weight": False,
+            "model.language_model.norm.weight": False,
+            "lm_head.weight": False,
+            "model.language_model.rotary_emb.inv_freq": False,
+            "model.visual.blocks.0.attn.qkv.weight": True,
+            "language_model.layers.63.mlp.down_proj.weight": True,
+            "module.model.language_model.layers.63.mlp.down_proj.weight": True,
+        }
+        self.assertEqual(
+            {name: should_load(name) for name in expected},
+            expected,
+        )
 
 
 if __name__ == "__main__":

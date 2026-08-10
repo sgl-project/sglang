@@ -56,7 +56,7 @@ impl Default for RuntimeConfig {
 }
 
 /// The scheduler's startup blob (`RustServer._build_server_args`) parsed once into
-/// typed fields: values are post-`__post_init__`, unknown keys (e.g. `api_key`) are dropped.
+/// typed fields: values are post-`__post_init__`; unrelated unknown keys are dropped.
 #[derive(Debug, serde::Deserialize)]
 pub struct ServerArgs {
     /// HF repo id / local dir of the model, reported by `/get_model_info`.
@@ -83,6 +83,21 @@ pub struct ServerArgs {
     pub log_level: String,
     #[serde(default)]
     pub log_level_http: Option<String>,
+    /// Optional built-in chat-template name or path to a Jinja/legacy JSON
+    /// template file. Without an override, uses the tokenizer config template.
+    #[serde(default)]
+    pub chat_template: Option<String>,
+    /// Parser selected by `--tool-call-parser`.
+    #[serde(default)]
+    pub tool_call_parser: Option<String>,
+    /// Reasoning splitter selected by `--reasoning-parser` (e.g. deepseek-r1).
+    /// When set, chat completions strip the model's reasoning markers out of
+    /// `content` into `reasoning_content` — both unary and streaming.
+    #[serde(default)]
+    pub reasoning_parser: Option<String>,
+    /// Python's global default for whether an SSE stream ends with a usage chunk.
+    #[serde(default)]
+    pub stream_response_default_include_usage: bool,
     /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
     #[serde(default = "default_worker_num")]
     pub tokenizer_worker_num: usize,
@@ -96,6 +111,11 @@ pub struct ServerArgs {
     /// text. Matches the Python `TokenizerManager`.
     #[serde(default)]
     pub incremental_streaming_output: bool,
+    /// PD-disaggregation role: `"null"` (unified), `"prefill"`, or `"decode"`.
+    /// (On prefill, the KV bootstrap registry is mounted on the api router —
+    /// see [`Self::enable_pd_bootstrap`].)
+    #[serde(default = "default_disaggregation_mode")]
+    pub disaggregation_mode: String,
     /// The resolved Python `ModelConfig`, attached to the blob at dump time.
     #[serde(default)]
     pub model_config: ModelConfig,
@@ -138,6 +158,50 @@ pub struct ModelConfig {
     /// boot ([`ServerArgs::validate_mandatory`]).
     #[serde(default)]
     pub vocab_size: Option<u64>,
+    /// Whether the model accepts multimodal inputs. Gates the MM Encoding branch
+    /// in tm-ingress; `false` silently ignores mm fields, as the Python
+    /// `TokenizerManager` does with `mm_processor is None`.
+    #[serde(default)]
+    pub is_multimodal: bool,
+    /// Resolved default sampling parameters, stamped by
+    /// `RustServer._build_server_args` from Python's
+    /// `ModelConfig.get_default_sampling_params()`. Already gated on
+    /// `--sampling-defaults`: holds the model's generation_config.json values
+    /// in "model" mode, and is empty in "openai" mode. Consumed when a chat
+    /// request omits `temperature`/`top_p` — the conversion must not skip
+    /// straight to the OpenAI terminal defaults.
+    #[serde(default)]
+    pub default_sampling_params: DefaultSamplingParams,
+}
+
+/// One `SamplingParams` field per key `get_default_sampling_params()` may emit
+/// (`repetition_penalty`, `temperature`, `top_k`, `top_p`, `min_p`), filtered
+/// to values the generation config actually sets — hence all `Option`.
+///
+/// `top_k` / `min_p` / `repetition_penalty` are parsed for parity with the
+/// Python dict but not yet consumed: the Dynamo chat request type only carries
+/// `temperature` and `top_p`, so the conversion resolves just those two.
+#[derive(Debug, Default, serde::Deserialize)]
+#[allow(dead_code)]
+pub struct DefaultSamplingParams {
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f64>,
+}
+
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}") // bare IPv6 (`::`) needs brackets to bind
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn default_host() -> String {
@@ -148,6 +212,9 @@ fn default_port() -> u16 {
 }
 fn default_log_level() -> String {
     "info".into()
+}
+fn default_disaggregation_mode() -> String {
+    "null".into()
 }
 fn default_worker_num() -> usize {
     1
@@ -170,13 +237,43 @@ impl ServerArgs {
         if self.model_config.vocab_size.is_none() {
             return Err("no resolvable vocab size (model_config.vocab_size)".into());
         }
+        if !matches!(
+            self.disaggregation_mode.as_str(),
+            "null" | "prefill" | "decode"
+        ) {
+            return Err(format!(
+                "unknown disaggregation_mode '{}' in server_args",
+                self.disaggregation_mode
+            ));
+        }
         Ok(())
     }
 
+    /// True on a prefill or decode node — requests need bootstrap routing.
+    pub fn is_disaggregation(&self) -> bool {
+        self.disaggregation_mode != "null"
+    }
+
+    /// Serve the PD KV bootstrap registry on the api listener: every prefill
+    /// rust server hosts it, unconditionally — no extra topology gating. KV
+    /// managers and decode nodes reach the registry at the resolved
+    /// `disaggregation_bootstrap_port`, which rust-server mode aliases to the
+    /// api port, so whichever prefill server that port names is the one that
+    /// receives the registrations.
+    pub fn enable_pd_bootstrap(&self) -> bool {
+        self.disaggregation_mode == "prefill"
+    }
+
+    /// Whether the served model is multimodal, from the scheduler's dump. See
+    /// [`ModelConfig::is_multimodal`].
+    pub fn model_is_multimodal(&self) -> bool {
+        self.model_config.is_multimodal
+    }
+
     /// Bind address `host:port`. `host` is expected to be an IP — the result is
-    /// parsed as a `SocketAddr`.
+    /// parsed as a `SocketAddr`, so a bare IPv6 host gets bracketed.
     pub fn bind(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        join_host_port(&self.host, self.port)
     }
 
     /// Whether the HTTP access log is emitted, mirroring the Python server:

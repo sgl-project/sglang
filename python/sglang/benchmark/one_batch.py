@@ -322,13 +322,14 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         attn_tp_size=attn_tp_size,
         attn_cp_rank=0,
         attn_cp_size=server_args.attn_cp_size,
+        attn_dcp_rank=tp_rank % server_args.dcp_size,
+        attn_dcp_size=server_args.dcp_size,
         attn_dp_rank=attn_dp_rank,
         attn_dp_size=attn_dp_size,
         moe_ep_rank=moe_ep_rank,
         moe_ep_size=server_args.ep_size,
         moe_dp_rank=None,
         moe_dp_size=server_args.moe_dp_size,
-        dcp_size=server_args.dcp_size,
         gpu_id=gpu_id,
     )
     runner_kwargs = dict(
@@ -536,6 +537,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
     if require_mlp_sync(model_runner.server_args):
         prepare_mlp_sync_batch_raw(
             batch,
+            model_runner=model_runner,
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=get_parallel().attn_tp_size,
             attn_cp_size=model_runner.ps.attn_cp_size,

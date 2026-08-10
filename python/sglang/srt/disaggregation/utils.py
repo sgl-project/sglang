@@ -218,6 +218,13 @@ def poll_and_all_reduce_with_staging(
     receivers = [dr.kv_receiver for dr in decode_reqs]
     raw_polls = _poll_with_failure_injection(receivers)
     for i, decode_req in enumerate(decode_reqs):
+        if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
+            decode_req
+        ):
+            # Staging completion timed out; KVPoll.Failed == 0 propagates
+            # through the MIN all_reduce.
+            raw_polls[i] = int(KVPoll.Failed)
+            continue
         if raw_polls[i] == int(KVPoll.Success):
             if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
                 decode_req
@@ -932,6 +939,31 @@ def build_transfer_entry_pairs(
             f"both peers; got src={n_src} dst={n_dst} entries"
         )
     return [(i, i) for i in range(n_src)]
+
+
+def resolve_dcp_dst_entry_indices(
+    src_layer_ids: List[int],
+    dst_layer_ids: List[int],
+    n_src: int,
+    n_dst: int,
+) -> List[int]:
+    """Destination entry index for each local KV entry, for a DCP relayout.
+
+    DCP re-splits the KV by context while PP re-splits it by layer, so the two
+    index spaces only line up when neither peer is pipelined. Both backends
+    need the same resolution, hence the shared helper.
+    """
+    if not src_layer_ids and not dst_layer_ids:
+        # Legacy/non-PP layout. n_dst may exceed n_src when the decode side
+        # runs speculative decoding and the prefill side does not.
+        return list(range(n_src))
+    # A one-sided mapping is rejected by build_transfer_entry_pairs itself.
+    return [
+        j
+        for _, j in build_transfer_entry_pairs(
+            src_layer_ids, dst_layer_ids, n_src, n_dst
+        )
+    ]
 
 
 def append_state_component(

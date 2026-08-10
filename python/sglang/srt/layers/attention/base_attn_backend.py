@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -9,10 +10,24 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+    from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+        BaseIndexerMetadata,
+    )
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+class SharedReadBoundary(Enum):
+    """Where a backend's scheduler-shared reads end, relative to the replay;
+    the WAR read-done record must land at or after this point. IN_REPLAY
+    means at the captured (in-graph) metadata init."""
+
+    PRE_REPLAY = auto()
+    IN_REPLAY = auto()
+    POST_REPLAY = auto()
+    UNKNOWN = auto()  # not audited -> coarse whole-forward fence
 
 
 class AttentionBackend(ABC):
@@ -98,12 +113,28 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # True for backends that preallocate per-seq extend metadata at req-pool
+    # size (e.g. triton's kv_indptr): dummy extend batches must then keep
+    # batch_size <= req_to_token_pool.size.
+    extend_dummy_seqs_capped_by_req_pool: bool = False
+
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata
     # tensors to kernels across graph breaks, so the captured graph depends on
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
+    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
+        """Declare where this backend's scheduler-shared reads end per mode.
+
+        Decode/verify default to IN_REPLAY: the out-graph/in-graph init
+        contract above makes it a safe upper bound for any backend honoring
+        the contract. Override for audited deviations.
+        """
+        if forward_mode.is_decode() or forward_mode.is_target_verify():
+            return SharedReadBoundary.IN_REPLAY
+        return SharedReadBoundary.UNKNOWN
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not
@@ -166,21 +197,10 @@ class AttentionBackend(ABC):
         """
         pass
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        """
-        Return buffers of verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
-        """
-        return [None, None]
-
-    def target_verify_reads_custom_mask(self) -> bool:
-        """Whether target-verify attention reads spec_info.custom_mask at all.
-
-        When False, build_tree_kernel_efficient skips the full-buffer prefix
-        fill (max_num_tokens x max_context_len bool memset per verify step).
-        """
-        return True
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        """The mask the draft stage fills in place, if this backend has one."""
+        return None
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
