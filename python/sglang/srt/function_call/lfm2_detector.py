@@ -381,12 +381,12 @@ class Lfm2Detector(BaseFormatDetector):
                 return _PYTHONIC_NAME_LITERALS[val.id]
             except KeyError:
                 raise ValueError(f"Unsupported name reference: {val.id}") from None
-        elif isinstance(val, ast.UnaryOp) and isinstance(val.op, ast.USub):
-            # Handle negative numbers like -5
+        elif isinstance(val, ast.UnaryOp) and isinstance(val.op, (ast.USub, ast.UAdd)):
+            # Handle signed numbers like -5 and +5
             inner = self._get_parameter_value(val.operand)
-            if isinstance(inner, (int, float)):
-                return -inner
-            raise ValueError(f"Cannot negate non-numeric value: {inner}")
+            if isinstance(inner, (int, float)) and not isinstance(inner, bool):
+                return -inner if isinstance(val.op, ast.USub) else inner
+            raise ValueError(f"Cannot apply sign to non-numeric value: {inner}")
         else:
             raise ValueError(
                 f"Tool call arguments must be literals, got: {type(val).__name__}"
