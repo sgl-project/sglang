@@ -29,6 +29,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
 )
 from sglang.srt.distributed import (
+    get_attn_tp_group,
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )

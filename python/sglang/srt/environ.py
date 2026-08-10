@@ -1288,6 +1288,15 @@ class Envs:
     # with a per-query CUSTOM block_table
     SGLANG_MINIMAX_NPU_PREFILL_FIA = EnvBool(True)
 
+    # MiniMax-M3 NPU sparse INDEXER (decode + verify topk block selection): route
+    # through the native AscendC packed indexer op instead of the Triton indexer.
+    SGLANG_MINIMAX_NPU_NATIVE_INDEXER = EnvBool(False)
+
+    # MiniMax-M3 NPU sparse MAIN-attention (decode-main + verify-main): route the
+    # sparse main attention through the native AscendC sparse-attention op with the
+    # cached block_table override.
+    SGLANG_MINIMAX_NPU_NATIVE_ATTN = EnvBool(False)
+
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")

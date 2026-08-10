@@ -31,6 +31,17 @@ _BSQ_THRESHOLD_32 = 1024  # max_seqlen_k >= 1K  -> BSQ=32
 _BSQ_THRESHOLD_16 = 512  # max_seqlen_k >= 512 -> BSQ=16
 # BSQ<=64 is UB-safe for the prefill indexer (Q tile up to 8KB at BSQ=64).
 
+
+def _native_indexer_enabled() -> bool:
+    # Native AscendC packed indexer switch (default off).
+    return envs.SGLANG_MINIMAX_NPU_NATIVE_INDEXER.get()
+
+
+def _native_attn_enabled() -> bool:
+    # Native AscendC sparse MAIN-attention switch (default off).
+    return envs.SGLANG_MINIMAX_NPU_NATIVE_ATTN.get()
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -267,7 +278,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
             f"fp8_attn_gemm={self.fp8_attn_gemm}, "
-            f"npu_native_sparse={'on' if self._native_sparse_ok else 'off'}, "
+            f"npu_native_attn={'on' if (self._native_sparse_ok and _native_attn_enabled()) else 'off'}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
         if self.fp8_attn_gemm and self.use_msa:
@@ -337,6 +348,46 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # runs only device-side ops; host-side code can't be captured.
         if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
             self._prepare_msa_decode_meta(forward_batch)
+
+        # ---- REPLAY-FRESH native verify block_table ----
+        if (
+            self.is_npu
+            and forward_batch.forward_mode.is_target_verify()
+            and self.speculative_num_draft_tokens
+        ):
+            _ndt = self.speculative_num_draft_tokens
+            _bs = forward_batch.seq_lens.shape[0]
+            _key = (_bs, int(_ndt))
+            _vmeta = self._verify_meta_cg.get(_key)
+            if _vmeta is not None:
+                _vmeta.per_query_req.copy_(
+                    forward_batch.req_pool_indices.long().repeat_interleave(int(_ndt))
+                )
+                _prefix = (forward_batch.seq_lens.to(torch.long) - int(_ndt)).clamp(
+                    min=0
+                )
+                _offs = torch.arange(
+                    1,
+                    int(_ndt) + 1,
+                    device=forward_batch.seq_lens.device,
+                    dtype=torch.long,
+                )
+                _vmeta.per_query_seq_lens.copy_(
+                    (_prefix.unsqueeze(1) + _offs.unsqueeze(0))
+                    .reshape(-1)
+                    .to(torch.int32)
+                )
+                _mb = self.req_to_token.shape[1] // self.page_size
+                _bt_cols = (
+                    torch.arange(
+                        _mb, device=_vmeta.per_query_req.device, dtype=torch.long
+                    )
+                    * self.page_size
+                ).clamp(max=self.req_to_token.shape[1] - 1)
+                _vmeta.native_bt = (
+                    self.req_to_token[_vmeta.per_query_req][:, _bt_cols]
+                    // self.page_size
+                ).to(torch.int32)
 
     def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
         """Refresh the persistent per-batch-size MSA decode plan + page table in place."""
@@ -631,7 +682,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Native main op takes a logical->physical block table, hoisted to
         # once per forward (cached by id(forward_batch)); triton falls back to req_to_token.
         _native_main_kwargs = None
-        if self._native_sparse_ok:
+        if self._native_sparse_ok and _native_attn_enabled():
             try:
                 _fb_id = id(forward_batch)
                 _bt = self._native_decode_bt.get(_fb_id)
@@ -684,6 +735,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             runtime_fill_only=True,
             score_max_chunks=self._choose_decode_score_max_chunks(bs),
             fused_append_local=True,
+            use_native=_native_indexer_enabled(),
         )
 
         # 2) Reduce heads and append forced blocks.
@@ -707,6 +759,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             block_size=page_size,
             topk_idx=topk_idx,
             sm_scale=head_dim**-0.5,
+            use_native=_native_attn_enabled(),
         )
 
         return idx_o, o
@@ -777,7 +830,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Native verify-main: per-query block_table. CUDA-graph path uses the
         # captured vmeta.native_bt (refreshed on replay); eager builds it per call.
         _native_main_kwargs = None
-        if self._native_sparse_ok:
+        if self._native_sparse_ok and _native_attn_enabled():
             try:
                 _bt = (
                     vmeta.native_bt
@@ -868,6 +921,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             runtime_score_short_max_blocks=256 if pack_verify else 0,
             runtime_score_short_chunks=16 if pack_verify else 0,
             fused_append_local=True,
+            use_native=_native_indexer_enabled(),
         )
         if pack_verify:
             # [ndt*H, bs, K] -> [H, bs*ndt, K] (request-major rows).
@@ -887,6 +941,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             num_kv_heads,
             max_blocks,
         )
+
         # 4) Main sparse attention; native op uses the cached block table override.
         _vmain_kwargs = (
             {**page_source_kwargs, **_native_main_kwargs}
@@ -903,6 +958,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             block_size=page_size,
             topk_idx=topk_idx,
             sm_scale=head_dim**-0.5,
+            use_native=_native_attn_enabled(),
         )
         return idx_o, o
 
@@ -1043,18 +1099,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         max_blocks = meta.max_blocks
         block_size_q = meta.block_size_q
         per_query_req = meta.per_query_req
-        if not getattr(self, "_prefill_diag_logged", False):
-            self._prefill_diag_logged = True
-            logger.warning(
-                "[MiniMax/NPU triton-prefill] max_seqlen=%d max_blocks=%d "
-                "total_q=%d page=%d _max_seqlen_k=%d max_context_len=%d",
-                max_seqlen,
-                max_blocks,
-                total_q,
-                page_size,
-                self._max_seqlen_k,
-                self.max_context_len,
-            )
 
         disable_index_value = idx_v_cache is None
 
