@@ -6,9 +6,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(
-    est_time=7200, suite="nightly-4-gpu-gb300-deepseek-v4-pro-fp4", nightly=True
-)
+register_cuda_ci(est_time=7200, stage="nightly", runner_config="4-gpu-gb300")
 
 MODEL_PATH = "deepseek-ai/DeepSeek-V4-Pro"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -136,7 +134,7 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
                     accuracy_params=accuracy_params,
                     performance_params=PerformanceTestParams(
                         batch_sizes=PERFORMANCE_BATCH_SIZES[variant.variant],
-                        profile_dir="performance_profiles_gb300",
+                        result_dir="performance_results_gb300",
                     ),
                 )
             except AssertionError as e:

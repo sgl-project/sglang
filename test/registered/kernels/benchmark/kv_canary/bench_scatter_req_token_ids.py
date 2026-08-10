@@ -16,7 +16,7 @@ from sglang.kernels.ops.kv_canary.scatter_req_token_ids import (
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=180, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
 # AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).
 # Note: amd_ci_exec.sh sets SGLANG_IS_IN_CI, so this runs the CI-reduced range
 # (_BS_AXIS_CI/_SEQ_LEN_AXIS_CI via get_benchmark_range), same as CUDA nightly.

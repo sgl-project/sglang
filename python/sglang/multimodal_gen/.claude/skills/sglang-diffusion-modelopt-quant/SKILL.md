@@ -23,7 +23,12 @@ This skill owns the ModelOpt-to-SGLang bridge. It is not a generic kernel-tuning
 - Benchmark only when BF16 and quantized commands are identical except for the checkpoint override being tested.
 - For diffusion FP8, keep `dit_cpu_offload=false`. `dit_layerwise_offload=true` is valid on the fixed path when you want lower DiT residency.
 - For multi-transformer pipelines, use per-component overrides when different components need different checkpoints.
-- For B200 NVFP4 validation, keep backend-sensitive environment variables explicit. Wan2.2 NVFP4 is commonly validated with `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn`; benchmark the default CUTLASS path separately if that is what you are evaluating.
+- For B200 NVFP4 validation, keep backend-sensitive environment variables
+  explicit. The current default is FlashInfer TensorRT-LLM
+  (`flashinfer_trtllm`); high-resolution Qwen Image can favor
+  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cutlass`, while 1024x1024 can
+  remain BF16-faster. Benchmark the exact shape instead of assuming one backend
+  or quantized checkpoint wins.
 - When a branch is missing the validated helper tools, refresh `python/sglang/multimodal_gen/tools/build_modelopt_fp8_transformer.py`, `python/sglang/multimodal_gen/tools/build_modelopt_nvfp4_transformer.py`, and `python/sglang/multimodal_gen/tools/compare_diffusion_trajectory_similarity.py` instead of inventing one-off scripts elsewhere.
 - After validating a new ModelOpt quant path, update the ModelOpt support matrix in `docs/docs/sglang-diffusion/quantization.mdx` before closing the task.
 
@@ -35,6 +40,7 @@ Read these sources before changing code:
 - ModelOpt quantization entrypoint: `examples/diffusers/quantization/quantize.py`
 - ModelOpt diffusers quant presets: `examples/diffusers/quantization/config.py`
 - SGLang diffusion quant runtime:
+  - `python/sglang/multimodal_gen/runtime/layers/quantization/modelopt_fp8.py`
   - `python/sglang/multimodal_gen/runtime/layers/quantization/modelopt_quant.py`
   - `python/sglang/multimodal_gen/runtime/utils/quantization_utils.py`
   - `python/sglang/multimodal_gen/runtime/loader/transformer_load_utils.py`
@@ -65,7 +71,8 @@ This repo now contains:
 Validated documentation and CI coverage currently center on these ModelOpt diffusion transformer override families:
 
 - FP8: FLUX.1-dev, FLUX.2-dev, Wan2.2, HunyuanVideo, Qwen Image, Qwen Image Edit
-- NVFP4: FLUX.1-dev, FLUX.2-dev, Wan2.2
+- NVFP4: FLUX.1-dev, FLUX.2-dev, Wan2.2, Qwen Image, Qwen Image 2512,
+  Qwen Image Edit, Qwen Image Edit 2511
 
 Treat a new family, a new precision, or a new checkpoint layout as unsupported until it has a documented matrix row and a matching validation story.
 Current B200 CI also contains an Ideogram4 NVFP4 native load case
@@ -77,8 +84,8 @@ Before writing CLI examples, re-read the active branch's `docs/docs/sglang-diffu
 
 B200 CI coverage can include loose BF16-vs-quantized quality checks. Inspect the active branch's `run_suite.py` before assuming they are part of the suite; mainline and feature branches may differ. Those checks are intended to catch blank, corrupted, or obviously divergent images, not exact image parity.
 
-Mainline documentation now uses `lmsys/*` for the eight converted ModelOpt
-checkpoint repos; the FLUX.2 NVFP4 raw export remains
+Mainline documentation now tracks thirteen published ModelOpt checkpoints.
+Twelve live under `lmsys/*`; the FLUX.2 NVFP4 raw export remains
 `black-forest-labs/FLUX.2-dev-NVFP4`. Do not use older `BBuf/*` examples unless
 you are explicitly testing a historical branch.
 
@@ -305,10 +312,23 @@ sglang generate \
   --save-output
 ```
 
+Full ModelOpt Diffusers repo example (current Qwen Image NVFP4 path):
+
+```bash
+sglang generate \
+  --model-path lmsys/qwen-image-2512-modelopt-nvfp4-sglang \
+  --prompt "<prompt>" \
+  --seed <seed> \
+  --save-output
+```
+
 Guideline:
 
 - use the global `--transformer-path` only when the model effectively has one transformer override to apply
 - use per-component overrides when different backbones need different checkpoints
+- use `--model-path` directly for published full ModelOpt Diffusers repos such
+  as the Qwen Image NVFP4 family; this is different from a transformer-only
+  override
 - the preferred CLI form is `--<component>-path`
 - config-expanded forms such as `--component_paths.transformer_2=...` also resolve to the same internal override map
 
@@ -411,6 +431,7 @@ When documenting results:
 | File | Role |
 | --- | --- |
 | `runtime/layers/quantization/__init__.py` | registers diffusion quant methods |
+| `runtime/layers/quantization/modelopt_fp8.py` | static per-tensor ModelOpt FP8 path used by flat `quant_method=modelopt` exports |
 | `runtime/layers/quantization/modelopt_quant.py` | ModelOpt FP8 and NVFP4 runtime loading |
 | `runtime/utils/quantization_utils.py` | resolves flat ModelOpt configs and reconstructs NVFP4 config from metadata |
 | `runtime/loader/transformer_load_utils.py` | guards incompatible FP8 offload modes |
