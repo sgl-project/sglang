@@ -473,7 +473,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             ):
                 query, _ = self.wq_b(q_lora)
                 query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-                q_rope = query[..., : self.rope_head_dim]
+                q_rope, _ = torch.split(
+                    query,
+                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                    dim=-1,
+                )
             with torch.cuda.stream(self.alt_stream):
                 # TODO we should also put DeepGEMM half SM here?
                 if self.use_dsa_indexer_fusion:
@@ -481,19 +485,28 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 else:
                     key, _ = self.wk(x)
                 key = self.k_norm(key)
-                k_rope = key[..., : self.rope_head_dim]
+
+                k_rope, _ = torch.split(
+                    key,
+                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                    dim=-1,
+                )
 
             current_stream.wait_stream(self.alt_stream)
         else:
             query, _ = self.wq_b(q_lora)
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-            q_rope = query[..., : self.rope_head_dim]
+            q_rope, _ = torch.split(
+                query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+            )
             if self.use_dsa_indexer_fusion:
                 key, weights_raw = self._fused_k_weights(x)
             else:
                 key, _ = self.wk(x)
             key = self.k_norm(key)
-            k_rope = key[..., : self.rope_head_dim]
+            k_rope, _ = torch.split(
+                key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+            )
 
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
@@ -558,7 +571,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Non-fusion path only; self.wk does not exist when fusion is on.
         key, _ = self.wk(x)
         key = self.k_norm(key)
-        k_rope = key[..., : self.rope_head_dim]
+        k_rope, _ = torch.split(
+            key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
 
         # The CUDA rotary implementation may update both inputs in place.  Do
         # not alias its query and key inputs: doing so can rotate/corrupt the

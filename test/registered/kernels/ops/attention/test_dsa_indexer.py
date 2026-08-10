@@ -966,6 +966,7 @@ class TestDSAIndexer(CustomTestCase):
         """The K-only prefill path must not pass one view as both Q and K."""
         indexer = Indexer.__new__(Indexer)
         torch.nn.Module.__init__(indexer)
+        indexer.head_dim = 4
         indexer.rope_head_dim = 2
 
         raw_key = torch.arange(8, device=self.device, dtype=self.dtype).reshape(2, 4)
@@ -984,7 +985,7 @@ class TestDSAIndexer(CustomTestCase):
             side_effect=lambda value: value,
         ):
             result = indexer._get_k_bf16(
-                torch.empty(2, 1, device=self.device), positions, False
+                torch.empty(2, 1, device=self.device), positions
             )
 
         expected = raw_key.clone()
