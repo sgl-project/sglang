@@ -132,6 +132,8 @@ def _dflash_top_p_renorm_prob(
     if npu_probs is not None:
         return npu_probs
     return top_p_normalize_probs_torch(probs, top_ps)
+
+
 def dflash_draft_cell_size_per_token(
     *,
     draft_model_config: Any,
