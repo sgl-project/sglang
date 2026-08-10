@@ -232,19 +232,28 @@ class MambaSubPoolSpec(SubPoolSpec):
 # ---------------------------------------------------------------------------
 
 
+def _dense_mha_decision(uniform_rows: bool) -> bool:
+    if envs.SGLANG_FORCE_STRIDED_UNIFIED_MHA.get():
+        return False
+    return uniform_rows
+
+
 def unified_dense_mha_enabled(*specs: MHASubPoolSpec) -> bool:
     """ONE decision for "do the MHA/SWA sub-pools get dense views?".
 
     The factories derive everything from it (view kind, pool class,
-    kernel_page_multiplier, tail pad), and the server_args backend allow-list
-    must agree with it — it evaluates the same predicate through
-    `ModelConfig.has_asymmetric_kv` (uniform rows per sub-pool) plus the same
-    env escape hatch. Dense iff EVERY KV sub-pool has uniform rows and the
-    strided A/B escape is off.
+    kernel_page_multiplier, tail pad). Dense iff EVERY KV sub-pool has
+    uniform rows and the strided A/B escape is off.
     """
-    if envs.SGLANG_FORCE_STRIDED_UNIFIED_MHA.get():
-        return False
-    return all(s.is_uniform_row() for s in specs)
+    return _dense_mha_decision(all(s.is_uniform_row() for s in specs))
+
+
+def unified_dense_mha_enabled_for_model(model_config) -> bool:
+    """The SAME decision evaluated at model-config level — the server_args
+    backend allow-list runs before any sub-pool spec exists. Uniform rows per
+    sub-pool is exactly ``not has_asymmetric_kv`` (one shared decision core,
+    so the gate and the factories can never diverge)."""
+    return _dense_mha_decision(not model_config.has_asymmetric_kv)
 
 
 def _assert_dense_id_bound(*, sub_pool_name: str, n_dense: int) -> None:

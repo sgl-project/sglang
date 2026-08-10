@@ -8066,6 +8066,13 @@ class ServerArgs:
                 "ships host/C4 rows straight from the allocator, bypassing the "
                 "virtual->physical translation the unified pool needs."
             )
+        # Speculative decoding: DSPARK (chain draft) is supported on the
+        # unified pool (#33974). Other algorithms are not yet audited for the
+        # virtual/dense loc translation. The read-path choke point plugs in
+        # the same way when they are: its canonical builder takes seq_lens as
+        # a tensor (target-verify's seq_lens + num_draft plugs in), per-draft
+        # write rails follow the swa_out_cache_loc ForwardBatch-rail pattern,
+        # and verify tables consume the same KVIndexBatchView.
         assert self.speculative_algorithm in (None, "DSPARK"), (
             "--enable-unified-memory only supports --speculative-algorithm "
             "DSPARK (chain draft); other speculative algorithms are not yet "
@@ -8126,18 +8133,24 @@ class ServerArgs:
             self.enable_page_major_kv_layout = True
         if not self.enable_page_major_kv_layout:
             return
-        # Only the Triton attention kernels read the strided 4-D envelope K/V
-        # views; FA3 / FlashInfer do not. EXCEPTION: the unified-memory MLA pool
-        # exposes each layer as a DENSE contiguous per-layer view
-        # (build_dense_mla_views), which the paged MLA kernels consume directly,
-        # with their kv_indices / block tables remapped to dense ids. Names below
-        # are the RESOLVED ids from _resolved_attention_backends: "flashinfer" is
-        # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
-        # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
-        # TRTLLMMLABackend and inherit its dense read/write path; "fa3" remaps its
-        # page_table (in-kernel for captured decode, one funnel for eager).
-        # flashmla / cutlass_mla share the create_flashmla block-table path and
-        # can be added the same way once exercised.
+        # Three-way allow-list. Under the unified pool every backend below
+        # reads through ONE id surface — the read-path choke point
+        # (mem_cache/kv_index_source.py) hands each batch a canonical
+        # kernel-facing page table and the backends consume it in their own
+        # format — so what gates a backend is only whether the pool can expose
+        # DENSE per-layer views its kernels can address:
+        #   * MLA models: always dense (build_dense_mla_views); the full paged
+        #     MLA family is wired, incl. flashmla (ps=64 snap). cutlass_mla
+        #     stays rejected (never exercised).
+        #   * MHA/SWA models: dense iff every KV sub-pool has uniform rows
+        #     (head_dim == v_head_dim) and the strided A/B escape
+        #     (SGLANG_FORCE_STRIDED_UNIFIED_MHA) is off — the SAME shared
+        #     decision the pool factories flip on
+        #     (unified_dense_mha_enabled_for_model). fa4 is the fa3 class.
+        #   * Otherwise (asymmetric K/V like MiMoV2, or env-forced strided):
+        #     the sub-pools stay envelope-strided 4-D views only the
+        #     stride-aware Triton kernels read.
+        # Names are the RESOLVED ids from _resolved_attention_backends.
         if self.enable_unified_memory and self.use_mla_backend():
             allowed_full = {
                 "triton",
@@ -8146,16 +8159,34 @@ class ServerArgs:
                 "flashinfer",
                 "cutedsl_mla",
                 "tokenspeed_mla",
+                "flashmla",
             }
+        elif self.enable_unified_memory:
+            from sglang.srt.mem_cache.unified_memory_pool import (
+                unified_dense_mha_enabled_for_model,
+            )
+
+            if unified_dense_mha_enabled_for_model(self.get_model_config()):
+                allowed_full = {
+                    "triton",
+                    "fa3",
+                    "fa4",
+                    "flashinfer",
+                    "trtllm_mha",
+                }
+            else:
+                allowed_full = {"triton"}
         else:
             allowed_full = {"triton"}
         backends = set(self._resolved_attention_backends())
         backends.discard(None)
         assert backends <= allowed_full, (
-            "--enable-page-major-kv-layout requires the Triton attention backend "
-            "for the full-attention layers (unified-memory MLA also allows the "
-            f"paged MLA backends); got {sorted(backends)}, allowed "
-            f"{sorted(allowed_full)}. Pass a compatible --attention-backend."
+            "--enable-page-major-kv-layout: the resolved attention backends "
+            f"{sorted(backends)} are not in the allowed set "
+            f"{sorted(allowed_full)} for this configuration (unified memory "
+            "allows the dense-view families; asymmetric-K/V or env-forced "
+            "strided MHA models are Triton-only). Pass a compatible "
+            "--attention-backend."
         )
         # The Mamba/KDA state is stored in envelope-strided views; only
         # stride-audited kernels may read it (Stage 4 audit, per slot):
