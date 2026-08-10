@@ -7,6 +7,7 @@ bit-exact vs the eager chain (``torch.equal``) and needs no quality gate.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -20,10 +21,15 @@ if TYPE_CHECKING:
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _ALIGN_BYTES = 16
+_FAILED_RUNTIME_KEYS: set[tuple[int | None, torch.dtype]] = set()
+
+logger = logging.getLogger(__name__)
 
 
 @cache_once
 def _jit_modulate_scale_shift_module(dtype: torch.dtype) -> Module:
+    if dtype not in _SUPPORTED_DTYPES:
+        raise RuntimeError(f"Unsupported modulate_scale_shift dtype: {dtype}")
     args = make_cpp_args(dtype)
     return load_jit(
         "diffusion_modulate_scale_shift",
@@ -32,8 +38,7 @@ def _jit_modulate_scale_shift_module(dtype: torch.dtype) -> Module:
         cuda_wrappers=[
             (
                 "modulate_scale_shift",
-                "sglang_modulate_scale_shift::"
-                f"ModulateScaleShiftKernel<{args}>::run",
+                f"modulate_scale_shift::ModulateScaleShiftKernel<{args}>::run",
             ),
         ],
     )
@@ -93,3 +98,33 @@ def modulate_scale_shift_cuda(
     if not can_use_modulate_scale_shift_cuda(x, scale, shift):
         raise RuntimeError("unsupported input for modulate_scale_shift CUDA")
     return _modulate_scale_shift_custom_op(x, scale, shift)
+
+
+def modulate_scale_shift(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+) -> torch.Tensor:
+    """Use the bit-exact CUDA fast path when supported, otherwise eager."""
+    runtime_key = (x.device.index, x.dtype)
+    if runtime_key not in _FAILED_RUNTIME_KEYS and can_use_modulate_scale_shift_cuda(
+        x, scale, shift
+    ):
+        try:
+            return modulate_scale_shift_cuda(x, scale, shift)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            _FAILED_RUNTIME_KEYS.add(runtime_key)
+            logger.warning(
+                "Disabling diffusion modulate CUDA fast path on %s/%s: %s",
+                x.device,
+                x.dtype,
+                exc,
+            )
+    return x * (1 + scale[:, None]) + shift[:, None]
+
+
+__all__ = [
+    "can_use_modulate_scale_shift_cuda",
+    "modulate_scale_shift",
+    "modulate_scale_shift_cuda",
+]
