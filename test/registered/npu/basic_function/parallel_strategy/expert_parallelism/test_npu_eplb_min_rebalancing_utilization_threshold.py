@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_W8A8_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.run_eval import run_eval
@@ -13,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-8-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-8-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 
@@ -94,6 +95,9 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
         os.remove("./rebalance_err_log.txt")
 
     def test_gsm8k(self):
+        if _is_pr_pipeline:
+            run_npu_pr_smoke(self.base_url)
+            return
         args = SimpleNamespace(
             max_tokens=512,
             base_url=DEFAULT_URL_FOR_TEST,

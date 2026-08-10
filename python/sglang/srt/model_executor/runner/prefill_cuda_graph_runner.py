@@ -63,6 +63,7 @@ from sglang.srt.layers.cp.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -109,6 +110,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
+from sglang.srt.model_executor.runner_utils import maybe_publish_prefill_war_read_done
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -337,6 +339,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
         )
+        # Archs on the MLA-BCG allowlist pin the absorbed MLA path inside
+        # capture/replay (attention_backend_handler), so the MHA companion is
+        # never captured and the MHA-prefix restrictions below don't apply.
+        self.mla_pinned_under_bcg = (
+            self.model_runner.model_config.is_mla_breakable_cuda_graph_supported
+        )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -529,10 +537,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = 0
 
     def _is_mamba_track_enabled(self) -> bool:
-        return (
-            self.model_runner.server_args.enable_mamba_extra_buffer()
-            and not self.model_runner.server_args.disable_radix_cache
-            and self.model_runner.spec_algorithm.is_none()
+        return self.model_runner.server_args.enable_mamba_extra_buffer() and (
+            not self.model_runner.server_args.disable_radix_cache
         )
 
     def _cache_loc_dtype(self):
@@ -770,7 +776,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     @staticmethod
     def _max_addressable_prefix_len(model_runner) -> int:
         table_width = model_runner.req_to_token_pool.req_to_token.shape[1]
-        configured_context = model_runner.server_args.context_length
+        # This runner's own resolved context (a draft runs at the target's
+        # positions), not the launcher's flag, which may be unset.
+        configured_context = model_runner.model_config.context_len
         return (
             min(table_width, configured_context)
             if configured_context is not None and configured_context > 0
@@ -1052,11 +1060,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         # A prefix forces the MHA companion path, whose captured state is
         # frozen prefix-free; DSA models are exempt (capture/replay force
-        # the sparse path, which takes any prefix via device metadata).
+        # the sparse path, which takes any prefix via device metadata), as
+        # are archs on the MLA-BCG allowlist (they pin the absorbed MLA path
+        # inside capture/replay, so the MHA companion is never captured).
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
             and not self.dsa_sparse_prefill_forced
+            and not self.mla_pinned_under_bcg
             and prefix_lens is not None
             and any(prefix_lens)
         ):
@@ -1125,6 +1136,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         ):
             return False
+        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+            forward_batch
+        ):
+            assert self.prefill_cp_bcg_input is not None
+            if (
+                self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
+                    num_tokens=len(forward_batch.input_ids),
+                    extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+                    capture_num_tokens=self.capture_num_tokens,
+                    max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+                )
+                is None
+            ):
+                return False
         # Multi-req replay is supported by body-capture backends via the
         # layer_model.forward monkey-patch in replay(): the captured graph runs
         # the transformer stack, then the outer model.forward runs
@@ -1392,7 +1417,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             run_once,
             # DP padding can install capture-only tensors on this dummy batch;
             # BCG retains it so their recorded addresses remain valid.
-            capture_inputs=forward_batch,
+            capture_inputs=(
+                forward_batch
+                if forward_batch.global_num_tokens_gpu is not None
+                else None
+            ),
             post_warmup_hook=post_warmup_hook,
         )
 
@@ -1402,6 +1431,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+            forward_batch
+        ):
+            assert self.prefill_cp_bcg_input is not None
+            static_num_tokens = (
+                self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
+                    num_tokens=num_tokens,
+                    extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+                    capture_num_tokens=self.capture_num_tokens,
+                    max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+                )
+            )
+            if static_num_tokens is None:
+                raise RuntimeError(
+                    "Prefill CUDA graph replay was admitted without a fitting bucket"
+                )
         self.raw_num_tokens = num_tokens
 
         bs = forward_batch.batch_size
@@ -1532,6 +1577,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and self.has_mha_companion_layers
+            and not self.mla_pinned_under_bcg
         ):
             self._restore_mha_capture_state(static_forward_batch)
 
@@ -1562,6 +1608,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 s["extend_start_loc"][bs:r].fill_(self.raw_num_tokens)
                 s["req_pool_indices"][bs:r].zero_()
                 s["orig_seq_lens"][bs:r].zero_()
+                # The captured track scatter reads these rows too, and a stale
+                # mask row still carries a live destination slot: it would land
+                # this replay's window in an earlier request's checkpoint.
+                registry = self.buffer_registry
+                for name in ("mamba_track_mask", "mamba_track_indices"):
+                    if registry.has_slot(name):
+                        registry.get_slot(name).buffer[bs:r].zero_()
 
         # Refresh the static buffer the captured graph reads from.
         if (
@@ -1723,6 +1776,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # The only variants this runner records are chunked-prefix ones.
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
+            # Replay prep, including the optional chunked-prefix gather above,
+            # has finished every scheduler-shared read.
+            maybe_publish_prefill_war_read_done(
+                self.model_runner, forward_batch, self.device_module
+            )
 
             if self.enable_cp_v2_bcg_capture:
                 output = execute_prefill_cp_bcg(
