@@ -262,9 +262,7 @@ class LaserAttentionImpl(AttentionImpl):
         # segment followed by alignment padding as [0, used, padded].
         padding_start = (
             bounds[1]
-            if len(bounds) == 3
-            and bounds[0] == 0
-            and bounds[-1] == query.shape[0]
+            if len(bounds) == 3 and bounds[0] == 0 and bounds[-1] == query.shape[0]
             else None
         )
         # Packed segments are independent; a single dense call would let real
