@@ -26,7 +26,7 @@ register_amd_ci(
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -60,7 +60,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 DEEPSEEK_V32_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V32_MODEL_PATH", "deepseek-ai/DeepSeek-V3.2"
 )
-PROFILE_DIR = "performance_profiles_deepseek_v32_basic_mi325"
+RESULT_DIR = "performance_results_deepseek_v32_basic_mi325"
 
 
 class TestNightlyDeepseekV32BasicPerformance(unittest.TestCase):
@@ -99,9 +99,9 @@ class TestNightlyDeepseekV32BasicPerformance(unittest.TestCase):
             "env_vars": {"SGLANG_USE_AITER": "1"},
         }
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
-        # Override full_report to remove traces help text
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
+        # Set the report header for this test
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
@@ -115,7 +115,6 @@ class TestNightlyDeepseekV32BasicPerformance(unittest.TestCase):
                 other_args=self.variant_config["other_args"],
                 variant=self.variant_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,  # Disable profiling for AMD tests
             )
             results = result_tuple[0]
             success = result_tuple[1]
@@ -125,7 +124,7 @@ class TestNightlyDeepseekV32BasicPerformance(unittest.TestCase):
             if avg_spec_accept_length is not None:
                 print(f"  avg_spec_accept_length={avg_spec_accept_length:.2f}")
 
-            # Use simplified report format without traces
+            # Use the simplified report format
             if results:
                 self.runner.full_report += (
                     generate_simple_markdown_report(results) + "\n"

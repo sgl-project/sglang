@@ -51,6 +51,12 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
+# Validated request-level quality levels. "lossless" is the exact reference
+# path (bit-exact against the CI golden outputs); "high" opts into validated
+# accelerated paths whose quality is guaranteed but not bit-exact.
+QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
+
+
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
     """Create a filesystem- and ffmpeg-friendly filename.
 
@@ -123,9 +129,20 @@ class SamplingParams:
     )
     output_quality: str | None = "default"
     output_compression: int | None = None
-    # Model-owned, request-scoped approximate acceleration profile. Models
-    # that support it must validate the deployment and workload explicitly.
-    # It intentionally participates in the dynamic-batch signature.
+    # Model-owned, request-scoped quality level.
+    #
+    # - "lossless" (default): the exact reference path. Output is expected to
+    #   be bit-identical to the HF reference implementation and to pass the
+    #   CI golden/ground-truth comparisons.
+    # - "high": opt into validated accelerated paths. Quality stays
+    #   guaranteed (the intent is to back every such path with mathematical
+    #   acceptance thresholds, e.g. PSNR > 25 against the reference), but
+    #   the output is no longer bit-exact versus the HF reference or the CI
+    #   ground truth.
+    #
+    # Models that support "high" must validate the deployment and workload
+    # explicitly. It intentionally participates in the dynamic-batch
+    # signature.
     quality: str = "lossless"
 
     # Frame interpolation
@@ -189,6 +206,10 @@ class SamplingParams:
     teacache_params: Any = (
         None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
     )
+
+    # Spectrum parameters
+    enable_spectrum: bool = False
+    spectrum_params: Any = None  # SpectrumParams
 
     # Profiling
     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
@@ -313,6 +334,16 @@ class SamplingParams:
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
 
+        if self.enable_spectrum and isinstance(self.spectrum_params, dict):
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+            self.spectrum_params = SpectrumParams(**self.spectrum_params)
+
+        if self.enable_spectrum and self.spectrum_params is None:
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+            self.spectrum_params = SpectrumParams()
+
     def build_request_extra(self) -> dict[str, Any]:
         """Return optional request-scoped extras for downstream pipeline stages."""
         extra = {}
@@ -408,9 +439,10 @@ class SamplingParams:
                 f"prompt_path must be a txt file, got {self.prompt_path!r}"
             )
 
-        if not isinstance(self.quality, str) or not self.quality.strip():
+        if self.quality not in QUALITY_LEVELS:
             raise ValueError(
-                f"quality must be a non-empty string, got {self.quality!r}"
+                f"quality must be one of {list(QUALITY_LEVELS)}, "
+                f"got {self.quality!r}"
             )
 
         # These are always required to be sane regardless of pipeline.
@@ -528,6 +560,11 @@ class SamplingParams:
                 raise ValueError(
                     f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
                 )
+
+        if self.enable_teacache and self.enable_spectrum:
+            raise ValueError(
+                "enable_teacache and enable_spectrum are mutually exclusive; enable only one."
+            )
 
         RLRolloutArgs.validate_sampling_params(self)
 
@@ -851,6 +888,69 @@ class SamplingParams:
             "--enable-teacache",
             action="store_true",
         )
+        add_argument(
+            "--enable-spectrum",
+            action="store_true",
+        )
+        add_argument("--w", type=float)
+        add_argument(
+            "--taylor-order",
+            "--taylor_order",
+            dest="taylor_order",
+            type=int,
+        )
+        add_argument(
+            "--history-size",
+            "--history_size",
+            dest="history_size",
+            type=int,
+        )
+        add_argument(
+            "--spectrum-window-size",
+            "--spectrum_window_size",
+            "--window-size",
+            "--window_size",
+            dest="spectrum_window_size",
+            type=float,
+            help="Spectrum initial skip window size.",
+        )
+        add_argument(
+            "--spectrum-flex-window",
+            "--spectrum_flex_window",
+            "--flex-window",
+            "--flex_window",
+            dest="spectrum_flex_window",
+            type=float,
+            help="Spectrum adaptive window growth slope.",
+        )
+        add_argument(
+            "--spectrum-warmup-steps",
+            "--spectrum_warmup_steps",
+            dest="spectrum_warmup_steps",
+            type=int,
+            help="Spectrum warmup denoising steps before caching.",
+        )
+        add_argument(
+            "--spectrum-m",
+            "--spectrum_m",
+            dest="spectrum_m",
+            type=int,
+            help="Spectrum Chebyshev polynomial degree (M).",
+        )
+        add_argument(
+            "--spectrum-lam",
+            "--spectrum_lam",
+            dest="spectrum_lam",
+            type=float,
+            help="Spectrum ridge regularization strength.",
+        )
+        add_argument(
+            "--spectrum-tau-num-steps",
+            "--spectrum_tau_num_steps",
+            dest="spectrum_tau_num_steps",
+            type=int,
+            help="Spectrum tau normalization horizon.",
+        )
 
         # profiling
         add_argument(
@@ -932,9 +1032,14 @@ class SamplingParams:
         add_argument(
             "--quality",
             type=str,
+            choices=list(QUALITY_LEVELS),
             help=(
-                "Select a model-owned quality/performance profile. "
-                "Support and validated deployment constraints are model-specific."
+                "Request-level quality: 'lossless' (default) keeps the exact "
+                "reference path, bit-exact against the reference "
+                "implementation; 'high' opts into the model-owned validated "
+                "accelerated path, whose quality stays guaranteed but is not "
+                "bit-exact. Support and validated deployment constraints are "
+                "model-specific."
             ),
         )
         add_argument(
@@ -1276,6 +1381,34 @@ class SamplingParams:
         }
         if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
             cli_args["seed"] = cli_args["seed"][0]
+
+        spectrum_overrides = {}
+        spectrum_flag_map = {
+            "w": "w",
+            "taylor_order": "taylor_order",
+            "window_size": "spectrum_window_size",
+            "flex_window": "spectrum_flex_window",
+            "history_size": "history_size",
+            "warmup_steps": "spectrum_warmup_steps",
+            "m": "spectrum_m",
+            "lam": "spectrum_lam",
+            "tau_num_steps": "spectrum_tau_num_steps",
+        }
+        for field_name, arg_name in spectrum_flag_map.items():
+            if hasattr(args, arg_name) and getattr(args, arg_name) is not None:
+                spectrum_overrides[field_name] = getattr(args, arg_name)
+        if spectrum_overrides:
+            if not cli_args.get("enable_spectrum", False):
+                logger.info(
+                    "Spectrum override flags were provided without --enable-spectrum; "
+                    "auto-enabling Spectrum caching."
+                )
+                cli_args["enable_spectrum"] = True
+            existing_spectrum_params = cli_args.get("spectrum_params")
+            if isinstance(existing_spectrum_params, dict):
+                spectrum_overrides = {**existing_spectrum_params, **spectrum_overrides}
+            cli_args["spectrum_params"] = spectrum_overrides
+
         return cli_args
 
     def output_file_path(self):

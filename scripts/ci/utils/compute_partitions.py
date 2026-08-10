@@ -41,46 +41,31 @@ _BASE_A_OVERRIDES = {
     "base-a-test-1-gpu-small": 1,
 }
 
-_REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
-
-# Inlined in pr-test.yml rather than dispatched through the reusable stage,
-# so there is no `run_timeout_minutes` input to read the budget from.
-_INLINE_SUITE_JOBS = {"base-a-test-cpu"}
+# Every stage dispatches through one of these; CPU has its own because its
+# hosted-runner install shares no step with the self-hosted GPU stages.
+_REUSABLE_STAGE_USES = {
+    "./.github/workflows/_pr-test-stage.yml",
+    "./.github/workflows/_pr-test-stage-cpu.yml",
+}
 
 
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
     """Map `self_name -> run_timeout_minutes` from one pr-test*.yml. The input
-    is required in `_pr-test-stage.yml` -- KeyError surfaces missing.
-    Inline suites (`_INLINE_SUITE_JOBS`) contribute their `Run test` step
-    timeout so they size off the same budget as dispatched stages."""
+    is required in both reusable stage workflows -- KeyError surfaces missing."""
     with open(pr_test_yml_path) as f:
         wf = yaml.safe_load(f)
     jobs = wf.get("jobs") or {}
     timeouts = {}
     for job_id, job in jobs.items():
-        if not isinstance(job, dict) or job.get("uses") != _REUSABLE_STAGE_USES:
+        if not isinstance(job, dict) or job.get("uses") not in _REUSABLE_STAGE_USES:
             continue
         with_ = job.get("with") or {}
         suite = with_.get("self_name", job_id)
         timeouts[suite] = int(with_["run_timeout_minutes"])
-    for suite in _INLINE_SUITE_JOBS:
-        budgets = [
-            s["timeout-minutes"]
-            for s in ((jobs.get(suite) or {}).get("steps") or [])
-            if isinstance(s, dict)
-            and s.get("name") == "Run test"
-            and "timeout-minutes" in s
-        ]
-        if len(budgets) != 1:
-            raise RuntimeError(
-                f"load_run_timeouts: inline suite {suite!r} needs exactly one "
-                f"`Run test` step with `timeout-minutes` in {pr_test_yml_path}."
-            )
-        timeouts[suite] = int(budgets[0])
     if not timeouts:
         raise RuntimeError(
-            f"load_run_timeouts: no jobs matched uses={_REUSABLE_STAGE_USES!r} "
-            f"in {pr_test_yml_path}. The reusable workflow path likely "
+            f"load_run_timeouts: no jobs matched uses in {_REUSABLE_STAGE_USES!r} "
+            f"in {pr_test_yml_path}. A reusable workflow path likely "
             "changed -- update _REUSABLE_STAGE_USES."
         )
     return timeouts
@@ -89,7 +74,10 @@ def load_run_timeouts(pr_test_yml_path: str) -> dict:
 def per_shard_target_seconds(suite: str, run_timeouts: dict) -> float:
     """Per-shard wall budget = 0.75 * stage timeout. 0.75 is the inverse
     of LPT's 4/3 worst-case approximation ratio, so the most imbalanced
-    LPT shard fills exactly the timeout."""
+    LPT shard fills exactly the timeout.
+
+    A stage's `run_timeout_minutes` therefore drives its fanout rather than
+    capping it: shrinking it buys more shards, not shorter ones."""
     return 0.75 * run_timeouts[suite] * 60
 
 
@@ -140,8 +128,11 @@ def compute_partitions(
     in-source `est_time` / `(1.0, 0.0)`.
     `full_parallel=True` lifts the matrix-fanout throttle.
     """
-    # Allowlist: stages pr-test.yml dispatches. Stress / weekly /
-    # nightly-* live in test/registered/ but pr-test doesn't run them.
+    # Allowlist of the stages this workflow dispatches -- what keeps stress /
+    # weekly / nightly out, since CUDA scheduled suites no longer carry
+    # `nightly=True`. The nightly filter still matters for CPU: some tests sit on
+    # a dispatched suite with the flag set, so run_suite.py skips them and their
+    # est_time must not inflate the shard count.
     dispatched_suites = set(run_timeouts) | set(_BASE_A_OVERRIDES)
     suite_tests = defaultdict(list)
     for t in tests:
