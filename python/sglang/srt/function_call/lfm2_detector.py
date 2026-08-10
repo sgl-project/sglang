@@ -47,6 +47,55 @@ _PYTHONIC_NAME_LITERALS = {
 }
 
 
+def _escape_ctrl_chars_in_strings(text: str) -> str:
+    """Escape raw control chars inside string literals of pythonic text.
+
+    Models frequently place raw newlines inside a string argument (multi-line
+    shell commands), which is invalid Python, and a NUL byte anywhere makes
+    ``ast.parse`` raise ``ValueError``. Escaping ``\\n``/``\\r``/``\\t``/
+    ``\\x00`` only inside string literals makes the text parseable while the
+    escape sequences evaluate back to the exact original value.
+    """
+    out: List[str] = []
+    quote: Optional[str] = None
+    index, length = 0, len(text)
+    while index < length:
+        char = text[index]
+        if quote is None:
+            if char in {"'", '"'}:
+                quote = char
+            out.append(char)
+        elif char == "\\" and index + 1 < length:
+            out.append(char)
+            out.append(text[index + 1])
+            index += 2
+            continue
+        elif char == quote:
+            quote = None
+            out.append(char)
+        elif char == "\n":
+            out.append("\\n")
+        elif char == "\r":
+            out.append("\\r")
+        elif char == "\t":
+            out.append("\\t")
+        elif char == "\x00":
+            out.append("\\x00")
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _recovery_candidates(content: str) -> List[str]:
+    """Progressive rewrites for content that failed to parse.
+
+    Each rewrite is a no-op on already-valid text; the first candidate whose
+    result parses wins.
+    """
+    return [_escape_ctrl_chars_in_strings(content)]
+
+
 class Lfm2Detector(BaseFormatDetector):
     """
     Detector for LFM2 (Liquid Foundation Model 2) function call format.
@@ -192,7 +241,20 @@ class Lfm2Detector(BaseFormatDetector):
         tool_indices = self._get_tool_indices(tools)
 
         try:
-            module = safe_ast_parse(content)
+            try:
+                module = safe_ast_parse(content)
+            except (SyntaxError, ValueError):
+                # Recoverable model quirks are rewritten value-preservingly;
+                # the first rewrite that parses wins. Unrecoverable text
+                # re-raises the original error.
+                for candidate in _recovery_candidates(content):
+                    try:
+                        module = safe_ast_parse(candidate)
+                        break
+                    except (SyntaxError, ValueError):
+                        continue
+                else:
+                    raise
             parsed = getattr(module.body[0], "value", None) if module.body else None
 
             if parsed is None:
@@ -221,7 +283,7 @@ class Lfm2Detector(BaseFormatDetector):
 
             return calls, ""
 
-        except SyntaxError as e:
+        except (SyntaxError, ValueError) as e:
             return [], f"Python syntax error: {e}"
         except Exception as e:
             logger.exception("Unexpected error in pythonic tool call parsing")
