@@ -299,6 +299,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
+    # trade checkpoint-loading peak memory for faster ordinary DiT startup
+    direct_gpu_weight_loading: bool = False
     # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
@@ -508,6 +510,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_scheduler_rpc_timeout()
         self._validate_pipeline()
         self._validate_offload()
+        self._validate_direct_gpu_weight_loading()
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
@@ -1772,6 +1775,15 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
         )
         parser.add_argument(
+            "--direct-gpu-weight-loading",
+            action=StoreBoolean,
+            default=ServerArgs.direct_gpu_weight_loading,
+            help="Load the full unquantized DiT checkpoint state dict directly "
+            "onto GPU before assigning model parameters. This may reduce startup "
+            "time depending on the model, but temporarily requires checkpoint "
+            "weights and model weights to coexist on GPU. Disabled by default.",
+        )
+        parser.add_argument(
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
@@ -2633,6 +2645,23 @@ class ServerArgs(DisaggServerArgsMixin):
                     "This reduces peak GPU memory and can increase latency; use "
                     "--performance-mode speed for GPU-resident defaults when memory allows."
                 )
+
+    def _validate_direct_gpu_weight_loading(self) -> None:
+        if not self.direct_gpu_weight_loading:
+            return
+        if not current_platform.is_cuda():
+            raise ValueError("--direct-gpu-weight-loading requires CUDA")
+        if self.dit_cpu_offload or self.is_dit_layerwise_offload_selected:
+            raise ValueError(
+                "--direct-gpu-weight-loading requires a GPU-resident DiT; disable "
+                "DiT CPU and layerwise offload"
+            )
+        if self.use_fsdp_inference:
+            raise ValueError(
+                "--direct-gpu-weight-loading does not support FSDP inference"
+            )
+        if self.tp_size != 1:
+            raise ValueError("--direct-gpu-weight-loading requires --tp-size 1")
 
     def _validate_parallelism(self):
         if self.kv_gather_degree < 1:

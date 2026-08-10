@@ -808,8 +808,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
-        self.config_data = config  # Store config
-        arch_config = config.arch_config
+        arch_config = self.config
 
         self.in_channels = arch_config.in_channels
         self.out_channels = arch_config.out_channels

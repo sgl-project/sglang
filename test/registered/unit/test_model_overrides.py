@@ -25,6 +25,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_context,
+    get_exec,
     get_server_args,
     reset_context,
 )
@@ -345,6 +346,51 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         flags = self._publish(sa)
         self.assertTrue(flags.enable_tf32_matmul)
         self.assertFalse(flags.enable_multi_layer_eagle)  # pristine materialize
+
+    def test_minimax_m2_sm10x_nvfp4_uses_routed_trtllm(self):
+        """MiniMax-M2 NVFP4 auto must avoid the unsupported plain TRT-LLM path."""
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            explicit = self._construct(
+                "MiniMaxM2ForCausalLM",
+                "llama",
+                quantization="modelopt_fp4",
+                moe_runner_backend="flashinfer_cutlass",
+            )
+            non_nvfp4 = self._construct(
+                "MiniMaxM2ForCausalLM", "llama", quantization="fp8"
+            )
+            nvfp4 = self._construct(
+                "MiniMaxM2ForCausalLM", "llama", quantization="modelopt_fp4"
+            )
+
+        self.assertEqual(explicit.moe_runner_backend, "flashinfer_cutlass")
+        self.assertEqual(non_nvfp4.moe_runner_backend, "auto")
+        self.assertEqual(nvfp4.moe_runner_backend, "flashinfer_trtllm_routed")
+        self.assertTrue(nvfp4.disable_shared_experts_fusion)
+        self.assertIn(
+            (
+                "_minimax_m2_overrides",
+                {
+                    "enable_tf32_matmul": True,
+                    "moe_runner_backend": "flashinfer_trtllm_routed",
+                },
+            ),
+            nvfp4._resolved_overrides,
+        )
+        self.assertIn(
+            ("_moe_runner_fusion_disable", {"disable_shared_experts_fusion": True}),
+            nvfp4._resolved_overrides,
+        )
+
+        # Thor (SM110) and other architectures keep the existing auto behavior.
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            non_sm10x = self._construct(
+                "MiniMaxM2ForCausalLM", "llama", quantization="modelopt_fp4"
+            )
+        self.assertEqual(non_sm10x.moe_runner_backend, "auto")
+
+        self._publish(nvfp4)
+        self.assertEqual(get_exec().moe.moe_runner_backend, "flashinfer_trtllm_routed")
 
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
