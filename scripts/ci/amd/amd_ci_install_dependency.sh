@@ -338,11 +338,29 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
+    AITER_TRITON_MODE=$(docker exec ci_sglang bash -c 'printf "%s" "${AITER_USE_SYSTEM_TRITON:-1}"')
+    if [[ -n "${AITER_COMMIT_OVERRIDE:-}" ]]; then
+        IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
+        case "${IMAGE_HIP_VERSION}" in
+            7.2*) AITER_TRITON_MODE="0" ;;
+            7.0*) AITER_TRITON_MODE="1" ;;
+            *)
+                echo "[CI-AITER-CHECK] ERROR: unsupported HIP version for AITER override: ${IMAGE_HIP_VERSION}"
+                exit 1
+                ;;
+        esac
+    fi
+    echo "[CI-AITER-CHECK] AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE}"
+
     # build AITER
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE} GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
+
+    if [[ "${AITER_TRITON_MODE}" == "0" ]]; then
+        docker exec ci_sglang python3 -c "import pathlib, re, triton; installer=pathlib.Path('/sgl-workspace/aiter/.github/scripts/install_triton.sh').read_text(); expected=re.search(r'\"triton==([^\"]+)\"', installer).group(1); assert triton.__version__.startswith(expected), (expected, triton.__version__); print(f'[CI-AITER-CHECK] Validated AITER Triton {triton.__version__}')"
+    fi
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi
