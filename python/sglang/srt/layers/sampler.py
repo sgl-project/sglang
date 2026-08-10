@@ -714,7 +714,9 @@ def multinomial_with_seed(
     # x is a uniform sample in [0, 1]. get gumbel noise from it.
     # which is equivalent to -log(-log(x))
     # keep everything in in-place operations to avoid unnecessary memory allocations.
-    x.log_().clamp_(min=torch.finfo(x.dtype).min).neg_()  # -log(x)
+    # clamp both ends: x == 1 gives gumbel +inf (NaN at -inf logprobs); the cap is
+    # the hash spacing so that bucket matches its neighbor instead of dominating
+    x.log_().clamp_(min=torch.finfo(x.dtype).min, max=-(2.0**-32)).neg_()
     x.log_().neg_()  # -log(-log(x)) == gumbel noise
 
     # add gumbel noise to logprobs

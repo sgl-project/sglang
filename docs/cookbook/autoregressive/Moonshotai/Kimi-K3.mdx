@@ -288,31 +288,22 @@ Clients then send requests to the router (`:8000`) instead of an individual role
 The open-source K3 serving contract currently supports **image input only** — its
 processor rejects video and audio input.
 
-#### Recommended high-speed VLM
+#### VLM feature transport
 
-The command panel now opens on the **B300 · Unified · Balanced**
-recipe below. It makes the VLM-specific performance choices explicit:
+Use **VLM Transport** in the command picker. `Auto` is a topology-aware starting
+point, not a claim that one configuration is fastest for every workload.
 
-```bash Command
-sglang serve \
-  --trust-remote-code \
-  --model-path moonshotai/Kimi-K3 \
-  --tp-size 8 \
-  --dcp-size 8 \
-  --mem-fraction-static 0.85 \
-  --mm-feature-transport cuda_ipc \
-  --mm-processor-worker-num 2 \
-  --mm-io-worker-num 16 \
-  --reasoning-parser kimi_k3 \
-  --tool-call-parser kimi_k3 \
-  --host 0.0.0.0 \
-  --port 30000
-```
+| Picker selection | Processor-to-scheduler feature path |
+|---|---|
+| Auto · single-node Unified CUDA | CUDA IPC |
+| Auto · Unified GB200/GB300 | CUDA VMM when IMEX is available; CPU otherwise |
+| Auto · PD or other topologies | CPU |
+| CPU | CPU, with no GPU feature pool |
 
-- `--mm-feature-transport cuda_ipc` — single-node only: skips the CPU round trip, bounded pool (per-tensor CPU fallback when full), reserves up to `SGLANG_MM_FEATURE_CACHE_MB` on the base GPU. Multi-node recipes use CPU transport.
-- 2 processor / 16 I/O workers are the measured defaults; more adds contention.
-- Leave `--mm-attention-backend` unset — auto-selected, with a correctness fallback.
-- Don't add `--mm-enable-dp-encoder`; K3 already shards images across TP ranks.
+CUDA IPC and CUDA VMM reserve up to `SGLANG_MM_FEATURE_CACHE_MB` (1 GiB by
+default) on the base GPU and fall back to CPU per tensor when full. This setting
+does not control EPD encoder output or PD KV/KDA transfer. K3 already defaults to
+2 processor workers and 16 I/O workers; leave those flags unset unless tuning.
 
 #### VLM compatibility
 
@@ -321,7 +312,7 @@ sglang serve \
 | PD | Supported. Image processing and ViT run on prefill; the PD transfer then moves both paged MLA KV and KDA recurrent state as described in [PD disaggregation](#pd-disaggregation). |
 | EPD | Supported on the public `kimi-k3` branch. Use an `--encoder-only` vision role and a `--language-only` prefill role; add the normal decode role for full EPD. See the [EPD guide](../../../docs/advanced_features/epd_disaggregation). |
 | MM encoder DP | Built in. K3 shards complete images across TP ranks, so leave `--mm-enable-dp-encoder` unset in unified, PD-prefill, and encoder-only roles. |
-| CUDA IPC | Compatible with the local processor-to-scheduler path on a single-node unified or PD-prefill role. It does not replace `--encoder-transfer-backend` for EPD or the PD KV/KDA transfer, and its bounded pool consumes HBM. |
+| MM feature transport | Processor-to-scheduler features only. EPD encoder output and PD KV/KDA transfer use their own backends. |
 | ViT BCG | Compatible with unified and encoder-only roles, but recommended only for repeated encoder shapes after measuring the HBM trade-off below. |
 
 #### Should ViT BCG be enabled?
@@ -335,11 +326,10 @@ Keep ViT BCG **off** for general serving; enable `SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 #### Low-HBM VLM
 
 Use this profile when keeping HBM headroom matters more than peak concurrency.
-It removes the 1 GiB CUDA IPC pool, keeps ViT BCG disabled, halves the context
+It removes the GPU feature pool, keeps ViT BCG disabled, halves the context
 window, caps concurrency, and lowers the static-memory target:
 
 ```bash Command
-SGLANG_VIT_ENABLE_CUDA_GRAPH=0 \
 sglang serve \
   --trust-remote-code \
   --model-path moonshotai/Kimi-K3 \
@@ -348,8 +338,6 @@ sglang serve \
   --enable-symm-mem \
   --mem-fraction-static 0.82 \
   --mm-feature-transport cpu \
-  --mm-processor-worker-num 2 \
-  --mm-io-worker-num 16 \
   --reasoning-parser kimi_k3 \
   --tool-call-parser kimi_k3 \
   --host 0.0.0.0 \

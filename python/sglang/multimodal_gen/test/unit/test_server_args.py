@@ -24,6 +24,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -588,6 +591,15 @@ class TestWarmupModeNormalization(unittest.TestCase):
     def test_breakable_cuda_graph_forces_server_warmup(self):
         sa = self._resolve(enable_breakable_cuda_graph=True)
         self.assertEqual(sa.warmup_mode, "server")
+
+    def test_breakable_cuda_graph_allows_unset_resolutions(self):
+        # BCG no longer hard-requires --warmup-resolutions; the model
+        # default warmup resolution is captured at warmup instead.
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.enable_breakable_cuda_graph = True
+        sa.warmup_resolutions = None
+        sa.bcg_text_buckets = None
+        sa._validate_breakable_cuda_graph()  # must not raise
 
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -1582,28 +1594,48 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
 
-    def test_speed_mode_enables_torch_compile_by_default(self):
+    def test_speed_mode_keeps_torch_compile_off_by_default(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
                 "performance_mode": "speed",
-            },
-        )
-
-        self.assertTrue(args.enable_torch_compile)
-
-    def test_speed_mode_preserves_explicit_torch_compile_off(self):
-        args = self._from_dict_with_pipeline_config(
-            QwenImagePipelineConfig(),
-            kwargs={
-                "model_path": "Qwen/Qwen-Image",
-                "performance_mode": "speed",
-                "enable_torch_compile": False,
             },
         )
 
         self.assertFalse(args.enable_torch_compile)
+
+    def test_speed_mode_preserves_explicit_torch_compile_setting(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                args = self._from_dict_with_pipeline_config(
+                    QwenImagePipelineConfig(),
+                    kwargs={
+                        "model_path": "Qwen/Qwen-Image",
+                        "performance_mode": "speed",
+                        "enable_torch_compile": enabled,
+                    },
+                )
+
+                self.assertEqual(args.enable_torch_compile, enabled)
+
+    def test_speed_mode_honors_model_torch_compile_opt_in(self):
+        with patch.object(
+            QwenImagePipelineConfig,
+            "get_model_deployment_config",
+            return_value=ModelDeploymentConfig(
+                speed_mode_enable_torch_compile_by_default=True
+            ),
+        ):
+            args = self._from_dict_with_pipeline_config(
+                QwenImagePipelineConfig(),
+                kwargs={
+                    "model_path": "Qwen/Qwen-Image",
+                    "performance_mode": "speed",
+                },
+            )
+
+        self.assertTrue(args.enable_torch_compile)
 
     def test_speed_mode_uses_minimax_h3_compile_policy(self):
         for explicit, expected in ((None, False), (True, True)):
