@@ -39,7 +39,19 @@ try:
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     use_flashinfer = True
-except ImportError:
+except (ImportError, AttributeError, AssertionError, OSError):
+    # Broader than plain ImportError on purpose: flashinfer's own module-level
+    # initialization can raise non-ImportError when the underlying runtime is
+    # missing/broken. Observed failure modes:
+    #   * AssertionError from flashinfer.comm.cuda_ipc when libcudart cannot be
+    #     loaded (non-CUDA hosts, e.g. NPU / bare-metal CPU with a leftover
+    #     flashinfer install).
+    #   * OSError from flashinfer / libtorch_cuda.so lookups on ROCm hosts
+    #     (see issue #27519).
+    #   * AttributeError has been used at other module-level flashinfer
+    #     guards in this repo (server_args.py, layernorm.py).
+    # Whatever the reason, the correct behavior at this site is graceful
+    # fallback (use_flashinfer = False), not aborting sglang startup.
     use_flashinfer = False
 
 logger = logging.getLogger(__name__)
