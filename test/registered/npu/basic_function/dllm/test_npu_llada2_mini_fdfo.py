@@ -2,6 +2,7 @@ import unittest
 
 from sglang.test.ascend.test_ascend_utils import (
     run_bench_serving,
+    LLaDA2_0_MINI_WEIGHTS_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -21,7 +22,7 @@ class TestLLaDA2MiniFDFO(CustomTestCase):
         TTFTS = []
         throughputs = []
         p99_ttfts = []
-        model = "/home/weights/LLaDA2.0-mini"
+        model = LLaDA2_0_MINI_WEIGHTS_PATH
         common_args = [
             [
                 "--trust-remote-code",
