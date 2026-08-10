@@ -2433,19 +2433,16 @@ class DeepseekV4Model(nn.Module):
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
-        if not _is_hip:
-            path_ok = not dsa_use_prefill_cp(forward_batch)
-        elif dsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             path_ok = (
-                not is_cp_v2_active(forward_batch)
+                _is_hip
+                and not is_cp_v2_active(forward_batch)
                 and is_dsa_prefill_cp_round_robin_split()
                 and get_moe_a2a_backend().is_none()
                 and self._cp_children_splittable(forward_batch)
             )
         else:
-            path_ok = (
-                not get_moe_a2a_backend().is_none() or get_parallel().attn_dp_size > 1
-            )
+            path_ok = True
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
