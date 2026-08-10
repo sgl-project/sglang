@@ -10,8 +10,9 @@ the external SMG inference stub drives a real generation request. The next
 deadline report must contain a snapshot collected by the request-end wake,
 rather than one collected by ordinary interval sampling at that deadline.
 
-Requires a GPU + model + ``smg-grpc-servicer`` + the load-reporter extra (CUDA
-CI); it cannot run on a CPU-only host without those packages.
+Requires a GPU + model + ``smg-grpc-servicer==0.8.0`` + the load-reporter extra
+(CUDA CI pins 0.8.0 in the test extra); it cannot run on a CPU-only host
+without those packages.
 """
 
 from __future__ import annotations
