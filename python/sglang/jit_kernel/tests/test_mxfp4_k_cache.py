@@ -183,7 +183,10 @@ def test_compatibility_with_decode_kernel():
     from sglang.jit_kernel.dsv4.mxfp4_decode import mxfp4_decode_attention
 
     q = k_all[0, :num_heads, :]
-    page_indices = torch.zeros(num_heads, dtype=torch.int32, device=dev)
+    # Each head attends over the single page (slots 0..page_size-1)
+    page_indices = torch.arange(
+        num_heads, dtype=torch.int32, device=dev
+    ).unsqueeze(1).expand(num_heads, page_size).contiguous()
 
     # The decode kernel expects flat k_cache, matching our pool layout
     k_cache_flat = pool.view(-1, MXFP4_BYTES_PER_TOKEN)
@@ -192,7 +195,7 @@ def test_compatibility_with_decode_kernel():
         k_cache_flat,
         page_indices,
         MXFP4_TOTAL_DIM**-0.5,
-        page_size,
+        swa_width=page_size,
     )
 
     assert torch.isfinite(out_kernel).all(), "Kernel produced NaN/inf"

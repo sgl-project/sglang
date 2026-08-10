@@ -83,20 +83,40 @@ def mxfp4_decode_attention(
     k_cache: torch.Tensor,
     page_indices: torch.Tensor,
     sm_scale: float,
-    page_size: int = 128,
+    swa_width: int = 128,
     num_valid: int = 0,
     attn_sink: Optional[torch.Tensor] = None,
+    swa_lengths: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_lengths: Optional[torch.Tensor] = None,
+    extra_topk_width: int = 0,
+    extra_page_size: int = 0,
 ) -> torch.Tensor:
     """Fused MXFP4 decode attention — CUDA-graph safe.
 
+    One call attends over the SWA window and (optionally) the extra C4/C128
+    cache with per-query valid lengths, fusing the online softmax.
+
     Args:
         q:            [N, 512] BF16 — flattened Q (batch * num_heads).
-        k_cache:      [*, 368] uint8 — row-major MXFP4 K-cache.
-        page_indices: [N] int32 — kernel-page indices per query.
+        k_cache:      [*, 368] uint8 — row-major MXFP4 SWA K-cache (one row
+                      per flat SWA slot, tightly packed).
+        page_indices: [N, W] int32 — flat SWA slot ids per query (W = swa_width,
+                      padded with -1); rows are addressed as slot * 368 so
+                      windows crossing storage-page boundaries work.
         sm_scale:     float — 1/sqrt(head_dim).
-        page_size:    int — tokens per kernel page (128 for DSV4 SWA).
-        num_valid:    int — actual valid tokens (0 = scan all page_size).
+        swa_width:    int — padded width W of page_indices (128 for DSV4 SWA).
+        num_valid:    int — fallback valid tokens when swa_lengths is None
+                      (0 = scan all swa_width).
         attn_sink:    [N] float32 or None — per-head sink values.
+        swa_lengths:  [N] int32 or None — per-query valid SWA tokens
+                      (clamped to swa_width); None falls back to num_valid.
+        extra_k_cache: [*, 368] uint8 or None — MXFP4 C4/C128 cache.
+        extra_indices: [N, W] int32 or None — flattened token ids per query.
+        extra_topk_lengths: [N] int32 or None — per-query valid count.
+        extra_topk_width: int — padded width W of extra_indices.
+        extra_page_size: int — tokens per page in the extra cache.
 
     Returns:
         o: [N, 512] BF16 attention output.
@@ -105,10 +125,36 @@ def mxfp4_decode_attention(
         raise ValueError(f"q must be [N, 512] BF16, got {q.shape}")
     if k_cache.ndim != 2 or k_cache.shape[1] != 368:
         raise ValueError(f"k_cache must be [*, 368] uint8, got {k_cache.shape}")
-    if page_indices.ndim != 1 or page_indices.shape[0] != q.shape[0]:
+    if page_indices.ndim != 2 or page_indices.shape[0] != q.shape[0]:
         raise ValueError(
-            f"page_indices must be [{q.shape[0]}], got {page_indices.shape}"
+            f"page_indices must be [{q.shape[0]}, W], got {page_indices.shape}"
         )
+    if page_indices.shape[1] != swa_width:
+        raise ValueError(
+            f"page_indices width {page_indices.shape[1]} != swa_width {swa_width}"
+        )
+    n = q.shape[0]
+    if swa_lengths is not None:
+        if swa_lengths.shape != (n,):
+            raise ValueError(f"swa_lengths must be [{n}], got {swa_lengths.shape}")
+        swa_lengths = swa_lengths.contiguous().to(torch.int32)
+    have_extra = extra_k_cache is not None
+    if have_extra:
+        if extra_indices is None or extra_topk_lengths is None:
+            raise ValueError("extra_k_cache requires extra_indices and extra_topk_lengths")
+        if extra_k_cache.ndim != 2 or extra_k_cache.shape[1] != 368:
+            raise ValueError(
+                f"extra_k_cache must be [*, 368] uint8, got {extra_k_cache.shape}"
+            )
+        if extra_indices.ndim != 2 or extra_indices.shape[0] != n:
+            raise ValueError(f"extra_indices must be [{n}, W], got {extra_indices.shape}")
+        if extra_topk_lengths.shape != (n,):
+            raise ValueError(f"extra_topk_lengths must be [{n}], got {extra_topk_lengths.shape}")
+        if extra_topk_width <= 0:
+            raise ValueError("extra_topk_width must be positive")
+        extra_k_cache = extra_k_cache.contiguous()
+        extra_indices = extra_indices.contiguous().to(torch.int32)
+        extra_topk_lengths = extra_topk_lengths.contiguous().to(torch.int32)
 
     q = q.contiguous()
     k_cache = k_cache.contiguous()
@@ -123,12 +169,18 @@ def mxfp4_decode_attention(
         q,
         k_cache,
         page_indices,
+        swa_lengths,
+        extra_k_cache,
+        extra_indices,
+        extra_topk_lengths,
         attn_sink,
         o,
         lse,
         sm_scale,
-        page_size,
+        swa_width,
         num_valid,
+        extra_topk_width,
+        extra_page_size,
     )
     return o
 
