@@ -33,7 +33,6 @@ dependencies = [
   "flash-attn-4>=4.0.0b18",
   "flashinfer_python[cu13]==0.6.15.post1", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
-  "helion==1.4",
   "humming-kernels[cu13]==0.1.10",
   "interegular",
   "IPython",
@@ -67,6 +66,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
+  "sgl-deep-ep==0.1.0",
   "sgl-deep-gemm==0.1.5.post2",
   "sglang-kernel==0.4.6.post1",
   "smg-grpc-servicer>=0.5.0",
@@ -120,6 +120,14 @@ diffusion = [
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "websockets",
   "xatlas",
+]
+
+diffusion-qvg = [
+  # quant-videogen 0.1.0 pins an incompatible Torch version, so it is
+  # installed separately with --no-deps; this extra provides its missing
+  # import-time dependencies.
+  "loguru>=0.7",
+  "termcolor>=2.3",
 ]
 
 ray = [

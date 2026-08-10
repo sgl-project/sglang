@@ -89,6 +89,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale,
 )
@@ -2649,35 +2650,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """V4 only fuses when explicitly asked to, and then the checkpoint must
+        carry exactly one shared expert. Asked by the loader before any layer is
+        built."""
+        if not get_exec().moe.enforce_shared_experts_fusion:
+            return "Config does not support fused shared expert(s)."
+        if hf_config.n_shared_experts != 1:
+            raise ValueError(
+                "DeepSeek V4 shared-experts fusion expects exactly one shared "
+                f"expert, but got n_shared_experts={hf_config.n_shared_experts}."
+            )
+        return None
+
     def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0
-        if get_exec().moe.disable_shared_experts_fusion:
-            return
-
-        disable_reason = None
-        if get_exec().moe.enforce_shared_experts_fusion:
-            if self.config.n_shared_experts != 1:
-                raise ValueError(
-                    "DeepSeek V4 shared-experts fusion expects exactly one shared "
-                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
-                )
-        else:
-            disable_reason = "Config does not support fused shared expert(s)."
-
-        if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "DeepseekV4ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
+        # The decision was installed by the loader; this only reads it.
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
 
     @torch.no_grad()
     def forward(

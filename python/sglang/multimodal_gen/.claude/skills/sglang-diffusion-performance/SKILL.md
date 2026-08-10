@@ -32,10 +32,13 @@ These options are intended to preserve output quality. In practice, some paths (
 
 | Option | CLI Flag / Env Var | What It Does | Speedup | Limitations / Notes |
 |---|---|---|---|---|
+| **Performance Mode** | `--performance-mode auto\|speed\|memory\|manual` (`--mode` alias) | Applies model-aware residency, FSDP/CFG, and compile defaults without overriding explicit flags. `auto` is the safe default; `speed` favors GPU residency; `memory` favors offload; `manual` leaves performance args explicit. | Fastest way to establish a sensible deployment baseline | `speed` may OOM and enables `torch.compile` only when the model deployment config allows it. Explicit offload/FSDP/parallelism/compile flags win. Use `manual` for controlled A/B benchmarks. |
 | **torch.compile** | `--enable-torch-compile` | Applies `torch.compile` to the DiT forward pass, fusing ops and reducing kernel launch overhead. | ~1.2–1.5x on denoising | First request is slow (compilation). May cause minor precision drifts due to [PyTorch issue #145213](https://github.com/pytorch/pytorch/issues/145213). Pair with `--warmup-mode request` for best results. |
+| **Breakable CUDA Graph** | `--enable-breakable-cuda-graph --warmup-resolutions <WxH...>` plus optional `--bcg-text-buckets ...` | Captures fixed-resolution DiT segments while leaving attention/collectives eager, reducing launch overhead on supported pipelines. | Large on launch-bound paths; merged SANA and LTX-2 cases show material e2e gains | Mutually exclusive with `torch.compile` and Cache-DiT; BCG takes priority. Every served resolution must be declared for warmup capture. Current support is model-specific (Ideogram4, LTX-2, MiniMax-H3, Qwen-Image, SANA1.5, Z-Image, GLM-Image); benchmark before keeping it. |
 | **Warmup** | `--warmup-mode request` | Runs dummy forward passes to warm up CUDA caches, JIT, and `torch.compile`. Eliminates cold-start penalty. | Removes first-request latency spike | Adds startup time. Without `--warmup-resolutions`, warmup happens on first request. |
 | **Warmup Resolutions** | `--warmup-resolutions 256x256 720x720` | Pre-compiles and warms up specific resolutions at server startup (instead of lazily on first request). | Faster first request per resolution | Each resolution adds to startup time. Serving mode only; useful when you know your target resolutions in advance. |
 | **Multi-GPU (SP)** | `--num-gpus N --ulysses-degree N` | Sequence parallelism across GPUs. Shards sequence tokens (not frames) to minimize padding. | Near-linear scaling with N GPUs | Requires NCCL; inter-GPU bandwidth matters. `ulysses_degree * ring_degree = sp_degree`. For Wan2.2 video, start by benchmarking pure Ulysses before assuming a mixed Ulysses/Ring layout is fastest. |
+| **Cross-node SP** | `--nnodes`, `--node-rank`, `--dist-init-addr` with total `--num-gpus`; combine node-local Ulysses with cross-node Ring | Extends sequence parallel groups across multiple nodes. | Capacity and long-sequence scaling beyond one host | Prefer Ulysses within a node and Ring across nodes; all-to-all is usually the least cross-node-friendly. Use `--encoder-parallel replicate` today and verify the model's Ring admission and determinism. MiniMax-H3 is the current end-to-end validated recipe. |
 | **CFG Parallel** | `--enable-cfg-parallel` | Runs conditional and unconditional CFG branches in parallel across GPUs. For CFG models on multi-GPU, benchmark this against pure Ulysses on your topology instead of assuming one always wins. | Often faster than pure SP for CFG models | Requires `num_gpus >= 2`. Halves the Ulysses group size (e.g. 8 GPU → two 4-GPU groups). Only for models that use CFG. Nightly coverage configs may intentionally use smaller Ulysses groups to keep ring behavior exercised; that does not automatically make them the lowest-latency choice. |
 | **Layerwise Offload** | `--dit-layerwise-offload` | Async layer-by-layer H2D prefetch with compute overlap. Only ~2 DiT layers reside on GPU at a time, dramatically reducing VRAM. For some video models the copy stream can be almost fully hidden behind compute. | Saves VRAM (40 GB → ~11 GB for Wan A14B); can be near-zero speed cost on the right workload | Enabled by default for Wan/MOVA video models. Incompatible with Cache-DiT. For **image models** or highly parallelized setups (many GPUs, small per-GPU compute), the copy stream may not be fully hidden and can cause slowdown. |
 | **Offload Prefetch Size** | `--dit-offload-prefetch-size F` | Fine-grained control over layerwise offload: how many layers to prefetch ahead. `0.0` = 1 layer (min VRAM), `0.1` = 10% of layers, `≥1` = absolute layer count. | Tune for cases where default offload has copy stream interference (e.g. image models). 0.05–0.1 is a good starting point. | Values ≥ 0.5 approach no-offload VRAM with worse performance. Use lower values when copy overlap is weak; disable offload when memory allows and latency dominates. |
@@ -53,8 +56,13 @@ These options **trade output quality** for speed or VRAM savings. Results will d
 
 | Option | CLI Flag / Env Var | What It Does | Speedup | Quality Impact / Limitations |
 |---|---|---|---|---|
+| **Request Quality Fast Paths** | `--quality high` (`lossless` is default) | Mounts model-owned accelerated DiT/VAE paths that are validated for high quality but are not bit-exact to the reference path. | Model- and shape-specific | Support is per model and may be a no-op. Keep `--quality lossless` as the A/B ground truth. Do not confuse this with `--output-quality`, which controls file compression. |
 | **Approximate Attention** | `--attention-backend sage_attn` / `sage_attn_3` / `sliding_tile_attn` / `video_sparse_attn` / `sparse_video_gen_2_attn` / `vmoba_attn` / `sla_attn` / `sage_sla_attn` | Replaces exact attention with approximate or sparse variants. `sage_attn`: INT8/FP8 quantized Q·K; `sliding_tile_attn`: spatial-temporal tile skipping; others: model-specific sparse patterns. | ~1.5–2x on attention (varies by backend) | Quality degradation varies by backend and model. `sage_attn` is the most general; sparse backends (`sliding_tile_attn`, `video_sparse_attn`, etc.) are video-model-specific and may require config files (e.g. `--mask-strategy-file-path` for STA). Requires corresponding packages installed. |
 | **Cache-DiT** | Native: `SGLANG_CACHE_DIT_ENABLED=true` plus `SGLANG_CACHE_DIT_*` env vars. Diffusers backend: `--backend diffusers --cache-dit-config <yaml-or-json>` | Caches intermediate residuals across denoising steps and skips redundant computations via DBCache, TaylorSeer, and optional SCM. | ~1.5-2x on supported models | Quality depends on cache policy. Incompatible with `--dit-layerwise-offload`. Do not pass `--cache-dit-config` for native SGLang tuning unless you are intentionally using the diffusers backend flow. |
+| **TeaCache** | `--enable-teacache` (uses model sampling presets) | Reuses residuals when adjacent denoising steps are sufficiently similar. | Model- and threshold-dependent | Approximate and model-specific. Mutually exclusive with Spectrum. Fix prompt/seed/shape/steps and validate temporal consistency, not only single frames. |
+| **Spectrum** | `--enable-spectrum` plus optional `--spectrum-*` controls | Forecasts DiT features and skips selected denoising steps. | Defaults target an accuracy/speed tradeoff; aggressive windows can be much faster | Native `sglang generate` only for FLUX.1, Wan, HunyuanVideo, and SD3; not FLUX.2 or server requests. Mutually exclusive with TeaCache. `--debug` adds shadow validation and is not representative latency. |
+| **Progressive Resolution** | `--progressive-mode dct_rewind --progressive-levels N --progressive-delta D` | Runs early denoising at lower latent resolution, then spectrally upsamples and switches to the target resolution. | Model- and schedule-dependent | Approximate and pipeline-specific. Keep the switch schedule fixed and compare detail, composition, and temporal stability. |
+| **Causal KV-Cache Quantization** | `--kv-cache-quant int4\|int2` plus optional `--kv-cache-quant-*` controls | Compresses completed causal KV-cache chunks with Quant-VideoGen PRQ while keeping the mutable/current chunk and recent chunks in BF16. | Primarily a long-session memory saving | Currently limited to LingBot World realtime causal serving; requires `quant-videogen`. INT4 is the starting point; INT2 saves more memory with more error. It quantizes cache state, not checkpoint weights. |
 | **Quantized Models (Nunchaku / SVDQuant)** | `--enable-svdquant --transformer-weights-path <path>` + optional `--quantization-precision int4\|nvfp4`, `--quantization-rank 32` | W4A4-style quantization via [Nunchaku](https://nunchaku.tech). Reduces DiT weight memory by ~4x. Precision/rank can be auto-inferred from weight filename or set explicitly. | ~1.5–2x compute speedup | Lossy quantization; quality depends on rank and precision. Requires pre-quantized weights. Ampere (SM8x) or SM12x only (no Hopper SM90). Higher rank = better quality but more memory. |
 | **Pre-quantized Transformer Override** | `--transformer-path <dir-or-repo>` / `--transformer-weights-path <path>` | Load a quantized transformer component or raw transformer weights. For converted ModelOpt FP8/NVFP4 directories, prefer `--transformer-path`; use `--transformer-weights-path` for weight-only artifacts the model loader expects. | ~1.3–1.5x compute (dtype dependent) | Requires a validated quantized transformer override, such as one produced by the ModelOpt helper tools. Quality is usually slightly worse than BF16 and depends on the format, fallback layers, and calibration scope. |
 | **Component Precision Override** | `--dit-precision fp16`, `--vae-precision fp16\|bf16` | On-the-fly dtype conversion for individual components. E.g. convert a BF16 model to FP16 at load time, or run VAE in BF16 instead of FP32. | Reduces memory; FP16 can be faster on some GPUs | May affect numerical stability. VAE is FP32 by default for accuracy; lowering it is lossy. DiT defaults to BF16. |
@@ -216,6 +224,37 @@ sglang generate --model-path <IMAGE_MODEL> \
 
 Note: for image models, per-layer compute is smaller, so layerwise offload may not fully hide H2D transfer. Disable DiT layerwise and CPU offload if VRAM allows; otherwise a large image DiT can stay resident on CPU and make the denoise loop H2D-bound.
 
+### Launch-bound fixed-resolution path: Breakable CUDA Graph
+
+```bash
+sglang serve --model-path Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers \
+  --performance-mode speed \
+  --enable-torch-compile false \
+  --enable-breakable-cuda-graph \
+  --warmup-resolutions 1024x1024 \
+  --port 30010
+```
+
+Keep `torch.compile` off, declare every production resolution, and benchmark
+the exact prompt-length distribution. Add `--bcg-text-buckets` only when the
+default buckets create excessive padding or miss a served prompt signature.
+
+### Compare request-scoped high-quality fast paths
+
+```bash
+sglang generate --model-path <MODEL> \
+  --quality lossless --prompt "..." --seed 42 \
+  --perf-dump-path baseline.json --save-output
+
+sglang generate --model-path <MODEL> \
+  --quality high --prompt "..." --seed 42 \
+  --perf-dump-path quality-high.json --save-output
+```
+
+Keep every other flag fixed and compare the generated artifact as well as the
+perf dumps. If the model has no registered quality-gated sites, `high` may be a
+no-op.
+
 ### Image-edit baselines: JoyAI and FireRed
 
 ```bash
@@ -317,6 +356,7 @@ Use these as first commands to benchmark, not as universal winners.
 | FLUX.1 / FLUX.2 image | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup-mode request --dit-layerwise-offload false` | `black-forest-labs/FLUX.*` repos are gated; for FP8/NVFP4 use validated `--transformer-path` or `--transformer-weights-path` flows from the quant skill. |
 | FLUX.2 Klein / Klein Base | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup-mode request --dit-layerwise-offload false` | Current registry has `black-forest-labs/FLUX.2-klein-4B`, `FLUX.2-klein-9B`, and base variants. Klein is step-distilled; Klein Base is not. |
 | Qwen-Image / Qwen-Image-Edit | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup-mode request`; optionally native `SGLANG_CACHE_DIT_ENABLED=true` | Cache-DiT is lossy. For edit tasks, keep reference image, seed, and output size fixed. |
+| Krea-2 | 1024x1024, distilled `oss_turbo` defaults (8 steps, guidance 1.0) | `--performance-mode speed --warmup-mode request` | Native `krea/Krea-2` text-to-image path with Qwen3-VL text conditioning. The repo may require HF access; keep the 8-step distilled baseline separate from non-turbo sampling experiments. |
 | Z-Image / Z-Image-Turbo | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup-mode request` | Keep base Z-Image separate from Turbo: base uses 50-step CFG defaults, Turbo uses 9-step zero-CFG defaults. Mainline has bf16-native Triton RMSNorm scale and tanh-residual fusions. |
 | Wan2.2 A14B T2V/I2V | 1280x720, 81 frames | Nightly: `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory` | For lowest latency, also benchmark pure Ulysses on the same GPUs. |
 | Wan2.2 TI2V 5B | 1280x720, 81 frames, 1 GPU | `--enable-torch-compile --warmup-mode request` | Keep the input image and motion prompt fixed when comparing sparse attention or Cache-DiT. |
@@ -329,7 +369,8 @@ Use these as first commands to benchmark, not as universal winners.
 | JoyAI-Image-Edit | 1024-class TI2I, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup-mode request --dit-layerwise-offload false --dit-cpu-offload false` | Newly supported image-edit path. Keep the input image, prompt, seed, and output size fixed; 2-GPU CFG parallel is the validated H100 starting point. |
 | FireRed-Image-Edit 1.0 / 1.1 | 1024x1024 image edit, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup-mode request --dit-layerwise-offload false --dit-cpu-offload false` | Uses the native `QwenImageEditPlusPipeline` path. 2-GPU CFG parallel is the validated H100 starting point; benchmark 1.0 and 1.1 separately because checkpoint differences can change denoise latency. |
 | Hunyuan3D-2 shape | Shape generation, 50 steps, guidance 5.0 | `--backend=sglang --enable-torch-compile --warmup-mode request --dit-layerwise-offload false --dit-cpu-offload false` | Focus on `Hunyuan3DShapeDenoisingStage`; keep mesh export/paint timings separate from denoise. |
-| MOVA / Helios / LingBot World | Use the benchmark/profile presets or server test cases first | `--enable-torch-compile --warmup-mode request`; pin offload and topology flags explicitly | These video/realtime families have model-specific stages and condition handling. Keep prompt/image/action inputs fixed and prefer perf dumps over wall time alone. |
+| LingBot Video MoE 30B | 384x640, 17 frames, 12 steps for the current GPU case | `--model-path robbyant/lingbot-video-moe-30b-a3b --text-encoder-cpu-offload` | Native T2V path. Prompts are structured JSON captions, not raw free text; keep that contract when comparing latency or quality. |
+| MOVA / Helios / LingBot World | Use the benchmark/profile presets or server test cases first | `--enable-torch-compile --warmup-mode request`; pin offload and topology flags explicitly | These video/realtime families have model-specific stages and condition handling. For LingBot World causal serving, keep `--kv-cache-quant off` as the exact cache baseline before testing INT4/INT2. |
 
 ## Historical PR Watchlist
 
@@ -344,10 +385,13 @@ about whether the work has merged:
 ## Tips
 
 - **Benchmarking**: always use `--warmup-mode request` and look for the line ending with `(with warmup excluded)` for accurate timing.
+- **Preset vs experiment control**: start with `--performance-mode auto` or
+  `speed` for deployment, but use `--performance-mode manual` and pin the
+  relevant residency/parallelism flags for controlled A/B claims.
 - **Perf dump**: use `--perf-dump-path result.json` to save structured metrics, then compare with `python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json result.json`.
 - **Offload tuning**: after the first request, the runtime logs peak GPU memory and which components could stay resident. Use this to decide which `--*-cpu-offload` flags to disable.
 - **Backend selection**: `--backend sglang` (default, auto-detected) enables native optimizations (fused kernels, SP, native Cache-DiT env knobs, etc.). `--backend diffusers` falls back to Diffusers pipelines and is the path that accepts `--cache-dit-config` plus diffusers attention backend names.
 - **Wan2.2-I2V sizing**: explicit `--width/--height` on `Wan2.2-I2V-A14B` control the target area while preserving the condition-image aspect ratio.
-- **Mainline diffusion fast paths**: before proposing a new kernel or overlap scheme, check `sglang-diffusion-benchmark-profile/existing-fast-paths.md`. It covers H3 indexed modulation, fused QK norm + RoPE, packed Ulysses QKV/USP relayout and batched TP AdaLN, plus GroupNorm+SiLU, Z-Image bf16-native Triton norm modulation, LTX2 split RoPE, LTX2 residual-gate add, varlen USP pack/scatter, packed QKV/NVFP4 expectations, and existing multi-GPU overlap families such as Ulysses / USP and turbo-layer async all-to-all.
+- **Mainline diffusion fast paths**: before proposing a new kernel or overlap scheme, check `sglang-diffusion-benchmark-profile/existing-fast-paths.md`. It covers H3 indexed modulation, fused QK norm + RoPE, packed Ulysses QKV/USP relayout and batched TP AdaLN; FLUX/GLM/SANA bit-exact LayerNorm+modulate; request-scoped quality gates; Wan causal-VAE data movement; GroupNorm+SiLU, Z-Image bf16-native norm modulation, LTX2 split RoPE/residual-gate add, varlen USP pack/scatter, packed QKV/NVFP4, breakable CUDA graph, and existing distributed overlap families.
 - **NVFP4 trace interpretation**: on FLUX.2 NVFP4 and Nunchaku-style checkpoints, packed QKV is expected. SGLang intentionally uses fused projection modules such as `to_qkv` / `to_added_qkv` instead of separate `to_q` / `to_k` / `to_v`, so a split-QKV trace usually means the quantized path did not engage rather than a brand new fusion opportunity.
 - **Hotspot workflow split**: use `sglang-diffusion-benchmark-profile` to prove and classify a slowdown with perf dumps plus `torch.profiler`; hand concrete kernel work off with the perf/profile evidence attached instead of expanding the benchmark skill.

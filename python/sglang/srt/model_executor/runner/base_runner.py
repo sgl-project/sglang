@@ -282,8 +282,10 @@ class BaseRunner(ABC):
         comm backend; must run before CG capture (it syncs the stream + barriers
         cross-rank, uncapturable) and raises early on non-MNNVL platforms.
         """
-        mr = self.model_runner
-        if mr.server_args.dcp_size <= 1 or mr.server_args.dcp_comm_backend != "fi_a2a":
+        if (
+            not get_parallel().dcp_enabled
+            or get_parallel().dcp_comm_backend != "fi_a2a"
+        ):
             return
 
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
@@ -402,7 +404,13 @@ class BaseRunner(ABC):
             else get_server_return_hidden_states_mode(mr.server_args)
         )
         num_tokens_per_req = 1
-        if mr.spec_algorithm.is_speculative():
+        # A PD prefill target worker's pool has no SpeculativeState, so a
+        # TARGET_VERIFY dummy forward would trip the linear-attn backend's
+        # pool-type assert. Warm up in plain DECODE instead.
+        _is_pd_prefill_target = (
+            mr.server_args.disaggregation_mode == "prefill" and not mr.is_draft_worker
+        )
+        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
             if mr.is_draft_worker:
                 assert (
                     mr.spec_algorithm.supports_target_verify_for_draft()

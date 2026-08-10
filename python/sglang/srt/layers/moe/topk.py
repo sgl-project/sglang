@@ -1374,7 +1374,7 @@ def _eplb_remap_enabled() -> bool:
     from sglang.srt.runtime_context import get_server_args
 
     try:
-        server_args = get_server_args()
+        get_server_args()  # probes that a config is published
     except ValueError:
         # Global server args are not initialized outside the server runtime
         # (e.g. in unit tests that call select_experts directly). In that case

@@ -19,7 +19,7 @@ def _jit_ltx2_qknorm_split_rope_module() -> Module:
         cuda_wrappers=[
             (
                 "ltx2_qknorm_split_rope_pair",
-                "sglang_ltx2_qknorm_split_rope::LTX2QKNormSplitRopeKernel::run",
+                "ltx2_qknorm_split_rope::LTX2QKNormSplitRopeKernel::run",
             )
         ],
     )
