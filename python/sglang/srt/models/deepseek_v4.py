@@ -1360,12 +1360,10 @@ class MQALayer(MqaAttentionBase):
                 dtype=x.dtype,
                 bf16_store=bf16_store,
             )
-            kv = None
 
             if not unified and use_cp:
-                # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
-                # write to the FlashMLA cache after gather.
-                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+                # DSA CP: keep the fused kernel's normalized and rotated bf16 kv
+                # for the cross-rank all-gather, then write it after gather.
                 kv = cp_materialize_global_token_order(
                     kv.contiguous(),
                     forward_batch,
@@ -1379,6 +1377,8 @@ class MQALayer(MqaAttentionBase):
                     swa_k=kv,
                     forward_batch=forward_batch,
                 )
+            else:
+                kv = None
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
