@@ -15,6 +15,8 @@
 
 from typing import Callable, Optional
 
+import ray
+
 from sglang.srt.entrypoints.engine import (
     init_tokenizer_manager,
     run_detokenizer_process,
@@ -44,7 +46,16 @@ def launch_server(
     if execute_warmup_func is None:
         execute_warmup_func = _execute_server_warmup
 
-    server_args.override("ray.http_server.clear_placement_group", placement_group=None)
+    placement_group = getattr(server_args, "placement_group", None)
+    if placement_group is not None and not ray.is_initialized():
+        ray.init(
+            address="auto",
+            runtime_env=getattr(server_args, "ray_runtime_env", None),
+        )
+    server_args.override(
+        "ray.http_server.placement_group",
+        placement_group=placement_group,
+    )
 
     (
         tokenizer_manager,

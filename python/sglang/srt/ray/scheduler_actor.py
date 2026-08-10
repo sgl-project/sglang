@@ -121,6 +121,19 @@ class SchedulerActor:
         """Return scheduler initialization info for handshake."""
         return self.scheduler.get_init_info()
 
+    def register_weight_for_rdt(self) -> None:
+        """Pin model parameters with NIXL for repeated RDT pulls."""
+        if self.scheduler.server_args.enable_memory_saver:
+            return
+
+        import torch
+        from ray.experimental import register_nixl_memory
+
+        torch.cuda.set_device(self.scheduler.ps.gpu_id)
+        model = self.scheduler.tp_worker.model_runner.model
+        for _, param in model.named_parameters():
+            register_nixl_memory(param.data)
+
     def pull_weights(
         self, weights_refs: List[ObjectRef], param_names: List[str]
     ) -> None:
