@@ -175,27 +175,38 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             "image_seq_len_target": 256,
         }
 
-    def test_zimage_prompt_lengths_share_bucket_signature(self):
+    def test_zimage_captures_at_native_caption_length(self):
+        """Z-Image attends its caption slots unmasked (learned pad tokens act
+        as attended registers), so padding to a shared text bucket changes how
+        many registers every token attends and drifts the output
+        (sgl-project/sglang#34183). The padder therefore captures at the
+        incoming native length: lengths are never extended, and distinct
+        native lengths intentionally do NOT share a graph signature (unseen
+        lengths fall back to eager at serving time)."""
         with self._patch_buckets(64, 128):
             short = self.stage._bcg_pad_prompt_kwargs(
+                self._zimage_kwargs(19), current_model=self.zimage_model
+            )
+            short_again = self.stage._bcg_pad_prompt_kwargs(
                 self._zimage_kwargs(19), current_model=self.zimage_model
             )
             longer = self.stage._bcg_pad_prompt_kwargs(
                 self._zimage_kwargs(47), current_model=self.zimage_model
             )
 
-        self.assertEqual(short["encoder_hidden_states"][0].shape, (64, 16))
-        self.assertEqual(longer["encoder_hidden_states"][0].shape, (64, 16))
-        self.assertEqual(short["encoder_hidden_states_mask"].shape, (1, 64))
-        self.assertEqual(short["caption_valid_lens"].shape, (1,))
+        # Captions keep their native length -- no bucket extension.
+        self.assertEqual(short["encoder_hidden_states"][0].shape, (19, 16))
+        self.assertEqual(longer["encoder_hidden_states"][0].shape, (47, 16))
+        self.assertEqual(short["encoder_hidden_states_mask"].shape, (1, 19))
         self.assertEqual(short["caption_valid_lens"].item(), 19)
         self.assertEqual(longer["caption_valid_lens"].item(), 47)
         self.assertTrue(short["_use_caption_valid_mask"])
-        self.assertTrue(longer["_use_caption_valid_mask"])
-        self.assertFalse(short["encoder_hidden_states_mask"][0, 19:].any())
-        self.assertFalse(longer["encoder_hidden_states_mask"][0, 47:].any())
-        self.assertEqual(short["freqs_cis"][0].shape, (64, 8))
-        self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
+        self.assertTrue(short["encoder_hidden_states_mask"].all())
+        self.assertEqual(short["freqs_cis"][0].shape, (19, 8))
+        # Same native length -> same signature (graph reuse works); different
+        # native lengths -> different signatures, by design.
+        self.assertEqual(_signature_kwargs(short), _signature_kwargs(short_again))
+        self.assertNotEqual(_signature_kwargs(short), _signature_kwargs(longer))
 
     def _minimax_h3_kwargs(self, text_seq: int):
         image_seq = 4
