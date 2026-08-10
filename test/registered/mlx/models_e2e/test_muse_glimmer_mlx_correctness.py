@@ -70,7 +70,7 @@ def _artifact_or_skip() -> Path:
     if not (path / "config.json").is_file():
         raise unittest.SkipTest(f"no packaged artifact at {path}")
     config = json.loads((path / "config.json").read_text())
-    if config.get("onyx_mlx_format") != 1:
+    if config.get("muse_glimmer_mlx_format") != 1:
         raise unittest.SkipTest(
             f"{path} is not a packaged Muse Glimmer MLX artifact (missing marker)"
         )

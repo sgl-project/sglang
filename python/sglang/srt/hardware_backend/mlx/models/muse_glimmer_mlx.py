@@ -14,7 +14,7 @@
 """Muse Glimmer (dense, text-only) for mlx-lm.
 
 Loaded via mlx-lm's custom-architecture path: ship this file in the checkpoint
-directory as ``mlx_onyx.py``, set ``"model_file": "mlx_onyx.py"`` in
+directory as ``muse_glimmer_mlx.py``, set ``"model_file": "muse_glimmer_mlx.py"`` in
 ``config.json``.  This copy under ``sglang/srt/hardware_backend/mlx/models/``
 is the maintained source; artifacts ship a byte-identical copy.  It must stay
 importable standalone (mlx / mlx-lm imports only — no sglang imports),
@@ -90,7 +90,7 @@ rejects everything else with an actionable error:
   but an older-generation export served through this path gets the wrong
   rope layout (their configs are byte-identical; prefer repackaging).
 * **Packaged MLX artifact**: already fused/folded, marked by
-  ``"onyx_mlx_format": 1`` in ``config.json`` (stamped at packaging time
+  ``"muse_glimmer_mlx_format": 1`` in ``config.json`` (stamped at packaging time
   only, never present on raw HF exports).  Passed through untouched.
 
 Config schemas.  ``ModelArgs.from_dict`` accepts the flat schema written at
@@ -191,7 +191,7 @@ def flatten_rc_config(config: dict) -> dict:
     layer_rope_theta = text.get("layer_rope_theta")
 
     flat = {
-        "model_type": "muse_glimmer_text",
+        "model_type": "muse_glimmer",
         "hidden_size": text["hidden_size"],
         "num_hidden_layers": text["num_hidden_layers"],
         "num_attention_heads": text["num_attention_heads"],
@@ -218,7 +218,7 @@ def flatten_rc_config(config: dict) -> dict:
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str = "muse_glimmer_text"
+    model_type: str = "muse_glimmer"
     hidden_size: int = 6656
     num_hidden_layers: int = 52
     num_attention_heads: int = 32
@@ -243,7 +243,7 @@ class ModelArgs(BaseModelArgs):
     layer_types: Optional[List[str]] = None
     # Set on saved MLX artifacts at packaging time (never on raw HF
     # exports); tells sanitize() the weights are already fused/folded.
-    onyx_mlx_format: Optional[int] = None
+    muse_glimmer_mlx_format: Optional[int] = None
 
     @classmethod
     def from_dict(cls, params):
@@ -320,11 +320,11 @@ class ModelArgs(BaseModelArgs):
                     f"{mismatches}"
                 )
 
-        if self.onyx_mlx_format is not None and (
-            self.onyx_mlx_format != MUSE_GLIMMER_MLX_FORMAT_VERSION
+        if self.muse_glimmer_mlx_format is not None and (
+            self.muse_glimmer_mlx_format != MUSE_GLIMMER_MLX_FORMAT_VERSION
         ):
             raise ValueError(
-                f"onyx_mlx_format {self.onyx_mlx_format} is not supported by "
+                f"muse_glimmer_mlx_format {self.muse_glimmer_mlx_format} is not supported by "
                 f"this model file (expected {MUSE_GLIMMER_MLX_FORMAT_VERSION}); "
                 "regenerate the artifact with a matching packager"
             )
@@ -611,7 +611,7 @@ class Model(nn.Module):
         return keys
 
     def sanitize(self, weights: dict) -> dict:
-        if self.args.onyx_mlx_format == MUSE_GLIMMER_MLX_FORMAT_VERSION:
+        if self.args.muse_glimmer_mlx_format == MUSE_GLIMMER_MLX_FORMAT_VERSION:
             # Packaged artifact: weights are already fused/folded.  A raw-only
             # key here means the marker was stamped on the wrong directory.
             stray = sorted(
@@ -622,7 +622,7 @@ class Model(nn.Module):
             if stray:
                 raise ValueError(
                     "config.json claims a packaged Muse Glimmer MLX artifact "
-                    f"(onyx_mlx_format={MUSE_GLIMMER_MLX_FORMAT_VERSION}) but the "
+                    f"(muse_glimmer_mlx_format={MUSE_GLIMMER_MLX_FORMAT_VERSION}) but the "
                     f"weights contain raw-checkpoint keys {stray[:4]}"
                     f"{'...' if len(stray) > 4 else ''}; the marker belongs "
                     "on packaged artifacts only — repackage from the raw HF export"
@@ -649,7 +649,7 @@ class Model(nn.Module):
             if gate_missing and not unexpected:
                 hint = (
                     " (weights look already fused: if this is a packaged "
-                    'artifact, its config.json must carry "onyx_mlx_format": '
+                    'artifact, its config.json must carry "muse_glimmer_mlx_format": '
                     f"{MUSE_GLIMMER_MLX_FORMAT_VERSION})"
                 )
             raise ValueError(
@@ -676,7 +676,7 @@ class Model(nn.Module):
                 f"raw q_proj.weight has shape {raw_q_shape}, expected "
                 f"({H * D}, {hidden}); a width of {2 * H * D} means the gate "
                 "is already fused — such artifacts must carry "
-                f'"onyx_mlx_format": {MUSE_GLIMMER_MLX_FORMAT_VERSION} in config.json'
+                f'"muse_glimmer_mlx_format": {MUSE_GLIMMER_MLX_FORMAT_VERSION} in config.json'
             )
 
         new_weights = {}

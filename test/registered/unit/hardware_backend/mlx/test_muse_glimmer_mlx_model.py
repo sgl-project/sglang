@@ -143,7 +143,7 @@ def _rc_weights(args):
 class TestFlattenRcConfig(CustomTestCase):
     def test_field_mapping_and_conversions(self):
         flat = flatten_rc_config({"text_config": dict(_RC_TEXT_CONFIG)})
-        self.assertEqual(flat["model_type"], "muse_glimmer_text")
+        self.assertEqual(flat["model_type"], "muse_glimmer")
         # RC qk_scale_factor is against SDPA's 1/sqrt(head_dim).
         self.assertAlmostEqual(flat["qk_scale_factor"], 0.5 * 4**0.5)
         self.assertEqual(flat["output_soft_cap_temp"], 20.0)
@@ -196,8 +196,8 @@ class TestModelArgsValidation(CustomTestCase):
             ModelArgs(**_TINY, no_rope_layers=[1, 1, 2, 0])
 
     def test_unknown_format_version_rejected(self):
-        with self.assertRaisesRegex(ValueError, "onyx_mlx_format"):
-            ModelArgs(**_TINY, onyx_mlx_format=99)
+        with self.assertRaisesRegex(ValueError, "muse_glimmer_mlx_format"):
+            ModelArgs(**_TINY, muse_glimmer_mlx_format=99)
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
@@ -257,12 +257,12 @@ class TestSanitize(CustomTestCase):
         self.assertFalse(any("language_model" in k for k in out))
 
     def test_packaged_artifact_passes_through(self):
-        model = self._model(onyx_mlx_format=1)
+        model = self._model(muse_glimmer_mlx_format=1)
         packaged = {"model.embed_tokens.weight": mx.zeros((32, 8))}
         self.assertIs(model.sanitize(packaged), packaged)
 
     def test_packaged_marker_with_raw_keys_rejected(self):
-        model = self._model(onyx_mlx_format=1)
+        model = self._model(muse_glimmer_mlx_format=1)
         raw = _raw_weights(ModelArgs(**_TINY))
         with self.assertRaisesRegex(ValueError, "raw-checkpoint keys"):
             model.sanitize(raw)
