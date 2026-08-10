@@ -2667,13 +2667,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            # This extend forward writes its snapshot into buf[next]; commit
-            # that slot as the consumable one, paired with the
-            # mamba_last_track_seqlen update below. Non-lazy then advances the
-            # write pointer to the other (always-allocated) slot; in lazy mode
-            # the second slot is not allocated yet, so the swap happens on
-            # demand in mamba_lazy_prealloc_at_boundary during
-            # prepare_for_decode.
+            # In lazy mode, skip the swap — the second ping-pong slot is not
+            # allocated yet; it will be allocated on demand at the track boundary
+            # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
             req.mamba_last_track_idx = req.mamba_next_track_idx
             if not mamba_extra_buffer_lazy_enabled():
                 req.mamba_next_track_idx = (
@@ -3284,11 +3280,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
-            mamba_track_buffer_indices=(
-                self.mamba_track_buffer_indices[:]
-                if self.mamba_track_buffer_indices is not None
-                else None
-            ),
+            mamba_track_buffer_indices=self.mamba_track_buffer_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             mamba_track_mask_cpu=self.mamba_track_mask_cpu,

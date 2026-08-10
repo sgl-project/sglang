@@ -1388,19 +1388,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             return mamba_next_track_idx
 
     def get_mamba_ping_pong_keep_idx(self, req: Req) -> int:
-        """Return the ping-pong index holding the most recent tracked state.
-
-        Both modes maintain req.mamba_last_track_idx as the consumer-side
-        pointer, updated at the same points as req.mamba_last_track_seqlen
-        (extend prep; decode-boundary result processing), so the (slot, seqlen)
-        pair handed to the cache is always self-consistent. next_track_idx is
-        the producer-side write target and may already point at a slot whose
-        write is still in flight (e.g. lazy prealloc under overlap scheduling).
-        """
-        assert req.mamba_last_track_idx is not None, (
-            "mamba_last_track_idx is None while the ping-pong buffer exists; "
-            "a producer path set mamba_next_track_idx without maintaining it"
-        )
+        """Return the ping-pong index holding the most recent tracked state."""
         return req.mamba_last_track_idx
 
     def _alloc_ping_pong_buffer(self, req: Req):
@@ -1428,10 +1416,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         buf[:n] = slots
         req.mamba_ping_pong_track_buffer = buf
         req.mamba_next_track_idx = 0
-        # Nothing is tracked yet, so the keep answer is nominal until the
-        # first track commits. Lazy holds its single slot at index 0;
-        # non-lazy starts at the "other" slot, preserving the invariant
-        # last == other(next) that the non-lazy flips maintain.
         req.mamba_last_track_idx = (
             0
             if self.enable_mamba_extra_buffer_lazy
@@ -1457,8 +1441,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         Returns the old slot index (shape [1]) for cache insertion and
         replaces it with new_slot so the request can continue tracking.
-        The valid state is at last_track_idx in both modes (see
-        get_mamba_ping_pong_keep_idx).
         """
         donate_idx = self.get_mamba_ping_pong_keep_idx(req)
         mamba_value_donated = (
