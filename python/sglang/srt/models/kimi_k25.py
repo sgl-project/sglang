@@ -730,9 +730,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
             acknowledges the entire TP group so the bounded IPC pool remains
             recyclable.
             """
-            # Same source as MmItemMemoryPool.try_to_recycle(), which waits on
-            # configured_tp_size(): the live world size agrees once dist is up,
-            # but a refcount that disagrees with the waiter would strand items.
+            # Match the configured TP consumer count captured when the
+            # tokenizer creates MmItemMemoryPool. A live attention subgroup
+            # size could leave acknowledgements missing and strand the lease.
             ipc_consumer_count = max(configured_tp_size(), 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
