@@ -13,6 +13,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 namespace device::tile {
 
 /**
@@ -60,3 +62,5 @@ struct Memory {
 };
 
 }  // namespace device::tile
+
+}  // namespace sglang
