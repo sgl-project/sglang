@@ -23,11 +23,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _make_wrapper(tup: Tuple[str, str]) -> str:
-    export_name, kernel_name = tup
-    return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
-
-
 _QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
 _ANGLE_INCLUDE_RE = re.compile(r"^\s*#\s*include\s*<(sgl_kernel/[^>]+)>", re.MULTILINE)
 
@@ -169,6 +164,19 @@ def _jit_build_dir_name(module_name: str) -> str:
     return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
+def _make_wrapper(tup: Tuple[str, str]) -> str:
+    export_name, kernel_name = tup
+    return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
+
+
+def _make_sources(files: List[str], wrappers: List[Tuple[str, str]]) -> List[str]:
+    sources = [f'#include "{path}"' for path in files]
+    sources += ["namespace sglang {"]
+    sources += [_make_wrapper(tup) for tup in wrappers]
+    sources += ["}  // namespace sglang"]
+    return sources
+
+
 # JIT compilation is pure Python/filesystem plumbing (path `.resolve()` calls
 # `os.lstat`, etc.) that Dynamo cannot trace. When a lazily-loaded kernel is
 # first reached from inside a `@torch.compile`d region, tracing into it produces
@@ -288,14 +296,8 @@ def load_jit(
             )
 
     if header_only:
-        cpp_wrappers = cpp_wrappers or []
-        cuda_wrappers = cuda_wrappers or []
-        cpp_sources = [f'#include "{path}"' for path in cpp_files]
-        cpp_sources += [_make_wrapper(tup) for tup in cpp_wrappers]
-
-        # include cuda files
-        cuda_sources = [f'#include "{path}"' for path in cuda_files]
-        cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
+        cpp_sources = _make_sources(cpp_files, cpp_wrappers or [])
+        cuda_sources = _make_sources(cuda_files, cuda_wrappers or [])
         with _jit_compile_context():
             return load_inline(
                 module_name,

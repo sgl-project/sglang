@@ -54,7 +54,10 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    MAX_SCHEDULER_RPC_TIMEOUT_S,
+    ServerArgs,
+)
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
@@ -584,6 +587,15 @@ class TestWarmupModeNormalization(unittest.TestCase):
     def test_breakable_cuda_graph_forces_server_warmup(self):
         sa = self._resolve(enable_breakable_cuda_graph=True)
         self.assertEqual(sa.warmup_mode, "server")
+
+    def test_breakable_cuda_graph_allows_unset_resolutions(self):
+        # BCG no longer hard-requires --warmup-resolutions; the model
+        # default warmup resolution is captured at warmup instead.
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.enable_breakable_cuda_graph = True
+        sa.warmup_resolutions = None
+        sa.bcg_text_buckets = None
+        sa._validate_breakable_cuda_graph()  # must not raise
 
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -1760,6 +1772,107 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(server_args.ltx2_two_stage_device_mode, "original")
 
 
+class TestKVGatherDegree(unittest.TestCase):
+    def test_sp2_defaults_to_kv_gather(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 2)
+        self.assertTrue(args.sp_split_auto)
+        # gather rows occupy the contiguous inner SP dimension
+        self.assertEqual(args.ulysses_degree, 2)
+        self.assertEqual(args.sp_degree, 2)
+
+    def test_higher_sp_defaults_to_ulysses(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 4,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 1)
+        self.assertFalse(args.sp_split_auto)
+        self.assertEqual(args.ulysses_degree, 4)
+
+    def test_explicit_ulysses_is_not_overridden(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "ulysses_degree": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 1)
+        self.assertEqual(args.ulysses_degree, 2)
+
+    def test_explicit_degree_is_not_auto(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "kv_gather_degree": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 2)
+        self.assertFalse(args.sp_split_auto)
+
+    def test_kv_gather_supports_tp(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 4,
+                "tp_size": 2,
+                "sp_degree": 2,
+                "kv_gather_degree": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.tp_size, 2)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.kv_gather_degree, 2)
+
+    def test_kv_gather_supports_fsdp(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "sp_degree": 2,
+                "kv_gather_degree": 2,
+                "use_fsdp_inference": True,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertEqual(args.kv_gather_degree, 2)
+
+    def test_kv_gather_does_not_compose_yet(self):
+        for extra in ({"ulysses_degree": 2}, {"ring_degree": 2}):
+            with self.assertRaisesRegex(ValueError, "does not compose"):
+                _from_dict_without_model_resolution(
+                    {
+                        "model_path": "/fake",
+                        "num_gpus": 4,
+                        "sp_degree": 4,
+                        "kv_gather_degree": 2,
+                        "performance_mode": "manual",
+                        **extra,
+                    }
+                )
+
+
 class TestFSDPShardConditions(unittest.TestCase):
     def test_helpers_match_only_direct_block_entries(self):
         self.assertTrue(
@@ -2093,6 +2206,40 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
         )
 
         self.assertEqual(args.disagg_role, RoleType.DENOISER)
+
+
+class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
+    def test_scheduler_rpc_timeout_defaults_to_unbounded(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+        self.assertIsNone(args.scheduler_rpc_timeout)
+
+    def test_scheduler_rpc_timeout_cli_arg_is_parsed_in_seconds(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--scheduler-rpc-timeout",
+            "7200",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.scheduler_rpc_timeout, 7200)
+
+    def test_scheduler_rpc_timeout_rejects_invalid_values(self):
+        invalid_values = (0, -1, MAX_SCHEDULER_RPC_TIMEOUT_S + 1, True, 1.5, "1")
+
+        for invalid_value in invalid_values:
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaisesRegex(
+                    ValueError, "scheduler_rpc_timeout must be None"
+                ):
+                    _from_dict_without_model_resolution(
+                        {
+                            "model_path": "/fake",
+                            "scheduler_rpc_timeout": invalid_value,
+                        }
+                    )
 
 
 class TestDisaggTransferBackendArgs(unittest.TestCase):

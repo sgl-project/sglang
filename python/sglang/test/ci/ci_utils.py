@@ -137,9 +137,23 @@ def _repo_relative_path(p: str) -> str:
     return p[idx + len(marker) :] if idx >= 0 else p
 
 
+# Slow-run variance is largely additive (cold HF cache, slow server launch), so
+# the multiplier alone under-provisions at both ends: test_encoder_dp runs
+# 200-426s but once took over 1185s against a 1.5x budget of 765s, and
+# test_lora_deepseek_v3_base_logprob_diff (est 1800) landed on exactly 1.5 * est.
+# Every file gets the same absolute slack on top of the proportional one.
+DERIVED_TIMEOUT_SLACK = 1800.0
+DERIVED_TIMEOUT_FACTOR = 1.5
+
+
+def derive_timeout_per_file(est_time: float) -> float:
+    est = float(est_time)
+    return max(est * DERIVED_TIMEOUT_FACTOR, est + DERIVED_TIMEOUT_SLACK)
+
+
 def run_unittest_files(
     files: Union[List[TestFile], List[CIRegistry]],
-    timeout_per_file: float,
+    timeout_per_file: Optional[float] = None,
     continue_on_error: bool = False,
     enable_retry: bool = False,
     max_attempts: int = 2,
@@ -150,7 +164,8 @@ def run_unittest_files(
 
     Args:
         files: List of TestFile objects to run
-        timeout_per_file: Timeout in seconds for each test file
+        timeout_per_file: Fixed timeout in seconds for every test file, or None
+                          to derive each file's budget from its own est_time.
         continue_on_error: If True, continue running remaining tests even if one fails.
                           If False, stop at first failure (default behavior for PR tests).
         enable_retry: If True, retry failed tests that appear to be accuracy/performance
@@ -177,6 +192,12 @@ def run_unittest_files(
         else:
             # FIXME: remove this branch after migrating all tests to use CIRegistry
             filename, estimated_time = file.name, file.estimated_time
+
+        file_timeout = (
+            timeout_per_file
+            if timeout_per_file is not None
+            else derive_timeout_per_file(estimated_time)
+        )
 
         process = None
         output_lines = []
@@ -235,7 +256,7 @@ def run_unittest_files(
                     run_one_file,
                     args=(filename,),
                     kwargs={"capture_output": enable_retry},
-                    timeout=timeout_per_file,
+                    timeout=file_timeout,
                 )
 
                 if ret_code == 0:
@@ -281,24 +302,22 @@ def run_unittest_files(
                 # TimeoutError aborts run_one_file before its elapsed write;
                 # record the timeout cap as an upper bound so the file still
                 # appears in the TIMINGS block below.
-                file_elapsed[filename] = float(timeout_per_file)
+                file_elapsed[filename] = float(file_timeout)
                 # Retry once on timeout: usually a stuck server / hung device.
                 # A real hang times out again and is reported.
                 if enable_retry and attempt < max_attempts:
                     logger.info(
                         f"\n[CI Retry] {filename} timed out after "
-                        f"{timeout_per_file}s; waiting {retry_wait_seconds}s "
+                        f"{file_timeout}s; waiting {retry_wait_seconds}s "
                         f"before retry (attempt {attempt + 1}/{max_attempts})\n"
                     )
                     time.sleep(retry_wait_seconds)
                     attempt += 1
                     continue
-                logger.info(
-                    f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n"
-                )
+                logger.info(f"\n✗ TIMEOUT: {filename} after {file_timeout} seconds\n")
                 if was_retried:
                     retried_tests.append((filename, attempt, "timeout"))
-                failed_tests.append((filename, f"timeout after {timeout_per_file}s"))
+                failed_tests.append((filename, f"timeout after {file_timeout}s"))
                 break
 
         if not file_passed:

@@ -32,7 +32,6 @@ runtime_base = [
   "einops",
   "fastapi",
   "gguf",
-  "helion==1.4",
   "interegular",
   "IPython",
   "llguidance>=1.7.6,<2.0.0",
