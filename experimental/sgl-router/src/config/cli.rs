@@ -10,8 +10,8 @@ use clap::Parser;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use crate::config::{
-    default_cache_sim_max_concurrent_captures, default_cache_sim_send_concurrency,
-    default_cb_cool_down, default_proxy_request_timeout_secs, default_shutdown_drain_secs,
+    default_cache_sim_max_concurrent_captures, default_cb_cool_down,
+    default_proxy_request_timeout_secs, default_shutdown_drain_secs,
     default_stale_request_timeout_secs, default_stream_idle_timeout_secs,
     default_stream_send_stall_secs, default_tokenizer_shards, resolve_mode, ActiveLoadConfig,
     AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig, Config, DiscoveryBackend,
@@ -361,18 +361,6 @@ pub struct Cli {
     /// capture. Only meaningful with `--cache-sim-url`.
     #[arg(long, default_value_t = default_cache_sim_max_concurrent_captures())]
     pub cache_sim_max_concurrent_captures: usize,
-    /// Concurrent in-flight POSTs the cache-sim ingest tee's sender runs. The
-    /// serial (single-task) sender capped tee throughput at ~1/POST-latency
-    /// (≈110 req/s), so peak traffic overflowed the bounded tee channel and
-    /// dropped records; N concurrent POSTs raise that ceiling ~N×. Also read
-    /// from `RADIXARK_CACHE_SIM_SEND_CONCURRENCY`. Only meaningful with
-    /// `--cache-sim-url`.
-    #[arg(
-        long,
-        env = "RADIXARK_CACHE_SIM_SEND_CONCURRENCY",
-        default_value_t = default_cache_sim_send_concurrency()
-    )]
-    pub cache_sim_send_concurrency: usize,
 }
 
 impl Cli {
@@ -615,7 +603,6 @@ impl Cli {
                 log_format: self.log_format,
                 cache_sim_url: self.cache_sim_url,
                 cache_sim_max_concurrent_captures: self.cache_sim_max_concurrent_captures,
-                cache_sim_send_concurrency: self.cache_sim_send_concurrency,
             },
             model: ModelConfig {
                 // Default the tokenizer source to the model id (treated as a
