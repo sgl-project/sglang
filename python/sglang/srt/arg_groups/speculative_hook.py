@@ -143,6 +143,93 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if algo is not None:
         algo.handle_server_args(server_args)
 
+    # After the algorithm handler, so speculative_num_draft_tokens and the cuda-graph config are
+    # both resolved.
+    _fill_default_max_running_requests(server_args, algo)
+
+
+# Historical speculative admission limit (#3986 -> #4908). Retained only as a lower bound so the
+# derived default is never below what the built-in algorithms used before.
+_SPEC_MIN_MAX_RUNNING_REQUESTS = 48
+
+
+def _fill_default_max_running_requests(server_args: ServerArgs, algo) -> None:
+    """Default a speculative server's admission limit to the captured decode-graph ladder.
+
+    A decode batch larger than ``cuda_graph_config[decode].max_bs`` has no captured graph and
+    runs eager, and under speculation an eager step is ``num_draft_tokens`` rows wide. The
+    ladder is used because it is a bound sglang already derives from measured device memory, so
+    this default scales with the hardware instead of being a constant chosen independently of
+    it, and every admissible batch stays inside a captured bucket.
+
+    It is a deliberately conservative default rather than a throughput optimum: batches above
+    the captured ladder are not always slower, and ``--max-running-requests`` still overrides
+    this value.
+
+    The literal 48 survives only as a floor. It arrived in #3986 as 32 and was raised in #4908,
+    back when enabling speculative decoding forcibly disabled the overlap scheduler, and it has
+    been one global constant for every device ever since. Flooring at it means no built-in
+    speculative algorithm admits fewer requests than it does today.
+    """
+    from sglang.srt.arg_groups.overrides import resolved_view
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+    if server_args.speculative_algorithm is None:
+        # handle_speculative_decoding runs unconditionally; a non-speculative server must be left
+        # with max_running_requests=None so the KV-capacity estimator in resolve_max_num_reqs
+        # decides, exactly as before this change.
+        return
+
+    if isinstance(algo, CustomSpecAlgo):
+        # Externally registered algorithms never received the historical 48 -- CustomSpecAlgo's
+        # handle_server_args is a no-op -- so they resolve through the KV-capacity estimator
+        # today. Leave them there; this change replaces the five built-in constants, it does not
+        # extend a default to algorithms that never had one.
+        return
+
+    if server_args.max_running_requests is not None:
+        # An explicit --max-running-requests, or an earlier model-specific writer such as
+        # deepseek_v4_hook. Never clobber either.
+        return
+
+    # The ladder is resolved by now: _handle_cuda_graph_config parses the flags and
+    # _handle_gpu_memory_settings fills the memory-tier max_bs, both earlier in __post_init__.
+    # A few later hooks can still disable the decode graph (tensor-dump debugging, dLLM
+    # inference, and the HRM-Text / embedding-Gemma capability adjustments); there this default
+    # is simply a number the eager path never benefits from, exactly as the constant it
+    # replaces was.
+    graph_config = server_args.cuda_graph_config
+    decode_graph = graph_config.decode if graph_config is not None else None
+    if (
+        decode_graph is None
+        or decode_graph.backend == Backend.DISABLED
+        or not decode_graph.max_bs
+    ):
+        # No ladder to derive from. Hybrid (mamba / linear-attention) servers assert this field
+        # is set under speculation before resolve_max_num_reqs runs
+        # (mem_cache/kv_cache_configurator.py::_handle_max_mamba_cache), so fall back to the
+        # historical value rather than leaving it None.
+        server_args.max_running_requests = _SPEC_MIN_MAX_RUNNING_REQUESTS
+        return
+
+    # max_running_requests is a global figure that resolve_max_num_reqs divides by the
+    # attention-DP degree, so scale up to make the per-worker result equal the ladder.
+    attn_dp_size = (
+        server_args.dp_size if resolved_view(server_args).enable_dp_attention else 1
+    )
+    derived = decode_graph.max_bs * attn_dp_size
+    server_args.max_running_requests = max(_SPEC_MIN_MAX_RUNNING_REQUESTS, derived)
+
+    logger.info(
+        "max_running_requests defaults to %d for speculative decoding "
+        "(decode CUDA-graph ladder max_bs=%d x attn_dp_size=%d). Batches above the captured "
+        "ladder run eager; override with --max-running-requests.",
+        server_args.max_running_requests,
+        decode_graph.max_bs,
+        attn_dp_size,
+    )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
@@ -253,12 +340,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
-
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -393,12 +474,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             f"got {server_args.speculative_num_draft_tokens}."
         )
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
-
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
         logger.warning(
@@ -508,12 +583,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
-
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
         logger.warning(
@@ -535,12 +604,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         # TODO: support dp attention for standalone speculative decoding
         raise ValueError(
             "Currently standalone speculative decoding does not support dp attention."
-        )
-
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
     _disable_overlap_schedule_for_cpu(server_args)
@@ -688,12 +751,6 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         )
 
     _disable_overlap_schedule_for_cpu(server_args)
-
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
 
     server_args.enable_mixed_chunk = False
     server_args.speculative_eagle_topk = server_args.speculative_ngram_max_bfs_breadth
