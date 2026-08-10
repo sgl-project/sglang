@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
+    fused_gate_rmsnorm_active,
     fused_rmsnorm_scale,
     fused_rmsnorm_tanh_residual,
     mark_fused_gate_rmsnorm_site,
@@ -394,7 +395,7 @@ class Ideogram4TransformerBlock(nn.Module):
             adaln_input
         ).chunk(4, dim=-1)
         enable_fused = (
-            self._sgl_fused_gate_rmsnorm_enabled and not torch.compiler.is_compiling()
+            fused_gate_rmsnorm_active(self) and not torch.compiler.is_compiling()
         )
         attn_out = self.attention(
             _norm_scale(x, scale_msa, self.attention_norm1, enable_fused),
