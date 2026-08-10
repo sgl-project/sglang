@@ -76,6 +76,11 @@ class TcPiecewiseForwardContext:
     dsa_indexers: Optional[List[Any]] = field(default=None)
     num_tokens: Optional[int] = None
     raw_num_tokens: Optional[int] = None
+    # True when the FULL prefill graph backend owns this forward (whole model
+    # captured uniformly). BCG / tc_piecewise leave it False -- consumers that
+    # bake per-forward fusion flags (e.g. the scattered AR-sconv gate) must
+    # not fuse across BCG's eager-break seams, but are safe under full graphs.
+    full_graph: bool = False
 
 
 _tc_piecewise_forward_context: Optional[TcPiecewiseForwardContext] = None
@@ -96,6 +101,7 @@ def set_tc_piecewise_forward_context(
     mha_companion_layers: Optional[List[Any]] = None,
     num_tokens: Optional[int] = None,
     raw_num_tokens: Optional[int] = None,
+    full_graph: bool = False,
 ):
     global _tc_piecewise_forward_context
     _tc_piecewise_forward_context = TcPiecewiseForwardContext(
@@ -108,6 +114,7 @@ def set_tc_piecewise_forward_context(
         dsa_indexers=dsa_indexers,
         num_tokens=num_tokens,
         raw_num_tokens=raw_num_tokens,
+        full_graph=full_graph,
     )
     try:
         yield

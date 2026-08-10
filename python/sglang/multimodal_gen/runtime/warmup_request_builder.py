@@ -240,6 +240,13 @@ def _resolve_warmup_num_frames(
         # use default num frames
         return num_frames
 
+    # Breakable CUDA graph replays only exact latent shapes: the warmup
+    # request must run the full serving frame count so its captured graphs
+    # match serving signatures (mirrors the uncapped-steps rule in
+    # _resolve_warmup_steps).
+    if getattr(server_args, "enable_breakable_cuda_graph", False) is True:
+        return num_frames
+
     return min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
 
 
@@ -298,6 +305,14 @@ def should_include_warmup_image(
         return False
     if task_type.requires_image_input():
         return True
+    if getattr(server_args, "enable_breakable_cuda_graph", False) is True:
+        # BCG replays only exact input signatures. A synthetic warmup image
+        # flips optional-TI2V pipelines (e.g. LTX-2) into image-conditioned
+        # kwargs (denoise-mask -> per-token timestep) that pure T2V serving
+        # never produces, so every T2V request would miss the captured
+        # graphs and silently run eager. Capture the T2V signature instead;
+        # image-conditioned requests fall back to eager.
+        return False
     if type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig":
         return False
     if server_based_warmup:
@@ -398,6 +413,9 @@ def build_warmup_reqs(
                 req.suppress_logs = True
                 req.metrics.suppress_stage_breakdown = True
                 req.extra["server_internal_prewarm"] = True
+            req.sampling_params.prepare_synthetic_warmup_request_for_queue(
+                req, server_args
+            )
             if return_warmup_result:
                 req.extra["return_warmup_result"] = True
             if server_based_warmup:

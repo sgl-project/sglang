@@ -17,6 +17,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -27,11 +28,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
@@ -47,7 +50,14 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    SIMULATE_ACC_METHOD,
+    SIMULATE_ACC_TOKEN_MODE,
+    GrammarTree,
+    assign_req_to_token_pool_func,
+    build_grammar_vocab_mask,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -162,6 +172,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.ps = ps
@@ -329,7 +341,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = (
-            self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -391,7 +403,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
-            max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
         )
 
@@ -639,6 +651,77 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
         out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
+
+    def _fill_compact_seq_lens_cpu_bound(
+        self,
+        *,
+        batch_seq_lens_cpu: Optional[torch.Tensor],
+        reserved_seq_lens_cpu: Optional[torch.Tensor],
+        draft_prefix_lens: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Fill the seq_lens_cpu planning bound, sync-free when a host-side
+        length source is available; backends consume it as a safe upper bound
+        (same contract as the non-compact path in forward_batch_generation)."""
+        if batch_seq_lens_cpu is not None:
+            self._compute_compact_draft_seq_lens_host(batch_seq_lens_cpu, out=out)
+        elif reserved_seq_lens_cpu is not None:
+            self._compute_compact_draft_seq_lens_host(reserved_seq_lens_cpu, out=out)
+        else:
+            # Last resort: the legacy blocking D2H copy.
+            out.copy_(draft_prefix_lens)
+
+    def _rebuild_compact_draft_cache(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        draft_prefix_lens: torch.Tensor,
+        verify_out_cache_loc_2d: torch.Tensor,
+        bs: int,
+        block_size: int,
+    ) -> None:
+        """Write the draft-local compact req->token rows: the committed suffix
+        window at [0, draft_prefix_len) plus the verify block slots after it."""
+        suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        if self._use_triton_compact_rebuild:
+            rebuild_compact_draft_req_to_token_func(
+                draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                req_pool_indices=req_pool_indices,
+                suffix_start=suffix_start,
+                draft_prefix_lens=draft_prefix_lens,
+                verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                batch_size=bs,
+                block_size=block_size,
+            )
+        else:
+            suffix_cache_loc = self._gather_req_to_token_segments(
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                req_pool_indices=req_pool_indices,
+                start=suffix_start,
+                lengths=draft_prefix_lens,
+            )
+            assign_req_to_token_pool_func(
+                req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                torch.zeros_like(draft_prefix_lens),
+                draft_prefix_lens,
+                suffix_cache_loc,
+                bs,
+            )
+
+            assert self._draft_block_end_buf is not None
+            block_end = self._draft_block_end_buf[:bs]
+            torch.add(draft_prefix_lens, block_size, out=block_end)
+            assign_req_to_token_pool_func(
+                req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                draft_prefix_lens,
+                block_end,
+                verify_out_cache_loc_2d.reshape(-1),
+                bs,
+            )
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -1185,7 +1268,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
-            mamba_track_interval = self.server_args.mamba_track_interval
+            mamba_track_interval = get_exec().mamba.mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != batch.seq_lens // mamba_track_interval
@@ -1203,12 +1286,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 torch.full_like(to_track_ith, -1, dtype=torch.int64),
             )
 
-        attn_backend.update_mamba_state_after_mtp_verify(
-            last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
-            mamba_steps_to_track=mamba_steps_to_track,
-            model=self.target_worker.model_runner.model,
-        )
+        model_runner = self.target_worker.model_runner
+        if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            attn_backend.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=model_runner.model,
+                req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
+            )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
@@ -1296,11 +1382,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        grammar_barrier=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DFLASH speculative decoding does not support return_logprob yet."
-            )
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -1342,7 +1425,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH prefill expected out_cache_loc, but got None."
                 )
             positions, _ = compute_position(
-                self.model_runner.server_args.attention_backend,
+                self.model_runner.prefill_attention_backend_str,
                 draft_seq_lens,
                 ctx_lens,
                 int(sum(batch.extend_lens)),
@@ -1488,63 +1571,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
-
-            # Host planning bound without a device sync; backends consume
-            # seq_lens_cpu as a safe upper bound (same contract as below).
-            if batch.seq_lens_cpu is not None:
-                self._compute_compact_draft_seq_lens_host(
-                    batch.seq_lens_cpu, out=seq_lens_cpu
-                )
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                self._compute_compact_draft_seq_lens_host(
-                    draft_input.reserved_seq_lens_cpu, out=seq_lens_cpu
-                )
-            else:
-                # Last resort: the legacy blocking D2H copy.
-                seq_lens_cpu.copy_(
-                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
-                )
-
-            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
-                torch.int64
+            self._fill_compact_seq_lens_cpu_bound(
+                batch_seq_lens_cpu=batch.seq_lens_cpu,
+                reserved_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
+                draft_prefix_lens=draft_prefix_lens,
+                out=seq_lens_cpu,
             )
-            if self._use_triton_compact_rebuild:
-                rebuild_compact_draft_req_to_token_func(
-                    draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
-                    target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    req_pool_indices=batch.req_pool_indices,
-                    suffix_start=suffix_start,
-                    draft_prefix_lens=draft_prefix_lens,
-                    verify_out_cache_loc_2d=verify_out_cache_loc_2d,
-                    batch_size=bs,
-                    block_size=block_size,
-                )
-            else:
-                suffix_cache_loc = self._gather_req_to_token_segments(
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    req_pool_indices=batch.req_pool_indices,
-                    start=suffix_start,
-                    lengths=draft_prefix_lens,
-                )
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
-                    torch.zeros_like(draft_prefix_lens),
-                    draft_prefix_lens,
-                    suffix_cache_loc,
-                    bs,
-                )
-
-                block_end = self._draft_block_end_buf[:bs]
-                torch.add(draft_prefix_lens, block_size, out=block_end)
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
-                    draft_prefix_lens,
-                    block_end,
-                    verify_out_cache_loc,
-                    bs,
-                )
+            self._rebuild_compact_draft_cache(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                draft_prefix_lens=draft_prefix_lens,
+                verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                bs=bs,
+                block_size=block_size,
+            )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:
@@ -1605,6 +1645,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
+        # Must stay ahead of the target verify launch below.
+        grammar_tree = (
+            GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
+        )
+
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
@@ -1650,6 +1695,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
+        grammar_mask = None
+        if batch.has_grammar:
+            grammar_mask = build_grammar_vocab_mask(
+                reqs=batch.reqs,
+                tree=grammar_tree,
+                sampling_info=batch.sampling_info,
+                device=logits_output.next_token_logits.device,
+                barrier=grammar_barrier,
+            )
+
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
@@ -1657,8 +1712,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_token_num=int(self.block_size),
             )
 
+        # Constrain every chain position before accept picks from it.
+        if grammar_mask is not None:
+            grammar_mask.apply(logits_output.next_token_logits)
+
         candidates = draft_tokens
         new_seq_lens = None
+        # Only the greedy branch sets target_predict; the simulated-acceptance
+        # override below checks for it.
+        target_predict = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -1742,6 +1804,46 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
+        if SIMULATE_ACC_LEN > 0:
+            if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+                raise ValueError(
+                    "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                    f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
+                    "'real-draft-token'."
+                )
+
+            if SIMULATE_ACC_TOKEN_MODE == "real-draft-token" and target_predict is None:
+                # The sampling-verify branch does not materialize the target argmax.
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, int(self.block_size))
+            apply_dflash_simulated_acceptance(
+                candidates=candidates,
+                target_predict=target_predict,
+                accept_len=accept_len,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+            )
+            # The Triton path may have written new_seq_lens from the real
+            # accept_len; recompute it from the forced commit_lens.
+            new_seq_lens = None
+
+        if batch.return_logprob:
+            output_indices = torch.arange(
+                bs * block_size, dtype=torch.int64, device=device
+            ).view(bs, block_size)
+            compute_spec_v2_logprobs(
+                batch,
+                logits_output,
+                out_tokens.reshape(-1),
+                output_indices,
+                block_size - 1,
+            )
+
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1789,4 +1891,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
+            routed_experts_output=target_out.routed_experts_output,
+            indexer_topk_output=target_out.indexer_topk_output,
         )

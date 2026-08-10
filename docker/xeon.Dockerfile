@@ -40,7 +40,7 @@ RUN source /opt/.venv/bin/activate && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install . && \
-    cd ../sgl-kernel && \
+    cd sglang/kernels/aot && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install .
 
