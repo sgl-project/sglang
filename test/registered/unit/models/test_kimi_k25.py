@@ -550,6 +550,31 @@ def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
     assert callable(run_dp.call_args.kwargs["load_local_pixel_values"])
 
 
+def test_kimi_k25_encoder_dp_loader_preserves_owner_item_order():
+    model = KimiK25ForConditionalGeneration.__new__(KimiK25ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.use_data_parallel = True
+    model.vision_tower = _MoonViT3dTower()
+    model.mm_projector = _Projector()
+    first = torch.full((4, 2), 1.0)
+    second = torch.full((8, 2), 2.0)
+    items = [
+        _image_item(first, [[1, 2, 2]]),
+        _image_item(second, [[1, 2, 4]]),
+    ]
+
+    def run_dp(*args, **kwargs):
+        loaded = kwargs["load_local_pixel_values"]([1, 0])
+        torch.testing.assert_close(loaded, torch.cat([second, first]))
+        return torch.zeros(3, 2)
+
+    with patch(
+        "sglang.srt.models.kimi_k25.run_dp_sharded_mrope_vision_model",
+        side_effect=run_dp,
+    ):
+        model.get_image_feature(items)
+
+
 def test_kimi_non_dp_keeps_grid_thws_on_the_host():
     model = KimiK25ForConditionalGeneration.__new__(KimiK25ForConditionalGeneration)
     nn.Module.__init__(model)
