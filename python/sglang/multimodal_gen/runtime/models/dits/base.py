@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.multimodal_gen.configs.models import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 # NOTE: SpectrumMixin lives in runtime.cache.spectrum
 from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
