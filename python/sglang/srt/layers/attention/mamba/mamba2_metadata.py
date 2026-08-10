@@ -22,6 +22,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocator.mamba import MambaStateIndexContract
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -29,6 +30,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    # Provenance for post-gather, post-v2p PHYSICAL indices.  It is attached by
+    # MambaAttnBackendBase after padding rows have been replaced with -1; kernels
+    # that cannot inspect CUDA values without synchronizing use this frozen
+    # contract to distinguish serving metadata from arbitrary device tensors.
+    mamba_cache_index_contract: Optional[MambaStateIndexContract] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
@@ -187,6 +193,7 @@ class Mamba2Metadata(ForwardMetadata):
         return Mamba2Metadata(
             query_start_loc=forward_metadata.query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_cache_index_contract=(forward_metadata.mamba_cache_index_contract),
             mamba_track_indices=forward_metadata.mamba_track_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
@@ -288,6 +295,7 @@ class Mamba2Metadata(ForwardMetadata):
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_cache_index_contract=(forward_metadata.mamba_cache_index_contract),
             mamba_track_indices=forward_metadata.mamba_track_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,

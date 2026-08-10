@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.mamba import MAMBA_STATE_INDEX_INVARIANT
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -134,6 +135,45 @@ class TestMamba(unittest.TestCase):
         assert (
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
         )
+        self.assertIs(
+            req_to_token_pool.mamba_allocator.state_index_invariant,
+            MAMBA_STATE_INDEX_INVARIANT,
+        )
+
+        # A selected active request prefix owns distinct allocator slots.  This
+        # is the mapping-side link used when metadata attests the post-gather
+        # physical tensor without a device-to-host check in production.
+        extra_reqs = [
+            Req(
+                rid=rid,
+                origin_input_text="",
+                origin_input_ids=array("q"),
+                sampling_params=sampling_params,
+            )
+            for rid in range(1, 4)
+        ]
+        self.assertIsNotNone(req_to_token_pool.alloc(extra_reqs))
+        active_reqs = [req, *extra_reqs]
+        active_req_indices = torch.tensor(
+            [active_req.req_pool_idx for active_req in active_reqs],
+            dtype=torch.int64,
+            device=device,
+        )
+        active_state_indices = req_to_token_pool.translate_mamba_indices(
+            req_to_token_pool.get_mamba_indices(active_req_indices)
+        ).cpu()
+        self.assertEqual(
+            active_state_indices.unique().numel(), active_state_indices.numel()
+        )
+        self.assertTrue(bool((active_state_indices >= 1).all().item()))
+        self.assertTrue(
+            bool(
+                (active_state_indices <= req_to_token_pool.mamba_pool.size).all().item()
+            )
+        )
+        for extra_req in extra_reqs:
+            req_to_token_pool.free_mamba_cache(extra_req)
+            req_to_token_pool.free(extra_req)
 
         # free req
         req_to_token_pool.free_mamba_cache(req)

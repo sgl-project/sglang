@@ -217,6 +217,7 @@ class KDAKernelDispatcher:
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
+        cache_index_contract=None,
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """Attempt packed decode. Returns output tensor or None if the decode
@@ -234,6 +235,7 @@ class KDAKernelDispatcher:
             cache_indices=cache_indices,
             num_v_heads=num_v_heads,
             head_v_dim=head_v_dim,
+            cache_index_contract=cache_index_contract,
             **kwargs,
         )
 
@@ -557,6 +559,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
+                cache_index_contract=(self.forward_metadata.mamba_cache_index_contract),
                 lower_bound=layer.lower_bound,
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,

@@ -10,6 +10,9 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
+from sglang.srt.mem_cache.allocator.mamba import (
+    MAMBA_STATE_INDEX_REPLAY_PROVENANCE,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
@@ -203,11 +206,18 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
         seq_lens_cpu = torch.tensor([5, 1, 1], dtype=torch.int32, device="cpu")
         seq_lens = seq_lens_cpu.to(device=device)
 
-        # Slot 7 on req 0 must survive; the trailing two rows must be -1.
-        fixture.runner.req_to_token_pool.req_index_to_mamba_index_mapping[
-            req_pool_indices
-        ] = torch.tensor([7, 0, 0], dtype=torch.int32, device=device)
+        # Own the slots through the real allocator before exposing them through
+        # the request mapping.  This lets the metadata producer combine its
+        # request-gather proof with the allocator's live-slot invariant.
+        owned_slots = fixture.runner.req_to_token_pool.mamba_allocator.alloc(bs)
+        self.assertIsNotNone(owned_slots)
+        owned_slots = owned_slots.to(torch.int32)
 
+        # Capture begins from repeated request-row zero placeholders.  The
+        # producer must not attest those values.  A custom runner has no
+        # contract; the supported stable-refresh runner records Cake against
+        # the same buffer with an empty active prefix and all -1 padding.
+        req_pool_indices.zero_()
         fb = SimpleNamespace(
             batch_size=bs,
             forward_mode=ForwardMode.DECODE,
@@ -217,13 +227,47 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             seq_lens_sum=int(seq_lens_cpu.sum().item()),
             spec_info=None,
             encoder_lens=None,
+            rids=["capture-placeholder"] * bs,
         )
+        backend.init_forward_metadata_out_graph(fb, in_capture=True)
+        self.assertIsNone(backend.forward_metadata.mamba_cache_index_contract)
+        self.assertEqual(backend.state_indices_list[bs - 1].cpu().tolist(), [-1] * bs)
+
+        fb.mamba_state_index_replay_provenance = MAMBA_STATE_INDEX_REPLAY_PROVENANCE
+        backend.init_forward_metadata_out_graph(fb, in_capture=True)
+        capture_contract = backend.forward_metadata.mamba_cache_index_contract
+        self.assertEqual(capture_contract.active_prefix, 0)
+        self.assertTrue(
+            capture_contract.matches(
+                backend.state_indices_list[bs - 1],
+                batch_size=bs,
+                state_slots=fixture.runner.req_to_token_pool.mamba_pool.size + 1,
+            )
+        )
+        self.assertEqual(backend.state_indices_list[bs - 1].cpu().tolist(), [-1] * bs)
+
+        # A real replay has one active request.  Its owned slot must survive;
+        # the trailing two rows must be -1.
+        req_pool_indices.copy_(torch.arange(bs, dtype=torch.int32, device=device))
+        fixture.runner.req_to_token_pool.req_index_to_mamba_index_mapping[
+            req_pool_indices
+        ] = torch.stack((owned_slots[2], owned_slots[0], owned_slots[1]))
+        fb.rids = ["request-0"]
         backend.init_forward_metadata_out_graph(fb)
 
+        contract = backend.forward_metadata.mamba_cache_index_contract
+        self.assertTrue(
+            contract.matches(
+                backend.state_indices_list[bs - 1],
+                batch_size=bs,
+                state_slots=fixture.runner.req_to_token_pool.mamba_pool.size + 1,
+            )
+        )
+        self.assertEqual(contract.active_prefix, 1)
         state_indices = backend.state_indices_list[bs - 1].cpu().tolist()
         self.assertEqual(
             state_indices,
-            [7, -1, -1],
+            [owned_slots[2].item(), -1, -1],
             "`MambaAttnBackendBase._replay_metadata` must use the "
             "unmutated `seq_lens_cpu` to count cuda-graph padding rows "
             "(== fill value 1). With `seq_lens_cpu - 1` (M21) the "
@@ -231,6 +275,63 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             "the trailing rows holding the real mamba indices instead "
             "of -1.",
         )
+
+        # Replay the same graph bucket with a larger active prefix.  The
+        # metadata buffer pointer is capture-stable, active physical IDs stay
+        # unique/in-bounds, and the former live tail is rewritten to -1.
+        state_indices_buf = backend.state_indices_list[bs - 1]
+        state_indices_ptr = state_indices_buf.data_ptr()
+        req_pool_indices.copy_(torch.arange(bs, dtype=torch.int32, device=device))
+        fixture.runner.req_to_token_pool.req_index_to_mamba_index_mapping[
+            req_pool_indices
+        ] = torch.stack((owned_slots[1], owned_slots[0], owned_slots[2]))
+        fb.seq_lens_cpu = torch.tensor([5, 6, 1], dtype=torch.int32, device="cpu")
+        fb.seq_lens = fb.seq_lens_cpu.to(device=device)
+        fb.seq_lens_sum = int(fb.seq_lens_cpu.sum().item())
+        fb.rids = ["request-1", "request-0"]
+
+        backend.init_forward_metadata_out_graph(fb)
+
+        self.assertEqual(state_indices_buf.data_ptr(), state_indices_ptr)
+        replay_contract = backend.forward_metadata.mamba_cache_index_contract
+        self.assertTrue(
+            replay_contract.matches(
+                state_indices_buf,
+                batch_size=bs,
+                state_slots=fixture.runner.req_to_token_pool.mamba_pool.size + 1,
+            )
+        )
+        self.assertEqual(replay_contract.active_prefix, 2)
+        self.assertIs(replay_contract.index_tensor, contract.index_tensor)
+        replayed = state_indices_buf.cpu()
+        self.assertEqual(
+            replayed.tolist(),
+            [owned_slots[1].item(), owned_slots[0].item(), -1],
+        )
+        active = replayed[:2]
+        self.assertEqual(active.unique().numel(), active.numel())
+        self.assertTrue(bool((active >= 1).all().item()))
+        self.assertTrue(
+            bool(
+                (active <= fixture.runner.req_to_token_pool.mamba_allocator.size)
+                .all()
+                .item()
+            )
+        )
+
+        # Frozen-KV top-k expansion repeats request rows.  A duplicate host
+        # request identity therefore prevents issuance even when the selected
+        # device mapping happens to contain distinct values.
+        fb.rids = ["request-0", "request-0"]
+        with self.assertRaisesRegex(RuntimeError, "unique active-request"):
+            backend.init_forward_metadata_out_graph(fb)
+
+        # A custom graph runner that cannot make the stable-refresh promise
+        # never captures Cake in the first place; its duplicate replay simply
+        # carries no contract and therefore selects the Triton fallback.
+        del fb.mamba_state_index_replay_provenance
+        backend.init_forward_metadata_out_graph(fb)
+        self.assertIsNone(backend.forward_metadata.mamba_cache_index_contract)
 
     # Hybrid dispatch fan-out tests (MagicMock-based) — same pattern as
     # GDN. `Mamba2AttnBackend` inherits the `MambaAttnBackendBase`

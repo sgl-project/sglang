@@ -31,6 +31,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.mem_cache.allocator.mamba import MambaStateIndexContract
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class CakePackedDecodeReason:
     NEGATIVE_ROW_STRIDE = "negative_row_stride"
     OVERLAPPING_ROW_STRIDE = "overlapping_row_stride"
     STORAGE_ALIAS = "storage_alias"
+    CACHE_INDEX_UNVERIFIED = "cache_index_unverified"
     CACHE_INDEX_OOB = "cache_index_oob"
     CACHE_INDEX_DUPLICATE = "cache_index_duplicate"
 
@@ -468,14 +470,12 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         track_ssm_h_src: Optional[torch.Tensor],
     ) -> bool:
         """Check the public frozen-prefill contract without a device sync."""
-        needs_interior_snapshot = (
-            return_intermediate_states
-            and track_ssm_h_src is not None
-            and track_ssm_h_src.numel() > 0
+        has_explicit_empty_checkpoint_track = (
+            track_ssm_h_src is not None and track_ssm_h_src.numel() == 0
         )
         if (
             is_spec_decode
-            or needs_interior_snapshot
+            or (return_intermediate_states and not has_explicit_empty_checkpoint_track)
             or lower_bound is None
             or not math.isfinite(float(lower_bound))
             or float(lower_bound) >= 0.0
@@ -1024,7 +1024,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
         active = []
         for value in values:
             value = int(value)
-            if value < -1 or value >= state_slots:
+            if value < -1 or value == 0 or value >= state_slots:
                 return CakeKDAKernel._cake_reject(
                     CakePackedDecodeReason.CACHE_INDEX_OOB, "cache_indices"
                 )
@@ -1033,6 +1033,38 @@ class CakeKDAKernel(FlashInferKDAKernel):
         if len(active) != len(set(active)):
             return CakeKDAKernel._cake_reject(
                 CakePackedDecodeReason.CACHE_INDEX_DUPLICATE, "cache_indices"
+            )
+        return None
+
+    @staticmethod
+    def _cake_cache_index_source_admission(
+        cache_indices,
+        *,
+        cache_indices_cpu,
+        cache_index_contract,
+        batch_size: int,
+        state_slots: int,
+    ) -> Optional[CakePackedDecodeAdmission]:
+        """Prove CUDA values by allocator provenance or validate a host mirror."""
+        host_indices = cache_indices_cpu
+        if host_indices is None and cache_indices.device.type == "cpu":
+            host_indices = cache_indices
+        if host_indices is not None:
+            return CakeKDAKernel._cake_cache_index_admission(
+                host_indices,
+                batch_size=batch_size,
+                state_slots=state_slots,
+            )
+        if not isinstance(
+            cache_index_contract, MambaStateIndexContract
+        ) or not cache_index_contract.matches(
+            cache_indices,
+            batch_size=batch_size,
+            state_slots=state_slots,
+        ):
+            return CakeKDAKernel._cake_reject(
+                CakePackedDecodeReason.CACHE_INDEX_UNVERIFIED,
+                "cache_indices",
             )
         return None
 
@@ -1051,13 +1083,14 @@ class CakeKDAKernel(FlashInferKDAKernel):
         head_v_dim: int,
         lower_bound: Optional[float],
         cache_indices_cpu=None,
+        cache_index_contract=None,
     ) -> CakePackedDecodeAdmission:
         """Return the exact frozen-ABI selector result without tensor copies.
 
-        FlashInfer intentionally treats CUDA index values as a caller contract
-        to avoid a device-to-host synchronization. SGLang applies the value
-        checks whenever the tensor is already on CPU (CPU/mock canaries), or
-        when the caller supplies an existing CPU mirror.
+        CUDA values are admitted only with the frozen provenance attached by
+        SGLang's Mamba allocator/metadata path, avoiding a device-to-host
+        synchronization. CPU/mock canaries and callers with an existing host
+        mirror are checked value-by-value instead.
         """
         batch_size = mixed_qkv.shape[0] if mixed_qkv.ndim == 2 else -1
         state_inner_size = (
@@ -1191,17 +1224,15 @@ class CakeKDAKernel(FlashInferKDAKernel):
                     CakePackedDecodeReason.STORAGE_ALIAS, f"state:{tensor_name}"
                 )
 
-        host_indices = cache_indices_cpu
-        if host_indices is None and cache_indices.device.type == "cpu":
-            host_indices = cache_indices
-        if host_indices is not None:
-            rejected = CakeKDAKernel._cake_cache_index_admission(
-                host_indices,
-                batch_size=batch_size,
-                state_slots=ssm_states.shape[0],
-            )
-            if rejected is not None:
-                return rejected
+        rejected = CakeKDAKernel._cake_cache_index_source_admission(
+            cache_indices,
+            cache_indices_cpu=cache_indices_cpu,
+            cache_index_contract=cache_index_contract,
+            batch_size=batch_size,
+            state_slots=ssm_states.shape[0],
+        )
+        if rejected is not None:
+            return rejected
         return CakePackedDecodeAdmission(True, CakePackedDecodeReason.ELIGIBLE)
 
     @staticmethod
@@ -1219,6 +1250,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
         head_v_dim: int,
         lower_bound: Optional[float],
         cache_indices_cpu=None,
+        cache_index_contract=None,
     ) -> bool:
         """Compatibility boolean for callers that only need eligibility."""
         return CakeKDAKernel._cake_packed_decode_admission(
@@ -1234,6 +1266,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
             head_v_dim=head_v_dim,
             lower_bound=lower_bound,
             cache_indices_cpu=cache_indices_cpu,
+            cache_index_contract=cache_index_contract,
         ).eligible
 
     @staticmethod
@@ -1286,6 +1319,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
         head_v_dim: int,
         lower_bound: Optional[float] = None,
         cache_indices_cpu=None,
+        cache_index_contract=None,
         **kwargs,
     ) -> torch.Tensor:
         """Run CAKE's exact packed decode or explicitly retain Triton semantics."""
@@ -1322,6 +1356,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
                 head_v_dim=head_v_dim,
                 lower_bound=lower_bound,
                 cache_indices_cpu=cache_indices_cpu,
+                cache_index_contract=cache_index_contract,
             )
         self._last_packed_decode_admission = admission
         if not admission.eligible:

@@ -37,6 +37,10 @@ from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (  # noqa:
 from sglang.srt.layers.attention.linear.kernels.kda_triton import (  # noqa: E402
     TritonKDAKernel,
 )
+from sglang.srt.mem_cache.allocator.mamba import (  # noqa: E402
+    MambaSlotAllocator,
+    _issue_state_index_contract,
+)
 
 _available, _ = _get_flashinfer_kda_kernel()
 if not _available:
@@ -119,6 +123,15 @@ def _make_packed_decode_inputs(
     )
     data["mixed_qkv"] = mixed_storage[:, :packed_width]
 
+    # Production Kimi-K3 stores beta inside a 144-column projection backing
+    # allocation.  Keep the interior offset and row pitch even for B=1, where
+    # reshape/view would otherwise canonicalize the pitch to the logical width.
+    beta_storage = (
+        torch.randn(batch_size, 144, device=device, dtype=dtype) * 0.5
+    ).contiguous()
+    data["beta_storage"] = beta_storage
+    data["b"] = beta_storage[:, 128 : 128 + num_value_heads]
+
     # Exercise the production pool contract: compact [HV, V, K] slots with a
     # legal non-compact outer stride supplied by the serving cache envelope.
     pool_size = data["ssm"].shape[0]
@@ -134,6 +147,14 @@ def _make_packed_decode_inputs(
         (pool_size, num_value_heads, V, K),
         (slot_stride, V * K, K, 1),
     )
+    data["index_allocator"] = MambaSlotAllocator(
+        size=pool_size - 1,
+        device=device,
+    )
+    data["allocated_cache_indices"] = (
+        data["index_allocator"].alloc(pool_size - 1).to(torch.int32)
+    )
+    data["cache_indices"] = data["allocated_cache_indices"][:batch_size].clone()
     return data
 
 
@@ -203,10 +224,24 @@ def _decode(kern, d, ssm, lower_bound=None):
 
 
 def _packed_decode(kern, d, ssm, lower_bound=-5.0, **kwargs):
+    if isinstance(kern, CakeKDAKernel) and "cache_indices_cpu" not in kwargs:
+        # This direct kernel harness has no MambaAttnBackendBase metadata
+        # producer, so bind the same private attestation to allocator-produced
+        # IDs explicitly. Production issuance occurs only in that producer.
+        active_prefix = d.get("cache_index_active_prefix", d["B"])
+        kwargs["cache_index_contract"] = _issue_state_index_contract(
+            d["index_allocator"],
+            d["cache_indices"],
+            active_prefix=active_prefix,
+            state_slots=ssm.shape[0],
+            active_request_ids=tuple(
+                f"direct-kernel-request-{i}" for i in range(active_prefix)
+            ),
+        )
     return kern.packed_decode(
         d["mixed_qkv"],
-        d["a"].view(d["B"], 1, -1),
-        d["b"].view(1, d["B"], -1),
+        d["a"].unsqueeze(1),
+        d["b"].unsqueeze(0),
         A_log=d["A_log"].view(1, 1, -1, 1),
         dt_bias=d["dt_bias"],
         scale=K**-0.5,
@@ -297,7 +332,7 @@ def test_kda_decode_flashinfer_matches_triton(batch_size):
     ), f"decode state mean diff {s_err.mean().item():.2e}"
 
 
-@pytest.mark.parametrize("batch_size", [1, 8, 64, 128])
+@pytest.mark.parametrize("batch_size", [1, 8, 31, 32, 64, 128])
 @pytest.mark.skipif(
     not CAKE_PACKED_AVAILABLE,
     reason="CAKE packed KDA decode requires its FlashInfer export on SM100/SM103.",
@@ -309,11 +344,14 @@ def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
     if batch_size > 1:
         assert not d["mixed_qkv"].is_contiguous()
     assert d["mixed_qkv"].stride(1) == 1
+    assert d["beta_storage"].shape == (batch_size, 144)
+    assert d["b"].storage_offset() == 128
+    assert d["b"].stride() == (144, 1)
     assert d["ssm"].stride(0) > 12 * V * K
     pool_size = d["ssm"].shape[0]
-    d["cache_indices"] = torch.randperm(pool_size, device="cuda", dtype=torch.int64)[
-        :batch_size
-    ].to(torch.int32)
+    d["cache_indices"] = d["allocated_cache_indices"][
+        torch.randperm(pool_size - 1, device="cuda")[:batch_size]
+    ].contiguous()
 
     cake, tri = CakeKDAKernel(), TritonKDAKernel()
     cake_calls = []
@@ -324,6 +362,7 @@ def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
         return run_cake(**kwargs)
 
     cake._packed_kda_decode = track_cake_call
+
     st_ref = _clone_strided_state(d["ssm"])
     ref_out = _packed_decode(tri, d, st_ref).float()
     st_cake = _clone_strided_state(d["ssm"])
@@ -333,6 +372,9 @@ def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
 
     assert len(cake_calls) == 1
     assert cake_calls[0]["mixed_qkv"].data_ptr() == d["mixed_qkv"].data_ptr()
+    assert cake_calls[0]["raw_beta"].data_ptr() == d["b"].data_ptr()
+    assert cake_calls[0]["raw_beta"].storage_offset() == 128
+    assert cake_calls[0]["raw_beta"].stride() == (144, 1)
     assert cake_calls[0]["state"].data_ptr() == st_cake.data_ptr()
     assert cake_calls[0]["state_indices"].data_ptr() == d["cache_indices"].data_ptr()
     assert cake_calls[0]["output"].shape == (batch_size, 1, 12, V)
@@ -362,6 +404,7 @@ def test_kda_decode_cake_masks_negative_state_indices():
         device="cuda",
         dtype=torch.int32,
     )
+    d["cache_indices_cpu"] = d["cache_indices"].cpu()
     active_rows = d["cache_indices"] >= 0
 
     # The Triton oracle only receives active rows, avoiding any dependency on
@@ -383,7 +426,12 @@ def test_kda_decode_cake_masks_negative_state_indices():
     output_ref = _packed_decode(tri, active, state_ref).float()
     state_cake = _clone_strided_state(d["ssm"])
     state_before = _clone_strided_state(state_cake)
-    output_cake = _packed_decode(cake, d, state_cake).float()
+    output_cake = _packed_decode(
+        cake,
+        d,
+        state_cake,
+        cache_indices_cpu=d["cache_indices_cpu"],
+    ).float()
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
@@ -413,16 +461,53 @@ def test_kda_decode_cake_masks_negative_state_indices():
     not CAKE_PACKED_AVAILABLE,
     reason="CAKE packed KDA decode requires its FlashInfer export on SM100/SM103.",
 )
-def test_kda_decode_cake_indexed_state_cuda_graph_replay():
-    """Replay must read changed values from the same static index buffer."""
-    batch_size = 64
-    torch.manual_seed(12300)
+@pytest.mark.parametrize("batch_size", [1, 8, 31, 32, 64, 128])
+def test_kda_decode_cake_indexed_state_cuda_graph_replay(batch_size):
+    """Replay must read changed beta/indices from stable captured buffers."""
+    torch.manual_seed(12300 + batch_size)
     d = _make_packed_decode_inputs(batch_size)
+    assert d["beta_storage"].shape == (batch_size, 144)
+    assert d["b"].storage_offset() == 128
+    assert d["b"].stride() == (144, 1)
     pool_size = d["ssm"].shape[0]
     initial_state = _clone_strided_state(d["ssm"])
     graph_state = _clone_strided_state(initial_state)
     graph_indices = d["cache_indices"]
     cake, tri = CakeKDAKernel(), TritonKDAKernel()
+    cake_calls = []
+    run_cake = cake._packed_kda_decode
+
+    def track_cake_call(**kwargs):
+        cake_calls.append(kwargs)
+        return run_cake(**kwargs)
+
+    cake._packed_kda_decode = track_cake_call
+
+    def assert_replay_index_contract(active_prefix):
+        contract = _issue_state_index_contract(
+            d["index_allocator"],
+            graph_indices,
+            active_prefix=active_prefix,
+            state_slots=graph_state.shape[0],
+            active_request_ids=tuple(
+                f"graph-replay-request-{i}" for i in range(active_prefix)
+            ),
+        )
+        assert contract.matches(
+            graph_indices,
+            batch_size=batch_size,
+            state_slots=graph_state.shape[0],
+        )
+        assert (
+            CakeKDAKernel._cake_cache_index_source_admission(
+                graph_indices,
+                cache_indices_cpu=None,
+                cache_index_contract=contract,
+                batch_size=batch_size,
+                state_slots=graph_state.shape[0],
+            )
+            is None
+        )
 
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
@@ -434,18 +519,72 @@ def test_kda_decode_cake_indexed_state_cuda_graph_replay():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
         captured_output = _packed_decode(cake, d, graph_state)
+    capture_stream.synchronize()
+
+    # Python runs for warmup/capture only.  Both calls must bind the interior
+    # beta view directly; graph replay below reuses the captured pointer.
+    assert len(cake_calls) == 2
+    for call in cake_calls:
+        assert call["raw_beta"].data_ptr() == d["b"].data_ptr()
+        assert call["raw_beta"].storage_offset() == 128
+        assert call["raw_beta"].stride() == (144, 1)
+
+    # First replay changes beta only.  This isolates the captured beta read
+    # from qkv/gate/index changes and catches a hidden contiguous copy made at
+    # capture time (especially the B=1 row-pitch canonicalization case).
+    captured_initial_output = captured_output.clone()
+    changed_beta = torch.full_like(d["b"], 7.0)
+    beta_case = dict(d)
+    beta_case["b"] = changed_beta
+    beta_state_ref = _clone_strided_state(initial_state)
+    beta_output_ref = _packed_decode(tri, beta_case, beta_state_ref).float()
+
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        graph_state.copy_(initial_state)
+        d["b"].copy_(changed_beta)
+    capture_stream.synchronize()
+    assert_replay_index_contract(batch_size)
+    with torch.cuda.stream(capture_stream):
+        graph.replay()
+    capture_stream.synchronize()
+
+    torch.testing.assert_close(
+        captured_output.float(), beta_output_ref, atol=1e-2, rtol=1e-2
+    )
+    beta_indices = d["cache_indices"].long()
+    torch.testing.assert_close(
+        graph_state[beta_indices].float(),
+        beta_state_ref[beta_indices].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    assert not torch.equal(captured_output, captured_initial_output)
 
     permutations = [
-        torch.randperm(pool_size, device="cuda", dtype=torch.int32)[:batch_size],
-        torch.cat(
-            (
-                torch.randperm(pool_size, device="cuda", dtype=torch.int32)[
-                    : batch_size - 8
-                ],
-                torch.full((8,), -1, device="cuda", dtype=torch.int32),
-            )
-        ),
+        d["allocated_cache_indices"][
+            torch.randperm(pool_size - 1, device="cuda")[:batch_size]
+        ].contiguous(),
     ]
+    num_padding = min(8, batch_size - 1)
+    if num_padding:
+        permutations.append(
+            torch.cat(
+                (
+                    d["allocated_cache_indices"][
+                        torch.randperm(pool_size - 1, device="cuda")[
+                            : batch_size - num_padding
+                        ]
+                    ].contiguous(),
+                    torch.full(
+                        (num_padding,),
+                        -1,
+                        device="cuda",
+                        dtype=torch.int32,
+                    ),
+                )
+            )
+        )
     for indices in permutations:
         next_mixed_qkv = torch.randn_like(d["mixed_qkv"])
         next_a = torch.randn_like(d["a"])
@@ -474,6 +613,7 @@ def test_kda_decode_cake_indexed_state_cuda_graph_replay():
             d["a"].copy_(next_a)
             d["b"].copy_(next_b)
         capture_stream.synchronize()
+        assert_replay_index_contract(int(active_rows.sum().item()))
         with torch.cuda.stream(capture_stream):
             graph.replay()
         capture_stream.synchronize()

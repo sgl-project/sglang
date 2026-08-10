@@ -2,7 +2,8 @@
 
 import sys
 import unittest
-from types import ModuleType
+from dataclasses import FrozenInstanceError
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -12,6 +13,11 @@ from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     CakeKDAKernel,
     CakePackedDecodeAdmission,
     CakePackedDecodeReason,
+)
+from sglang.srt.mem_cache.allocator.mamba import (
+    MambaSlotAllocator,
+    MambaStateIndexReplayProvenance,
+    _issue_state_index_contract,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -184,6 +190,20 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
                 return_intermediate_states=True,
                 track_ssm_h_src=torch.empty(0, dtype=torch.int64),
             )
+            missing_checkpoint_track = CakeKDAKernel._cake_prefill_is_supported(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=query_start_loc,
+                lower_bound=-5.0,
+                is_spec_decode=False,
+                return_intermediate_states=True,
+                track_ssm_h_src=None,
+            )
             interior_checkpoint = CakeKDAKernel._cake_prefill_is_supported(
                 q,
                 k,
@@ -201,6 +221,7 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
 
         self.assertTrue(without_checkpoint)
         self.assertEqual(aligned_checkpoint, without_checkpoint)
+        self.assertFalse(missing_checkpoint_track)
         self.assertFalse(interior_checkpoint)
 
     @staticmethod
@@ -442,7 +463,7 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
                 128,
                 dtype=torch.bfloat16,
             ),
-            "cache_indices": torch.arange(batch_size, dtype=torch.int32),
+            "cache_indices": torch.arange(1, batch_size + 1, dtype=torch.int32),
             "num_v_heads": 12,
             "head_v_dim": 128,
             "lower_bound": -5.0,
@@ -480,6 +501,15 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
                     ).stride(),
                     (144, 1),
                 )
+
+    def test_selector_accepts_all_padding_capture_envelope(self):
+        inputs = self._row_strided_inputs(batch_size=8)
+        inputs["cache_indices"].fill_(-1)
+
+        admission = self._admission(inputs)
+
+        self.assertTrue(admission.eligible, admission)
+        self.assertEqual(admission.reason, CakePackedDecodeReason.ELIGIBLE)
 
     def test_exact_contract_forwards_original_packed_inputs_and_owned_output(self):
         calls = []
@@ -635,6 +665,11 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
             self._admission(inputs).reason, CakePackedDecodeReason.CACHE_INDEX_OOB
         )
 
+        inputs["cache_indices"] = torch.tensor([0, 1], dtype=torch.int32)
+        self.assertEqual(
+            self._admission(inputs).reason, CakePackedDecodeReason.CACHE_INDEX_OOB
+        )
+
         inputs["cache_indices"] = torch.tensor([1, 1], dtype=torch.int32)
         self.assertEqual(
             self._admission(inputs).reason,
@@ -646,11 +681,110 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
             "cache_index_duplicate",
         )
 
+    def test_cuda_indices_require_exact_allocator_provenance(self):
+        cuda_indices = SimpleNamespace(device=torch.device("cuda"))
+
+        missing = CakeKDAKernel._cake_cache_index_source_admission(
+            cuda_indices,
+            cache_indices_cpu=None,
+            cache_index_contract=None,
+            batch_size=2,
+            state_slots=3,
+        )
+
+        class FakeCudaIndices:
+            device = torch.device("cuda")
+
+            @staticmethod
+            def data_ptr():
+                return 1234
+
+            @staticmethod
+            def storage_offset():
+                return 0
+
+            @staticmethod
+            def numel():
+                return 2
+
+        indices = FakeCudaIndices()
+        allocator = MambaSlotAllocator(size=2, device="cpu")
+        trusted_contract = _issue_state_index_contract(
+            allocator,
+            indices,
+            active_prefix=2,
+            state_slots=3,
+            active_request_ids=("request-a", "request-b"),
+        )
+        with self.assertRaisesRegex(ValueError, "distinct active request"):
+            _issue_state_index_contract(
+                allocator,
+                indices,
+                active_prefix=2,
+                state_slots=3,
+                active_request_ids=("request-a", "request-a"),
+            )
+        with self.assertRaisesRegex(ValueError, "one host request identity"):
+            _issue_state_index_contract(
+                allocator,
+                indices,
+                active_prefix=2,
+                state_slots=3,
+                active_request_ids=("unexpanded-topk-request",),
+            )
+        with self.assertRaisesRegex(ValueError, "Unknown.*replay producer"):
+            _issue_state_index_contract(
+                allocator,
+                indices,
+                active_prefix=2,
+                state_slots=3,
+                active_request_ids=("request-a", "request-b"),
+                replay_provenance=MambaStateIndexReplayProvenance(),
+            )
+        trusted = CakeKDAKernel._cake_cache_index_source_admission(
+            indices,
+            cache_indices_cpu=None,
+            cache_index_contract=trusted_contract,
+            batch_size=2,
+            state_slots=3,
+        )
+        lookalike_tensor = CakeKDAKernel._cake_cache_index_source_admission(
+            FakeCudaIndices(),
+            cache_indices_cpu=None,
+            cache_index_contract=trusted_contract,
+            batch_size=2,
+            state_slots=3,
+        )
+        wrong_state_envelope = CakeKDAKernel._cake_cache_index_source_admission(
+            indices,
+            cache_indices_cpu=None,
+            cache_index_contract=trusted_contract,
+            batch_size=2,
+            state_slots=4,
+        )
+
+        self.assertEqual(missing.reason, CakePackedDecodeReason.CACHE_INDEX_UNVERIFIED)
+        self.assertIsNone(trusted)
+        with self.assertRaises(FrozenInstanceError):
+            trusted_contract.active_prefix = 1
+        self.assertEqual(
+            lookalike_tensor.reason,
+            CakePackedDecodeReason.CACHE_INDEX_UNVERIFIED,
+        )
+        self.assertEqual(
+            wrong_state_envelope.reason,
+            CakePackedDecodeReason.CACHE_INDEX_UNVERIFIED,
+        )
+        self.assertEqual(
+            CakePackedDecodeReason.CACHE_INDEX_UNVERIFIED,
+            "cache_index_unverified",
+        )
+
     def test_invalid_indices_fall_back_with_zero_cake_activity(self):
         packed_decode = Mock(side_effect=AssertionError("invalid indices reached CAKE"))
         kernel = self._kernel(packed_decode)
         inputs = self._row_strided_inputs(batch_size=2)
-        inputs["cache_indices"] = torch.tensor([0, 0], dtype=torch.int32)
+        inputs["cache_indices"] = torch.tensor([1, 1], dtype=torch.int32)
         sentinel = torch.empty(1, 2, 12, 128, dtype=torch.bfloat16)
         with (
             patch.object(

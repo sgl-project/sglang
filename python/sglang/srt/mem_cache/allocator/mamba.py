@@ -22,9 +22,165 @@ free-slot bookkeeping.
 
 from __future__ import annotations
 
-from typing import Iterator, Optional
+from dataclasses import dataclass, field
+from typing import Iterator, Optional, Sequence
 
 import torch
+
+
+@dataclass(frozen=True)
+class MambaStateIndexInvariant:
+    """Allocator guarantee consumed by the post-translation metadata producer."""
+
+    padding_index: int = -1
+    first_active_index: int = 1
+    live_allocations_are_unique: bool = True
+    allocated_indices_are_in_bounds: bool = True
+    unified_translation_is_physical: bool = True
+
+
+MAMBA_STATE_INDEX_INVARIANT = MambaStateIndexInvariant()
+
+
+@dataclass(frozen=True)
+class MambaStateIndexReplayProvenance:
+    """Promise made by a graph runner that refreshes a stable index buffer."""
+
+    refreshes_before_graph_launch: bool = True
+    carries_exact_active_request_ids: bool = True
+
+
+MAMBA_STATE_INDEX_REPLAY_PROVENANCE = MambaStateIndexReplayProvenance()
+
+
+@dataclass(frozen=True)
+class MambaStateIndexContract:
+    """Frozen allocator attestation for one kernel-facing index buffer.
+
+    Within ``index_tensor[:active_prefix]`` IDs are physical, unique, and in
+    ``[first_active_index, state_slots)``.  The remaining replay rows are the
+    ``padding_index`` sentinel.  The metadata producer issues this only after
+    request gather, unified v2p translation, and padding.  Its distinct host
+    request identities rule out repeated/top-k gather rows; combined with the
+    allocator's unique live-slot invariant, that proves the active values
+    without reading the CUDA tensor.  Tests cover both slot allocators and
+    repeated stable-buffer refreshes.
+    """
+
+    version: int = 1
+    padding_index: int = -1
+    index_tensor: torch.Tensor | None = field(repr=False, compare=False, default=None)
+    index_data_ptr: int = 0
+    index_storage_offset: int = 0
+    index_numel: int = 0
+    active_prefix: int = 0
+    state_slots: int = 0
+    first_active_index: int = 1
+    active_indices_are_unique: bool = True
+    indices_are_physical: bool = True
+    padding_is_trailing: bool = True
+    source_invariant: MambaStateIndexInvariant | None = field(
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    active_request_ids: tuple[str, ...] = field(
+        repr=False,
+        compare=False,
+        default=(),
+    )
+    replay_provenance: MambaStateIndexReplayProvenance | None = field(
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    allocator_id: int = 0
+    _issuer: object = field(repr=False, compare=False, default=None)
+
+    def matches(
+        self,
+        index_tensor: torch.Tensor,
+        *,
+        batch_size: int,
+        state_slots: int,
+    ) -> bool:
+        """Check the exact tensor/envelope binding without reading its values."""
+        return (
+            self._issuer is _MAMBA_STATE_INDEX_CONTRACT_ISSUER
+            and self.index_tensor is index_tensor
+            and self.index_data_ptr == index_tensor.data_ptr()
+            and self.index_storage_offset == index_tensor.storage_offset()
+            and self.index_numel == index_tensor.numel() == batch_size
+            and 0 <= self.active_prefix <= batch_size
+            and self.state_slots == state_slots
+            and self.padding_index == -1
+            and self.first_active_index == 1
+            and self.active_indices_are_unique
+            and self.indices_are_physical
+            and self.padding_is_trailing
+            and self.source_invariant is MAMBA_STATE_INDEX_INVARIANT
+            and len(self.active_request_ids) == self.active_prefix
+            and len(set(self.active_request_ids)) == self.active_prefix
+            and (
+                self.replay_provenance is None
+                or self.replay_provenance is MAMBA_STATE_INDEX_REPLAY_PROVENANCE
+            )
+            and self.allocator_id != 0
+        )
+
+
+_MAMBA_STATE_INDEX_CONTRACT_ISSUER = object()
+
+
+def _issue_state_index_contract(
+    allocator,
+    index_tensor: torch.Tensor,
+    *,
+    active_prefix: int,
+    state_slots: int,
+    active_request_ids: Sequence[str],
+    replay_provenance: MambaStateIndexReplayProvenance | None = None,
+) -> MambaStateIndexContract:
+    """Issue provenance at the post-gather/post-v2p metadata producer."""
+    if allocator.state_index_invariant is not MAMBA_STATE_INDEX_INVARIANT:
+        raise ValueError("Mamba allocator does not expose the frozen index invariant")
+    if state_slots != allocator.size + 1:
+        raise ValueError(
+            "Mamba state-index contract requires allocator.size + 1 state slots: "
+            f"got {state_slots=} for allocator size {allocator.size}"
+        )
+    if not 0 <= active_prefix <= index_tensor.numel():
+        raise ValueError(
+            "Mamba state-index active prefix is outside the index buffer: "
+            f"got {active_prefix=} for {index_tensor.numel()=}"
+        )
+    request_ids = tuple(active_request_ids)
+    if len(request_ids) != active_prefix:
+        raise ValueError(
+            "Mamba state-index contract requires one host request identity per "
+            f"active row: got {len(request_ids)=} for {active_prefix=}"
+        )
+    if len(set(request_ids)) != active_prefix:
+        raise ValueError(
+            "Mamba state-index contract requires distinct active request identities"
+        )
+    if replay_provenance is not None and (
+        replay_provenance is not MAMBA_STATE_INDEX_REPLAY_PROVENANCE
+    ):
+        raise ValueError("Unknown Mamba state-index replay producer")
+    return MambaStateIndexContract(
+        index_tensor=index_tensor,
+        index_data_ptr=index_tensor.data_ptr(),
+        index_storage_offset=index_tensor.storage_offset(),
+        index_numel=index_tensor.numel(),
+        active_prefix=active_prefix,
+        state_slots=state_slots,
+        source_invariant=allocator.state_index_invariant,
+        active_request_ids=request_ids,
+        replay_provenance=replay_provenance,
+        allocator_id=id(allocator),
+        _issuer=_MAMBA_STATE_INDEX_CONTRACT_ISSUER,
+    )
 
 
 class MambaSlotAllocator:
@@ -38,6 +194,7 @@ class MambaSlotAllocator:
     def __init__(self, size: int, device: str):
         self.size = size
         self.device = device
+        self.state_index_invariant = MAMBA_STATE_INDEX_INVARIANT
         # Active preallocated batch for `alloc_group_begin` / `alloc_group_end`.
         # When non-None, `alloc(1)` consumes the next slot from this iterator
         # instead of calling `_do_alloc(1)` per request. Reset to None outside
