@@ -74,7 +74,22 @@ void fp8_per_tensor_scaled_mm(
   using namespace host;
 
   RuntimeCheck(mat_a.device().device_type == kDLCUDA, "mat_a must be a CUDA tensor");
-  RuntimeCheck(mat_b.device().device_type == kDLCUDA, "mat_b must be a CUDA tensor");
+  const DLDevice device = mat_a.device();
+  // Every operand is dereferenced by the kernel on mat_a's stream, so a host or
+  // cross-device operand would be an illegal access rather than a bad result.
+  const auto check_device = [&device](tvm::ffi::TensorView tensor, const char* name) {
+    RuntimeCheck(
+        tensor.device().device_type == device.device_type && tensor.device().device_id == device.device_id,
+        name,
+        " must be a CUDA tensor on ",
+        host::details::PrintableDevice{device},
+        "; got ",
+        host::details::PrintableDevice{tensor.device()});
+  };
+  check_device(mat_b, "mat_b");
+  check_device(out, "out");
+  check_device(scales_a, "scales_a");
+  check_device(scales_b, "scales_b");
 
   RuntimeCheck(mat_a.dim() == 2, "mat_a must be a 2D tensor");
   RuntimeCheck(mat_b.dim() == 2, "mat_b must be a 2D tensor");
@@ -113,6 +128,7 @@ void fp8_per_tensor_scaled_mm(
       (out.size(1) * (out.dtype().bits / 8)) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
 
   if (bias.has_value()) {
+    check_device(bias.value(), "bias");
     RuntimeCheck(bias.value().numel() == mat_b.size(1), "size of bias is not matched");
     RuntimeCheck(bias.value().IsContiguous(), "bias must be contiguous");
     RuntimeCheck(
@@ -120,7 +136,7 @@ void fp8_per_tensor_scaled_mm(
         "bias dtype must match output dtype");
   }
 
-  const cudaStream_t stream = LaunchKernel::resolve_device(mat_a.device());
+  const cudaStream_t stream = LaunchKernel::resolve_device(device);
 
   if (is_type<bf16_t>(out.dtype())) {
     fp8_per_tensor_dispatch_arch<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias, stream);

@@ -170,6 +170,31 @@ def test_rejects_invalid_a_scale_count():
         fp8_per_tensor_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, None)
 
 
+@pytest.mark.parametrize("off_device_arg", ["scales_a", "scales_b", "bias"])
+def test_rejects_off_device_operands(off_device_arg):
+    M, N, K = 8, 128, 512
+    a = torch.randn(M, K, device="cuda").to(torch.float8_e4m3fn)
+    b = torch.randn(N, K, device="cuda").to(torch.float8_e4m3fn).t()
+    operands = {
+        "scales_a": torch.ones(M, device="cuda", dtype=torch.float32),
+        "scales_b": torch.ones(N, device="cuda", dtype=torch.float32),
+        "bias": torch.zeros(N, device="cuda", dtype=torch.bfloat16),
+    }
+    operands[off_device_arg] = operands[off_device_arg].cpu()
+
+    with pytest.raises(
+        RuntimeError, match=f"{off_device_arg} must be a CUDA tensor on"
+    ):
+        fp8_per_tensor_scaled_mm(
+            a,
+            b,
+            operands["scales_a"],
+            operands["scales_b"],
+            torch.bfloat16,
+            operands["bias"],
+        )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9),
     reason="SM89-specific scalar A validation",
