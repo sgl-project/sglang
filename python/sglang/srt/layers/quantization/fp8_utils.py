@@ -542,7 +542,11 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
         return Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
 
     if backend.is_flashinfer_cutedsl():
-        if not (_is_sm100_supported and is_flashinfer_available()):
+        if not (
+            _is_sm100_supported
+            and get_device_capability() in ((10, 0), (10, 3))
+            and is_flashinfer_available()
+        ):
             raise RuntimeError(
                 "MXFP8 dense GEMM requested via --fp8-gemm-backend=flashinfer_cutedsl, "
                 "but that kernel requires SM100/SM103 GPUs and FlashInfer."
