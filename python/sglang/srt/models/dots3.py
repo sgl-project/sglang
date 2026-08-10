@@ -64,6 +64,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -278,9 +279,7 @@ class Dots3MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.num_fused_shared_experts = (
-            0
-            if get_server_args().disable_shared_experts_fusion
-            else config.n_shared_experts
+            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
         self.config = config
         self.layer_id = layer_id
@@ -1848,6 +1847,7 @@ class Dots3Model(nn.Module):
 class Dots3LanguageModelForCausalLM(nn.Module):
     # for quark model load
     packed_modules_mapping = {}
+    fused_shared_experts_architecture = "Dots3NoteForCausalLM"
 
     def __init__(
         self,
@@ -1899,43 +1899,34 @@ class Dots3LanguageModelForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
-    def determine_num_fused_shared_experts(
-        self, architecture: str = "Dots3NoteForCausalLM"
-    ):
-        self.num_fused_shared_experts = 0
-        if get_server_args().disable_shared_experts_fusion:
-            return
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """Why this checkpoint cannot fuse its shared expert, or ``None``.
 
-        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
-        disable_reason = None
+        The loader evaluates this once per target or draft runner before any
+        model layer is constructed.
+        """
         if (
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
-            or self.config.architectures[0] != architecture
-            or self.config.n_routed_experts != 256
-            or self.config.n_shared_experts != 1
+            or hf_config.architectures[0]
+            != cls.fused_shared_experts_architecture
+            or hf_config.n_routed_experts != 256
+            or hf_config.n_shared_experts != 1
         ):
-            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
-        elif get_moe_expert_parallel_world_size() > 1:
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
-        elif self.quant_config is not None and self.quant_config.get_name() == "w4afp8":
-            disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
+            return "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
+        if get_moe_expert_parallel_world_size() > 1:
+            return "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
+        if quant_config is not None and quant_config.get_name() == "w4afp8":
+            return "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
+        return None
 
-        if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "Dots3ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
-            self.num_fused_shared_experts = 0
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
+    def determine_num_fused_shared_experts(self):
+        self.num_fused_shared_experts = (
+            0
+            if is_shared_experts_fusion_disabled()
+            else self.config.n_shared_experts
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -2789,6 +2780,12 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
 
     packed_modules_mapping = Dots3LanguageModelForCausalLM.packed_modules_mapping
     fall_back_to_pt_during_load = False
+
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        return Dots3LanguageModelForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
 
     def __init__(
         self,

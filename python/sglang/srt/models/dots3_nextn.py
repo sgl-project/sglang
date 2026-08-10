@@ -139,6 +139,8 @@ class Dot3NoteModelNextN(nn.Module):
 class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
     """Full-sharing Dots3 MTP draft registered for NEXTN decoding."""
 
+    fused_shared_experts_architecture = "Dots3NoteForCausalLMNextN"
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -158,7 +160,7 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
                 "g_proj",
             ]
         }
-        self.determine_num_fused_shared_experts("Dots3NoteForCausalLMNextN")
+        self.determine_num_fused_shared_experts()
 
         self.model = Dot3NoteModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
