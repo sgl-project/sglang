@@ -69,8 +69,6 @@ class TestBasicSanityDSpark(
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--tp",
-                "2",
                 "--attention-backend",
                 cls.attention_backend,
                 "--speculative-draft-attention-backend",
@@ -88,8 +86,8 @@ class TestBasicSanityDSpark(
                 "--enable-metrics",
                 "--disable-piecewise-cuda-graph",
             ]
-            # XPU: fp16 overflows on the attention backend; force bf16.
-            + (["--dtype", "bfloat16"] if is_xpu() else []),
+            # XPU: run TP=2, and fp16 overflows on the attention backend so force bf16.
+            + (["--tp", "2", "--dtype", "bfloat16"] if is_xpu() else []),
             env={
                 "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
                 "SGLANG_RAGGED_VERIFY_MODE": "compact",
