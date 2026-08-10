@@ -20,7 +20,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,

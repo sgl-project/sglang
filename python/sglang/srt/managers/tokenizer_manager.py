@@ -2054,7 +2054,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             target_rids = (rid,)
 
         for target_rid in target_rids:
-            self._dispatch_to_scheduler(AbortReq(rid=target_rid, abort_all=abort_all, prefix=prefix))
+            self._dispatch_to_scheduler(
+                AbortReq(rid=target_rid, abort_all=abort_all, prefix=prefix)
+            )
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -3634,9 +3636,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._finalize_lora_lease(
                     self._remove_req_state(child_rid, lifecycle_id)
                 )
-            self._finalize_lora_lease(
-                self._remove_req_state(logical_rid, lifecycle_id)
-            )
+            self._finalize_lora_lease(self._remove_req_state(logical_rid, lifecycle_id))
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
