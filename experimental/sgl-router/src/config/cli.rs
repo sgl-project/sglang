@@ -132,6 +132,27 @@ pub struct Cli {
     /// not proof that diverting pays.
     #[arg(long)]
     pub saturation_queue_floor: Option<NonZeroUsize>,
+    /// Per-replica headroom subtracted from `--worker-queue-limit` to curb
+    /// cross-replica overshoot on the DETERMINISTIC affinity path. Every
+    /// router replica reads the same engine load snapshot and routes a given
+    /// prefix to the same owner, so within one snapshot-refresh window N
+    /// replicas can each admit up to the limit before any dispatch is reported
+    /// back — the owner's real queue then overshoots the limit by up to the
+    /// concurrent replica count. (The min-load FALLBACK already diverges via
+    /// `--min-load-choices` sampling; the affinity path cannot, because the
+    /// owner is the same for every replica.) Reserving H slots gates each
+    /// replica at `limit - H`, so the collective stays near the true limit.
+    ///
+    /// Requires `--worker-queue-limit` and must be strictly less than it (the
+    /// effective gate must stay >= 1). With `--saturation-queue-floor` set it
+    /// must also leave `limit - H >= floor`, preserving that invariant. Size it
+    /// around the router replica count; unset disables it.
+    ///
+    /// The subtraction happens once at config build, so the policy only ever
+    /// sees the effective value: log fields and diagnostics named
+    /// `worker_queue_limit` report `limit - H`, not the raw flag.
+    #[arg(long)]
+    pub worker_queue_headroom: Option<NonZeroUsize>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -223,12 +244,13 @@ impl Cli {
             || self.balance_rel_threshold.is_some()
             || self.worker_queue_limit.is_some()
             || self.min_load_choices.is_some()
-            || self.saturation_queue_floor.is_some();
+            || self.saturation_queue_floor.is_some()
+            || self.worker_queue_headroom.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
                 "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
                  --balance-rel-threshold / --worker-queue-limit / --min-load-choices / \
-                 --saturation-queue-floor) \
+                 --saturation-queue-floor / --worker-queue-headroom) \
                  requires --policy cache_aware_zmq"
             ));
         }
@@ -263,6 +285,36 @@ impl Cli {
                      declare the fleet saturated while workers the gate still \
                      admits exist"
                 ));
+            }
+        }
+        // Headroom is subtracted from the queue limit to build the gate, so it
+        // needs a limit to subtract from, must leave the effective gate >= 1,
+        // and must not push the effective limit below the floor (which would
+        // break floor <= limit, the invariant `cache_hit_all_queued` relies on).
+        if let Some(headroom) = self.worker_queue_headroom {
+            let Some(limit) = self.worker_queue_limit else {
+                return Err(anyhow!(
+                    "--worker-queue-headroom is subtracted from --worker-queue-limit, \
+                     so it requires that flag"
+                ));
+            };
+            if headroom >= limit {
+                return Err(anyhow!(
+                    "--worker-queue-headroom ({headroom}) must be strictly less than \
+                     --worker-queue-limit ({limit}): the effective per-replica gate \
+                     (limit - headroom) must stay >= 1"
+                ));
+            }
+            if let Some(floor) = self.saturation_queue_floor {
+                let effective = limit.get() - headroom.get();
+                if floor.get() > effective {
+                    return Err(anyhow!(
+                        "--worker-queue-headroom ({headroom}) leaves an effective gate of \
+                         {effective} (--worker-queue-limit {limit} - headroom), which is \
+                         below --saturation-queue-floor ({floor}); lower the headroom or \
+                         the floor so limit - headroom >= floor"
+                    ));
+                }
             }
         }
 
@@ -340,7 +392,19 @@ impl Cli {
             // `validate` has already rejected the combination, so the queue
             // limit alone decides which gate is built.
             let load_gate = match self.worker_queue_limit {
-                Some(limit) => LoadGate::PerWorkerQueue(limit),
+                // `validate` guarantees headroom < limit, so the subtraction
+                // stays >= 1 and the NonZeroUsize rebuild cannot fail. The
+                // effective limit is baked into the gate here, leaving every
+                // downstream policy comparison (and the floor invariant, which
+                // validate holds against `limit - headroom`) untouched.
+                Some(limit) => {
+                    let effective = match self.worker_queue_headroom {
+                        Some(headroom) => NonZeroUsize::new(limit.get() - headroom.get())
+                            .expect("validate() enforces headroom < limit, so effective >= 1"),
+                        None => limit,
+                    };
+                    LoadGate::PerWorkerQueue(effective)
+                }
                 None => LoadGate::FleetSpread {
                     abs_threshold: self
                         .balance_abs_threshold
@@ -910,6 +974,101 @@ mod tests {
         // The gate REPLACES the spread strategy — the spread knobs must not
         // survive alongside it in the built config.
         assert!(matches!(ca.load_gate, LoadGate::PerWorkerQueue(_)));
+    }
+
+    #[test]
+    fn worker_queue_headroom_reduces_the_effective_gate() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "10",
+            "--worker-queue-headroom",
+            "3",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        // The gate the policy reads is limit - headroom = 7, not the raw 10.
+        assert_eq!(ca.load_gate.queue_limit(), Some(7));
+    }
+
+    #[test]
+    fn rejects_worker_queue_headroom_without_limit() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-headroom",
+            "3",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires that flag"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_worker_queue_headroom_at_or_above_limit() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "4",
+            "--worker-queue-headroom",
+            "4",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("strictly less than"), "got: {err}");
+    }
+
+    /// Headroom must not push the effective gate below the saturation floor:
+    /// limit 10 - headroom 4 = 6 < floor 8 would break the floor <= limit
+    /// invariant `cache_hit_all_queued` relies on.
+    #[test]
+    fn rejects_worker_queue_headroom_pushing_effective_gate_below_floor() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "10",
+            "--saturation-queue-floor",
+            "8",
+            "--worker-queue-headroom",
+            "4",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("below --saturation-queue-floor"), "got: {err}");
+    }
+
+    /// The boundary is inclusive, mirroring `floor == limit` being accepted
+    /// without headroom: floor == limit - headroom still upholds the
+    /// invariant, so it must configure.
+    #[test]
+    fn accepts_worker_queue_headroom_leaving_effective_gate_at_floor() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "10",
+            "--saturation-queue-floor",
+            "7",
+            "--worker-queue-headroom",
+            "3",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert_eq!(ca.load_gate.queue_limit(), Some(7));
+        assert_eq!(ca.saturation_queue_floor.map(NonZeroUsize::get), Some(7));
     }
 
     /// A limit of 0 would make every worker ineligible, silently degrading the
