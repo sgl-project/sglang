@@ -182,11 +182,6 @@ class ReqState:
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
-    # A request may be observed as terminal by more than one path (normal
-    # output, an abort echo, an error finish reason, or dispatch cleanup).
-    # The LoRA registry reference must nevertheless be handed back once.
-    lora_released: bool = False
-
     # Usually a state owns the single reference in ``obj.lora_id``. When an
     # explicit rid list is used with parallel sampling, however, normalization
     # keeps one parent rid per prompt while LoRARegistry.acquire has already
@@ -199,6 +194,23 @@ class ReqState:
     # scheduler never saw the rid, so the dispatch path must resolve the
     # request as aborted instead of sending it.
     abort_before_dispatch: bool = False
+
+    # Cleanup after a partial batch failure may only discard requests that the
+    # scheduler has never seen. A dispatched request keeps its LoRA lease until
+    # a scheduler terminal output (normal finish or abort ACK) arrives.
+    dispatched_to_scheduler: bool = False
+
+    # Parallel-sampling children and the prefix-cache warm-up use regenerated
+    # rids. This points back to the manager-held group ledger that owns any
+    # leases not transferred to real children yet.
+    request_group: Optional[str] = None
+
+    # The LoRA lease for this request has already been released. Every terminal
+    # path funnels through TokenizerManager._finalize_lora_lease, which uses
+    # this flag to stay idempotent: a leaked release hangs unload's
+    # wait_for_zero forever, and a double release drives the ConcurrentCounter
+    # negative, which hangs it just the same (it waits for exactly zero).
+    lora_lease_released: bool = False
 
     # For streaming output
     last_output_offset: int = 0
@@ -257,6 +269,17 @@ class ReqState:
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
+
+
+@dataclasses.dataclass
+class _ParallelSampleGroup:
+    """Ownership and abort ledger for one prompt's parallel samples."""
+
+    aliases: set[str]
+    residual_lora_ids: List[str]
+    member_rids: set[str] = dataclasses.field(default_factory=set)
+    abort_requested: bool = False
+    fanout_done: bool = False
 
 
 def _slice_streaming_output_meta_info(
@@ -468,6 +491,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # asyncio only keeps weak references to tasks. Keep release tasks alive
         # until their registry decrement has completed.
         self._lora_release_tasks: set[asyncio.Task] = set()
+        # Parallel-sampling children use regenerated request IDs. Keep the
+        # original parent IDs as abort aliases until every child terminates.
+        self._parallel_request_groups: Dict[str, _ParallelSampleGroup] = {}
+        self._parallel_request_group_aliases: Dict[str, str] = {}
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -685,12 +712,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     self._send_one_request(tokenized_obj)
-                    async for response in self._wait_one_response(obj, request):
+                    async for response in self._wait_one_response(
+                        obj, request, detached_state=state
+                    ):
                         yield response
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
-        except Exception:
+        except (Exception, asyncio.CancelledError, GeneratorExit):
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -1388,39 +1417,46 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _abort_instead_of_dispatch(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
-    ) -> bool:
+    ) -> Optional[ReqState]:
         """Resolve a request whose rid an abort matched while it was still
         tokenizer-held (see abort_request): the scheduler never saw the rid, so
-        it must be finished here instead of dispatched. Returns True if the
-        request was aborted."""
+        it must be finished here instead of dispatched. Returns the detached
+        terminal state when the request was aborted locally."""
         state = self.rid_to_state.get(tokenized_obj.rid)
         if (
             state is None
             or not state.abort_before_dispatch
             or is_health_check_generate_req(tokenized_obj)
         ):
-            return False
+            return None
         self._handle_abort_req(
             AbortReq(
                 rid=tokenized_obj.rid,
                 abort_message="Aborted by AbortReq before dispatch to scheduler",
             )
         )
-        return True
+        return state
 
     def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
-        if self._abort_instead_of_dispatch(tokenized_obj):
-            return
+        locally_aborted_state = self._abort_instead_of_dispatch(tokenized_obj)
+        if locally_aborted_state is not None:
+            return locally_aborted_state
+        state = self.rid_to_state.get(tokenized_obj.rid)
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         time_stats = tokenized_obj.time_stats
         tokenized_obj.wrap_pickle_fields()
         self._dispatch_to_scheduler(tokenized_obj)
+        if state is not None:
+            # Set this only after the IPC send succeeds. If preparation or the
+            # send itself raises, exception cleanup still owns the lease.
+            state.dispatched_to_scheduler = True
         tokenized_obj.time_stats = time_stats
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+        return None
 
     def _send_batch_request(
         self,
@@ -1429,13 +1465,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
-        tokenized_objs = [
-            tokenized_obj
-            for tokenized_obj in tokenized_objs
-            if not self._abort_instead_of_dispatch(tokenized_obj)
-        ]
+        locally_aborted_states = {}
+        dispatch_objs = []
+        for tokenized_obj in tokenized_objs:
+            locally_aborted_state = self._abort_instead_of_dispatch(tokenized_obj)
+            if locally_aborted_state is None:
+                dispatch_objs.append(tokenized_obj)
+            else:
+                locally_aborted_states[tokenized_obj.rid] = locally_aborted_state
+        tokenized_objs = dispatch_objs
         if not tokenized_objs:
-            return
+            return locally_aborted_states
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
         time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
         for tokenized_obj in tokenized_objs:
@@ -1447,9 +1487,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         self._dispatch_to_scheduler(batch_req)
+        for tokenized_obj in tokenized_objs:
+            state = self.rid_to_state.get(tokenized_obj.rid)
+            if state is not None:
+                state.dispatched_to_scheduler = True
         for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
             tokenized_obj.time_stats = time_stat
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+        return locally_aborted_states
 
     def _coalesce_streaming_chunks(
         self,
@@ -1488,6 +1533,115 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             out["meta_info"] = meta_info
         return out
 
+    def _track_lora_task(self, task: asyncio.Task) -> asyncio.Task:
+        tasks = getattr(self, "_lora_release_tasks", None)
+        if tasks is None:
+            tasks = self._lora_release_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    def _schedule_lora_release(
+        self, lora_ids: Optional[Union[str, List[Optional[str]]]]
+    ) -> Optional[asyncio.Task]:
+        if not getattr(self, "enable_lora", False) or lora_ids is None:
+            return None
+        if isinstance(lora_ids, list):
+            lora_ids = [lora_id for lora_id in lora_ids if lora_id is not None]
+            if not lora_ids:
+                return None
+        return self._track_lora_task(
+            asyncio.create_task(self.lora_registry.release(lora_ids))
+        )
+
+    def _finalize_lora_lease(self, state: Optional[ReqState]) -> Optional[asyncio.Task]:
+        """Hand a state's LoRA lease back to the registry exactly once.
+
+        ``lora_id`` (or an explicit bundle in ``lora_ids_to_release``) is the
+        ownership signal. The path may be cleared while a stable upsert ID is
+        still owned, so release must never depend on ``lora_path``. The strong
+        task reference is also intentional: asyncio otherwise keeps only a
+        weak reference to fire-and-forget tasks.
+        """
+        if state is None or state.lora_lease_released:
+            return None
+
+        lora_ids = state.lora_ids_to_release
+        if lora_ids is None:
+            lora_ids = getattr(state.obj, "lora_id", None)
+        if not getattr(self, "enable_lora", False) or lora_ids is None:
+            return None
+        if isinstance(lora_ids, list) and not any(
+            lora_id is not None for lora_id in lora_ids
+        ):
+            return None
+
+        state.lora_lease_released = True
+        state.lora_ids_to_release = []
+        return self._schedule_lora_release(lora_ids)
+
+    def _get_parallel_group_maps(
+        self,
+    ) -> Tuple[Dict[str, _ParallelSampleGroup], Dict[str, str]]:
+        groups = getattr(self, "_parallel_request_groups", None)
+        if groups is None:
+            groups = self._parallel_request_groups = {}
+        aliases = getattr(self, "_parallel_request_group_aliases", None)
+        if aliases is None:
+            aliases = self._parallel_request_group_aliases = {}
+        return groups, aliases
+
+    def _register_parallel_group(
+        self, group_key: str, aliases: Iterable[str], lora_ids: Iterable[str]
+    ) -> _ParallelSampleGroup:
+        groups, alias_index = self._get_parallel_group_maps()
+        aliases = set(aliases)
+        if group_key in groups or any(alias in alias_index for alias in aliases):
+            raise ValueError(f"Duplicate parallel request group: {group_key}")
+        group = _ParallelSampleGroup(aliases=aliases, residual_lora_ids=list(lora_ids))
+        groups[group_key] = group
+        for alias in aliases:
+            alias_index[alias] = group_key
+        return group
+
+    def _remove_parallel_group(self, group_key: str) -> None:
+        groups, alias_index = self._get_parallel_group_maps()
+        group = groups.pop(group_key, None)
+        if group is None:
+            return
+        for alias in group.aliases:
+            if alias_index.get(alias) == group_key:
+                alias_index.pop(alias, None)
+
+    def _maybe_finalize_parallel_group(
+        self, group_key: Optional[str]
+    ) -> Optional[asyncio.Task]:
+        if group_key is None:
+            return None
+        groups, _ = self._get_parallel_group_maps()
+        group = groups.get(group_key)
+        if group is None or group.member_rids:
+            return None
+        if not group.abort_requested and not group.fanout_done:
+            return None
+        residual_lora_ids = group.residual_lora_ids
+        group.residual_lora_ids = []
+        self._remove_parallel_group(group_key)
+        return self._schedule_lora_release(residual_lora_ids)
+
+    def _complete_parallel_group_member(
+        self, state: Optional[ReqState], rid: Optional[str] = None
+    ) -> Optional[asyncio.Task]:
+        if state is None or state.request_group is None:
+            return None
+        group_key = state.request_group
+        groups, _ = self._get_parallel_group_maps()
+        group = groups.get(group_key)
+        if group is None:
+            return None
+        group.member_rids.discard(rid or state.obj.rid)
+        return self._maybe_finalize_parallel_group(group_key)
+
     async def _handle_abort_finish_reason(
         self,
         out: dict,
@@ -1506,9 +1660,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
         ):
             self.rid_to_state.pop(state.obj.rid, None)
-            release_task = self._release_lora_once(state)
+            release_task = self._finalize_lora_lease(state)
+            self._complete_parallel_group_member(state, state.obj.rid)
             if release_task is not None:
-                await release_task
+                await asyncio.shield(release_task)
             if not is_stream:
                 raise ValueError(finish_reason["message"])
             return out
@@ -1522,10 +1677,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
             self.rid_to_state.pop(state.obj.rid, None)
-
-            release_task = self._release_lora_once(state)
+            # Status-code aborts also arrive through _handle_batch_output, which
+            # already released the lease and deleted the state — the finalizer's
+            # idempotency is what prevents the counter from going negative here.
+            release_task = self._finalize_lora_lease(state)
+            self._complete_parallel_group_member(state, state.obj.rid)
             if release_task is not None:
-                await release_task
+                await asyncio.shield(release_task)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -1535,45 +1693,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         return None
 
-    def _release_lora_once(self, state: ReqState) -> Optional[asyncio.Task]:
-        """Release a request's LoRA registry reference at most once.
-
-        A scheduler output, an abort echo, an error finish reason, and failed
-        dispatch cleanup may all observe the same terminal request. The
-        per-state guard makes those paths idempotent, while the task set keeps
-        the asynchronous registry decrement alive until it completes.
-
-        ``lora_id`` is the ownership signal. A request can carry ``lora_path``
-        before registry acquisition succeeds, so checking the path alone can
-        incorrectly schedule ``release(None)`` on validation failures.
-        """
-        if state.lora_released:
-            return None
-
-        lora_ids = state.lora_ids_to_release
-        if lora_ids is None:
-            lora_ids = getattr(state.obj, "lora_id", None)
-        if not getattr(self, "enable_lora", False) or lora_ids is None:
-            return None
-
-        if isinstance(lora_ids, list):
-            lora_ids = [lora_id for lora_id in lora_ids if lora_id is not None]
-            if not lora_ids:
-                return None
-
-        state.lora_released = True
-        task = asyncio.create_task(self.lora_registry.release(lora_ids))
-        self._lora_release_tasks.add(task)
-        task.add_done_callback(self._lora_release_tasks.discard)
-        return task
-
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        detached_state: Optional[ReqState] = None,
     ):
         """Wait for the response of one request."""
-        state = self.rid_to_state[obj.rid]
+        state = detached_state or self.rid_to_state[obj.rid]
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
         while True:
@@ -1675,6 +1802,173 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
                     )
 
+    def _prepare_parallel_sample_groups(
+        self,
+        obj: GenerateReqInput,
+        batch_size: int,
+    ) -> List[str]:
+        """Move normalized parent leases into cancellation-safe group ledgers.
+
+        Normalization repeats the whole batch for ``n`` samples, so prompt
+        ``i`` owns indices ``i, i + batch_size, ...``. Explicit rid lists are
+        the exception: one parent state already owns the whole stride bundle.
+        """
+        rids = obj.rid if isinstance(obj.rid, list) else [obj.rid]
+        parallel_sample_num = obj.parallel_sample_num
+        if len(rids) == batch_size:
+            source_rids_by_prompt = [[rids[i]] for i in range(batch_size)]
+        elif len(rids) == batch_size * parallel_sample_num:
+            source_rids_by_prompt = [rids[i::batch_size] for i in range(batch_size)]
+        else:
+            raise ValueError(
+                "Unexpected rid count for parallel sampling: "
+                f"got {len(rids)}, expected {batch_size} or "
+                f"{batch_size * parallel_sample_num}"
+            )
+
+        groups, alias_index = self._get_parallel_group_maps()
+        plans = []
+        for prompt_index, source_rids in enumerate(source_rids_by_prompt):
+            source_states = []
+            owned_lora_ids = []
+            for source_rid in source_rids:
+                state = self.rid_to_state.get(source_rid)
+                if state is None:
+                    raise ValueError(
+                        f"Parallel sampling parent state disappeared: {source_rid}"
+                    )
+                source_states.append(state)
+                state_lora_ids = state.lora_ids_to_release
+                if state_lora_ids is None:
+                    state_lora_ids = getattr(state.obj, "lora_id", None)
+                if isinstance(state_lora_ids, list):
+                    owned_lora_ids.extend(
+                        lora_id for lora_id in state_lora_ids if lora_id is not None
+                    )
+                elif state_lora_ids is not None:
+                    owned_lora_ids.append(state_lora_ids)
+
+            expected_lora_id = getattr(obj[prompt_index], "lora_id", None)
+            expected_count = parallel_sample_num if expected_lora_id is not None else 0
+            if len(owned_lora_ids) != expected_count:
+                raise RuntimeError(
+                    "Parallel LoRA ownership mismatch: "
+                    f"prompt {prompt_index} owns {len(owned_lora_ids)} leases, "
+                    f"expected {expected_count}"
+                )
+
+            group_key = source_rids[0]
+            if group_key in groups or any(
+                source_rid in alias_index for source_rid in source_rids
+            ):
+                raise ValueError(f"Duplicate parallel request group: {group_key}")
+            plans.append((group_key, source_rids, source_states, owned_lora_ids))
+
+        group_keys = []
+        for group_key, source_rids, source_states, owned_lora_ids in plans:
+            # This transfer contains no await: the source states stop owning
+            # only when the manager-held group becomes the owner.
+            group = self._register_parallel_group(
+                group_key, source_rids, owned_lora_ids
+            )
+            group.abort_requested = any(
+                source_state.abort_before_dispatch for source_state in source_states
+            )
+            for source_rid, source_state in zip(source_rids, source_states):
+                source_state.lora_ids_to_release = []
+                source_state.time_stats.set_finished_time()
+                self.rid_to_state.pop(source_rid, None)
+            group_keys.append(group_key)
+
+        return group_keys
+
+    def _add_parallel_group_member(
+        self,
+        group_key: str,
+        state: ReqState,
+        *,
+        transfer_lora_id: bool,
+    ) -> None:
+        groups, _ = self._get_parallel_group_maps()
+        group = groups[group_key]
+        state.request_group = group_key
+        state.lora_ids_to_release = []
+        group.member_rids.add(state.obj.rid)
+
+        lora_id = getattr(state.obj, "lora_id", None)
+        if not transfer_lora_id or lora_id is None:
+            return
+        if not group.residual_lora_ids:
+            raise RuntimeError(
+                f"Parallel request group {group_key} has no lease to transfer"
+            )
+        owned_lora_id = group.residual_lora_ids[0]
+        if owned_lora_id != lora_id:
+            raise RuntimeError(
+                "Parallel LoRA identity changed during fan-out: "
+                f"expected {lora_id}, got {owned_lora_id}"
+            )
+        group.residual_lora_ids.pop(0)
+        state.lora_ids_to_release = owned_lora_id
+
+    def _abort_parallel_sample_groups(self, group_keys: Iterable[str]) -> None:
+        """Stop fan-out without releasing leases still used by the scheduler."""
+        groups, _ = self._get_parallel_group_maps()
+        dispatched_rids = []
+        for group_key in group_keys:
+            group = groups.get(group_key)
+            if group is None:
+                continue
+            group.abort_requested = True
+            for member_rid in list(group.member_rids):
+                state = self.rid_to_state.get(member_rid)
+                if state is None:
+                    group.member_rids.discard(member_rid)
+                elif state.dispatched_to_scheduler:
+                    dispatched_rids.append(member_rid)
+                else:
+                    self.rid_to_state.pop(member_rid, None)
+                    self._finalize_lora_lease(state)
+                    self._complete_parallel_group_member(state, member_rid)
+            self._maybe_finalize_parallel_group(group_key)
+
+        for dispatched_rid in dispatched_rids:
+            try:
+                self._dispatch_to_scheduler(AbortReq(rid=dispatched_rid))
+            except Exception:
+                logger.exception(
+                    "Failed to abort partially dispatched parallel request %s",
+                    dispatched_rid,
+                )
+
+    def _materialize_aborted_parallel_samples(
+        self,
+        source_obj: GenerateReqInput,
+        sample_count: int,
+        abort_message: str,
+    ) -> List[Tuple[GenerateReqInput, ReqState]]:
+        """Create local terminal outputs for an aborted parallel prompt.
+
+        The group ledger owns (or has already released) the real LoRA bundle.
+        These synthetic samples exist only to preserve the batch's ``B * n``
+        response cardinality, so they explicitly own no adapter lease and are
+        never sent to the scheduler.
+        """
+        samples = []
+        for _ in range(sample_count):
+            tmp_obj = copy.copy(source_obj)
+            tmp_obj.regenerate_rid()
+            tmp_obj.lora_path = None
+            tmp_obj.lora_id = None
+            self._init_req_state(tmp_obj)
+            state = self.rid_to_state[tmp_obj.rid]
+            state.lora_ids_to_release = []
+            self._handle_abort_req(
+                AbortReq(rid=tmp_obj.rid, abort_message=abort_message)
+            )
+            samples.append((tmp_obj, state))
+        return samples
+
     async def _handle_batch_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1684,18 +1978,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         generators = []
         rids = []
+        parallel_group_keys = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                batch_states = [
+                    self.rid_to_state[obj[i].rid] for i in range(batch_size)
+                ]
                 self._send_batch_request(tokenized_objs)
 
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
-                    state = self.rid_to_state[tmp_obj.rid]
+                    state = batch_states[i]
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    generators.append(
+                        self._wait_one_response(tmp_obj, request, detached_state=state)
+                    )
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -1713,7 +2013,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
                         self._send_one_request(tokenized_obj)
-                        generators.append(self._wait_one_response(tmp_obj, request))
+                        generators.append(
+                            self._wait_one_response(
+                                tmp_obj, request, detached_state=state
+                            )
+                        )
                         rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
@@ -1730,89 +2034,182 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
 
-            # Every real sample below is sent under a regenerated rid. The
-            # original states are bookkeeping parents, not additional LoRA
-            # users: the acquire count belongs to the regenerated children.
-            # Remove all parents (including the otherwise orphaned expanded
-            # entries) and mark their accounting as transferred.
-            parent_states = {}
-            for parent_rid in obj.rid if isinstance(obj.rid, list) else [obj.rid]:
-                parent_state = self.rid_to_state.pop(parent_rid, None)
-                if parent_state is not None:
-                    parent_state.lora_released = True
-                    parent_states[parent_rid] = parent_state
-
-            # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
-                tmp_obj = copy.copy(objs[i])
-                # This warm-up is an extra request beyond the n references
-                # acquired for the real samples. Keep LoRA on tokenized_obj so
-                # the scheduler caches the prefix under the right adapter, but
-                # make its tokenizer-side state a non-owner.
-                tmp_obj.lora_path = None
-                tmp_obj.lora_id = None
-                tokenized_obj = copy.copy(tokenized_objs[i])
-                # Ensure independent mm_items so wrap_shm_features won't mutate the original
-                if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
-                    tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
-                    tokenized_obj.mm_inputs.mm_items = [
-                        copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
-                    ]
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
-                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
-                tokenized_obj.sampling_params.max_new_tokens = 0
-                tokenized_obj.stream = False
-                self._init_req_state(tmp_obj)
-                self._send_one_request(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
-
-            # Expand requests, assign new rids for them, and send them
-            for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+            # The group ledger survives every await below. It owns leases that
+            # have not yet moved to real child states and also maps parent aborts
+            # to regenerated scheduler rids.
+            parallel_group_keys = self._prepare_parallel_sample_groups(obj, batch_size)
+            aborted_group_keys = set()
+            fanout_complete = False
+            try:
+                # Cache the common prefix for parallel sampling. The warm-up
+                # uses the adapter in the scheduler but owns no lease itself;
+                # the group's residual leases protect it until terminal ACK.
+                for i in range(batch_size):
+                    group_key = parallel_group_keys[i]
+                    groups, _ = self._get_parallel_group_maps()
+                    group = groups.get(group_key)
+                    if group is None or group.abort_requested:
+                        aborted_group_keys.add(group_key)
+                        self._abort_parallel_sample_groups([group_key])
+                        continue
                     tmp_obj = copy.copy(objs[i])
+                    tmp_obj.lora_path = None
+                    tmp_obj.lora_id = None
                     tokenized_obj = copy.copy(tokenized_objs[i])
-                    # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
                         tokenized_obj.mm_inputs.mm_items = [
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    tokenized_obj.sampling_params = copy.copy(
+                        tokenized_obj.sampling_params
+                    )
+                    tokenized_obj.sampling_params.max_new_tokens = 0
+                    tokenized_obj.stream = False
                     self._init_req_state(tmp_obj)
-                    state = self.rid_to_state[tmp_obj.rid]
-                    tokenized_obj.time_stats = state.time_stats
-                    if tmp_obj.return_prompt_token_ids:
-                        state.prompt_token_ids = list(tokenized_objs[i].input_ids)
+                    warmup_state = self.rid_to_state[tmp_obj.rid]
+                    self._add_parallel_group_member(
+                        group_key, warmup_state, transfer_lora_id=False
+                    )
                     self._send_one_request(tokenized_obj)
-                    generators.append(self._wait_one_response(tmp_obj, request))
-                    rids.append(tmp_obj.rid)
+                    await self._wait_one_response(
+                        tmp_obj, request, detached_state=warmup_state
+                    ).__anext__()
+                    # Real response handling already did this; keeping it
+                    # idempotent also supports lightweight unit-test waiters.
+                    self._complete_parallel_group_member(warmup_state, tmp_obj.rid)
+                    groups, _ = self._get_parallel_group_maps()
+                    group = groups.get(group_key)
+                    if group is None or group.abort_requested:
+                        aborted_group_keys.add(group_key)
+                        self._abort_parallel_sample_groups([group_key])
 
-                if objs[i].rid in parent_states:
-                    parent_states[objs[i].rid].time_stats.set_finished_time()
+                # Create each real child before transferring exactly one lease
+                # from the group. There is no await inside this hand-off.
+                for i in range(batch_size):
+                    group_key = parallel_group_keys[i]
+                    groups, _ = self._get_parallel_group_maps()
+                    group = groups.get(group_key)
+                    if group is None or group.abort_requested:
+                        aborted_group_keys.add(group_key)
+                        self._abort_parallel_sample_groups([group_key])
+
+                    if group_key in aborted_group_keys:
+                        aborted_samples = self._materialize_aborted_parallel_samples(
+                            objs[i],
+                            obj.parallel_sample_num,
+                            f"Parallel request {group_key} was aborted",
+                        )
+                        for tmp_obj, state in aborted_samples:
+                            generators.append(
+                                self._wait_one_response(
+                                    tmp_obj, request, detached_state=state
+                                )
+                            )
+                            rids.append(tmp_obj.rid)
+                        continue
+
+                    for _ in range(obj.parallel_sample_num):
+                        groups, _ = self._get_parallel_group_maps()
+                        group = groups.get(group_key)
+                        if group is None or group.abort_requested:
+                            raise RuntimeError(
+                                "Parallel request group changed during synchronous "
+                                f"fan-out: {group_key}"
+                            )
+                        tmp_obj = copy.copy(objs[i])
+                        tokenized_obj = copy.copy(tokenized_objs[i])
+                        if (
+                            hasattr(tokenized_obj, "mm_inputs")
+                            and tokenized_obj.mm_inputs
+                        ):
+                            tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
+                            tokenized_obj.mm_inputs.mm_items = [
+                                copy.copy(item)
+                                for item in tokenized_obj.mm_inputs.mm_items
+                            ]
+                        tokenized_obj.rid = tmp_obj.regenerate_rid()
+                        self._init_req_state(tmp_obj)
+                        state = self.rid_to_state[tmp_obj.rid]
+                        self._add_parallel_group_member(
+                            group_key, state, transfer_lora_id=True
+                        )
+                        tokenized_obj.time_stats = state.time_stats
+                        if tmp_obj.return_prompt_token_ids:
+                            state.prompt_token_ids = list(tokenized_objs[i].input_ids)
+                        self._send_one_request(tokenized_obj)
+                        generators.append(
+                            self._wait_one_response(
+                                tmp_obj, request, detached_state=state
+                            )
+                        )
+                        rids.append(tmp_obj.rid)
+
+                groups, _ = self._get_parallel_group_maps()
+                for group_key in parallel_group_keys:
+                    if group_key in aborted_group_keys:
+                        continue
+                    group = groups.get(group_key)
+                    if group is None:
+                        raise RuntimeError(
+                            f"Parallel request group disappeared: {group_key}"
+                        )
+                    if group.residual_lora_ids:
+                        raise RuntimeError(
+                            f"Parallel request group {group_key} retained "
+                            f"{len(group.residual_lora_ids)} unassigned LoRA leases"
+                        )
+                    group.fanout_done = True
+                    self._maybe_finalize_parallel_group(group_key)
+                fanout_complete = True
+            finally:
+                if not fanout_complete:
+                    self._abort_parallel_sample_groups(parallel_group_keys)
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
-        if not is_stream:
-            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
-            yield outputs
-        else:
-            rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
-            while task_map:
-                done, _ = await asyncio.wait(
-                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
-                )
+        task_map = {}
+        wait_tasks = []
+        try:
+            if not is_stream:
+                wait_tasks = [
+                    asyncio.create_task(gen.__anext__()) for gen in generators
+                ]
+                outputs = await asyncio.gather(*wait_tasks)
+                yield outputs
+            else:
+                rid_to_index = {rid: i for i, rid in enumerate(rids)}
+                task_map = {
+                    asyncio.create_task(gen.__anext__()): gen for gen in generators
+                }
+                while task_map:
+                    done, _ = await asyncio.wait(
+                        task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                    )
 
-                for task in done:
-                    gen = task_map.pop(task)
-                    try:
-                        result = task.result()
-                        result["index"] = rid_to_index[result["meta_info"]["id"]]
-                        yield result
-                        new_task = asyncio.create_task(gen.__anext__())
-                        task_map[new_task] = gen
-                    except StopAsyncIteration:
-                        pass
+                    for task in done:
+                        gen = task_map.pop(task)
+                        try:
+                            result = task.result()
+                            result["index"] = rid_to_index[result["meta_info"]["id"]]
+                            yield result
+                            new_task = asyncio.create_task(gen.__anext__())
+                            task_map[new_task] = gen
+                        except StopAsyncIteration:
+                            pass
+        finally:
+            pending_wait_tasks = [task for task in wait_tasks if not task.done()]
+            for task in pending_wait_tasks:
+                task.cancel()
+            if pending_wait_tasks:
+                await asyncio.gather(*pending_wait_tasks, return_exceptions=True)
+            if task_map:
+                for task in task_map:
+                    task.cancel()
+                await asyncio.gather(*task_map, return_exceptions=True)
+            if parallel_group_keys:
+                self._abort_parallel_sample_groups(parallel_group_keys)
 
     def abort_request(
         self, rid: str = "", abort_all: bool = False, prefix: bool = False
@@ -1821,11 +2218,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
+
+        groups, alias_index = self._get_parallel_group_maps()
+        matched_group_keys = set()
+        if abort_all:
+            matched_group_keys.update(groups)
+        else:
+            for alias, group_key in alias_index.items():
+                if alias.startswith(rid) if prefix else alias == rid:
+                    matched_group_keys.add(group_key)
+        matched_group_members = {
+            member_rid
+            for group_key in matched_group_keys
+            for member_rid in groups[group_key].member_rids
+        }
+
         if not abort_all and self.server_args.tokenizer_worker_num == 1:
             if prefix:
-                if not any(r.startswith(rid) for r in self.rid_to_state):
+                if not matched_group_keys and not any(
+                    r.startswith(rid) for r in self.rid_to_state
+                ):
                     return
-            elif rid not in self.rid_to_state:
+            elif rid not in self.rid_to_state and not matched_group_keys:
                 return
         # A matching request can still be tokenizer-held: rid_to_state is
         # populated in _init_req_state, several awaits (pause gate,
@@ -1835,12 +2249,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # aborted instead of sending them. Already-dispatched requests are
         # unaffected (the flag is only read at dispatch).
         for tracked_rid, state in self.rid_to_state.items():
-            if abort_all or (
-                tracked_rid.startswith(rid) if prefix else tracked_rid == rid
-            ):
+            direct_match = tracked_rid.startswith(rid) if prefix else tracked_rid == rid
+            if abort_all or direct_match or tracked_rid in matched_group_members:
                 state.abort_before_dispatch = True
+
+        for group_key in matched_group_keys:
+            groups[group_key].abort_requested = True
+
         req = AbortReq(rid=rid, abort_all=abort_all, prefix=prefix)
         self._dispatch_to_scheduler(req)
+        if not abort_all:
+            # Regenerated parallel rids are not necessarily prefixed by the
+            # user-visible parent. Forward concrete aborts for members that the
+            # scheduler's startswith matching cannot reach through ``req``.
+            for member_rid in matched_group_members:
+                state = self.rid_to_state.get(member_rid)
+                if (
+                    state is not None
+                    and state.dispatched_to_scheduler
+                    and not member_rid.startswith(rid)
+                ):
+                    self._dispatch_to_scheduler(AbortReq(rid=member_rid))
+        for group_key in matched_group_keys:
+            self._maybe_finalize_parallel_group(group_key)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -2286,7 +2717,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
-                self._release_lora_once(state)
+                # Mark ongoing LoRA request as finished.
+                self._finalize_lora_lease(state)
+                self._complete_parallel_group_member(state, rid)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -2944,8 +3377,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+        # This abort echo is the scheduler-side terminal ACK for queued,
+        # tokenizer-held, and disagg-retracted requests — none of them reach
+        # _handle_batch_output, so this is their only lease-release point.
+        self._finalize_lora_lease(state)
         del self.rid_to_state[recv_obj.rid]
-        self._release_lora_once(state)
+        self._complete_parallel_group_member(state, recv_obj.rid)
 
         state.out_list.append(out)
         state.event.set()
@@ -3076,8 +3513,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"All loaded adapters: {self.lora_ref_cache.keys()}."
                 )
 
-            logger.info(f"Reloading evicted adapter: {lora_path}")
             new_lora_ref = self.lora_ref_cache[lora_path]
+            if not new_lora_ref.reloadable:
+                raise ValueError(
+                    f"LoRA adapter '{lora_path}' was loaded over the wire "
+                    f"(lora_path={new_lora_ref.lora_path!r}) and has no disk "
+                    "artifact to reload from; it must be re-pushed by the "
+                    "trainer instead of implicitly reloaded."
+                )
+            logger.info(f"Reloading evicted adapter: {lora_path}")
             load_result = await self.load_lora_adapter(
                 LoadLoRAAdapterReqInput(
                     lora_name=new_lora_ref.lora_name,
@@ -3094,7 +3538,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
-        obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+        # Shield the admission step so cancellation cannot land after the
+        # registry increments its counter but before this owner sees the ID.
+        acquire_task = asyncio.create_task(self.lora_registry.acquire(obj.lora_path))
+        try:
+            obj.lora_id = await asyncio.shield(acquire_task)
+        except asyncio.CancelledError:
+
+            async def release_cancelled_acquire() -> None:
+                try:
+                    acquired_lora_ids = await acquire_task
+                except Exception:
+                    return
+                if isinstance(acquired_lora_ids, list):
+                    acquired_lora_ids = [
+                        lora_id for lora_id in acquired_lora_ids if lora_id is not None
+                    ]
+                    if not acquired_lora_ids:
+                        return
+                elif acquired_lora_ids is None:
+                    return
+                await self.lora_registry.release(acquired_lora_ids)
+
+            self._track_lora_task(asyncio.create_task(release_cancelled_acquire()))
+            raise
         # Propagate lora_id to any sub-objects already cached by __getitem__.
         for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
             sub_obj.lora_id = (
@@ -3108,7 +3575,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # (lora_id is still None), so return the newly acquired references
             # here instead of leaking them.
             if orphaned_lora_ids:
-                await self.lora_registry.release(orphaned_lora_ids)
+                orphan_release_task = self._schedule_lora_release(orphaned_lora_ids)
+                if orphan_release_task is not None:
+                    await asyncio.shield(orphan_release_task)
             raise ValueError(
                 "Request was aborted while resolving its LoRA adapter: "
                 + ", ".join(missing_rids)
@@ -3190,9 +3659,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        item_rids = [rid for rid, _, _ in items]
+        if len(item_rids) != len(set(item_rids)):
+            raise ValueError("Duplicate request IDs detected within the request")
+        _, parallel_aliases = self._get_parallel_group_maps()
+        for rid in item_rids:
+            if rid in self.rid_to_state or rid in parallel_aliases:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+
+        # Insertion is deliberately a second pass: a late duplicate cannot
+        # leave earlier batch entries behind when initialization raises.
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
@@ -3201,20 +3678,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats.set_created_time(created_time)
 
     def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
+        """Release states that are known never to have reached the scheduler.
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        A partial batch failure can occur after an earlier sibling was sent.
+        That sibling remains tracked and keeps its lease until scheduler
+        terminal output; releasing it here would let unload/upsert mutate the
+        adapter slot while it is still executing.
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
         else:
             rids = obj.rid
         for rid in rids:
-            state = self.rid_to_state.pop(rid, None)
-            if state is not None:
-                self._release_lora_once(state)
+            state = self.rid_to_state.get(rid)
+            if state is None or state.dispatched_to_scheduler:
+                continue
+            self.rid_to_state.pop(rid, None)
+            self._finalize_lora_lease(state)
+            self._complete_parallel_group_member(state, rid)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

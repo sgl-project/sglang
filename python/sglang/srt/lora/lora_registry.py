@@ -38,6 +38,12 @@ class LoRARef(msgspec.Struct, frozen=True, array_like=True):
     lora_name: Optional[str] = None
     lora_path: Optional[str] = None
     pinned: Optional[bool] = None
+    # False for adapters whose weights arrived over the wire (lora_path
+    # "__distributed__" / "__tensor__"): there is no disk artifact to reload
+    # from, so they must never be LRU-evicted nor implicitly reloaded.
+    # Trailing field with a default keeps the array_like wire format
+    # compatible with refs encoded before this field existed.
+    reloadable: bool = True
 
     def __post_init__(self):
         if self.lora_id is None:
@@ -184,24 +190,28 @@ class LoRARegistry:
             self._registry.move_to_end(name)
             return lora_ref.lora_id
 
+        # Lookup and increment must be one atomic admission step under the
+        # writer lock: with the increment outside, an unload can slip between
+        # them — unregister the adapter, observe the counter at zero, delete
+        # the counter — leaving this request to KeyError or to run on an
+        # adapter that is already gone. wait_for_unload never awaits inside
+        # this lock, so holding it across the increment cannot deadlock.
         if isinstance(lora_name, str):
             async with self._registry_lock.writer_lock:
                 lora_id = _lookup(lora_name)
-
-            await self._counters[lora_id].increment(notify_all=False)
+                await self._counters[lora_id].increment(notify_all=False)
             return lora_id
         elif isinstance(lora_name, list):
             async with self._registry_lock.writer_lock:
                 lora_ids = [_lookup(name) for name in lora_name]
-
-            # Increment the counters only after all IDs are looked up.
-            await asyncio.gather(
-                *[
-                    self._counters[id].increment(notify_all=False)
-                    for id in lora_ids
-                    if id is not None
-                ]
-            )
+                # Increment the counters only after all IDs are looked up.
+                await asyncio.gather(
+                    *[
+                        self._counters[id].increment(notify_all=False)
+                        for id in lora_ids
+                        if id is not None
+                    ]
+                )
             return lora_ids
         else:
             raise TypeError("lora_name must be either a string or a list of strings.")
@@ -266,14 +276,15 @@ class LoRARegistry:
         If exclude_pinned is True, then return the LRU LoRA adapter that isn't pinned.
         """
         async with self._registry_lock.reader_lock:
-            if not exclude_pinned:
-                return next(iter(self._registry), None)
-
             for lora_name, lora_ref in self._registry.items():
-                if not lora_ref.pinned:
-                    return lora_name
-            else:
-                return None
+                # Evicting a non-reloadable (wire-loaded) adapter is always
+                # destructive: there is no artifact to reload it from.
+                if not lora_ref.reloadable:
+                    continue
+                if exclude_pinned and lora_ref.pinned:
+                    continue
+                return lora_name
+            return None
 
     def _register_adapter(self, lora_ref: LoRARef):
         """
