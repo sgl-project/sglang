@@ -17,6 +17,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models.interns2_mobius import (
+    InternS2MobiusForConditionalGeneration,
+)
 from sglang.srt.models.interns2preview import InternS2PreviewForConditionalGeneration
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
@@ -58,6 +61,30 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
+
+QWEN_VIDEO_PREPROCESS_CONFIG_KEYS = frozenset(
+    {
+        "fps",
+        "nframes",
+        "min_frames",
+        "max_frames",
+        "min_pixels",
+        "max_pixels",
+        "total_pixels",
+        "resized_height",
+        "resized_width",
+    }
+)
+
+
+def _get_processor_video_config(video_config, video_metadata):
+    if video_metadata and all(metadata is not None for metadata in video_metadata):
+        return {
+            key: value
+            for key, value in video_config.items()
+            if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
+        }
+    return None
 
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -268,6 +295,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen3_5MoeForConditionalGeneration,
         Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
+        InternS2MobiusForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
     ]
 
@@ -281,6 +309,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "interns2_mobius",
         ):
             # Two workers overlap CPU preprocessing without over-fragmenting
             # burst arrivals into smaller GPU prefill batches. Higher counts can
@@ -490,6 +519,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "interns2_mobius",
         ):
             return None
 
@@ -719,6 +749,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         preprocess_time = time.perf_counter()
 
+        processor_kwargs = {}
+        processor_video_config = _get_processor_video_config(
+            self.video_config, video_metadata
+        )
+        if processor_video_config is not None:
+            processor_kwargs["processor_video_config"] = processor_video_config
+
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
         if self.hf_config.model_type in (
             "qwen3_vl",
@@ -726,17 +763,16 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "interns2_mobius",
         ):
-            mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
-                base_output,
-                self.mm_tokens,
+            processor_kwargs.update(
                 video_metadata=video_metadata,
                 do_sample_frames=False,
             )
-        else:
-            mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
-                base_output, self.mm_tokens
-            )
+
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
+            base_output, self.mm_tokens, **processor_kwargs
+        )
 
         audio_feature_lengths = None
 

@@ -2,6 +2,10 @@
 //!
 //! Model-specific processors compose these to build their preprocessing
 //! pipelines. All functions operate on flat RGB byte arrays (HWC layout).
+//!
+//! Not every primitive is wired into a compiled-in processor yet; they are
+//! kept available for upcoming model integrations.
+#![allow(dead_code)]
 
 /// Normalize u8 RGB pixels to f32 in a single pass: `(pixel/255 - mean) / std`.
 ///
@@ -37,8 +41,8 @@ pub fn pad_to_grid(
     grid_w: usize,
     pad_value: &[f32],
 ) -> (Vec<f32>, usize, usize) {
-    let new_h = ((h + grid_h - 1) / grid_h) * grid_h;
-    let new_w = ((w + grid_w - 1) / grid_w) * grid_w;
+    let new_h = h.div_ceil(grid_h) * grid_h;
+    let new_w = w.div_ceil(grid_w) * grid_w;
     let mut out = vec![0.0f32; new_h * new_w * channels];
     // Fill with pad value
     for i in 0..new_h * new_w {
@@ -89,5 +93,5 @@ pub fn extract_patches_hwc(
 /// Compute the patch grid dimensions for a given image size and patch size.
 #[inline]
 pub fn patch_grid(h: usize, w: usize, patch_h: usize, patch_w: usize) -> (usize, usize) {
-    ((h + patch_h - 1) / patch_h, (w + patch_w - 1) / patch_w)
+    (h.div_ceil(patch_h), w.div_ceil(patch_w))
 }
