@@ -662,6 +662,21 @@ class MooncakeKVManager(CommonKVManager):
             # Layer IDs map PP-local buffers to global decode entries.
             # Registrations without them retain the existing PP mapping.
             if src_layer_ids or dst_layer_ids:
+                logger.warning(
+                    "[pd-kv-pair-debug] pp=%s/%s tp=%s/%s flat=%s "
+                    "src_ptrs=%d src_ids=%d:%s dst_ptrs=%d dst_ids=%d:%s",
+                    self.pp_rank,
+                    self.pp_size,
+                    self.attn_tp_rank,
+                    self.attn_tp_size,
+                    force_flat,
+                    len(src_data_ptrs),
+                    len(src_layer_ids or []),
+                    src_layer_ids,
+                    len(dst_data_ptrs),
+                    len(dst_layer_ids or []),
+                    dst_layer_ids,
+                )
                 pairs = build_transfer_entry_pairs(
                     src_layer_ids,
                     dst_layer_ids,
