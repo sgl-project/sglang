@@ -1016,6 +1016,7 @@ class HiRadixCache(RadixCache):
         storage_queue_sizes = (
             (
                 cache_controller.prefetch_hit_queue.qsize(),
+                cache_controller.ack_prefetch_queue.qsize(),
                 cache_controller.ack_backup_queue.qsize(),
                 cache_controller.host_mem_release_queue.qsize(),
             )
@@ -1548,9 +1549,12 @@ class HiRadixCache(RadixCache):
             self.loading_check(finish_count=load_finish_count)
 
             if self.enable_storage and storage_queue_sizes:
-                n_storage_hit, n_backup, n_release = storage_queue_sizes[:3]
+                n_storage_hit, n_ack_prefetch, n_backup, n_release = (
+                    storage_queue_sizes[:4]
+                )
                 self._drain_storage_control_queues_impl(
                     n_storage_hit=n_storage_hit,
+                    n_ack_prefetch=n_ack_prefetch,
                     n_backup=n_backup,
                     n_release=n_release,
                     log_metrics=True,
