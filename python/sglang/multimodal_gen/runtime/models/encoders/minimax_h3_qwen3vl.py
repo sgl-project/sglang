@@ -76,7 +76,15 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
 
     @property
     def device(self) -> torch.device:
-        return next(self.parameters()).device
+        """Device this encoder's forward runs on.
+
+        Deliberately not `next(self.parameters()).device`. `--text-encoder-cpu-offload`
+        loads this component under an FSDP CPU offload policy, which keeps the sharded
+        parameters on CPU and all-gathers them to the accelerator for the forward. The
+        parameter device then names the storage side, not the compute side, so inputs
+        built from it stay on CPU while the forward runs on the accelerator.
+        """
+        return get_local_torch_device()
 
     @torch.no_grad()
     def forward(
