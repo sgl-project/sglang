@@ -176,8 +176,8 @@ class MlxTpModelWorker(TpModelWorker):
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
 
-        Shared by the sync (:meth:`_forward_batch_generation_mlx`) and async
-        (:meth:`_async_extend_batch`) paths so both route identically.
+        Called once per request from :meth:`_async_extend_batch`, which both
+        the overlap loop and the synchronous entry point launch through.
 
         Returns one of:
 
@@ -370,179 +370,21 @@ class MlxTpModelWorker(TpModelWorker):
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
-        """Run forward pass through the MLX model runner.
+        """Run one forward pass through the MLX model runner, synchronously.
 
-        Token selection (greedy, or in-graph sampling when
-        ``--mlx-enable-sampling`` is set) happens inside the runner's
-        lazy graph; this method only routes requests.
+        Reachable only under ``--disable-overlap-schedule``: the default MLX
+        loop drives :meth:`async_forward_batch_generation_mlx` /
+        :meth:`finalize_mlx_result` directly and never calls ``run_batch``.
+        Launching and finalising back-to-back IS the synchronous path — the
+        lazy graph is built exactly the same way, then blocked on
+        immediately — so routing, logit edits, logprob collection and
+        chunk-head skipping have one implementation rather than two that
+        must be kept in step.  It is also strictly cheaper than evaluating
+        each request as it is queued: one ``mx.async_eval`` covers the whole
+        batch.
         """
-        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-
-        forward_mode = batch.forward_mode
-        reqs = batch.reqs
-
-        if forward_mode.is_idle():
-            return GenerationBatchResult(
-                logits_output=LogitsProcessorOutput(next_token_logits=None),
-                can_run_cuda_graph=False,
-            )
-
-        self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
-
-        next_token_ids_list: list[int] = []
-        edit_rows = self._build_logit_edit_rows(batch)
-        logprob_rows = self._logprob_rows(batch)
-        step_logprob_rows: dict[str, tuple] = {}
-
-        if forward_mode.is_extend():
-            # Ensure pool is up-to-date before pool-backed attention reads it
-            # for prefix-cached prefills.  Only runs on extend batches.
-            self._mlx_runner.flush_all_decode_kv()
-            input_ids_cpu = batch.input_ids.cpu().tolist()
-            out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
-            extend_seq_lens = batch.extend_lens
-
-            offset = 0  # into input_ids_cpu
-            slot_offset = 0  # into out_cache_loc_cpu
-            prefill_rids: list[tuple[str, int]] = []
-            extend_rids: list[tuple[str, int]] = []
-            decode_rids: list[str] = []
-            # Genuine decode steps mixed into this extend batch; see
-            # _route_extend_request.
-            decoding_rids = {r.rid for r in (batch.decoding_reqs or [])}
-
-            for i, req in enumerate(reqs):
-                seq_len = extend_seq_lens[i]
-                req_token_ids = input_ids_cpu[offset : offset + seq_len]
-                req_new_slots = out_cache_loc_cpu[slot_offset : slot_offset + seq_len]
-                offset += seq_len
-                slot_offset += seq_len
-
-                route = self._route_extend_request(req.rid, decoding_rids)
-                if route == "continuation":
-                    pending_e = self._mlx_runner.extend_start(
-                        req_id=req.rid,
-                        new_token_ids=req_token_ids,
-                        new_slot_ids=req_new_slots,
-                        needs_logits=self._chunk_needs_logits(req),
-                        logit_edit_row=edit_rows[req.rid] if edit_rows else None,
-                        logprob_spec=self._logprob_spec_for(logprob_rows, [req.rid]),
-                    )
-                    self._mlx_runner.eval_pending(pending_e)
-                    next_token = self._mlx_runner.extend_finalize(pending_e)
-                    self._collect_step_logprobs(
-                        step_logprob_rows, pending_e.lazy_logprobs, [req.rid]
-                    )
-                    extend_rids.append((req.rid, next_token))
-                elif route == "decode":
-                    decode_rids.append(req.rid)
-                else:  # "prefill"
-                    prefix_slot_ids = req.prefix_indices.tolist()
-                    full_token_ids = list(req.get_fill_ids())
-                    pending_p = self._mlx_runner.prefill_start(
-                        req_id=req.rid,
-                        new_token_ids=req_token_ids,
-                        full_token_ids=full_token_ids,
-                        prefix_slot_ids=prefix_slot_ids,
-                        new_slot_ids=req_new_slots,
-                        req_pool_idx=req.req_pool_idx,
-                        req=req,
-                        needs_logits=self._chunk_needs_logits(req),
-                        logit_edit_row=edit_rows[req.rid] if edit_rows else None,
-                        logprob_spec=self._logprob_spec_for(logprob_rows, [req.rid]),
-                    )
-                    self._mlx_runner.eval_pending(pending_p)
-                    next_token = self._mlx_runner.prefill_finalize(pending_p)
-                    self._collect_step_logprobs(
-                        step_logprob_rows, pending_p.lazy_logprobs, [req.rid]
-                    )
-                    prefill_rids.append((req.rid, next_token))
-
-            # Batch decode all existing requests at once
-            if decode_rids:
-                decode_map = dict(
-                    zip(
-                        decode_rids,
-                        self._sync_decode(
-                            batch,
-                            decode_rids,
-                            edit_rows,
-                            logprob_rows,
-                            step_logprob_rows,
-                            allow_hook=False,
-                        ),
-                    )
-                )
-            else:
-                decode_map = {}
-
-            prefill_map = dict(prefill_rids)
-            extend_map = dict(extend_rids)
-
-            for req in reqs:
-                if req.rid in decode_map:
-                    next_token_ids_list.append(decode_map[req.rid])
-                elif req.rid in extend_map:
-                    next_token_ids_list.append(extend_map[req.rid])
-                else:
-                    next_token_ids_list.append(prefill_map[req.rid])
-
-        elif forward_mode.is_decode():
-            req_ids = [req.rid for req in reqs]
-            next_token_ids_list = self._sync_decode(
-                batch,
-                req_ids,
-                edit_rows,
-                logprob_rows,
-                step_logprob_rows,
-                allow_hook=True,
-            )
-
-        else:
-            raise ValueError(
-                f"MLX runner does not support forward mode: {forward_mode}"
-            )
-
-        next_token_ids = torch.tensor(
-            next_token_ids_list, dtype=torch.long, device="cpu"
-        )
-
-        logits_output = (
-            self._assemble_logprob_output(step_logprob_rows, reqs)
-            if step_logprob_rows
-            else LogitsProcessorOutput(next_token_logits=None)
-        )
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-            can_run_cuda_graph=False,
-        )
-
-    def _sync_decode(
-        self,
-        batch: ScheduleBatch,
-        req_ids: list[str],
-        edit_rows: dict[str, mx.array] | None,
-        logprob_rows: dict[str, tuple[int, tuple[int, ...] | None]] | None,
-        step_logprob_rows: dict[str, tuple],
-        allow_hook: bool,
-    ) -> list[int]:
-        """Synchronous decode step with logit edits and logprob collection.
-
-        ``allow_hook`` is False for decode rows mixed into an extend batch:
-        ``apply_custom_logit_processor`` asserts its logits rows match the
-        full ``sampling_info``, which only holds for pure-decode batches.
-        """
-        pending = self._mlx_runner.decode_batch_start(
-            req_ids,
-            edit_rows=self._stacked_edit_rows(edit_rows, req_ids),
-            logprob_spec=self._logprob_spec_for(logprob_rows, req_ids),
-            logits_hook=self._custom_logits_hook(batch) if allow_hook else None,
-        )
-        self._mlx_runner.eval_pending(pending)
-        next_tokens = self._mlx_runner.decode_batch_finalize(pending)
-        self._collect_step_logprobs(step_logprob_rows, pending.lazy_logprobs, req_ids)
-        return next_tokens
+        launch = self.async_forward_batch_generation_mlx(batch)
+        return self.finalize_mlx_result(launch, batch.reqs)
 
     @staticmethod
     def _stacked_edit_rows(

@@ -146,10 +146,8 @@ class BatchedDecodeContext:
             attention_layer_indices = list(range(len(caches[0])))
         # One arbitrary attention layer speaks for the whole step: every
         # attention cache's ``offset`` is the ABSOLUTE sequence position, so
-        # they all agree.  Sliding-window layers keep that invariant by
-        # storing the full history and windowing at read time; a future
-        # window-bounded store must still report the absolute offset here or
-        # every layer in the step gets the wrong lengths.
+        # they all agree even though a windowed cache stores far fewer
+        # tokens than that (see the class docstring's read-through rule).
         seq_lens = [
             caches[i][attention_layer_indices[0]].offset for i in range(batch_size)
         ]

@@ -396,7 +396,7 @@ class TestSanitizeAndLogprobs(CustomTestCase):
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestRunnerSelectTokens(CustomTestCase):
-    """_select_tokens lifecycle on a bare runner (object.__new__)."""
+    """_select_tokens_with_logprobs lifecycle on a bare runner (object.__new__)."""
 
     class _FakeCache:
         def __init__(self, offset):
@@ -425,13 +425,13 @@ class TestRunnerSelectTokens(CustomTestCase):
         caches = [[self._FakeCache(4)], [self._FakeCache(9)]]
 
         disabled = self._runner(enable_sampling=False)
-        toks = disabled._select_tokens(logits, ["a", "b"], caches)
+        toks = disabled._select_tokens_with_logprobs(logits, ["a", "b"], caches)[0]
         self.assertEqual(toks.tolist(), expected)
 
         enabled = self._runner(enable_sampling=True)
         enabled._req_sampling = {"a": GREEDY_PARAMS, "b": _params(top_k=1)}
         key_before = enabled._rng_key
-        toks = enabled._select_tokens(logits, ["a", "b"], caches)
+        toks = enabled._select_tokens_with_logprobs(logits, ["a", "b"], caches)[0]
         self.assertEqual(toks.tolist(), expected)
         self.assertIs(enabled._rng_key, key_before)
 
@@ -566,7 +566,7 @@ class TestRunnerSelectTokens(CustomTestCase):
         caches = [[self._FakeCache(3)]]
         toks = set()
         for _ in range(20):
-            t = runner._select_tokens(logits, ["a"], caches)
+            t = runner._select_tokens_with_logprobs(logits, ["a"], caches)[0]
             mx.eval(t)
             toks.add(int(t[0].item()))
         self.assertGreater(len(toks), 3, toks)

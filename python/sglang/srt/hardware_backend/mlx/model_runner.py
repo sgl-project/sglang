@@ -1126,25 +1126,13 @@ class MlxModelRunner:
             logits[:, -1, :], [req_id], [cache], edits, logprob_spec
         )
 
-    def _select_tokens(
-        self,
-        last_logits: mx.array,
-        req_ids: list[str],
-        caches: list[list[Any]],
-        edit_rows: mx.array | None = None,
-    ) -> mx.array:
-        tokens, _ = self._select_tokens_with_logprobs(
-            last_logits, req_ids, caches, edit_rows, None
-        )
-        return tokens
-
     def _select_tokens_with_logprobs(
         self,
         last_logits: mx.array,
         req_ids: list[str],
         caches: list[list[Any]],
-        edit_rows: mx.array | None,
-        logprob_spec: MlxLogprobSpec | None,
+        edit_rows: mx.array | None = None,
+        logprob_spec: MlxLogprobSpec | None = None,
     ) -> tuple[mx.array, MlxLazyLogprobs | None]:
         """Pick one token per row of ``last_logits`` — lazily, inside the graph.
 

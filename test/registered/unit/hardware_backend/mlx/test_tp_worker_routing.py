@@ -15,11 +15,15 @@ correct discriminator is ``batch.decoding_reqs``, not the chunk length.
 
 The routing decision was duplicated across the sync and async paths (the bug
 therefore existed in both). It now lives in the shared
-``MlxTpModelWorker._route_extend_request`` helper. These tests cover:
+``MlxTpModelWorker._route_extend_request`` helper, and the sync entry point
+launches through the async one rather than re-implementing it. These tests
+cover:
 
-  * the helper decision directly (both paths delegate to it);
-  * the sync wiring, by driving ``_forward_batch_generation_mlx``;
-  * the async wiring, by driving ``_async_extend_batch``.
+  * the helper decision directly;
+  * the async wiring, by driving ``_async_extend_batch``;
+  * the sync entry point, by driving ``_forward_batch_generation_mlx`` --
+    which also guards the delegation, since a divergence there would show up
+    as a routing or token-ordering difference between the two.
 
 They mock the MLX runner and load no model. Apple-Silicon-only because
 ``tp_worker`` imports ``mlx.core`` at module load.
@@ -210,6 +214,10 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
+        # The sync entry point delegates to the async launch, which guards
+        # pool creation behind this flag; forward_batch_generation has
+        # already run it for real by the time either path is reached.
+        worker._mlx_pool_initialized = True
         return worker
 
     # ---------- the shared decision helper ----------
