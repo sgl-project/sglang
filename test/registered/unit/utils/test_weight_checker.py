@@ -171,6 +171,8 @@ class _TinyModel(nn.Module):
         self.register_buffer("running_mean", torch.zeros(4))
         # Buffer names that match weight_checker's hard-coded skip patterns.
         self.register_buffer("rotary_emb_cos_sin_cache", torch.full((8,), 3.14))
+        self.register_buffer("rotary_emb_cos_cache", torch.full((8,), 1.62))
+        self.register_buffer("rotary_emb_sin_cache", torch.full((8,), 0.58))
         self.register_buffer("rotary_emb_freqs_cis", torch.full((8,), 2.71))
         self.register_buffer("gate_proj_weight_fp32_cache", torch.full((8,), 1.41))
 
@@ -584,6 +586,8 @@ class TestSnapshot(_WeightCheckerTestBase):
             "b",
             "running_mean",
             "rotary_emb_cos_sin_cache",
+            "rotary_emb_cos_cache",
+            "rotary_emb_sin_cache",
             "rotary_emb_freqs_cis",
             "gate_proj_weight_fp32_cache",
         }
@@ -614,6 +618,16 @@ class TestResetTensors(_WeightCheckerTestBase):
         before = self.model.rotary_emb_cos_sin_cache.clone()
         self.checker._reset_tensors()
         torch.testing.assert_close(self.model.rotary_emb_cos_sin_cache, before)
+
+    def test_skips_cos_cache(self):
+        before = self.model.rotary_emb_cos_cache.clone()
+        self.checker._reset_tensors()
+        torch.testing.assert_close(self.model.rotary_emb_cos_cache, before)
+
+    def test_skips_sin_cache(self):
+        before = self.model.rotary_emb_sin_cache.clone()
+        self.checker._reset_tensors()
+        torch.testing.assert_close(self.model.rotary_emb_sin_cache, before)
 
     def test_skips_freqs_cis(self):
         before = self.model.rotary_emb_freqs_cis.clone()
