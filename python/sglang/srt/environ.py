@@ -635,6 +635,20 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # Opt into fp8 kv-cache under aiter MLA decode context parallel
+    # (--dcp-size > 1). The gluon DCP decode path is only validated on bf16
+    # kv-cache, so ServerArgs rejects fp8 there by default; this is an escape
+    # hatch for deliberate experiments, not a supported configuration.
+    SGLANG_EXPERIMENTAL_AITER_DCP_FP8 = EnvBool(False)
+    # Run the DCP MLA decode on aiter's Gluon kernel
+    # (aiter.ops.triton.gluon.mla_gluon) instead of the Triton MLA kernel
+    # reached via aiter.ops.triton.attention.mla.mla_decode_fwd. The Gluon
+    # kernel needs triton >= 3.7 (it passes cga_layout= to PaddedSharedLayout);
+    # aiter's own guard only checks >= 3.6, so on 3.6 this fails at kernel
+    # compile time rather than at import. Off by default until the stack
+    # ships a 3.7 build. Note it cannot serve fp8 kv-cache above batch 1,
+    # so it is mutually exclusive with SGLANG_EXPERIMENTAL_AITER_DCP_FP8.
+    SGLANG_USE_AITER_GLUON_MLA_DCP = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")

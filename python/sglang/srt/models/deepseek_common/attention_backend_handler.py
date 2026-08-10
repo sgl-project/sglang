@@ -11,7 +11,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import is_sm100_or_sm110_supported, use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
@@ -190,6 +190,13 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        # Under DCP, route prefill through absorbed MLA (aiter's gluon
+        # mla_prefill_fwd) instead of the MHA one-shot path: the MHA concat
+        # kernel assumes a power-of-2 local head count, which Kimi-K3 (12 local
+        # heads at tp8) violates, and absorbed MLA keeps prefill on the same
+        # round-robin latent-KV layout the DCP decode path reads.
+        if get_parallel().dcp_enabled:
+            return AttnForwardMethod.MLA
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA
