@@ -4,6 +4,9 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    is_unified_kv_triton,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -678,6 +681,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
+        state_slot = final_pos = None
+        if is_unified_kv_triton():
+            repeats = ctx_lens.to(torch.int64)
+            state_slot = torch.repeat_interleave(
+                batch.req_pool_indices.to(device=device, dtype=torch.int64), repeats
+            )
+            final_pos = torch.repeat_interleave(
+                (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
+            )
         if self._use_full_projection_prefill:
             if not has_local_target_hidden or output_pp_proxy_tensors is not None:
                 raise RuntimeError(
@@ -688,6 +700,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_hidden=target_hidden,
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
+                state_slot=state_slot,
+                final_pos=final_pos,
             )
         else:
             incoming_ctx = (
@@ -725,6 +739,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                     projected_context=ctx_acc,
                     cache_loc=batch.out_cache_loc,
                     positions=positions,
+                    state_slot=state_slot,
+                    final_pos=final_pos,
                 )
             elif has_local_target_hidden and not (
                 self.ps.pp_size > 1 and not self._draft_is_moe
@@ -733,6 +749,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                     target_hidden=target_hidden,
                     cache_loc=batch.out_cache_loc,
                     positions=positions,
+                    state_slot=state_slot,
+                    final_pos=final_pos,
                 )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         if logits_output is not None:
