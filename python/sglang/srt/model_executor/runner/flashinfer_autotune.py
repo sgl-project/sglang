@@ -114,8 +114,9 @@ def should_run_flashinfer_autotune(
         "modelopt_fp8",
         "modelopt_mixed",
     )
-    # SM120 reaches the same tunable FlashInfer CUTLASS FP8 GEMM path as SM100,
-    # so without this the kernel always runs at tactic=-1.
+    # SM120 satisfies is_blackwell_supported(), so resolve_mxfp8_dense_gemm_backend
+    # sends it to the same tunable FlashInfer CUTLASS MXFP8 dense GEMM as SM100;
+    # without this the kernel always runs at tactic=-1.
     fp8_gemm_needs_autotune = get_fp8_gemm_runner_backend().is_flashinfer_cutlass() or (
         model_uses_modelopt_fp8 and (is_sm100_supported() or is_sm120_supported())
     )
