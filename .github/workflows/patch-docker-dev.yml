@@ -38,10 +38,6 @@ jobs:
                 exit 1
                 ;;
             esac
-            if [ "${#2}" -gt 128 ]; then
-              echo "::error::${1} exceeds the 128-character Docker tag limit"
-              exit 1
-            fi
           }
           validate_tag image_tag "${IMAGE_TAG}"
           validate_tag output_tag "${OUTPUT_TAG}"
@@ -101,12 +97,6 @@ jobs:
             IFS=',' read -ra PRS <<< "${PR_NUMBERS}"
             for pr in "${PRS[@]}"; do
               pr=$(echo "${pr}" | xargs)
-              case "${pr}" in
-                ""|*[!0-9]*)
-                  echo "::error::Invalid PR number: '${pr}'"
-                  exit 1
-                  ;;
-              esac
               echo "Fetching PR #${pr}"
               git fetch origin "pull/${pr}/head:pr-${pr}"
               MERGE_BASE=$(git merge-base origin/main "pr-${pr}")
@@ -126,12 +116,11 @@ jobs:
 
           TOTAL=$(cat /tmp/patch-ctx/*.patch | wc -l)
           if [ "${TOTAL}" -eq 0 ]; then
-            echo "::warning::All patches are empty - image is already up to date"
-            echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
+            echo "::error::All patches are empty - nothing to apply on top of ${BASE_IMAGE}"
+            exit 1
           fi
 
       - name: Build patched image
-        if: env.SKIP_BUILD != 'true'
         run: |
           cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
           ARG BASE_IMAGE
@@ -157,7 +146,6 @@ jobs:
             /tmp/patch-ctx/
 
       - name: Push patched image
-        if: env.SKIP_BUILD != 'true'
         env:
           PR_NUMBERS: ${{ inputs.pr_numbers }}
         run: |
@@ -174,23 +162,4 @@ jobs:
             echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`"
             echo "- **Source:** ${SOURCE}"
             echo "- **Platform:** \`linux/amd64\` only - patched on an x64 runner, so the base image's multi-arch manifest is not carried over"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # An empty patch set still has to produce output_tag, otherwise the run
-      # goes green having published nothing. imagetools retags by digest, so
-      # this path keeps the base image's multi-arch manifest intact.
-      - name: Set up Docker Buildx
-        if: env.SKIP_BUILD == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Retag base image under output tag
-        if: env.SKIP_BUILD == 'true'
-        run: |
-          docker buildx imagetools create -t "${OUT_IMAGE}" "${BASE_IMAGE}"
-
-          {
-            echo "### Retagged \`${OUT_IMAGE}\`"
-            echo "- **Base image:** \`${BASE_IMAGE}\`"
-            echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`"
-            echo "- All patches were empty, so the base image was retagged unchanged (multi-arch manifest preserved)."
           } >> "$GITHUB_STEP_SUMMARY"
