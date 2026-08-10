@@ -13,14 +13,14 @@ const GROUPS = {
   },
 };
 
-const QualityBadge = ({ quality }) => (
+const qualityBadge = (quality) => (
   <span className="sgd-feature-badge" data-tone={quality.tone}>
     {quality.label}
   </span>
 );
 
-const Feature = ({ feature, copied, onCopy }) => (
-  <details className="sgd-feature-item">
+const featureView = ({ feature, copied, onCopy }) => (
+  <details className="sgd-feature-item" key={feature.id}>
     <summary>
       <span className="sgd-feature-marker" aria-hidden="true">
         {feature.marker}
@@ -30,7 +30,7 @@ const Feature = ({ feature, copied, onCopy }) => (
         <span>{feature.summary}</span>
       </span>
       <span className="sgd-feature-summary-meta">
-        <QualityBadge quality={feature.quality} />
+        {qualityBadge(feature.quality)}
         <span className="sgd-feature-scope">{feature.scope}</span>
       </span>
       <span className="sgd-feature-chevron" aria-hidden="true">↘</span>
@@ -59,7 +59,7 @@ const Feature = ({ feature, copied, onCopy }) => (
             <div className="sgd-feature-recipe" key={copyId}>
               <div className="sgd-feature-recipe-heading">
                 <strong>{recipe.label}</strong>
-                {recipe.quality && <QualityBadge quality={recipe.quality} />}
+                {recipe.quality && qualityBadge(recipe.quality)}
               </div>
               {recipe.description && <p>{recipe.description}</p>}
               {recipe.code && (
@@ -82,7 +82,7 @@ const Feature = ({ feature, copied, onCopy }) => (
   </details>
 );
 
-const FeatureGroup = ({ type, features, copied, onCopy }) => {
+const featureGroup = ({ type, features, copied, onCopy }) => {
   const group = GROUPS[type];
   return (
     <section className="sgd-feature-group" data-group={type}>
@@ -92,14 +92,7 @@ const FeatureGroup = ({ type, features, copied, onCopy }) => {
         <p>{group.description}</p>
       </header>
       <div className="sgd-feature-list">
-        {features.map((feature) => (
-          <Feature
-            key={feature.id}
-            feature={feature}
-            copied={copied}
-            onCopy={onCopy}
-          />
-        ))}
+        {features.map((feature) => featureView({ feature, copied, onCopy }))}
       </div>
     </section>
   );
@@ -136,8 +129,8 @@ export const DiffusionFeatureGuide = ({ serveFeatures = [], requestFeatures = []
       </div>
 
       <div className="sgd-feature-groups">
-        <FeatureGroup type="serve" features={serveFeatures} copied={copied} onCopy={copy} />
-        <FeatureGroup type="request" features={requestFeatures} copied={copied} onCopy={copy} />
+        {featureGroup({ type: "serve", features: serveFeatures, copied, onCopy: copy })}
+        {featureGroup({ type: "request", features: requestFeatures, copied, onCopy: copy })}
       </div>
     </section>
   );
