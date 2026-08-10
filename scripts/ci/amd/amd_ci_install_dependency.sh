@@ -43,10 +43,11 @@ fi
 # ROCm 7.2.4 images ship torch 2.11, which srt_hip cannot satisfy (it pins
 # compressed-tensors 0.15.0, requiring torch<2.11). Select the rocm724 extras.
 IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
+IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 if [[ "${IMAGE_TORCH_VERSION}" == 2.11.* ]]; then
   EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm724}"
 fi
-echo "Image torch ${IMAGE_TORCH_VERSION}; installing python extras: [${EXTRAS}]"
+echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
 
 # Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
 docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
@@ -338,11 +339,61 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
+    AITER_TRITON_MODE=$(docker exec ci_sglang bash -c 'printf "%s" "${AITER_USE_SYSTEM_TRITON:-1}"')
+    if [[ -n "${AITER_COMMIT_OVERRIDE:-}" ]]; then
+        case "${IMAGE_HIP_VERSION}" in
+            7.2*) AITER_TRITON_MODE="0" ;;
+            7.0*) AITER_TRITON_MODE="1" ;;
+            *)
+                echo "[CI-AITER-CHECK] ERROR: unsupported HIP version for AITER override: ${IMAGE_HIP_VERSION}"
+                exit 1
+                ;;
+        esac
+    fi
+    echo "[CI-AITER-CHECK] AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE}"
+
     # build AITER
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE} GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
+
+    if [[ "${AITER_TRITON_MODE}" == "0" ]]; then
+        docker exec -i ci_sglang python3 - <<'PY'
+import importlib.metadata as metadata
+import pathlib
+import re
+
+import triton
+
+triton_version = metadata.version("triton")
+torch_dist = metadata.distribution("torch")
+metadata_path = pathlib.Path(torch_dist._path) / "METADATA"
+source = metadata_path.read_text()
+pattern = r"^Requires-Dist: triton-rocm==3\.6\.0(?P<marker>\s*;.*)?$"
+updated, count = re.subn(
+    pattern,
+    lambda match: f"Requires-Dist: triton=={triton_version}{match.group('marker') or ''}",
+    source,
+    flags=re.MULTILINE,
+)
+if count:
+    assert count == 1, count
+    metadata_path.write_text(updated)
+
+installer = pathlib.Path(
+    "/sgl-workspace/aiter/.github/scripts/install_triton.sh"
+).read_text()
+expected = re.search(r'"triton==([^"]+)"', installer).group(1)
+assert triton_version.startswith(expected), (expected, triton_version)
+assert triton.__version__.startswith(expected), (expected, triton.__version__)
+assert "triton-custom" not in triton.__file__, triton.__file__
+print(
+    f"[CI-AITER-CHECK] Validated AITER Triton {triton_version} "
+    f"from {triton.__file__}"
+)
+PY
+    fi
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi

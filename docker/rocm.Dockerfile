@@ -8,7 +8,7 @@
 #
 # Flavor notes:
 #   GPU_ARCH=*-rocm724 is built on a Python 3.12 base and upgrades the stack to
-#   torch 2.11 (+torchvision 0.26 / torchaudio 2.11) and triton 3.6.0 for ROCm 7.2.
+#   torch 2.11 (+torchvision 0.26 / torchaudio 2.11) and AITER-managed Triton.
 #   The ROCm 7.2.0 flavors remain on Python 3.10 and torch 2.9.1.
 
 # Usage (to build SGLang ROCm + Mori docker image):
@@ -62,14 +62,12 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Base image 942 with rocm724 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_942_ROCM724 AS gfx942-rocm724
 ENV BUILD_VLLM="0"
-# The triton-rocm 3.6.0 wheel that ships in this base aborts in the AMD
-# buffer-ops pass pipeline ("PassManager::run failed") when it compiles AITER's
-# blockscale GEMM during CUDA graph capture. Source triton at TRITON_COMMIT
-# compiles the same shapes with buffer ops enabled, so build it as the other
-# flavors do.
-ENV BUILD_TRITON="1"
+# AITER installs the Triton version pinned by AITER_COMMIT. Do not replace it
+# with the shared source-Triton build later in this Dockerfile.
+ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
+ENV AITER_USE_SYSTEM_TRITON="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
@@ -102,11 +100,11 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Base image 950 with rocm724 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_950_ROCM724 AS gfx950-rocm724
 ENV BUILD_VLLM="0"
-# See the gfx942-rocm724 stage: the base image's triton-rocm 3.6.0 wheel crashes
-# the AMD backend on AITER's blockscale GEMM, so build triton from source.
-ENV BUILD_TRITON="1"
+# See gfx942-rocm724: AITER owns the Triton installation for this flavor.
+ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
+ENV AITER_USE_SYSTEM_TRITON="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
@@ -307,7 +305,7 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 # Keep the base image's Torch-compatible Triton by default. Override with
 # AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
-ENV AITER_USE_SYSTEM_TRITON=1
+ENV AITER_USE_SYSTEM_TRITON="${AITER_USE_SYSTEM_TRITON:-1}"
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
 # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does not
@@ -374,6 +372,34 @@ RUN cd aiter \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         fi \
       && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
+
+# torch 2.11 declares triton-rocm==3.6.0, while AITER replaces that distribution
+# with its pinned `triton` wheel. Keep torch's installed metadata aligned with
+# the actual provider so later pip operations do not restore triton-rocm.
+RUN python3 - <<'PY'
+import importlib.metadata as metadata
+import os
+import pathlib
+import re
+
+if os.environ.get("AITER_USE_SYSTEM_TRITON") != "0":
+    raise SystemExit(0)
+
+triton_version = metadata.version("triton")
+torch_dist = metadata.distribution("torch")
+metadata_path = pathlib.Path(torch_dist._path) / "METADATA"
+source = metadata_path.read_text()
+pattern = r"^Requires-Dist: triton-rocm==3\.6\.0(?P<marker>\s*;.*)?$"
+updated, count = re.subn(
+    pattern,
+    lambda match: f"Requires-Dist: triton=={triton_version}{match.group('marker') or ''}",
+    source,
+    flags=re.MULTILINE,
+)
+assert count == 1, f"expected one torch triton-rocm requirement, found {count}"
+metadata_path.write_text(updated)
+print(f"Rewrote torch Triton requirement to triton=={triton_version}")
+PY
 
 # -----------------------
 # Build Mooncake
@@ -464,7 +490,7 @@ RUN python -m pip cache purge
 
 RUN if [ "${GPU_ARCH##*-}" = "rocm724" ]; then \
       python3 -m pip check \
-      && python3 -c "import importlib.metadata as m; import torch, torchao, torchaudio, torchvision, triton; expected={'torch':'2.11.','torchao':'0.9.','torchaudio':'2.11.','torchvision':'0.26.','triton':'3.6.0'}; actual={'torch':torch.__version__,'torchao':m.version('torchao'),'torchaudio':torchaudio.__version__,'torchvision':torchvision.__version__,'triton':triton.__version__}; assert torch.version.hip, actual; assert all(actual[name].startswith(version) for name, version in expected.items()), actual; print('Validated ROCm stack:', actual, 'HIP', torch.version.hip)" \
+      && python3 -c "import importlib.metadata as m; import torch, torchao, torchaudio, torchvision, triton; expected={'torch':'2.11.','torchao':'0.9.','torchaudio':'2.11.','torchvision':'0.26.'}; actual={'torch':torch.__version__,'torchao':m.version('torchao'),'torchaudio':torchaudio.__version__,'torchvision':torchvision.__version__,'triton':triton.__version__}; assert torch.version.hip, actual; assert all(actual[name].startswith(version) for name, version in expected.items()), actual; print('Validated ROCm stack:', actual, 'HIP', torch.version.hip)" \
       && if pip list --format=freeze | grep -Eq '^nvidia-.*-cu[0-9]+'; then \
            echo "ERROR: NVIDIA CUDA runtime packages were installed into the ROCm image"; \
            exit 1; \
@@ -793,11 +819,11 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
     fi
 
-# Re-validate the 7.2.4 stack after the source Triton build. The rocm724 gate
-# earlier in this file runs before this step, so without this the triton that
-# actually ships in the image is never checked.
-RUN if [ "${GPU_ARCH##*-}" = "rocm724" ] && [ "$BUILD_TRITON" = "1" ]; then \
-      python3 -c "import torch, triton, triton.backends; assert triton.__version__.startswith('3.6.0'), triton.__version__; assert 'triton-custom' in triton.__file__, triton.__file__; assert 'amd' in triton.backends.backends, triton.backends.backends; assert torch.__version__.startswith('2.11.'), torch.__version__; assert torch.version.hip, 'torch lost HIP'; print('Validated source triton:', triton.__version__, triton.__file__)"; \
+# Validate the final imported Triton against the pin declared by AITER_COMMIT.
+# This runs after the optional source-Triton block so later steps cannot silently
+# replace AITER's wheel.
+RUN if [ "${GPU_ARCH##*-}" = "rocm724" ] && [ "$AITER_USE_SYSTEM_TRITON" = "0" ]; then \
+      python3 -c "import importlib.metadata as m, pathlib, re, torch, triton, triton.backends; script=pathlib.Path('/sgl-workspace/aiter/.github/scripts/install_triton.sh').read_text(); expected=re.search(r'\"triton==([^\"]+)\"', script).group(1); actual=m.version('triton'); assert actual.startswith(expected), (expected, actual); assert 'triton-custom' not in triton.__file__, triton.__file__; assert 'amd' in triton.backends.backends, triton.backends.backends; assert torch.__version__.startswith('2.11.'), torch.__version__; assert torch.version.hip, 'torch lost HIP'; print('Validated AITER Triton:', actual, triton.__file__)"; \
     fi
 
 # -----------------------
