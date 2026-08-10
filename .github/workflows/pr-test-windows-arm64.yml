@@ -1,0 +1,132 @@
+name: PR Test (Windows ARM64 build)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "python/**"
+      - "rust/Cargo.lock"
+      - "rust/Cargo.toml"
+      - "rust/sglang-mm/**"
+      - ".github/workflows/pr-test-windows-arm64.yml"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "python/**"
+      - "rust/Cargo.lock"
+      - "rust/Cargo.toml"
+      - "rust/sglang-mm/**"
+      - ".github/workflows/pr-test-windows-arm64.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: windows-arm64-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheel:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: arm64
+
+      - name: Verify native toolchain
+        shell: pwsh
+        run: |
+          python -c "import platform, sysconfig; assert platform.machine().lower() == 'arm64'; assert sysconfig.get_platform() == 'win-arm64'"
+          rustc -vV
+          cargo --version
+          clang --version
+
+      - name: Install Python build frontend
+        run: python -m pip install build
+
+      - name: Build Windows ARM64 wheel
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath`) do set "VS_PATH=%%i"
+          if not defined VS_PATH (
+            echo Visual Studio ARM64 build tools were not found.
+            exit /b 1
+          )
+          set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvarsall.bat" arm64
+          copy /Y README.md python\README.md
+          copy /Y LICENSE python\LICENSE
+          python -m build --wheel --outdir dist python
+
+      - name: Verify wheel contents
+        shell: pwsh
+        run: |
+          $wheels = @(Get-ChildItem dist\*.whl)
+          if ($wheels.Count -ne 1) {
+            throw "Expected one wheel, found $($wheels.Count)."
+          }
+          if ($wheels[0].Name -notmatch "-cp313-cp313-win_arm64\.whl$") {
+            throw "Unexpected Windows ARM64 wheel tag: $($wheels[0].Name)"
+          }
+          $env:SGLANG_WHEEL = $wheels[0].FullName
+          @'
+          import os
+          import zipfile
+          from email.parser import Parser
+
+          with zipfile.ZipFile(os.environ["SGLANG_WHEEL"]) as wheel:
+              names = wheel.namelist()
+              metadata_name = next(
+                  name for name in names if name.endswith(".dist-info/METADATA")
+              )
+              metadata = Parser().parsestr(
+                  wheel.read(metadata_name).decode("utf-8")
+              )
+
+          multimodal = [
+              name
+              for name in names
+              if name.startswith("sglang/srt/multimodal/_core")
+              and name.endswith(".pyd")
+          ]
+          unexpected = [
+              name
+              for name in names
+              if (
+                  name.startswith("sglang/srt/grpc/_core")
+                  or name.startswith("sglang/srt/server/_core")
+              )
+              and name.endswith(".pyd")
+          ]
+          if len(multimodal) != 1:
+              raise SystemExit(
+                  f"expected one multimodal extension, found {multimodal}"
+              )
+          if unexpected:
+              raise SystemExit(
+                  f"found unsupported Windows extension modules: {unexpected}"
+              )
+          version = metadata["Version"]
+          if version.startswith("0.0.0"):
+              raise SystemExit(
+                  f"setuptools-scm fell back to an invalid version: {version}"
+              )
+          print(f"verified {os.environ['SGLANG_WHEEL']} ({version})")
+          '@ | python -
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: sglang-wheel-python3.13-windows-arm64
+          path: dist/*.whl
