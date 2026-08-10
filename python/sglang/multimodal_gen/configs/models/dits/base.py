@@ -38,7 +38,6 @@ class DiTArchConfig(ArchConfig):
             AttentionBackendEnum.LASER_ATTN,
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
-            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
         }
     )
 

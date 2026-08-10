@@ -18,10 +18,13 @@ individual keys of the defaults below::
 
 Requirements inherited from the kernel: compute capability 10.0 (B200 / GB200
 class -- it is built for ``sm_100a``, which does not forward-run on 10.3 or
-12.x), bf16, head_dim 128. On such a GPU any call the kernel cannot serve --
-cross/refiner attention, short sequences, non-bf16 -- runs dense instead, so
-selecting this backend is safe model-wide. On any other GPU the resolver refuses
-it at startup rather than falling back.
+12.x), bf16, head_dim 128. Inside the DiT, any call the kernel cannot serve --
+cross/refiner attention, short sequences, non-bf16 -- runs dense instead. On any
+other GPU the resolver refuses the backend at startup rather than falling back.
+
+``--attention-backend`` reaches every component, and the text encoder admits
+only fa / torch_sdpa / sage_attn_3, so pair it with
+``--component-attention-backends text_encoder=fa``; see the README.
 """
 
 from __future__ import annotations

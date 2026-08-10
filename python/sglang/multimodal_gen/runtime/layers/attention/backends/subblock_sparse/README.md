@@ -11,10 +11,19 @@ configuration and what every number below was measured at:
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
   --num-gpus 8 --ulysses-degree 8 --performance-mode speed \
   --attention-backend subblock_sparse_attn \
+  --component-attention-backends text_encoder=fa \
   --attention-backend-config '{"sparsity": 0.75, "n_k": 4, "n_q": 4,
                                "skip_first_steps": 10, "skip_first_layers": 0,
                                "min_seq_len": 4096}'
 ```
+
+**`text_encoder=fa` is not optional.** `--attention-backend` applies to every
+component, and the Qwen3-VL text encoder admits only `fa` / `torch_sdpa` /
+`sage_attn_3`; without the override it raises and the server never starts. Put
+the override on the *encoder*, not the DiT — `transformer=subblock_sparse_attn`
+appears to work and silently does nothing, because H3 resolves the DiT backend
+lazily on the first forward, outside the component-loading context that the
+override applies to.
 
 `--attention-backend-config` is optional and overrides only the keys it names,
 so `'{"sparsity": 0.85}'` alone trades quality for another 6%. Inline JSON gets
@@ -32,9 +41,9 @@ Everything below comes from `bsa_attn_blk64_fwd`, not from this backend.
 | head_dim | 128 |
 | attention | non-causal, one contiguous sequence per call |
 
-Within a supported GPU, anything the kernel cannot serve — cross attention, the
-token refiner, sequences under `min_seq_len`, non-bf16 activations, head_dim !=
-128 — silently runs dense, so the backend is safe to select model-wide.
+Inside the DiT, anything the kernel cannot serve — cross attention, the token
+refiner, sequences under `min_seq_len`, non-bf16 activations, head_dim != 128 —
+falls back to dense for that call, so no layer has to be excluded by hand.
 
 **On an unsupported GPU it is not a fallback, it is an error at startup.** The
 resolver checks the compute capability before anything loads and refuses
@@ -134,6 +143,11 @@ its whole range: it is a quality knob, not a speed one.
 measured 1.13x at 37.7k tokens, 1.20x at 52k and 1.47x at 96k — the backend only
 touches attention, and attention's share of the DiT grows with S. Treat 1.2x as
 the 768p/5 s number, not the ceiling.
+
+The same effect shows up in the sequence-parallel degree, since that sets how
+much of the sequence each GPU holds: on 4x B200 at Ulysses-4 the identical
+config gives **1.168x** on denoise and **1.138x** end to end, against 1.138x on
+denoise at Ulysses-8.
 
 Peak memory is unchanged (99,356 vs 99,358 MiB/GPU): block sparsity saves
 compute, not activations, and the `[B,H,Gq,Gk]` score matrix is ~20 MB at
