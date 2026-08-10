@@ -118,7 +118,16 @@ bag to override at all.
 - **Whole-object passes** (`f(server_args)` handing the instance along) keep the
   supplied-instance contract; don't rewrite the parameter reads to bag reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
-  `eplb/expert_location.py`).
+  `eplb/expert_location.py`) — **or the field is one resolution fills in and the
+  callee runs in a process that has published.** That second case is step-12
+  debt, not a style question: the record is destined to carry the user's raw
+  input, so `server_args.page_size` inside a runner-owned constructor will read
+  the CLI default instead of the effective value. `test_supplied_instance_exposure_ratchet.py`
+  pins the remaining set and fails on a new one, so the decision gets made when
+  the read is written. Two shapes stay parameter-form on purpose: a helper the
+  *resolution pipeline* calls with a `resolved_view` (its parameter happens to be
+  named `server_args`), and a factory whose contract is "build X from the record
+  you are handed" (`create_kt_config_from_server_args`, `DllmConfig.from_server_args`).
 
 ### `get_parallel()`: config leaves vs live topology
 
