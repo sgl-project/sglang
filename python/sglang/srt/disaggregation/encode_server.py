@@ -60,6 +60,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.encoder_preprocessing import (
     get_encoder_preprocessed_items,
+    invoke_encoder_preprocessor,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
@@ -1704,11 +1705,13 @@ class MMEncoder:
             images = self._normalize_kimi_encoder_images(images)
         original_image_sizes = [_get_original_image_size(item) for item in images]
         if model_preprocessor:
-            return model_preprocessor(
+            return invoke_encoder_preprocessor(
+                model_preprocessor,
                 images,
                 Modality.IMAGE,
                 self.vision_config,
                 image_processor=self.image_processor,
+                use_gpu_preprocessing=self.use_image_processor_gpu,
             )
         image_config = self.vision_config.get("image", {})
         processor_input = await asyncio.get_running_loop().run_in_executor(

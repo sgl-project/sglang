@@ -7,7 +7,9 @@ from PIL import Image
 DEFERRED_PREPROCESSING_KEY = "kimi_k3_deferred_preprocessing"
 
 
-def prepare_kimi_k3_encoder_inputs(images, image_processor):
+def prepare_kimi_k3_encoder_inputs(
+    images, image_processor, *, use_gpu_preprocessing=False
+):
     """Keep K3 EPD images raw until the vision-DP owner is known.
 
     The lightweight NaViT shape calculation runs on every encoder rank.  The
@@ -55,6 +57,7 @@ def prepare_kimi_k3_encoder_inputs(images, image_processor):
     patch_size = int(media_proc_cfg["patch_size"])
     merge_kernel_size = int(media_proc_cfg["merge_kernel_size"])
     common_deferred_config = {
+        "backend": "gpu" if use_gpu_preprocessing else "cpu",
         "image_mean": list(media_proc_cfg["image_mean"]),
         "image_std": list(media_proc_cfg["image_std"]),
         "transparent_bg_config": media_proc_cfg.get("transparent_bg_config"),
@@ -83,11 +86,16 @@ def prepare_kimi_k3_encoder_inputs(images, image_processor):
         items.append(
             MultimodalDataItem(
                 modality=Modality.IMAGE,
-                feature=to_chw_uint8(image),
+                feature=(
+                    to_chw_uint8(image)
+                    if use_gpu_preprocessing
+                    else to_hwc_uint8(image)
+                ),
                 model_specific_data={
                     "grid_thws": grid_tensor,
                     DEFERRED_PREPROCESSING_KEY: {
                         **common_deferred_config,
+                        "feature_layout": ("chw" if use_gpu_preprocessing else "hwc"),
                         "resize_config": resize_config,
                     },
                 },
@@ -107,6 +115,59 @@ def prepare_kimi_k3_encoder_inputs(images, image_processor):
         },
         mm_items=items,
     )
+
+
+def materialize_kimi_k3_cpu_features(items, image_processor) -> torch.Tensor:
+    """Run the checkpoint's exact processor only on locally owned images."""
+    medias = []
+    for item in items:
+        image = item.feature
+        if not isinstance(image, torch.Tensor) or image.dtype != torch.uint8:
+            raise TypeError("Kimi-K3 deferred CPU preprocessing expects uint8 tensors")
+        config = item.model_specific_data[DEFERRED_PREPROCESSING_KEY]
+        if config["feature_layout"] != "hwc":
+            raise ValueError("Kimi-K3 deferred CPU preprocessing expects HWC inputs")
+        image = image.detach().cpu().contiguous().numpy()
+        channels = image.shape[-1]
+        if channels == 1:
+            image = Image.fromarray(image[..., 0], mode="L")
+        elif channels == 3:
+            image = Image.fromarray(image, mode="RGB")
+        elif channels == 4:
+            image = Image.fromarray(image, mode="RGBA")
+        else:
+            raise ValueError(f"Unsupported Kimi-K3 image channel count: {channels}")
+        medias.append({"type": "image", "image": image})
+
+    output = image_processor.preprocess(medias, return_tensors="pt")
+    expected_grids = torch.cat(
+        [item.model_specific_data["grid_thws"] for item in items], dim=0
+    )
+    if not torch.equal(output["grid_thws"].cpu(), expected_grids.cpu()):
+        raise ValueError("Kimi-K3 deferred CPU preprocessing produced wrong grids")
+    return output["pixel_values"]
+
+
+def to_hwc_uint8(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
+    """Stage an exact CPU image without doing resize/normalize work."""
+    if isinstance(image, Image.Image):
+        has_alpha = image.mode != "RGB" and (
+            "A" in image.getbands() or "transparency" in image.info
+        )
+        array = np.array(image.convert("RGBA" if has_alpha else "RGB"), copy=True)
+        return torch.from_numpy(array)
+
+    if image.dtype != torch.uint8:
+        raise ValueError(
+            f"Kimi-K3 preprocessing expects raw uint8 pixels, got {image.dtype}"
+        )
+    if image.dim() == 2:
+        image = image.unsqueeze(-1)
+    elif image.dim() == 3 and image.shape[0] in (1, 3, 4):
+        image = image.permute(1, 2, 0)
+    if image.shape[-1] == 1:
+        image = image.repeat(1, 1, 3)
+    return image.cpu().contiguous()
 
 
 def to_chw_uint8(

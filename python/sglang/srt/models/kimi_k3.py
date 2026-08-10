@@ -3071,6 +3071,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         config,
         *,
         image_processor=None,
+        use_gpu_preprocessing=False,
     ):
         """Prepare per-image raw inputs for owner-side EPD preprocessing."""
         if modality != Modality.IMAGE:
@@ -3082,7 +3083,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
             prepare_kimi_k3_encoder_inputs,
         )
 
-        return prepare_kimi_k3_encoder_inputs(mm_data, image_processor)
+        self._encoder_image_processor = image_processor
+        return prepare_kimi_k3_encoder_inputs(
+            mm_data,
+            image_processor,
+            use_gpu_preprocessing=use_gpu_preprocessing,
+        )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
@@ -3133,25 +3139,44 @@ class KimiK3ForConditionalGeneration(nn.Module):
                     raise ValueError(
                         "Kimi-K3 cannot mix deferred and preprocessed image features"
                     )
-                from sglang.srt.multimodal.processors.kimi_k25 import (
-                    _gpu_preprocess_images,
-                )
-
                 first_config = deferred[0]
-                image_scale, image_bias = normalization_tensors(
-                    first_config["image_mean"], first_config["image_std"], device
-                )
-                pixel_values, _ = _gpu_preprocess_images(
-                    [item.feature for item in selected_items],
-                    [config["resize_config"] for config in deferred],
-                    image_scale,
-                    image_bias,
-                    self.vision_tower.patch_size,
-                    to_chw=lambda image: to_chw_uint8(image, device=device),
-                    post_resize=lambda x: fill_transparent_bg(
-                        x, first_config["transparent_bg_config"]
-                    ),
-                )
+                backend = first_config["backend"]
+                if any(config["backend"] != backend for config in deferred):
+                    raise ValueError(
+                        "Kimi-K3 cannot mix deferred preprocessing backends"
+                    )
+                if backend == "gpu":
+                    from sglang.srt.multimodal.processors.kimi_k25 import (
+                        _gpu_preprocess_images,
+                    )
+
+                    image_scale, image_bias = normalization_tensors(
+                        first_config["image_mean"], first_config["image_std"], device
+                    )
+                    pixel_values, _ = _gpu_preprocess_images(
+                        [item.feature for item in selected_items],
+                        [config["resize_config"] for config in deferred],
+                        image_scale,
+                        image_bias,
+                        self.vision_tower.patch_size,
+                        to_chw=lambda image: to_chw_uint8(image, device=device),
+                        post_resize=lambda x: fill_transparent_bg(
+                            x, first_config["transparent_bg_config"]
+                        ),
+                    )
+                elif backend == "cpu":
+                    from sglang.srt.multimodal.kimi_k3_image_processing import (
+                        materialize_kimi_k3_cpu_features,
+                    )
+
+                    pixel_values = materialize_kimi_k3_cpu_features(
+                        selected_items, self._encoder_image_processor
+                    )
+                    pixel_values = pixel_values.to(device, non_blocking=True)
+                else:
+                    raise ValueError(
+                        f"Unsupported Kimi-K3 deferred preprocessing backend: {backend}"
+                    )
                 return pixel_values.to(dtype=target_dtype)
 
             features = []

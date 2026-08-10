@@ -1,3 +1,4 @@
+import inspect
 from collections.abc import Mapping
 from typing import Any, Iterable
 
@@ -36,3 +37,33 @@ def get_encoder_preprocessed_items(
     if isinstance(processor_output, EncoderPreprocessOutput):
         return processor_output.mm_items
     return None
+
+
+def invoke_encoder_preprocessor(
+    preprocessor,
+    mm_data,
+    modality,
+    config,
+    **available_context,
+):
+    """Call a model hook with only the optional context it declares.
+
+    Existing hooks keep their three-argument contract. New model integrations
+    can request shared processor state or backend policy by adding named
+    keyword-only parameters, without requiring encode-server model branches.
+    """
+    parameters = inspect.signature(preprocessor).parameters
+    accepts_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    context = (
+        available_context
+        if accepts_kwargs
+        else {
+            name: value
+            for name, value in available_context.items()
+            if name in parameters
+        }
+    )
+    return preprocessor(mm_data, modality, config, **context)

@@ -30,9 +30,11 @@ from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
+    invoke_encoder_preprocessor,
 )
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
+    materialize_kimi_k3_cpu_features,
     prepare_kimi_k3_encoder_inputs,
 )
 from sglang.srt.runtime_context import get_context
@@ -181,7 +183,7 @@ def test_kimi_k3_epd_preprocess_preserves_raw_per_image_items():
     for item, size in zip(items, ((6, 8), (9, 5))):
         assert item.modality == Modality.IMAGE
         assert item.feature.dtype == torch.uint8
-        assert item.feature.shape == (3, *size)
+        assert item.feature.shape == (*size, 3)
         deferred = item.model_specific_data[DEFERRED_PREPROCESSING_KEY]
         assert deferred["image_mean"] == [0.5, 0.5, 0.5]
         assert deferred["image_std"] == [0.5, 0.5, 0.5]
@@ -192,12 +194,22 @@ def test_kimi_k3_epd_model_preprocessor_receives_image_processor():
     image_processor = _kimi_k3_image_processor()
     calls = []
 
-    def model_preprocessor(mm_data, modality, config, *, image_processor=None):
-        calls.append((mm_data, modality, config, image_processor))
+    def model_preprocessor(
+        mm_data,
+        modality,
+        config,
+        *,
+        image_processor=None,
+        use_gpu_preprocessing=False,
+    ):
+        calls.append(
+            (mm_data, modality, config, image_processor, use_gpu_preprocessing)
+        )
         return prepare_kimi_k3_encoder_inputs(mm_data, image_processor)
 
     encoder = _encoder()
     encoder.image_processor = image_processor
+    encoder.use_image_processor_gpu = False
     encoder.vision_config = {"image": {"return_tensors": "pt"}}
     encoder._flatten_and_load_images = AsyncMock(return_value=[image])
 
@@ -205,8 +217,63 @@ def test_kimi_k3_epd_model_preprocessor_receives_image_processor():
 
     assert len(calls) == 1
     assert calls[0][0][0] == {"type": "image", "image": image}
-    assert calls[0][1:] == (Modality.IMAGE, encoder.vision_config, image_processor)
+    assert calls[0][1:] == (
+        Modality.IMAGE,
+        encoder.vision_config,
+        image_processor,
+        False,
+    )
     assert len(get_encoder_preprocessed_items(output)) == 1
+
+
+def test_encoder_preprocessor_context_keeps_legacy_hooks_compatible():
+    calls = []
+
+    def legacy_hook(mm_data, modality, config):
+        calls.append((mm_data, modality, config))
+        return {"ok": True}
+
+    result = invoke_encoder_preprocessor(
+        legacy_hook,
+        ["image"],
+        Modality.IMAGE,
+        {"image": {}},
+        image_processor=object(),
+        use_gpu_preprocessing=True,
+    )
+
+    assert result == {"ok": True}
+    assert calls == [(["image"], Modality.IMAGE, {"image": {}})]
+
+
+def test_kimi_k3_epd_default_cpu_materialization_is_owner_only_and_exact():
+    class RecordingImageProcessor:
+        media_proc_cfg = _kimi_k3_image_processor().media_proc_cfg
+
+        def __init__(self):
+            self.calls = []
+
+        def preprocess(self, medias, return_tensors):
+            self.calls.append(medias)
+            features = [
+                torch.full((4, 3, 2, 2), media["image"].getpixel((0, 0))[0])
+                for media in medias
+            ]
+            grids = torch.tensor([[1, 2, 2]] * len(medias))
+            return {"pixel_values": torch.cat(features), "grid_thws": grids}
+
+    processor = RecordingImageProcessor()
+    images = [Image.new("RGB", (4, 4), color=(value, 0, 0)) for value in (7, 11)]
+    output = prepare_kimi_k3_encoder_inputs(images, processor)
+    items = get_encoder_preprocessed_items(output)
+
+    materialized = materialize_kimi_k3_cpu_features([items[1]], processor)
+
+    assert len(processor.calls) == 1
+    assert len(processor.calls[0]) == 1
+    assert processor.calls[0][0]["image"].getpixel((0, 0)) == (11, 0, 0)
+    assert torch.all(materialized == 11)
+    assert items[0].model_specific_data[DEFERRED_PREPROCESSING_KEY]["backend"] == "cpu"
 
 
 @pytest.mark.parametrize(
