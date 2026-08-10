@@ -168,9 +168,20 @@ transfer overhead. This exact recipe was validated on
 2× RTX 5090 (32 GB each) and a 377 GiB host; use a 384 GiB-class machine. The
 latency and memory comparison is collected in the benchmark section below.
 
+For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager.
+The current `torch.compile` path changes the model's numerical output, so it is
+not enabled implicitly by any recommended lossless preset. An explicit
+`--enable-torch-compile true` remains available for controlled experiments, but
+it should not be used to generate consistency ground truth.
+
 For Ascend NPU, follow the
 [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation)
 before starting the server.
+
+The Ascend commands below explicitly enable the Cache-DiT configuration used
+for the reported performance measurements. Remove these `SGLANG_CACHE_DIT_*`
+variables to use lossless denoising. See the **Ascend NPU topology comparison**
+in the Benchmarks section for the measured eight- and four-NPU latency.
 
 For an eight-NPU host, the validated topology is TP2 + SP4 with Laser
 Attention. Use Ascend Flash Attention by replacing `laser_attn` with `fa`.
@@ -220,13 +231,6 @@ HCCL_BUFFSIZE=256 sglang serve \
 The first launch downloads the model through the selected Hub. If the Hugging
 Face repository requires authentication, export a Hugging Face token in the
 server environment.
-
-The Ascend commands explicitly enable the Cache-DiT configuration used for the
-reported performance measurements. Remove these `SGLANG_CACHE_DIT_*` variables
-to use lossless denoising. The current `torch.compile` path changes the model's
-numerical output, so it should not be used to generate consistency ground truth.
-See the **Ascend NPU topology comparison** in the Benchmarks section for the
-measured eight- and four-NPU latency.
 
 ## 4. Generate video and audio
 
