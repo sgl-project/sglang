@@ -163,7 +163,6 @@ class TestInklingSmallNvfp4Deterministic(CustomTestCase):
                 "--mem-fraction-static",
                 "0.85",
                 "--enable-deterministic-inference",
-                "--disable-prefill-cuda-graph",
             ],
             env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
