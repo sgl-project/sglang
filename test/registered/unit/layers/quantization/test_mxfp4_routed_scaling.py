@@ -1,3 +1,7 @@
+import sys
+
+import pytest
+
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     _fuses_routed_scaling_factor_in_topk,
 )
@@ -21,3 +25,7 @@ def test_native_mxfp4_methods_fold_routed_scaling_into_topk_weights():
     )
 
     assert all(_fuses_routed_scaling_factor_in_topk(method) for method in methods)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
