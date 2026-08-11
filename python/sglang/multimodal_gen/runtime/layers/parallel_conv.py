@@ -168,20 +168,12 @@ def split_height_for_parallel_decode(
 
 
 def _maybe_contiguous_for_sp_gather(x: torch.Tensor) -> torch.Tensor:
-    if (
-        x.dim() == 5
-        and hasattr(torch, "channels_last_3d")
-        and x.is_contiguous(memory_format=torch.channels_last_3d)
-        and not x.is_contiguous()
-    ):
-        return x.contiguous()
-    if (
-        x.dim() == 4
-        and x.is_contiguous(memory_format=torch.channels_last)
-        and not x.is_contiguous()
-    ):
-        return x.contiguous()
-    return x
+    # NCCL requires contiguous buffers, and the gather concatenates along height,
+    # so channels-last / permuted views (e.g. from platform conv fast paths) must
+    # be materialized in standard layout first.
+    if x.is_contiguous():
+        return x
+    return x.contiguous()
 
 
 def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
@@ -658,10 +650,18 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
         return _spatial_parallel_conv_forward(
             self,
             x,
-            super().forward,
+            self._halo_conv_forward,
             height_pad_mode="zeros",
             match_conv3d_format=True,
         )
+
+    def _halo_conv_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Convolve the halo-exchanged input.
+
+        Platform fast paths override this per instance instead of ``forward``,
+        so the halo exchange and output trim stay in place.
+        """
+        return nn.Conv3d.forward(self, x)
 
 
 class SpatialParallelConv3d(nn.Conv3d):
@@ -723,10 +723,18 @@ class SpatialParallelConv3d(nn.Conv3d):
         return _spatial_parallel_conv_forward(
             self,
             x,
-            super().forward,
+            self._halo_conv_forward,
             height_pad_mode=self.padding_mode,
             match_conv3d_format=True,
         )
+
+    def _halo_conv_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Convolve the halo-exchanged input.
+
+        Platform fast paths override this per instance instead of ``forward``,
+        so the halo exchange and output trim stay in place.
+        """
+        return nn.Conv3d.forward(self, x)
 
     def _direct_forward(self, x):
         time_pad = self.padding[0]
