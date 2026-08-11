@@ -1077,7 +1077,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
             return
-        elif _is_xpu:
+        elif _is_xpu and not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu's W4A16 grouped GEMM consumes the checkpoint MXFP4
             # layout as-is: packed e2m1 [E, N, K/2] uint8 plus N-outer ue8m0
             # scales [E, N, K/32] uint8, with GPT-OSS's interleaved
@@ -1091,7 +1091,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Biases stay bf16 (the launcher promotes them to fp32, which is how
             # the kernel accumulates them). Crucially there is no bf16 upcast of
             # the weights -- the whole point of MXFP4 on XPU.
-            return
+            pass
         else:
             w13_weight = _dequant_mxfp4_to_bf16(
                 layer.w13_weight, layer.w13_weight_scale
@@ -1103,7 +1103,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w2_weight_scale
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
-        torch.cuda.empty_cache()
+        torch.get_device_module().empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
@@ -1448,6 +1448,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "--moe-runner-backend marlin."
                 )
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif moe_runner_backend.is_intel_xpu():
+            self.runner = None
         else:
             raise NotImplementedError(
                 f"Mxfp4MoEMethod has no MoeRunner for backend={moe_runner_backend} "
@@ -1645,7 +1647,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
             return StandardCombineInput(hidden_states=output)
 
-        if _is_xpu:
+        if _is_xpu and not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu path: moe_grouped_mm_nt_xe20_w4a16 consumes the
             # packed MXFP4 weights directly, so no dequantization happens.
             from sgl_kernel import fused_experts as sgl_fused_experts
