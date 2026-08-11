@@ -9,6 +9,12 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_double_block,
+    is_refiner_block,
+    is_single_block,
+    is_txt_in,
+)
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -508,9 +514,8 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     # PY: we make the input args the same as HF config
 
     # shard single stream, double stream blocks, and refiner_blocks
-    _fsdp_shard_conditions = HunyuanVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = HunyuanVideoConfig()._compile_conditions
-    _supported_attention_backends = HunyuanVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_double_block, is_single_block, is_refiner_block]
+    _compile_conditions = [is_double_block, is_single_block, is_txt_in]
     param_names_mapping = HunyuanVideoConfig().param_names_mapping
     reverse_param_names_mapping = HunyuanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = HunyuanVideoConfig().lora_param_names_mapping

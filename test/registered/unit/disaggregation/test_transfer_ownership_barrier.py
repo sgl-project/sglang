@@ -11,6 +11,7 @@ transfer work can still read or write them. The properties under test are:
 """
 
 import concurrent.futures
+import functools
 import threading
 import time
 import unittest
@@ -41,6 +42,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -160,6 +162,13 @@ class TestPageReuseRace(unittest.TestCase):
     On a build without the barrier this asserts Failed at [T3] and fails.
     """
 
+    def setUp(self):
+        # send_kvcache's envelope-layout validation reads
+        # get_memory().enable_unified_memory from the published config.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
     def test_terminal_state_is_withheld_while_a_write_is_in_flight(self):
         entered_write = threading.Event()
         release_write = threading.Event()
@@ -183,6 +192,7 @@ class TestPageReuseRace(unittest.TestCase):
             "session:1": SimpleNamespace(
                 dst_attn_tp_size=1,
                 dst_kv_ptrs=[0xDEAD0000],
+                dst_kv_item_len=64,
                 dst_kv_layer_ids=[0],
                 dst_state_layer_ids=[],
                 requires_dcp_relayout=False,
@@ -257,6 +267,7 @@ class TestPageReuseRace(unittest.TestCase):
             "session:1": SimpleNamespace(
                 dst_attn_tp_size=1,
                 dst_kv_ptrs=[0xDEAD0000],
+                dst_kv_item_len=64,
                 dst_kv_layer_ids=[0],
                 dst_state_layer_ids=[],
                 requires_dcp_relayout=False,
@@ -1595,17 +1606,26 @@ class TestChunkedPrefillAbort(unittest.TestCase):
 
     @staticmethod
     def _scheduler(req, mode):
-        return SimpleNamespace(
+        from sglang.srt.disaggregation.prefill import (
+            SchedulerDisaggregationPrefillMixin,
+        )
+
+        scheduler = SimpleNamespace(
             _pending_chunked_abort_req=req,
             chunked_req=req,
             enable_hicache_storage=False,
             tree_cache=Mock(),
             disaggregation_mode=mode,
             disagg_prefill_inflight_queue=[],
+            disagg_prefill_pending_chunk_rids={req.rid},
             ipc_channels=SimpleNamespace(
                 send_to_tokenizer=SimpleNamespace(send_output=Mock())
             ),
         )
+        scheduler.clear_pending_chunk_send = functools.partial(
+            SchedulerDisaggregationPrefillMixin.clear_pending_chunk_send, scheduler
+        )
+        return scheduler
 
     @staticmethod
     def _chunked_req():
@@ -1615,6 +1635,7 @@ class TestChunkedPrefillAbort(unittest.TestCase):
             time_stats=SimpleNamespace(trace_ctx=Mock()),
             to_finish=object(),
             skip_radix_cache_insert=False,
+            pending_bootstrap=True,
         )
 
     def _run(self, mode):
@@ -1643,6 +1664,16 @@ class TestChunkedPrefillAbort(unittest.TestCase):
         self.assertTrue(
             req.skip_radix_cache_insert,
             "the aborted partial prefix must not enter the radix cache",
+        )
+        self.assertNotIn(
+            req.rid,
+            scheduler.disagg_prefill_pending_chunk_rids,
+            "a parked abort must hand the compaction gate to the inflight queue",
+        )
+        self.assertIs(
+            req.pending_bootstrap,
+            False,
+            "a parked request must take the normal poll path at retirement",
         )
         self.assertIsNone(scheduler.chunked_req)
         self.assertIsNone(scheduler._pending_chunked_abort_req)
@@ -1690,6 +1721,11 @@ class TestChunkedPrefillAbort(unittest.TestCase):
             output_streamer=SimpleNamespace(stream_output=Mock()),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             enable_hicache_storage=False,
+            disagg_prefill_pending_chunk_rids={req.rid},
+        )
+        scheduler.clear_pending_chunk_send = functools.partial(
+            prefill_mod.SchedulerDisaggregationPrefillMixin.clear_pending_chunk_send,
+            scheduler,
         )
 
         with patch.object(prefill_mod, "prepare_abort") as prepare_abort:

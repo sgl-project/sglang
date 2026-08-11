@@ -266,6 +266,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+    "megamoe",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -2765,6 +2766,12 @@ class ServerArgs:
         "Enable global multimodal embedding cache to skip redundant ViT inference.",
         NS("mm"),
     ] = False
+    image_processor_backend: A[
+        Literal["auto", "torchvision", "pil"],
+        "Image processor backend. 'auto' lets Transformers select the best "
+        "available backend.",
+        NS("mm"),
+    ] = "auto"
     mm_global_cache_backend: A[
         str,
         Arg(
@@ -2775,7 +2782,9 @@ class ServerArgs:
         NS("mm"),
     ] = "mooncake"
     disable_fast_image_processor: A[
-        bool, "Adopt base image processor instead of fast image processor.", NS("mm")
+        bool,
+        "Deprecated. Use --image-processor-backend=pil instead.",
+        NS("mm"),
     ] = False
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
@@ -3504,6 +3513,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -3671,6 +3681,20 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_moe_runner_backend_alias(self):
+        if self.moe_runner_backend != "megamoe":
+            return
+
+        if self.moe_a2a_backend not in ("none", "megamoe"):
+            logger.warning(
+                "--moe-runner-backend megamoe is an alias for "
+                "--moe-a2a-backend megamoe; overriding "
+                "--moe-a2a-backend %s.",
+                self.moe_a2a_backend,
+            )
+        self.moe_runner_backend = "auto"
+        self.moe_a2a_backend = "megamoe"
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
@@ -3974,6 +3998,18 @@ class ServerArgs:
                     )
 
     def _handle_deprecated_args(self):
+        if self.disable_fast_image_processor:
+            if self.image_processor_backend not in {"auto", "pil"}:
+                raise ValueError(
+                    "--disable-fast-image-processor conflicts with "
+                    f"--image-processor-backend={self.image_processor_backend}."
+                )
+            logger.warning(
+                "--disable-fast-image-processor is deprecated; use "
+                "--image-processor-backend=pil instead."
+            )
+            self.image_processor_backend = "pil"
+
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
         if self.tool_call_parser in deprecated_tool_call_parsers:
@@ -8007,9 +8043,29 @@ class ServerArgs:
     def _handle_unified_memory_pool(self):
         if not self.enable_unified_memory:
             return
-        assert self.disaggregation_mode == "null", (
-            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
-        )
+        if self.disaggregation_mode != "null":
+            # Constraints of the whole-envelope transfer; see
+            # UnifiedMLATokenToKVPool.get_contiguous_buf_infos.
+            assert self.disaggregation_transfer_backend == "mooncake", (
+                "--enable-unified-memory with PD disaggregation supports only "
+                "the mooncake transfer backend; got "
+                f"{self.disaggregation_transfer_backend!r}."
+            )
+            assert self.pp_size == 1, (
+                "--enable-unified-memory with PD disaggregation does not support "
+                "pipeline parallelism (whole-envelope transfer has no per-layer "
+                "entries to subset)."
+            )
+            assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+                "--enable-unified-memory with PD disaggregation requires lazy "
+                "compaction; unset SGLANG_DISABLE_LAZY_COMPACTION."
+            )
+            assert not self.enable_hisparse, (
+                "--enable-unified-memory with PD disaggregation is not compatible "
+                "with --enable-hisparse: the decode-side HiSparse prealloc path "
+                "ships host/C4 rows straight from the allocator, bypassing the "
+                "virtual->physical translation the unified pool needs."
+            )
         assert self.speculative_algorithm in (None, "DSPARK"), (
             "--enable-unified-memory only supports --speculative-algorithm "
             "DSPARK (chain draft); other speculative algorithms are not yet "

@@ -4,11 +4,6 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
-
-
-def is_layers(n: str, m) -> bool:
-    return is_module_list_entry_in(n, ("layers", "gen_layers"))
 
 
 def _build_cosmos3_param_names_mapping() -> dict:
@@ -127,8 +122,6 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     flow through ``update_model_arch`` without translation. Defaults are
     Qwen3-8B-Instruct-derived and overridden by the checkpoint at load time.
     """
-
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_layers])
 
     # Transformer architecture
     hidden_size: int = 4096
