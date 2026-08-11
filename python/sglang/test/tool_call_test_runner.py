@@ -356,7 +356,7 @@ def run_tool_call_test(
             model.model_path,
             base_url,
             other_args=model.extra_args,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env=model.env,
         )
         client = openai.Client(api_key="sk-test", base_url=base_url + "/v1")
