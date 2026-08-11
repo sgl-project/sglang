@@ -114,9 +114,13 @@ class WrapperDispatch(Enum):
 
 
 def _is_supported_dflash_fast_plan_topology(
-    plan_kind: str, dispatch_reason: Optional[WrapperDispatch]
+    plan_kind: str,
+    dispatch_reason: Optional[WrapperDispatch],
+    use_compact_draft_cache: bool = False,
 ) -> bool:
-    """Whether a DFlash worker's FlashInfer wrapper layout is host-rebuildable."""
+    """Whether a DFlash FlashInfer layout supports sync-free planning."""
+    if use_compact_draft_cache:
+        return False
     if plan_kind == "draft":
         return dispatch_reason in (
             None,
@@ -125,6 +129,17 @@ def _is_supported_dflash_fast_plan_topology(
     if plan_kind == "target_verify":
         return dispatch_reason is None
     return False
+
+
+def _can_use_dflash_fast_prefill_plan(
+    spec_info: Optional[SpecInput], plan_kind: Optional[str]
+) -> bool:
+    return bool(
+        spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+        and plan_kind in ("draft", "target_verify")
+        and getattr(spec_info, "host_seq_lens_include_verify_block", False)
+    )
 
 
 @dataclass
@@ -319,6 +334,15 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         self._dflash_fast_plan_kind = (
             "draft" if model_runner.is_draft_worker else "target_verify"
+        )
+        self._dflash_use_compact_draft_cache = (
+            self._enable_dflash_sync_free_decode
+            and getattr(
+                model_runner.server_args,
+                "speculative_draft_window_size",
+                None,
+            )
+            is not None
         )
 
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -830,7 +854,9 @@ class FlashInferAttnBackend(AttentionBackend):
             and forward_mode.is_target_verify()
             and self._enable_dflash_sync_free_decode
             and _is_supported_dflash_fast_plan_topology(
-                self._dflash_fast_plan_kind, self.dispatch_reason
+                self._dflash_fast_plan_kind,
+                self.dispatch_reason,
+                self._dflash_use_compact_draft_cache,
             )
             and self.prefill_backend == "fa2"
         ):
@@ -840,6 +866,8 @@ class FlashInferAttnBackend(AttentionBackend):
             # use DFlashVerifyInput and CPU-rebuildable scheduling metadata.
             for w in self.prefill_cuda_graph_metadata[bs]:
                 w._sglang_dflash_fast_prefill_plan_kind = self._dflash_fast_plan_kind
+                if not hasattr(w, "_sglang_dflash_original_begin_forward"):
+                    w._sglang_dflash_original_begin_forward = w.begin_forward
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
@@ -1940,10 +1968,37 @@ class FlashInferIndicesUpdaterPrefill:
                         sliding_window_size + seq_lens - prefix_lens,
                     )
                     if seq_lens_cpu is not None and prefix_lens_is_seq_lens:
-                        paged_kernel_lens_cpu = torch.clamp(
-                            seq_lens_cpu, max=sliding_window_size
+                        is_dflash_verify = (
+                            spec_info is not None
+                            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
                         )
+                        host_lens_include_verify_block = getattr(
+                            spec_info,
+                            "host_seq_lens_include_verify_block",
+                            False,
+                        )
+                        if is_dflash_verify and host_lens_include_verify_block:
+                            assert spec_info.num_tokens_per_req > 0
+                            prefix_lens_cpu = (
+                                seq_lens_cpu - spec_info.num_tokens_per_req
+                            )
+                            paged_kernel_lens_cpu = (
+                                torch.clamp(
+                                    prefix_lens_cpu,
+                                    min=0,
+                                    max=sliding_window_size,
+                                )
+                                + spec_info.num_tokens_per_req
+                            )
+                        else:
+                            paged_kernel_lens_cpu = torch.clamp(
+                                seq_lens_cpu, max=sliding_window_size
+                            )
                         paged_kernel_lens_sum = int(paged_kernel_lens_cpu.sum())
+                        if is_dflash_verify and host_lens_include_verify_block:
+                            paged_kernel_lens_sum -= (
+                                seq_lens_cpu.numel() * spec_info.num_tokens_per_req
+                            )
                     else:
                         paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
@@ -2217,28 +2272,32 @@ class FlashInferIndicesUpdaterPrefill:
             "_sglang_dflash_fast_prefill_plan_kind",
             None,
         )
-        if uses_fast_prefill:
+        is_dflash_fast_prefill = (
+            spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+            and dflash_fast_plan_kind in ("draft", "target_verify")
+        )
+        dflash_can_use_fast_prefill = _can_use_dflash_fast_prefill_plan(
+            spec_info, dflash_fast_plan_kind
+        )
+        use_fast_prefill_this_step = uses_fast_prefill and (
+            not is_dflash_fast_prefill or dflash_can_use_fast_prefill
+        )
+        if use_fast_prefill_this_step:
             assert (
                 seq_lens_cpu is not None
             ), "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
             assert (
                 num_tokens_per_req is not None and num_tokens_per_req > 0
             ), f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
-            is_dflash_fast_prefill = (
-                spec_info is not None
-                and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
-                and dflash_fast_plan_kind in ("draft", "target_verify")
-            )
             if is_dflash_fast_prefill:
                 assert paged_kernel_lens_cpu is not None, (
                     "DFlash fast_prefill_plan requires CPU-known paged "
                     "kernel lengths; prefix_lens must default to seq_lens"
                 )
-                # These conservative host lengths only produce FlashInfer
-                # scheduling metadata; device indptr remains authoritative.
-                kv_lens_host = (
-                    paged_kernel_lens_cpu.to(torch.int32) + num_tokens_per_req
-                )
+                # DFlashWorkerV2 owns the final host planning bound, including
+                # exactly one verify block. Device indptr remains authoritative.
+                kv_lens_host = paged_kernel_lens_cpu.to(torch.int32)
             else:
                 kv_lens_host = seq_lens_cpu.to(torch.int32)
             qo_indptr_host = torch.arange(
@@ -2262,7 +2321,11 @@ class FlashInferIndicesUpdaterPrefill:
             # selects the module with the per-element window mask compiled in
             paged_plan_kwargs["window_left"] = window_left
 
-        wrapper_paged.begin_forward(
+        begin_forward = wrapper_paged.begin_forward
+        if uses_fast_prefill and not use_fast_prefill_this_step:
+            begin_forward = wrapper_paged._sglang_dflash_original_begin_forward
+
+        begin_forward(
             qo_indptr,
             kv_indptr,
             kv_indices,

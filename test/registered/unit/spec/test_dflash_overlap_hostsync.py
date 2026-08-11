@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -342,7 +343,7 @@ class TestMultimodalMropeCacheInvalidation(CustomTestCase):
 
 
 class TestDFlashFlashInferHostPlanning(CustomTestCase):
-    def test_sliding_window_uses_cpu_known_paged_lengths(self):
+    def test_sliding_window_respects_host_length_contract(self):
         from sglang.srt.layers.attention.flashinfer_backend import (
             FlashInferIndicesUpdaterPrefill,
         )
@@ -359,31 +360,63 @@ class TestDFlashFlashInferHostPlanning(CustomTestCase):
             calls.append((args, kwargs))
 
         updater.call_begin_forward = record_call
-        seq_lens = torch.tensor([3, 7], dtype=torch.int64)
-        seq_lens_cpu = seq_lens.clone()
+        # Cover P < W, P = W - 1, P = W, and P > W.
+        seq_lens = torch.tensor([2, 3, 4, 7], dtype=torch.int64)
+        verify_block_size = 4
+        seq_lens_cpu = seq_lens + verify_block_size
         wrappers = [object(), object()]
 
         updater.update_sliding_window(
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            req_pool_indices=torch.arange(seq_lens.numel(), dtype=torch.int64),
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
-            seq_lens_sum=10,
+            seq_lens_sum=int(seq_lens.sum()),
             prefix_lens=None,
             prefill_wrappers=wrappers,
             use_ragged=False,
             encoder_lens=None,
-            spec_info=SimpleNamespace(num_accept_tokens=None),
+            spec_info=SimpleNamespace(
+                num_accept_tokens=None,
+                num_tokens_per_req=verify_block_size,
+                spec_input_type=SpecInputType.DFLASH_VERIFY,
+                host_seq_lens_include_verify_block=True,
+            ),
         )
 
         self.assertEqual(len(calls), 2)
-        torch.testing.assert_close(calls[0][0][3], torch.tensor([3, 4]))
-        self.assertEqual(calls[0][0][4], 7)
+        torch.testing.assert_close(calls[0][0][3], torch.tensor([2, 3, 4, 4]))
+        self.assertEqual(calls[0][0][4], 13)
         torch.testing.assert_close(
-            calls[0][1]["paged_kernel_lens_cpu"], torch.tensor([3, 4])
+            calls[0][1]["paged_kernel_lens_cpu"], torch.tensor([6, 7, 8, 8])
         )
         torch.testing.assert_close(calls[1][0][3], seq_lens)
-        self.assertEqual(calls[1][0][4], 10)
+        self.assertEqual(calls[1][0][4], 16)
         torch.testing.assert_close(calls[1][1]["paged_kernel_lens_cpu"], seq_lens_cpu)
+
+        # The legacy fallback still provides prefix-only CPU lengths and must
+        # retain its original sliding-window metadata for the blocking plan().
+        calls.clear()
+        updater.update_sliding_window(
+            req_pool_indices=torch.arange(seq_lens.numel(), dtype=torch.int64),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.clone(),
+            seq_lens_sum=int(seq_lens.sum()),
+            prefix_lens=None,
+            prefill_wrappers=wrappers,
+            use_ragged=False,
+            encoder_lens=None,
+            spec_info=SimpleNamespace(
+                num_accept_tokens=None,
+                num_tokens_per_req=verify_block_size,
+                spec_input_type=SpecInputType.DFLASH_VERIFY,
+                host_seq_lens_include_verify_block=False,
+            ),
+        )
+
+        torch.testing.assert_close(
+            calls[0][1]["paged_kernel_lens_cpu"], torch.tensor([2, 3, 4, 4])
+        )
+        torch.testing.assert_close(calls[1][1]["paged_kernel_lens_cpu"], seq_lens)
 
 
 if __name__ == "__main__":

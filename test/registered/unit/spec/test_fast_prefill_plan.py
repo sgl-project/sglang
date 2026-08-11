@@ -13,14 +13,17 @@ sensitive to the metadata under test and the equivalence is not vacuous.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.layers.attention.flashinfer_backend import (
     WrapperDispatch,
+    _can_use_dflash_fast_prefill_plan,
     _is_supported_dflash_fast_plan_topology,
     fast_prefill_plan,
 )
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -64,6 +67,37 @@ class TestDFlashFastPrefillPlanTopology(unittest.TestCase):
                     _is_supported_dflash_fast_plan_topology(plan_kind, dispatch_reason),
                     expected,
                 )
+
+    def test_compact_draft_cache_uses_original_plan(self):
+        for plan_kind, dispatch_reason in (
+            ("draft", None),
+            ("draft", WrapperDispatch.SLIDING_WINDOW),
+            ("target_verify", None),
+        ):
+            with self.subTest(
+                plan_kind=plan_kind,
+                dispatch_reason=dispatch_reason,
+            ):
+                self.assertFalse(
+                    _is_supported_dflash_fast_plan_topology(
+                        plan_kind,
+                        dispatch_reason,
+                        use_compact_draft_cache=True,
+                    )
+                )
+
+    def test_legacy_fallback_uses_original_plan(self):
+        final_host_bound = SimpleNamespace(
+            spec_input_type=SpecInputType.DFLASH_VERIFY,
+            host_seq_lens_include_verify_block=True,
+        )
+        legacy_fallback = SimpleNamespace(
+            spec_input_type=SpecInputType.DFLASH_VERIFY,
+            host_seq_lens_include_verify_block=False,
+        )
+
+        self.assertTrue(_can_use_dflash_fast_prefill_plan(final_host_bound, "draft"))
+        self.assertFalse(_can_use_dflash_fast_prefill_plan(legacy_fallback, "draft"))
 
 
 @unittest.skipUnless(_HAS_FLASHINFER, "requires flashinfer")

@@ -1568,6 +1568,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+        host_seq_lens_include_verify_block = False
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
@@ -1597,13 +1598,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.copy_(batch.seq_lens_cpu)
                 seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum())
+                host_seq_lens_include_verify_block = True
             elif draft_input.reserved_seq_lens_cpu is not None:
                 # GPU-only backend: reserved is a safe over-estimate.
                 seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
                 draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+                host_seq_lens_include_verify_block = True
             else:
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
                 draft_seq_lens_sum = int(prefix_lens.sum().item())
+
+        self._draft_block_spec_info.host_seq_lens_include_verify_block = (
+            host_seq_lens_include_verify_block
+        )
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -1676,9 +1683,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_host_seq_lens = seq_lens_cpu_backup + block_size
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+            verify_input.host_seq_lens_include_verify_block = True
         elif draft_input.reserved_seq_lens_cpu is not None:
             batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            verify_input.host_seq_lens_include_verify_block = True
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
