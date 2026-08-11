@@ -77,7 +77,11 @@ def minimax_h3_rollout_update_video_target(
     current_sigma = sample.new_tensor(float(sigma_curr))
     next_sigma = sample.new_tensor(float(sigma_next))
 
-    if noise_buffer is None or noise_buffer.shape != sample.shape or noise_buffer.device != sample.device:
+    if (
+        noise_buffer is None
+        or noise_buffer.shape != sample.shape
+        or noise_buffer.device != sample.device
+    ):
         noise_buffer = torch.empty_like(sample)
     variance_noise = torch.randn(
         sample.shape,
@@ -117,7 +121,9 @@ def minimax_h3_rollout_update_video_target(
         noise_std_dev = std_dev_t * torch.sqrt(-1.0 * dt)
         prev_mean = (
             sample * (1.0 + std_dev_t**2 / (2.0 * current_sigma) * dt)
-            + model_output * (1.0 + std_dev_t**2 * (1.0 - current_sigma) / (2.0 * current_sigma)) * dt
+            + model_output
+            * (1.0 + std_dev_t**2 * (1.0 - current_sigma) / (2.0 * current_sigma))
+            * dt
         )
         prev_sample = prev_mean + variance_noise * noise_std_dev
         log_prob_no_const_val = -((variance_noise * noise_std_dev) ** 2)
@@ -128,12 +134,21 @@ def minimax_h3_rollout_update_video_target(
         log_prob_sum = log_prob_no_const_val.sum().unsqueeze(0)
     else:
         log_prob_sum = (
-            log_prob_no_const_val / (2.0 * (noise_std_dev**2))
-            - torch.log(noise_std_dev)
-            - _LOG_SQRT_2PI
-        ).sum().unsqueeze(0)
+            (
+                log_prob_no_const_val / (2.0 * (noise_std_dev**2))
+                - torch.log(noise_std_dev)
+                - _LOG_SQRT_2PI
+            )
+            .sum()
+            .unsqueeze(0)
+        )
     log_prob_count = sample.new_tensor([float(sample.numel())])
-    return prev_sample.to(dtype=video_target.dtype), log_prob_sum, log_prob_count, noise_buffer
+    return (
+        prev_sample.to(dtype=video_target.dtype),
+        log_prob_sum,
+        log_prob_count,
+        noise_buffer,
+    )
 
 
 @dataclass

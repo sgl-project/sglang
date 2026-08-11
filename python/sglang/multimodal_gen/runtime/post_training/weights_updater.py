@@ -646,7 +646,9 @@ class WeightsUpdater:
                 # (e.g. [3, rank, in] for Q/K/V), so the rank is the second-to-last
                 # dim; reading shape[0] there would yield the section count and
                 # rescale every delta by alpha/sections.
-                inferred_rank = int(lora_a.shape[-2] if lora_a.dim() > 2 else lora_a.shape[0])
+                inferred_rank = int(
+                    lora_a.shape[-2] if lora_a.dim() > 2 else lora_a.shape[0]
+                )
                 alpha = lora_alpha if lora_alpha is not None else inferred_rank
                 if lora_rank is not None and lora_rank != inferred_rank:
                     logger.warning(

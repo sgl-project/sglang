@@ -641,7 +641,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     rollout_ctx=rollout_ctx,
                 )
                 if rollout_ctx is not None:
-                    batch.rollout_trajectory_data = rollout_ctx.collector.build_trajectory_data()
+                    batch.rollout_trajectory_data = (
+                        rollout_ctx.collector.build_trajectory_data()
+                    )
         finally:
             self._finish_active_component_use()
         _publish_full_loop_outputs(
