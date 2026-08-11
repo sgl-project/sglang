@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mha_views,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
     HybridReqToTokenPool,
     MambaPool,
     MHATokenToKVPool,
@@ -664,6 +665,20 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_size_bytes(self):
         return 0  # UnifiedKVPool logs the total; per-sub-pool would double-count
 
+    def get_contiguous_buf_infos(self):
+        """PD-transfer registration: ONE entry, the raw buffer, addressed as
+        ``raw_ptr + physical_page_id * page_envelope_bytes``.
+
+        The transfer item is the whole page envelope (all layers of one page)
+        rather than a per-layer region, because the per-layer dense views
+        overlap and index in dense ids. Both sides must therefore build the
+        pool with identical specs.
+        """
+        # The address formula omits the anchor; a nonzero one would mis-address.
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        raw = self._unified_buffer._raw
+        return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate whole page envelopes.
 
@@ -813,6 +828,31 @@ class UnifiedMambaPool(MambaPool):
         # Physical-slot copy used by the allocator's `_compact_pending`.
         MambaPool.copy_from(self, src_index, dst_index)
 
+    # -- PD state transfer (StateType.MAMBA) --
+    # The transfer item is the whole per-slot envelope, addressed as
+    # `raw_ptr + physical_slot * entry_bytes`. An envelope cannot be TP-resliced
+    # or PP-subset, so the per-tensor metadata below stays empty and both sides
+    # must build identical mamba specs (equal attn TP, pp=1).
+
+    def get_contiguous_buf_infos(self):
+        # The address formula omits the anchor; a nonzero one would mis-address.
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        spec = self._unified_buffer.mamba_spec(self._sub_pool_name)
+        raw = self._unified_buffer._raw
+        return [raw.data_ptr()], [raw.numel()], [spec.entry_bytes()]
+
+    def get_state_dim_per_tensor(self):
+        return []
+
+    def get_state_layer_ids(self):
+        return []
+
+    def get_state_slice_outer_counts(self):
+        return []
+
+    def get_state_conv_shard_groups(self):
+        return []
+
 
 class UnifiedMambaSlotAllocator:
     """Mamba slot allocator (PHYSICAL view) for the unified memory pool.
@@ -931,6 +971,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         speculative_num_draft_tokens: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
+        pre_alloc_size: int = 0,
     ):
         self._unified_buffer = unified_buffer
         self._mamba_sub_pool_name = mamba_sub_pool_name
@@ -938,7 +979,10 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             unified_buffer.max_slots(mamba_sub_pool_name) - 1
         )  # reserve slot 0
         super().__init__(
-            size=size,
+            # `DecodeReqToTokenPool` semantics: rows cover the preallocated
+            # requests too, while `self.size` (rebound below) stays the
+            # running-request cap the scheduler and leak invariant expect.
+            size=size + pre_alloc_size,
             mamba_size=self._shared_mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
             max_context_len=max_context_len,
@@ -951,6 +995,8 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             enable_overlap_schedule=enable_overlap_schedule,
             start_layer=start_layer,
         )
+        self.size = size
+        self.pre_alloc_size = pre_alloc_size
 
     def _init_mamba_pool(
         self,
@@ -1015,6 +1061,17 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         return self.mamba_allocator.translate(virtual_ids).to(torch.int32)
 
 
+class UnifiedHybridLinearKVPool(HybridLinearKVPool):
+    """`HybridLinearKVPool` over unified sub-pools (full = Unified{MLA,MHA},
+    mamba = UnifiedMambaPool)."""
+
+    def get_kv_layer_ids(self):
+        # Empty: the KV component is one whole-envelope entry, so there are no
+        # per-layer entries to pair by layer id (the sender falls back to
+        # positional pairing).
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -1056,9 +1113,9 @@ def init_unified_mamba_pools(
     mamba_full_memory_ratio: Optional[float] = None,  # informational only
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
+    decode_pre_alloc_size: int = 0,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
     from sglang.srt.mem_cache.multi_ended_allocator import (
         UnifiedMambaTokenToKVPoolAllocator,
     )
@@ -1134,6 +1191,7 @@ def init_unified_mamba_pools(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
+        pre_alloc_size=decode_pre_alloc_size,
     )
     if use_mla_backend:
         # start_layer stays 0: HybridLinearKVPool patches layer ids to the dense
@@ -1155,7 +1213,7 @@ def init_unified_mamba_pools(
     full_attn_layer_ids_for_pool = (
         [0] if is_draft_worker else list(full_attention_layer_ids)
     )
-    token_to_kv_pool = HybridLinearKVPool(
+    token_to_kv_pool = UnifiedHybridLinearKVPool(
         page_size=page_size,
         size=max_total_num_tokens,
         dtype=kv_cache_dtype,

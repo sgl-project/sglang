@@ -1152,7 +1152,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         self,
                         run_once,
                         post_warmup_hook=post_warmup_hook,
-                        skip_logits=False,
+                        run_lm_head=True,
                     )
                 with capture_kda_route_plan(
                     shape_key,
