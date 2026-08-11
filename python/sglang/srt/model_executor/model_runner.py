@@ -410,6 +410,8 @@ class ModelRunner:
         self.war_read_done_event = make_war_read_done_event(
             torch.get_device_module(self.device)
         )
+        self.rank_sync_done_event: Optional[torch.cuda.Event] = None
+        self.rank_sync_boundary_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
         set_offloader(

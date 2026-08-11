@@ -122,6 +122,22 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 
+@contextlib.contextmanager
+def _draft_extend_rank_sync_context(runner):
+    event = runner.rank_sync_boundary_event
+    if event is None:
+        yield
+        return
+    with forward_context(
+        ForwardContext(
+            attn_backend=runner.attn_backend,
+            rank_sync_done_event=event,
+        )
+    ):
+        yield
+    runner.rank_sync_done_event = event
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -804,7 +820,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        with canary_ctx, _draft_extend_rank_sync_context(self.draft_runner):
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
@@ -924,9 +940,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch
                 )
             else:
-                draft_logits_output = self.draft_runner.forward(
-                    forward_batch
-                ).logits_output
+                with _draft_extend_rank_sync_context(self.draft_runner):
+                    draft_logits_output = self.draft_runner.forward(
+                        forward_batch
+                    ).logits_output
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,

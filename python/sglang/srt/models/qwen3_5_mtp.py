@@ -80,6 +80,8 @@ def _mtp_quant_config(quant_config):
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
 
+    requires_dp_attention_rank_sync_ordering = True
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
@@ -137,6 +139,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+
+    @property
+    def rank_sync_boundary_after_last_layer_communication(self) -> bool:
+        return not self.logits_processor.do_tensor_parallel_all_gather
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

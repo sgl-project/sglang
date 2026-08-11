@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -40,6 +41,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
+    is_cuda,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -139,6 +141,26 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
+        can_record_rank_sync = (
+            is_cuda()
+            and not model_runner.server_args.disable_overlap_schedule
+            and envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+            and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+            and getattr(
+                model_runner.model,
+                "requires_dp_attention_rank_sync_ordering",
+                False,
+            )
+            and getattr(
+                model_runner.model,
+                "rank_sync_boundary_after_last_layer_communication",
+                False,
+            )
+        )
+        if can_record_rank_sync:
+            self.model_runner.rank_sync_boundary_event = self.device_module.Event(
+                external=True
+            )
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -434,7 +456,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             return ret
 
         with forward_context(
-            ForwardContext(attn_backend=self.draft_extend_attn_backend)
+            ForwardContext(
+                attn_backend=self.draft_extend_attn_backend,
+                rank_sync_done_event=self.model_runner.rank_sync_boundary_event,
+            )
         ):
             self.draft_extend_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
@@ -601,6 +626,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         shape_key = self._make_graph_key(bs)
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
+        if self.model_runner.rank_sync_boundary_event is not None:
+            self.model_runner.rank_sync_done_event = (
+                self.model_runner.rank_sync_boundary_event
+            )
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],
