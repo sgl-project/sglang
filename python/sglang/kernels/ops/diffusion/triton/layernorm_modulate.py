@@ -336,8 +336,19 @@ def is_plain_layer_norm(norm: torch.nn.Module, hidden: int) -> bool:
     )
 
 
+# The fused fast paths below reproduce NVIDIA aten LayerNorm bit-for-bit
+# using PTX inline asm (rcp.approx.f32 / div.rn.f32 / rsqrt.approx.f32 with
+# "=f" float-register constraints via tl.inline_asm_elementwise). PTX is
+# CUDA-only: on ROCm the AMDGPU backend cannot allocate the "f" constraint
+# and the Triton JIT aborts at warmup ("couldn't allocate output register
+# for constraint 'f'"), which hangs FLUX/diffusion bring-up. Disable the
+# fused paths on ROCm so callers fall back to the eager aten chain (the
+# module already guarantees bit-exact-or-eager-fallback).
+_IS_ROCM = getattr(torch.version, "hip", None) is not None
+
+
 def _is_bf16_cuda(t: torch.Tensor) -> bool:
-    return t.is_cuda and t.dtype is torch.bfloat16
+    return (not _IS_ROCM) and t.is_cuda and t.dtype is torch.bfloat16
 
 
 def _mod_row_stride(t: torch.Tensor, batch: int, hidden: int) -> int | None:
