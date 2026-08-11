@@ -62,10 +62,10 @@ sgl-eval run gsm8k \\
 
   dockerImages: {
     // Multi-arch index (amd64 + arm64), so one tag covers H100, B200, and GB10.
-    // Equivalent to dev-cu13-nemotron3-5-lighting.
-    b200:        "lmsysorg/sglang:dev-nemotron3-5-lighting",
-    h100:        "lmsysorg/sglang:dev-nemotron3-5-lighting",
-    "dgx-spark": "lmsysorg/sglang:dev-nemotron3-5-lighting",
+    // Equivalent to dev-cu13-nemotron3-5-lightning.
+    b200:        "lmsysorg/sglang:dev-nemotron3-5-lightning",
+    h100:        "lmsysorg/sglang:dev-nemotron3-5-lightning",
+    "dgx-spark": "lmsysorg/sglang:dev-nemotron3-5-lightning",
   },
 
   github: {
