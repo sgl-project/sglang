@@ -43,8 +43,7 @@
  * Expert-weight scale convention: in our target backends
  * (flashinfer trtllm nvfp4 + unquantized), ``apply_routed_scaling_factor_on_output``
  * is True, so the routed scaling factor is already folded into
- * ``expert_weights`` at topk time. This kernel does not apply any
- * additional scale.
+ * ``expert_weights`` at topk time.
  */
 
 #include <cutlass/array.h>
@@ -71,6 +70,7 @@ __global__ void moeFinalizeKernel(
     int hiddenDim,
     int hiddenDimPadded,
     int topK,
+    float routedScale,
     BF16 const* __restrict__ inPtr,
     int const* __restrict__ expandedIdxToPermutedIdx,
     TypeExpW const* __restrict__ expertWeightsPtr,
@@ -90,7 +90,7 @@ __global__ void moeFinalizeKernel(
         if (permutedIdx == -1) {
           continue;
         }
-        float const scale = static_cast<float>(expertWeightsPtr[expandedIdx]);
+        float const scale = static_cast<float>(expertWeightsPtr[expandedIdx]) * routedScale;
         float const val = static_cast<float>(inPtr[permutedIdx * hiddenDimPadded + hiddenIdx]);
         acc += scale * val;
       }
@@ -141,6 +141,7 @@ __global__ void moeFinalizeKernelVecLoad(
     int hiddenDim,
     int hiddenDimPadded,
     int topK,
+    float routedScale,
     BF16 const* __restrict__ inPtr,
     int const* __restrict__ expandedIdxToPermutedIdx,
     TypeExpW const* __restrict__ expertWeightsPtr,
@@ -214,7 +215,7 @@ __global__ void moeFinalizeKernelVecLoad(
         if (permutedIdx == -1) {
           continue;
         }
-        float const scale = static_cast<float>(scaleArr[ki]);
+        float const scale = static_cast<float>(scaleArr[ki]) * routedScale;
         cutlass::NumericArrayConverter<float, BF16, FINALIZE_ELEM_PER_THREAD> toFloat;
         ComputeElem expertResult = toFloat(inputElemArr[ki]);
 #pragma unroll
@@ -253,6 +254,7 @@ void dispatchFinalize(
     int hiddenDim,
     int hiddenDimPadded,
     int topK,
+    float routedScale,
     BF16 const* inPtr,
     int const* expandedIdxPtr,
     void const* weightsPtrVoid,
@@ -283,6 +285,7 @@ void dispatchFinalize(
         hiddenDim,
         hiddenDimPadded,
         topK,
+        routedScale,
         inPtr,
         expandedIdxPtr,
         weightsPtr,
@@ -307,6 +310,7 @@ void dispatchFinalize(
         hiddenDim,
         hiddenDimPadded,
         topK,
+        routedScale,
         inPtr,
         expandedIdxPtr,
         weightsPtr,
@@ -333,7 +337,8 @@ void moe_finalize_fuse_shared(
     TensorView expert_weights,
     TensorView shared_output,
     int64_t top_k,
-    bool enable_pdl) {
+    bool enable_pdl,
+    double routed_scale) {
   TVM_FFI_ICHECK_EQ(out.ndim(), 2) << "out must be 2-D [numTokens, hiddenDim]";
   TVM_FFI_ICHECK_EQ(gemm2_out.ndim(), 2) << "gemm2_out must be 2-D [totalNumPaddedTokens, hiddenDimPadded]";
   TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.ndim(), 1);
@@ -381,6 +386,7 @@ void moe_finalize_fuse_shared(
         hiddenDim,
         hiddenDimPadded,
         int(top_k),
+        float(routed_scale),
         inPtr,
         expandedIdxPtr,
         expert_weights.data_ptr(),
@@ -396,6 +402,7 @@ void moe_finalize_fuse_shared(
         hiddenDim,
         hiddenDimPadded,
         int(top_k),
+        float(routed_scale),
         inPtr,
         expandedIdxPtr,
         expert_weights.data_ptr(),

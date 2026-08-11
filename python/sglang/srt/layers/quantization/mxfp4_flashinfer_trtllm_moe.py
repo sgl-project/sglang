@@ -319,20 +319,32 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         else:
             raise NotImplementedError(f"Unsupported mxfp4 moe precision: {precision}")
 
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            num_tokens = x_quant.shape[0]
-            out_hidden_size = (
-                x_quant.shape[-1] * 2
-                if x_quant.dtype == torch.uint8
-                else x_quant.shape[-1]
-            )
-            symm_output = torch.empty(
-                num_tokens, out_hidden_size, dtype=torch.bfloat16, device=x_quant.device
-            )
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            FlashInferTrtllmDeferredFinalizeOutput,
+            _deferred_finalize_enabled,
+        )
 
-        output = trtllm_fp4_block_scale_routed_moe(
+        defer_finalize = _deferred_finalize_enabled.get()
+
+        symm_output = None
+        if not defer_finalize:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                num_tokens = x_quant.shape[0]
+                out_hidden_size = (
+                    x_quant.shape[-1] * 2
+                    if x_quant.dtype == torch.uint8
+                    else x_quant.shape[-1]
+                )
+                symm_output = torch.empty(
+                    num_tokens,
+                    out_hidden_size,
+                    dtype=torch.bfloat16,
+                    device=x_quant.device,
+                )
+
+        result = trtllm_fp4_block_scale_routed_moe(
             topk_ids=packed_topk,
             routing_bias=None,
             hidden_states=x_quant,
@@ -358,12 +370,28 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             local_num_experts=num_local_experts,
             routed_scaling_factor=1.0,
             routing_method_type=int(RoutingMethodType.TopK),
-            do_finalize=True,
+            do_finalize=not defer_finalize,
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=symm_output,
-        )[0]
+        )
 
-        return StandardCombineInput(hidden_states=output)
+        if not defer_finalize:
+            return StandardCombineInput(hidden_states=result[0])
+
+        gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+
+        return StandardCombineInput(
+            hidden_states=FlashInferTrtllmDeferredFinalizeOutput(
+                gemm2_out=gemm2_out,
+                expert_weights=expert_weights,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                top_k=packed_topk.shape[1],
+                routed_scale=(
+                    1.0 if routed_scaling_factor is None else routed_scaling_factor
+                ),
+            )
+        )
 
 
 def maybe_fuse_routed_scale_and_shared_add(

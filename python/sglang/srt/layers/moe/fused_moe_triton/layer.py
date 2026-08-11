@@ -48,6 +48,7 @@ from sglang.srt.layers.moe.topk import (
     TopKConfig,
     TopKOutput,
     TopKOutputChecker,
+    TopKOutputFormat,
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -97,6 +98,24 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # layers can resolve to different quant methods, so print_info_once (keyed on the
 # full message) would otherwise fire once per distinct quant method.
 _deferred_finalize_info_logged = False
+
+
+def _deferred_finalize_topk_format(quant_method) -> Optional[TopKOutputFormat]:
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+        Mxfp4FlashinferTrtllmMoEMethod,
+    )
+
+    backend = get_moe_runner_backend()
+    if backend.is_flashinfer_trtllm():
+        if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
+            return TopKOutputFormat.BYPASSED
+        if isinstance(quant_method, Fp8MoEMethod) and quant_method.block_quant:
+            return TopKOutputFormat.BYPASSED
+    if backend.is_flashinfer_mxfp4() and isinstance(
+        quant_method, Mxfp4FlashinferTrtllmMoEMethod
+    ):
+        return TopKOutputFormat.STANDARD
+    return None
 
 
 def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
@@ -381,10 +400,12 @@ class FusedMoE(torch.nn.Module):
                     self.use_deep_gemm,
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
+        self.deferred_finalize_topk_format = _deferred_finalize_topk_format(
+            self.quant_method
+        )
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
-            and get_moe_runner_backend().is_flashinfer_trtllm()
-            and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            and self.deferred_finalize_topk_format is not None
         )
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
@@ -392,6 +413,7 @@ class FusedMoE(torch.nn.Module):
             logging.getLogger(__name__).info(
                 "FlashInfer TRTLLM MoE deferred finalize is "
                 f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+                f"(topk_format={self.deferred_finalize_topk_format}) "
                 f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
                 f"quant_method={type(self.quant_method).__name__})."
             )

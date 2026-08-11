@@ -24,6 +24,7 @@ def moe_finalize_fuse_shared(
     shared_output: Optional[torch.Tensor],
     top_k: int,
     enable_pdl: bool = False,
+    routed_scale: float = 1.0,
 ) -> torch.Tensor:
     assert gemm2_out.dtype == torch.bfloat16
     assert expert_weights.dtype in (torch.float32, torch.bfloat16)
@@ -56,5 +57,6 @@ def moe_finalize_fuse_shared(
         shared_output,
         int(top_k),
         bool(enable_pdl),
+        float(routed_scale),
     )
     return out

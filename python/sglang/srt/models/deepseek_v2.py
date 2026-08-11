@@ -981,8 +981,8 @@ class DeepseekV2MoE(nn.Module):
         deferred_finalize = (
             has_shared_output
             and not self._shared_expert_tp1
-            and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
+            and topk_output.format == self.experts.deferred_finalize_topk_format
         )
         if deferred_finalize:
             final_hidden_states = self.experts.forward_deferred_finalize(
