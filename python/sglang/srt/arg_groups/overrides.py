@@ -1299,8 +1299,41 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         else:
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
-    if is_sm100_supported() and server_args.attention_backend is None:
-        overrides["attention_backend"] = "flashinfer"
+    # FlashInfer target verification can materially change acceptance for
+    # Nemotron-H speculative decoding on Blackwell. On SM100, TRT-LLM MHA is
+    # the fastest validated target backend and also accelerates the eligible
+    # MTP / DSpark drafts; it requires paged KV and the Mamba extra buffer.
+    # TRT-LLM MHA prefill is not supported on SM120/121, where Triton target
+    # verification plus a FlashInfer draft preserves the expected acceptance.
+    # DFlash keeps its existing config-aware draft resolver: the public draft's
+    # full-attention layout falls back to FlashInfer, while a future compatible
+    # all-sliding or explicitly causal draft can retain TRT-LLM MHA.
+    # Keep the target-only default unchanged, and never override an explicitly
+    # selected unified/split target backend or an explicit draft backend.
+    if is_blackwell_supported() and server_args.is_attention_backend_not_set():
+        if server_args.speculative_algorithm is not None:
+            speculative_algorithm = server_args.speculative_algorithm.upper()
+            if is_sm100_supported() and server_args.speculative_eagle_topk in (
+                None,
+                1,
+            ):
+                overrides["attention_backend"] = "trtllm_mha"
+                if server_args.page_size is None:
+                    overrides["page_size"] = 64
+                if server_args.mamba_radix_cache_strategy == "auto":
+                    overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+                if server_args.speculative_draft_attention_backend is None:
+                    if speculative_algorithm in ("EAGLE", "NEXTN", "DSPARK"):
+                        overrides["speculative_draft_attention_backend"] = "trtllm_mha"
+            else:
+                overrides["attention_backend"] = "triton"
+                if (
+                    server_args.speculative_draft_attention_backend is None
+                    and speculative_algorithm in ("EAGLE", "NEXTN", "DFLASH", "DSPARK")
+                ):
+                    overrides["speculative_draft_attention_backend"] = "flashinfer"
+        elif is_sm100_supported():
+            overrides["attention_backend"] = "flashinfer"
     return overrides
 
 

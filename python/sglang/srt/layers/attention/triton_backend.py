@@ -14,6 +14,7 @@ from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     kimi_linear_config,
     linear_attn_model_spec,
+    mamba2_config,
 )
 from sglang.srt.configs.model_config import AttentionArch, is_kimi_k3
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -68,6 +69,16 @@ if TYPE_CHECKING:
 
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
+
+
+def _is_hybrid_linear_attention_model(model_config) -> bool:
+    """Whether layer zero may be a non-attention hybrid layer."""
+    return (
+        hybrid_gdn_config(model_config) is not None
+        or kimi_linear_config(model_config) is not None
+        or linear_attn_model_spec(model_config) is not None
+        or mamba2_config(model_config) is not None
+    )
 
 
 def _mla_decode_kv_splits_cap(
@@ -213,11 +224,7 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and swa_v_head_dim != full_v_head_dim:
             self.v_head_dim = full_v_head_dim
             self.swa_v_head_dim = swa_v_head_dim
-        elif (
-            hybrid_gdn_config(model_runner.model_config) is not None
-            or kimi_linear_config(model_runner.model_config) is not None
-            or linear_attn_model_spec(model_runner.model_config) is not None
-        ):
+        elif _is_hybrid_linear_attention_model(model_runner.model_config):
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
