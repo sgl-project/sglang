@@ -64,6 +64,14 @@ impl Config {
             // (including empty, for a cluster-wide watch) is accepted.
             DiscoveryBackend::K8s(_) => {}
         }
+        // Prefix the role so the diagnostic names the flag that has to
+        // change — `validate_bucket_ranges` only sees a list of ranges
+        // and can't tell prefill from decode. The two lists are checked
+        // independently: the same bucket name in both roles is fine.
+        validate_bucket_ranges(&self.buckets.prefill)
+            .map_err(|e| anyhow!("--prefill-bucket: {e}"))?;
+        validate_bucket_ranges(&self.buckets.decode)
+            .map_err(|e| anyhow!("--decode-bucket: {e}"))?;
         Ok(())
     }
 }
@@ -96,6 +104,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            buckets: BucketConfig::default(),
         }
     }
 

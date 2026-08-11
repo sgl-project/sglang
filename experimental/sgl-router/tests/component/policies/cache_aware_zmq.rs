@@ -22,7 +22,7 @@ use std::time::Duration;
 use zeromq::SocketSend;
 
 use sgl_router::config::CacheAwareConfig;
-use sgl_router::config::{ActiveLoadConfig, ProxyConfig};
+use sgl_router::config::{ActiveLoadConfig, BucketConfig, ProxyConfig};
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::cache_aware_zmq::CacheAwareZmqPolicy;
@@ -80,6 +80,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         ),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        buckets: BucketConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
 

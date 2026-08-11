@@ -1,5 +1,7 @@
 use std::num::NonZeroU32;
 
+use crate::config::BucketRange;
+
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
 /// [`Config::validate`]. The router serves exactly one model.
@@ -8,6 +10,12 @@ pub struct Config {
     pub server: ServerConfig,
     pub observability: ObservabilityConfig,
     pub model: ModelConfig,
+    /// Bucket-dispatch ranges, per role. Built from the
+    /// `--prefill-bucket` / `--decode-bucket` flags; empty vecs mean
+    /// bucket dispatch is not configured. Cross-bucket invariants
+    /// (duplicate names, overlaps) are checked by [`Config::validate`].
+    pub buckets: BucketConfig,
+
     /// Selected discovery backend. Built from CLI flags by
     /// [`crate::config::cli::Cli::into_config`]: the static-vs-k8s choice
     /// and the k8s selector grammar are resolved there (the latter via
@@ -16,6 +24,16 @@ pub struct Config {
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
     pub active_load: ActiveLoadConfig,
+}
+
+/// Length-range buckets used to narrow worker selection before the
+/// routing policy runs. Prefill and decode carry independent range
+/// lists because the two roles bucket on different quantities —
+/// uncached prefill tokens vs estimated sequence length.
+#[derive(Debug, Clone, Default)]
+pub struct BucketConfig {
+    pub prefill: Vec<BucketRange>,
+    pub decode: Vec<BucketRange>,
 }
 
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
