@@ -2649,7 +2649,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         checkpoint_grid = mamba_checkpoint_grid(self.tree_cache.page_size)
 
         def _force_track_h(i: int) -> int:
-            assert i % chunk_size == 0
+            # h is indexed relative to the extend start, so check that offset.
+            assert (i - len(req.prefix_indices)) % chunk_size == 0, (
+                f"The force track calculation only handles last-position or "
+                f"unaligned seqlens, so it needs a chunk-aligned offset to "
+                f"start from. But i={i} prefix_len={len(req.prefix_indices)} "
+                f"chunk_size={chunk_size} checkpoint_grid={checkpoint_grid}"
+            )
             # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
             # 1) aligned with chunk_size-> retrieve from last_recurrent_state
             #    a) is the last position -> retrieve from last_recurrent_state
