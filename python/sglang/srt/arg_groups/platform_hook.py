@@ -48,6 +48,12 @@ def handle_ppu_backends(server_args: Any):
     # Use CUDA FLA fast path by default on PPU.
     if not envs.SGLANG_SAIL_FLA_CUDA.is_set():
         envs.SGLANG_SAIL_FLA_CUDA.set(True)
+    # Disable DeepSeek-V4 topk_v2 on PPU by default.
+    if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+        envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+    # Disable DeepSeek-V4 topk_v2 on PPU by default.
+    if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+        envs.SGLANG_OPT_USE_TOPK_V2.set(False)
     # Disable custom allreduce by default on PPU (use pccl allreduce for perf).
     if not cfg.disable_custom_all_reduce:
         declare_resolution(
