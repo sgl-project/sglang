@@ -48,6 +48,13 @@ pub struct ProxyConfig {
     /// per-worker in-flight slot (otherwise a non-draining client pins it
     /// forever). Wired into `STREAM_SEND_STALL`'s slot.
     pub stream_send_stall_secs: u64,
+    /// Absolute cap (seconds) on total streaming-response lifetime, independent
+    /// of the idle timeout. Backstops a pump draining a fast upstream for a
+    /// silently-gone client (which trips neither the idle timeout nor
+    /// `tx.closed()`), so its per-request state can't accumulate into an OOM
+    /// under a disconnect flood. Set well above the longest legitimate
+    /// generation. Wired into `STREAM_TOTAL_TIMEOUT`'s slot.
+    pub stream_total_timeout_secs: u64,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -65,12 +72,20 @@ pub fn default_stream_send_stall_secs() -> u64 {
     180
 }
 
+// Absolute total-lifetime cap. Must stay in sync with the `STREAM_TOTAL_TIMEOUT`
+// fallback const in `proxy`. Generous by default so it only ever reaps a pump
+// that has outlived any plausible client, never a real long generation.
+pub fn default_stream_total_timeout_secs() -> u64 {
+    3600
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             stream_send_stall_secs: default_stream_send_stall_secs(),
+            stream_total_timeout_secs: default_stream_total_timeout_secs(),
         }
     }
 }

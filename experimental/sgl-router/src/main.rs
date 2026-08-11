@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
         .with_stream_timeouts(
             std::time::Duration::from_secs(cfg.proxy.stream_idle_timeout_secs),
             std::time::Duration::from_secs(cfg.proxy.stream_send_stall_secs),
+            std::time::Duration::from_secs(cfg.proxy.stream_total_timeout_secs),
         ),
     );
 

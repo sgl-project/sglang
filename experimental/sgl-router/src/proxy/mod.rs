@@ -235,6 +235,16 @@ fn breaker_outcome(status: reqwest::StatusCode) -> BreakerOutcome {
 /// it, a half-open upstream (e.g. a worker killed mid-stream) pins the SSE pump
 /// and leaks the per-worker in-flight slot forever.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Absolute wall-clock cap on a single streaming response, independent of the
+/// idle timeout. Backstops the case where a pump drains a fast upstream for a
+/// client that has silently gone away (e.g. an HTTP/2 peer whose reset never
+/// surfaces as `tx.closed()`): the idle timeout never trips because the upstream
+/// keeps progressing, so without this cap the pump — and its per-request state
+/// (admission slot, active-load entry, read-ahead channel, capture buffer) —
+/// lives until the generation ends, and under a disconnect flood these
+/// accumulate into an OOM. Set well above the longest legitimate generation so
+/// real long streams are never affected; prod overrides from config.
+const STREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// How long an abort POST may take before we give up. The client is already
 /// gone, so this only bounds how long the fire-and-forget task lingers; a slow
@@ -479,6 +489,11 @@ pub struct Proxy {
     /// the per-worker slot. Defaults to `STREAM_SEND_STALL`; prod overrides it
     /// from config via [`Self::with_stream_timeouts`].
     pub stream_send_stall: Duration,
+    /// Absolute cap on total streaming-response lifetime — the backstop that
+    /// reaps a pump draining a fast upstream for a silently-gone client (which
+    /// trips neither `stream_idle_timeout` nor `tx.closed()`). Defaults to
+    /// `STREAM_TOTAL_TIMEOUT`; prod overrides it via [`Self::with_stream_timeouts`].
+    pub stream_total_timeout: Duration,
     /// Metrics sink for the drop-side of `AbortOnDrop`. Filled once at startup
     /// via [`Self::attach_metrics`] — matching the same pattern
     /// `ActiveLoadRegistry` and `PolicyRegistry` use — so tests that build a
@@ -576,6 +591,7 @@ impl Proxy {
             // Defaults; prod overrides from config via `with_stream_timeouts`.
             stream_idle_timeout: STREAM_IDLE_TIMEOUT,
             stream_send_stall: sse::STREAM_SEND_STALL,
+            stream_total_timeout: STREAM_TOTAL_TIMEOUT,
             metrics: OnceLock::new(),
         })
     }
@@ -588,9 +604,11 @@ impl Proxy {
         mut self,
         stream_idle_timeout: Duration,
         stream_send_stall: Duration,
+        stream_total_timeout: Duration,
     ) -> Self {
         self.stream_idle_timeout = stream_idle_timeout;
         self.stream_send_stall = stream_send_stall;
+        self.stream_total_timeout = stream_total_timeout;
         self
     }
 
@@ -1018,8 +1036,14 @@ impl Proxy {
         // or a non-draining stall — the guard drops with the flag still false and
         // tells the engine to stop. A non-2xx stream is the engine's own error
         // body (it isn't generating), so it is never abortable.
+        // Idle cap (per-chunk stall) composed under a total cap (absolute
+        // lifetime). The total cap is the backstop for a fast upstream draining
+        // to a silently-gone client, where the idle cap never trips.
         let upstream: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>> =
-            sse::idle_timeout_stream(resp.bytes_stream(), self.stream_idle_timeout);
+            sse::total_timeout_stream(
+                sse::idle_timeout_stream(resp.bytes_stream(), self.stream_idle_timeout),
+                self.stream_total_timeout,
+            );
         let (upstream, abort_guard, abort_reason_handle) = match abort_rid {
             Some(rid) if status.is_success() => match worker_url.join("/abort_request") {
                 Ok(abort_url) => {
@@ -1103,9 +1127,14 @@ mod tests {
     async fn with_stream_timeouts_overrides_both_legs() {
         let p = Proxy::new(Duration::from_secs(5))
             .unwrap()
-            .with_stream_timeouts(Duration::from_secs(90), Duration::from_secs(45));
+            .with_stream_timeouts(
+                Duration::from_secs(90),
+                Duration::from_secs(45),
+                Duration::from_secs(600),
+            );
         assert_eq!(p.stream_idle_timeout, Duration::from_secs(90));
         assert_eq!(p.stream_send_stall, Duration::from_secs(45));
+        assert_eq!(p.stream_total_timeout, Duration::from_secs(600));
         // Untouched by the builder.
         assert_eq!(p.request_timeout, Duration::from_secs(5));
     }

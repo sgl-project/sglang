@@ -13,7 +13,8 @@ use crate::config::{
     default_cache_sim_max_concurrent_captures, default_cb_cool_down,
     default_proxy_request_timeout_secs, default_shutdown_drain_secs,
     default_stale_request_timeout_secs, default_stream_idle_timeout_secs,
-    default_stream_send_stall_secs, default_tokenizer_shards, resolve_mode, ActiveLoadConfig,
+    default_stream_send_stall_secs, default_stream_total_timeout_secs, default_tokenizer_shards,
+    resolve_mode, ActiveLoadConfig,
     AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig, Config, DiscoveryBackend,
     K8sDiscoveryConfig, LoadGate, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, RetryConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
@@ -281,6 +282,19 @@ pub struct Cli {
         default_value_t = default_stream_send_stall_secs()
     )]
     pub stream_send_stall_secs: u64,
+    /// Absolute cap (seconds) on total streaming-response lifetime, independent
+    /// of the idle timeout. Backstops a pump draining a fast upstream for a
+    /// silently-gone client (which trips neither the idle timeout nor the
+    /// client-disconnect signal), bounding retained per-request state so it
+    /// cannot accumulate into an OOM under a disconnect flood. Set well above
+    /// the longest legitimate generation. Also settable via the
+    /// `SGLANG_ROUTER_STREAM_TOTAL_TIMEOUT_SECS` env var.
+    #[arg(
+        long,
+        env = "SGLANG_ROUTER_STREAM_TOTAL_TIMEOUT_SECS",
+        default_value_t = default_stream_total_timeout_secs()
+    )]
+    pub stream_total_timeout_secs: u64,
     /// Max lifetime of an in-flight request entry before the janitor
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
@@ -631,6 +645,7 @@ impl Cli {
                 request_timeout_secs: self.request_timeout_secs,
                 stream_idle_timeout_secs: self.stream_idle_timeout_secs,
                 stream_send_stall_secs: self.stream_send_stall_secs,
+                stream_total_timeout_secs: self.stream_total_timeout_secs,
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,

@@ -765,6 +765,62 @@ where
     .boxed()
 }
 
+/// Cap the *total* wall-clock lifetime of a stream, independent of the per-chunk
+/// idle timeout.
+///
+/// [`idle_timeout_stream`] only reaps a stream that goes *quiet*. But a pump
+/// draining a fast, still-progressing upstream for a client that has silently
+/// gone away — e.g. an HTTP/2 peer whose `RST_STREAM` never surfaces as
+/// `tx.closed()`, so neither the `tx.closed()` arm nor the idle timeout fires —
+/// stays busy and never idles. Its per-request state (the per-worker admission
+/// slot + active-load entry + read-ahead channel + capture buffer) is pinned for
+/// the whole generation, and under a flood of such disconnects these accumulate
+/// and walk the router into an OOM (the failure this guards against; see
+/// [`idle_timeout_stream`]'s note on leaked in-flight slots).
+///
+/// A total cap guarantees every pump is torn down within `total` regardless of
+/// whether the disconnect was ever detected, bounding retained per-request
+/// state. Unlike the idle timeout, the deadline is fixed at stream start and is
+/// **not** reset by delivered chunks. Set `total` well above the longest
+/// legitimate generation so real long streams are unaffected — it should only
+/// ever trip on a pump that has outlived any plausible client.
+pub fn total_timeout_stream<S, E>(
+    stream: S,
+    total: std::time::Duration,
+) -> futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let deadline = tokio::time::Instant::now() + total;
+    futures::stream::unfold((stream, false), move |(mut s, ended)| async move {
+        if ended {
+            return None;
+        }
+        // `timeout_at` shares one fixed deadline across every poll, so a chunk
+        // arriving does not extend it (contrast `idle_timeout_stream`, which
+        // resets per chunk).
+        match tokio::time::timeout_at(deadline, s.next()).await {
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), (s, false))),
+            Ok(Some(Err(e))) => Some((
+                std::io::Result::Err(std::io::Error::other(e.to_string())),
+                (s, true),
+            )),
+            Ok(None) => None,
+            // Total lifetime exceeded: surface a terminal error so the pump
+            // exits and drops its guards instead of draining a dead client
+            // forever.
+            Err(_elapsed) => Some((
+                std::io::Result::Err(std::io::Error::other(format!(
+                    "upstream stream exceeded total lifetime {total:?}; aborting to release in-flight slot"
+                ))),
+                (s, true),
+            )),
+        }
+    })
+    .boxed()
+}
+
 /// Wrap a stream so `reached_end` flips to `true` the instant the stream yields
 /// its terminal item — a clean `None` (the engine finished generating) or a
 /// terminal `Err` (the engine failed, or the idle timeout tripped). The SSE
@@ -1677,6 +1733,94 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             "a client disconnect during an upstream stall must release guards \
              promptly via the disconnect break, not wait for the idle timeout",
+        );
+    }
+
+    /// The distinguishing invariant of the *total* cap versus the idle cap: a
+    /// stream that stays busy (emits a chunk before every idle window, so the
+    /// idle timeout never trips) is still reaped once the absolute deadline
+    /// passes. The idle cap would let such a stream run forever; the total cap
+    /// must pass chunks through until the deadline, then yield exactly one
+    /// terminal error and end.
+    #[tokio::test(start_paused = true)]
+    async fn total_timeout_reaps_a_never_idle_stream() {
+        // Upstream that emits a chunk every 100 ms forever — never idle.
+        let busy = stream::unfold(0u64, |n| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Some((Ok::<Bytes, std::io::Error>(Bytes::from_static(b"x")), n + 1))
+        });
+        let mut capped = total_timeout_stream(busy.boxed(), std::time::Duration::from_secs(2));
+
+        let mut chunks = 0usize;
+        let mut saw_timeout_err = false;
+        while let Some(item) = capped.next().await {
+            match item {
+                Ok(_) => chunks += 1,
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("exceeded total lifetime"),
+                        "terminal error must be the total-cap error, got: {e}",
+                    );
+                    saw_timeout_err = true;
+                }
+            }
+        }
+        assert!(
+            saw_timeout_err,
+            "a never-idle stream must be reaped by the total cap",
+        );
+        assert!(
+            chunks > 0,
+            "chunks produced before the deadline must pass through untouched",
+        );
+    }
+
+    /// The OOM backstop end-to-end: a *fast* upstream (never idle, so the idle
+    /// timeout never trips) must still release its `stream_guards` — via the
+    /// total-lifetime cap. Under a flood of such pumps this is the retention
+    /// path that walks the router into an OOM; the total cap bounds each pump's
+    /// held admission slot + buffers to a fixed lifetime.
+    #[tokio::test(start_paused = true)]
+    async fn total_timeout_releases_guards_for_a_busy_upstream() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard: Box<dyn Send + 'static> = Box::new(DropFlag(Arc::clone(&dropped)));
+
+        // Busy upstream (chunk every 50 ms forever) wrapped in a LONG (1 h) idle
+        // timeout, so the ONLY reaping path is the 2 s total cap.
+        let busy = stream::unfold(0u64, |n| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Some((Ok::<Bytes, std::io::Error>(Bytes::from_static(b"x")), n + 1))
+        });
+        let capped = total_timeout_stream(
+            idle_timeout_stream(busy.boxed(), std::time::Duration::from_secs(3600)),
+            std::time::Duration::from_secs(2),
+        );
+        let body = bytes_stream_to_body(capped, Some(guard), None, None, None, None);
+        tokio::spawn(async move {
+            let _ = body.collect().await;
+        });
+
+        // The guard must drop once the 2 s total cap fires — well before the 1 h
+        // idle timeout it is composed over.
+        for _ in 0..1000 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "a busy upstream must release stream_guards via the total cap, \
+             not run until the (long) idle timeout",
         );
     }
 
