@@ -1,10 +1,11 @@
 """Run the `rust/` Cargo workspace's unit tests from the CPU CI suite.
 
-The `rust/` workspace (sglang-grpc, sglang-mm, sglang-server) is compiled into
-the wheel by setuptools-rust, but until now nothing ran `cargo test` in CI --
-`.github/workflows/pr-test-rust.yml` and `pr-benchmark-rust.yml` are both
-path-scoped to `sgl-model-gateway/**`, a different workspace. `lint.yml` covers
-rustfmt/clippy via the pre-commit hooks, so this file only adds the test run.
+The `rust/` workspace (sglang-grpc, sglang-grpc-proto, sglang-mm, and
+sglang-server) contains the crates compiled into the wheel by setuptools-rust
+or linked into those extensions. `.github/workflows/pr-test-rust.yml` and
+`pr-benchmark-rust.yml` are both path-scoped to `sgl-model-gateway/**`, a
+different workspace. `lint.yml` covers rustfmt/clippy via the pre-commit hooks,
+so this file only adds the test run.
 
 The debug profile is deliberate: these are pure-logic tests (no timing or
 codegen assertions), and the release profile costs a full LTO build for the
