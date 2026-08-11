@@ -3,6 +3,7 @@ import base64
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from PIL import Image
@@ -60,6 +61,14 @@ class TestMediaIdentity(unittest.TestCase):
             second = snapshot_media(str(path))
         self.assertNotEqual(first.content_digest, second.content_digest)
 
+    def test_same_url_with_new_contents_misses(self):
+        with patch(
+            "sglang.srt.utils.get_image_bytes", side_effect=[b"first", b"second"]
+        ):
+            first = snapshot_media("https://example.com/image.png")
+            second = snapshot_media("https://example.com/image.png")
+        self.assertNotEqual(first.content_digest, second.content_digest)
+
     def test_pil_and_noncontiguous_tensor_are_snapshotted(self):
         image = Image.new("RGBA", (3, 2), (1, 2, 3, 4))
         first = snapshot_media(image)
@@ -70,6 +79,24 @@ class TestMediaIdentity(unittest.TestCase):
         tensor_snapshot = snapshot_media(tensor)
         self.assertTrue(tensor_snapshot.data.is_contiguous())
         self.assertTrue(torch.equal(tensor_snapshot.data, tensor))
+
+    def test_pil_palette_and_transparency_are_part_of_identity(self):
+        first = Image.new("P", (2, 2), color=0)
+        second = first.copy()
+        first.putpalette([255, 0, 0] + [0, 0, 0] * 255)
+        second.putpalette([0, 255, 0] + [0, 0, 0] * 255)
+        self.assertNotEqual(
+            snapshot_media(first).content_digest,
+            snapshot_media(second).content_digest,
+        )
+
+        second.putpalette(first.getpalette())
+        first.info["transparency"] = 0
+        second.info["transparency"] = 1
+        self.assertNotEqual(
+            snapshot_media(first).content_digest,
+            snapshot_media(second).content_digest,
+        )
 
     def test_artifact_key_includes_processor_and_kwargs(self):
         digest = snapshot_media(b"image").content_digest
@@ -163,6 +190,33 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
             release.set()
             self.assertEqual((await task).value, b"old-generation")
             self.assertNotIn("key", cache)
+
+        asyncio.run(run())
+
+    def test_clear_starts_a_new_singleflight_generation(self):
+        async def run():
+            cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def compute_old():
+                started.set()
+                await release.wait()
+                return b"old"
+
+            async def compute_new():
+                return b"new"
+
+            old_task = asyncio.create_task(cache.get_or_compute("key", compute_old))
+            await started.wait()
+            cache.clear()
+            new_result = await cache.get_or_compute("key", compute_new)
+            release.set()
+            old_result = await old_task
+
+            self.assertEqual(old_result.value, b"old")
+            self.assertEqual(new_result.value, b"new")
+            self.assertEqual(cache.get("key"), b"new")
 
         asyncio.run(run())
 
