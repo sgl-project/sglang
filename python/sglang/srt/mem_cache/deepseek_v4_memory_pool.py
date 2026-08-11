@@ -87,6 +87,16 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
+        self.bf16_kv = envs.SGLANG_DSV4_BF16_KV.get()
+        if self.bf16_kv:
+            assert qk_nope_head_dim + qk_rope_head_dim == 512, (
+                "DSV4 BF16 KV cache expects head_dim=512, got "
+                f"{qk_nope_head_dim + qk_rope_head_dim}"
+            )
+            logger.info(
+                "DSV4 BF16 KV cache enabled: plain BF16 head_dim=512, "
+                "bytes_per_token=1024"
+            )
         self._create_buffers()
 
     def _create_buffers(self):
@@ -104,6 +114,10 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
+        if self.bf16_kv:
+            return (
+                self.qk_nope_head_dim + self.qk_rope_head_dim
+            ) * torch.bfloat16.itemsize
         dim_per_token = (
             self.qk_nope_head_dim
             + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
@@ -114,8 +128,18 @@ class DeepSeekV4SingleKVPool(KVCache):
 
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
-        self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
+        if self.bf16_kv:
+            self.kv_cache_total_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            self.bytes_per_page_padded = bytes_per_page_non_padded
+            return torch.zeros(
+                num_pages,
+                bytes_per_page_non_padded,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+
+        self.kv_cache_total_dim = bytes_per_token
         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
 
         assert bytes_per_token == 448 + 64 * 2 + 8, (
@@ -137,6 +161,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
+        assert not self.bf16_kv, "BF16 KV cache requires set_key_buffer_bf16"
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
@@ -144,12 +169,28 @@ class DeepSeekV4SingleKVPool(KVCache):
             nope_fp8_rope_bf16_pack=cache_nope_fp8_rope_bf16_pack,
         )
 
+    def set_key_buffer_bf16(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        assert self.bf16_kv, "BF16 KV cache is not enabled"
+        assert cache_k.dtype == torch.bfloat16
+        cache_k = cache_k.reshape(-1, self.kv_cache_total_dim)
+        cache = self.kv_buffer[layer_id].view(torch.bfloat16).view(
+            -1, self.kv_cache_total_dim
+        )
+        cache[loc.to(torch.int64)] = cache_k
+
     def set_key_buffer_fused(
         self,
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if self.bf16_kv:
+            return self.set_key_buffer_bf16(layer_id, loc, cache_k)
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
@@ -159,6 +200,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
 
     def get_key_buffer(self, layer_id: int):
+        if self.bf16_kv:
+            return self.kv_buffer[layer_id - self.start_layer].view(torch.bfloat16)
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
@@ -249,6 +292,15 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
     ) -> None:
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().set_key_buffer_fused(layer_id, loc, cache_k)
+
+    def set_key_buffer_bf16(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        loc = self.translate_loc_to_hisparse_device(loc)
+        return super().set_key_buffer_bf16(layer_id, loc, cache_k)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
@@ -1061,6 +1113,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return layer_id - self._stage_start
 
     def get_swa_raw_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.swa_kv_pool.bf16_kv:
+            return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
         return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
 
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
@@ -1075,6 +1129,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         self.swa_kv_pool.set_key_buffer(
             self._swa_local_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
+        )
+
+    def set_swa_key_buffer_bf16(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        self.swa_kv_pool.set_key_buffer_bf16(
+            self._swa_local_layer_id(layer_id), loc, cache_k
         )
 
     def get_extra_key_page_size(self, layer_id: int) -> int:
@@ -1099,6 +1163,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_kv_pool.set_key_buffer(
             compress_layer_id, loc, cache_nope_fp8_rope_bf16_pack
         )
+
+    def set_extra_key_buffer_bf16(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        assert compress_kv_pool is not None
+        compress_kv_pool.set_key_buffer_bf16(compress_layer_id, loc, cache_k)
 
     def get_index_k_page_size(self) -> int:
         return self.c4_indexer_kv_pool.page_size
@@ -1161,6 +1235,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         self.swa_kv_pool.set_key_buffer(
             self._swa_local_layer_id(layer_id), swa_loc, cache_nope_fp8_rope_bf16_pack
+        )
+
+    def set_swa_key_buffer_radix_bf16(
+        self,
+        layer_id: int,
+        swa_loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        self.swa_kv_pool.set_key_buffer_bf16(
+            self._swa_local_layer_id(layer_id), swa_loc, cache_k
         )
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:

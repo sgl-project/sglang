@@ -248,6 +248,7 @@ class CompressorBackendMixin:
                 assert compress_kv_pool is not None
                 kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+                bf16_store = envs.SGLANG_DSV4_BF16_KV.get()
                 if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                     out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
                         out_loc
