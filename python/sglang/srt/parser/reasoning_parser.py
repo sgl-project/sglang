@@ -23,6 +23,16 @@ from sglang.srt.function_call.kimik3_format import (
     strip_partial_marker_suffix,
     strip_response_wrappers,
 )
+from sglang.srt.function_call.muse_glimmer_format import (
+    EOM,
+    EOT,
+    MAX_CHANNEL_MARKER,
+    MESSAGE,
+    RECIPIENT_RE,
+    START,
+    has_atem_markers,
+    partial_marker_len,
+)
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
@@ -1652,16 +1662,6 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
     terminator and the partial body is still attributed to whichever channel was open.
     """
 
-    MESSAGE = "<|message|>"
-    EOM = "<|eom|>"
-    EOT = "<|eot|>"
-    START = "<|start|>"
-    _MAX_MARKER = max(len(MESSAGE), len(EOM), len(EOT), len(START))
-    _RECIPIENT_RE = re.compile(r"to=([^\s<]+)")
-
-    # ATEM markers that identify a tool-call turn in the non-reasoning remainder.
-    _ATEM_MARKERS = ("<atem:invoke", "<atem:function_calls>")
-
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -1672,8 +1672,8 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
         tool_call_parser_active: bool = False,
     ):
         super().__init__(
-            " to=self" + self.MESSAGE,
-            self.EOM,
+            " to=self" + MESSAGE,
+            EOM,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
@@ -1688,20 +1688,6 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
 
     def _sink(self, recipient: Optional[str]) -> str:
         return "reasoning" if recipient == "self" else "normal"
-
-    @classmethod
-    def _partial_marker_len(cls, buf: str) -> int:
-        """Length of the longest suffix of ``buf`` that could still become a marker.
-
-        Returns 0 when nothing is held back, so ordinary text streams out immediately
-        instead of waiting for a terminator that may never arrive.
-        """
-        markers = (cls.EOM, cls.EOT, cls.START)
-        for k in range(min(len(buf), cls._MAX_MARKER - 1), 0, -1):
-            tail = buf[-k:]
-            if any(m.startswith(tail) for m in markers):
-                return k
-        return 0
 
     def _consume(self, flush: bool, preserve_channels: bool = False) -> Tuple[str, str]:
         """Drain self._buffer into (reasoning, normal).
@@ -1719,16 +1705,16 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
 
         while self._buffer:
             if not self._in_body:
-                idx = self._buffer.find(self.MESSAGE)
+                idx = self._buffer.find(MESSAGE)
                 if idx == -1:
                     if flush:
                         normal_parts.append(self._buffer)
                         self._buffer = ""
                     break
                 header = self._buffer[:idx]
-                m = self._RECIPIENT_RE.search(header)
+                m = RECIPIENT_RE.search(header)
                 self._recipient = m.group(1) if m else "user"
-                self._buffer = self._buffer[idx + len(self.MESSAGE) :]
+                self._buffer = self._buffer[idx + len(MESSAGE) :]
                 self._in_body = True
                 if self._sink(self._recipient) == "reasoning":
                     if self._saw_reasoning_block:
@@ -1736,11 +1722,11 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
                     self._saw_reasoning_block = True
                 elif self._recipient != "user" or preserve_channels:
                     # Keep the header so the function-call detector sees it.
-                    normal_parts.append(header + self.MESSAGE)
+                    normal_parts.append(header + MESSAGE)
                 continue
 
             end_idx, end_tok = -1, ""
-            for tok in (self.EOM, self.EOT):
+            for tok in (EOM, EOT):
                 i = self._buffer.find(tok)
                 if i != -1 and (end_idx == -1 or i < end_idx):
                     end_idx, end_tok = i, tok
@@ -1762,7 +1748,9 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
             if flush:
                 body, self._buffer = self._buffer, ""
             else:
-                keep = self._partial_marker_len(self._buffer)
+                keep = partial_marker_len(
+                    self._buffer, (EOM, EOT, START), MAX_CHANNEL_MARKER
+                )
                 if keep == len(self._buffer):
                     break
                 body = self._buffer[: len(self._buffer) - keep]
@@ -1780,9 +1768,7 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
         self._buffer += text
         raw = self._buffer
         reasoning, normal = self._consume(flush=True)
-        if self._tool_call_parser_active and any(
-            m in normal for m in self._ATEM_MARKERS
-        ):
+        if self._tool_call_parser_active and has_atem_markers(normal):
             self._buffer = raw
             self._recipient = None
             self._in_body = False

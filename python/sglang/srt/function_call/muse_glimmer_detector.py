@@ -12,21 +12,23 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.muse_glimmer_format import (
+    EOM,
+    EOT,
+    FUNCTION_CALLS_CLOSE,
+    FUNCTION_CALLS_OPEN,
+    INVOKE_CLOSE,
+    INVOKE_OPEN,
+    MAX_MARKER,
+    MESSAGE,
+    RECIPIENT_RE,
+    START,
+    has_atem_markers,
+    partial_marker_len,
+)
 
 logger = logging.getLogger(__name__)
 
-# Channel framing, shared with the reasoning-side MuseGlimmerDetector.
-MESSAGE = "<|message|>"
-EOM = "<|eom|>"
-EOT = "<|eot|>"
-START = "<|start|>"
-
-# ATEM payload markers.
-FUNCTION_CALLS_OPEN = "<atem:function_calls>"
-FUNCTION_CALLS_CLOSE = "</atem:function_calls>"
-INVOKE_CLOSE = "</atem:invoke>"
-
-_RECIPIENT_RE = re.compile(r"to=([^\s<]+)")
 _INVOKE_OPEN_RE = re.compile(r'<atem:invoke\b[^>]*?\bname="(?P<name>[^"]+)"[^>]*?>')
 _PARAM_RE = re.compile(
     r'<atem:parameter\b[^>]*?\bname="(?P<key>[^"]+)"[^>]*?>(?P<value>.*?)'
@@ -41,10 +43,6 @@ _NON_TOOL_RECIPIENTS = frozenset({"self", "user"})
 def _is_tool_channel(recipient: Optional[str]) -> bool:
     """True when this channel routes to a tool."""
     return recipient is not None and recipient not in _NON_TOOL_RECIPIENTS
-
-
-# Longest marker that could straddle a chunk boundary while streaming.
-_MAX_MARKER = max(len(m) for m in (MESSAGE, EOM, EOT, START, FUNCTION_CALLS_OPEN))
 
 
 def _decode_value(raw: str):
@@ -98,7 +96,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
         self._open_invoke: Optional[str] = None
 
     def has_tool_call(self, text: str) -> bool:
-        return FUNCTION_CALLS_OPEN in text or "<atem:invoke" in text
+        return has_atem_markers(text)
 
     def _registered_names(self, tools: Optional[List[Tool]]) -> Set[str]:
         return {t.function.name for t in tools or [] if t.function and t.function.name}
@@ -150,12 +148,8 @@ class MuseGlimmerDetector(BaseFormatDetector):
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def _held_back(self, text: str) -> int:
-        """Length of the trailing suffix that could still grow into a marker."""
-        markers = (MESSAGE, EOM, EOT, START, FUNCTION_CALLS_OPEN, "<atem:invoke")
-        for k in range(min(len(text), _MAX_MARKER - 1), 0, -1):
-            if any(m.startswith(text[-k:]) for m in markers):
-                return k
-        return 0
+        markers = (MESSAGE, EOM, EOT, START, FUNCTION_CALLS_OPEN, INVOKE_OPEN)
+        return partial_marker_len(text, markers, MAX_MARKER)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -189,7 +183,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
                 if idx == -1:
                     break
                 header = self._buffer[:idx]
-                m = _RECIPIENT_RE.search(header)
+                m = RECIPIENT_RE.search(header)
                 self._recipient = m.group(1) if m else "user"
                 self._buffer = self._buffer[idx + len(MESSAGE) :]
                 self._in_body = True
@@ -273,7 +267,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=f'{FUNCTION_CALLS_OPEN}\n<atem:invoke name="{name}">',
+            begin=f'{FUNCTION_CALLS_OPEN}\n{INVOKE_OPEN} name="{name}">',
             end=f"{INVOKE_CLOSE}\n{FUNCTION_CALLS_CLOSE}",
             trigger=FUNCTION_CALLS_OPEN,
         )
