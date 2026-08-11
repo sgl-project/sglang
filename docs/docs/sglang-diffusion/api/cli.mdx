@@ -195,6 +195,19 @@ For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Ca
 
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
+### Component CPU Offload
+
+Use `--cpu-offload-components` to explicitly select components for coarse CPU offload:
+
+```bash Command
+sglang generate \
+  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --cpu-offload-components dit text_encoder \
+  --prompt "A quiet city street after rain"
+```
+
+Supported components are `dit`, `text_encoder`, `image_encoder`, and `vae`. Use `all` to offload all components or `none` to disable coarse component CPU offload. This unified option cannot be combined with the legacy per-component CPU offload flags. Layerwise offload remains independently controlled by `--layerwise-offload-components`.
+
 ### Layerwise Offload
 
 Use layerwise offload when a large component does not fit comfortably in GPU memory. By default, `--dit-layerwise-offload` only applies to legacy DiT components. Use `--layerwise-offload-components` to select pipeline component names explicitly (`--layerwise-offload-modules` is accepted as an alias):

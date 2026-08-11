@@ -322,12 +322,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
 
         logger.debug(
-            f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
-            f"Peak allocated: {peak_allocated_gb:.2f} GB, "
-            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
-            f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
-            f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
-            f"Related offload server args to disable: {suggested_args_str}"
+            f"GPU memory: peak_reserved={peak_reserved_gb:.2f} GB, "
+            f"peak_allocated={peak_allocated_gb:.2f} GB, "
+            f"pool_overhead={pool_overhead_gb:.2f} GB "
+            f"({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
+            f"available_at_peak={remaining_gpu_mem_gb:.2f} GB; "
+            f"resident_candidates={can_stay_resident}; "
+            f"offload_control={suggested_args_str}"
         )
 
     def _format_offload_disable_suggestions(self, components: List[str]) -> str:
@@ -341,16 +342,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
             arg = None
             if component == "vae":
-                arg = "--vae-cpu-offload"
+                arg = "--cpu-offload-components"
             elif component == "image_encoder":
-                arg = "--image-encoder-cpu-offload"
+                arg = "--cpu-offload-components"
             elif component in ("text_encoder", "text_encoder_2"):
-                arg = "--text-encoder-cpu-offload"
+                arg = "--cpu-offload-components"
             elif component == "transformer":
                 if self.server_args.is_dit_layerwise_offload_selected:
                     arg = "--dit-layerwise-offload"
                 elif self.server_args.dit_cpu_offload:
-                    arg = "--dit-cpu-offload"
+                    arg = "--cpu-offload-components"
 
             if arg is not None and arg not in seen_args:
                 suggestions.append(arg)
