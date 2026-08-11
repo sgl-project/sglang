@@ -1707,10 +1707,8 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
 
         while self._buffer:
             if not self._in_body:
-                # Decide whether a header is still coming before buffering for
-                # one; otherwise unframed prose never streams (the <|message|>
-                # it waits for never arrives). Mirrors the function-call
-                # detector's own header resolution.
+                # Without this, unframed prose never streams: it buffers
+                # forever waiting for a <|message|> that never arrives.
                 if not (self._at_stream_start and could_start_header(self._buffer)):
                     ws = len(self._buffer) - len(self._buffer.lstrip())
                     head = self._buffer[ws : ws + len(START)]
@@ -1811,10 +1809,9 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
             if not self._in_body and self._pending_reasoning:
                 reasoning, self._pending_reasoning = self._pending_reasoning, ""
         if self._force_nonempty_content:
-            # Base contract: keep a copy of the reasoning so finish() can promote
-            # it to content if the turn produces none. Drop it when real content
-            # arrives, NOT when the reasoning channel closes -- <|eom|> lands in
-            # the same chunk as the last reasoning text.
+            # Kept so finish() can promote it to content if the turn produces
+            # none. Dropped on real content, NOT when the channel closes --
+            # <|eom|> lands in the same chunk as the last reasoning text.
             self._accumulated_reasoning += reasoning
             if normal:
                 self._accumulated_reasoning = ""

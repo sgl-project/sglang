@@ -536,7 +536,10 @@ class ModelConfig:
 
         self.hf_config.encoder_only = encoder_only
         self.hf_config.language_only = language_only
-        self.hf_config.language_model_only = language_model_only
+        # Checkpoints declare this one themselves (hf_transformers/processor.py),
+        # so the flag may only turn it on: writing the default back would build a
+        # vision tower with no weights to fill.
+        self.hf_config.language_model_only = language_model_only or self.is_lm_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
