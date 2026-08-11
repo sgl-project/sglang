@@ -289,10 +289,7 @@ class AutoRoundConfig(QuantizationConfig):
             raise ValueError(_CPU_AMX_REQUIRED_MSG)
 
     def log_gptq_default_assumptions_once(self) -> None:
-        if (
-            self._logged_gptq_default_assumptions
-            or not self.gptq_defaulted_config_keys
-        ):
+        if self._logged_gptq_default_assumptions or not self.gptq_defaulted_config_keys:
             return
         self._logged_gptq_default_assumptions = True
         default_summary = {
@@ -313,7 +310,9 @@ class AutoRoundConfig(QuantizationConfig):
                 "`--quantization gptq` or `--quantization gptq_marlin` instead."
             )
 
-    def get_gptq_config_kwargs(self, weight_bits: int, group_size: int) -> dict[str, Any]:
+    def get_gptq_config_kwargs(
+        self, weight_bits: int, group_size: int
+    ) -> dict[str, Any]:
         self.log_gptq_default_assumptions_once()
         self.check_gptq_support()
         return {
