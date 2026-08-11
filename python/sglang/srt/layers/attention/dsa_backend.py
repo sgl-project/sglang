@@ -167,6 +167,25 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+def _idle_spec_rows_per_seq(forward_batch: ForwardBatch) -> int:
+    """Query rows carried by each padded sequence of an idle DP-attention rank.
+
+    A rank that idles through a speculative round is still padded to the sync
+    group's token count, and ``ForwardBatch.prepare_mlp_sync_batch`` turns that
+    into ``batch_size = num_tokens // spec_info.num_tokens_per_req`` fabricated
+    sequences — so the batch runs that many query rows per sequence while
+    ``seq_lens`` / ``req_pool_indices`` hold only one entry each. Returns 1 for
+    any batch that is not such an idle speculative round.
+    """
+    if not forward_batch.forward_mode.is_idle():
+        return 1
+    spec_info = forward_batch.spec_info
+    if spec_info is None:
+        return 1
+    # -1 means the flow never set a width (see SpecInput.num_tokens_per_req).
+    return max(1, spec_info.num_tokens_per_req)
+
+
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -829,6 +848,26 @@ class DeepseekSparseAttnBackend(
         indexer_seq_lens = forward_batch.seq_lens
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            # An idle rank padded through a speculative round runs
+            # `rows_per_seq` query rows per fabricated sequence, so metadata
+            # built one-row-per-sequence would be shorter than the rows the
+            # indexer scores (its paged top-k requires one `lengths` entry per
+            # score row). Every row here is discarded padding, so restate the
+            # batch as `batch_size * rows_per_seq` single-token dummy sequences
+            # rather than teaching each consumer about the expansion.
+            rows_per_seq = _idle_spec_rows_per_seq(forward_batch)
+            if rows_per_seq > 1:
+                batch_size = batch_size * rows_per_seq
+                cache_seqlens_int32 = cache_seqlens_int32.repeat_interleave(
+                    rows_per_seq
+                )
+                cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+                page_table = page_table.repeat_interleave(rows_per_seq, dim=0)
+                indexer_seq_lens = indexer_seq_lens.repeat_interleave(rows_per_seq)
+                if indexer_seq_lens_cpu is not None:
+                    indexer_seq_lens_cpu = indexer_seq_lens_cpu.repeat_interleave(
+                        rows_per_seq
+                    )
             extend_seq_lens_cpu = [1] * batch_size
             max_seqlen_q = 1
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
