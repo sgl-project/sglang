@@ -3881,6 +3881,48 @@ class ServerArgs:
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
                 )
 
+        # Only the aiter MLA decode backend runs this DCP path; the triton HIP
+        # DCP path has different constraints, so don't reject it here. Resolve
+        # the decode backend the same way the model overrides do
+        # (attention_backends_of: the split field falls back to the base one) --
+        # gating on self.attention_backend alone missed
+        # `--decode-attention-backend aiter` without `--attention-backend aiter`,
+        # which is exactly what the K3 PD recipe passes, so the fp8 rejection
+        # below never fired on it.
+        if self.dcp_size > 1 and is_hip():
+            from sglang.srt.arg_groups.overrides import attention_backends_of
+
+            _, decode_backend = attention_backends_of(self)
+            if decode_backend == "aiter":
+                self._validate_aiter_mla_dcp()
+
+    def _validate_aiter_mla_dcp(self):
+        """Validate aiter MLA decode-context-parallel (DCP).
+
+        The decode path runs aiter's MLA kernel over each rank's round-robin
+        KV shard (see AiterAttnBackend._mla_decode_fwd_dcp). The kernel tiles
+        the query heads, so any gathered head count is served (Kimi-K3's 96 at
+        tp8 dcp8 works).
+        """
+        from sglang.srt.configs.model_config import AttentionArch
+
+        model_config = self.get_model_config()
+        if model_config.attention_arch != AttentionArch.MLA:
+            return
+
+        if "fp8" in (self.kv_cache_dtype or "") and not (
+            envs.SGLANG_EXPERIMENTAL_AITER_DCP_FP8.get()
+        ):
+            # Validated, but on one model/arch only, so it stays opt-in rather
+            # than becoming the default.
+            raise ValueError(
+                "aiter MLA decode context parallel (--dcp-size > 1) defaults to "
+                "bf16 kv-cache. fp8 kv-cache has been validated for Kimi-K3 on "
+                "gfx950 only (gsm8k within the run-to-run band of bf16, KV pool "
+                "exactly 2x); it stays opt-in pending broader coverage. Set "
+                "SGLANG_EXPERIMENTAL_AITER_DCP_FP8=1 to enable it."
+            )
+
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
             raise ValueError(

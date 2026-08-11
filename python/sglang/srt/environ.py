@@ -633,6 +633,11 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # Opt into fp8 kv-cache under aiter MLA decode context parallel
+    # (--dcp-size > 1). Validated for Kimi-K3 on gfx950 -- accuracy inside the
+    # bf16 run-to-run band, KV pool exactly 2x -- but on that one model/arch
+    # only, so ServerArgs keeps it opt-in instead of making it the default.
+    SGLANG_EXPERIMENTAL_AITER_DCP_FP8 = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
