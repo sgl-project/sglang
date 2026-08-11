@@ -1100,7 +1100,20 @@ def _fwd_kernel_unified(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     # Unified loop: process all KV tokens (prefix + extend)
-    for start_n in range(0, cur_seq_kv_len, BLOCK_N):
+    #
+    # The two-stage kernel's floor. cur_window_start appears on both sides of the
+    # mask below and cancels, so A = cur_seq_prefix_len + cur_block_m * BLOCK_M -
+    # SLIDING_WINDOW_SIZE. This loop spans prefix and extend KV alike, so the one
+    # floor drops the fully-masked tiles of both.
+    unified_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        unified_start = (
+            tl.maximum(
+                cur_seq_prefix_len + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
+            )
+            // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(unified_start, cur_seq_kv_len, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_kv_len
 
