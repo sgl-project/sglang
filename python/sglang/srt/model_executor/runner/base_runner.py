@@ -100,7 +100,7 @@ def _allocate_decode_buffers(
             dtype=torch.bool,
         )
         # (max_num_token, vocab) fp32 is large (>10GB at 16k tokens); callers
-        # whose dummy runs never touch logits (skip_logits autotune) opt out.
+        # whose dummy runs never touch logits (run_lm_head=False autotune) opt out.
         next_token_logits_buffer = (
             torch.zeros(
                 (max_num_token, vocab_size),
@@ -314,7 +314,9 @@ class BaseRunner(ABC):
                 run_ctx=canary_run_ctx,
             )
 
-        run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
+        run_flashinfer_autotune_forward(
+            self.model_runner, forward_fn, run_lm_head=False
+        )
 
     def _alloc_dummy_decode_buffers(
         self,
