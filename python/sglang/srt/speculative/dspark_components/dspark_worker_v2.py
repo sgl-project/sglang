@@ -53,6 +53,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+    simulate_acc_len_needs_verify_all,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -255,8 +256,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
         if (
-            self._simulate_acc_len > 0
-            and self._simulate_acc_len != 1.0
+            simulate_acc_len_needs_verify_all()
             and not self._verify_planner.is_verify_all
         ):
             raise ValueError(
@@ -380,6 +380,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+        # Outside the draft context on purpose: the cost curve is measured from the TARGET worker's
+        # verify graphs. This is the first point at which they exist, and the planner was built
+        # before capture, so it cannot have derived anything itself.
+        self._verify_planner.install_capture_derived_sps_table(
+            draft_model_runner=self.draft_model_runner
+        )
 
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(

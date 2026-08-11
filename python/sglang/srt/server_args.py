@@ -2126,9 +2126,14 @@ class ServerArgs:
         Optional[str],
         "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "
         "sglang.benchmark.dspark_sps_profiler, consumed by the ragged-verify "
-        "scheduler (cap-accept / compact). Omit for an uninitialized flat "
-        "constant-SPS table: the budget degenerates to verify-all (zero throughput "
-        "gain by itself).",
+        "scheduler (cap-accept / compact). Takes precedence over "
+        "SGLANG_DSPARK_ENABLE_CAPTURE_DERIVED_SPS: a table loaded from this path is "
+        "not the uninitialized flat table, so the capture-time derivation is never armed and "
+        "that variable has no effect. Omit it unless you want to pin a specific "
+        "curve. With neither -- in cap-accept mode, with the derivation disabled, or "
+        "when the measurement is unusable -- the table stays an uninitialized flat "
+        "constant-SPS curve and the budget degenerates to verify-all (zero "
+        "throughput gain by itself).",
         NS("spec"),
     ] = None
     speculative_dspark_confidence_sts_path: A[

@@ -36,7 +36,7 @@ from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _CAPTURE_TRACE = "SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE"
 _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
@@ -288,6 +288,47 @@ class TestOriginalTraceExport(CustomTestCase):
                     putils.graph_capture_profile_dir(),
                     os.path.join(tmp, "graph_capture_profile"),
                 )
+
+
+class TestSubsampleKeepingEnds(CustomTestCase):
+    """Bounding the capture-time cost sweep must never silently shrink the range it covers.
+
+    Consumers use the last entry as the top of the measured range, so dropping it would quietly
+    narrow the cost curve; and the sample must stay ordered and unique because the cost table it
+    feeds rejects anything else.
+    """
+
+    @staticmethod
+    def _subsample(values, limit):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            _subsample_keeping_ends,
+        )
+
+        return _subsample_keeping_ends(values, limit)
+
+    def test_identity_when_already_within_the_limit(self):
+        values = [8, 16, 32, 64]
+        self.assertEqual(self._subsample(values, 4), values)
+        self.assertEqual(self._subsample(values, 99), values)
+
+    def test_never_exceeds_the_limit_and_keeps_both_ends(self):
+        values = list(range(8, 8 * 41, 8))
+        for limit in (2, 3, 5, 8, 12, 40):
+            picked = self._subsample(values, limit)
+            self.assertLessEqual(len(picked), limit, f"limit={limit}")
+            self.assertEqual(picked[0], values[0], f"limit={limit}")
+            self.assertEqual(picked[-1], values[-1], f"limit={limit}")
+
+    def test_output_is_sorted_unique_and_a_subset(self):
+        values = list(range(8, 8 * 41, 8))
+        picked = self._subsample(values, 8)
+        self.assertEqual(picked, sorted(set(picked)))
+        self.assertTrue(set(picked).issubset(values))
+
+    def test_degenerate_limits_return_the_input(self):
+        values = [8, 16, 32]
+        for limit in (0, 1):
+            self.assertEqual(self._subsample(values, limit), values)
 
 
 if __name__ == "__main__":

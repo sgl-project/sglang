@@ -481,6 +481,11 @@ class Envs:
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
+    # Measure the ragged-verify cost table from the captured verify/draft CUDA graphs at startup,
+    # instead of shipping the uninitialized flat table that pins the budget to verify-all. Compact mode only.
+    # --speculative-dspark-sps-table-path wins: a table loaded from disk is not uninitialized, so
+    # the derivation is never armed and this flag has no effect.
+    SGLANG_DSPARK_ENABLE_CAPTURE_DERIVED_SPS = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)

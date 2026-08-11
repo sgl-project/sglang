@@ -79,5 +79,23 @@ class BaseCudaGraphBackend(ABC):
         **kwargs,
     ) -> Any: ...
 
+    def replay_captured_shape(self, shape_key: ShapeKey) -> None:
+        """Replay one captured graph as-is, leaving the static buffers as capture left them.
+
+        For capture-time cost measurement, where there is no ForwardBatch to bind. A captured graph
+        replays a fixed kernel DAG, so its launch configuration is a property of the captured shape
+        and not of the buffer contents.
+
+        Duration is a weaker claim than launch configuration, and it does not hold everywhere. Where
+        a kernel's work depends on values read from device memory -- MoE routing being the clear case,
+        since token-to-expert assignment drives per-expert GEMM extents and dispatch volume -- the
+        replay is timed under whatever distribution capture happened to leave behind, which is not
+        the one serving produces. Treat a curve derived this way as approximate on such models.
+
+        Backends that cannot replay without a bound batch leave this unimplemented and the caller
+        falls back to not measuring.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def cleanup(self) -> None: ...

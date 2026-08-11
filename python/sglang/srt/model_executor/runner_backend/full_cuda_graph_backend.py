@@ -150,6 +150,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
+    def replay_captured_shape(self, shape_key: ShapeKey) -> None:
+        self._graphs[shape_key].replay()
+
     def cleanup(self) -> None:
         self._graphs.clear()
         self._outputs.clear()

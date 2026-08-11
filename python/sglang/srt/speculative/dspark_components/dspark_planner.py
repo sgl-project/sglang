@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional, Union
 
 import msgspec
@@ -28,6 +29,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
     _interp_clamped,
+    build_capture_derived_sps_table,
     build_uninitialized_sps_table,
     is_uninitialized_sps_table,
     load_sps_table_from_path,
@@ -52,6 +54,43 @@ from sglang.srt.utils.invariants import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Bounds on the capture-time cost sweep. Spend it on PROBE DENSITY rather than on repeats: the
+# lookup is a floor step function, so a sparse grid becomes wide plateaus and the chosen budget
+# quantises to the end of whichever plateau it lands in, while a replay is reproducible enough that
+# a median over five samples is already tight (measured spread is well under 1% of the median). A
+# coarser grid also errs toward the cheaper neighbour, i.e. toward wider budgets and so toward
+# today's verify-all, which is the safe direction to be wrong in.
+#
+# The counts are fixed rather than adaptive so that every rank performs exactly the same replays:
+# captured graphs carry the model's collectives, and a rank that replays a different number of times
+# hangs its peers.
+
+# A derived curve only earns the right to trim when it predicts a win worth having. How much a
+# deployment can win was read directly, by forcing each budget fraction at a fixed load through
+# /set_internal_state -- that measures the objective rather than modelling it. On a Qwen3-4B target
+# at concurrency 48 every fraction from 0.3 to 1.0 lands within noise of verifying everything, so
+# trimming there is a small net loss; on Qwen3-14B the same sweep has a clear interior peak.
+#
+# The threshold separates "the model sees a real win" from "the model sees rounding". It is a regime
+# separator rather than a tuned constant: swept over 0.05-0.35, the deployments that gain move by
+# less than the run-to-run spread between 0.05 and 0.20, and only start giving the gain back beyond
+# that. Raising it is the safe direction -- behaviour moves monotonically towards verify-all, so a
+# threshold set too high forfeits gain but cannot introduce a regression.
+CAPTURE_DERIVED_SPS_MIN_GAIN = 0.05
+CAPTURE_DERIVED_SPS_MAX_PROBES = 40
+CAPTURE_DERIVED_SPS_WARMUP = 2
+CAPTURE_DERIVED_SPS_REPS = 5
+
+
+def _rows_to_probes(*, rows: list[list[float]]) -> list[tuple[int, float, float]]:
+    """Read back (shape, seconds, spread) rows, dropping the ones nobody measured."""
+    return [
+        (int(shape), seconds, spread)
+        for shape, seconds, spread in rows
+        if shape >= 1.0 and seconds > 0.0
+    ]
+
 
 # DSpark confidence is a per-token score that must stay in [0, 1].
 _CONFIDENCE = Invariant(
@@ -83,6 +122,7 @@ class DSparkVerifyPlanner:
         self.gamma = gamma
         self.model_runner = model_runner
         self.device = device
+        self.tp_rank = tp_rank
         self.server_args = server_args
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._align_verify_tokens_to_graph_tier = (
@@ -136,6 +176,13 @@ class DSparkVerifyPlanner:
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
+        # Set only when this planner installs a table it measured itself. The full-window fast path
+        # below keys off it so that a deployment which did not opt in -- including one running a
+        # profiled table from disk -- keeps exactly the scheduling path it has today.
+        self._derived_sps_installed = False
+        # Assigned before the mode branch: install_capture_derived_sps_table() is called
+        # unconditionally after capture, including in static mode where the branch below never runs.
+        self._derive_sps_at_capture = False
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
                 raise ValueError(
@@ -154,6 +201,25 @@ class DSparkVerifyPlanner:
             self._is_verify_all = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_uninitialized_sps_table(sps_table)
+            )
+            # A cost model can be measured from the verify graphs the compact path already
+            # captures, which happens after this constructor runs. Decide here, install later.
+            #
+            # --speculative-dspark-sps-table-path wins, and does so by construction rather than by
+            # an explicit branch: a table loaded from disk is not uninitialized, so
+            # is_uninitialized_sps_table is False, _is_verify_all is False, and the derivation is
+            # never armed. An operator who pinned a curve keeps exactly that curve.
+            #
+            # Compact only, via _is_verify_all above, and deliberately: cap-accept runs its target
+            # forward at full uniform width and its budget only caps acceptance afterwards, so a
+            # cost curve there could lose accepted tokens without saving any compute.
+            # Excluded when a simulated acceptance length is forcing a verify-all schedule: the
+            # validation below keys off is_verify_all, so deriving a table would silently
+            # invalidate a check that has already passed.
+            self._derive_sps_at_capture = (
+                self._is_verify_all
+                and envs.SGLANG_DSPARK_ENABLE_CAPTURE_DERIVED_SPS.get()
+                and not simulate_acc_len_needs_verify_all()
             )
             relay_lag_steps = (
                 0
@@ -198,14 +264,226 @@ class DSparkVerifyPlanner:
                         )
                     ),
                 )
-                if isinstance(sps_table, SpsCostTable) and is_uninitialized_sps_table(
-                    sps_table
+                if (
+                    isinstance(sps_table, SpsCostTable)
+                    and is_uninitialized_sps_table(sps_table)
+                    and not self._derive_sps_at_capture
                 ):
                     logger.warning(
                         "DSpark SPS table is uninitialized (flat): the verify "
                         "budget degenerates to verify-all (zero scheduling gain). "
                         "Pass a profiled --speculative-dspark-sps-table-path."
                     )
+
+    def install_capture_derived_sps_table(self, *, draft_model_runner) -> None:
+        """Replace the uninitialized cost model with one measured from the captured graphs.
+
+        Runs after CUDA graph capture, because that is the earliest point the measurement exists:
+        this planner is constructed during worker init, which happens before capture.
+
+        Without a profiled table the cost model is a single probe reporting the same steps-per-sec
+        for every batch size, i.e. "a step costs the same no matter how wide it is". Under that
+        model the budget objective is strictly increasing and argmax always lands on verify-all, so
+        the planner cannot trim however good its confidence estimates are. The compact path already
+        captures one verify graph per token tier, so replaying those tiers yields a real cost curve
+        over exactly the axis the planner looks up.
+
+        Opt-in via SGLANG_DSPARK_ENABLE_CAPTURE_DERIVED_SPS: whether trimming pays is a property of
+        the deployment, not of the cost model. Where the throughput-versus-budget curve is flat,
+        acting on a predicted gain costs accepted tokens for a time saving that does not materialise,
+        so a deployment should measure before enabling this.
+
+        Every failure leaves the uninitialized table in place: this is a startup optimisation and must never
+        be able to stop the engine from starting.
+        """
+        if not self._derive_sps_at_capture:
+            return
+        self._derive_sps_at_capture = False
+
+        if not ragged_verify_graphs_are_replayable(model_runner=self.model_runner):
+            # The captured graphs will never be replayed on this backend, so timing them would price
+            # a path the engine does not take. Keep the uninitialized table: verify-all, exactly as today.
+            if self.tp_rank == 0:
+                runner = self.model_runner.decode_cuda_graph_runner
+                reason = (
+                    "decode CUDA graphs are disabled"
+                    if runner is None
+                    else f"{type(runner.attn_backend).__name__} does not replay ragged verify graphs"
+                )
+                logger.info(
+                    "DSpark capture-derived SPS table skipped: %s, so replay time does not "
+                    "describe a verify step. The verify budget stays at verify-all.",
+                    reason,
+                )
+            return
+
+        started = time.perf_counter()
+        try:
+            verify_probes, draft_probes = self._measure_step_cost_probes(
+                draft_model_runner=draft_model_runner
+            )
+        except Exception:
+            # A startup optimisation must never stop the engine starting. The collective inside is
+            # deliberately outside this guard -- see _measure_step_cost_probes.
+            logger.warning(
+                "DSpark capture-time SPS derivation failed; keeping the uninitialized table.",
+                exc_info=True,
+            )
+            verify_probes, draft_probes = [], []
+        elapsed = time.perf_counter() - started
+
+        sps_table = build_capture_derived_sps_table(
+            verify_probes=verify_probes, draft_probes=draft_probes
+        )
+        if sps_table is None:
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DSpark SPS table is uninitialized (flat) and could not be derived from the "
+                    "captured verify graphs (%d usable probes): the verify budget degenerates to "
+                    "verify-all (zero scheduling gain). Pass a profiled "
+                    "--speculative-dspark-sps-table-path.",
+                    len(verify_probes),
+                )
+            return
+
+        self._budget_planner.sps_table = sps_table
+        self._schedule_cfg.min_predicted_gain = CAPTURE_DERIVED_SPS_MIN_GAIN
+        self._derived_sps_installed = True
+        # The verify-all fast path short-circuits schedule_layout before the budget is consulted,
+        # and its cached uniform layouts were built for that path, so both must go with the table.
+        self._is_verify_all = False
+        self._uniform_layout_cache = {}
+        if self.tp_rank == 0:
+            logger.info(
+                "DSpark SPS table derived from %d verify tiers and %d draft batch sizes in %.2f s; "
+                "the verify budget is now scheduled. Verify cost (tokens: ms) %s. Draft cost "
+                "(requests: ms) %s. Unset SGLANG_DSPARK_ENABLE_CAPTURE_DERIVED_SPS to restore "
+                "verify-all.",
+                len(sps_table.m_probes),
+                len(sps_table.bs_probes),
+                elapsed,
+                ", ".join(
+                    f"{tokens}: {seconds * 1000.0:.2f}"
+                    for tokens, seconds in zip(
+                        sps_table.m_probes, sps_table.theta_seconds
+                    )
+                ),
+                ", ".join(
+                    f"{reqs}: {seconds * 1000.0:.2f}"
+                    for reqs, seconds in zip(
+                        sps_table.bs_probes, sps_table.alpha_seconds
+                    )
+                ),
+            )
+
+    def _measure_step_cost_probes(
+        self, *, draft_model_runner
+    ) -> tuple[list[tuple[int, float, float]], list[tuple[int, float, float]]]:
+        """Measure both axes of the step cost, replicated identically across ranks.
+
+        A verify graph replay covers the target forward, whose cost tracks the token count. The step
+        the planner prices also runs the draft model, whose cost tracks the request count and is
+        already spent by the time a budget is chosen. Both ladders are captured, so both terms are
+        measurable here, and they are returned separately -- see build_capture_derived_sps_table for
+        why collapsing them onto one axis is what makes the curve wrong.
+
+        The result is broadcast from rank 0: the chosen budget selects which captured graph a step
+        replays, so ranks planning against different curves would replay different shapes and their
+        in-graph collectives would not match.
+
+        Only the local measurement may fail. The broadcast is unconditional, because a rank that
+        skipped it would leave its peers blocked in the collective for the distributed timeout --
+        a worse failure than the one the measurement was guarded against. A rank that measured
+        nothing contributes zeros and takes rank 0's curves; if rank 0 is the one that failed, every
+        rank ends up with zeros and keeps the uninitialized table together.
+        """
+        tiers = ragged_capture_num_tokens(model_runner=self.model_runner)
+        if not tiers:
+            return [], []
+
+        # Shape depends only on the tier list and a constant -- never on what this rank measured --
+        # which is what keeps the collective below deadlock-free.
+        costs = torch.zeros(
+            (len(tiers) + CAPTURE_DERIVED_SPS_MAX_PROBES, 3),
+            dtype=torch.float64,
+            device=self.device,
+        )
+        try:
+            self._fill_local_step_costs(
+                costs=costs, tiers=tiers, draft_model_runner=draft_model_runner
+            )
+        except Exception:
+            logger.warning(
+                "DSpark capture-time cost measurement failed on this rank; falling back to "
+                "whatever rank 0 measured.",
+                exc_info=True,
+            )
+
+        broadcast_group, group_size = verify_lens_broadcast_group(
+            tp_size=get_parallel().tp_size
+        )
+        if group_size > 1:
+            broadcast_group.broadcast(costs, src=0)
+
+        rows = costs.tolist()
+        return _rows_to_probes(rows=rows[: len(tiers)]), _rows_to_probes(
+            rows=rows[len(tiers) :]
+        )
+
+    def _fill_local_step_costs(
+        self, *, costs: torch.Tensor, tiers: list[int], draft_model_runner
+    ) -> None:
+        """Time this rank's captured graphs into `costs` as (shape, seconds, spread) rows.
+
+        Verify tiers take the first `len(tiers)` rows, keyed by total verify tokens; draft batch
+        sizes take the rest, keyed by request count. Rows this rank could not measure stay zero and
+        are dropped after the broadcast.
+
+        The fixed shape is what makes the broadcast deadlock-free: it does not depend on how many
+        probes this rank managed to measure.
+        """
+        measure_kwargs = dict(
+            max_probes=CAPTURE_DERIVED_SPS_MAX_PROBES,
+            warmup=CAPTURE_DERIVED_SPS_WARMUP,
+            reps=CAPTURE_DERIVED_SPS_REPS,
+        )
+        verify_measured = (
+            self.model_runner.decode_cuda_graph_runner.measure_captured_replay_seconds(
+                **measure_kwargs
+            )
+        )
+        tier_index = {tier: i for i, tier in enumerate(tiers)}
+        for tier, seconds, spread in verify_measured:
+            self._write_cost_row(
+                costs=costs,
+                row=tier_index[tier],
+                shape=tier,
+                seconds=seconds,
+                spread=spread,
+            )
+
+        draft_runner = draft_model_runner.decode_cuda_graph_runner
+        if draft_runner is None:
+            return
+        draft_measured = draft_runner.measure_captured_replay_seconds(**measure_kwargs)
+        for offset, (batch_size, seconds, spread) in enumerate(
+            draft_measured[:CAPTURE_DERIVED_SPS_MAX_PROBES]
+        ):
+            self._write_cost_row(
+                costs=costs,
+                row=len(tiers) + offset,
+                shape=batch_size,
+                seconds=seconds,
+                spread=spread,
+            )
+
+    @staticmethod
+    def _write_cost_row(
+        *, costs: torch.Tensor, row: int, shape: int, seconds: float, spread: float
+    ) -> None:
+        costs[row, 0] = float(shape)
+        costs[row, 1] = seconds
+        costs[row, 2] = spread
 
     @property
     def carries_confidence(self) -> bool:
@@ -404,6 +682,25 @@ class DSparkVerifyPlanner:
             )
         )
 
+    def _budget_covers_full_window(self, *, bs: int, budget: Optional[int]) -> bool:
+        """Would this budget let every request verify its whole window?
+
+        A real cost table makes `_is_verify_all` False for the engine's lifetime, but the planner
+        still returns a full-width budget whenever trimming does not pay -- on a deployment with no
+        headroom, that is every step. Without this the engine would pay the per-step schedule and its
+        host<->device round-trips to arrive at the layout the cache already holds, which is a
+        measured regression on models that gain nothing from trimming.
+
+        The test is deliberately the *sufficient* one: at this budget the top-k can fill every
+        window, so the uniform layout is what verify-all serves today. Anything less falls through
+        to the scheduler.
+        """
+        if budget is None:
+            return False
+        cfg = self._schedule_cfg
+        widest = cfg.resolved_max_verify_len() - cfg.min_verify_len
+        return budget >= bs * widest
+
     def schedule_layout(
         self,
         *,
@@ -417,7 +714,13 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+        serves_full_window = self._is_verify_all or (
+            self._derived_sps_installed
+            and self._budget_covers_full_window(
+                bs=int(req_pool_indices.shape[0]), budget=budget
+            )
+        )
+        if serves_full_window and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
             # the per-step schedule and its host<->device round-trips.
@@ -808,6 +1111,25 @@ def ragged_capture_max_slots(*, model_runner) -> Optional[int]:
     return runner.max_bs
 
 
+def ragged_verify_graphs_are_replayable(*, model_runner) -> bool:
+    """Will a verify step ever replay one of the captured ragged graphs?
+
+    Capture records a verify graph per token tier regardless, but the runner's admission test starts
+    at `attn_backend.supports_ragged_verify_graph`, and a backend that does not implement the ragged
+    metadata path fails it on every step -- hybrid linear-attention targets, for instance, whose GDN
+    backend leaves the base class default of False.
+
+    On such a target the captured graphs are recorded and never replayed, so a cost model derived by
+    timing them describes a path the engine does not take. Deriving one there is worse than useless:
+    it spends the measurement, and then hands the planner a curve with no bearing on the step it is
+    pricing.
+    """
+    runner = model_runner.decode_cuda_graph_runner
+    if runner is None or not runner.ragged_verify_mode:
+        return False
+    return bool(runner.attn_backend.supports_ragged_verify_graph)
+
+
 def ragged_layout_exceeds_captured_grid(
     *,
     num_reqs: int,
@@ -916,6 +1238,9 @@ class DSparkScheduleConfig(msgspec.Struct):
     min_verify_len: int = 1
     max_verify_len: int = 0
     survival_eps: float = 1e-6
+    # Smallest predicted throughput gain, relative to verifying everything, that justifies trimming
+    # at all. Zero keeps the historical behaviour of always taking the argmax.
+    min_predicted_gain: float = 0.0
 
     def resolved_max_verify_len(self) -> int:
         return self.max_verify_len or (self.gamma + 1)
@@ -937,6 +1262,18 @@ class VerifyBudgetDecision(msgspec.Struct):
     budget: int
     predicted_step_seconds: Optional[float] = None
     predicted_theta: Optional[float] = None
+
+
+def simulate_acc_len_needs_verify_all() -> bool:
+    """True when SGLANG_SIMULATE_ACC_LEN pins the schedule to verify-all.
+
+    A constant simulated correct_len > 0 can exceed a trimmed request's verify budget and break the
+    cutoff accounting, so DSparkWorkerV2 refuses that combination at construction. Deriving a cost
+    table happens afterwards and would flip the planner off verify-all, so both the admission check
+    and the derivation read this one predicate rather than each carrying a copy.
+    """
+    simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+    return simulate_acc_len > 0.0 and simulate_acc_len != 1.0
 
 
 def compute_verify_token_budget(
@@ -963,13 +1300,13 @@ def compute_verify_token_budget(
             num_budgets=int(tau_star.numel()),
         )
         theta = tau_star / step_time
-        idx = int(torch.argmax(theta))
+        idx = _argmax_worth_trimming(theta=theta, min_gain=cfg.min_predicted_gain)
         predicted_step_seconds = float(step_time[idx])
     else:
         batch_tokens = num_requests + torch.arange(tau_star.numel(), dtype=torch.int64)
         sps = _lookup_sps_tensor(sps_table=sps_table, batch_tokens=batch_tokens)
         theta = tau_star * sps
-        idx = int(torch.argmax(theta))
+        idx = _argmax_worth_trimming(theta=theta, min_gain=cfg.min_predicted_gain)
         sps_at_idx = float(sps[idx])
         predicted_step_seconds = 1.0 / sps_at_idx if sps_at_idx > 0 else None
     return VerifyBudgetDecision(
@@ -977,6 +1314,27 @@ def compute_verify_token_budget(
         predicted_step_seconds=predicted_step_seconds,
         predicted_theta=float(theta[idx]),
     )
+
+
+def _argmax_worth_trimming(*, theta: torch.Tensor, min_gain: float) -> int:
+    """Best budget, unless the predicted win over verifying everything is too small to be worth it.
+
+    Trimming is not free even when the cost model likes it: fewer drafted tokens are verified, so a
+    step that would have committed them has to earn the loss back in reduced step time. Where the
+    cost curve is nearly flat -- small models, low load -- the predicted win shrinks to noise while
+    the accepted-token loss stays real, and acting on it is a measured throughput regression.
+
+    Verify-all is the last index because tau_star is strictly increasing, so it is also the baseline
+    to beat. `min_gain` of zero reproduces a plain argmax.
+    """
+    idx = int(torch.argmax(theta))
+    if min_gain <= 0.0:
+        return idx
+    verify_all = int(theta.numel()) - 1
+    baseline = float(theta[verify_all])
+    if baseline <= 0.0 or float(theta[idx]) < baseline * (1.0 + min_gain):
+        return verify_all
+    return idx
 
 
 def _lookup_sps_tensor(
@@ -1013,7 +1371,7 @@ class HostConfidenceBudgetPlanner:
     def __init__(
         self,
         *,
-        sps_table: SpsCostTable,
+        sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
         cfg: DSparkScheduleConfig,
         model_runner,
         relay_lag_steps: int = 1,
