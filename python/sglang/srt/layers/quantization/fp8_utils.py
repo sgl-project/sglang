@@ -574,30 +574,13 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="trtllm")
     elif backend.is_flashinfer_cutlass():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
-    elif (
-        _is_hip
-        and _is_gfx95_supported
-        and (
-            backend.is_auto()
-            or backend.is_triton()
-            or backend.is_aiter()
-            or backend.is_bf16()
-        )
-    ):
+    elif backend.is_gfx95_dot_scaled():
         from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
             dot_scaled_mxfp8_blockscaled_linear,
         )
 
         return dot_scaled_mxfp8_blockscaled_linear
-    elif backend.is_bf16():
-        raise RuntimeError(
-            "--fp8-gemm-backend bf16 is supported only for MXFP8 on AMD gfx950."
-        )
-    elif backend.is_triton():
-        return triton_mxfp8_blockscaled_linear
-    elif backend.is_unsupported():
-        return _unsupported_mxfp8_linear
-    return triton_mxfp8_blockscaled_linear
+    return _unsupported_mxfp8_linear
 
 
 def _deepgemm_w8a8_mxfp8_linear_with_fallback(
