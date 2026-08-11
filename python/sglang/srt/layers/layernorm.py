@@ -207,10 +207,7 @@ def _forward_with_allreduce_fusion(
         if use_attn_tp_group:
             world_size = get_parallel().attn_tp_size
         else:
-            if get_parallel().moe_ep_size > 1:
-                world_size = get_parallel().moe_ep_size
-            else:
-                world_size = get_parallel().moe_tp_size
+            world_size = get_parallel().tp_size
 
         if world_size > 1:
             if post_residual_addition is not None:

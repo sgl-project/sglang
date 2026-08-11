@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-h100")
 register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-b200")
@@ -71,7 +72,37 @@ def _torch_allreduce_residual_rmsnorm_baseline(
     return norm_out, residual_out
 
 
-class TestFlashInferCommFusion(unittest.TestCase):
+class TestFlashInferCommFusion(CustomTestCase):
+    def test_post_moe_fusion_uses_full_tp_group(self):
+        tp_group = object()
+        attn_tp_group = object()
+
+        for moe_ep_size, moe_tp_size in ((1, 8), (2, 4), (4, 2), (8, 1)):
+            parallel = types.SimpleNamespace(
+                tp_size=8,
+                tp_rank=3,
+                attn_tp_size=4,
+                attn_tp_rank=1,
+                moe_ep_size=moe_ep_size,
+                moe_ep_rank=0,
+                moe_tp_size=moe_tp_size,
+                moe_tp_rank=min(3, moe_tp_size - 1),
+            )
+            with (
+                self.subTest(moe_ep_size=moe_ep_size, moe_tp_size=moe_tp_size),
+                patch.object(fusion, "get_parallel", return_value=parallel),
+                patch.object(fusion, "get_tp_group", return_value=tp_group),
+                patch.object(fusion, "get_attn_tp_group", return_value=attn_tp_group),
+            ):
+                self.assertEqual(
+                    fusion._get_allreduce_group_info(use_attn_tp_group=False),
+                    (8, 3, tp_group),
+                )
+                self.assertEqual(
+                    fusion._get_allreduce_group_info(use_attn_tp_group=True),
+                    (4, 1, attn_tp_group),
+                )
+
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="auto", nnodes=1
