@@ -103,7 +103,10 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
 from sglang.srt.models.glm_ocr import GlmOcrVisionModel
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.mm_utils import (
+    run_dp_presharded_mrope_vision_model,
+    run_dp_sharded_mrope_vision_model,
+)
 from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
@@ -1222,6 +1225,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        if items and getattr(items[0], "dp_decode_sharded", False):
+            if len(items) != 1:
+                raise ValueError("DP-sharded video decode requires one video item")
+            dp_meta = items[0].dp_meta
+            height = int(video_grid_thw[0][1])
+            width = int(video_grid_thw[0][2])
+            global_grid = [[1, height, width]] * int(dp_meta["n_units"])
+            return run_dp_presharded_mrope_vision_model(
+                self.visual,
+                pixel_values,
+                flattened_video_grid_thw.tolist(),
+                global_grid,
+                dp_meta["gpu_sample_counts"],
+            )
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
                 self.visual,

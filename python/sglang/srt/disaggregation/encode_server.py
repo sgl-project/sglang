@@ -36,6 +36,9 @@ from sglang.srt.disaggregation.encode_receiver import (
     video_meta_attrs_for,
 )
 from sglang.srt.distributed.parallel_state import (
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
+    get_attn_tp_group,
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
     get_tp_group,
@@ -62,6 +65,13 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
     invoke_encoder_preprocessor,
+)
+from sglang.srt.multimodal.processors.glm4v import (
+    glm_decode_frames_at,
+    glm_sample_and_decode_sync,
+    glm_sample_frame_indices,
+    preprocess_video_frames_sync,
+    split_glm_video_items,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
@@ -215,6 +225,8 @@ _mm_feature_attrs = {
 
 
 def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
+    if modality == Modality.VIDEO and "_video_grid_thw_global" in mm_inputs:
+        return _convert(mm_inputs["_video_grid_thw_global"])
     # Kimi K2.5/K3 vision processors only emit `grid_thws`; prefer it over generic keys
     # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
     attrs = _mm_grid_attrs[modality]
@@ -689,7 +701,7 @@ class MMEncoder:
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                return load_video(data, use_gpu=self.use_image_processor_gpu)
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 
@@ -744,9 +756,95 @@ class MMEncoder:
             input_length = (feature_lens - 1) // 2 + 1
             return (input_length - 2) // 2 + 1
 
+    async def _dp_sharded_decode_single_video(
+        self,
+        vr,
+        video_config,
+        *,
+        tp_rank: int,
+        tp_size: int,
+        video_processor_kwargs: dict,
+        precomputed_indices: Optional[List[int]] = None,
+    ):
+        """Decode and preprocess only this encoder rank's temporal units."""
+        video_config = video_config or {}
+        video_fps = vr.avg_fps
+        duration = len(vr) / video_fps if video_fps else 0
+        global_indices = precomputed_indices or glm_sample_frame_indices(
+            len(vr),
+            video_fps,
+            duration,
+            target_fps=video_config.get("fps"),
+            max_frame_count=video_config.get("max_frames"),
+        )
+        n_units = len(global_indices) // 2
+        base, remainder = divmod(n_units, tp_size)
+        gpu_sample_counts = [
+            base + (1 if rank < remainder else 0) for rank in range(tp_size)
+        ]
+        start = sum(gpu_sample_counts[:tp_rank])
+        count = gpu_sample_counts[tp_rank]
+        local_indices = global_indices[2 * start : 2 * (start + count)]
+
+        local_error = None
+        frames = None
+        try:
+            frames = await asyncio.get_running_loop().run_in_executor(
+                self.io_executor,
+                glm_decode_frames_at,
+                vr,
+                local_indices,
+                video_config,
+            )
+        except Exception as exc:
+            local_error = exc
+
+        # All ranks must either enter the later ViT all-gather or fail before
+        # it.  A rank-local decoder error must therefore be agreed globally.
+        ok = torch.tensor([0 if local_error else 1], dtype=torch.int32)
+        if tp_size > 1:
+            torch.distributed.all_reduce(
+                ok,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_attn_tp_group().cpu_group,
+            )
+        if not int(ok.item()):
+            if local_error is not None:
+                raise local_error
+            raise MMError(
+                "peer encoder rank failed during sharded video decode",
+                code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        if frames is None:
+            height, width = vr.frame_shape
+            frames = np.zeros((0, height, width, 3), dtype=np.uint8)
+
+        video_processor_kwargs["do_sample_frames"] = False
+        video_processor_kwargs["return_metadata"] = True
+        # Preserve the same per-frame spatial budget as the unsharded request.
+        if global_indices and local_indices:
+            budget = video_config.get("max_image_tokens")
+            if budget is None:
+                budget = getattr(self.video_processor, "max_image_tokens", None)
+            if budget is not None:
+                video_processor_kwargs["max_image_tokens"] = max(
+                    1, int(int(budget) * len(local_indices) / len(global_indices))
+                )
+        video_processor_kwargs["_dp_meta"] = {
+            "global_indices": list(global_indices),
+            "fps": video_fps,
+            "n_units": n_units,
+            "gpu_sample_counts": gpu_sample_counts,
+        }
+        return [frames], video_processor_kwargs
+
     async def _flatten_and_load_videos(self, mm_items):
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
+
+        video_configs = [{} for _ in mm_items]
+        if "glm" in self.model_type:
+            mm_items, video_configs = split_glm_video_items(mm_items)
 
         futures, _ = self.submit_data_loading_tasks(
             mm_items, [Modality.VIDEO] * len(mm_items)
@@ -765,6 +863,63 @@ class MMEncoder:
             ]
             videos, video_metadata = map(list, zip(*video_processed))
             video_processor_kwargs["do_sample_frames"] = False
+            if video_metadata:
+                video_processor_kwargs["video_metadata"] = video_metadata
+            return videos, video_processor_kwargs
+        elif "glm" in self.model_type:
+            framed = any(isinstance(video, list) for video in video_items)
+            if framed:
+                processed = await asyncio.gather(
+                    *[
+                        asyncio.get_running_loop().run_in_executor(
+                            self.io_executor, preprocess_video_frames_sync, video
+                        )
+                        for video in video_items
+                    ]
+                )
+            else:
+                tp_size = get_attn_tensor_model_parallel_world_size()
+                sampled = None
+                if len(video_items) == 1:
+                    vr = video_items[0]
+                    config = video_configs[0]
+                    sampled = glm_sample_frame_indices(
+                        len(vr),
+                        vr.avg_fps,
+                        len(vr) / vr.avg_fps if vr.avg_fps else 0,
+                        target_fps=config.get("fps"),
+                        max_frame_count=config.get("max_frames"),
+                    )
+                # The static threshold intentionally keeps small videos on the
+                # simpler path; only large single videos need decode sharding.
+                if (
+                    self.server_args.mm_enable_dp_encoder
+                    and tp_size > 1
+                    and sampled is not None
+                    and len(sampled) >= max(32, tp_size * 2)
+                ):
+                    return await self._dp_sharded_decode_single_video(
+                        video_items[0],
+                        video_configs[0],
+                        tp_rank=get_attn_tensor_model_parallel_rank(),
+                        tp_size=tp_size,
+                        video_processor_kwargs=video_processor_kwargs,
+                        precomputed_indices=sampled,
+                    )
+                processed = await asyncio.gather(
+                    *[
+                        asyncio.get_running_loop().run_in_executor(
+                            self.io_executor,
+                            glm_sample_and_decode_sync,
+                            video,
+                            video_configs[index],
+                        )
+                        for index, video in enumerate(video_items)
+                    ]
+                )
+            videos, video_metadata = map(list, zip(*processed))
+            video_processor_kwargs["do_sample_frames"] = False
+            video_processor_kwargs["return_metadata"] = True
             if video_metadata:
                 video_processor_kwargs["video_metadata"] = video_metadata
             return videos, video_processor_kwargs
@@ -1764,6 +1919,7 @@ class MMEncoder:
             raise ValueError("No video processor available")
 
         videos, video_processor_kwargs = await self._flatten_and_load_videos(mm_items)
+        dp_meta = video_processor_kwargs.pop("_dp_meta", None)
         processor_input = await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,
             functools.partial(
@@ -1772,7 +1928,44 @@ class MMEncoder:
         )
 
         # Get additional video metadata
-        if (
+        if "glm" in self.model_type:
+            if dp_meta is not None:
+                global_timestamps = [
+                    index / dp_meta["fps"] for index in dp_meta["global_indices"]
+                ][::2]
+                processor_input["video_timestamps"] = [global_timestamps]
+                processor_input.pop("video_metadata", None)
+                processor_input["dp_decode_sharded"] = True
+                processor_input["dp_meta"] = dp_meta
+                local_grid = processor_input.get("video_grid_thw")
+                if local_grid is not None and len(local_grid) > 0:
+                    processor_input["_video_grid_thw_global"] = torch.tensor(
+                        [
+                            [
+                                dp_meta["n_units"],
+                                int(local_grid[0][1]),
+                                int(local_grid[0][2]),
+                            ]
+                        ]
+                    )
+            else:
+                video_metadata = processor_input.get("video_metadata")
+                video_timestamps = []
+                for metadata in video_metadata or []:
+                    timestamps = getattr(metadata, "timestamps", None)
+                    if timestamps is None and isinstance(metadata, dict):
+                        fps = metadata.get("fps") or 1
+                        timestamps = [
+                            index / fps for index in metadata.get("frames_indices", [])
+                        ]
+                    if timestamps is None:
+                        raise InternalError(
+                            f"GLM video metadata missing timestamps: {metadata}"
+                        )
+                    video_timestamps.append(list(timestamps)[::2])
+                processor_input["video_timestamps"] = video_timestamps
+                processor_input.pop("video_metadata", None)
+        elif (
             self.model_type
             in [
                 "qwen3_vl",
@@ -1876,9 +2069,12 @@ class MMEncoder:
                 modality,
                 grid_thw,
             )
+            is_dp_sharded = bool(mm_inputs.get("dp_decode_sharded", False))
 
             cache_hit = False
-            use_mm_cache = get_mm().enable_prefix_mm_cache and log_metrics
+            use_mm_cache = (
+                get_mm().enable_prefix_mm_cache and log_metrics and not is_dp_sharded
+            )
             if use_mm_cache:
                 for item in model_mm_items:
                     item.set_pad_value()
