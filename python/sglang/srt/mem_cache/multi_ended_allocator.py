@@ -25,7 +25,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -38,7 +38,10 @@ from sglang.srt.mem_cache.allocator.paged import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import (
+    UnifiedKVPool,
+    UnifiedMLATokenToKVPool,
+)
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
 logger = logging.getLogger(__name__)
@@ -136,6 +139,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # once page ids are scaled by layer_num — `translate_kv_loc_dense` emits
         # that space. 1 for sub-pools whose kernels take real physical ids.
         self.kernel_page_multiplier = kernel_page_multiplier
+        # Zero page envelopes on hand-out — see _maybe_zero_pages.
+        self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
         # v2p writes + move kernel serialize after the in-flight forward.
         self.forward_stream = forward_stream
@@ -213,6 +218,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             _STATS_INSTANCES.add(self)
             _install_signal_handlers_once()
         self.live_page_count = 0
+        # While this returns False, `_flush` must not relocate any page.
+        self.disagg_move_gate: Optional[Callable[[], bool]] = None
         self._latest_forward_done_event: Optional[torch.cuda.Event] = None
         # Most-recent forward's (done_event, out_cache_loc_virtual) for `_flush`'s
         # write-race check. Single slot: at most ONE forward in flight per call site.
@@ -387,6 +394,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         peer = self._peer
         if peer is None or not peer.lazy_compaction:
+            return 0
+        if peer.disagg_move_gate is not None and not peer.disagg_move_gate():
+            # The peer cannot compact while a PD transfer is in flight, so these
+            # holes are not realizable. Crediting them would let the scheduler
+            # admit work that `_flush_peer_for_alloc` then cannot satisfy, and
+            # the caller treats a failed alloc as a memory-estimation bug.
             return 0
         return len(peer._free_phys_pages) * peer.entry_bytes_per_page
 
@@ -617,6 +630,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
                 if self.lazy_compaction:  # live_page_count tracked only in lazy mode
                     self.live_page_count += N
+                self._maybe_zero_pages(phys_pages)
                 return phys_pages
 
             # SLOW PATH: holes exist — drain them first, then bind.
@@ -624,7 +638,20 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if phys_pages is None:
                 return None
             self.bind(v_pages, phys_pages)
+            self._maybe_zero_pages(phys_pages)
             return phys_pages
+
+    def _maybe_zero_pages(self, phys_pages: torch.Tensor) -> None:
+        """Zero the page ENVELOPES on hand-out (MLA-dense full pool only):
+        the MLA kernels arithmetically mask the rows beyond seq_len, so
+        never-written page bytes must read as finite values. Runs on the
+        schedule stream, ordered before the consuming forward by the
+        run_batch wait_stream fence.
+        """
+        if not self._zero_pages_on_alloc or phys_pages.numel() == 0:
+            return
+        with record_function("MultiEndedAlloc._maybe_zero_pages"):
+            self._kvcache.zero_physical_pages(phys_pages)
 
     # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
 
@@ -1039,6 +1066,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._compact_pending_impl(freed_physical_pages)
 
     def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
+        assert self.disagg_move_gate is None, (
+            f"_compact_pending({self.sub_pool_name!r}): eager compaction ran with "
+            "a PD-disaggregation move gate installed; PD requires lazy_compaction."
+        )
         freed_set = set(int(x) for x in freed_physical_pages.tolist())
         if not freed_set:
             return
@@ -1420,6 +1451,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         loop is a corrupt-state bug and raises.
         """
         if not self.lazy_compaction:
+            return 0
+        if self.disagg_move_gate is not None and not self.disagg_move_gate():
+            # Holes stay in the free list; the next flush picks them up.
             return 0
         self._stats_n_flush_calls += 1
         with record_function("MultiEndedAlloc._flush"):
@@ -1916,6 +1950,26 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids. Falls back
         to the physical translate when `kernel_page_multiplier == 1` (MHA)."""
         return self.full_attn_allocator.translate_kv_loc_dense(loc, out=out)
+
+    def translate_kv_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Virtual TOKEN ids -> PHYSICAL token ids for the PD transfer engine.
+
+        PHYSICAL, not dense: the transfer registers page ENVELOPES (see
+        `UnifiedMLATokenToKVPool.get_contiguous_buf_infos`).
+        """
+        return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+
+    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Install the PD-disaggregation move gate on both sub-allocators."""
+        assert self.lazy_compaction, (
+            "PD disaggregation with the unified memory pool requires lazy "
+            "compaction (eager free-path compaction moves pages under "
+            "in-flight transfers)."
+        )
+        self.full_attn_allocator.disagg_move_gate = gate
+        self.mamba_allocator.disagg_move_gate = gate
 
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)

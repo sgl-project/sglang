@@ -57,6 +57,7 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
@@ -302,6 +303,41 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
         )
+
+    def test_served_model_name_cli_arg(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        cases = [
+            (
+                [
+                    "--model-path",
+                    "/fake",
+                    "--model-id",
+                    "Qwen-Image",
+                    "--served-model-name",
+                    "my-served-name",
+                ],
+                "my-served-name",
+            ),
+            (
+                ["--model-path", "/fake", "--model-id", "Qwen-Image"],
+                "Qwen-Image",
+            ),
+            (["--model-path", "/fake"], "/fake"),
+        ]
+
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                with patch.object(sys, "argv", ["sglang"] + argv):
+                    args, unknown_args = parser.parse_known_args(argv)
+                    with patch.object(
+                        PipelineConfig,
+                        "from_kwargs",
+                        return_value=QwenImagePipelineConfig(),
+                    ):
+                        server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+                self.assertEqual(server_args.served_model_name, expected)
 
     def test_dit_layerwise_offload_cli_arg(self):
         parser = FlexibleArgumentParser()
@@ -2300,6 +2336,45 @@ class TestNcclNvlsArgs(unittest.TestCase):
         self.assertFalse(default_args.enable_nccl_nvls)
         self.assertTrue(enabled_args.enable_nccl_nvls)
         self.assertFalse(disabled_args.enable_nccl_nvls)
+
+
+class TestDirectGpuWeightLoading(unittest.TestCase):
+    def _args(self) -> ServerArgs:
+        args = ServerArgs.__new__(ServerArgs)
+        args.direct_gpu_weight_loading = True
+        args.dit_cpu_offload = False
+        args.layerwise_offload_components = []
+        args.use_fsdp_inference = False
+        args.tp_size = 1
+        return args
+
+    def test_cli_defaults_off_and_parses_explicit_enable(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        default_args, _ = parser.parse_known_args(["--model-path", "/fake"])
+        enabled_args, _ = parser.parse_known_args(
+            ["--model-path", "/fake", "--direct-gpu-weight-loading"]
+        )
+
+        self.assertFalse(default_args.direct_gpu_weight_loading)
+        self.assertTrue(enabled_args.direct_gpu_weight_loading)
+
+    def test_rejects_cpu_offload_fsdp_and_tp(self):
+        cpu_offload_args = self._args()
+        cpu_offload_args.dit_cpu_offload = True
+        fsdp_args = self._args()
+        fsdp_args.use_fsdp_inference = True
+        tp_args = self._args()
+        tp_args.tp_size = 2
+
+        with patch.object(current_platform, "is_cuda", return_value=True):
+            with self.assertRaisesRegex(ValueError, "GPU-resident DiT"):
+                cpu_offload_args._validate_direct_gpu_weight_loading()
+            with self.assertRaisesRegex(ValueError, "FSDP"):
+                fsdp_args._validate_direct_gpu_weight_loading()
+            with self.assertRaisesRegex(ValueError, "tp-size 1"):
+                tp_args._validate_direct_gpu_weight_loading()
 
 
 if __name__ == "__main__":
