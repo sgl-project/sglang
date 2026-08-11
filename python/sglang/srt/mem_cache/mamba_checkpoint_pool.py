@@ -36,7 +36,7 @@ The scale axis (reduces over d_v) matches the per-k-channel decay diag(alpha), s
 the large state entries keep ~bf16 precision and the error concentrates on small
 entries that barely affect the readout. Storing cached states int8 gives ~2x the
 cached-prefix capacity at fixed memory, and composes with host-offload
-(HiMambaRadixCache) which it also halves.
+(--enable-hierarchical-cache) which it also halves.
 
 This is strategy-agnostic: whether the active slot to be cached was produced by
 the ``no_buffer`` donate (copy_from) or the ``extra_buffer`` ping-pong track
