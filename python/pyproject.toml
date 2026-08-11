@@ -151,10 +151,6 @@ fastokens = [
   "fastokens>=0.1.1,<0.2.0",
 ]
 
-helion = [
-  "helion==1.4.0",
-]
-
 test = [
   "accelerate",
   "addict",
@@ -183,7 +179,6 @@ test = [
   "pytest-cov",
   "sentence_transformers",
   "sglang[fastokens]",
-  "sglang[helion]",
   "tabulate",
 ]
 

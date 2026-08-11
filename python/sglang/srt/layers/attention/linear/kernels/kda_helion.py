@@ -40,7 +40,7 @@ class HelionKDAKernel(LinearAttnKernelBase):
                     raise
                 raise ImportError(
                     "The Helion package is required when a KDA backend is set to "
-                    "Helion. Install it with: pip install 'sglang[helion]'"
+                    "Helion. Install it with: pip install helion==1.4.0"
                 ) from None
         if enable_decode:
             from sglang.kernels.ops.attention.helion.kda_decode import (
