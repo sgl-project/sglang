@@ -2,12 +2,13 @@
 
 import sys
 import unittest
+from contextlib import ExitStack
 from dataclasses import FrozenInstanceError
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-
+from sglang.srt.layers.attention.linear import kda_route_telemetry
 from sglang.srt.layers.attention.linear.kernels import kda_flashinfer
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     CakeKDAKernel,
@@ -551,6 +552,16 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
             ),
             patch.object(
                 torch.Tensor,
+                "clone",
+                side_effect=AssertionError("packed CAKE decode cloned an input"),
+            ),
+            patch.object(
+                torch.Tensor,
+                "copy_",
+                side_effect=AssertionError("packed CAKE decode copied an input"),
+            ),
+            patch.object(
+                torch.Tensor,
                 "index_select",
                 side_effect=AssertionError("packed CAKE decode gathered state"),
             ),
@@ -646,6 +657,91 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
             reason=CakePackedDecodeReason.INNER_STRIDE,
             detail="raw_beta",
         )
+
+    def test_every_rejection_reason_bypasses_cake_and_emits_exact_terminal_event(
+        self,
+    ):
+        """Keep the complete schema-v1 rejection vocabulary fail-closed.
+
+        This is the host-side routing gate.  A GPU/CUPTI receipt must separately
+        prove that every row has no packed-CAKE kernel activity.
+        """
+        selector_reasons = (
+            CakePackedDecodeReason.UNSUPPORTED_CONTRACT,
+            CakePackedDecodeReason.INNER_STRIDE,
+            CakePackedDecodeReason.ZERO_ROW_STRIDE,
+            CakePackedDecodeReason.NEGATIVE_ROW_STRIDE,
+            CakePackedDecodeReason.OVERLAPPING_ROW_STRIDE,
+            CakePackedDecodeReason.STORAGE_ALIAS,
+            CakePackedDecodeReason.CACHE_INDEX_UNVERIFIED,
+            CakePackedDecodeReason.CACHE_INDEX_OOB,
+            CakePackedDecodeReason.CACHE_INDEX_DUPLICATE,
+        )
+        cases = (
+            (CakePackedDecodeReason.KERNEL_UNAVAILABLE, "", "kernel"),
+            (CakePackedDecodeReason.REPLAYSSM_REQUESTED, "", "replayssm"),
+            *((reason, f"case:{reason}", "selector") for reason in selector_reasons),
+        )
+        self.assertEqual(
+            {reason for reason, _, _ in cases},
+            set(kda_route_telemetry._DECODE_FALLBACK_REASONS),
+        )
+        inputs = self._inputs()
+        sentinel = torch.empty(1, 2, 12, 128, dtype=torch.bfloat16)
+
+        for reason, detail, source in cases:
+            with self.subTest(reason=reason):
+                packed_decode = Mock(
+                    side_effect=AssertionError(
+                        f"rejected route {reason!r} reached packed CAKE"
+                    )
+                )
+                kernel = self._kernel(packed_decode)
+                call_kwargs = {}
+                if source == "kernel":
+                    kernel._packed_kda_decode = None
+                elif source == "replayssm":
+                    call_kwargs["replayssm_d"] = object()
+                with ExitStack() as stack:
+                    fallback = stack.enter_context(
+                        patch.object(
+                            kernel,
+                            "_packed_decode_triton",
+                            return_value=sentinel,
+                        )
+                    )
+                    telemetry = stack.enter_context(
+                        patch.object(kda_flashinfer, "record_kda_terminal_route")
+                    )
+                    if source == "selector":
+                        stack.enter_context(
+                            patch.object(
+                                kernel,
+                                "_cake_packed_decode_admission",
+                                return_value=CakePackedDecodeAdmission(
+                                    False, reason, detail
+                                ),
+                            )
+                        )
+                    output = kernel.packed_decode(**inputs, layer_id=7, **call_kwargs)
+
+                self.assertIs(output, sentinel)
+                fallback.assert_called_once()
+                packed_decode.assert_not_called()
+                self.assertFalse(kernel._last_packed_decode_admission.eligible)
+                self.assertEqual(kernel._last_packed_decode_admission.reason, reason)
+                self.assertEqual(kernel._last_packed_decode_admission.detail, detail)
+                telemetry.assert_called_once_with(
+                    mode="decode",
+                    layer_id=7,
+                    eligible=False,
+                    attempted_cake=False,
+                    cake_success=False,
+                    triton_fallback=True,
+                    fatal=False,
+                    reason=reason,
+                    detail=detail,
+                )
 
     def test_selector_reports_stable_stride_reasons(self):
         batch_size = 8
