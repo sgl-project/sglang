@@ -864,13 +864,13 @@ inline void transfer_kv_page_first_direct_impl(
         const int64_t d_index = dst_indices_ptr[i * page_size] / page_size;
         for (int64_t j = 0; j < num_layers; ++j) {
           batch_append(
-	      src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+              src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
           if (!is_mla) {
             batch_append(
                 src_ptrs[j + num_layers],
-		dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
-		s_index,
-		0,
+                dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
+                s_index,
+                0,
                 page_size);
           }
         }
@@ -883,13 +883,13 @@ inline void transfer_kv_page_first_direct_impl(
         const int64_t d_index = dst_indices_ptr[i * page_size];
         for (int64_t j = 0; j < num_layers; ++j) {
           batch_append(
-	      src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+              src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
           if (!is_mla) {
             batch_append(
                 src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
-		dst_ptrs[j + num_layers],
-		0,
-		d_index,
+                dst_ptrs[j + num_layers],
+                0,
+                d_index,
                 page_size);
           }
         }
@@ -899,13 +899,13 @@ inline void transfer_kv_page_first_direct_impl(
       size_t fail_idx = std::numeric_limits<size_t>::max();
       hipError_t err = hipMemcpyBatchAsync(
           b_dsts.data(),
-	  b_srcs.data(),
-	  b_sizes.data(),
-	  b_srcs.size(),
-	  nullptr,
-	  nullptr,
-	  0,
-	  &fail_idx,
+          b_srcs.data(),
+          b_sizes.data(),
+          b_srcs.size(),
+          nullptr,
+          nullptr,
+          0,
+          &fail_idx,
           at::cuda::getCurrentCUDAStream().stream());
       if (err != hipSuccess) {
         TORCH_WARN_ONCE("hipMemcpyBatchAsync failed (", hipGetErrorString(err), "), falling back to per-page copy");
