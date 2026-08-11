@@ -860,7 +860,9 @@ def flash_decode_with_topk_idx(
     )
     use_jit_topk = (
         envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= 4096
+        # kMaxNumBlocks in minimax_decode_topk.cuh; the kernel clamps its scan
+        # to the live seq_len, so graph-static widths sized for max context pass.
+        and score.shape[2] <= 16384
         and topk <= 32
     )
     # If the live context has <= topk sparse blocks, the downstream dense
