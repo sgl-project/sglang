@@ -25,6 +25,10 @@ class ModelDeploymentConfig:
     auto_enable_cfg_parallel: bool = True
     # degree 1 keeps CFG parallel disabled and leaves GPUs available for SP
     auto_cfg_parallel_degree_by_num_gpus: tuple[tuple[int, int], ...] = ()
+    # torch.compile is model opt-in because it can be slower than eager for
+    # diffusion workloads dominated by already-optimized kernels
+    speed_mode_enable_torch_compile_by_default: bool = False
+    supports_cfg_parallel: bool = True
 
     def get_auto_cfg_parallel_degree(self, num_gpus: int) -> int:
         for candidate_num_gpus, cfg_degree in self.auto_cfg_parallel_degree_by_num_gpus:

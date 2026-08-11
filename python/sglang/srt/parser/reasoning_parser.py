@@ -12,6 +12,17 @@ from sglang.srt.entrypoints.openai.encoding_dsv4 import (
 )
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
+from sglang.srt.function_call.kimik3_format import (
+    MESSAGE_CLOSE,
+    RESPONSE_CLOSE,
+    RESPONSE_OPEN,
+    THINK_CLOSE,
+    THINK_OPEN,
+    TOOLS_OPEN,
+    partial_suffix_len,
+    strip_partial_marker_suffix,
+    strip_response_wrappers,
+)
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
@@ -417,6 +428,182 @@ class KimiK2Detector(BaseReasoningFormatDetector):
             reasoning_default="thinking",
             force_nonempty_content=force_nonempty_content,
         )
+
+
+class KimiK3Detector(BaseReasoningFormatDetector):
+    """Detector for the Kimi K3 XTML think channel.
+
+    K3 wraps reasoning as ``<|open|>think<|sep|>...<|close|>think<|sep|>``
+    where each marker is a multi-token special sequence, so partial markers
+    can straddle streaming chunks and must be held back. In thinking mode
+    the serving layer may feed the open marker as the generation prefix, so
+    output can begin inside the think channel with no open marker
+    (``force_reasoning=True`` covers this).
+
+    Post-reasoning content is unwrapped from the XTML ``response`` /
+    ``message`` markers; a ``tools`` channel is passed through raw for the
+    kimi_k3 tool-call detector.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        # strict-thinking flattens these to single token ids, so the full marker
+        # "<|open|>response<|sep|>" is inexpressible. The bare name works: it
+        # follows <|open|> unspaced, so it tokenizes to the no-space variant, not
+        # the " response"/" message" tokens prose uses -- at the cost of not being
+        # able to start those words unspaced mid-reasoning. tools is left out on
+        # purpose: the model may jump from think straight into that channel.
+        think_excluded_tokens = [
+            "response",
+            "message",
+            "<|end_of_msg|>",
+            "[EOS]",
+            "[EOT]",
+        ]
+        super().__init__(
+            THINK_OPEN,
+            THINK_CLOSE,
+            think_excluded_tokens=think_excluded_tokens,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token=TOOLS_OPEN,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            reasoning_default="thinking",
+        )
+        self._reasoning_done = False
+        self._tools_passthrough = False
+
+    def _clean_content(self, text: str) -> str:
+        tools_idx = text.find(TOOLS_OPEN)
+        if tools_idx != -1:
+            return strip_response_wrappers(text[:tools_idx]) + text[tools_idx:]
+        return strip_response_wrappers(text)
+
+    def _next_channel_idx(self, text: str, start: int = 0) -> int:
+        found = [
+            idx
+            for token in (RESPONSE_OPEN, self.tool_start_token)
+            if (idx := text.find(token, start)) != -1
+        ]
+        return min(found) if found else -1
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        in_reasoning = self._in_reasoning or self.think_start_token in text
+        if not in_reasoning and self.think_end_token not in text:
+            return StreamingParseResult(normal_text=self._clean_content(text))
+
+        open_idx = text.find(self.think_start_token)
+        start = open_idx + len(self.think_start_token) if open_idx != -1 else 0
+        close_idx = text.find(self.think_end_token, start)
+        if close_idx == -1:
+            channel_idx = self._next_channel_idx(text, start)
+            if channel_idx != -1:
+                return StreamingParseResult(
+                    reasoning_text=strip_partial_marker_suffix(text[start:channel_idx]),
+                    normal_text=self._clean_content(text[channel_idx:]),
+                )
+            return StreamingParseResult(
+                reasoning_text=strip_partial_marker_suffix(text[start:])
+            )
+
+        reasoning_text = text[start:close_idx]
+        rest = text[close_idx + len(self.think_end_token) :]
+        return StreamingParseResult(
+            reasoning_text=reasoning_text, normal_text=self._clean_content(rest)
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        self._buffer += new_text
+
+        if not self._in_reasoning and not self._reasoning_done:
+            open_idx = self._buffer.find(self.think_start_token)
+            if open_idx != -1:
+                self._buffer = self._buffer[open_idx + len(self.think_start_token) :]
+                self._in_reasoning = True
+                self.stripped_think_start = True
+            elif self.think_start_token.startswith(self._buffer):
+                return StreamingParseResult()
+            else:
+                self._reasoning_done = True
+
+        if self._in_reasoning:
+            buf = self._buffer
+            if not self.stripped_think_start:
+                open_idx = buf.find(self.think_start_token)
+                if open_idx != -1:
+                    buf = buf[open_idx + len(self.think_start_token) :]
+                    self._buffer = buf
+                    self.stripped_think_start = True
+
+            close_idx = buf.find(self.think_end_token)
+            if close_idx != -1:
+                reasoning_text = buf[:close_idx]
+                self._buffer = buf[close_idx + len(self.think_end_token) :]
+                self._in_reasoning = False
+                self._reasoning_done = True
+                return StreamingParseResult(
+                    reasoning_text=reasoning_text or None,
+                    normal_text=self._drain_content() or None,
+                )
+
+            channel_idx = self._next_channel_idx(buf)
+            if channel_idx != -1:
+                reasoning_text = strip_partial_marker_suffix(buf[:channel_idx])
+                self._buffer = buf[channel_idx:]
+                self._in_reasoning = False
+                self._reasoning_done = True
+                self._tools_passthrough = buf.startswith(
+                    self.tool_start_token, channel_idx
+                )
+                return StreamingParseResult(
+                    reasoning_text=reasoning_text or None,
+                    normal_text=self._drain_content() or None,
+                )
+
+            if not self.stream_reasoning:
+                return StreamingParseResult()
+            markers = [self.think_end_token, self.tool_start_token, RESPONSE_OPEN]
+            if not self.stripped_think_start:
+                markers.append(self.think_start_token)
+            holdback = partial_suffix_len(buf, markers)
+            emit = buf[: len(buf) - holdback] if holdback else buf
+            emit = strip_partial_marker_suffix(emit)
+            self._buffer = buf[len(emit) :]
+            return StreamingParseResult(reasoning_text=emit)
+
+        return StreamingParseResult(normal_text=self._drain_content())
+
+    def _drain_content(self) -> str:
+        buf = self._buffer
+        if not buf:
+            return ""
+        if self._tools_passthrough:
+            self._buffer = ""
+            return buf
+
+        tools_idx = buf.find(TOOLS_OPEN)
+        if tools_idx != -1:
+            head = buf[:tools_idx]
+            for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
+                head = head.replace(marker, "")
+            self._tools_passthrough = True
+            self._buffer = ""
+            return head + buf[tools_idx:]
+
+        holdback = partial_suffix_len(
+            buf, [RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE, TOOLS_OPEN]
+        )
+        emit = buf[: len(buf) - holdback] if holdback else buf
+        self._buffer = buf[len(emit) :]
+        for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
+            emit = emit.replace(marker, "")
+        return emit
 
 
 class Glm45Detector(BaseReasoningFormatDetector):
@@ -1448,6 +1635,7 @@ class ReasoningParser:
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
+        "kimi_k3": KimiK3Detector,
         "mimo": _MimoDetector,
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,

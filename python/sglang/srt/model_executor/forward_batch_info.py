@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -51,7 +51,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -229,6 +229,25 @@ def register_attn_tp_sequence_sharded_predicate(
     """Register the predicate for whether a forward is sharded across attn-TP."""
     global _attn_tp_sequence_sharded_predicate
     _attn_tp_sequence_sharded_predicate = predicate
+
+
+def get_server_return_hidden_states_mode(server_args: Any) -> CaptureHiddenMode:
+    mode = getattr(server_args, "return_hidden_states_mode", None)
+    if mode == "last":
+        return CaptureHiddenMode.LAST
+    if mode == "full" or getattr(server_args, "enable_return_hidden_states", False):
+        return CaptureHiddenMode.FULL
+    return CaptureHiddenMode.NULL
+
+
+def get_required_capture_hidden_mode(
+    capture_hidden_mode: CaptureHiddenMode,
+    spec_info: Optional[SpecInput],
+) -> CaptureHiddenMode:
+    spec_capture_hidden_mode = (
+        getattr(spec_info, "capture_hidden_mode", None) or CaptureHiddenMode.NULL
+    )
+    return max(capture_hidden_mode, spec_capture_hidden_mode)
 
 
 def _attn_tp_local_shard_bounds(num_tokens_per_dp: int) -> Tuple[int, int]:
@@ -534,6 +553,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     num_token_non_padded_cpu: int = None
 
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
+    # Preallocated piecewise-graph attention output, set by RadixAttention.
+    _attn_output: Optional[torch.Tensor] = None
+
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
@@ -680,6 +702,39 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if skip_attn_backend_init:
             self.mark_forward_metadata_ready()
 
+    def init_mlp_sync_metadata(
+        self, batch: ScheduleBatch, device: Union[str, torch.device]
+    ) -> None:
+        """Populate per-rank token counts for DP-attention MLP synchronization."""
+        if batch.global_num_tokens is None:
+            return
+
+        assert batch.global_num_tokens_for_logprob is not None
+        if self.spec_info is not None:
+            from sglang.srt.speculative.spec_info import spec_scale_global_num_tokens
+
+            global_num_tokens, global_num_tokens_for_logprob = (
+                spec_scale_global_num_tokens(
+                    self.spec_info,
+                    batch.global_num_tokens,
+                    batch.global_num_tokens_for_logprob,
+                )
+            )
+        else:
+            global_num_tokens = batch.global_num_tokens
+            global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+
+        self.original_global_num_tokens_cpu = batch.global_num_tokens
+        self.global_num_tokens_cpu = global_num_tokens
+        self.global_num_tokens_gpu = torch.tensor(
+            global_num_tokens, dtype=torch.int64
+        ).to(device, non_blocking=True)
+        self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
+        self.global_num_tokens_for_logprob_gpu = torch.tensor(
+            global_num_tokens_for_logprob, dtype=torch.int64
+        ).to(device, non_blocking=True)
+        self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+
     @classmethod
     def init_new(
         cls,
@@ -692,17 +747,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
 
-        # capture_hidden_mode=None means no override: derive from
-        # SB.return_hidden_states / spec_info.capture_hidden_mode.
+        # capture_hidden_mode=None means no override: capture the server's
+        # configured maximum so lower-mode requests can share one graph.
         if capture_hidden_mode is None:
-            if batch.return_hidden_states:
-                capture_hidden_mode = CaptureHiddenMode.FULL
-            elif batch.spec_info is not None:
-                capture_hidden_mode = getattr(
-                    batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+            request_capture_hidden_mode = (
+                CaptureHiddenMode.NULL
+                if model_runner.is_draft_worker
+                else max(
+                    batch.return_hidden_states_mode,
+                    get_server_return_hidden_states_mode(model_runner.server_args),
                 )
-            else:
-                capture_hidden_mode = CaptureHiddenMode.NULL
+            )
+            capture_hidden_mode = get_required_capture_hidden_mode(
+                request_capture_hidden_mode,
+                batch.spec_info,
+            )
 
         # extend-mode-only fields are None on decode/idle
         if batch.forward_mode.is_decode_or_idle():
@@ -815,40 +874,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
         ret.num_token_non_padded_cpu = num_tokens
 
-        # For MLP sync
-        if batch.global_num_tokens is not None:
-            assert batch.global_num_tokens_for_logprob is not None
-
-            # process global_num_tokens and global_num_tokens_for_logprob
-            if batch.spec_info is not None:
-                from sglang.srt.speculative.spec_info import (
-                    spec_scale_global_num_tokens,
-                )
-
-                global_num_tokens, global_num_tokens_for_logprob = (
-                    spec_scale_global_num_tokens(
-                        batch.spec_info,
-                        batch.global_num_tokens,
-                        batch.global_num_tokens_for_logprob,
-                    )
-                )
-            else:
-                global_num_tokens = batch.global_num_tokens
-                global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
-
-            ret.original_global_num_tokens_cpu = batch.global_num_tokens
-            ret.global_num_tokens_cpu = global_num_tokens
-            ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
-            ).to(device, non_blocking=True)
-
-            ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
-            ).to(device, non_blocking=True)
+        ret.init_mlp_sync_metadata(batch, device)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if model_runner.server_args.enable_lora:
+                model_runner.lora_manager.reset_lora_batch()
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -893,7 +924,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
-                model_runner.server_args.attention_backend,
+                model_runner.prefill_attention_backend_str,
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
@@ -931,12 +962,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         if (
-            getattr(model_runner, "dcp_size", 1) > 1
+            model_runner.ps.attn_dcp_size > 1
             and ret.out_cache_loc is not None
             and is_hip()
         ):
             ret.dcp_kv_mask = (
-                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
+                ret.positions % model_runner.ps.attn_dcp_size
+                == model_runner.ps.attn_dcp_rank
             )
 
         return ret
@@ -963,7 +995,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # --enable-mis: every request must carry delimiter indices (the score
             # endpoint always produces MIS-structured requests; consumers index
             # without None-checking).
-            if get_server_args().enable_mis and any(
+            if get_exec().features.enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
             ):
                 assert all(
@@ -1132,7 +1164,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
-        rl_on_policy_target = get_server_args().rl_on_policy_target
+        rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
@@ -1240,11 +1272,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dp_padding_mode = DpPaddingMode.SUM_LEN
         # Prefill breakable CUDA graph requires every DP rank to run the SAME
         # captured shape. Under SUM_LEN each rank pads to its own local token
-        # count and can select a different capture bucket, so the in-graph DP
-        # collectives (all_gather / reduce_scatter) mismatch across ranks and
-        # corrupt the output. Force MAX_LEN so every rank pads to the global
-        # max and picks the same bucket (mirrors the decode cuda graph
-        # contract, which always runs MAX_LEN).
+        # count and can select a different capture bucket. This mismatches the
+        # rank-coupled communication geometry: DP gather/combine uses
+        # all_gather_into_tensor / reduce_scatter_tensor, while MoE backends may
+        # use A2A dispatch/combine. Force MAX_LEN so every rank pads to the global
+        # max and picks the same bucket.
         #
         # Only force MAX_LEN when the batch fits a captured breakable prefill
         # graph; larger prefills fall back to eager and keep the
@@ -1492,9 +1524,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_accept_tokens = self._pad_tensor_to_size(
                     spec_info.num_accept_tokens, bs
                 )
-            spec_info.hidden_states = self._pad_tensor_to_size(
-                spec_info.hidden_states, num_tokens
-            )
+            if spec_info.hidden_states is not None:
+                spec_info.hidden_states = self._pad_tensor_to_size(
+                    spec_info.hidden_states, num_tokens
+                )
 
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
         from sglang.srt.layers.communicator import get_attn_tp_context
@@ -1541,12 +1574,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
-                num_tokens = bs * self.spec_info.draft_token_num
+                num_tokens = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :num_tokens
                     ]
-                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[
+                        :num_tokens
+                    ]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:

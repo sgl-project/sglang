@@ -34,7 +34,7 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
@@ -120,7 +120,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.speculative_num_steps = (
-            model_runner.server_args.speculative_num_steps
+            get_spec().speculative_num_steps
             if speculative_num_steps is None
             else speculative_num_steps
         )
@@ -479,7 +479,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 self,
                 run_once,
                 post_warmup_hook=post_warmup_hook,
-                skip_logits=False,
+                run_lm_head=True,
             )
             self.backend.capture_one(
                 shape_key,

@@ -59,6 +59,11 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import (
+    cp_materialize_global_token_order,
+    cp_round_robin_input_ids_v2,
+    is_cp_v2_active,
+)
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -84,6 +89,10 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.quantization.fp8_utils import (
+    view_aiter_fused_rms_transposed_fp8_scale,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -138,7 +147,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -216,6 +225,74 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     )
 
 
+# FlashInfer's mhc_pre_big_fuse only accepts these split-K counts.
+_FLASHINFER_MHC_PRE_SPLITS = (1, 2, 4, 8, 16)
+
+
+@functools.cache
+def _cuda_sm_count() -> int:
+    return torch.cuda.get_device_properties(0).multi_processor_count
+
+
+def _flashinfer_mhc_pre_num_splits(num_tokens: int, hc_hidden_size: int) -> int:
+    block_m = block_k = 64
+    grid_m = (num_tokens + block_m - 1) // block_m
+    num_block_k = (hc_hidden_size + block_k - 1) // block_k
+    raw = max(1, min(_cuda_sm_count() // max(grid_m, 1), num_block_k // 4))
+    best = 1
+    for split in _FLASHINFER_MHC_PRE_SPLITS:
+        if split <= raw:
+            best = split
+    return best
+
+
+def _flashinfer_hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from flashinfer.mhc import mhc_pre_big_fuse
+
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+
+    num_tokens, hc_mult, hidden_size = x.shape
+    hc_hidden_size = hc_mult * hidden_size
+    mix_dim = hc_fn.shape[0]  # hc_mult * (2 + hc_mult) == 24
+    n_splits = _flashinfer_mhc_pre_num_splits(num_tokens, hc_hidden_size)
+
+    dot_mix = torch.empty(
+        (n_splits, num_tokens, mix_dim), dtype=torch.float32, device=x.device
+    )
+    sqrsum = torch.empty((n_splits, num_tokens), dtype=torch.float32, device=x.device)
+    tf32_hc_prenorm_gemm(
+        x.reshape(num_tokens, hc_hidden_size), hc_fn, dot_mix, sqrsum, n_splits
+    )
+    if n_splits == 1:
+        dot_mix = dot_mix.squeeze(0)
+        sqrsum = sqrsum.squeeze(0)
+
+    post, comb, layer_input = mhc_pre_big_fuse(
+        dot_mix,
+        sqrsum,
+        x,
+        hc_scale,
+        hc_base,
+        hc_hidden_size,
+        rms_eps=rms_eps,
+        mhc_pre_eps=hc_eps,
+        mhc_sinkhorn_eps=hc_eps,
+        mhc_post_mult_value=_MHC_POST_MULT_VALUE,
+        sinkhorn_repeat=sinkhorn_iters,
+        num_splits=n_splits,
+    )
+    return layer_input, post.squeeze(-1), comb
+
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
@@ -243,6 +320,11 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
         output_unquantized_inp1=True,
         transpose_scale=_use_aiter_bpreshuffle_gfx95,
     )
+    if _use_aiter_bpreshuffle_gfx95:
+        x_quant = (
+            x_quant[0],
+            view_aiter_fused_rms_transposed_fp8_scale(x_quant[1]),
+        )
     return x_quant, x_bf16
 
 
@@ -620,7 +702,7 @@ class MQALayer(MqaAttentionBase):
             base=self.rope_base,
             rope_scaling=self.rope_scaling,
             is_neox_style=False,
-            device=get_server_args().device,
+            device=get_device().device,
         )
 
         if _is_npu:
@@ -1065,9 +1147,8 @@ class MQALayer(MqaAttentionBase):
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
+                kv = cp_materialize_global_token_order(
                     kv.contiguous(),
-                    self.cp_size,
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
@@ -1116,9 +1197,8 @@ class MQALayer(MqaAttentionBase):
                     # unified_kv + DSA CP: the 2-source prefill path needs the
                     # FULL current-chunk KV (extend source + ring write), so
                     # all-gather the per-rank bf16 KV across the CP group.
-                    kv = cp_all_gather_rerange_output(
+                    kv = cp_materialize_global_token_order(
                         kv.contiguous(),
-                        self.cp_size,
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
@@ -1126,9 +1206,8 @@ class MQALayer(MqaAttentionBase):
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
+                kv = cp_materialize_global_token_order(
                     kv.contiguous(),
-                    self.cp_size,
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
@@ -1505,6 +1584,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
+            y, post, comb = _flashinfer_hc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+            )
+            return y, post, comb, False
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
@@ -1597,6 +1688,11 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
+            from flashinfer.mhc import mhc_post
+
+            return mhc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_post
@@ -1846,7 +1942,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            # self_attn has already reduced across attention TP, so these hidden
+            # states are replicated and must not be summed by a partial gather.
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
@@ -2344,8 +2442,13 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
@@ -2364,16 +2467,24 @@ class DeepseekV4Model(nn.Module):
             )
             # Token ids are replicated within an attention-TP group. Use replicate
             # gather here to avoid summing duplicated ids when attention_tp_size > 1.
-            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
+            # Clone because the MAX_LEN gather may zero its local input in place.
+            dp_gather_replicate(
+                input_ids_global, input_ids[:, None].clone(), forward_batch
+            )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
 
-        if dsa_use_prefill_cp(forward_batch):
-            if self.pp_group.is_first_rank:
-                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
-            input_ids = cp_round_robin_input_ids(input_ids)
+        if use_prefill_cp:
+            if cp_v2_active:
+                input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
+            else:
+                if self.pp_group.is_first_rank:
+                    hidden_states = cp_split_and_rebuild_data(
+                        forward_batch, hidden_states
+                    )
+                positions = cp_split_and_rebuild_position(forward_batch, positions)
+                input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
@@ -2381,12 +2492,6 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
         capture_dspark = self.dspark_layers_to_capture is not None
-        if capture_dspark and dsa_use_prefill_cp(forward_batch):
-            raise NotImplementedError(
-                "DSpark aux hidden-state capture is not supported together with "
-                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
-                "of them: DSpark static-verify is CP-off for v1."
-            )
         dspark_aux_hidden_states: List[torch.Tensor] = []
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
@@ -2436,13 +2541,22 @@ class DeepseekV4Model(nn.Module):
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
+        if self.pp_group.is_last_rank and use_prefill_cp and not cp_v2_active:
+            stream = torch.cuda.current_stream()
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                stream,
             )
+            # Gather DSpark aux tensors on the same CP token split.
+            if capture_dspark:
+                dspark_aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        aux, self.cp_size, forward_batch, stream
+                    )
+                    for aux in dspark_aux_hidden_states
+                ]
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
@@ -2495,7 +2609,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()
@@ -2544,35 +2658,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """V4 only fuses when explicitly asked to, and then the checkpoint must
+        carry exactly one shared expert. Asked by the loader before any layer is
+        built."""
+        if not get_exec().moe.enforce_shared_experts_fusion:
+            return "Config does not support fused shared expert(s)."
+        if hf_config.n_shared_experts != 1:
+            raise ValueError(
+                "DeepSeek V4 shared-experts fusion expects exactly one shared "
+                f"expert, but got n_shared_experts={hf_config.n_shared_experts}."
+            )
+        return None
+
     def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0
-        if get_server_args().disable_shared_experts_fusion:
-            return
-
-        disable_reason = None
-        if get_server_args().enforce_shared_experts_fusion:
-            if self.config.n_shared_experts != 1:
-                raise ValueError(
-                    "DeepSeek V4 shared-experts fusion expects exactly one shared "
-                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
-                )
-        else:
-            disable_reason = "Config does not support fused shared expert(s)."
-
-        if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "DeepseekV4ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
+        # The decision was installed by the loader; this only reads it.
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
 
     @torch.no_grad()
     def forward(
@@ -2744,8 +2848,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return name
 
-    def _prewarm_mhc_pre_kernels(self) -> None:
-        """One-shot mhc_pre() JIT prewarm at load time, synced across ranks.
+    def _prewarm_mhc_kernels(self) -> None:
+        """One-shot MHC JIT prewarm at load time, synced across ranks.
 
         Runs before any forward so the compile burst stays off the serving
         path; the barrier keeps ranks from proceeding while a peer is still
@@ -2766,16 +2870,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         if layer is None:
             return
 
-        from sglang.kernels.ops.layernorm.mhc import prewarm_mhc_pre
+        from sglang.kernels.ops.layernorm.mhc import mhc_post, prewarm_mhc_pre
 
         tic = time.perf_counter()
+        residual = torch.zeros(
+            (1, layer.hc_mult, layer.hidden_size),
+            dtype=torch.bfloat16,
+            device=layer.hc_attn_fn.device,
+        )
         prewarm_mhc_pre(
             # Template carrying dtype/device; buckets allocate their own sizes.
-            residual=torch.zeros(
-                (1, layer.hc_mult, layer.hidden_size),
-                dtype=torch.bfloat16,
-                device=layer.hc_attn_fn.device,
-            ),
+            residual=residual,
             fn=layer.hc_attn_fn,
             hc_scale=layer.hc_attn_scale,
             hc_base=layer.hc_attn_base,
@@ -2789,13 +2894,27 @@ class DeepseekV4ForCausalLM(nn.Module):
             norm_weight=layer.input_layernorm.weight.data,
             norm_eps=layer.input_layernorm.variance_epsilon,
         )
+        mhc_post(
+            x=residual.new_zeros((1, layer.hidden_size)),
+            residual=residual,
+            post_layer_mix=torch.zeros(
+                (1, layer.hc_mult, 1),
+                dtype=torch.float32,
+                device=residual.device,
+            ),
+            comb_res_mix=torch.zeros(
+                (1, layer.hc_mult, layer.hc_mult),
+                dtype=torch.float32,
+                device=residual.device,
+            ),
+        )
         torch.cuda.synchronize()
         compile_secs = time.perf_counter() - tic
         # Runs before init_memory_pool(); don't let transients skew pool sizing.
         torch.cuda.empty_cache()
         get_tp_group().barrier()
         logger.info(
-            "DeepSeek V4 MHC prenorm prewarm at load: compile %.1fs, rank sync +%.1fs",
+            "DeepSeek V4 MHC prewarm at load: compile %.1fs, rank sync +%.1fs",
             compile_secs,
             time.perf_counter() - tic - compile_secs,
         )
@@ -3145,7 +3264,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         if not is_nextn:
-            self._prewarm_mhc_pre_kernels()
+            self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

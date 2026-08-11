@@ -261,6 +261,45 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
             compression_outputs,
         )
 
+    def test_padded_metadata_rows_mask_missing_cache_write_locations(self):
+        # CP-v2 pads causal metadata rows without padding the cache-write
+        # locations. Exercise that contract with both the retained full-tail
+        # path and the target-verify live-prefix grid.
+        seq_lens_values = (0, 128, 256)
+        seq_lens = torch.tensor(seq_lens_values, dtype=torch.int32, device=self.device)
+        positions = seq_lens - 1
+        page_table = (
+            torch.arange(
+                len(seq_lens_values) * NUM_PAGES,
+                dtype=torch.int32,
+                device=self.device,
+            ).view(len(seq_lens_values), NUM_PAGES)
+            + 100
+        )
+        raw_out_loc = torch.tensor([512, 1024], dtype=torch.int64, device=self.device)
+
+        for live_prefix_only in (False, True):
+            with self.subTest(live_prefix_only=live_prefix_only):
+                outputs = init_compression_metadata(
+                    seq_lens,
+                    positions,
+                    raw_out_loc,
+                    page_table,
+                    PAGE_SIZE,
+                    compute_page_indices=True,
+                    live_prefix_only=live_prefix_only,
+                )
+                torch.cuda.synchronize()
+
+                self.assertEqual(outputs[0].shape, raw_out_loc.shape)
+                self.assertEqual(outputs[4].shape, raw_out_loc.shape)
+                self._assert_compression_metadata(
+                    seq_lens_values,
+                    raw_out_loc,
+                    page_table,
+                    outputs,
+                )
+
     def test_torch_and_triton_match_page_table_contract(self):
         max_seq_len = 2048
         seq_lens_values = (-1, 0, 1, 255, 256, 257, 1025, 2048, 4096)

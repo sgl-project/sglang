@@ -1,3 +1,4 @@
+import dataclasses
 import importlib
 import json
 import os
@@ -42,6 +43,56 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_return_hidden_states_mode_configuration(self):
+        disabled = ServerArgs(model_path="dummy")
+        self.assertFalse(disabled.enable_return_hidden_states)
+        self.assertIsNone(disabled.return_hidden_states_mode)
+
+        last = ServerArgs(
+            model_path="dummy",
+            return_hidden_states_mode="last",
+        )
+        self.assertTrue(last.enable_return_hidden_states)
+        self.assertEqual(last.return_hidden_states_mode, "last")
+
+        legacy_full = ServerArgs(
+            model_path="dummy",
+            enable_return_hidden_states=True,
+        )
+        self.assertTrue(legacy_full.enable_return_hidden_states)
+        self.assertEqual(legacy_full.return_hidden_states_mode, "full")
+
+        parsed_last = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--return-hidden-states-mode",
+                "last",
+            ]
+        )
+        self.assertTrue(parsed_last.enable_return_hidden_states)
+        self.assertEqual(parsed_last.return_hidden_states_mode, "last")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "return_hidden_states_mode must be one of",
+        ):
+            ServerArgs(
+                model_path="dummy",
+                return_hidden_states_mode="lst",
+            )
+
+    def test_draft_quantization_explicitness_survives_asdict_round_trip(self):
+        inherited = ServerArgs(model_path="dummy", quantization="modelopt_fp4")
+        inherited._handle_missing_default_values()
+        self.assertEqual(inherited.speculative_draft_model_quantization, "modelopt_fp4")
+        self.assertFalse(inherited._speculative_draft_quantization_explicitly_set)
+
+        reconstructed = ServerArgs(**dataclasses.asdict(inherited))
+        reconstructed._handle_missing_default_values()
+
+        self.assertFalse(reconstructed._speculative_draft_quantization_explicitly_set)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
@@ -92,6 +143,10 @@ class TestMmEncoderDataParallelLogging(CustomTestCase):
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
+    @staticmethod
+    def _set_model_type(server_args, *, is_multimodal):
+        server_args.model_config = SimpleNamespace(is_multimodal=is_multimodal)
+
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
         server_args = ServerArgs(
@@ -126,6 +181,16 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
         self.assertIn("deprecated", logs.output[0])
 
+    def test_legacy_keep_flag_rejects_explicit_cuda_vmm(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            keep_mm_feature_on_device=True,
+            mm_feature_transport="cuda_vmm",
+        )
+
+        with self.assertRaisesRegex(ValueError, "conflicts.*cuda_vmm"):
+            server_args._handle_multimodal_feature_transport()
+
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_explicit_cpu_overrides_legacy_environment(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cpu")
@@ -148,6 +213,131 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(server_args.mm_feature_transport, "cpu")
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_for_text_only_model(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy")
+        self._set_model_type(server_args, is_multimodal=False)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertNoLogs(server_args_module.logger, level="INFO"):
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cuda_ipc_for_multimodal_model(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy")
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("auto-resolved to cuda_ipc", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.os.path.exists", return_value=True)
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch(
+        "sglang.srt.model_loader.utils.supports_cuda_vmm_feature_transport",
+        return_value=True,
+    )
+    def test_default_transport_is_cuda_vmm_for_supported_multinode_mnnvl(
+        self,
+        _mock_supports_cuda_vmm,
+        _mock_is_cuda,
+        _mock_is_mnnvl,
+        _mock_path_exists,
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_vmm")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("auto-resolved to cuda_vmm", output)
+        self.assertIn("CUDA FABRIC", output)
+
+    @patch("sglang.srt.server_args.os.path.exists", return_value=True)
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch(
+        "sglang.srt.model_loader.utils.supports_cuda_vmm_feature_transport",
+        return_value=False,
+    )
+    def test_default_transport_is_cpu_for_unsupported_multinode_model(
+        self,
+        _mock_supports_cuda_vmm,
+        _mock_is_cuda,
+        _mock_is_mnnvl,
+        _mock_path_exists,
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            server_args._handle_multimodal_feature_transport()
+
+        self.assertEqual(server_args.mm_feature_transport, "cpu")
+        self.assertIn("has not opted into CUDA VMM", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.os.path.exists", return_value=False)
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_without_imex_channel(
+        self, _mock_is_cuda, _mock_is_mnnvl, _mock_path_exists
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+
+        self.assertIn("no IMEX channel", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_for_multinode_non_mnnvl(
+        self, _mock_is_cuda, _mock_is_mnnvl
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cuda_ipc_for_language_only_model(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", language_only=True)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
     def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
@@ -162,6 +352,57 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "single node"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_vmm_is_explicit_and_uses_shared_budget(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="cuda_vmm",
+            nnodes=2,
+            tokenizer_worker_num=2,
+        )
+
+        with (
+            patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "1"}),
+            envs.SGLANG_MM_FEATURE_CACHE_MB.override(256),
+        ):
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_vmm")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("CUDA FABRIC", output)
+        self.assertIn("256 MiB", output)
+        self.assertIn("2 tokenizer worker", output)
+        self.assertIn("falls back to inline CPU", output)
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_cuda_vmm_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_vmm_rejects_rust_server(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"),
+        ):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_vmm_rejects_pipeline_parallelism(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy", mm_feature_transport="cuda_vmm", pp_size=2
+        )
+
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
             server_args._handle_multimodal_feature_transport()
 
 
@@ -1272,17 +1513,6 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             with self.subTest(kv_cache_dtype=kv_cache_dtype):
                 with self.assertRaisesRegex(ValueError, "nvfp4.*fp4_mx_block16"):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
-
-
-class TestSessionRadixCacheServerArgs(unittest.TestCase):
-    def test_requires_priority_radix_eviction_policy(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            enable_session_radix_cache=True,
-            radix_eviction_policy="lru",
-        )
-        with self.assertRaisesRegex(ValueError, "--radix-eviction-policy priority"):
-            server_args._handle_cache_compatibility()
 
 
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):

@@ -16,12 +16,15 @@
 The page-major envelope K/V views are strided, which only the Triton attention
 kernels read. The one exception is the unified-memory MLA pool: it exposes each
 layer as a DENSE contiguous view (`build_dense_mla_views`), so the paged MLA
-backends (`trtllm_mla` and its `cutedsl_mla` / `tokenspeed_mla` subclasses, plus
-`flashinfer`'s MLA backend) can read it directly once their kv_indices / block
-tables are remapped to dense ids.
+backends can read it directly once their kv_indices / block tables are remapped
+to dense ids -- `fa3`, `flashinfer`'s MLA backend, and `trtllm_mla` with its
+`cutedsl_mla` / `tokenspeed_mla` subclasses.
 
 Pinned here so the exception cannot silently widen to a backend that has no
-dense-id remapping (`fa3`, `flashmla`, ...) or leak into the MHA path.
+dense-id remapping (`flashmla`, `cutlass_mla`, ...) or leak into the MHA path.
+`fa3` matters most: it is the resolved default on pre-Blackwell hosts, so it is
+the one entry whose absence used to make `--enable-unified-memory` fail to boot
+under its own default configuration.
 
     python -m pytest test/registered/unit/server_args/test_page_major_backend_allowlist.py -v
 """
@@ -66,9 +69,15 @@ def _accepts(backend: str, *, use_mla: bool, unified: bool = True) -> bool:
 
 class TestPageMajorBackendAllowlist(unittest.TestCase):
     # Wired for the dense per-layer MLA views (see the module docstring).
-    DENSE_MLA_BACKENDS = ("trtllm_mla", "flashinfer", "cutedsl_mla", "tokenspeed_mla")
+    DENSE_MLA_BACKENDS = (
+        "fa3",
+        "trtllm_mla",
+        "flashinfer",
+        "cutedsl_mla",
+        "tokenspeed_mla",
+    )
     # No dense-id remapping: must stay rejected until they get one.
-    UNWIRED_BACKENDS = ("fa3", "flashmla", "cutlass_mla", "trtllm_mha", "aiter")
+    UNWIRED_BACKENDS = ("flashmla", "cutlass_mla", "trtllm_mha", "aiter")
 
     def test_triton_always_allowed(self):
         for use_mla in (True, False):
