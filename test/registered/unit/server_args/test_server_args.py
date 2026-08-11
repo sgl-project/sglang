@@ -2175,5 +2175,21 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestParallelRankLayoutValidation(CustomTestCase):
+    def test_standard_launcher_rejects_unsupported_layout(self):
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            pp_size=3,
+            nnodes=4,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "tp_size=8.*pp_size=3.*nnodes=4",
+        ):
+            args.check_server_args()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -67,6 +67,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.parallel_topology import calculate_rank_ranges
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -608,23 +609,27 @@ class DataParallelController:
 
         scheduler_pipe_readers = []
 
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
-        )
-
-        nnodes_per_tp_group = nnodes_per_pp_rank
-        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
         if server_args.is_ep_scale_joiner:
             # Scale joiners enumerate their full local TP span.
+            pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+            nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+            pp_rank_range = range(
+                pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+                pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
+            )
             tp_rank_range = range(server_args.tp_size)
             tp_size_per_node = server_args.tp_size
         else:
-            tp_rank_range = range(
-                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+            (
+                pp_rank_range,
+                tp_rank_range,
+                pp_size_per_node,
+                tp_size_per_node,
+            ) = calculate_rank_ranges(
+                server_args.nnodes,
+                server_args.pp_size,
+                server_args.tp_size,
+                server_args.node_rank,
             )
 
         attn_cp_rank = 0

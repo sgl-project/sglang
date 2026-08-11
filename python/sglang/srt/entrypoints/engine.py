@@ -123,6 +123,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     is_port_available,
 )
+from sglang.srt.utils.parallel_topology import calculate_rank_ranges
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -1790,21 +1791,7 @@ def _calculate_rank_ranges(
         - pp_size_per_node: number of PP ranks per node.
         - tp_size_per_node: number of TP ranks per node.
     """
-    pp_size_per_node = max(pp_size // nnodes, 1)
-    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
-    pp_rank_range = range(
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank),
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
-    )
-
-    nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = tp_size // nnodes_per_tp_group
-    tp_rank_range = range(
-        tp_size_per_node * (node_rank % nnodes_per_tp_group),
-        tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
-    )
-
-    return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+    return calculate_rank_ranges(nnodes, pp_size, tp_size, node_rank)
 
 
 def _compute_parallelism_ranks(
