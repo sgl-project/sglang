@@ -12,9 +12,7 @@
 
 namespace sglang {
 
-// Hash routing selects experts by token id, so nothing keeps the selected experts'
-// scores away from zero; without a floor an all-underflowed row renormalizes 0/0 to
-// NaN. Matches _RENORMALIZE_SUM_EPSILON in srt/layers/moe/topk.py.
+// Hash routing ignores scores, so an all-underflowed row would renorm 0/0 to NaN.
 constexpr float kRenormalizeSumEpsilon = 1e-20f;
 
 [[maybe_unused]]

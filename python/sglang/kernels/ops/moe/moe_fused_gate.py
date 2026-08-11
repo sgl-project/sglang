@@ -145,10 +145,8 @@ def _router_triton_kernel(
         activated = tl.sigmoid(scores)
         biased = activated + bias[None, :]
     elif SCORING_FUNC == 1:
-        # sqrt(softplus(x)) = sqrt(max(x,0) + log1p(exp(-|x|))). Triton has no log1p,
-        # so it is recovered from log via z*log(u)/(u-1): a plain log(1.0 + exp(x))
-        # rounds to log(1.0) == 0 below -16.64 (flushing the routing weight to zero)
-        # and exp(x) overflows above 88.7.
+        # sqrt(softplus(x)). log(1.0 + exp(x)) rounds to 0 below -16.64 and overflows
+        # above 88.7; Triton has no log1p, so recover it from log via z*log(u)/(u-1).
         z = tl.exp(-tl.abs(scores))
         u = 1.0 + z
         exact = u == 1.0
