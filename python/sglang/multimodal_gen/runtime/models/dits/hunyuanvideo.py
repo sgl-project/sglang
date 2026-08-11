@@ -9,6 +9,12 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_double_block,
+    is_refiner_block,
+    is_single_block,
+    is_txt_in,
+)
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -18,7 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
-    UlyssesAttention,
+    USPAttention,
 )
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -212,8 +218,7 @@ class MMDoubleStreamBlock(nn.Module):
             quant_config=quant_config,
         )
 
-        # Use UlyssesAttention to replace Distributed attention
-        self.attn = UlyssesAttention(
+        self.attn = USPAttention(
             num_heads=self.local_num_attention_heads,
             head_size=head_dim,
             causal=False,
@@ -292,15 +297,20 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Run distributed attention
         if txt_is_sharded:
-            attn, _ = self.attn(
+            attn = self.attn(
                 torch.cat((img_q, txt_q), dim=1),
                 torch.cat((img_k, txt_k), dim=1),
                 torch.cat((img_v, txt_v), dim=1),
                 seq_lens=seq_lens,
             )
-            img_attn, txt_attn = attn.split([image_seq_len, text_seq_len], dim=1)
         else:
-            img_attn, txt_attn = self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v)
+            attn = self.attn(
+                torch.cat((img_q, txt_q), dim=1),
+                torch.cat((img_k, txt_k), dim=1),
+                torch.cat((img_v, txt_v), dim=1),
+                num_replicated_suffix=text_seq_len,
+            )
+        img_attn, txt_attn = attn.split([image_seq_len, text_seq_len], dim=1)
         img_attn_out, _ = self.img_attn_proj(
             img_attn.reshape(batch_size, image_seq_len, -1)
         )
@@ -406,8 +416,7 @@ class MMSingleStreamBlock(nn.Module):
             prefix=f"{prefix}.modulation",
         )
 
-        # Use UlyssesAttention to replace Distributed attention
-        self.attn = UlyssesAttention(
+        self.attn = USPAttention(
             num_heads=self.local_num_attention_heads,
             head_size=head_dim,
             causal=False,
@@ -463,17 +472,19 @@ class MMSingleStreamBlock(nn.Module):
 
         # Run distributed attention
         if txt_is_sharded:
-            attn_output, _ = self.attn(
+            attn_output = self.attn(
                 torch.cat((img_q, txt_q), dim=1),
                 torch.cat((img_k, txt_k), dim=1),
                 torch.cat((img_v, txt_v), dim=1),
                 seq_lens=seq_lens,
             )
         else:
-            img_attn_output, txt_attn_output = self.attn(
-                img_q, img_k, img_v, txt_q, txt_k, txt_v
+            attn_output = self.attn(
+                torch.cat((img_q, txt_q), dim=1),
+                torch.cat((img_k, txt_k), dim=1),
+                torch.cat((img_v, txt_v), dim=1),
+                num_replicated_suffix=txt_len,
             )
-            attn_output = torch.cat((img_attn_output, txt_attn_output), dim=1)
         attn_output = attn_output.view(batch_size, seq_len, -1)
         # Process MLP activation
         mlp_output = self.mlp_act(mlp)
@@ -503,9 +514,8 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     # PY: we make the input args the same as HF config
 
     # shard single stream, double stream blocks, and refiner_blocks
-    _fsdp_shard_conditions = HunyuanVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = HunyuanVideoConfig()._compile_conditions
-    _supported_attention_backends = HunyuanVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_double_block, is_single_block, is_refiner_block]
+    _compile_conditions = [is_double_block, is_single_block, is_txt_in]
     param_names_mapping = HunyuanVideoConfig().param_names_mapping
     reverse_param_names_mapping = HunyuanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = HunyuanVideoConfig().lora_param_names_mapping

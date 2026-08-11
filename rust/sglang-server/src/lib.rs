@@ -17,6 +17,7 @@ mod error;
 mod fsm;
 mod ids;
 mod message;
+mod mm;
 mod ring;
 mod runtime;
 mod tokenizer;
@@ -30,6 +31,21 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
 use crate::runtime::{Runtime, RuntimeConfig};
+
+/// One drained MM result (see [`Server::take_mm`]). Exactly one of
+/// `features`/`shm_names` is `Some`: inline features for single-rank serving
+/// (zero-copy into numpy), or one POSIX segment name per item when the scheduler
+/// broadcasts across TP ranks and Python wraps each in a `ShmPointerMMData`.
+#[pyclass(frozen, get_all)]
+struct MmHandoff {
+    features: Option<Py<numpy::PyArray1<f32>>>,
+    shm_names: Option<Vec<String>>,
+    grids: Vec<(u32, u32, u32)>,
+    hashes: Vec<u64>,
+    offsets: Vec<(u32, u32)>,
+    mrope: Py<numpy::PyArray1<i64>>,
+    mrope_delta: i64,
+}
 
 /// Columnar ingress batch handed to Python by [`Server::recv_requests`].
 /// `frozen`: immutable snapshot, so field access never contends on a borrow.
@@ -199,6 +215,54 @@ impl Server {
         self.push_frame(py, crate::message::frame_egress_error(rid, message))
     }
 
+    /// Spawn the MM worker pool for the pipeline in `spec_json` (built from the
+    /// resolved processor config; see `NativeMmHost.resolve_native_spec`).
+    /// Image-only requests are processed entirely in Rust and parked for
+    /// [`Server::take_mm`]; anything the pipeline cannot serve is rejected back to
+    /// the client — there is no Python fallback.
+    fn start_mm_workers(&self, spec_json: &str, workers: usize) -> PyResult<()> {
+        let ctx = mm::Context::new(
+            spec_json,
+            self.rt.tokenizer.clone(),
+            self.rt.mm_sidecar.clone(),
+        )
+        .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        self.rt.spawn_mm_pool(workers, std::sync::Arc::new(ctx));
+        Ok(())
+    }
+
+    /// Pop the MM result for `rid` — parked strictly before the request reached
+    /// the ingress ring — or `None` if there is none. The numeric buffers become
+    /// 1-D numpy arrays that take **ownership** of the Rust vectors, no copy.
+    ///
+    /// Runs on the scheduler loop (`RustServer.drain`, under the GIL) between
+    /// decode steps, so any per-byte work here — memcpy or hashing, tens of MB
+    /// per image-heavy request — would stall every running request's ITL. Hence
+    /// the worker-precomputed `hashes`.
+    fn take_mm(&self, py: Python<'_>, rid: &str) -> Option<MmHandoff> {
+        use numpy::IntoPyArray;
+
+        let res = self.rt.mm_sidecar.take(rid)?;
+        let (features, shm_names) = match res.features {
+            mm::FeatureStore::Inline(v) => (Some(v.into_pyarray(py).unbind()), None),
+            // The segments — and the duty to unlink — move to Python here;
+            // `materialize()` unlinks after the post-broadcast clone on each rank.
+            mm::FeatureStore::Shm(segments) => (
+                None,
+                Some(segments.into_iter().map(|s| s.into_name()).collect()),
+            ),
+        };
+        Some(MmHandoff {
+            features,
+            shm_names,
+            grids: res.grids.iter().map(|g| (g[0], g[1], g[2])).collect(),
+            hashes: res.hashes,
+            offsets: res.offsets,
+            mrope: res.mrope.into_pyarray(py).unbind(),
+            mrope_delta: res.mrope_delta,
+        })
+    }
+
     /// Signal all threads to stop (best effort).
     fn shutdown(&self) {
         self.rt.request_shutdown();
@@ -245,5 +309,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .try_init();
     m.add_class::<Server>()?;
     m.add_class::<IngressBatch>()?;
+    m.add_class::<MmHandoff>()?;
     Ok(())
 }

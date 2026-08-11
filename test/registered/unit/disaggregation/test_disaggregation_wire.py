@@ -1,10 +1,16 @@
+import struct
+import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.common.staging_handler import (
+    handle_staging_req,
+)
 from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
     pack_int_lists,
@@ -12,11 +18,17 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo,
+    MooncakeKVManager,
+)
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.speculative.eagle_disaggregation import (
@@ -28,6 +40,35 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_mooncake_registration_staging_fields(self):
+        msg = [
+            b"room",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            struct.pack("Q", 0x1000),
+            struct.pack("Q", 0x2000),
+            b"",
+            b"0",
+            b"1",
+            b"128",
+            b"",
+            b"",
+            b"",
+            b"",
+            struct.pack("Q", 0x3000),
+            b"4096",
+            b"4",
+            b"2",
+        ]
+
+        info = KVArgsRegisterInfo.from_zmq(msg)
+
+        self.assertEqual(info.staging_base_ptr, 0x3000)
+        self.assertEqual(info.staging_total_size, 4096)
+        self.assertEqual(info.dst_dcp_size, 4)
+        self.assertEqual(info.dst_dcp_rank, 2)
+
     def test_int_lists_roundtrip(self):
         cases = [
             ("Q", [[1, 2, 3], [4]]),
@@ -98,6 +139,84 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
 
 
+class TestMooncakePPStaging(unittest.TestCase):
+    def test_staging_response_targets_requesting_pp_rank(self):
+        sock = Mock()
+        receiver = SimpleNamespace(
+            chunk_staging_infos=[],
+            _connect_to_bootstrap_server=Mock(return_value=(sock, threading.Lock())),
+        )
+        allocator = SimpleNamespace(
+            assign=Mock(return_value=(3, 128, 0)), total_size=1 << 20
+        )
+        kv_args = SimpleNamespace(
+            page_size=64,
+            kv_item_lens=[4096, 4096],
+            total_kv_head_num=4,
+            engine_rank=0,
+        )
+        target = {"pp_rank": 3}
+
+        handle_staging_req(
+            [b"STAGING_REQ", b"7", b"0", b"1", b"peer", b"3"],
+            allocator,
+            kv_args,
+            attn_tp_size=16,
+            prefill_attn_tp_size=1,
+            kv_buffer_tensors=None,
+            room_receivers={7: receiver},
+            room_bootstrap={7: [{"pp_rank": 2}, target]},
+        )
+
+        receiver._connect_to_bootstrap_server.assert_called_once_with(target)
+        sock.send_multipart.assert_called_once()
+
+    @patch(
+        "sglang.srt.disaggregation.common.staging_buffer.gather_all_layers_to_staging"
+    )
+    def test_pp_stage_writes_its_global_layer_slots(self, gather):
+        manager = object.__new__(MooncakeKVManager)
+        tensor = SimpleNamespace(shape=(1, 1, 8), element_size=lambda: 2)
+        manager.kv_buffer_tensors = {
+            "k_buffers": [tensor],
+            "v_buffers": [tensor],
+            "page_size": 2,
+        }
+        manager.attn_tp_size = 1
+        manager.pp_size = 16
+        manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            gpu_id=0,
+            total_kv_head_num=4,
+            kv_head_num=4,
+            kv_layer_ids=[7, 7],
+        )
+        manager._transfer_data = Mock(return_value=0)
+        staging = SimpleNamespace(fits=lambda size: True, get_ptr=lambda: 0x9000)
+
+        ret = manager.send_kvcache_staged(
+            "peer",
+            np.array([1, 2], dtype=np.int32),
+            dst_staging_ptr=0x100000,
+            dst_staging_size=1 << 20,
+            dst_tp_rank=0,
+            dst_attn_tp_size=16,
+            dst_kv_item_len=128,
+            dst_layer_ids=[3, 7, 11, 3, 7, 11],
+            staging_buffer=staging,
+        )
+
+        self.assertEqual(ret, 0)
+        gather.assert_called_once()
+        manager._transfer_data.assert_called_once_with(
+            "peer",
+            [
+                (0x9000, 0x100000 + 64, 64),
+                (0x9000 + 64, 0x100000 + 4 * 64, 64),
+            ],
+        )
+
+
 class TestEagleDsaSeedTransfer(unittest.TestCase):
     @staticmethod
     def _make_req(seed, metadata_buffer_index=0):
@@ -150,6 +269,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
+            disaggregation_mode="null",
         )
         last_tokens = torch.tensor([11, 12], dtype=torch.int64)
 
@@ -167,6 +287,53 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
                 batch, server_args, last_tokens, None
             )
             self.assertIsNone(draft_input.dsa_topk_indices)
+
+    def test_pd_decode_fused_topk_remaps_wire_positions_to_local_slots(self):
+        wire_positions = (
+            torch.tensor([2, 0, -1], dtype=torch.int32),
+            torch.tensor([1, 3, -1], dtype=torch.int32),
+        )
+        req_to_token = torch.tensor(
+            [
+                [0, 0, 0, 0],
+                [700, 801, 902, 990],
+                [410, 420, 430, 440],
+                [101, 205, 309, 450],
+            ],
+            dtype=torch.int32,
+        )
+        batch = SimpleNamespace(
+            reqs=[self._make_req(seed) for seed in wire_positions],
+            device="cpu",
+            enable_overlap=False,
+            req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        )
+        server_args = SimpleNamespace(
+            speculative_eagle_topk=1,
+            speculative_num_steps=5,
+            enable_multi_layer_eagle=False,
+            disaggregation_mode="decode",
+            enable_hisparse=False,
+        )
+
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True), patch(
+            "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True
+        ):
+            self.assertTrue(
+                should_use_dsa_fused_topk(
+                    server_args, seed_dsa_topk_from_draft_extend=True
+                )
+            )
+            draft_input = build_eagle_disagg_draft_input(
+                batch, server_args, torch.tensor([11, 12], dtype=torch.int64), None
+            )
+
+        self.assertEqual(
+            draft_input.dsa_topk_indices.tolist(),
+            [[309, 101, -1], [801, 990, -1]],
+        )
 
     def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
         future_map = object.__new__(FutureMap)
