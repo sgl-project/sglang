@@ -1801,9 +1801,20 @@ def apply_fp8_linear(
     )
 
     if input_prequantized:
-        assert input_scale is not None and input_scale.numel() == 1
+        assert input_scale is not None
         qinput = input_2d
-        if channelwise_cutlass and not native_scalar_a_scale:
+        # The producer supplies either one scalar scale (static per-tensor, from
+        # the flashinfer rmsnorm_quant fusion) or one scale per row (dynamic
+        # per-token, from the fused add+rmsnorm+per-token-quant kernel).
+        prequant_per_token = input_scale.numel() != 1
+        if prequant_per_token:
+            assert input_scale.shape[0] == input_2d.shape[0], (
+                f"per-token input_scale rows {input_scale.shape[0]} != "
+                f"activation rows {input_2d.shape[0]}"
+            )
+            # Already one scale per row; the CUTLASS epilogue wants [M, 1].
+            x_scale = input_scale.view(-1, 1)
+        elif channelwise_cutlass and not native_scalar_a_scale:
             # Unsupported CUTLASS epilogues require one A scale per row.
             x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
         else:

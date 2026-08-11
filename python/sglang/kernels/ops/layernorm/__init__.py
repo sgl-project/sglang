@@ -526,6 +526,23 @@ for _mod, _fn, _bk in _PHASE25_KERNELS:
     )
 del _mod, _fn, _bk
 
+# Fused (add +) RMSNorm + dynamic per-token FP8 quant. JIT-only: there is no
+# AOT/aiter/npu equivalent at this granularity (flashinfer's fused
+# rmsnorm_quant is static per-tensor, aiter's is per-group 1x128), so it is
+# registered for inventory rather than modelled as a BaseFusedOp with backends.
+for _fn in (
+    "fused_add_rmsnorm_per_token_quant",
+    "fused_rmsnorm_per_token_quant",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.layernorm.fused_norm_quant:{_fn}",
+        )
+    )
+del _fn
+
 # The fused-rmsnorm variants physically live in the shared fused-pointwise
 # collection (sglang.kernels.ops.elementwise.elementwise) but stay layernorm ops.
 for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):

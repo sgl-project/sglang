@@ -159,6 +159,18 @@ if _is_cuda:
 
         _jit_rmsnorm_hf = None
 
+    # Fused (add +) RMSNorm + dynamic per-token FP8 quant (JIT-compiled).
+    try:
+        from sglang.kernels.ops.layernorm.fused_norm_quant import (
+            can_use_fused_norm_per_token_quant,
+        )
+    except ImportError:
+
+        def can_use_fused_norm_per_token_quant(
+            hidden_size: int, dtype: torch.dtype, add_weight_one: bool = False
+        ) -> bool:
+            return False
+
     from sglang.kernels.ops.layernorm.norm import (
         fused_add_rmsnorm as _jit_fused_add_rmsnorm,
     )
@@ -420,6 +432,54 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
     return False
 
 
+def _is_dynamic_per_token_fp8_linear(linear) -> bool:
+    """Whether ``linear`` quantizes its activation dynamically, per token.
+
+    The mirror image of :func:`_is_static_per_tensor_fp8_linear`: there is no
+    scale to return because the producer computes it, so this is a predicate.
+    Covers native ``Fp8LinearMethod`` with no static ``input_scale`` and the
+    compressed-tensors W8A8-FP8 dynamic scheme (the case the original PR's
+    ``server_args.quantization == "fp8"`` gate missed entirely, since
+    checkpoint-quantized models leave ``quantization`` unset).
+
+    Block-quant / mxfp8 / marlin are excluded: their activation quant is not
+    per-token, so a per-token scale would be silently wrong.
+    """
+    if linear is None:
+        return False
+    quant_method = getattr(linear, "quant_method", None)
+    if quant_method is None:
+        return False
+    # A static scale means the per-tensor path above owns this linear.
+    if getattr(linear, "input_scale", None) is not None:
+        return False
+    try:
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+    except ImportError:
+        Fp8LinearMethod = ()
+    if isinstance(quant_method, Fp8LinearMethod):
+        return not (
+            getattr(quant_method, "block_quant", False)
+            or getattr(quant_method, "use_mxfp8", False)
+            or getattr(quant_method, "use_marlin", False)
+        )
+    try:
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsLinearMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            CompressedTensorsW8A8Fp8,
+        )
+    except ImportError:
+        return False
+    if isinstance(quant_method, CompressedTensorsLinearMethod):
+        scheme = getattr(linear, "scheme", None)
+        return isinstance(scheme, CompressedTensorsW8A8Fp8) and not getattr(
+            scheme, "is_static_input_scheme", False
+        )
+    return False
+
+
 class RMSNorm(BaseFusedOp):
     def __init__(
         self,
@@ -517,6 +577,19 @@ class RMSNorm(BaseFusedOp):
                 return self.forward_with_per_tensor_quant_fusion(
                     x, scale, residual, post_residual_addition
                 )
+        # Same fusion, one granularity down: a linear doing *dynamic per-token*
+        # activation quant has no static scale to hand us, so the norm kernel
+        # computes the per-token scale itself. Opt-in while it soaks.
+        if (
+            quant_linear is not None
+            and not self.cast_x_before_out_mul
+            and envs.SGLANG_FUSED_NORM_FP8_QUANT.get()
+            and _is_dynamic_per_token_fp8_linear(quant_linear)
+            and can_use_fused_norm_per_token_quant(x.shape[-1], x.dtype)
+        ):
+            return self.forward_with_per_token_quant_fusion(
+                x, residual, post_residual_addition
+            )
         if self.cast_x_before_out_mul and residual is None:
             # Use HF-semantics kernel (cast to dtype before weight multiply).
             if (
@@ -915,6 +988,77 @@ class RMSNorm(BaseFusedOp):
         if needs_reshape:
             out = out.reshape(original_shape)
         return out, scale, orig_dtype
+
+    def forward_with_per_token_quant_fusion(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor, torch.dtype],
+        Tuple[Tuple[torch.Tensor, torch.Tensor, torch.dtype], torch.Tensor],
+    ]:
+        """Fused RMSNorm + dynamic per-token FP8 quantization.
+
+        The per-token counterpart of
+        :meth:`forward_with_per_tensor_quant_fusion`, and it deliberately
+        returns the *same* ``(fp8_out, scale, orig_dtype)`` contract so the
+        downstream FP8 linear needs no new entry point -- the difference is
+        only that ``scale`` is ``[num_tokens, 1]`` produced by the kernel
+        rather than a scalar supplied by the caller.
+
+        Returning the quantized activation as a value (rather than stashing it
+        on the bf16 tensor as an attribute) is what makes this safe under CUDA
+        graph capture and ``torch.compile``: the fp8 buffer and its scale are
+        real graph inputs to the consumer, so the dependency is visible to the
+        capture and to dynamo instead of travelling out of band.
+
+        NOT bit-identical to the unfused path, by construction. The kernel takes
+        the per-token absmax from the fp32 values it still holds in registers,
+        whereas ``fused_add_rmsnorm`` + ``scaled_fp8_quant`` takes it from the
+        activation-dtype value after it has been rounded and written to HBM.
+        One fewer rounding step, so the fused scale is the more accurate of the
+        two, but the resulting scales differ on essentially every row (measured
+        on 8xH100: ~3.9e-3 max relative scale difference, ~2% of fp8 code points
+        differ) and greedy decoding will diverge. GSM8K is statistically
+        indistinguishable (1319q, 5-shot: 0.767 unfused vs 0.762 fused, well
+        inside a ~1.2pp single-arm SE), but callers needing bit-exact parity
+        with the unfused path must not enable this.
+        """
+        from sglang.kernels.ops.layernorm.fused_norm_quant import (
+            fused_add_rmsnorm_per_token_quant,
+            fused_rmsnorm_per_token_quant,
+        )
+
+        orig_dtype = x.dtype
+        needs_reshape = x.dim() != 2
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, original_shape[-1])
+        elif not x.is_contiguous():
+            x = x.contiguous()
+
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            if residual.dim() != 2:
+                residual = residual.contiguous().reshape(-1, residual.shape[-1])
+            elif not residual.is_contiguous():
+                residual = residual.contiguous()
+            fp8_out, scale = fused_add_rmsnorm_per_token_quant(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
+            if needs_reshape:
+                fp8_out = fp8_out.reshape(original_shape)
+                residual = residual.reshape(original_shape)
+            return (fp8_out, scale, orig_dtype), residual
+
+        fp8_out, scale = fused_rmsnorm_per_token_quant(
+            x, self.weight.data, self.variance_epsilon
+        )
+        if needs_reshape:
+            fp8_out = fp8_out.reshape(original_shape)
+        return fp8_out, scale, orig_dtype
 
 
 class LayerNorm(BaseFusedOp):

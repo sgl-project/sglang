@@ -1086,6 +1086,12 @@ class Envs:
     # on links that can drive more channels.
     SGLANG_DETERMINISTIC_NCCL_NCHANNELS = EnvInt(8)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # Fuse the downstream dynamic per-token FP8 activation quant into the
+    # RMSNorm kernel, so the FP8 linear consumes a pre-quantized
+    # (fp8, per-token scale) activation instead of launching its own
+    # per_token_quant_fp8. Opt-in while it soaks; only takes effect on CUDA for
+    # linears that actually do dynamic per-token activation quant.
+    SGLANG_FUSED_NORM_FP8_QUANT = EnvBool(False)
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
