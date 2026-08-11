@@ -640,19 +640,29 @@ class DeepseekV2WeightLoaderMixin:
                         torch.bfloat16
                     )
 
-            # GLM ships kv_b_proj as bf16, which falls back to torch.bmm. Quantize to
-            # per-tensor e4m3fn (not fnuz) to match forward_mla_rocm's dtype gate.
-            if (
+            # GLM absorbed weights load as bf16. Keep the current per-tensor FP8
+            # conversion as the default rollback, or preserve packed MXFP4 weights
+            # and per-head scales for the opt-in AITER absorbed-BMM backend.
+            is_glm_bf16_absorbed_weight = (
                 _use_aiter_gfx95
                 and self.config.architectures
                 and self.config.architectures[0] == "GlmMoeDsaForCausalLM"
                 and w.dtype == torch.bfloat16
-            ):
-                w, self_attn.w_scale = input_to_float8(w, dtype=torch.float8_e4m3fn)
+            )
+            use_mxfp4_mla_bmm = (
+                is_glm_bf16_absorbed_weight and envs.SGLANG_USE_MXFP4_MLA_BMM.get()
+            )
+            if use_mxfp4_mla_bmm:
+                w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
+                    quark_post_load_weights(self_attn, w, "mxfp4")
+                )
+            else:
+                if is_glm_bf16_absorbed_weight:
+                    w, self_attn.w_scale = input_to_float8(w, dtype=torch.float8_e4m3fn)
 
-            w_kc, w_vc = w.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                w_kc, w_vc = w.unflatten(
+                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
             if (
                 _use_aiter_gfx95

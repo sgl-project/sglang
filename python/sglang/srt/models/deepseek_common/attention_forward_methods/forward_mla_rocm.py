@@ -46,6 +46,8 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    _run_mxfp4_k_bmm,
+    _run_mxfp4_v_bmm,
     _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
     is_mla_dcp_lse_base_on_e,
@@ -116,7 +118,6 @@ if _use_aiter_gfx95:
     )
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
-        batched_gemm_afp4wfp4_pre_quant,
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
     )
@@ -140,11 +141,10 @@ def rocm_absorb_q_bmm(
             device=x.device,
             dtype=torch.bfloat16,
         )
-        batched_gemm_afp4wfp4_pre_quant(
+        _run_mxfp4_k_bmm(
             x,
             attn.w_kc.transpose(-2, -1),
             attn.w_scale_k.transpose(-2, -1),
-            torch.bfloat16,
             q_nope_out,
         )
     else:
@@ -192,14 +192,13 @@ def rocm_absorb_v_bmm(
             device=x.device,
             dtype=torch.bfloat16,
         )
-        attn_bmm_output = _bmm_buf.transpose(0, 1)
-        batched_gemm_afp4wfp4_pre_quant(
+        _bmm_buf = _run_mxfp4_v_bmm(
             x,
             attn.w_vc.transpose(-2, -1),
             attn.w_scale_v.transpose(-2, -1),
-            torch.bfloat16,
-            attn_bmm_output,
+            _bmm_buf,
         )
+        attn_bmm_output = _bmm_buf
     else:
         _bmm_buf = None
         if _use_aiter_gfx95 and attn.w_kc.dtype == torch.float8_e4m3fn:
