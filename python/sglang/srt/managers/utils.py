@@ -390,6 +390,6 @@ def compute_num_reserved_tokens(server_args: ServerArgs) -> int:
     if not algorithm.is_eagle():
         return 0
     return max(
-        server_args.speculative_eagle_topk * server_args.speculative_num_steps,
+        (server_args.speculative_eagle_topk or 1) * server_args.speculative_num_steps,
         server_args.max_speculative_num_draft_tokens,
     )
