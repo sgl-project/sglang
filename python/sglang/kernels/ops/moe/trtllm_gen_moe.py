@@ -48,9 +48,7 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     load_jit,
-    override_jit_cuda_arch,
 )
 from sglang.srt.environ import envs
 
@@ -257,8 +255,10 @@ def _jit_trtllm_gen_moe_module() -> Module:
     cache = pathlib.Path(
         os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
     ).expanduser()
-    # Flags are not part of load_jit's source hash: fold the pool identity
-    # (meta hash + path) into the module marker so a pool change rebuilds.
+    # Fold the pool identity (meta hash + path) into the module marker so a pool
+    # change rebuilds, and pin the build there so the launcher's .so can be
+    # located afterwards -- setup_cubin_loader needs to reopen it with ctypes to
+    # reach plain C symbols that tvm-ffi does not expose.
     path_tag = hashlib.sha256(cubin_path.encode()).hexdigest()[:8]
     build_dir = cache / f"sgl_trtllm_gen_moe_{meta_tag}_{path_tag}"
 
@@ -268,67 +268,65 @@ def _jit_trtllm_gen_moe_module() -> Module:
     # arch-specific feature set: compile for sm_XXXa, not plain sm_XXX.
     # The trtllm-gen cubins themselves are prebuilt (sm100f) and loaded at
     # runtime, unaffected by this flag.
-    arch = get_jit_cuda_arch()
-    with override_jit_cuda_arch(arch.major, arch.minor, "a"):
-        module = load_jit(
-            "trtllm_gen_moe",
-            meta_tag,
-            path_tag,
-            cpp_files=cpp_files,
-            cuda_files=cuda_files,
-            header_only=False,  # the launcher exports its own tvm-ffi functions
-            extra_cflags=["-fvisibility=hidden"],
-            extra_cuda_cflags=[
-                "-DTLLM_GEN_EXPORT_INTERFACE",
-                "-DTLLM_GEN_EXPORT_FLASHINFER",
-                "-DTLLM_ENABLE_CUDA",
-                "-DENABLE_BF16",
-                "-DENABLE_FP8",
-                "-DENABLE_FP4",
-                "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-                "-DTLLM_GEN_LOCAL_CUBINS_ABI",
-                "-DFLASHINFER_PRIVATE_MOE_FFI_NAMES",
-                "-DFLASHINFER_PRIVATE_MOE_LEAN_ROUTING",
-                f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{cubin_path}\\"',
-                "-Xcompiler=-fvisibility=hidden",
+    module = load_jit(
+        "trtllm_gen_moe",
+        meta_tag,
+        path_tag,
+        cpp_files=cpp_files,
+        cuda_files=cuda_files,
+        header_only=False,  # the launcher exports its own tvm-ffi functions
+        extra_cflags=["-fvisibility=hidden"],
+        extra_cuda_cflags=[
+            "-DTLLM_GEN_EXPORT_INTERFACE",
+            "-DTLLM_GEN_EXPORT_FLASHINFER",
+            "-DTLLM_ENABLE_CUDA",
+            "-DENABLE_BF16",
+            "-DENABLE_FP8",
+            "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-DTLLM_GEN_LOCAL_CUBINS_ABI",
+            "-DFLASHINFER_PRIVATE_MOE_FFI_NAMES",
+            "-DFLASHINFER_PRIVATE_MOE_LEAN_ROUTING",
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{cubin_path}\\"',
+            "-Xcompiler=-fvisibility=hidden",
+        ],
+        extra_ldflags=[*_cuda_stub_ldflags(), "-lcuda", "-lnvrtc"],
+        extra_include_paths=[
+            str(staged),
+            str(
+                staged
+                / "flashinfer"
+                / "trtllm"
+                / "batched_gemm"
+                / "trtllmGen_bmm_export"
+            ),
+            # Per-root include layout: include/, csrc/, csrc/nv_internal/,
+            # csrc/nv_internal/include/, plus the flashinfer package's
+            # pinned CUTLASS (data/cutlass/). The overlay root comes first
+            # so modified headers shadow the public copies.
+            *[
+                str(root / sub)
+                for root in include_roots
+                for sub in (
+                    "include",
+                    "csrc",
+                    "csrc/nv_internal",
+                    "csrc/nv_internal/include",
+                )
             ],
-            extra_ldflags=[*_cuda_stub_ldflags(), "-lcuda", "-lnvrtc"],
-            extra_include_paths=[
-                str(staged),
-                str(
-                    staged
-                    / "flashinfer"
-                    / "trtllm"
-                    / "batched_gemm"
-                    / "trtllmGen_bmm_export"
-                ),
-                # Per-root include layout: include/, csrc/, csrc/nv_internal/,
-                # csrc/nv_internal/include/, plus the flashinfer package's
-                # pinned CUTLASS (data/cutlass/). The overlay root comes first
-                # so modified headers shadow the public copies.
-                *[
-                    str(root / sub)
-                    for root in include_roots
-                    for sub in (
-                        "include",
-                        "csrc",
-                        "csrc/nv_internal",
-                        "csrc/nv_internal/include",
-                    )
-                ],
-                *[
-                    str(root / "cutlass" / "include")
-                    for root in include_roots
-                    if (root / "cutlass" / "include").is_dir()
-                ],
-                # Host .cpp files (g++) need the CUDA headers explicitly; nvcc
-                # adds them implicitly for .cu. CUDA 13's bundled CCCL is
-                # used as-is (mixing another pinned CCCL with the toolkit's
-                # explodes).
-                _cuda_include_dir(),
+            *[
+                str(root / "cutlass" / "include")
+                for root in include_roots
+                if (root / "cutlass" / "include").is_dir()
             ],
-            build_directory=str(build_dir),
-        )
+            # Host .cpp files (g++) need the CUDA headers explicitly; nvcc
+            # adds them implicitly for .cu. CUDA 13's bundled CCCL is
+            # used as-is (mixing another pinned CCCL with the toolkit's
+            # explodes).
+            _cuda_include_dir(),
+        ],
+        build_directory=str(build_dir),
+    )
     so_files = sorted(build_dir.glob("*.so"))
     if not so_files:
         raise RuntimeError(f"no built .so under {build_dir}")

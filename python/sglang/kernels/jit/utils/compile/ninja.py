@@ -34,6 +34,16 @@ _BUILD_FILE = "build.ninja"
 _NINJA_TIMEOUT_S = 1800
 
 
+def _write_if_changed(path: pathlib.Path, content: str) -> None:
+    """Write only on a real change, so ninja's mtime check stays meaningful."""
+    try:
+        if path.read_text() == content:
+            return
+    except OSError:
+        pass
+    path.write_text(content)
+
+
 def _escape(path: str) -> str:
     return path.replace(":", "$:").replace(" ", "$ ")
 
@@ -101,14 +111,18 @@ def build(*, spec: BuildSpec, build_dir: pathlib.Path, build_file: str) -> pathl
     The caller passes the generated text rather than letting this regenerate it,
     so the text the cache key was taken over is provably the text that gets
     compiled.
+
+    *build_dir* may be reused across calls when the caller pins it, so nothing
+    is rewritten unless its content actually changed — an unconditional write
+    bumps the mtime and makes ninja recompile a build that was already current.
     """
     build_dir.mkdir(parents=True, exist_ok=True)
     for unit in spec.translation_units():
         # Only the generated wrappers are materialized; sources that already
         # exist are compiled where they are.
         if unit.source is not None:
-            (build_dir / unit.filename).write_text(unit.source)
-    (build_dir / _BUILD_FILE).write_text(build_file)
+            _write_if_changed(build_dir / unit.filename, unit.source)
+    _write_if_changed(build_dir / _BUILD_FILE, build_file)
 
     command = ["ninja", "-f", _BUILD_FILE]
     jobs = os.environ.get("MAX_JOBS")

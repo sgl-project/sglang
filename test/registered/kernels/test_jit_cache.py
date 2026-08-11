@@ -374,6 +374,68 @@ def test_build_lock_excludes_a_second_holder(tmp_path):
     assert contender_entered.is_set(), "never entered after the lock was released"
 
 
+def test_pinned_build_directory_is_locked(tmp_path, monkeypatch):
+    """A caller-pinned `build_directory` is shared, not private.
+
+    `trtllm_gen_moe` pins one directory keyed by its cubin pool, so all eight
+    tensor-parallel ranks land in it at once. Without the lock they each ran
+    ninja there simultaneously and clobbered each other's build log — observed
+    on an 8-GPU b300 job as `ninja: error: opening build log`. Reproduced
+    locally at 2-4 crashes out of 8 ranks before the fix, 0 after.
+    """
+    import fcntl
+
+    from sglang.kernels.jit.utils.compile import loader
+
+    def lock_is_held(directory: pathlib.Path) -> bool:
+        # A separate open file description conflicts even within one process.
+        handle = os.open(directory / loader._LOCK_FILE, os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(handle)
+
+    observed = {}
+
+    def fake_build(*, spec, build_dir, build_file):
+        observed["locked"] = lock_is_held(build_dir)
+        observed["dir"] = build_dir
+        return build_dir / f"{spec.module_name}.so"
+
+    monkeypatch.setattr(loader.ninja, "build", fake_build)
+    monkeypatch.setattr(loader, "_load", lambda library: library)
+
+    loader.load_jit(
+        "pinned_probe",
+        cuda_files=[],
+        cuda_wrappers=[("run", "K::run")],
+        build_directory=str(tmp_path / "pinned"),
+    )
+    assert observed["dir"] == tmp_path / "pinned"
+    assert observed["locked"], "ninja ran in a pinned directory without the lock"
+
+
+def test_build_file_is_not_rewritten_when_unchanged(tmp_path):
+    """A pinned directory is reused, so an unconditional write forces a rebuild.
+
+    ninja decides by mtime; rewriting identical content bumps it and makes every
+    rank recompile a build that was already current. tvm-ffi used write-if-
+    different here for the same reason.
+    """
+    path = tmp_path / "build.ninja"
+    ninja._write_if_changed(path, "rule x\n")
+    first = path.stat().st_mtime_ns
+
+    ninja._write_if_changed(path, "rule x\n")
+    assert path.stat().st_mtime_ns == first, "identical content must not be rewritten"
+
+    ninja._write_if_changed(path, "rule y\n")
+    assert path.read_text() == "rule y\n"
+
+
 # --------------------------------------------------------------------------
 # ninja generation
 # --------------------------------------------------------------------------

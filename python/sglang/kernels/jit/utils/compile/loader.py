@@ -75,8 +75,14 @@ def load_jit(
     :param extra_ldflags: Extra linker flags.
     :param extra_include_paths: Extra include paths.
     :param extra_dependencies: Registered header-only dependencies, e.g. cutlass.
-    :param build_directory: Pin the build to this directory and bypass the
-                            shared cache entirely.
+    :param build_directory: Escape hatch — build in this directory instead of
+                            the content-addressed cache. Avoid it. A pinned
+                            directory is shared state: every process naming it
+                            writes the same sources and objects there, so it
+                            gives up the cache's staging, atomic publication and
+                            content-addressed staleness checks, and keeps only
+                            the build lock and whatever ninja can infer from
+                            mtimes in that directory.
     :param header_only: Compile through a generated wrapper that exports the
                         given entry points. Otherwise the sources must export
                         from the C++ side themselves.
@@ -113,10 +119,13 @@ def load_jit(
     build_file = ninja.generate(spec)
 
     # An explicit build_directory is a caller-pinned location; honour it and
-    # stay out of the shared cache entirely.
+    # stay out of the shared cache entirely. It still needs the lock: callers
+    # pin a *shared* directory, so every tensor-parallel rank would otherwise
+    # run ninja in it at once and clobber each other's build log and objects.
     if build_directory is not None:
         dir = pathlib.Path(build_directory)
-        return _load(ninja.build(spec=spec, build_dir=dir, build_file=build_file))
+        with _build_lock(dir):
+            return _load(ninja.build(spec=spec, build_dir=dir, build_file=build_file))
 
     build_key = cache.compute_build_key(spec, build_file=build_file)
     scope = cache.build_key_dir(module_name=spec.module_name, build_key=build_key)
@@ -160,6 +169,8 @@ def load_jit(
         staging = scope / f".staging-{uuid.uuid4().hex}"
         try:
             library = ninja.build(spec=spec, build_dir=staging, build_file=build_file)
+            # Loaded before publishing, so a broken artifact never becomes a
+            # leaf that later runs have to discover and discard.
             module = _load(library)
             cache.commit_build(
                 spec,
