@@ -44,6 +44,12 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    is_dit_component_name,
+    is_image_encoder_component_name,
+    is_text_encoder_component_name,
+    is_vae_component_name,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
@@ -317,43 +323,41 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
-        suggested_args_str = self._format_offload_disable_suggestions(can_stay_resident)
+        disable_offload_str = self._format_offload_disable_suggestions(
+            can_stay_resident
+        )
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
+        pool_overhead_pct = (
+            pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb else 0.0
+        )
 
         logger.debug(
-            f"GPU memory: peak_reserved={peak_reserved_gb:.2f} GB, "
-            f"peak_allocated={peak_allocated_gb:.2f} GB, "
-            f"pool_overhead={pool_overhead_gb:.2f} GB "
-            f"({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
-            f"available_at_peak={remaining_gpu_mem_gb:.2f} GB; "
-            f"resident_candidates={can_stay_resident}; "
-            f"offload_control={suggested_args_str}"
+            "GPU memory: peak=%.2f GB, allocated=%.2f GB, pool=%.2f GB (%.1f%%), "
+            "headroom=%.2f GB; resident_candidates=%s; disable_offload=%s",
+            peak_reserved_gb,
+            peak_allocated_gb,
+            pool_overhead_gb,
+            pool_overhead_pct,
+            remaining_gpu_mem_gb,
+            can_stay_resident,
+            disable_offload_str,
         )
 
     def _format_offload_disable_suggestions(self, components: List[str]) -> str:
-        component_set = set(components)
-        component_names = []
-        layerwise_suggestions = []
-
-        for component in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
-            if component not in component_set:
-                continue
-
-            if component in ("vae", "image_encoder", "text_encoder", "text_encoder_2"):
-                component_names.append(component)
-            elif component == "transformer":
-                if self.server_args.is_dit_layerwise_offload_selected:
-                    layerwise_suggestions.append("--dit-layerwise-offload")
-                elif self.server_args.dit_cpu_offload:
-                    component_names.append(component)
+        if not components:
+            return "None"
 
         suggestions = []
-        if component_names:
-            suggestions.append("--cpu-offload-components " + " ".join(component_names))
-        suggestions.extend(layerwise_suggestions)
-
-        return ", ".join(suggestions) if suggestions else "None"
+        for component in components:
+            if self.server_args.should_configure_layerwise_offload_for_lazy_component(
+                component
+            ):
+                option = "--layerwise-offload-components"
+            else:
+                option = "--cpu-offload-components"
+            suggestions.append(f"{component} via {option}")
+        return ", ".join(suggestions)
 
     def execute_forward(
         self, batch: List[Req], return_req: bool = False
@@ -971,33 +975,45 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not self.pipeline:
             return can_stay_resident
 
-        # Map memory_usage keys to server_args offload flags.
-        # If the flag is False, the component is already resident, so we do not suggest it.
-        # If the flag is True, it is currently offloaded, so it is a candidate to stay resident.
-        offload_flags = {
-            "transformer": self.server_args.dit_cpu_offload
-            or self.server_args.is_dit_layerwise_offload_selected,
-            "vae": self.server_args.vae_cpu_offload,
-            "text_encoder": self.server_args.text_encoder_cpu_offload,
-            "text_encoder_2": self.server_args.text_encoder_cpu_offload,
-            "image_encoder": self.server_args.image_encoder_cpu_offload,
-        }
-
-        for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
-            # Only consider components that are currently configured to be offloaded
-            is_offload_configured = offload_flags.get(name, False)
-            if not is_offload_configured:
+        memory_usages = self.pipeline.memory_usages
+        ordered_names = [
+            name
+            for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+            if name in memory_usages
+        ]
+        ordered_names.extend(
+            name
+            for name in memory_usages
+            if name not in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+        )
+        for name in ordered_names:
+            usage = memory_usages[name]
+            if not self._is_component_offloaded(name):
                 continue
-
-            usage = self.pipeline.memory_usages.get(name)
             if usage is None:
                 continue
-
             if usage <= remaining_gpu_mem_gb:
                 can_stay_resident.append(name)
                 remaining_gpu_mem_gb -= usage
 
         return can_stay_resident
+
+    def _is_component_offloaded(self, component_name: str) -> bool:
+        if self.server_args.should_configure_layerwise_offload_for_lazy_component(
+            component_name
+        ):
+            return True
+        if self.server_args.cpu_offload_components is not None:
+            return self.server_args.is_cpu_offload_component_selected(component_name)
+        if is_dit_component_name(component_name):
+            return bool(self.server_args.dit_cpu_offload)
+        if is_text_encoder_component_name(component_name):
+            return bool(self.server_args.text_encoder_cpu_offload)
+        if is_image_encoder_component_name(component_name):
+            return bool(self.server_args.image_encoder_cpu_offload)
+        if is_vae_component_name(component_name):
+            return bool(self.server_args.vae_cpu_offload)
+        return False
 
     def set_lora(
         self,

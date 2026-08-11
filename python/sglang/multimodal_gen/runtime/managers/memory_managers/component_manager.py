@@ -166,7 +166,6 @@ class ComponentResidencyManager:
         if pipeline is not self.pipeline:
             self._remove_nvtx_hooks()
             self.strategy_for.cache_clear()
-            self._should_keep_single_dit.cache_clear()
             self._active_use = None
             self._active_use_module = None
             self._uses_seen.clear()
@@ -468,8 +467,15 @@ class ComponentResidencyManager:
             preferred = component_name in preferred_uses
             if is_resident_layerwise_module(module):
                 preferred = False
-            elif not preferred and self._should_keep_single_dit(component_name):
+            keep_single_dit = self._should_keep_single_dit(component_name, module)
+            if not preferred and keep_single_dit:
                 continue
+            # A preferred component is normally prefetched for the next request.
+            # Do not let that performance hint override CPU/layerwise offload for
+            # a single DiT, which must obey the selected memory policy.
+            preferred = preferred and (
+                not self._is_single_dit_component(component_name) or keep_single_dit
+            )
             strategy = self.strategy_for(component_name, module)
             if preferred and not self.state.batch_is_warmup:
                 strategy.prepare_after_request(module, use, self.state)
@@ -546,16 +552,25 @@ class ComponentResidencyManager:
         }
         if use.component_name in future_component_names:
             return True
-        if self._should_keep_single_dit(use.component_name):
-            module = self.get_module(use.component_name)
-            if module is not None and is_resident_layerwise_module(module):
-                # don't keep a layerwise DiT resident across the request to avoid OOMs
-                return False
+        module = self.get_module(use.component_name)
+        if module is not None and self._should_keep_single_dit(
+            use.component_name, module
+        ):
             return True
         return False
 
-    @lru_cache(maxsize=None)
-    def _should_keep_single_dit(self, component_name: str) -> bool:
+    def _should_keep_single_dit(self, component_name: str, module: nn.Module) -> bool:
+        """Keep a single DiT resident only when its effective strategy is resident.
+
+        The single-DiT fast path is a performance optimization, not a memory
+        policy. In particular, it must not override explicit or auto-selected
+        CPU/layerwise offload.
+        """
+        if not self._is_single_dit_component(component_name):
+            return False
+        return isinstance(self.strategy_for(component_name, module), ResidentStrategy)
+
+    def _is_single_dit_component(self, component_name: str) -> bool:
         modules = self.pipeline.modules
         return (component_name == "transformer" and "transformer_2" not in modules) or (
             component_name == "video_dit" and "video_dit_2" not in modules
