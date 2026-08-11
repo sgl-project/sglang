@@ -54,7 +54,7 @@ class AscendFABackend(AttentionBackend):
 
     @classmethod
     def supports_ring_rotation(cls) -> bool:
-        """Whether this backend can serve as the ring-attention kernel; the 
+        """Whether this backend can serve as the ring-attention kernel; the
         per-hop online-softmax merge needs the kernel's softmax LSE."""
         return True
 
