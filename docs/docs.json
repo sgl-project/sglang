@@ -1309,6 +1309,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3.5-Lightning",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Ultra",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano",
@@ -1351,6 +1352,7 @@
                   {
                     "group": "InternLM",
                     "pages": [
+                      "cookbook/autoregressive/InternLM/Intern-S2-Mobius",
                       "cookbook/autoregressive/InternLM/Intern-S2-Preview",
                       "cookbook/autoregressive/InternLM/Intern-S1"
                     ]
