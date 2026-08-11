@@ -168,6 +168,20 @@ class LTX2SigmaPreparationStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         batch.extra["ltx2_phase"] = "stage1"
+        pinned_sigmas = server_args.pipeline_config.default_sigmas
+        if pinned_sigmas:
+            # Distilled checkpoints (LTX-2.5) ship an explicit schedule; handing
+            # them a generic linear one silently costs quality.
+            if int(batch.num_inference_steps) != len(pinned_sigmas):
+                logger.info(
+                    "Overriding num_inference_steps=%d with the pinned distilled "
+                    "sigma schedule (%d steps).",
+                    int(batch.num_inference_steps),
+                    len(pinned_sigmas),
+                )
+            batch.sigmas = list(pinned_sigmas)
+            batch.num_inference_steps = len(pinned_sigmas)
+            return batch
         if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
             # Gate on pipeline class to mirror the three official entry points:
             # - HQ (`ti2vid_two_stages_hq.py:164`) calls

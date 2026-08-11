@@ -866,6 +866,16 @@ class LTX23VideoMidBlock3d(nn.Module):
 
 
 # Like LTXVideoUpBlock3d but with no conv_in and the updated LTX2VideoResnetBlock3d
+# Per-stage upsampling strides, selected by the decoder's `upsample_type`.
+# LTX-2 upsamples every decoder stage in all three dimensions; LTX-2.5 mixes
+# spatial-only and temporal-only stages.
+_UPSAMPLE_STRIDES: dict[str, tuple[int, int, int]] = {
+    "spatial": (1, 2, 2),
+    "temporal": (2, 1, 1),
+    "spatiotemporal": (2, 2, 2),
+}
+
+
 class LTX2VideoUpBlock3d(nn.Module):
     r"""
     Up block used in the LTXVideo model.
@@ -901,6 +911,7 @@ class LTX2VideoUpBlock3d(nn.Module):
         resnet_eps: float = 1e-6,
         resnet_act_fn: str = "swish",
         spatio_temporal_scale: bool = True,
+        upsample_type: str = "spatiotemporal",
         inject_noise: bool = False,
         timestep_conditioning: bool = False,
         upsample_residual: bool = False,
@@ -936,7 +947,7 @@ class LTX2VideoUpBlock3d(nn.Module):
                 [
                     LTXVideoUpsampler3d(
                         out_channels * upscale_factor,
-                        stride=(2, 2, 2),
+                        stride=_UPSAMPLE_STRIDES[upsample_type],
                         residual=upsample_residual,
                         upscale_factor=upscale_factor,
                         spatial_padding_mode=spatial_padding_mode,
@@ -1236,6 +1247,7 @@ class LTX2VideoDecoder3d(nn.Module):
         timestep_conditioning: bool = False,
         upsample_residual: Tuple[bool, ...] = (True, True, True),
         upsample_factor: Tuple[bool, ...] = (2, 2, 2),
+        upsample_type: Tuple[str, ...] | None = None,
         spatial_padding_mode: str = "reflect",
     ) -> None:
         super().__init__()
@@ -1245,12 +1257,18 @@ class LTX2VideoDecoder3d(nn.Module):
         self.out_channels = out_channels * patch_size**2
         self.is_causal = is_causal
 
+        if upsample_type is None:
+            upsample_type = ("spatiotemporal",) * len(block_out_channels)
+
         block_out_channels = tuple(reversed(block_out_channels))
         spatio_temporal_scaling = tuple(reversed(spatio_temporal_scaling))
         layers_per_block = tuple(reversed(layers_per_block))
         inject_noise = tuple(reversed(inject_noise))
         upsample_residual = tuple(reversed(upsample_residual))
         upsample_factor = tuple(reversed(upsample_factor))
+        # NOTE: `upsample_type` is deliberately *not* reversed -- upstream
+        # indexes it in decoder order while the other per-stage lists are given
+        # in encoder order.
         output_channel = block_out_channels[0]
 
         self.conv_in = LTX2VideoCausalConv3d(
@@ -1283,6 +1301,7 @@ class LTX2VideoDecoder3d(nn.Module):
                 num_layers=layers_per_block[i + 1],
                 resnet_eps=resnet_norm_eps,
                 spatio_temporal_scale=spatio_temporal_scaling[i],
+                upsample_type=upsample_type[i],
                 inject_noise=inject_noise[i + 1],
                 timestep_conditioning=timestep_conditioning,
                 upsample_residual=upsample_residual[i],
@@ -1624,28 +1643,25 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             config.arch_config.decoder_spatio_temporal_scaling
         )
         decoder_layers_per_block = config.arch_config.decoder_layers_per_block
-        decoder_inject_noise = getattr(
-            config.arch_config, "decoder_inject_noise", (False, False, False, False)
-        )
+        decoder_inject_noise = config.arch_config.decoder_inject_noise
         if isinstance(decoder_inject_noise, bool):
             decoder_inject_noise = (decoder_inject_noise,) * 4
         else:
             decoder_inject_noise = tuple(decoder_inject_noise)
-        upsample_residual = getattr(
-            config.arch_config, "upsample_residual", (True, True, True)
-        )
+        upsample_residual = config.arch_config.upsample_residual
         if isinstance(upsample_residual, bool):
             upsample_residual = (upsample_residual,) * 3
         else:
             upsample_residual = tuple(upsample_residual)
-        upsample_factor = getattr(config.arch_config, "upsample_factor", (2, 2, 2))
+        upsample_factor = config.arch_config.upsample_factor
         if isinstance(upsample_factor, int):
             upsample_factor = (upsample_factor,) * 3
         else:
             upsample_factor = tuple(upsample_factor)
-        timestep_conditioning = getattr(
-            config.arch_config, "timestep_conditioning", False
-        )
+        upsample_type = config.arch_config.upsample_type
+        if upsample_type is not None:
+            upsample_type = tuple(upsample_type)
+        timestep_conditioning = config.arch_config.timestep_conditioning
         use_ltx23_video_decoder = (
             str(config.arch_config.video_decoder_variant) == "ltx_2_3"
         )
@@ -1732,6 +1748,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 timestep_conditioning=timestep_conditioning,
                 upsample_residual=upsample_residual,
                 upsample_factor=upsample_factor,
+                upsample_type=upsample_type,
                 spatial_padding_mode=decoder_spatial_padding_mode,
             )
 

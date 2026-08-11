@@ -178,6 +178,10 @@ class LTX2PipelineConfig(PipelineConfig):
     generator_device: str = "cpu"
     dit_config: LTX2Config = field(default_factory=LTX2Config)
 
+    # Distilled checkpoints are trained against one fixed sigma schedule rather
+    # than a step count. When set, it replaces the derived schedule.
+    default_sigmas: tuple[float, ...] | None = None
+
     # Model architecture
     in_channels: int = 128
     out_channels: int = 128

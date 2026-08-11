@@ -5,9 +5,22 @@ from sglang.multimodal_gen.configs.models.adapter.base import (
     AdapterConfig,
 )
 
+# LTX-2.5 ships diffusers-format connectors, whose per-modality projections are
+# named `video_text_proj_in` / `audio_text_proj_in`. SGLang follows the upstream
+# ltx-core naming (`*_aggregate_embed`). Every other connector weight already
+# matches diffusers exactly.
+LTX2_CONNECTOR_PARAM_NAMES_MAPPING: dict[str, str] = {
+    r"^video_text_proj_in\.(.*)$": r"video_aggregate_embed.\1",
+    r"^audio_text_proj_in\.(.*)$": r"audio_aggregate_embed.\1",
+}
+
 
 @dataclass
 class LTX2ConnectorArchConfig(AdapterArchConfig):
+    param_names_mapping: dict = field(
+        default_factory=lambda: dict(LTX2_CONNECTOR_PARAM_NAMES_MAPPING)
+    )
+
     audio_connector_attention_head_dim: int = 128
     audio_connector_num_attention_heads: int = 30
     audio_connector_num_layers: int = 2
@@ -27,6 +40,32 @@ class LTX2ConnectorArchConfig(AdapterArchConfig):
     video_connector_num_attention_heads: int = 30
     video_connector_num_layers: int = 2
     video_connector_num_learnable_registers: int = 128
+
+    # Names used by the diffusers `connectors/config.json`. `update_model_arch`
+    # copies the JSON verbatim onto this object, so declare them here and derive
+    # the SGLang-side fields in `__post_init__` rather than reading the JSON
+    # names at every use site. LTX-2.0 leaves `per_modality_projections` false
+    # and keeps the single shared `text_proj_in`; LTX-2.3/2.5 set it.
+    per_modality_projections: bool = False
+    video_hidden_dim: int = 4096
+    audio_hidden_dim: int = 2048
+    video_gated_attn: bool = False
+    audio_gated_attn: bool = False
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        if self.per_modality_projections:
+            self.feature_extractor_in_features = (
+                self.caption_channels * self.text_proj_in_factor
+            )
+            self.video_feature_extractor_out_features = self.video_hidden_dim
+            self.audio_feature_extractor_out_features = self.audio_hidden_dim
+
+        # Upstream gates the two connectors separately, but they are always
+        # configured together in released checkpoints.
+        if self.video_gated_attn or self.audio_gated_attn:
+            self.connector_apply_gated_attention = True
 
 
 @dataclass
