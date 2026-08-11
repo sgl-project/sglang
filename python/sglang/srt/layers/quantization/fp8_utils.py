@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    get_device_sm,
     get_hip_version,
     is_blackwell_supported,
     is_cuda,
@@ -542,10 +543,16 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
         return Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
 
     if backend.is_flashinfer_cutedsl():
-        if not (_is_sm100_supported and is_flashinfer_available()):
+        if not (
+            is_blackwell_supported()
+            and is_flashinfer_available()
+            and _raw_flashinfer_mm_mxfp8.is_backend_supported(
+                "cute-dsl", get_device_sm()
+            )
+        ):
             raise RuntimeError(
                 "MXFP8 dense GEMM requested via --fp8-gemm-backend=flashinfer_cutedsl, "
-                "but that kernel requires SM10X GPUs and FlashInfer."
+                "but that kernel requires an SM100/SM103 GPU and FlashInfer."
             )
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
 
@@ -570,7 +577,7 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
     if is_blackwell_supported() and is_flashinfer_available():
-        if _is_sm100_supported:
+        if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
             return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
 
