@@ -1048,6 +1048,10 @@ class CakeKDAKernel(FlashInferKDAKernel):
                 CakePackedDecodeReason.ZERO_ROW_STRIDE, name
             )
         if row_stride < 0:
+            # PyTorch tensors cannot currently carry negative strides.  Keep
+            # this schema-v1 reason as fail-closed selector armor for foreign
+            # tensor-like inputs or a future framework ABI; production CUPTI
+            # evidence must label it synthetic/unreachable.
             return CakeKDAKernel._cake_reject(
                 CakePackedDecodeReason.NEGATIVE_ROW_STRIDE, name
             )

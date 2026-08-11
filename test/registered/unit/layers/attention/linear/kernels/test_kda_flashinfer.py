@@ -772,6 +772,10 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
             CakePackedDecodeReason.OVERLAPPING_ROW_STRIDE,
         )
 
+        # torch.as_strided rejects negative strides, so this schema-v1 reason
+        # is selector-only armor rather than a constructible production tensor.
+        with self.assertRaises(RuntimeError):
+            torch.empty(12).as_strided((1, 12), (-1, 1))
         negative = CakeKDAKernel._cake_row_stride_admission("raw_beta", -1, 12)
         self.assertEqual(negative.reason, CakePackedDecodeReason.NEGATIVE_ROW_STRIDE)
         self.assertEqual(CakePackedDecodeReason.INNER_STRIDE, "inner_stride")
