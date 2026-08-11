@@ -37,7 +37,7 @@ from .common import (
     get_tokenizer_from_processor,
 )
 from .config import get_config
-from .processor import get_processor
+from .processor import get_processor, resolve_image_processor_backend
 from .tokenizer import (
     _fix_added_tokens_encoding,
     _fix_v5_add_bos_eos_token,
@@ -57,6 +57,7 @@ __all__ = [
     "get_generation_config",
     "get_hf_text_config",
     "get_processor",
+    "resolve_image_processor_backend",
     "get_rope_config",
     "get_sparse_attention_config",
     "get_tokenizer",

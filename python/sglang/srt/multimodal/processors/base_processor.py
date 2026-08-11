@@ -206,7 +206,12 @@ class BaseMultimodalProcessor(ABC):
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
-        self.disable_fast_image_processor = server_args.disable_fast_image_processor
+        self.image_processor_backend = getattr(
+            server_args, "image_processor_backend", "auto"
+        )
+        if getattr(server_args, "disable_fast_image_processor", False):
+            self.image_processor_backend = "pil"
+        self.disable_fast_image_processor = self.image_processor_backend == "pil"
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
         mm_process_config = self.server_args.mm_process_config
