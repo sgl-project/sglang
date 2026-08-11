@@ -3,41 +3,41 @@
 
 //! gRPC contract tests: exercise all four RPCs of the `KVIndexer` service
 //! over the wire (real tonic server + client), not just the backend trait.
-//!
-//! Like the backend integration tests these require a live store and are
-//! opt-in via `KV_INDEXER_REDIS_URL`; when it is not set every test skips. Each
-//! test uses a unique namespace and unique worker/hash ids so a shared store
-//! never causes collisions.
-#![cfg(feature = "redis-backend")]
 
-#[path = "common/require.rs"]
-mod require;
 #[path = "common/id.rs"]
 mod test_id;
-#[allow(dead_code)] // Shared fixtures include Redis-only tier helpers.
+#[allow(dead_code)]
 #[path = "common/kv.rs"]
 mod test_kv;
 #[path = "common/net.rs"]
 mod test_net;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
 use tonic::transport::Server;
-use tonic::Code;
+use tonic::{Code, Status};
 
 use sgl_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
 use sgl_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sgl_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
-    GetExternalKvHitCountsRequest, MatchExternalKvPrefixRequest, MatchExternalKvRequest,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
+    ExternalKvActionType, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
+    MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse, MatchExternalKvRequest,
+    MatchExternalKvResponse,
 };
-use sgl_kv_indexer::{KvIndexerService, RedisKvIndexerBackend};
+use sgl_kv_indexer::{
+    GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService, PrefixIndex,
+    PrefixIndexConfig,
+};
 use test_id::nanos;
 use test_kv::{action, apply_request, hbm};
 use test_net::free_addr;
 
 async fn start_backend(
-    backend: RedisKvIndexerBackend,
+    backend: InMemoryKvIndexerBackend,
 ) -> KvIndexerClient<tonic::transport::Channel> {
     let svc = KvIndexerServer::new(KvIndexerService::new(backend));
     let addr = free_addr();
@@ -59,21 +59,127 @@ async fn start_backend(
     panic!("client failed to connect to {endpoint}");
 }
 
-/// Starts a real gRPC server backed by Redis on a unique namespace and returns
-/// a connected client, or `None` (skip) when no store env is configured.
-async fn start(test: &str) -> Option<KvIndexerClient<tonic::transport::Channel>> {
-    let url = match std::env::var("KV_INDEXER_REDIS_URL") {
-        Ok(u) => u,
-        Err(_) => {
-            require::skip(test, "KV_INDEXER_REDIS_URL is not set");
-            return None;
+#[derive(Clone)]
+struct BlockingPrefixBackend {
+    entered: Arc<AtomicUsize>,
+    release: Arc<Semaphore>,
+}
+
+#[tonic::async_trait]
+impl KvIndexerBackend for BlockingPrefixBackend {
+    async fn apply_external_kv_batch(
+        &self,
+        _request: ApplyExternalKvBatchRequest,
+    ) -> Result<ApplyExternalKvBatchResponse, Status> {
+        Ok(ApplyExternalKvBatchResponse::default())
+    }
+
+    async fn match_external_kv(
+        &self,
+        _request: MatchExternalKvRequest,
+    ) -> Result<MatchExternalKvResponse, Status> {
+        Ok(MatchExternalKvResponse::default())
+    }
+
+    async fn match_external_kv_prefix(
+        &self,
+        _request: MatchExternalKvPrefixRequest,
+    ) -> Result<MatchExternalKvPrefixResponse, Status> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let _permit = self.release.acquire().await.expect("semaphore open");
+        Ok(MatchExternalKvPrefixResponse::default())
+    }
+
+    async fn get_external_kv_hit_counts(
+        &self,
+        _request: GetExternalKvHitCountsRequest,
+    ) -> Result<GetExternalKvHitCountsResponse, Status> {
+        Ok(GetExternalKvHitCountsResponse::default())
+    }
+}
+
+async fn start_blocking_backend(
+    backend: BlockingPrefixBackend,
+) -> KvIndexerClient<tonic::transport::Channel> {
+    let svc = KvIndexerServer::new(KvIndexerService::with_prefix_query_max_inflight(backend, 2));
+    let addr = free_addr();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve(addr)
+            .await
+            .expect("server serve");
+    });
+
+    let endpoint = format!("http://{addr}");
+    for _ in 0..50 {
+        if let Ok(client) = KvIndexerClient::connect(endpoint.clone()).await {
+            return client;
         }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("client failed to connect to {endpoint}");
+}
+
+/// Starts a real gRPC server with isolated process-local state.
+async fn start() -> KvIndexerClient<tonic::transport::Channel> {
+    start_backend(InMemoryKvIndexerBackend::new()).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefix_limit_rejects_over_real_grpc_without_blocking_writes() {
+    let entered = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let backend = BlockingPrefixBackend {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
     };
-    let ns = format!("grpc:{test}:{}", nanos());
-    let backend = RedisKvIndexerBackend::connect_single(&url, ns)
-        .await
-        .expect("connect redis");
-    Some(start_backend(backend).await)
+    let client = start_blocking_backend(backend).await;
+    let request = || MatchExternalKvPrefixRequest {
+        hashes: vec!["hash".into()],
+        max_blocks: 0,
+    };
+
+    let mut first_client = client.clone();
+    let first = tokio::spawn(async move { first_client.match_external_kv_prefix(request()).await });
+    let mut second_client = client.clone();
+    let second =
+        tokio::spawn(async move { second_client.match_external_kv_prefix(request()).await });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while entered.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two prefix queries should enter the backend");
+
+    let mut rejected_client = client.clone();
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(1),
+        rejected_client.match_external_kv_prefix(request()),
+    )
+    .await
+    .expect("overload response should be immediate")
+    .expect_err("third prefix query should be rejected");
+    assert_eq!(rejected.code(), Code::ResourceExhausted);
+    assert_eq!(entered.load(Ordering::SeqCst), 2);
+
+    let mut write_client = client.clone();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        write_client.apply_external_kv_batch(ApplyExternalKvBatchRequest {
+            worker_id: "worker".into(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("writes should not share the prefix-query limit")
+    .expect("write should succeed");
+
+    release.add_permits(2);
+    first.await.expect("first task").expect("first response");
+    second.await.expect("second task").expect("second response");
 }
 
 fn apply(
@@ -105,24 +211,8 @@ fn apply_report(
 }
 
 #[tokio::test]
-async fn disjoint_workers_scale_across_two_indexer_servers() {
-    let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") else {
-        require::skip(
-            "disjoint_workers_scale_across_two_indexer_servers",
-            "KV_INDEXER_REDIS_URL is not set",
-        );
-        return;
-    };
-    let namespace = format!("grpc:horizontal:{}", nanos());
-    let backend_0 = RedisKvIndexerBackend::connect_single(&url, namespace.clone())
-        .await
-        .expect("connect indexer-0 backend");
-    let backend_1 = RedisKvIndexerBackend::connect_single(&url, namespace)
-        .await
-        .expect("connect indexer-1 backend");
-    let mut indexer_0 = start_backend(backend_0).await;
-    let mut indexer_1 = start_backend(backend_1).await;
-
+async fn multiple_workers_share_one_indexer_server() {
+    let mut indexer = start().await;
     let suffix = nanos();
     let worker_0 = format!("worker-0-{suffix}");
     let worker_1 = format!("worker-1-{suffix}");
@@ -130,59 +220,47 @@ async fn disjoint_workers_scale_across_two_indexer_servers() {
     let hash_1 = format!("horizontal-h1-{suffix}");
     let shared_hash = format!("horizontal-shared-{suffix}");
 
-    let apply_0 = indexer_0.apply_external_kv_batch(apply_report(
-        &worker_0,
-        "10.0.0.1:9000",
-        1,
-        hbm(),
-        &[&hash_0, &shared_hash],
-    ));
-    let apply_1 = indexer_1.apply_external_kv_batch(apply_report(
-        &worker_1,
-        "10.0.0.2:9000",
-        1,
-        hbm(),
-        &[&hash_1, &shared_hash],
-    ));
-    let (result_0, result_1) = tokio::join!(apply_0, apply_1);
-    result_0.expect("indexer-0 applies worker-0");
-    result_1.expect("indexer-1 applies worker-1");
-
-    let request = || MatchExternalKvRequest {
-        hashes: vec![hash_0.clone(), hash_1.clone(), shared_hash.clone()],
-        count_as_hit: false,
-    };
-    let from_0 = indexer_0
-        .match_external_kv(request())
+    indexer
+        .apply_external_kv_batch(apply_report(
+            &worker_0,
+            "10.0.0.1:9000",
+            1,
+            hbm(),
+            &[&hash_0, &shared_hash],
+        ))
         .await
-        .expect("query indexer-0")
-        .into_inner();
-    let from_1 = indexer_1
-        .match_external_kv(request())
+        .expect("apply worker-0");
+    indexer
+        .apply_external_kv_batch(apply_report(
+            &worker_1,
+            "10.0.0.2:9000",
+            1,
+            hbm(),
+            &[&hash_1, &shared_hash],
+        ))
         .await
-        .expect("query indexer-1")
-        .into_inner();
+        .expect("apply worker-1");
 
-    for response in [&from_0, &from_1] {
-        assert!(
-            response
-                .matches
-                .iter()
-                .any(|entry| entry.worker_id == worker_0),
-            "either indexer must see worker-0 through shared Redis"
-        );
-        assert!(
-            response
-                .matches
-                .iter()
-                .any(|entry| entry.worker_id == worker_1),
-            "either indexer must see worker-1 through shared Redis"
-        );
-    }
+    let response = indexer
+        .match_external_kv(MatchExternalKvRequest {
+            hashes: vec![hash_0.clone(), hash_1.clone(), shared_hash.clone()],
+            count_as_hit: false,
+        })
+        .await
+        .expect("query indexer")
+        .into_inner();
+    assert!(response
+        .matches
+        .iter()
+        .any(|entry| entry.worker_id == worker_0));
+    assert!(response
+        .matches
+        .iter()
+        .any(|entry| entry.worker_id == worker_1));
 
     // Keep one wire-level smoke check for hit counting; detailed counter
-    // semantics live in redis_integration.rs.
-    indexer_0
+    // semantics live in memory_integration.rs.
+    indexer
         .match_external_kv(MatchExternalKvRequest {
             hashes: vec![hash_0.clone()],
             count_as_hit: true,
@@ -190,7 +268,7 @@ async fn disjoint_workers_scale_across_two_indexer_servers() {
         .await
         .expect("counting match over gRPC");
     let miss = format!("horizontal-miss-{suffix}");
-    let counts = indexer_1
+    let counts = indexer
         .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
             hashes: vec![hash_0.clone(), miss.clone()],
         })
@@ -211,9 +289,7 @@ async fn disjoint_workers_scale_across_two_indexer_servers() {
 
 #[tokio::test]
 async fn validation_errors_map_to_invalid_argument_over_grpc() {
-    let Some(mut c) = start("validation").await else {
-        return;
-    };
+    let mut c = start().await;
 
     // empty worker_id
     let err = c
@@ -289,9 +365,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
 
 #[tokio::test]
 async fn match_prefix_over_grpc() {
-    let Some(mut c) = start("match_prefix").await else {
-        return;
-    };
+    let mut c = start().await;
     let (w_long, w_short) = (format!("long-{}", nanos()), format!("short-{}", nanos()));
     let (a, b, d) = ("mp-a", "mp-b", "mp-c");
 
@@ -320,4 +394,83 @@ async fn match_prefix_over_grpc() {
     assert_eq!(resp.matches[0].worker_address, "10.0.0.1:9000");
     assert_eq!(resp.matches[1].worker_id, w_short);
     assert_eq!(resp.matches[1].matched_prefix_blocks, 1);
+}
+
+/// Serves an empty backend behind an interceptor that records the `grpc-timeout`
+/// of every request, and returns the router-facing client alongside the capture.
+async fn start_recording_deadlines(
+    query_deadline: Duration,
+) -> (GrpcPrefixIndex, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let svc = KvIndexerServer::with_interceptor(
+        KvIndexerService::new(InMemoryKvIndexerBackend::new()),
+        move |request: tonic::Request<()>| {
+            if let Some(timeout) = request.metadata().get("grpc-timeout") {
+                recorder
+                    .lock()
+                    .expect("deadline recorder")
+                    .push(timeout.to_str().expect("ascii timeout").to_string());
+            }
+            Ok(request)
+        },
+    );
+    let addr = free_addr();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve(addr)
+            .await
+            .expect("server serve");
+    });
+
+    let endpoint = format!("http://{addr}");
+    for _ in 0..50 {
+        if KvIndexerClient::connect(endpoint.clone()).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let index = GrpcPrefixIndex::new(PrefixIndexConfig {
+        endpoint,
+        query_deadline,
+        max_inflight: sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT,
+    });
+    (index, seen)
+}
+
+/// The router-facing client must publish its deadline on the wire, since that
+/// header is the only thing letting the indexer shed a query whose caller has
+/// already given up. Nothing else in the suite covers `GrpcPrefixIndex` itself,
+/// so without this the header could be dropped silently.
+#[tokio::test]
+async fn router_client_publishes_its_deadline_on_the_wire() {
+    let (index, seen) = start_recording_deadlines(Duration::from_millis(250)).await;
+
+    index
+        .match_prefix(vec![1, 2, 3])
+        .await
+        .expect("query reaches the indexer");
+
+    let seen = seen.lock().expect("deadline recorder").clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "exactly one query reached the server: {seen:?}"
+    );
+    let raw = &seen[0];
+    // Asserted structurally rather than byte-for-byte: the wire spec lets the
+    // sender pick any unit that fits, so pinning tonic's current choice would
+    // make this fail on an encoding change that is still correct.
+    let (digits, unit) = raw.split_at(raw.len() - 1);
+    assert!(
+        matches!(unit, "H" | "M" | "S" | "m" | "u" | "n"),
+        "unit is one the wire spec defines: {raw:?}"
+    );
+    let value: u64 = digits.parse().expect("timeout value is numeric");
+    assert!(
+        value > 0,
+        "a budget of zero would shed every query: {raw:?}"
+    );
 }

@@ -29,7 +29,7 @@ pub fn action(kind: ExternalKvActionType, tier: i32, values: &[&str]) -> Externa
 
 /// A component-aware REPORT action: each hash carries its component bitmask and
 /// token count, index-aligned with `values`.
-#[allow(dead_code)] // used by redis_integration, not grpc_contract
+#[allow(dead_code)] // used by memory_integration, not grpc_contract
 pub fn component_report(
     tier: i32,
     values: &[&str],

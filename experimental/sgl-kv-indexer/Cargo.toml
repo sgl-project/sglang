@@ -7,18 +7,12 @@ name = "sgl-kv-indexer"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Redis-backed KV cache indexer with a SGLang KV-event bridge"
+description = "In-memory KV cache indexer with a SGLang KV-event bridge"
 publish = false  # experimental crate; not published to crates.io
 
 [lib]
 name = "sgl_kv_indexer"
 path = "src/lib.rs"
-
-[features]
-default = []
-# Enables the Redis storage backend. Kept off by default so the standard build
-# does not pull the redis client and its transitive deps.
-redis-backend = ["dep:redis", "dep:futures"]
 
 [[bin]]
 name = "kv-indexer-server"
@@ -30,15 +24,9 @@ path = "src/bin/kv-indexer-bridge.rs"
 
 [dependencies]
 bytes = "1"
-futures = { version = "0.3", optional = true }
 prost = "0.14"
-redis = { version = "0.27", optional = true, features = [
-    "tokio-comp",
-    "cluster-async",
-    "connection-manager",
-] }
 rmpv = "1.3.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { version = "0.14.6", features = ["transport"] }
 tonic-prost = "0.14.6"
 tracing = "0.1"

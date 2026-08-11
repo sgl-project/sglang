@@ -1,24 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration tests for the Redis backend.
-//!
-//! These require a live store and are opt-in via environment:
-//!   * `KV_INDEXER_REDIS_URL`            → single Redis/Dragonfly, or
-//!   * `KV_INDEXER_REDIS_CLUSTER_NODES`  → Redis Cluster (comma-separated seeds)
-//!
-//! When neither is set every test skips (prints a note and returns), so the
-//! default `cargo test --features redis-backend` run stays green without a store.
-//!
-//! Each test uses a unique namespace so a shared store never causes collisions.
-#![cfg(feature = "redis-backend")]
+//! Integration tests for the process-local in-memory backend.
 
-#[path = "common/require.rs"]
-mod require;
-#[path = "common/id.rs"]
-mod test_id;
 #[path = "common/kv.rs"]
 mod test_kv;
+
+use std::sync::Arc;
 
 use sgl_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
@@ -27,41 +15,13 @@ use sgl_kv_indexer::pb::{
     WorkerCacheSpec,
 };
 use sgl_kv_indexer::{
-    KvIndexerBackend, RedisKvIndexerBackend, WorkerPrefixInput, COMPONENT_FULL, COMPONENT_SWA,
+    InMemoryKvIndexerBackend, KvIndexerBackend, WorkerPrefixInput, COMPONENT_FULL, COMPONENT_SWA,
 };
-use test_id::nanos;
 use test_kv::{action, apply_request as apply_req, component_report, dram, hashes, hbm};
 use tonic::Status;
 
-/// Builds a backend against the configured store with a unique namespace, or
-/// returns `None` (skip) when no store env is set.
-async fn backend(test: &str) -> Option<RedisKvIndexerBackend> {
-    let ns = format!("itest:{test}:{}", nanos());
-    if let Ok(nodes) = std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES") {
-        let nodes: Vec<String> = nodes
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
-        Some(
-            RedisKvIndexerBackend::connect_cluster(nodes, ns)
-                .await
-                .expect("connect cluster"),
-        )
-    } else if let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") {
-        Some(
-            RedisKvIndexerBackend::connect_single(&url, ns)
-                .await
-                .expect("connect single"),
-        )
-    } else {
-        require::skip(
-            test,
-            "neither KV_INDEXER_REDIS_URL nor KV_INDEXER_REDIS_CLUSTER_NODES is set",
-        );
-        None
-    }
+fn backend() -> InMemoryKvIndexerBackend {
+    InMemoryKvIndexerBackend::new()
 }
 
 fn match_req(hs: &[&str], count_as_hit: bool) -> MatchExternalKvRequest {
@@ -92,9 +52,7 @@ macro_rules! itest {
     ($name:ident, $b:ident, $body:block) => {
         #[tokio::test]
         async fn $name() {
-            let Some($b) = backend(stringify!($name)).await else {
-                return;
-            };
+            let $b = backend();
             $body
         }
     };
@@ -127,9 +85,8 @@ itest!(report_then_match_returns_worker_and_address, b, {
     assert!(tiers_for(&resp, "w1", "3").is_empty());
 });
 
-itest!(large_request_crosses_redis_fanout_chunks, b, {
-    // The backend fan-out chunk is 256. Exercise more than one chunk on both
-    // write and read paths while preserving complete, ordered results.
+itest!(large_request_preserves_complete_ordered_results, b, {
+    // Exercise a large write and read while preserving complete ordered results.
     let hashes: Vec<String> = (0..300).map(|i| format!("chunk-{i}")).collect();
     let hash_refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
     b.apply_external_kv_batch(apply_req(
@@ -323,35 +280,6 @@ itest!(recomputed_batch_replay_keeps_cpu_copy, b, {
     assert_eq!(tiers_for(&result, "w1", "tiered"), vec![hbm(), dram()]);
 });
 
-itest!(cluster_client_follows_ask_redirect, b, {
-    if std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES").is_err() {
-        eprintln!("skipping ASK redirect test outside Redis Cluster");
-        return;
-    }
-    let Ok(hash) = std::env::var("KV_INDEXER_ASK_HASH") else {
-        eprintln!("skipping ASK redirect test: set KV_INDEXER_ASK_HASH");
-        return;
-    };
-
-    // The external harness marks this hash's slot MIGRATING on its owner and
-    // IMPORTING on another master before starting the test. This namespace is
-    // unique, so the placement key is absent on the source and Redis responds
-    // with ASK. The cluster client must issue ASKING on the target and retry.
-    b.apply_external_kv_batch(apply_req(
-        "ask-worker",
-        "a",
-        1,
-        vec![action(ExternalKvActionType::ActionReport, hbm(), &[&hash])],
-    ))
-    .await
-    .unwrap();
-    let result = b
-        .match_external_kv(match_req(&[&hash], false))
-        .await
-        .unwrap();
-    assert_eq!(tiers_for(&result, "ask-worker", &hash), vec![hbm()]);
-});
-
 itest!(revoke_partial_tier_keeps_other_tier, b, {
     b.apply_external_kv_batch(apply_req(
         "w1",
@@ -502,7 +430,7 @@ itest!(
 itest!(full_revoke_drops_hit_key, b, {
     // Report a block, count a hit (creates the co-located :h key), then fully
     // revoke it. The hit key must be removed together with placement; otherwise a
-    // matched-then-evicted block leaks its :h key forever (slow Redis memory growth).
+    // matched-then-evicted block would otherwise leak its counter forever.
     b.apply_external_kv_batch(apply_req(
         "w1",
         "a",
@@ -619,23 +547,21 @@ itest!(batch_action_order_is_preserved, b, {
     assert!(tiers_for(&resp, "w1", "6").is_empty());
 });
 
-// --- server-side seq gate (durable idempotency) -----------------------------
-
-// --- prefix query: Redis fast path vs. the trait's default implementation ----
+// --- prefix query: backend override vs. the trait's default implementation ---
 //
 // The default `match_external_kv_prefix` (composed from `match_external_kv`) is
-// the written semantics; the Redis override is a command-count optimization. It
+// the written semantics; the backend override is a read optimization. It
 // must stay field-for-field identical on the parts that ARE the contract
 // (per-worker prefix set and best_prefix_blocks); `blocks_read` is observability
 // and legitimately differs, so it is not compared.
 
-/// Delegates every RPC to a Redis backend EXCEPT `match_external_kv_prefix`,
+/// Delegates every RPC to an in-memory backend EXCEPT `match_external_kv_prefix`,
 /// which it leaves to the trait default — giving a reference answer computed from
-/// the same store the fast path reads.
-struct DefaultViaRedis(RedisKvIndexerBackend);
+/// the same state the optimized path reads.
+struct DefaultViaMemory(Arc<InMemoryKvIndexerBackend>);
 
 #[tonic::async_trait]
-impl KvIndexerBackend for DefaultViaRedis {
+impl KvIndexerBackend for DefaultViaMemory {
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
@@ -650,7 +576,7 @@ impl KvIndexerBackend for DefaultViaRedis {
         self.0.match_external_kv(request).await
     }
 
-    // Delegate the component-aware read to Redis so the trait-default
+    // Delegate the component-aware read to the same backend so the trait-default
     // `match_external_kv_prefix` computes over the same placement + specs the
     // fast path sees — the parity contract covers component-aware data too.
     async fn collect_worker_prefix_inputs(
@@ -668,42 +594,10 @@ impl KvIndexerBackend for DefaultViaRedis {
     }
 }
 
-/// Two backends on one shared namespace, or `None` (skip) with no store.
-async fn shared_ns_pair(test: &str) -> Option<(RedisKvIndexerBackend, RedisKvIndexerBackend)> {
-    let ns = format!("itest:{test}:{}", nanos());
-    let connect = |ns: String| async move {
-        if let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") {
-            Some(
-                RedisKvIndexerBackend::connect_single(&url, ns)
-                    .await
-                    .expect("connect single"),
-            )
-        } else if let Ok(nodes) = std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES") {
-            let nodes: Vec<String> = nodes
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
-            Some(
-                RedisKvIndexerBackend::connect_cluster(nodes, ns)
-                    .await
-                    .expect("connect cluster"),
-            )
-        } else {
-            None
-        }
-    };
-    match (connect(ns.clone()).await, connect(ns).await) {
-        (Some(a), Some(b)) => Some((a, b)),
-        _ => {
-            require::skip(
-                test,
-                "neither KV_INDEXER_REDIS_URL nor KV_INDEXER_REDIS_CLUSTER_NODES is set",
-            );
-            None
-        }
-    }
+fn shared_state_pair() -> (Arc<InMemoryKvIndexerBackend>, DefaultViaMemory) {
+    let backend = Arc::new(InMemoryKvIndexerBackend::new());
+    let reference = DefaultViaMemory(Arc::clone(&backend));
+    (backend, reference)
 }
 
 fn prefix_req(hs: &[&str]) -> MatchExternalKvPrefixRequest {
@@ -736,10 +630,7 @@ fn report(worker: &str, addr: &str, seq: u64, hs: &[&str]) -> ApplyExternalKvBat
 
 #[tokio::test]
 async fn prefix_fast_path_matches_default_impl() {
-    let Some((fast, reference)) = shared_ns_pair("prefix_parity").await else {
-        return;
-    };
-    let reference = DefaultViaRedis(reference);
+    let (fast, reference) = shared_state_pair();
 
     // Nested prefixes (hole-free), a diverging branch, and a hole.
     fast.apply_external_kv_batch(report("w-long", "10.0.0.1:1", 1, &["a", "b", "c", "d"]))
@@ -789,9 +680,7 @@ async fn prefix_fast_path_matches_default_impl() {
 
 #[tokio::test]
 async fn prefix_first_block_miss_reads_one_block() {
-    let Some(b) = backend("prefix_first_miss").await else {
-        return;
-    };
+    let b = backend();
     // No worker holds the first queried block; the scan stops after one read.
     b.apply_external_kv_batch(report("w1", "10.0.0.1:1", 1, &["y", "z"]))
         .await
@@ -807,9 +696,7 @@ async fn prefix_first_block_miss_reads_one_block() {
 
 #[tokio::test]
 async fn prefix_max_blocks_caps_the_scan() {
-    let Some(b) = backend("prefix_max_blocks").await else {
-        return;
-    };
+    let b = backend();
     b.apply_external_kv_batch(report("w1", "10.0.0.1:1", 1, &["a", "b", "c", "d"]))
         .await
         .unwrap();
@@ -856,10 +743,7 @@ fn apply_with_spec(
 
 #[tokio::test]
 async fn component_prefix_matches_default_impl() {
-    let Some((fast, reference)) = shared_ns_pair("component_parity").await else {
-        return;
-    };
-    let reference = DefaultViaRedis(reference);
+    let (fast, reference) = shared_state_pair();
 
     // Four full blocks (50 tokens each); swa present on all but the 4th, so the
     // largest boundary with an unbroken 100-token swa window is 3.
@@ -901,9 +785,7 @@ async fn component_prefix_matches_default_impl() {
 
 #[tokio::test]
 async fn partial_eviction_replace_shrinks_component_set() {
-    let Some(b) = backend("component_replace").await else {
-        return;
-    };
+    let b = backend();
     // Store full+swa, then restate to full-only (partial swa eviction) via a
     // REPLACE snapshot for the same (hash, tier). No BlockRemoved is involved.
     b.apply_external_kv_batch(apply_with_spec(
@@ -947,13 +829,23 @@ async fn partial_eviction_replace_shrinks_component_set() {
         .await
         .unwrap();
     assert_eq!(after.best_prefix_blocks, 1);
+
+    let snapshot = b
+        .match_external_kv(match_req(&["a", "b"], false))
+        .await
+        .unwrap();
+    let tier = &snapshot.matches[0].hashes_by_tier[0];
+    assert_eq!(tier.hashes, vec!["a", "b"]);
+    assert_eq!(
+        tier.component_masks,
+        vec![COMPONENT_FULL | COMPONENT_SWA, COMPONENT_FULL]
+    );
+    assert_eq!(tier.block_sizes, vec![80, 80]);
 }
 
 #[tokio::test]
 async fn component_aware_worker_without_spec_is_excluded() {
-    let Some(b) = backend("no_spec_excluded").await else {
-        return;
-    };
+    let b = backend();
     // Report component-aware placement but never send a spec: the worker cannot
     // be interpreted and must be excluded (NoSignal-safe), never over-reported.
     b.apply_external_kv_batch(apply_req(
@@ -979,9 +871,7 @@ async fn component_aware_worker_without_spec_is_excluded() {
 
 #[tokio::test]
 async fn duplicate_hash_in_one_report_keeps_last_snapshot() {
-    let Some(b) = backend("dedup_last_write").await else {
-        return;
-    };
+    let b = backend();
     // A single REPORT action naming the same hash twice (a coalesced
     // store+restate): the LAST snapshot must win deterministically, never a race.
     b.apply_external_kv_batch(apply_with_spec(
@@ -1010,9 +900,7 @@ async fn duplicate_hash_in_one_report_keeps_last_snapshot() {
 
 #[tokio::test]
 async fn absent_spec_batch_clears_stored_spec() {
-    let Some(b) = backend("spec_clear").await else {
-        return;
-    };
+    let b = backend();
     // First a component-aware batch establishes a spec + a reusable block.
     b.apply_external_kv_batch(apply_with_spec(
         "w1",

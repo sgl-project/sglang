@@ -3,8 +3,10 @@
 
 use std::collections::HashMap;
 
+use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
+use crate::admission::{reject_if_deadline_passed, RejectionLog};
 use crate::pb::kv_indexer_server::KvIndexer;
 use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
@@ -13,18 +15,21 @@ use crate::pb::{
     MatchExternalKvRequest, MatchExternalKvResponse, TierType, WorkerCacheSpec,
 };
 
-/// Protocol-level resource bounds. The Redis backend additionally chunks its
-/// fan-out, but rejecting oversized requests here prevents any backend from
-/// allocating or scheduling work proportional to an unbounded repeated field.
+/// Protocol-level resource bounds, enforced before a backend sees the request so
+/// no caller can make one allocate or schedule work proportional to an unbounded
+/// repeated field.
 const MAX_HASHES_PER_REQUEST: usize = 16_384;
 const MAX_ACTIONS_PER_BATCH: usize = 256;
+pub const DEFAULT_PREFIX_QUERY_MAX_INFLIGHT: usize = 32;
+
+static OVERLOAD_LOG: RejectionLog = RejectionLog::new();
 
 /// Storage backend for the indexer. Deliberately narrow: every mutation flows
 /// through `apply_external_kv_batch`, preserving one ordered write path.
 ///
-/// Async because real backends (e.g. Redis) do network IO; the trait is made
-/// dyn-safe via `#[tonic::async_trait]` so the server can select a backend at
-/// runtime and hold it as `Arc<dyn KvIndexerBackend>`.
+/// Async so a backend that does IO fits without reshaping the trait, even though
+/// this build's is process-local. Made dyn-safe via `#[tonic::async_trait]` so the
+/// server can select a backend at runtime and hold it as `Arc<dyn KvIndexerBackend>`.
 #[tonic::async_trait]
 pub trait KvIndexerBackend: Send + Sync + 'static {
     /// Applies a whole SGLang KVEventBatch. The actions are pre-validated and
@@ -137,6 +142,7 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
 #[derive(Debug)]
 pub struct KvIndexerService<B> {
     backend: B,
+    prefix_query_semaphore: Semaphore,
 }
 
 impl<B> KvIndexerService<B>
@@ -144,7 +150,18 @@ where
     B: KvIndexerBackend,
 {
     pub fn new(backend: B) -> Self {
-        Self { backend }
+        Self::with_prefix_query_max_inflight(backend, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT)
+    }
+
+    pub fn with_prefix_query_max_inflight(backend: B, max_inflight: usize) -> Self {
+        assert!(
+            max_inflight > 0,
+            "prefix query max inflight must be greater than zero"
+        );
+        Self {
+            backend,
+            prefix_query_semaphore: Semaphore::new(max_inflight),
+        }
     }
 }
 
@@ -167,8 +184,22 @@ where
         &self,
         request: Request<MatchExternalKvPrefixRequest>,
     ) -> Result<Response<MatchExternalKvPrefixResponse>, Status> {
-        let request = request.into_inner();
+        let (metadata, extensions, request) = request.into_parts();
+        // Before any work: an expired query must not spend the capacity the rest
+        // of the backlog needs to drain.
+        reject_if_deadline_passed(&metadata, &extensions)?;
         validate_hashes(&request.hashes)?;
+        // Bounds a backend that holds this permit across IO; see `admission` for
+        // why that cannot observe a process-local one.
+        let _permit = self.prefix_query_semaphore.try_acquire().map_err(|_| {
+            if let Some(rejected_total) = OVERLOAD_LOG.record() {
+                tracing::warn!(
+                    rejected_total,
+                    "rejecting prefix query: too many in-flight prefix queries"
+                );
+            }
+            Status::resource_exhausted("too many in-flight prefix queries")
+        })?;
         let response = self.backend.match_external_kv_prefix(request).await?;
         Ok(Response::new(response))
     }
@@ -503,9 +534,9 @@ fn component_available(
 }
 
 /// Sorts `(worker_id, address, prefix)` entries by prefix descending and builds
-/// the response. Shared so the Redis fast path, which computes prefixes during
-/// its scan, produces byte-identical shape to the default implementation.
-pub(crate) fn assemble_prefix_response(
+/// the response, so `best_prefix_blocks` and the match order are derived in one
+/// place rather than per caller.
+fn assemble_prefix_response(
     mut entries: Vec<(String, String, u32)>,
     blocks_read: u32,
 ) -> MatchExternalKvPrefixResponse {
@@ -531,6 +562,164 @@ pub(crate) fn assemble_prefix_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use tokio::time::{timeout, Duration};
+
+    #[derive(Clone)]
+    struct BlockingPrefixBackend {
+        entered: Arc<AtomicUsize>,
+        release: Arc<Semaphore>,
+    }
+
+    #[tonic::async_trait]
+    impl KvIndexerBackend for BlockingPrefixBackend {
+        async fn apply_external_kv_batch(
+            &self,
+            _request: ApplyExternalKvBatchRequest,
+        ) -> Result<ApplyExternalKvBatchResponse, Status> {
+            Ok(ApplyExternalKvBatchResponse::default())
+        }
+
+        async fn match_external_kv(
+            &self,
+            _request: MatchExternalKvRequest,
+        ) -> Result<MatchExternalKvResponse, Status> {
+            Ok(MatchExternalKvResponse::default())
+        }
+
+        async fn match_external_kv_prefix(
+            &self,
+            _request: MatchExternalKvPrefixRequest,
+        ) -> Result<MatchExternalKvPrefixResponse, Status> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let _permit = self
+                .release
+                .acquire()
+                .await
+                .expect("release semaphore closed");
+            Ok(MatchExternalKvPrefixResponse::default())
+        }
+
+        async fn get_external_kv_hit_counts(
+            &self,
+            _request: GetExternalKvHitCountsRequest,
+        ) -> Result<GetExternalKvHitCountsResponse, Status> {
+            Ok(GetExternalKvHitCountsResponse::default())
+        }
+    }
+
+    fn prefix_request() -> Request<MatchExternalKvPrefixRequest> {
+        Request::new(MatchExternalKvPrefixRequest {
+            hashes: vec!["a".to_string()],
+            max_blocks: 0,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prefix_query_limit_rejects_without_queueing() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let backend = BlockingPrefixBackend {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let service = Arc::new(KvIndexerService::with_prefix_query_max_inflight(backend, 2));
+
+        let first = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                KvIndexer::match_external_kv_prefix(service.as_ref(), prefix_request()).await
+            })
+        };
+        let second = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                KvIndexer::match_external_kv_prefix(service.as_ref(), prefix_request()).await
+            })
+        };
+
+        timeout(Duration::from_secs(1), async {
+            while entered.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("two prefix queries should enter the backend");
+
+        let rejected = KvIndexer::match_external_kv_prefix(service.as_ref(), prefix_request())
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(entered.load(Ordering::SeqCst), 2);
+
+        release.add_permits(2);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+    }
+
+    /// Runs the arrival stamp, waits out `queued_for` to stand in for the time a
+    /// dispatched request spends waiting in the runtime, then serves it.
+    async fn serve_after_queueing(
+        service: &KvIndexerService<BlockingPrefixBackend>,
+        caller_deadline: Duration,
+        queued_for: Duration,
+    ) -> Result<Response<MatchExternalKvPrefixResponse>, Status> {
+        let mut arriving = Request::new(());
+        arriving.set_timeout(caller_deadline);
+        let (metadata, extensions, ()) = crate::admission::stamp_arrival(arriving)
+            .expect("arrival stamp never rejects")
+            .into_parts();
+
+        tokio::time::sleep(queued_for).await;
+
+        let request = Request::from_parts(
+            metadata,
+            extensions,
+            MatchExternalKvPrefixRequest {
+                hashes: vec!["a".to_string()],
+                max_blocks: 0,
+            },
+        );
+        KvIndexer::match_external_kv_prefix(service, request).await
+    }
+
+    fn non_blocking_backend(entered: &Arc<AtomicUsize>) -> BlockingPrefixBackend {
+        BlockingPrefixBackend {
+            entered: Arc::clone(entered),
+            release: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_that_outlived_its_caller_never_reaches_the_backend() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let service = KvIndexerService::new(non_blocking_backend(&entered));
+
+        let status = serve_after_queueing(
+            &service,
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn query_still_inside_its_deadline_is_served() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let service = KvIndexerService::new(non_blocking_backend(&entered));
+
+        serve_after_queueing(&service, Duration::from_secs(30), Duration::from_millis(10))
+            .await
+            .expect("a query within its deadline must still be answered");
+
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+    }
 
     fn hbm() -> i32 {
         crate::pb::TierType::TierHbm as i32

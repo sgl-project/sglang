@@ -108,6 +108,10 @@ message ApplyExternalKvBatchResponse {
 message TierHashes {
   TierType tier = 1;
   repeated string hashes = 2;
+  // Diagnostic snapshots aligned with `hashes`. Empty only for backends that
+  // cannot expose component detail.
+  repeated uint32 component_masks = 3;
+  repeated uint32 block_sizes = 4;
 }
 
 message ExternalKvNodeMatch {

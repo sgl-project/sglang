@@ -183,11 +183,13 @@ impl Policy for CacheAwareZmqPolicy {
         if self.is_imbalanced(workers) {
             return Self::pick_min_load(workers);
         }
-        if let Some(worker) = ctx
-            .external_prefix()
-            .and_then(|signal| self.select_external(workers, ctx, signal))
-        {
-            return Some(worker);
+
+        // An external signal is authoritative: an empty/unusable result
+        // degrades only to min-load and never consults the local radix tree.
+        if let Some(signal) = ctx.external_prefix() {
+            return self
+                .select_external(workers, ctx, signal)
+                .or_else(|| Self::pick_min_load(workers));
         }
 
         // 2. Routing tokens. Prefer the ids computed once at ingress; fall
@@ -436,25 +438,27 @@ mod tests {
     }
 
     #[test]
-    fn external_no_signal_falls_back_to_existing_policy() {
-        let policy = CacheAwareZmqPolicy::new(
-            cfg_default(),
-            Arc::new(HashTree::new()),
-            tokenizer_registry_with_tiny(),
-            oracle_for_tests(4),
-        );
+    fn external_empty_result_uses_min_load_without_local_tree() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+
+        let policy = CacheAwareZmqPolicy::new(cfg_default(), tree, registry, oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         let _load = w0.load_guard();
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
         let signal = crate::policies::ExternalPrefixSignal {
-            outcome: sgl_kv_indexer::PrefixOutcome::NoSignal(
-                sgl_kv_indexer::NoSignalReason::Timeout,
-            ),
+            outcome: sgl_kv_indexer::PrefixOutcome::Empty,
             query_blocks: 4,
         };
         let model = ModelId("tiny".into());
-        let ctx = SelectionContext::new(&model, None).with_external_prefix(Some(&signal));
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body)).with_external_prefix(Some(&signal));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, w1.url);
     }

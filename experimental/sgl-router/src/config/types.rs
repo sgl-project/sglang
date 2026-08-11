@@ -157,6 +157,14 @@ pub struct ModelConfig {
     pub sticky: Option<StickyConfig>,
 }
 
+/// External KV Indexer client settings.
+#[derive(Debug, Clone)]
+pub struct KvIndexerEndpointConfig {
+    pub url: String,
+    pub query_timeout_ms: u64,
+    pub query_max_inflight: usize,
+}
+
 /// Per-model cache-aware tuning.
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
@@ -174,8 +182,9 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
-    /// Optional external KV indexer gRPC endpoint. The local ZMQ index remains active.
-    pub kv_indexer_endpoint: Option<String>,
+    /// Optional external KV Indexer client configuration. When configured, it
+    /// replaces the local ZMQ radix tree as the cache signal.
+    pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
 impl Default for CacheAwareConfig {

@@ -12,20 +12,19 @@ pub mod pb {
     tonic::include_proto!("kv_indexer.v1");
 }
 
+mod admission;
+mod memory_backend;
 mod service;
 mod shutdown;
 
-#[cfg(feature = "redis-backend")]
-pub mod redis_backend;
-
+pub use admission::stamp_arrival;
 pub use client::{
-    GrpcPrefixIndex, NoSignalReason, PrefixIndex, PrefixIndexConfig, PrefixMatch, PrefixOutcome,
+    GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig, PrefixIndexError, PrefixMatch, PrefixOutcome,
+    DEFAULT_QUERY_MAX_INFLIGHT,
 };
+pub use memory_backend::InMemoryKvIndexerBackend;
 pub use service::{
     component_bit, BlockComponents, KvIndexerBackend, KvIndexerService, WorkerPrefixInput,
-    COMPONENT_FULL, COMPONENT_MAMBA, COMPONENT_SWA,
+    COMPONENT_FULL, COMPONENT_MAMBA, COMPONENT_SWA, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT,
 };
 pub use shutdown::shutdown_signal;
-
-#[cfg(feature = "redis-backend")]
-pub use redis_backend::RedisKvIndexerBackend;

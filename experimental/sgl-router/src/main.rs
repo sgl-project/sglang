@@ -103,10 +103,13 @@ async fn main() -> Result<()> {
         .cache_aware
         .as_ref()
         .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
-        .map(|endpoint| {
-            Arc::new(sgl_kv_indexer::GrpcPrefixIndex::new(
-                sgl_kv_indexer::PrefixIndexConfig::new(endpoint.clone()),
-            ))
+        .map(|indexer| {
+            let config = sgl_kv_indexer::PrefixIndexConfig {
+                endpoint: indexer.url.clone(),
+                query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
+                max_inflight: indexer.query_max_inflight,
+            };
+            Arc::new(sgl_kv_indexer::GrpcPrefixIndex::new(config))
         });
 
     // Build the KV-event index up front so the cache-aware-zmq policy can

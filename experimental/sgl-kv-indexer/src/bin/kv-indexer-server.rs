@@ -1,95 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::{env, io};
 
 use sgl_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
-use sgl_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
-    GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, MatchExternalKvRequest,
-    MatchExternalKvResponse,
+use sgl_kv_indexer::{
+    shutdown_signal, stamp_arrival, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService,
+    DEFAULT_PREFIX_QUERY_MAX_INFLIGHT,
 };
-use sgl_kv_indexer::{shutdown_signal, KvIndexerBackend, KvIndexerService};
 use tonic::transport::Server;
-use tonic::Status;
 use tracing::info;
 
-/// A small stateful backend for joint debugging: it keeps the live set of
-/// (tier, hash) blocks in memory and logs running totals on every apply, so the
-/// indexer side of the SGLang -> bridge -> indexer chain is observable.
-#[derive(Default)]
-struct LoggingKvIndexerBackend {
-    live: Mutex<HashSet<(i32, String)>>,
-}
-
-impl LoggingKvIndexerBackend {
-    fn total(&self) -> usize {
-        self.live.lock().unwrap().len()
-    }
-}
-
-#[tonic::async_trait]
-impl KvIndexerBackend for LoggingKvIndexerBackend {
-    async fn apply_external_kv_batch(
-        &self,
-        request: ApplyExternalKvBatchRequest,
-    ) -> Result<ApplyExternalKvBatchResponse, Status> {
-        let (mut reported, mut revoked, mut cleared) = (0usize, 0usize, 0usize);
-        {
-            let mut live = self.live.lock().unwrap();
-            for action in &request.actions {
-                match ExternalKvActionType::try_from(action.r#type) {
-                    Ok(ExternalKvActionType::ActionReport) => {
-                        for hash in &action.hashes {
-                            if live.insert((action.tier, hash.clone())) {
-                                reported += 1;
-                            }
-                        }
-                    }
-                    Ok(ExternalKvActionType::ActionRevoke) => {
-                        for hash in &action.hashes {
-                            if live.remove(&(action.tier, hash.clone())) {
-                                revoked += 1;
-                            }
-                        }
-                    }
-                    Ok(ExternalKvActionType::ActionClearAllAtTier) => {
-                        let before = live.len();
-                        live.retain(|(tier, _)| *tier != action.tier);
-                        cleared += before - live.len();
-                    }
-                    _ => {}
-                }
-            }
-        }
-        info!(
-            worker = %request.worker_id,
-            seq = request.seq,
-            reported,
-            revoked,
-            cleared,
-            live_total = self.total(),
-            "APPLY external kv batch"
-        );
-        Ok(ApplyExternalKvBatchResponse {})
-    }
-
-    async fn match_external_kv(
-        &self,
-        _request: MatchExternalKvRequest,
-    ) -> Result<MatchExternalKvResponse, Status> {
-        Ok(MatchExternalKvResponse { matches: vec![] })
-    }
-
-    async fn get_external_kv_hit_counts(
-        &self,
-        _request: GetExternalKvHitCountsRequest,
-    ) -> Result<GetExternalKvHitCountsResponse, Status> {
-        Ok(GetExternalKvHitCountsResponse { entries: vec![] })
-    }
-}
+const PREFIX_QUERY_MAX_INFLIGHT_ENV: &str = "KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -102,11 +26,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = std::env::var("KV_INDEXER_LISTEN_ADDR")
         .unwrap_or_else(|_| "[::1]:50051".to_string())
         .parse::<SocketAddr>()?;
+    let prefix_query_max_inflight = prefix_query_max_inflight_from_env()?;
 
-    let backend = select_backend().await?;
-    let service = KvIndexerServer::new(KvIndexerService::new(backend));
+    let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
+    // The interceptor timestamps each request on the connection task, before its
+    // own task is queued, which is what lets the query path shed work whose
+    // caller deadline expired while it waited.
+    let service = KvIndexerServer::with_interceptor(
+        KvIndexerService::with_prefix_query_max_inflight(backend, prefix_query_max_inflight),
+        stamp_arrival,
+    );
 
-    info!(%addr, "starting SGLang KV Indexer gRPC server");
+    info!(
+        %addr,
+        prefix_query_max_inflight,
+        "starting single-server in-memory SGLang KV Indexer"
+    );
     Server::builder()
         .add_service(service)
         .serve_with_shutdown(addr, shutdown_signal())
@@ -115,45 +50,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-/// Selects the storage backend from `KV_INDEXER_BACKEND`:
-///   * `logging` — in-memory, logs running totals; for joint debugging.
-///   * `redis` — the Redis backend (requires the `redis-backend` cargo feature).
-///
-/// The variable is required: silently defaulting to a fake backend makes a
-/// misconfigured production process look healthy while returning no real matches.
-/// The Redis backend lives behind the feature so the default build stays light;
-/// requesting `redis` without it is a loud startup error rather than a silent
-/// fallback.
-async fn select_backend(
-) -> Result<Arc<dyn KvIndexerBackend>, Box<dyn std::error::Error + Send + Sync>> {
-    let backend = match std::env::var("KV_INDEXER_BACKEND") {
-        Ok(value) => value,
-        Err(_) => {
-            return Err(
-                "KV_INDEXER_BACKEND is required; set it explicitly to redis or logging".into(),
-            )
-        }
-    };
-    match backend.as_str() {
-        "logging" => {
-            info!("using logging backend");
-            Ok(Arc::new(LoggingKvIndexerBackend::default()))
-        }
-        "redis" => {
-            #[cfg(feature = "redis-backend")]
-            {
-                info!("using redis backend");
-                let backend = sgl_kv_indexer::RedisKvIndexerBackend::from_env().await?;
-                Ok(Arc::new(backend))
-            }
-            #[cfg(not(feature = "redis-backend"))]
-            {
-                Err(
-                    "KV_INDEXER_BACKEND=redis requires building with --features redis-backend"
-                        .into(),
-                )
-            }
-        }
-        other => Err(format!("unknown KV_INDEXER_BACKEND: {other}").into()),
+fn prefix_query_max_inflight_from_env() -> io::Result<usize> {
+    match env::var(PREFIX_QUERY_MAX_INFLIGHT_ENV) {
+        Ok(raw) => parse_prefix_query_max_inflight(&raw),
+        Err(env::VarError::NotPresent) => Ok(DEFAULT_PREFIX_QUERY_MAX_INFLIGHT),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{PREFIX_QUERY_MAX_INFLIGHT_ENV} must be valid UTF-8"),
+        )),
+    }
+}
+
+fn parse_prefix_query_max_inflight(raw: &str) -> io::Result<usize> {
+    let value = raw.parse::<usize>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{PREFIX_QUERY_MAX_INFLIGHT_ENV} must be a positive integer, got {raw:?}"),
+        )
+    })?;
+    if value == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{PREFIX_QUERY_MAX_INFLIGHT_ENV} must be greater than zero"),
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_positive_prefix_query_limit() {
+        assert_eq!(parse_prefix_query_max_inflight("64").unwrap(), 64);
+    }
+
+    #[test]
+    fn rejects_invalid_prefix_query_limit() {
+        assert!(parse_prefix_query_max_inflight("0").is_err());
+        assert!(parse_prefix_query_max_inflight("many").is_err());
     }
 }
