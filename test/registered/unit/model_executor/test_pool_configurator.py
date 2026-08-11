@@ -737,7 +737,7 @@ class TestDflashDraftKvBudget(unittest.TestCase):
 
         self.assertLess(_tokens(10240), _tokens(None))
 
-    def test_dsv4_budget_uses_resolved_dspark_stage_count(self):
+    def test_dsv4_budget_prices_dspark_as_packed_swa_only(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         mr = _make_model_runner(
@@ -764,7 +764,11 @@ class TestDflashDraftKvBudget(unittest.TestCase):
             configurator = DSV4PoolConfigurator(mr)
 
         target_only_bytes = configurator._get_bytes_per_full_token()
-        self.assertEqual(configurator.bytes_per_full_token, target_only_bytes * 2)
+        draft_swa_bytes = 0.8 * (448 + 64 * 2 + 8) * 3
+        self.assertEqual(
+            configurator.bytes_per_full_token,
+            target_only_bytes + draft_swa_bytes,
+        )
 
 
 if __name__ == "__main__":

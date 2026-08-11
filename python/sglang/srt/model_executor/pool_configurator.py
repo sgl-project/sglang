@@ -647,6 +647,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
+        self.swa_kv_bytes_per_token = (
+            self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[
@@ -700,17 +703,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
-            # Reserve memory for the speculative draft worker by inflating
-            # per-token bytes by (target+draft)/target. Equivalent to dflash's
-            # scale_kv_cell_size_per_token_for_dflash but applied to
-            # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
+            # DSV4 draft stages allocate only the packed SWA pool. Do not price
+            # them as average target layers, which also include C4/C128,
+            # indexer, and compression-state storage.
             draft_layers = (
                 kvc.spec_aux_config.dflash_draft_num_layers
                 or kvc.spec_aux_config.eagle_draft_num_layers
                 or 1
             )
-            target_layers = self.num_layers_total
-            self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
+            self.bytes_per_full_token += (
+                self.swa_ratio * self.swa_kv_bytes_per_token * draft_layers
+            )
 
         # Online c128 keeps a single in-progress (max, sum, kv) state per index
         # and assumes a strict forward-only schedule. Speculative decode (MTP)
@@ -763,7 +766,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        kv_bytes = self.swa_kv_bytes_per_token
 
         quant_block_size = 128
         indexer_bytes = (
