@@ -960,7 +960,7 @@ class AiterAttnBackend(AttentionBackend):
         """
         from aiter.ops.triton.attention.mla import mla_decode_fwd
 
-        from sglang.kernels.ops.attention.dcp_mla_reduce import (
+        from sglang.kernels.ops.attention.dcp_kernels import (
             dcp_mla_reduce,
         )
 
@@ -1053,7 +1053,7 @@ class AiterAttnBackend(AttentionBackend):
         """
         from aiter.ops.triton.attention.mla import mla_decode_fwd
 
-        from sglang.kernels.ops.attention.dcp_mla_reduce import (
+        from sglang.kernels.ops.attention.dcp_kernels import (
             dcp_mla_reduce,
         )
 
@@ -1134,7 +1134,7 @@ class AiterAttnBackend(AttentionBackend):
         """
         from aiter.ops.triton.attention.mla import mla_prefill_fwd
 
-        from sglang.kernels.ops.attention.dcp_mla_reduce import (
+        from sglang.kernels.ops.attention.dcp_kernels import (
             pack_dcp_kv_into_pages,
         )
 
@@ -1947,7 +1947,7 @@ class AiterAttnBackend(AttentionBackend):
         path: this runs OUT of the graph, so a freshly allocated tensor would be
         invisible to the captured kernels, which keep the capture-time pointer.
         """
-        from sglang.kernels.ops.attention.dcp_mla_reduce import (
+        from sglang.kernels.ops.attention.dcp_kernels import (
             build_dcp_page_table,
         )
 
