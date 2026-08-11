@@ -250,6 +250,47 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_clear_starts_a_new_singleflight_generation(self):
+        async def run():
+            cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def compute_old():
+                started.set()
+                await release.wait()
+                return b"old"
+
+            async def compute_new():
+                return b"new"
+
+            old_task = asyncio.create_task(cache.get_or_compute("key", compute_old))
+            await started.wait()
+            cache.clear()
+            new_result = await cache.get_or_compute("key", compute_new)
+            release.set()
+            old_result = await old_task
+
+            self.assertEqual(old_result.value, b"old")
+            self.assertEqual(new_result.value, b"new")
+            self.assertEqual(cache.get("key"), b"new")
+
+        asyncio.run(run())
+
+    def test_clear_starts_a_new_reservation_generation(self):
+        cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
+        old = cache.reserve_many(["key"])[0]
+        cache.clear()
+        new = cache.reserve_many(["key"])[0]
+
+        self.assertTrue(old.owner)
+        self.assertTrue(new.owner)
+        self.assertIsNot(old.future, new.future)
+        cache.fulfill(old, b"old")
+        self.assertNotIn("key", cache)
+        cache.fulfill(new, b"new")
+        self.assertEqual(cache.get("key"), b"new")
+
 
 class TestMultimodalEmbeddingCacheLease(unittest.TestCase):
     @staticmethod
