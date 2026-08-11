@@ -122,7 +122,7 @@ SGLANG_CACHE_DIT_FN=2 SGLANG_CACHE_DIT_BN=1 SGLANG_CACHE_DIT_WARMUP=4 SGLANG_CAC
 SGLANG_CACHE_DIT_MC=4 SGLANG_CACHE_DIT_TAYLORSEER=true SGLANG_CACHE_DIT_TS_ORDER=2 \
 SGLANG_CACHE_DIT_ENABLED=true sglang generate --model-path /path/to/zai-org/GLM-Image/ \
 --prompt "A curious raccoon" --height 1920 --width 1088 --num-inference-steps 50 --num-gpus 4 \
---sp-degree 4 --srt-encoder-url "http://${HOST}:${PORT}" --warmup
+--sp-degree 4 --srt-encoder-url "http://${HOST}:${PORT}" --warmup-mode request
 ```
 Result:
 ```bash

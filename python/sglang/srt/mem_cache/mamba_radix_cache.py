@@ -50,7 +50,9 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    mamba_cache_chunk_size,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -450,7 +452,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
-        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
 
         self.page_size = params.page_size
         self.disable = params.disable
