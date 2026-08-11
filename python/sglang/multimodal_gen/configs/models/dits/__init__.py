@@ -8,6 +8,9 @@ from sglang.multimodal_gen.configs.models.dits.ideogram import (
     Ideogram4DistilledDiTConfig,
     Ideogram4DiTConfig,
 )
+from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
+    LingBotVideoMoEConfig,
+)
 from sglang.multimodal_gen.configs.models.dits.lingbot_world import (
     LingBotWorldVideoConfig,
 )
@@ -27,6 +30,7 @@ __all__ = [
     "Ideogram4DiTConfig",
     "Ideogram4DistilledDiTConfig",
     "LingBotWorldVideoConfig",
+    "LingBotVideoMoEConfig",
     "LongLive2VideoConfig",
     "MiniMaxH3DiTConfig",
     "WanVideoConfig",

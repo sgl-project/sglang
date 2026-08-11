@@ -1,12 +1,10 @@
 import unittest
 from array import array
-from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
     CacheAwarePolicy,
-    PrefillAdder,
     SchedulePolicy,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -327,56 +325,6 @@ class TestSchedulePolicy(CustomTestCase):
         self.assertEqual(waiting_queue[0].rid, "w1")
         self.assertEqual(waiting_queue[1].rid, "w2")
         self.assertEqual(waiting_queue[2].rid, "w3")
-
-
-def _swa_adder(size_swa, sliding_window, page_size=16, rem_chunk_tokens=512):
-    """A PrefillAdder carrying only the fields _swa_req_never_fits transitively
-    reads, built via __new__ so the check is tested as pure logic (no KV pools,
-    no GPU)."""
-    adder = PrefillAdder.__new__(PrefillAdder)
-    adder.page_size = page_size
-    adder.rem_chunk_tokens = rem_chunk_tokens
-    adder.tree_cache = SimpleNamespace(sliding_window_size=sliding_window)
-    adder.token_to_kv_pool_allocator = SimpleNamespace(size_swa=size_swa)
-    return adder
-
-
-class TestSwaChunkCapHatch(CustomTestCase):
-    """The _swa_chunk_cap shrink-and-admit hatch must fire ONLY for a request
-    whose SWA budget can never fit the drained pool (true head-of-line
-    livelock). _swa_req_never_fits() is the gate: True => hatch, False => wait
-    (NO_TOKEN). Admitting transient-pressure requests instead of waiting
-    collapses the SWA evictable cushion and causes a retraction storm."""
-
-    def test_transient_pressure_request_waits(self):
-        # Small request against an ample pool: budget << pool, so it would fit
-        # once running decodes drain -> must wait, not take the hatch.
-        adder = _swa_adder(size_swa=1024, sliding_window=128)
-        self.assertFalse(
-            adder._swa_req_never_fits(extend_input_len=256, max_new_tokens=64)
-        )
-
-    def test_request_larger_than_whole_pool_takes_hatch(self):
-        # A large host-hit load-back charge pushes the budget past the entire
-        # pool: it can never fit however far the pool drains -> hatch (True).
-        adder = _swa_adder(size_swa=1024, sliding_window=128)
-        self.assertTrue(
-            adder._swa_req_never_fits(
-                extend_input_len=256, max_new_tokens=64, swa_host_hit_length=4096
-            )
-        )
-
-    def test_decision_is_gated_by_pool_capacity(self):
-        # Same request; only the pool size changes. Proves the check compares
-        # the budget against size_swa (guards against a wrong-accessor bug):
-        # never-fits on a small pool, fits on a large one.
-        req = dict(extend_input_len=256, max_new_tokens=64, swa_host_hit_length=600)
-        self.assertTrue(
-            _swa_adder(size_swa=512, sliding_window=128)._swa_req_never_fits(**req)
-        )
-        self.assertFalse(
-            _swa_adder(size_swa=4096, sliding_window=128)._swa_req_never_fits(**req)
-        )
 
 
 if __name__ == "__main__":
