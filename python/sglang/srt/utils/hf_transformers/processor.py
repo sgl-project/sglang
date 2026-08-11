@@ -48,6 +48,7 @@ from .tokenizer import (
     _TOKENIZERS_BACKEND,
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
+    get_tokenizer,
 )
 
 _IMAGE_PROCESSOR_BACKENDS = {"auto", "torchvision", "pil"}
@@ -344,13 +345,30 @@ def get_processor(
     ):
         processor = wrap_as_pixtral(processor, config)
 
-    tokenizer = get_tokenizer_from_processor(processor)
+    if not isinstance(processor, PreTrainedTokenizerBase) and not hasattr(
+        processor, "tokenizer"
+    ):
+        # e.g. InternVL2.5's tokenizer ships as separate remote code.
+        logger.warning(
+            "Processor %s for %s has no tokenizer attribute, loading tokenizer "
+            "separately",
+            type(processor).__name__,
+            tokenizer_name,
+        )
+        tokenizer = get_tokenizer(
+            tokenizer_name,
+            tokenizer_mode=tokenizer_mode,
+            trust_remote_code=trust_remote_code,
+            tokenizer_revision=revision,
+            tokenizer_backend=tokenizer_backend,
+        )
+        processor.tokenizer = tokenizer
+    else:
+        tokenizer = get_tokenizer_from_processor(processor)
 
     # AutoProcessor may internally create a TokenizersBackend tokenizer
     # (same issue as get_tokenizer). Replace it with a properly loaded one.
     if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
-        from .tokenizer import get_tokenizer
-
         logger.warning(
             "Processor tokenizer for %s is TokenizersBackend, "
             "reloading via get_tokenizer",

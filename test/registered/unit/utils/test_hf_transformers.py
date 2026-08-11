@@ -137,6 +137,33 @@ class TestGetProcessor(unittest.TestCase):
             revision=None,
         )
 
+    def test_loads_tokenizer_separately_for_image_only_processor(self):
+        """Regression for #32169: an AutoProcessor with no .tokenizer (e.g. InternVL2.5's image-only processor) must not raise AttributeError."""
+        config = SimpleNamespace(model_type="internvl_chat", auto_map={})
+        image_only_processor = MagicMock(spec=BaseImageProcessor)
+        fake_tokenizer = MagicMock()
+        fake_tokenizer.chat_template = "template"
+
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.return_value = image_only_processor
+        get_tokenizer_mock = MagicMock(return_value=fake_tokenizer)
+
+        self.assertFalse(hasattr(image_only_processor, "tokenizer"))
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+            get_tokenizer=get_tokenizer_mock,
+        ):
+            processor = processor_utils.get_processor("OpenGVLab/InternVL2_5-2B")
+
+        get_tokenizer_mock.assert_called_once()
+        self.assertIs(processor, image_only_processor)
+        self.assertIs(processor.tokenizer, fake_tokenizer)
+
 
 # ---------------------------------------------------------------------------
 # _patch_image_processor_kwargs
