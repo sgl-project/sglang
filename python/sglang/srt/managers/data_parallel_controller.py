@@ -43,7 +43,10 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
     wrap_as_pickle,
 )
-from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
+from sglang.srt.managers.load_snapshot import (
+    create_load_snapshot_reader,
+    is_load_aware_method,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -163,13 +166,8 @@ class DataParallelController:
             LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
-        self.refresh_load_budget_on_dispatch = self.load_balance_method in (
-            LoadBalanceMethod.TOTAL_REQUESTS,
-            LoadBalanceMethod.TOTAL_TOKENS,
-            # PREFIX_AFFINITY's overload guard compares per-rank load against the
-            # fleet average, so it needs the same fresh snapshots the load-aware
-            # methods rely on.
-            LoadBalanceMethod.PREFIX_AFFINITY,
+        self.refresh_load_budget_on_dispatch = is_load_aware_method(
+            self.load_balance_method.name
         )
 
         # prefix_affinity routing config (only consulted when that method is active).
