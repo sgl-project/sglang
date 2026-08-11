@@ -391,9 +391,7 @@ class EagerRunner(BaseRunner):
             # Mirror DeepseekV4ForCausalLM.forward: drop pre_hc_head when
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
-                logits_kwargs["hidden_states_before_norm"] = (
-                    hidden_states_before_norm
-                )
+                logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
