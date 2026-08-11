@@ -134,7 +134,6 @@ class _MooncakeEPDispatcherImpl:
         params_dtype: torch.dtype,
         return_recv_hook: bool,
         deepep_mode: DeepEPMode,
-        num_trailing_shared_slots: int,
     ):
         try:
             from mooncake.mooncake_ep_buffer import Buffer  # noqa: F401
@@ -152,7 +151,6 @@ class _MooncakeEPDispatcherImpl:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.return_recv_hook = return_recv_hook
-        self.num_trailing_shared_slots = num_trailing_shared_slots
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
@@ -208,8 +206,7 @@ class _MooncakeEPDispatcherImpl:
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            masked_m,
-            num_trailing_shared_slots=self.num_trailing_shared_slots,
+            masked_m
         )
 
         if isinstance(hidden_states, tuple):
@@ -326,8 +323,6 @@ class MooncakeEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
-        *,
-        num_trailing_shared_slots: int,
     ):
         super().__init__()
 
@@ -344,7 +339,6 @@ class MooncakeEPDispatcher(BaseDispatcher):
                 params_dtype=params_dtype,
                 return_recv_hook=return_recv_hook,
                 deepep_mode=deepep_mode,
-                num_trailing_shared_slots=num_trailing_shared_slots,
             )
         if self.deepep_mode.enable_normal():
             raise NotImplementedError
