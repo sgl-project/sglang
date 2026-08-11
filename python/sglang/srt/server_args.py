@@ -3892,11 +3892,11 @@ class ServerArgs:
         if self.dcp_size > 1 and is_hip():
             from sglang.srt.arg_groups.overrides import attention_backends_of
 
-            _, decode_backend = attention_backends_of(self)
+            prefill_backend, decode_backend = attention_backends_of(self)
             if decode_backend == "aiter":
-                self._validate_aiter_mla_dcp()
+                self._validate_aiter_mla_dcp(prefill_backend=prefill_backend)
 
-    def _validate_aiter_mla_dcp(self):
+    def _validate_aiter_mla_dcp(self, *, prefill_backend: Optional[str] = None):
         """Validate aiter MLA decode-context-parallel (DCP).
 
         The decode path runs aiter's MLA kernel over each rank's round-robin
@@ -3909,6 +3909,22 @@ class ServerArgs:
         model_config = self.get_model_config()
         if model_config.attention_arch != AttentionArch.MLA:
             return
+
+        # TEMPORARY, removed by the triton-MLA-DCP fix later in this series.
+        # The triton extend path writes its MLA KV with a pre-divided location
+        # (`out_cache_loc // dcp_size`) while the pool owner-filters that same
+        # value with `loc % dcp_size == rank` and never divides, so the filter
+        # runs in the wrong coordinate space and only ~1/dcp_size of the tokens
+        # reach their owning rank. There is no error and no log line -- just
+        # degraded answers that get worse as dcp_size grows. Refuse the
+        # combination until the fix lands rather than serve it silently.
+        if prefill_backend == "triton":
+            raise ValueError(
+                "--prefill-attention-backend triton is not yet supported "
+                "together with the aiter MLA DCP decode path (--dcp-size > 1): "
+                "the triton extend path corrupts its MLA KV writes under DCP. "
+                "Use the default aiter prefill backend."
+            )
 
         if "fp8" in (self.kv_cache_dtype or "") and not (
             envs.SGLANG_EXPERIMENTAL_AITER_DCP_FP8.get()
