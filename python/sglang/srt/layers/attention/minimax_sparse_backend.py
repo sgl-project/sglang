@@ -241,8 +241,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     # The fixed cap is safe and avoids a device-to-host sync.
                     self._max_seqlen_q = self._target_verify_q_cap(forward_batch)
             else:
-                extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-                self._max_seqlen_q = int(max(extend_lens)) if extend_lens else 1
+                extend_lens = getattr(
+                    forward_batch, "extend_seq_lens_cpu", None
+                )
+                self._max_seqlen_q = (
+                    int(max(extend_lens)) if extend_lens else 1
+                )
 
             if in_capture and forward_batch.forward_mode.is_decode_or_idle():
                 self._max_seqlen_k = self.max_context_len
@@ -432,7 +436,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=q.device,
             )
-            seq_lens = (forward_batch.seq_lens + uniform_verify_lens).to(torch.int32)
+            seq_lens = (
+                forward_batch.seq_lens + uniform_verify_lens
+            ).to(torch.int32)
             prefix_lens = forward_batch.seq_lens.to(torch.int32)
             extend_seq_lens_cpu = [verify_len] * bs
         else:
@@ -657,9 +663,6 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
         self.sparse.dense_backend = dense_backend
-        self.extend_dummy_seqs_capped_by_req_pool = getattr(
-            dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
-        ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata(forward_batch)

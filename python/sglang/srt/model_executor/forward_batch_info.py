@@ -963,13 +963,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         if (
-            model_runner.ps.attn_dcp_size > 1
+            getattr(model_runner, "dcp_size", 1) > 1
             and ret.out_cache_loc is not None
             and is_hip()
         ):
             ret.dcp_kv_mask = (
-                ret.positions % model_runner.ps.attn_dcp_size
-                == model_runner.ps.attn_dcp_rank
+                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
             )
 
         return ret
@@ -1301,7 +1300,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         self.seq_lens_cpu, self.extend_seq_lens_cpu
                     )
                 ]
-                self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
+                self.extend_logprob_start_lens_cpu = (
+                    self.extend_prefix_lens_cpu
+                )
             else:
                 self.extend_prefix_lens_cpu = None
                 self.extend_logprob_start_lens_cpu = None
@@ -1741,7 +1742,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
-                ragged_layout = getattr(self.spec_info, "ragged_verify_layout", None)
+                ragged_layout = getattr(
+                    self.spec_info, "ragged_verify_layout", None
+                )
                 if ragged_layout is not None:
                     num_tokens = (
                         int(ragged_layout.total_verify_tokens)
