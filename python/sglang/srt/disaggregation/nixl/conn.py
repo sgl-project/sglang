@@ -25,10 +25,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
     KVTransferError,
 )
-from sglang.srt.disaggregation.common.staging_handler import (
-    STAGING_WATERMARK_WAIT_S,
-    StagingRegisterInfo,
-)
+from sglang.srt.disaggregation.common.staging_handler import STAGING_WATERMARK_WAIT_S
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
@@ -237,9 +234,8 @@ class KVArgsRegisterInfo:
     dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
     dst_homogeneous_mem_kind: Optional[str] = None
     kv_xfer_segments: Optional[List[_KVXferPreparedSegment]] = None
-    # Keep last: optional, parsed from a variable-length tail of the ZMQ
-    # frame in from_zmq() below, so positional construction stays stable.
-    staging: Optional[StagingRegisterInfo] = None
+    staging_base_ptr: int = 0
+    staging_total_size: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -310,7 +306,14 @@ class KVArgsRegisterInfo:
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             dst_state_layer_ids=dst_state_layer_ids,
             dst_state_types=dst_state_types,
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            staging_base_ptr=(
+                struct.unpack("Q", msg[14])[0]
+                if len(msg) > 14 and len(msg[14]) == 8
+                else 0
+            ),
+            staging_total_size=(
+                int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
+            ),
         )
 
 
@@ -1209,7 +1212,10 @@ class NixlKVManager(CommonKVManager):
                             and not self.is_mla_backend
                             and not self.is_hybrid_mla_backend
                             and decode_tp_size != self.attn_tp_size
-                            and dst_info.staging is not None
+                            and (
+                                dst_info.staging_base_ptr != 0
+                                or dst_info.staging_total_size != 0
+                            )
                         )
 
                         kv_xfer_handle = None
@@ -1979,8 +1985,8 @@ class NixlKVManager(CommonKVManager):
         handle = self.send_kvcache_staged(
             req.agent_name,
             src_prefill_kv_indices,
-            dst_info.staging.base_ptr + c_offset,
-            dst_info.staging.total_size - c_offset,
+            dst_info.staging_base_ptr + c_offset,
+            dst_info.staging_total_size - c_offset,
             dst_info.gpu_id,
             dst_info.decode_tp_rank,
             dst_info.decode_tp_size,

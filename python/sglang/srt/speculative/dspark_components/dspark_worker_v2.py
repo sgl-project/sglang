@@ -157,19 +157,27 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._is_lifecycle_only_pp_prefill_rank = (
             self._draft_is_moe and self.draft_model.is_lifecycle_only
         )
+        self._linear_accept_index_cache = None
 
-        # The mask token needs an embedding row, not a tokenizer entry, so bound it
-        # by the embedding width. A padded vocab reserves rows past the real tokens
-        # and drafts place the mask there (Inkling: 200058 real, 201024 padded).
+        # The mask token is input-only (it is embedded, never sampled), so its
+        # bound is the embedding-table row count: the PADDED vocab when the
+        # target pads its embedding (e.g. Inkling true vocab 200058, padded
+        # 201024, mask 200064), else the plain vocab size.
         target_model_config = self.target_worker.model_runner.model_config
-        target_vocab_size = (
+        target_embed_rows = (
             getattr(target_model_config.hf_text_config, "padded_vocab_size", None)
             or target_model_config.vocab_size
         )
+        # muP targets declare logits_mup_width_multiplier; the draft was
+        # trained against the folded head, so compute_base_logits divides.
+        self.draft_model.logits_mup_width_multiplier = getattr(
+            target_model_config.hf_text_config, "logits_mup_width_multiplier", None
+        )
+        self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
-            target_vocab_size=int(target_vocab_size),
+            target_vocab_size=int(target_embed_rows),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
@@ -1101,6 +1109,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
+            req_pool_indices=batch.req_pool_indices,
         )
 
     def get_confidence_budget_prepare(self):

@@ -177,10 +177,10 @@ class PrefillBootstrapQueue:
                     f"chunked_prefill_size that is a multiple of page_size "
                     f"({page_size}); got {chunked_prefill_size}."
                 )
-            if self.pp_size > 1:
-                # Staging writer accounting has no pp dimension.
+            if self.pp_size > 1 and self.transfer_backend != TransferBackend.MOONCAKE:
                 raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
+                    "SGLANG_DISAGG_STAGING_BUFFER with pp_size > 1 is only "
+                    "supported by Mooncake."
                 )
             if get_parallel().enable_prefill_context_parallel:
                 # CP rewrites index_slice per rank, breaking the chunk grid.
@@ -830,6 +830,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Optimistic bootstrap can fail while this overlapped chunk is
                 # already running. Drop aborted chunks instead of sending KV.
                 if is_aborted(req):
+                    self.clear_pending_chunk_send(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -1052,7 +1053,17 @@ class SchedulerDisaggregationPrefillMixin:
 
         return success_rids, failed_rids
 
+    def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
+        """Drop `req` from the sent-but-unconcluded chunk set.
+
+        Every path that retires a request without a `last_chunk=True` send must
+        call this: a stale entry holds the unified-memory compaction gate closed
+        for the process lifetime.
+        """
+        self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+        self.clear_pending_chunk_send(req)
         error_message = (
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -1250,9 +1261,11 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _mamba_payload():
                 return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
-                    ]
+                    self.req_to_token_pool.translate_mamba_indices(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ]
+                    )
                     .cpu()
                     .numpy()
                 ]
@@ -1359,6 +1372,13 @@ class SchedulerDisaggregationPrefillMixin:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, seg_start:seg_end
             ]
+            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
+            # physical ones. Per segment, since each is its own gather.
+            kv_indices = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    kv_indices
+                )
+            )
             page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
@@ -1371,6 +1391,12 @@ class SchedulerDisaggregationPrefillMixin:
                 num_kv_tokens=seg_end - seg_start,
             )
         req.start_send_idx = end_idx
+        # A last chunk needs no entry: every `last_chunk=True` call site has
+        # already put the request on `disagg_prefill_inflight_queue`.
+        if last_chunk:
+            self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+        else:
+            self.disagg_prefill_pending_chunk_rids.add(req.rid)
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
@@ -1380,6 +1406,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
+        self.clear_pending_chunk_send(req)  # re-sends from scratch
         req.tmp_end_idx = -1
         req.disagg_decode_prefix_len = 0
         req.early_send_prefix_end = None

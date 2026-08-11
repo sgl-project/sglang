@@ -29,8 +29,6 @@ Where the remaining reads live (``runtime_context.py``, exempt by module):
     the short circuit is the point: with PP off the group is never touched, which
     is what lets the ``Indexer`` be constructed before distributed init. The live
     property would demand the group either way.
-  - ``cuda_ipc_transport_utils.tp_size`` runs in the tokenizer process, which has
-    no groups at all (the call site already guards for "not published yet").
   - ``dp_attention.attn_cp_size`` / ``moe_dp_size``: the configuration the
     predicate detects (``attn_cp_size > moe_dp_size``) is the one where
     ``initialize_model_parallel`` aliases ``_MOE_DP`` to ``_ATTN_CP``, so the live
@@ -102,14 +100,10 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the same dict already carries the live moe_dp_size under 'dp'; this entry "
         "is the configured intent"
     ),
-    ("srt/utils/cuda_ipc_transport_utils.py", "configured_tp_size"): (
-        "runs in the tokenizer process, which has no parallel groups at all"
-    ),
     ("srt/models/kimi_k25.py", "configured_tp_size"): (
-        "the IPC refcount has to name the same number the recycler waits on, and "
-        "that waiter (MmItemMemoryPool.try_to_recycle) reads configured_tp_size() "
-        "because it runs in the tokenizer process; a refcount taken from the live "
-        "attention subgroup would strand items in the bounded pool"
+        "the IPC refcount must match the configured TP consumer count captured "
+        "when the tokenizer creates MmItemMemoryPool; a live attention subgroup "
+        "size could strand leases in the bounded pool"
     ),
     ("srt/models/kimi_k3.py", "configured_tp_size"): (
         "same as kimi_k25: the IPC refcount must agree with the recycler's waiter"

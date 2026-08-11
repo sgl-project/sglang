@@ -20,6 +20,7 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -37,6 +38,7 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
     MqaAttentionBase,
     _dequant_fp8_wo_a_streaming,
     hc_head_torch,
@@ -400,6 +402,7 @@ class DSparkV4MarkovHead(nn.Module):
             self.markov_rank, self.vocab_size, bias=False, dtype=markov_w2_dtype
         )
         self._tp_shard: Optional[MarkovW2ShardGeometry] = None
+        self._shard_group = None
 
     def configure_tp_shard(self, *, lm_head: nn.Module) -> None:
         if not self._opt_markov_w2_tp_shard:
@@ -419,16 +422,23 @@ class DSparkV4MarkovHead(nn.Module):
                 f"num_embeddings_per_partition({per_partition}) * tp_size({tp_size}) != "
                 f"num_embeddings_padded({num_padded})."
             )
-        attn_tp_size = get_parallel().attn_tp_group.world_size
-        if attn_tp_size != tp_size:
+        # Follow lm_head's group choice; attn_tp_group degenerates to size 1
+        # under prefill CP while lm_head still shards over the full TP group.
+        parallel = get_parallel()
+        shard_group = (
+            parallel.attn_tp_group
+            if getattr(lm_head, "use_attn_tp_group", False)
+            else parallel.tp_group
+        )
+        shard_group_size = shard_group.world_size
+        if shard_group_size != tp_size:
             raise ValueError(
-                "DSpark markov_w2 TP-shard needs the attn-TP group (used for the per-step "
-                f"all-gather) to equal the lm_head shard group, got attn_tp_size="
-                f"{attn_tp_size} vs lm_head tp_size={tp_size}. This config (e.g. DP "
-                "attention without --enable-dp-lm-head, where lm_head shards over the "
-                "global TP group) is unsupported; disable "
-                "SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
+                "DSpark markov_w2 TP-shard needs the per-step all-gather group to "
+                f"equal the lm_head shard group, got shard_group_size="
+                f"{shard_group_size} vs lm_head tp_size={tp_size}. "
+                "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
+        self._shard_group = shard_group
         self._tp_shard = MarkovW2ShardGeometry(
             tp_size=tp_size,
             org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
@@ -481,7 +491,8 @@ class DSparkV4MarkovHead(nn.Module):
             bias = F.linear(latent.float(), weight_local)
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
         if shard.tp_size > 1:
-            full = get_parallel().attn_tp_group.all_gather(step_local, dim=-1)
+            assert self._shard_group is not None
+            full = self._shard_group.all_gather(step_local, dim=-1)
         else:
             full = step_local
         return full[..., : self.vocab_size]
@@ -654,6 +665,12 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -663,6 +680,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
+        )
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -1028,14 +1048,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=(self.config.n_routed_experts + self.num_fused_shared_experts),
         )
 
         for name, loaded_weight in weights:
             mapped = self._remap_dspark_weight_name(name)
             if mapped is None:
                 continue
-
+            if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
+                mapped = mapped.replace(
+                    ".mlp.shared_experts.",
+                    f".mlp.experts.{self.config.n_routed_experts}.",
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:
                     continue

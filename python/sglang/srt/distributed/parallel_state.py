@@ -1080,7 +1080,10 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                ca_comm.reduce_scatter(input, output, registered=True)
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    ca_comm.reduce_scatter(input, output, registered=False)
+                else:
+                    ca_comm.reduce_scatter(input, output, registered=True)
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
             else:

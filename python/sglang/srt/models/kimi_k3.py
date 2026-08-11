@@ -3108,6 +3108,32 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
 
+    def preprocess_mm_for_encoder(
+        self,
+        mm_data,
+        modality,
+        config,
+        *,
+        image_processor=None,
+        use_gpu_preprocessing=False,
+    ):
+        """Prepare per-image raw inputs for owner-side EPD preprocessing."""
+        if modality != Modality.IMAGE:
+            raise ValueError("Kimi-K3 encoder mode supports image input only")
+        if image_processor is None:
+            raise ValueError("Kimi-K3 encoder preprocessing needs an image processor")
+
+        from sglang.srt.multimodal.kimi_k3_image_processing import (
+            prepare_kimi_k3_encoder_inputs,
+        )
+
+        self._encoder_image_processor = image_processor
+        return prepare_kimi_k3_encoder_inputs(
+            mm_data,
+            image_processor,
+            use_gpu_preprocessing=use_gpu_preprocessing,
+        )
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -3131,9 +3157,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
         def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
             """Materialize only the images assigned to this vision-DP rank."""
-            # Same source as MmItemMemoryPool.try_to_recycle(), which waits on
-            # configured_tp_size(): the live world size agrees once dist is up,
-            # but a refcount that disagrees with the waiter would strand items.
+            from sglang.srt.multimodal.encoder_preprocessing import (
+                LOCAL_PREPROCESSED_KEY,
+            )
+
+            # Match the configured TP consumer count captured when the
+            # tokenizer creates MmItemMemoryPool. A live attention subgroup
+            # size could leave acknowledgements missing and strand the lease.
             ipc_consumer_count = max(configured_tp_size(), 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
@@ -3148,6 +3178,21 @@ class KimiK3ForConditionalGeneration(nn.Module):
                     )
                 selected_items.append(item)
 
+            locally_preprocessed = [
+                item.model_specific_data.get(LOCAL_PREPROCESSED_KEY, False)
+                for item in selected_items
+            ]
+            if any(locally_preprocessed):
+                if not all(locally_preprocessed):
+                    raise ValueError(
+                        "Kimi-K3 cannot mix local preprocessed and deferred images"
+                    )
+                return materialize_multimodal_features(
+                    [item.feature for item in selected_items],
+                    device=device,
+                    dtype=target_dtype,
+                )
+
             deferred = [
                 item.model_specific_data.get(DEFERRED_PREPROCESSING_KEY)
                 for item in selected_items
@@ -3157,25 +3202,44 @@ class KimiK3ForConditionalGeneration(nn.Module):
                     raise ValueError(
                         "Kimi-K3 cannot mix deferred and preprocessed image features"
                     )
-                from sglang.srt.multimodal.processors.kimi_k25 import (
-                    _gpu_preprocess_images,
-                )
-
                 first_config = deferred[0]
-                image_scale, image_bias = normalization_tensors(
-                    first_config["image_mean"], first_config["image_std"], device
-                )
-                pixel_values, _ = _gpu_preprocess_images(
-                    [item.feature for item in selected_items],
-                    [config["resize_config"] for config in deferred],
-                    image_scale,
-                    image_bias,
-                    self.vision_tower.patch_size,
-                    to_chw=lambda image: to_chw_uint8(image, device=device),
-                    post_resize=lambda x: fill_transparent_bg(
-                        x, first_config["transparent_bg_config"]
-                    ),
-                )
+                backend = first_config["backend"]
+                if any(config["backend"] != backend for config in deferred):
+                    raise ValueError(
+                        "Kimi-K3 cannot mix deferred preprocessing backends"
+                    )
+                if backend == "gpu":
+                    from sglang.srt.multimodal.processors.kimi_k25 import (
+                        _gpu_preprocess_images,
+                    )
+
+                    image_scale, image_bias = normalization_tensors(
+                        first_config["image_mean"], first_config["image_std"], device
+                    )
+                    pixel_values, _ = _gpu_preprocess_images(
+                        [item.feature for item in selected_items],
+                        [config["resize_config"] for config in deferred],
+                        image_scale,
+                        image_bias,
+                        self.vision_tower.patch_size,
+                        to_chw=lambda image: to_chw_uint8(image, device=device),
+                        post_resize=lambda x: fill_transparent_bg(
+                            x, first_config["transparent_bg_config"]
+                        ),
+                    )
+                elif backend == "cpu":
+                    from sglang.srt.multimodal.kimi_k3_image_processing import (
+                        materialize_kimi_k3_cpu_features,
+                    )
+
+                    pixel_values = materialize_kimi_k3_cpu_features(
+                        selected_items, self._encoder_image_processor
+                    )
+                    pixel_values = pixel_values.to(device, non_blocking=True)
+                else:
+                    raise ValueError(
+                        f"Unsupported Kimi-K3 deferred preprocessing backend: {backend}"
+                    )
                 return pixel_values.to(dtype=target_dtype)
 
             features = []

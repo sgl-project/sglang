@@ -847,7 +847,10 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.managers.hisparse_coordinator import (
+            HiSparseCoordinator,
+            resolve_shared_index_layers,
+        )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
@@ -867,6 +870,11 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            shared_index_layers=resolve_shared_index_layers(
+                hf_text_config=self.model_config.hf_text_config,
+                pp_size=self.ps.pp_size,
+                is_speculative=self.spec_algorithm.is_speculative(),
+            ),
         )
 
     def post_capture_resize_kv_pool(self):
@@ -997,7 +1005,7 @@ class ModelRunner:
             RoutedExpertsCapturer.create(
                 model=self.model,
                 model_config=self.model_config,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1007,7 +1015,7 @@ class ModelRunner:
         set_global_indexer_capturer(
             create_indexer_capturer(
                 model_config=self.model_config,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1243,6 +1251,16 @@ class ModelRunner:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
             return self.max_total_num_tokens
+
+    @property
+    def max_token_pool_size(self):
+        """Return the max token pool size considering hybrid swa and hisparse settings."""
+        if self.enable_hisparse:
+            # HiSparse uses the host-backed full pool capacity.
+            size_full = getattr(self.token_to_kv_pool_allocator, "size_full", None)
+            if size_full is not None:
+                return size_full
+        return self.effective_max_total_num_tokens
 
     def _load_format_scope(self, load_format: Optional[str]):
         """Make this runner's load format the published one while it loads.

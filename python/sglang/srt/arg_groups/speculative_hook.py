@@ -279,13 +279,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("DSpark speculative decoding only supports CUDA device.")
 
-    if server_args.attn_cp_size > 1:
-        raise ValueError(
-            "DSpark does not support context parallel "
-            f"(attn_cp_size={server_args.attn_cp_size})."
-        )
-
-    if server_args.enable_dp_attention:
+    # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
+    if server_args.enable_dp_attention and server_args.dp_size > 1:
         if not server_args.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
         if server_args.moe_a2a_backend != "none":
