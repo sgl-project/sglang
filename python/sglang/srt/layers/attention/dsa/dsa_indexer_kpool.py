@@ -52,6 +52,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+DEEP_GEMM_PAGED_MQA_MAX_NEXT_N = 6
+
+
 class IndexerKPool(MultiPlatformOp):
     def __init__(
         self,
@@ -159,11 +162,29 @@ class IndexerKPool(MultiPlatformOp):
         self.softmax_scale = self.head_dim**-0.5
 
     @torch.compile(dynamic=True)
-    def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
+    def _project_and_scale_head_gates(self, x: torch.Tensor) -> torch.Tensor:
         weights, _ = self.weights_proj(x.float())
-        weights = weights * self.n_heads**-0.5
-        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
-        return weights
+        return weights * self.n_heads**-0.5
+
+    @torch.compile(dynamic=True)
+    def _apply_q_scale_and_softmax_scale(
+        self, weights: torch.Tensor, q_scale: torch.Tensor
+    ) -> torch.Tensor:
+        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+
+    def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
+        weights = self._project_and_scale_head_gates(x)
+        return self._apply_q_scale_and_softmax_scale(weights, q_scale)
+
+    def _resolve_head_gate_weights(
+        self,
+        x: torch.Tensor,
+        q_scale: torch.Tensor,
+        head_weights: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if head_weights is not None:
+            return self._apply_q_scale_and_softmax_scale(head_weights, q_scale)
+        return self._get_logits_head_gate(x, q_scale)
 
     @staticmethod
     def _cp_gather_concat(
@@ -601,8 +622,10 @@ class IndexerKPool(MultiPlatformOp):
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
         precompute_compress_gate: bool = False,
+        precompute_head_gate: bool = False,
     ):
         gate_score = None
+        head_weights = None
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -620,6 +643,11 @@ class IndexerKPool(MultiPlatformOp):
                     [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                     dim=-1,
                 )
+            if precompute_head_gate:
+                # Keep the relatively expensive head-gate projection on the
+                # Q stream so it overlaps the alt-stream K projection.  The
+                # later critical path only needs the cheap q-scale multiply.
+                head_weights = self._project_and_scale_head_gates(x)
             with torch.cuda.stream(self.alt_stream):
                 key, _ = self.wk(x)
                 key = self.k_norm(key)
@@ -655,7 +683,7 @@ class IndexerKPool(MultiPlatformOp):
 
         query = rotate_activation(query)
 
-        return query, key, gate_score
+        return query, key, gate_score, head_weights
 
     def _get_k_bf16(
         self,
@@ -871,7 +899,8 @@ class IndexerKPool(MultiPlatformOp):
         if n_real < num_q_padded:
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
-        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
+        q_fp8_flat = q_fp8
+        q_fp8_single = q_fp8.unsqueeze(1)
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 64
         num_heads_kv = 1
@@ -881,7 +910,9 @@ class IndexerKPool(MultiPlatformOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        use_tilelang_paged_mqa = self._should_use_tilelang_paged_mqa_logits(q_fp8)
+        use_tilelang_paged_mqa = self._should_use_tilelang_paged_mqa_logits(
+            q_fp8_single
+        )
 
         pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
             self._get_kpool_decode_metadata(
@@ -893,13 +924,24 @@ class IndexerKPool(MultiPlatformOp):
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
+        plan = metadata.attn_metadata.kpool_write_plan
+        use_dg_native = (
+            not use_tilelang_paged_mqa
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            and plan is not None
+            and plan.pool_seqlens_per_q_2d is not None
+            and plan.pool_seqlens_per_q_2d.shape[1] <= DEEP_GEMM_PAGED_MQA_MAX_NEXT_N
+        )
         if use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits,
             )
 
             logits = tilelang_fp8_paged_mqa_logits(
-                q_fp8,
+                q_fp8_single,
                 kv_cache_fp8,
                 weights,
                 pool_seqlens,
@@ -908,9 +950,29 @@ class IndexerKPool(MultiPlatformOp):
                 pool_max_seq_len,
                 clean_logits=False,
             )
+        elif use_dg_native:
+            next_n = plan.pool_seqlens_per_q_2d.shape[1]
+            assert n_real % next_n == 0
+            batch_size = n_real // next_n
+            pool_seqlens_2d = plan.pool_seqlens_per_q_2d[:batch_size]
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_fp8_flat.view(
+                    batch_size,
+                    next_n,
+                    q_fp8_flat.shape[1],
+                    q_fp8_flat.shape[2],
+                ),
+                kv_cache_fp8,
+                weights,
+                pool_seqlens_2d,
+                pool_block_tables[:n_real:next_n],
+                pool_schedule_metadata,
+                pool_max_seq_len,
+                clean_logits=False,
+            )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8,
+                q_fp8_single,
                 kv_cache_fp8,
                 weights,
                 pool_context_lens,
@@ -1485,7 +1547,7 @@ class IndexerKPool(MultiPlatformOp):
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
 
-        query, key, gate_score_maybe = self._get_q_k_bf16(
+        query, key, gate_score_maybe, head_weights = self._get_q_k_bf16(
             q_lora,
             x,
             positions,
@@ -1494,6 +1556,7 @@ class IndexerKPool(MultiPlatformOp):
             precompute_compress_gate=(
                 enable_dual_stream and self.compress_gate_stream is not None
             ),
+            precompute_head_gate=enable_dual_stream and return_indices,
         )
 
         pool = get_token_to_kv_pool()
@@ -1532,7 +1595,7 @@ class IndexerKPool(MultiPlatformOp):
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             if return_indices:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._get_logits_head_gate(x, q_scale)
+                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
             with torch.cuda.stream(self.alt_stream):
                 _compress_write()
             current_stream.wait_stream(self.alt_stream)
@@ -1627,13 +1690,14 @@ class IndexerKPool(MultiPlatformOp):
             and forward_batch.forward_mode.is_decode_or_idle()
             and self.compress_gate_stream is not None
         )
-        query, key, gate_score = self._get_q_k_bf16(
+        query, key, gate_score, head_weights = self._get_q_k_bf16(
             q_lora,
             x,
             positions,
             enable_dual_stream,
             forward_batch=forward_batch,
             precompute_compress_gate=precompute_compress_gate,
+            precompute_head_gate=enable_dual_stream and return_indices,
         )
         use_cp = dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
         if use_cp:
@@ -1661,7 +1725,7 @@ class IndexerKPool(MultiPlatformOp):
                     gate_score=gate_score,
                 )
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            weights = self._get_logits_head_gate(x, q_scale)
+            weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
             current_stream.wait_stream(self.alt_stream)
         else:
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
@@ -1692,7 +1756,7 @@ class IndexerKPool(MultiPlatformOp):
                 return None
 
         if weights is None:
-            weights = self._get_logits_head_gate(x, q_scale)
+            weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
 
         if is_cuda():
             if (
