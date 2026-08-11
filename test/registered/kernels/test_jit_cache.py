@@ -100,24 +100,28 @@ def test_unresolvable_anchor_is_a_miss_not_a_crash():
     assert cache._resolve_path(root="pkg:does-not-exist", relpath="x.h") is None
 
 
-def test_anchor_roots_are_resolved():
+def test_anchor_roots_are_symlink_resolved(tmp_path, monkeypatch):
     """Anchors must be symlink-resolved, since the paths matched against them are.
 
     `/usr/local/cuda` is a symlink to `/usr/local/cuda-<version>`; an unresolved
     anchor makes every toolkit header miss it and fall through to `sys`, whose
     relpath then carries the CUDA version and breaks reuse across upgrades.
+
+    The toolkit stands in for all of them — one comprehension resolves every
+    anchor — and it is faked rather than read off the machine so this still
+    guards on the CPU-only runners, which have no toolkit at all.
     """
-    for _, root in cache._anchor_roots():
-        assert root == root.resolve(), root
-
-
-def test_toolkit_headers_anchor_to_the_toolkit():
     from sglang.kernels.jit.utils.compile import toolchain
 
-    home = toolchain.toolkit_home().resolve()
-    root, relpath = cache._normalize_path(home / "include" / "cuda_runtime.h")
-    assert root == "toolkit"
-    assert relpath == "include/cuda_runtime.h"
+    versioned = tmp_path / "cuda-12.9"
+    versioned.mkdir()
+    (tmp_path / "cuda").symlink_to(versioned)
+    monkeypatch.setattr(toolchain, "toolkit_home", lambda: tmp_path / "cuda")
+
+    # `__wrapped__` is the undecorated function: the anchors are memoized for
+    # the process, and the real ones were already computed by an earlier test.
+    roots = dict(cache._anchor_roots.__wrapped__())
+    assert roots["toolkit"] == versioned
 
 
 # --------------------------------------------------------------------------
