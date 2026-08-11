@@ -656,20 +656,24 @@ else:
 PY
 
 # -----------------------
-# Triton: install AITER's pinned ROCm 3.7 wheel (AMD index), replacing the base
-# image's 3.5.1.
+# Triton: hand the choice to AITER's installer, replacing the base image's Triton
+# with whatever revision AITER is built and tested against. Deliberately no
+# version assertion here — AITER's pin is the source of truth (its installer
+# enforces its own floor), so repeating it would only break this build the day
+# AITER moves. The version lands in the build log below.
 #
 # This MUST stay the last pip step, after the torch-ROCm metadata patch above.
-# The base ROCm Torch wheel declares `Requires-Dist: triton==3.5.1`, so any pip
-# install that resolves torch while Triton 3.7 is present drags in PyPI's CUDA
-# triton 3.5.1 and breaks the ROCm stack. The metadata patch above is what drops
+# The base ROCm Torch wheel pins `triton==3.5.1`, so once a different Triton is
+# installed, any pip install that resolves torch drags in PyPI's CUDA triton and
+# replaces ROCm Torch with a CUDA build. The metadata patch above is what drops
 # that pin (see the `Requires-Dist` rewrite in hack.py) — do not install Triton
-# before it, and do not add pip steps after this one.
+# before it, and do not add pip steps after this one. The Torch check below is
+# what catches it if either rule is broken.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         cd /sgl-workspace/aiter \
      && test -f .github/scripts/install_triton.sh \
      && PIP_NO_CACHE_DIR=1 bash .github/scripts/install_triton.sh \
-     && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; assert v.startswith('3.7.'), v; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
+     && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
     fi
 
 # -----------------------
