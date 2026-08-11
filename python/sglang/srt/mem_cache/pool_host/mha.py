@@ -385,7 +385,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if io_backend == "kernel_ascend":
-            # Ascend pools use contiguous multi-layer tensors and intentionally do
+            # NPU pools use contiguous multi-layer tensors and intentionally do
             # not build the CUDA-style k_data_ptrs/v_data_ptrs arrays.
             device_kv_buffers = None
         else:
