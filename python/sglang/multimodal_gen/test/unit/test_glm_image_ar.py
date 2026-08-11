@@ -74,6 +74,9 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
             srt_encoder_timeout=100,
         )
 
+    def setUp(self):
+        set_global_server_args(self._server_args())
+
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
         "model_specific_stages.glm_image.get_local_torch_device",
@@ -425,8 +428,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
         "model_specific_stages.glm_image.requests.post"
     )
     def test_single_srt_ar_prefetch_uses_cpu_batch_path(self, mock_post, _mock_device):
-        set_global_server_args(self._server_args())
-        mock_post.return_value = _FakeBatchResponse([list(range(1025))])
+        mock_post.return_value = _FakeBatchResponse([{"output_ids": list(range(1025))}])
         stage = GlmImageAR(processor=_FakeProcessor(), vision_language_encoder=None)
         batches = [
             SimpleNamespace(
@@ -437,6 +439,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
                 height=1024,
                 width=1024,
                 metrics=None,
+                extra={},
             )
         ]
 
