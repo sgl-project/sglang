@@ -93,6 +93,16 @@ QUIESCE_TIMEOUT_S = 60.0
 # How many requests may be stuck without proof of quiescence before the worker
 # fails, so that a restart releases every withheld page safely at once.
 MAX_UNQUIESCED_ROOMS = 256
+# An error return from a Mooncake engine call is NOT proof that its RDMA work
+# stopped: the engine has no cancellation API, its sync wrapper's deadline
+# return deliberately leaves the batch running (a known issue acknowledged in
+# the engine's own source), and a failed batch is resubmitted internally so an
+# earlier generation's writes can still land after the call returns. Posted
+# work drains within the QP retransmit horizon times the engine's software
+# re-posts, so a room whose engine call failed only counts as drained after
+# this additional quarantine. Success returns need none: COMPLETED requires a
+# terminal completion for every slice.
+ENGINE_FAILURE_QUARANTINE_S = 30.0
 # How often a decode rank re-sends an unacknowledged abort notification.
 ABORT_RETRY_INTERVAL_S = 0.5
 # How often the bookkeeping thread re-checks drained rooms and sweeps lifetimes.
@@ -124,17 +134,28 @@ class RoomTransferLifetime:
     every outstanding lease has been returned. Only then is it safe to release
     the room's KV pages.
 
-    The proof this provides is at the transfer-engine API boundary: a lease is
-    returned when the engine call returns, so the guarantee is exactly as
-    strong as the engine's contract that a returned call -- success or error --
-    leaves no posted RDMA work that can still land. Verifying quiescence below
-    that boundary is the engine's job, not this barrier's.
+    The proof this provides is at the transfer-engine API boundary, and that
+    contract is asymmetric. A success return means every slice reached a
+    terminal completion, so no posted RDMA work can still land. An error
+    return proves nothing: the engine has no cancellation, and its deadline
+    and retry paths return with work still posted or queued for re-posting.
+    A lease returned by a *failed* engine call therefore only counts toward
+    quiescence after ``ENGINE_FAILURE_QUARANTINE_S``, which bounds the
+    engine's residual drain.
 
     Abort tokens minted by decode peers are recorded here so that a late or
     duplicated abort for a recycled room cannot close a live room.
     """
 
-    __slots__ = ("_cond", "_leases", "_open", "_abort_tokens", "created_at", "_claimed")
+    __slots__ = (
+        "_cond",
+        "_leases",
+        "_open",
+        "_abort_tokens",
+        "created_at",
+        "_claimed",
+        "_quarantine_until",
+    )
 
     def __init__(self) -> None:
         self._cond = threading.Condition()
@@ -146,6 +167,9 @@ class RoomTransferLifetime:
         # unclaimed room was created by decode metadata alone, so nothing will
         # ever release it and the sweep must.
         self._claimed = False
+        # Monotonic deadline before which the room must not report quiesced,
+        # armed whenever an engine call for this room returns an error.
+        self._quarantine_until = 0.0
 
     def try_lease(self) -> bool:
         """Take a lease, or return False if the room no longer admits work."""
@@ -172,9 +196,29 @@ class RoomTransferLifetime:
         with self._cond:
             return not self._open
 
+    def quarantine(self, duration_s: float) -> None:
+        """Withhold quiescence for *duration_s* from now.
+
+        Called when an engine call for this room returns an error: the engine
+        cannot cancel posted RDMA work, so the returned lease alone is not
+        proof of drain and the room must stay owned while the engine's
+        residual work runs out.
+        """
+        with self._cond:
+            self._quarantine_until = max(
+                self._quarantine_until, time.monotonic() + duration_s
+            )
+
+    def _quiesced_locked(self) -> bool:
+        return (
+            not self._open
+            and self._leases == 0
+            and time.monotonic() >= self._quarantine_until
+        )
+
     def is_quiesced(self) -> bool:
         with self._cond:
-            return not self._open and self._leases == 0
+            return self._quiesced_locked()
 
     def outstanding_leases(self) -> int:
         with self._cond:
@@ -191,12 +235,13 @@ class RoomTransferLifetime:
     def is_reclaimable(self) -> bool:
         """Whether this room has no active local transfer ownership.
 
-        A quiesced room admits no work and has none running. An unclaimed room
-        has no sender *yet*, so callers must additionally preserve it for the
-        bootstrap grace period in which a metadata-late sender may still arrive.
+        A quiesced room admits no work and has none running (including any
+        engine-failure quarantine). An unclaimed room has no sender *yet*, so
+        callers must additionally preserve it for the bootstrap grace period
+        in which a metadata-late sender may still arrive.
         """
         with self._cond:
-            return (not self._open and self._leases == 0) or not self._claimed
+            return self._quiesced_locked() or not self._claimed
 
     def add_abort_token(self, token: bytes) -> None:
         if not token:
@@ -2307,6 +2352,9 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                             )
                         if ret != 0:
+                            # A failed engine call can leave RDMA work running;
+                            # keep the room owned while the engine drains.
+                            lifetime.quarantine(ENGINE_FAILURE_QUARANTINE_S)
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
@@ -2339,6 +2387,7 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info,
                                 )
                                 if state_rc != 0:
+                                    lifetime.quarantine(ENGINE_FAILURE_QUARANTINE_S)
                                     with self.session_lock:
                                         self.session_failures[
                                             req.mooncake_session_id
@@ -2434,6 +2483,10 @@ class MooncakeKVManager(CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
+                # An exception may have interrupted an engine call mid-flight;
+                # its RDMA work can still be running, so quarantine the room.
+                if lifetime is not None:
+                    lifetime.quarantine(ENGINE_FAILURE_QUARANTINE_S)
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."

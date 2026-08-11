@@ -233,6 +233,90 @@ class TestPageReuseRace(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(self._poll(sender), KVPoll.Failed)
 
+    def test_failed_engine_call_quarantines_the_room(self):
+        # An error return from the engine is NOT proof its RDMA work stopped:
+        # Mooncake has no cancellation, and its deadline/retry paths return
+        # with work still posted. The room must therefore stay owned for the
+        # quarantine window even though every lease has been returned.
+        mgr = make_prefill_manager()
+        mgr.request_status[ROOM] = KVPoll.WaitingForInput
+        mgr.transfer_infos = {
+            ROOM: {
+                "session:1": SimpleNamespace(
+                    room=ROOM,
+                    endpoint="127.0.0.1",
+                    dst_port=1,
+                    mooncake_session_id="session:1",
+                    dst_kv_indices=np.array([0], dtype=np.int32),
+                    dst_device_kv_indices=None,
+                    is_dummy=False,
+                )
+            }
+        }
+        mgr.decode_kv_args_table = {
+            "session:1": SimpleNamespace(
+                dst_attn_tp_size=1,
+                dst_kv_ptrs=[0xDEAD0000],
+                dst_kv_layer_ids=[0],
+                dst_state_layer_ids=[],
+                requires_dcp_relayout=False,
+            )
+        }
+        mgr.session_lock, mgr.failed_sessions = threading.Lock(), set()
+        mgr.session_failures = defaultdict(int)
+        mgr.is_mla_backend, mgr.is_hybrid_mla_backend = True, False
+        mgr.attn_tp_size = mgr.attn_cp_size = mgr.pp_size = 1
+        mgr.attn_tp_rank = mgr.attn_cp_rank = mgr.pp_rank = mgr.attn_dp_rank = 0
+        mgr.transfer_queues = [FastQueue()]
+        mgr.sync_status_to_decode_endpoint = Mock()
+
+        failed_send = threading.Event()
+
+        def failing_write(*_args, **_kwargs):
+            failed_send.set()
+            return -1
+
+        mgr.send_kvcache = failing_write
+        sender = make_sender(mgr)
+
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.ENGINE_FAILURE_QUARANTINE_S",
+            0.3,
+        ):
+            threading.Thread(
+                target=mgr.transfer_worker,
+                args=(mgr.transfer_queues[0], Mock()),
+                daemon=True,
+            ).start()
+            mgr.add_transfer_request(
+                ROOM, np.array([0], dtype=np.int32), slice(0, 1), False
+            )
+            self.assertTrue(failed_send.wait(5), "worker never attempted the send")
+            sender.abort()
+
+            # Leases drain almost immediately (the failed call returned), but
+            # the scheduler must still not observe a terminal state: the
+            # engine's work may still be landing in the decode's pages.
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                lifetime = mgr._room_lifetime(ROOM, create=False)
+                if lifetime is not None and lifetime.outstanding_leases() == 0:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(
+                self._poll(sender),
+                KVPoll.Transferring,
+                "a failed engine call must not count as drained before the "
+                "quarantine expires",
+            )
+
+            # Once the quarantine elapses, the failure may conclude.
+            for _ in range(500):
+                if self._poll(sender) == KVPoll.Failed:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(self._poll(sender), KVPoll.Failed)
+
     def test_a_queued_chunk_cannot_attach_to_a_recycled_room(self):
         """The other half of the race, reported on the upstream discussion.
 
@@ -298,6 +382,31 @@ class TestRoomTransferLifetime(unittest.TestCase):
         self.assertFalse(lifetime.authorizes_abort(b"someone-elses"))
         # A tokenless abort cannot be authenticated; honour it, fail-safe.
         self.assertTrue(lifetime.authorizes_abort(b""))
+
+    def test_quarantine_withholds_quiescence_after_a_failed_engine_call(self):
+        # An error-returning engine call is not proof of drain: the engine has
+        # no cancellation, so its work can still land after the lease returns.
+        lifetime = RoomTransferLifetime()
+        lifetime.claim()
+        self.assertTrue(lifetime.try_lease())
+        lifetime.quarantine(0.2)
+        lifetime.end_lease()
+        lifetime.close()
+
+        self.assertFalse(
+            lifetime.is_quiesced(),
+            "drained leases alone must not prove quiescence during quarantine",
+        )
+        self.assertFalse(
+            lifetime.is_reclaimable(),
+            "the sweep must not retire a quarantined room either",
+        )
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not lifetime.is_quiesced():
+            time.sleep(0.02)
+        self.assertTrue(lifetime.is_quiesced())
+        self.assertTrue(lifetime.is_reclaimable())
 
 
 class TestExecutorDrain(unittest.TestCase):
