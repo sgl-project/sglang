@@ -91,9 +91,6 @@ ARG BRANCH_TYPE=remote
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
-ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG TRITON_COMMIT="89002410dee054a1207a3d88cfbe1748dacfd819"
-
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
@@ -222,8 +219,8 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # leak into AITER's version when AITER uses setuptools_scm)
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-# Keep the base Triton while compiling AITER. ROCm 7.2 switches to AITER's
-# pinned Triton only after all dependency resolution is complete.
+# Compile AITER against the base image's Triton. ROCm 7.2 swaps in AITER's
+# pinned Triton 3.7 at the very end of this file (see the Triton step below).
 ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -659,12 +656,19 @@ else:
 PY
 
 # -----------------------
-# Finalize Triton only after every pip dependency install and the ROCm Torch
-# metadata patch, so pip cannot replace ROCm Torch while resolving dependencies.
+# Triton: install AITER's pinned ROCm 3.7 wheel (AMD index), replacing the base
+# image's 3.5.1.
+#
+# This MUST stay the last pip step, after the torch-ROCm metadata patch above.
+# The base ROCm Torch wheel declares `Requires-Dist: triton==3.5.1`, so any pip
+# install that resolves torch while Triton 3.7 is present drags in PyPI's CUDA
+# triton 3.5.1 and breaks the ROCm stack. The metadata patch above is what drops
+# that pin (see the `Requires-Dist` rewrite in hack.py) — do not install Triton
+# before it, and do not add pip steps after this one.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         cd /sgl-workspace/aiter \
      && test -f .github/scripts/install_triton.sh \
-     && bash .github/scripts/install_triton.sh \
+     && PIP_NO_CACHE_DIR=1 bash .github/scripts/install_triton.sh \
      && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; assert v.startswith('3.7.'), v; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
     fi
 
