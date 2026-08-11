@@ -32,6 +32,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
 )
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
@@ -1024,11 +1025,11 @@ class MiniMaxH3FinalLayer(nn.Module):
 
 
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = _ARCH_DEFAULTS._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_block]
     # parameters mix fp32 (patch projections, timestep embedder, and output
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
-    _compile_conditions = _ARCH_DEFAULTS._compile_conditions
+    _compile_conditions = [is_block]
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping

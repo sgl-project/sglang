@@ -7,6 +7,9 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_blocks_or_transformer_blocks,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -344,9 +347,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     Returns: ``(B, C, T, H, W)`` predicted velocity / noise.
     """
 
-    _fsdp_shard_conditions = SanaWMConfig()._fsdp_shard_conditions
-    _compile_conditions = SanaWMConfig()._compile_conditions
-    _supported_attention_backends = SanaWMConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
+    _compile_conditions = [is_blocks_or_transformer_blocks]
     param_names_mapping = SanaWMConfig().param_names_mapping
     reverse_param_names_mapping = SanaWMConfig().reverse_param_names_mapping
     lora_param_names_mapping: dict = {}
