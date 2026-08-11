@@ -1126,7 +1126,28 @@ def _fwd_kernel_unified(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     # Unified loop: process all KV tokens (prefix + extend)
-    for start_n in range(0, cur_seq_kv_len, BLOCK_N):
+    #
+    # Sliding window: the same bound as the two-stage kernel. The window mask below
+    # compares absolute positions, and cur_window_start appears on both sides, so it
+    # cancels and the mask keeps (q, kv) iff
+    #     cur_seq_prefix_len + cur_block_m * BLOCK_M + i
+    #         <= start_n + j + SLIDING_WINDOW_SIZE.
+    # Row i = 0 always exists (the early return above guarantees
+    # cur_block_m * BLOCK_M < cur_seq_q_len) and the largest kv in a tile is
+    # start_n + BLOCK_N - 1, so the first tile that can hold an unmasked element is
+    # (A // BLOCK_N) * BLOCK_N for
+    # A = cur_seq_prefix_len + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE. Because
+    # this loop spans prefix and extend KV alike, that one floor removes both the
+    # fully-masked prefix tiles and the fully-masked extend tiles below the window.
+    unified_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        unified_start = (
+            tl.maximum(
+                cur_seq_prefix_len + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
+            )
+            // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(unified_start, cur_seq_kv_len, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_kv_len
 
