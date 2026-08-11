@@ -1308,7 +1308,11 @@ jobs:
           )
         )
       )
-    runs-on: linux-mi35x-gpu-8
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi35x-gpu-8]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1360,7 +1364,11 @@ jobs:
           )
         )
       )
-    runs-on: linux-mi35x-gpu-8
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi35x-gpu-8]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
