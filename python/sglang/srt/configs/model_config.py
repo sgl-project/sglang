@@ -1043,13 +1043,11 @@ class ModelConfig:
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
-        # DFlash drafts have no vocab of their own.
-        if self.is_draft_model and not hasattr(self.hf_text_config, "vocab_size"):
-            self.vocab_size = None
-        else:
-            self.vocab_size = self.hf_text_config.vocab_size
-            if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
-                self.vocab_size = self.hf_text_config.vision_vocab_size
+        self.vocab_size = self.hf_text_config.vocab_size
+        # GLM-Image is the only model here whose output head predicts vision tokens.
+        # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
+        if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
+            self.vocab_size = self.hf_text_config.vision_vocab_size
 
     def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
         """Base MLA attention scale from the head dims, then the rope mscale."""
