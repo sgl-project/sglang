@@ -654,30 +654,20 @@ class MooncakeKVManager(CommonKVManager):
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
 
-    def _send_kvcache_generic(
+    def _build_kvcache_transfer_block_groups(
         self,
-        mooncake_session_id: str,
         src_data_ptrs: list[int],
         dst_data_ptrs: list[int],
         item_lens: list[int],
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
-        executor: concurrent.futures.ThreadPoolExecutor,
         state_type: Optional[StateType] = None,
         force_flat: bool = False,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_device_data_ptrs: Optional[set[int]] = None,
-    ) -> int:
-        """
-        Generic KV cache transfer supporting both MHA and MLA architectures.
-        This method is used by both send_kvcache (full pool) and maybe_send_extra.
-
-        ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
-        even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
-        index) whose per-layer list must not be half-split into K/V.
-        """
+    ) -> Optional[List[List[Tuple[int, int, int]]]]:
         # Host and device buffers may use different destination page spaces.
         # Build both transfer plans once, then select per destination buffer.
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -733,7 +723,7 @@ class MooncakeKVManager(CommonKVManager):
                     "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
                     f"layers_current_pp_stage={layers_current_pp_stage}, len(dst_k_ptrs)={len(dst_k_ptrs)}"
                 )
-                return -1
+                return None
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
@@ -773,27 +763,61 @@ class MooncakeKVManager(CommonKVManager):
                 transfer_blocks.append((src_addr, dst_addr, length))
             return transfer_blocks
 
-        # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+        return [
+            set_transfer_blocks(src_ptr, dst_ptr, item_len)
+            for src_ptr, dst_ptr, item_len in layers_params
+        ]
 
-        # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
-            transfer_blocks = []
-            for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+    def _send_kvcache_generic(
+        self,
+        mooncake_session_id: str,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        item_lens: list[int],
+        prefill_data_indices: npt.NDArray[np.int32],
+        dst_data_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        state_type: Optional[StateType] = None,
+        force_flat: bool = False,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+        dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_device_data_ptrs: Optional[set[int]] = None,
+    ) -> int:
+        """
+        Generic KV cache transfer supporting both MHA and MLA architectures.
+        This method is used by both send_kvcache (full pool) and maybe_send_extra.
+
+        ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
+        even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
+        index) whose per-layer list must not be half-split into K/V.
+        """
+        transfer_block_groups = self._build_kvcache_transfer_block_groups(
+            src_data_ptrs=src_data_ptrs,
+            dst_data_ptrs=dst_data_ptrs,
+            item_lens=item_lens,
+            prefill_data_indices=prefill_data_indices,
+            dst_data_indices=dst_data_indices,
+            state_type=state_type,
+            force_flat=force_flat,
+            src_layer_ids=src_layer_ids,
+            dst_layer_ids=dst_layer_ids,
+            dst_device_data_indices=dst_device_data_indices,
+            dst_device_data_ptrs=dst_device_data_ptrs,
+        )
+        if transfer_block_groups is None:
+            return -1
+
+        def process_blocks(transfer_blocks: List[Tuple[int, int, int]]) -> int:
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
+                    process_blocks,
+                    transfer_blocks,
                 )
-                for (src_ptr, dst_ptr, item_len) in layers_params
+                for transfer_blocks in transfer_block_groups
             ]
             for future in concurrent.futures.as_completed(futures):
                 status = future.result()
@@ -805,7 +829,13 @@ class MooncakeKVManager(CommonKVManager):
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
-            return process_layers(layers_params)
+            return process_blocks(
+                [
+                    block
+                    for transfer_blocks in transfer_block_groups
+                    for block in transfer_blocks
+                ]
+            )
 
     def _validate_envelope_kv_layout(
         self,
@@ -891,6 +921,115 @@ class MooncakeKVManager(CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+        )
+
+    def _find_draft_swa_component_index(
+        self, prefill_state_indices: List
+    ) -> Optional[int]:
+        state_types = self.kv_args.state_types
+        for state_type in (StateType.SWA, StateType.SWA_RING):
+            matching_indices = [
+                index
+                for index, item in enumerate(state_types)
+                if item == state_type
+                and index < len(prefill_state_indices)
+                and prefill_state_indices[index] is not None
+            ]
+            if len(matching_indices) >= 2:
+                return matching_indices[-1]
+        return None
+
+    def send_kvcache_with_draft_swa(
+        self,
+        req: TransferInfo,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        prefill_state_indices: List,
+        target_rank_registration_info: KVArgsRegisterInfo,
+    ) -> Optional[Tuple[int, int]]:
+        """Batch the final target KV and DSV4 draft SWA into one RDMA submit.
+
+        Returns ``None`` when the request is not eligible. Otherwise returns the
+        transfer status and the source state-component index consumed here.
+        """
+        if self.enable_custom_mem_pool or not self.is_mla_backend:
+            return None
+
+        component_index = self._find_draft_swa_component_index(
+            prefill_state_indices
+        )
+        if component_index is None:
+            return None
+
+        self._validate_envelope_kv_layout(
+            dst_kv_ptrs,
+            target_rank_registration_info.dst_kv_item_len,
+            target_rank_registration_info.dst_attn_tp_size,
+        )
+
+        state_types = self.kv_args.state_types
+        state_type = state_types[component_index]
+        dst_component_index = resolve_state_component_dst_index(
+            state_types,
+            target_rank_registration_info.dst_state_types,
+            component_index,
+        )
+        if (
+            dst_component_index
+            >= len(target_rank_registration_info.dst_state_data_ptrs)
+            or dst_component_index >= len(req.dst_state_indices)
+        ):
+            return -1, component_index
+
+        src_state_indices = list(prefill_state_indices[component_index])
+        dst_state_indices = list(req.dst_state_indices[dst_component_index])
+        if len(src_state_indices) != len(dst_state_indices):
+            if self._requires_exact_state_index_match(state_type):
+                raise RuntimeError(
+                    f"{state_type.upper()} state index length mismatch: "
+                    f"prefill={len(src_state_indices)}, "
+                    f"dst={len(dst_state_indices)}"
+                )
+            logger.warning(
+                "len(prefill_state_indices) = %s, len(dst_state_indices) = %s",
+                len(src_state_indices),
+                len(dst_state_indices),
+            )
+            common_len = min(len(src_state_indices), len(dst_state_indices))
+            src_state_indices = src_state_indices[:common_len]
+            dst_state_indices = dst_state_indices[:common_len]
+
+        kv_block_groups = self._build_kvcache_transfer_block_groups(
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=self.kv_args.kv_item_lens,
+            prefill_data_indices=prefill_kv_indices,
+            dst_data_indices=dst_kv_indices,
+            src_layer_ids=self.kv_args.kv_layer_ids,
+            dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
+        )
+        state_block_groups = self._build_kvcache_transfer_block_groups(
+            src_data_ptrs=self.kv_args.state_data_ptrs[component_index],
+            dst_data_ptrs=target_rank_registration_info.dst_state_data_ptrs[
+                dst_component_index
+            ],
+            item_lens=self.kv_args.state_item_lens[component_index],
+            prefill_data_indices=np.asarray(src_state_indices, dtype=np.int32),
+            dst_data_indices=np.asarray(dst_state_indices, dtype=np.int32),
+            state_type=state_type,
+        )
+        if kv_block_groups is None or state_block_groups is None:
+            return -1, component_index
+
+        transfer_blocks = [
+            block
+            for block_group in kv_block_groups + state_block_groups
+            for block in block_group
+        ]
+        return (
+            self._transfer_data(req.mooncake_session_id, transfer_blocks),
+            component_index,
         )
 
     def send_kvcache_dcp(
@@ -1267,10 +1406,13 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        skip_component_indices: Optional[set[int]] = None,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
         for i, st in enumerate(state_types):
+            if skip_component_indices and i in skip_component_indices:
+                continue
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
@@ -1746,6 +1888,7 @@ class MooncakeKVManager(CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
+                        batched_state_component_index = None
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -1779,17 +1922,35 @@ class MooncakeKVManager(CommonKVManager):
                             or self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
-                            ret = self.send_kvcache(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                executor,
-                                dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
-                                dst_device_kv_indices=chunked_dst_device_kv_indice,
-                                dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
-                                dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
-                            )
+                            batched_result = None
+                            if (
+                                kv_chunk.is_last_chunk
+                                and kv_chunk.state_indices
+                                and not skip_state
+                                and chunked_dst_device_kv_indice is None
+                            ):
+                                batched_result = self.send_kvcache_with_draft_swa(
+                                    req,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    kv_chunk.state_indices,
+                                    target_rank_registration_info,
+                                )
+                            if batched_result is None:
+                                ret = self.send_kvcache(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                    dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
+                                    dst_device_kv_indices=chunked_dst_device_kv_indice,
+                                    dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
+                                    dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                )
+                            else:
+                                ret, batched_state_component_index = batched_result
                         elif (
                             self.enable_staging
                             and staging_strategy is not None
@@ -1854,6 +2015,11 @@ class MooncakeKVManager(CommonKVManager):
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
+                                    (
+                                        {batched_state_component_index}
+                                        if batched_state_component_index is not None
+                                        else None
+                                    ),
                                 )
                                 if state_rc != 0:
                                     with self.session_lock:
