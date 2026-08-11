@@ -71,11 +71,10 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 }
 
 # None outside a FlashInfer autotune pass; inside one, whether that pass runs the
-# LM head. Not-None is the fact that this forward's output is discarded, so a
-# consumer may take a cheaper or safer path -- attention backends read it through
-# get_in_autotune_dummy_run() to skip a real cross-node exchange. Skipping the LM
-# head also skips its [batch * dp_size, vocab] all-gather, which OOMs under DP
-# attention with a tight mem_fraction_static.
+# LM head. Not-None means the forward's output is discarded -- attention backends
+# read that via get_in_autotune_dummy_run() to skip a cross-node exchange.
+# Skipping the LM head skips its [batch * dp_size, vocab] all-gather, which OOMs
+# under DP attention with a tight mem_fraction_static.
 _autotune_run_lm_head: Optional[bool] = None
 
 
@@ -345,10 +344,9 @@ class LogitsProcessor(nn.Module):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
-        # Autotune dummy run discards this output. `is False` and not `not`: None
-        # means no autotune pass is running, which must not skip anything. Placed
-        # before the MIS / DLLM / common dispatch so all three LM-head paths are
-        # skipped.
+        # Autotune dummy run discards this output. `is False` not `not`: None
+        # means no autotune pass, which must not skip. Placed before the MIS /
+        # DLLM / common dispatch so all three LM-head paths are skipped.
         if _autotune_run_lm_head is False:
             return LogitsProcessorOutput(next_token_logits=None)
 
