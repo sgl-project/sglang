@@ -62,6 +62,9 @@ class _FakeNonStreamingErrorOpenAI:
 
     supports_inline_system = False
 
+    def supports_native_reasoning_history(self):
+        return False
+
     def __init__(self, status_code=400, body=None, content=None, exception=None):
         self._status_code = status_code
         self._body = body
