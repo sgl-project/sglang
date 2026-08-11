@@ -9,10 +9,6 @@ import inspect
 import json
 import logging
 import os
-
-# Registered tests run with the strict config-mutation guard: bare
-# server_args assignments after resolution raise (use ServerArgs.override).
-os.environ.setdefault("SGLANG_STRICT_CONFIG_MUTATION", "1")
 import random
 import re
 import shlex
@@ -2347,6 +2343,28 @@ def _wait_for_gpu_idle_in_ci(
             pynvml.nvmlShutdown()
         except Exception:
             pass
+
+
+def server_args_variant(server_args, **fields):
+    """A modified deep copy of a config, for a test double whose fixture
+    differs from the (possibly published, read-only) config it starts from.
+    The receiver is untouched; the copy keeps its read-only guard.
+
+    A name may also shadow a method with a fixture value (the runner kits set
+    ``use_mla_backend``, a method ModelRunner itself overwrites at init);
+    names that exist nowhere on the class fail loudly."""
+    variant = copy.deepcopy(server_args)
+    cls = type(variant)
+    unknown = {
+        name
+        for name in fields
+        if name not in cls.__dataclass_fields__ and not hasattr(cls, name)
+    }
+    if unknown:
+        raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    for name, value in fields.items():
+        object.__setattr__(variant, name, value)
+    return variant
 
 
 class CustomTestCase(unittest.TestCase):

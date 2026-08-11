@@ -12,7 +12,7 @@ inputs:
   cache_key_prefix:
     description: 'Must match what _pr-test-rust-ext-build.yml saves under.'
     required: false
-    default: rust-ext-x86_64
+    default: rust-ext-x86_64-cp310-cp312
 
 outputs:
   hit:
