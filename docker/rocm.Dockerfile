@@ -113,7 +113,6 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
-ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
 # Base image 950 and args
@@ -134,7 +133,6 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
-ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # Local source stage: with BRANCH_TYPE=local the build context is copied here and
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
@@ -301,8 +299,8 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # from AITER_COMMIT rather than SGLang's nightly version.
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-# Keep the base image's Torch-compatible Triton by default. Override with
-# AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
+# Compile AITER against the base image's Triton; the Triton step at the end of
+# this file swaps in AITER's own pin afterwards.
 ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -727,53 +725,13 @@ RUN cd /tmp/whl \
       *rocm720*) \
         echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
         python hack.py \
+        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
         && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
         ;; \
       *) \
         echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
         ;; \
     esac
-
-
-# -----------------------
-# Hot patch: Triton
-# For ROCm 7.2, this custom build breaks pip dependency management,
-# so future `pip install` will break the ROCm stack.
-# A workaround for this is to reinstall the default triton
-# wheel with the `rocm/pytorch` image in the root directory.
-# For ROCm 7.15, it is a different story:
-# https://github.com/ROCm/rocm-systems/issues/7643
-# Rebuilding tag 3.7.0 seems to workaround this issue without
-# sacrificing accuracy. The previous section to rewrite the metadata
-# of the wheel becomes unnecessary once we apply the trick to fake
-# the version string as we do here.
-RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        TRITON_INSTALLED_VERSION=$(pip show triton 2>/dev/null | grep '^Version:' | cut -d' ' -f2 || echo "") \
-     && TRITON_BASE_VERSION=$(echo "$TRITON_INSTALLED_VERSION" | cut -d'+' -f1) \
-     && TRITON_VERSION_SUFFIX=$(echo "$TRITON_INSTALLED_VERSION" | grep -o '+.*' || echo "") \
-     && echo "Captured Triton version: $TRITON_INSTALLED_VERSION (base: $TRITON_BASE_VERSION, suffix: $TRITON_VERSION_SUFFIX)" \
-     && pip uninstall -y triton \
-     && apt install -y cmake \
-     && git clone ${TRITON_REPO} triton-custom \
-     && cd triton-custom \
-     && git checkout ${TRITON_COMMIT} \
-     && if [ -n "$TRITON_BASE_VERSION" ]; then \
-            TRITON_SOURCE_VERSION=$(grep -oP 'TRITON_VERSION = "\K[^"]+' setup.py || echo "") \
-         && if [ -n "$TRITON_SOURCE_VERSION" ]; then \
-                sed -i "s/TRITON_VERSION = \"$TRITON_SOURCE_VERSION\"/TRITON_VERSION = \"$TRITON_BASE_VERSION\"/" setup.py \
-             && sed -i "s/__version__ = '$TRITON_SOURCE_VERSION'/__version__ = '$TRITON_BASE_VERSION'/" python/triton/__init__.py; \
-            fi \
-         && sed -i '/^def get_git_version_suffix():/,/^def get_triton_version_suffix():/{ /^def get_triton_version_suffix():/!{ /^def get_git_version_suffix():/!d; }; }' setup.py \
-         && sed -i '/^def get_git_version_suffix():/a\    return ""' setup.py; \
-        fi \
-     && pip install -r python/requirements.txt \
-     && if [ -n "$TRITON_VERSION_SUFFIX" ]; then \
-            TRITON_WHEEL_VERSION_SUFFIX="$TRITON_VERSION_SUFFIX" pip install -e .; \
-        else \
-            pip install -e .; \
-        fi \
-     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
-    fi
 
 # -----------------------
 # Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
@@ -804,6 +762,63 @@ else:
     path.write_text(patched)
     print("patched transformers dynamic_module_utils.py (symlink hash fix)")
 PY
+
+# -----------------------
+# Triton.
+#
+# Keep this last. Base ROCm Torch pins triton==3.5.1 and the torch patch above
+# is what drops that pin, so installing Triton any earlier lets the next pip
+# install pull CUDA torch instead. The hip check below is the tripwire.
+#
+# ROCm 7.2 installs the Triton AITER pins, replacing the base image's. No
+# version check on purpose: the pin is AITER's to move, and its installer
+# enforces a floor.
+#
+# ROCm 7.15 cannot use those wheels: they are published per ROCm release and
+# AITER's installer selects the index from the `rocm-core` package, which the
+# pip-installed 7.15 SDK never registers with dpkg. It builds TRITON_COMMIT
+# from source instead, reusing the version string of the Triton the base stage
+# installed so that Torch's pin still resolves (a source build carrying its own
+# version breaks pip dependency resolution for the whole ROCm stack, see
+# https://github.com/ROCm/rocm-systems/issues/7643).
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+      case "${GPU_ARCH}" in \
+        *rocm7_15*) \
+             TRITON_INSTALLED_VERSION=$(pip show triton 2>/dev/null | grep '^Version:' | cut -d' ' -f2 || echo "") \
+          && TRITON_BASE_VERSION=$(echo "$TRITON_INSTALLED_VERSION" | cut -d'+' -f1) \
+          && TRITON_VERSION_SUFFIX=$(echo "$TRITON_INSTALLED_VERSION" | grep -o '+.*' || echo "") \
+          && echo "Captured Triton version: $TRITON_INSTALLED_VERSION (base: $TRITON_BASE_VERSION, suffix: $TRITON_VERSION_SUFFIX)" \
+          && pip uninstall -y triton \
+          && apt install -y cmake \
+          && git clone ${TRITON_REPO} /sgl-workspace/triton-custom \
+          && cd /sgl-workspace/triton-custom \
+          && git checkout ${TRITON_COMMIT} \
+          && if [ -n "$TRITON_BASE_VERSION" ]; then \
+                 TRITON_SOURCE_VERSION=$(grep -oP 'TRITON_VERSION = "\K[^"]+' setup.py || echo "") \
+              && if [ -n "$TRITON_SOURCE_VERSION" ]; then \
+                     sed -i "s/TRITON_VERSION = \"$TRITON_SOURCE_VERSION\"/TRITON_VERSION = \"$TRITON_BASE_VERSION\"/" setup.py \
+                  && sed -i "s/__version__ = '$TRITON_SOURCE_VERSION'/__version__ = '$TRITON_BASE_VERSION'/" python/triton/__init__.py; \
+                 fi \
+              && sed -i '/^def get_git_version_suffix():/,/^def get_triton_version_suffix():/{ /^def get_triton_version_suffix():/!{ /^def get_git_version_suffix():/!d; }; }' setup.py \
+              && sed -i '/^def get_git_version_suffix():/a\    return ""' setup.py; \
+             fi \
+          && pip install -r python/requirements.txt \
+          && if [ -n "$TRITON_VERSION_SUFFIX" ]; then \
+                 TRITON_WHEEL_VERSION_SUFFIX="$TRITON_VERSION_SUFFIX" pip install -e .; \
+             else \
+                 pip install -e .; \
+             fi \
+          && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi \
+          && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}')" \
+          ;; \
+        *) \
+             cd /sgl-workspace/aiter \
+          && test -f .github/scripts/install_triton.sh \
+          && PIP_NO_CACHE_DIR=1 bash .github/scripts/install_triton.sh \
+          && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')" \
+          ;; \
+      esac; \
+    fi
 
 # -----------------------
 # Performance environment variable.

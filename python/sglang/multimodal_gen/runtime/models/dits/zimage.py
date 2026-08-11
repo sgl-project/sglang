@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_zimage_layer
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
@@ -41,6 +42,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -765,7 +769,7 @@ class RopeEmbedder:
 class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
-    _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_zimage_layer]
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         ZImageDitConfig().arch_config.reverse_param_names_mapping
@@ -808,8 +812,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
-        self.config_data = config  # Store config
-        arch_config = config.arch_config
+        arch_config = self.config
 
         self.in_channels = arch_config.in_channels
         self.out_channels = arch_config.out_channels
@@ -1199,7 +1202,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         cached = getattr(self, "_cached_batched_freqs_cis", None)
         if cached is not None and cached[0] == cache_key:
-            return cached[1]
+            return self._pin_for_active_capture(cached[1])
 
         freqs_cis = self._build_batched_freqs_cis(
             images,
@@ -1210,7 +1213,32 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             cap_target_len=cap_target_len,
         )
         self._cached_batched_freqs_cis = (cache_key, freqs_cis)
-        return freqs_cis
+        return self._pin_for_active_capture(freqs_cis)
+
+    def _pin_for_active_capture(self, value):
+        """Keep cache values consumed under CUDA graph capture alive forever.
+
+        The single-slot shape-keyed caches below hold tensors that are pure
+        functions of their cache key. Capturing a second signature (e.g. the
+        next BCG caption bucket, whose static input buffers change every
+        ``data_ptr()``-keyed entry) replaces the slot and frees the old
+        tensors -- but a previously captured graph baked their device
+        addresses, so replaying it dereferences freed memory (observed as an
+        illegal memory access or a hang at the first replayed segment).
+        Pinning every value a capture consumes keeps those addresses alive;
+        contents stay correct because a value never changes for its key.
+        Growth is bounded by O(cache sites x captured signatures) small
+        tensors, and nothing is pinned outside graph capture.
+        """
+        if is_in_breakable_cuda_graph() or (
+            _is_cuda and torch.cuda.is_current_stream_capturing()
+        ):
+            pinned = getattr(self, "_bcg_pinned_cache_values", None)
+            if pinned is None:
+                pinned = []
+                self._bcg_pinned_cache_values = pinned
+            pinned.append(value)
+        return value
 
     def _get_rope_cache(
         self,
@@ -1235,7 +1263,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         cached = getattr(self, cache_attr, None)
         if cached is not None and cached[0] == cache_key:
-            return cached[1]
+            return self._pin_for_active_capture(cached[1])
 
         if cos.dim() == 3:
             batch_size, seq_len = cos.shape[:2]
@@ -1263,7 +1291,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         rope_cache = (cos_sin_cache, positions)
         setattr(self, cache_attr, (cache_key, rope_cache))
-        return rope_cache
+        return self._pin_for_active_capture(rope_cache)
 
     def _get_attn_mask_and_meta(
         self, cache_attr: str, lengths: list[int], target_len: int, device: torch.device
@@ -1279,7 +1307,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         cached = getattr(self, cache_attr, None)
         if cached is not None and cached[0] == cache_key:
-            return cached[1]
+            return self._pin_for_active_capture(cached[1])
 
         positions = torch.arange(target_len, device=device).unsqueeze(0)
         length_tensor = torch.as_tensor(
@@ -1289,7 +1317,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         meta = build_varlen_mask_meta_from_lengths(length_key, target_len, device)
         result = (mask, meta)
         setattr(self, cache_attr, (cache_key, result))
-        return result
+        return self._pin_for_active_capture(result)
 
     def _get_joint_attn_mask_and_meta(
         self,
@@ -1315,7 +1343,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         cached = getattr(self, "_cached_joint_attn_mask_meta", None)
         if cached is not None and cached[0] == cache_key:
-            return cached[1]
+            return self._pin_for_active_capture(cached[1])
 
         image_pos = torch.arange(image_target_len, device=device).unsqueeze(0)
         cap_pos = torch.arange(cap_target_len, device=device).unsqueeze(0)
@@ -1342,7 +1370,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         result = (mask, meta)
         self._cached_joint_attn_mask_meta = (cache_key, result)
-        return result
+        return self._pin_for_active_capture(result)
 
     @staticmethod
     def _has_padding(valid_lens: list[int], target_len: int) -> bool:
