@@ -7,6 +7,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.platforms import current_platform
+
 logger = logging.getLogger(__name__)
 
 CONTROL_WORD_BYTES = 4
@@ -213,7 +215,7 @@ class StreamOrderedMmFeaturePool:
             .view(max_inflight_slices, self.control_words_per_slot)
         )
         self._control_words.zero_()
-        torch.cuda.synchronize(device_id)
+        current_platform.synchronize(device_id)
 
         self._available_ranges = [(self.data_start, memory_size)]
         self._available_slots = list(reversed(range(max_inflight_slices)))
