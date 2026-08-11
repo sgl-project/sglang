@@ -6,7 +6,7 @@ export const config = {
   modelName: "Nemotron 3.5 Lightning",
 
   // Two validated single-GPU platforms, both at TP1/EP1.
-  supportedHardware: ["h100", "dgx-spark"],
+  supportedHardware: ["b200", "h100", "dgx-spark"],
 
   variants: [{ id: "default", label: "Default" }],
 
@@ -63,6 +63,7 @@ sgl-eval run gsm8k \\
   dockerImages: {
     // Multi-arch index (amd64 + arm64), so one tag covers H100 and GB10.
     // Equivalent to dev-cu13-nemotron3-5-lighting.
+    b200:        "lmsysorg/sglang:dev-nemotron3-5-lighting",
     h100:        "lmsysorg/sglang:dev-nemotron3-5-lighting",
     "dgx-spark": "lmsysorg/sglang:dev-nemotron3-5-lighting",
   },
@@ -122,6 +123,118 @@ sgl-eval run gsm8k \\
   },
 
   cells: [
+    // ==== NVIDIA Blackwell (SM100) + NVFP4, single GPU ====
+    // flashinfer Mamba with no_buffer radix caching, stochastic Mamba-cache
+    // rounding and overlap scheduling off. Marlin is pinned because auto
+    // selects flashinfer_trtllm on SM100. The speculative cells also pin
+    // flashinfer attention: left unset, the Nemotron-H override hook picks
+    // trtllm_mha on SM100, which is not what these recipes validated.
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-backend flashinfer",
+        "--mamba-ssm-dtype float16",
+        "--mamba-radix-cache-strategy no_buffer",
+        "--enable-mamba-cache-stochastic-rounding",
+        "--mamba-cache-philox-rounds 5",
+        "--disable-overlap-schedule",
+        "--moe-runner-backend marlin",
+        "--max-running-requests 16",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend flashinfer",
+        "--mamba-backend flashinfer",
+        "--mamba-ssm-dtype float16",
+        "--mamba-radix-cache-strategy no_buffer",
+        "--enable-mamba-cache-stochastic-rounding",
+        "--mamba-cache-philox-rounds 5",
+        "--disable-overlap-schedule",
+        "--moe-runner-backend marlin",
+        "--max-running-requests 16",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-moe-runner-backend marlin",
+        "--speculative-draft-attention-backend flashinfer",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path {{MODEL_NAME}}",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dflash", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend flashinfer",
+        "--mamba-backend flashinfer",
+        "--mamba-ssm-dtype float16",
+        "--mamba-radix-cache-strategy no_buffer",
+        "--enable-mamba-cache-stochastic-rounding",
+        "--mamba-cache-philox-rounds 5",
+        "--disable-overlap-schedule",
+        "--moe-runner-backend marlin",
+        "--max-running-requests 16",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-moe-runner-backend marlin",
+        "--speculative-draft-attention-backend flashinfer",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path nvidia/nemotron-3.5-dflash-w4a16-preview",
+        "--speculative-dflash-block-size 6",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
+      env: [
+        "SGLANG_RAGGED_VERIFY_MODE=static",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend flashinfer",
+        "--mamba-backend flashinfer",
+        "--mamba-ssm-dtype float16",
+        "--mamba-radix-cache-strategy no_buffer",
+        "--enable-mamba-cache-stochastic-rounding",
+        "--mamba-cache-philox-rounds 5",
+        "--disable-overlap-schedule",
+        "--moe-runner-backend marlin",
+        "--max-running-requests 16",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-moe-runner-backend marlin",
+        "--speculative-draft-attention-backend flashinfer",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path nvidia/nemotron-3.5-dspark-w4a16-preview",
+        "--speculative-dspark-block-size 7",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     // ==== NVIDIA Hopper (SM90) + NVFP4, single GPU ====
     // Everything SGLang already resolves for NemotronH on Hopper is left
     // unset: fa3 attention (target and draft), Triton Mamba, the
