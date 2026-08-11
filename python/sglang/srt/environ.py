@@ -431,6 +431,7 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
@@ -651,6 +652,8 @@ class Envs:
     # Number of decode steps between periodic mx.clear_cache() calls.
     # Set to 0 to disable cache clearing entirely.
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
+    # MLX buffer-cache cap in GB.
+    SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)

@@ -1930,6 +1930,14 @@ def _deepseek_v4_sm120_moe(view: Any) -> dict:
     return {}
 
 
+@_register_for("MuseGlimmerForConditionalGeneration", "MuseGlimmerForCausalLM")
+def _muse_glimmer_fp4_gemm_runner_overrides(server_args: Any, hf_config: Any) -> dict:
+    if is_sm120_supported() and server_args.fp4_gemm_runner_backend == "auto":
+        logger.info("Use marlin as FP4 GEMM runner backend on SM120 for Muse Glimmer")
+        return {"fp4_gemm_runner_backend": "marlin"}
+    return {}
+
+
 @register_post_process
 def _sparse_head_overlap_disable(view: Any) -> dict:
 
