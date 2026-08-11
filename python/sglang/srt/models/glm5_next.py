@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
@@ -134,6 +135,14 @@ if _use_aiter_gfx95:
 logger = logging.getLogger(__name__)
 
 
+@torch.compile
+def swiglu_clamped(y: torch.Tensor, limit: float):
+    gate, up = torch.chunk(y, 2, dim=-1)
+    gate = torch.clamp(gate, max=limit)
+    up = torch.clamp(up, min=-limit, max=limit)
+    return F.silu(gate) * up
+
+
 class Glm5NextVisionMLP(GlmOcrVisionMLP):
     def __init__(
         self,
@@ -157,12 +166,37 @@ class Glm5NextVisionMLP(GlmOcrVisionMLP):
 
     def forward(self, x: torch.Tensor):
         gate_up, _ = self.gate_up_proj(x)
-        split = gate_up.shape[-1] // 2
-        gate_up[..., :split].clamp_(max=self.swiglu_limit)
-        gate_up[..., split:].clamp_(
-            min=-self.swiglu_limit, max=self.swiglu_limit
+        x = swiglu_clamped(gate_up, self.swiglu_limit)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class Glm5NextVisionPatchMerger(GlmOcrVisionPatchMerger):
+    def __init__(
+        self,
+        d_model: int,
+        context_dim: int,
+        swiglu_limit: float,
+        quant_config: Optional[QuantizationConfig] = None,
+        bias: bool = False,
+        prefix: str = "",
+        use_data_parallel: bool = False,
+    ) -> None:
+        super().__init__(
+            d_model=d_model,
+            context_dim=context_dim,
+            quant_config=quant_config,
+            bias=bias,
+            prefix=prefix,
+            use_data_parallel=use_data_parallel,
         )
-        x = self.act_fn(gate_up)
+        self.swiglu_limit = swiglu_limit
+
+    def forward(self, x: torch.Tensor):
+        x, _ = self.proj(x)
+        x = self.extra_activation_func(self.post_projection_norm(x))
+        gate_up, _ = self.gate_up_proj(x)
+        x = swiglu_clamped(gate_up, self.swiglu_limit)
         x, _ = self.down_proj(x)
         return x
 
@@ -261,7 +295,7 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         projection_intermediate_size = getattr(
             vision_config, "projection_intermediate_size", None
         )
-        self.merger = GlmOcrVisionPatchMerger(
+        self.merger = Glm5NextVisionPatchMerger(
             d_model=vision_config.out_hidden_size,
             context_dim=(
                 projection_intermediate_size
@@ -272,6 +306,7 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             bias=False,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
+            swiglu_limit=vision_config.swiglu_limit,
         )
 
         self.downsample = nn.Conv2d(
