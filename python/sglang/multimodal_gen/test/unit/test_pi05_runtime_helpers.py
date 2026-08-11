@@ -21,7 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.p
     _preprocess_image,
     _resize_with_pad_image_tensor,
 )
-from sglang.multimodal_gen.runtime.vla.denoise_cuda_graph import (
+from sglang.multimodal_gen.runtime.vla.cuda_graph import (
     VLADenoiseGraphRunner,
     _CapturedDenoiseGraph,
 )
@@ -74,13 +74,42 @@ def test_denoise_graph_skips_prefix_copy_for_same_digest(monkeypatch):
         raise AssertionError("PrefixContext should not be copied on digest hit")
 
     monkeypatch.setattr(
-        "sglang.multimodal_gen.runtime.vla.denoise_cuda_graph._copy_prefix_context_",
+        "sglang.multimodal_gen.runtime.vla.cuda_graph._copy_prefix_context_",
         fail_copy,
     )
 
     runner._sync_context_if_needed(captured, _prefix_context(2.0, "same"))
 
     assert captured.static_prefix_context.past_key_values[0][0].eq(1.0).all()
+
+
+def test_denoise_graph_copies_mutable_prefix_graph_output():
+    runner = VLADenoiseGraphRunner(enabled=True)
+    static_context = _prefix_context(1.0, None)
+    captured = _CapturedDenoiseGraph(
+        graph=object(),
+        static_prefix_context=static_context,
+        static_x_t=torch.empty(1, 2, 4),
+        static_timestep=torch.empty(1),
+        static_output=torch.empty(1, 2, 4),
+        current_context_id=123,
+    )
+    current_context = _prefix_context(2.0, None)
+    current_context.layout["mutable_graph_output"] = True
+
+    runner._sync_context_if_needed(captured, current_context)
+
+    assert captured.static_prefix_context.past_key_values[0][0].eq(2.0).all()
+
+
+def test_prefix_graph_rejects_tensor_parallel_prefix():
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    model.config = Pi05PipelineConfig()
+    model.device = torch.device("cuda")
+    model.runtime_role = "all"
+    model._prefix_language_model = lambda: SimpleNamespace(tensor_parallel=True)
+
+    assert not model._prefix_cuda_graph_enabled()
 
 
 def test_runai_direct_gpu_loader_does_not_reject_split_roles(monkeypatch):

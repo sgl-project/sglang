@@ -27,6 +27,7 @@
 FROM lmsysorg/sglang:v0.5.16 AS base
 
 ARG SGL_DEEP_GEMM_VERSION="0.1.5.post2"
+ARG NVIMGCODEC_VERSION="0.9.0.20"
 
 # Current Kimi-K3 source auto-discovers and builds its PyO3 extensions.
 ARG RUST_VERSION="1.90.0"
@@ -78,6 +79,12 @@ RUN TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
 # The v0.5.16 base contains DeepGEMM 0.1.4.post1.
 RUN python3 -m pip install --no-deps --force-reinstall \
     "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}"
+
+# High-fidelity GPU JPEG decode. The K3 processor enables nvJPEG interpolated
+# chroma upsampling through nvImageCodec and zero-copy DLPack handoff to Torch.
+RUN python3 -m pip install \
+      "nvidia-nvimgcodec-cu13[all]==${NVIMGCODEC_VERSION}" && \
+    rm -rf /root/.cache/pip
 
 # Install the pinned FlashInfer MXFP4 MoE runner cubin pool.
 ARG TRTLLM_GEN_MOE_CUBIN_URL="https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip"
