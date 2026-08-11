@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -12,6 +13,9 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.flash_attention import (
+    flash_attn_varlen_func as _lingbot_fa_varlen,
+)
 from sglang.multimodal_gen.configs.models.dits import LingBotWorldVideoConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -90,9 +94,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
-from sglang.multimodal_gen.runtime.realtime.states import (
-    get_realtime_causal_dit_state,
-)
+from sglang.multimodal_gen.runtime.realtime.states import get_realtime_causal_dit_state
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -193,6 +195,38 @@ class LingBotWorldCamConditioner(nn.Module):
         return (1.0 + cam_scale) * hidden_states + cam_shift
 
 
+_LINGBOT_SP_STRATEGIES = (
+    "ulysses",
+    "kvgather_replicated",
+    "kvgather_sharded",
+    "ring",
+)
+
+
+def lingbot_sp_strategy() -> str:
+    """Which sequence-parallel exchange the causal attention uses.
+
+    `ulysses` splits the cache by head, so history never crosses ranks. The
+    other three split by token or not at all, and each pays for that
+    differently -- see the docstrings on the branches in `forward`.
+    """
+    value = os.environ.get("SGLANG_LINGBOT_SP_STRATEGY", "ulysses").strip().lower()
+    if value not in _LINGBOT_SP_STRATEGIES:
+        raise ValueError(
+            f"SGLANG_LINGBOT_SP_STRATEGY must be one of {_LINGBOT_SP_STRATEGIES}, got {value!r}"
+        )
+    return value
+
+
+def _lingbot_merge_lse(o1, l1, o2, l2):
+    """Online-softmax merge of two partial attention results."""
+    merged = torch.logaddexp(l1, l2)
+    out = o1 * (l1 - merged).exp().unsqueeze(-1) + o2 * (l2 - merged).exp().unsqueeze(
+        -1
+    )
+    return out, merged
+
+
 class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -202,6 +236,20 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 f"num_heads ({self.num_heads}) must be divisible by ulysses_degree ({ulysses_world_size})."
             )
         self.ulysses_num_heads = self.num_heads // ulysses_world_size
+        # kv-gather and ring keep every head on every rank and shard the
+        # queries instead, so they need a full-width attention impl.
+        self.full_head_attn = LocalAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+            supported_attention_backends=(
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.AITER,
+                AttentionBackendEnum.TORCH_SDPA,
+            ),
+        )
         self.ulysses_attn = LocalAttention(
             num_heads=self.ulysses_num_heads,
             head_size=self.head_dim,
@@ -272,6 +320,8 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 cache_start,
             )
 
+        strategy = lingbot_sp_strategy() if sequence_shard_enabled else "ulysses"
+
         if sequence_shard_enabled:
             seq_splits = getattr(forward_batch, "sequence_shard_splits", None)
             if seq_splits is None:
@@ -280,7 +330,9 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 )
             seq_splits = list(seq_splits)
             uniform_seq_splits = _sequence_splits_are_uniform(seq_splits)
-            # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
+
+        if sequence_shard_enabled and strategy == "ulysses":
+            # Trade sequence for heads. Packed so this is one collective, not three.
             qkv = torch.cat([roped_query, roped_key, v], dim=-1)
             qkv = (
                 _usp_input_all_to_all(qkv, head_dim=2)
@@ -288,6 +340,13 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 else _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
+        elif sequence_shard_enabled and strategy == "kvgather_replicated":
+            # Queries stay sharded with every head; only the NEW chunk's K/V is
+            # gathered. History is already identical on every rank because each
+            # step appended the same gathered chunk, so it is never re-synced.
+            kv = torch.cat([roped_key, v], dim=-1)
+            kv = sequence_model_parallel_all_gather(kv, dim=1)
+            roped_key, v = kv.chunk(2, dim=-1)
 
         if (
             not sequence_shard_enabled
@@ -296,15 +355,23 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         ):
             return self.attn(roped_query, roped_key, v)
 
-        cache_head_start = (
-            get_tp_rank() * roped_key.shape[2]
-            if sequence_shard_enabled
-            else self.head_start
-        )
+        if sequence_shard_enabled and strategy == "ulysses":
+            cache_head_start = get_tp_rank() * roped_key.shape[2]
+        elif sequence_shard_enabled:
+            # every non-ulysses strategy keeps all heads resident
+            cache_head_start = 0
+        else:
+            cache_head_start = self.head_start
+        # A token-sharded window stores this rank's slice only, so the chunk
+        # start must be counted in local rows, not global ones.
+        cache_chunk_start = current_start
+        if sequence_shard_enabled and strategy in ("kvgather_sharded", "ring"):
+            cache_chunk_start = current_start // get_sp_world_size()
+
         cache_view = kv_cache.update_and_get_attention_kv(
             key=roped_key,
             value=v,
-            current_chunk_start=current_start,
+            current_chunk_start=cache_chunk_start,
             cache_head_start=cache_head_start,
             recent_window_tokens=(
                 None
@@ -315,20 +382,89 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         )
         if update_cache_only:
             return v
-        attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
-        x = attn_impl(
-            roped_query,
-            cache_view.k,
-            cache_view.v,
-        )
-        if sequence_shard_enabled:
+        if not sequence_shard_enabled:
+            x = self.attn(roped_query, cache_view.k, cache_view.v)
+        elif strategy == "ulysses":
+            x = self.ulysses_attn(roped_query, cache_view.k, cache_view.v)
             assert seq_splits is not None
             x = (
                 _usp_output_all_to_all(x, head_dim=2)
                 if uniform_seq_splits
                 else _usp_output_all_to_all_varlen(x, seq_splits, head_dim=2)
             )
+        elif strategy == "kvgather_replicated":
+            # Output is already this rank's row shard; no second collective.
+            x = self.full_head_attn(roped_query, cache_view.k, cache_view.v)
+        elif strategy == "kvgather_sharded":
+            # The window itself is split by token, so it must be reassembled
+            # every step -- O(window) instead of O(chunk).
+            full_k = sequence_model_parallel_all_gather(cache_view.k, dim=1)
+            full_v = sequence_model_parallel_all_gather(cache_view.v, dim=1)
+            x = self.full_head_attn(roped_query, full_k, full_v)
+        elif strategy == "ring":
+            x = self._ring_attend(roped_query, cache_view.k, cache_view.v)
+        else:
+            raise ValueError(f"unhandled LingBot SP strategy: {strategy}")
         return x
+
+    def _ring_attend(self, q, k, v):
+        """P2P-rotate a token-sharded window, merging each hop's partial result.
+
+        The transfer for the next hop is issued before this hop's attention so
+        the two overlap; unlike a blocking all-gather, no step waits on the
+        whole window before it can start computing.
+        """
+        sp_group = get_sp_group()
+        pg = sp_group.device_group
+        ws = get_sp_world_size()
+        rank = get_sp_parallel_rank()
+        nxt = torch.distributed.get_global_rank(pg, (rank + 1) % ws)
+        prv = torch.distributed.get_global_rank(pg, (rank - 1) % ws)
+
+        bufs = [torch.stack((k, v)), None]
+        bufs[1] = torch.empty_like(bufs[0])
+        cur = 0
+        out_acc = lse_acc = None
+        for step in range(ws):
+            nxt_buf = 1 - cur
+            pending = None
+            if step < ws - 1:
+                pending = torch.distributed.batch_isend_irecv(
+                    [
+                        torch.distributed.P2POp(
+                            torch.distributed.isend, bufs[cur], nxt, group=pg
+                        ),
+                        torch.distributed.P2POp(
+                            torch.distributed.irecv, bufs[nxt_buf], prv, group=pg
+                        ),
+                    ]
+                )
+            result = _lingbot_fa_varlen(
+                q=q,
+                k=bufs[cur][0],
+                v=bufs[cur][1],
+                cu_seqlens_q=None,
+                cu_seqlens_k=None,
+                max_seqlen_q=q.shape[1],
+                max_seqlen_k=bufs[cur][0].shape[1],
+                softmax_scale=self.head_dim**-0.5,
+                causal=False,
+                return_softmax_lse=True,
+                ver=3,
+            )
+            out, lse = result[0], result[1]
+            if lse.shape[-1] == q.shape[1]:
+                lse = lse.transpose(1, 2)
+            out_acc, lse_acc = (
+                (out, lse)
+                if out_acc is None
+                else _lingbot_merge_lse(out_acc, lse_acc, out, lse)
+            )
+            if pending is not None:
+                for op in pending:
+                    op.wait()
+            cur = nxt_buf
+        return out_acc.to(q.dtype)
 
 
 class LingBotWorldTransformerBlock(nn.Module):
@@ -785,13 +921,16 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         else:
             ts_seq_len = None
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep,
-                encoder_hidden_states,
-                encoder_hidden_states_image,
-                timestep_seq_len=ts_seq_len,
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+            timestep_seq_len=ts_seq_len,
         )
         timestep_proj = (
             timestep_proj.unflatten(2, (6, -1))
@@ -1558,13 +1697,16 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 device=hidden_states.device,
             )
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self._prepare_condition_embeddings(
-                timestep=timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_hidden_states_image=encoder_hidden_states_image,
-                crossattn_cache=crossattn_cache,
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self._prepare_condition_embeddings(
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_image=encoder_hidden_states_image,
+            crossattn_cache=crossattn_cache,
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
             dim=0, sizes=timestep.shape
