@@ -145,8 +145,7 @@ class ForwardMetadata:
 
 _AITER_PARTITION_SIZE_ROCM = 256
 
-# Staging page size for the DCP extend path, independent of --page-size. The KV
-# tile is the block size: a 16384^2 chunk measured 5156 ms at 1 vs 39.5 ms at 64.
+# Staging page size for the DCP extend path, independent of --page-size
 _DCP_PREFILL_PAGE_SIZE = 64
 
 
@@ -472,10 +471,6 @@ class AiterAttnBackend(AttentionBackend):
         page_size = self.page_size
         dtype = self.kv_cache_dtype
 
-        # Only thread the round-robin CP flag when DCP is on, so the non-DCP path
-        # stays agnostic to the installed aiter's get_mla_metadata_v1 signature.
-        cprr_kwargs = {"is_cp_round_robin": True} if dcp_enabled() else {}
-
         # For dcp, kv_indptr here is already localized to this rank's shard
         meta = get_mla_metadata_v1(
             qo_indptr,
@@ -498,7 +493,6 @@ class AiterAttnBackend(AttentionBackend):
             intra_batch_mode=intra_batch_mode,
             dtype_q=dtype,
             dtype_kv=dtype,
-            **cprr_kwargs,
         )
 
     def make_mla_prefill_ps_meta_data_buffer(
@@ -1035,7 +1029,7 @@ class AiterAttnBackend(AttentionBackend):
         seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
         max_kv = int(seqused_k.max().item())
         # The KV tile is the paged block size, so block_size 1 collapses each
-        # tile to one token (16384^2 chunk: 5156 ms vs 39 ms at 64). Repack.
+        # tile to one token. Need to repack here.
         paged_kv, block_tables = pack_dcp_kv_into_pages(
             kv_buffer, kv_indptr, kv_indices, bs, _DCP_PREFILL_PAGE_SIZE
         )
@@ -1312,7 +1306,7 @@ class AiterAttnBackend(AttentionBackend):
                 max_q_len = 1
 
                 # DCP decode runs the aiter MLA kernel (builds its own block-table
-                # metadata in forward_decode), so skip the cprr persist metadata.
+                # metadata in forward_decode), so skip the persist metadata.
                 if _use_mla_ps_kernel and dcp_cp_world_size == 1:
                     (
                         work_metadata,
@@ -2168,7 +2162,7 @@ class AiterAttnBackend(AttentionBackend):
                 max_q_len = 1
 
                 # DCP decode builds its own block-table metadata in
-                # forward_decode, so the cprr persist metadata is unused here.
+                # forward_decode, so the persist metadata is unused here.
                 if _use_mla_ps_kernel and dcp_cp_world_size == 1:
                     num_kv_splits = self.max_split_per_batch
 
