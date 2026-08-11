@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-import sglang.srt.multimodal._core.inkling
+from sglang.srt.multimodal._core import common as _rs_common
+from sglang.srt.multimodal._core import inkling as _rs_inkling
 
 
 def py_scaled_dims(
@@ -33,17 +34,34 @@ def py_scaled_dims(
     return scale(width), scale(height)
 
 
-def pil_resize(arr: np.ndarray, tw: int, th: int) -> np.ndarray:
-    return np.array(
-        Image.fromarray(arr).resize((tw, th), resample=Image.Resampling.LANCZOS),
-        dtype=np.uint8,
-    )
+def pil_resize(arr: np.ndarray, tw: int, th: int, filter=Image.Resampling.LANCZOS):
+    return np.array(Image.fromarray(arr).resize((tw, th), resample=filter), np.uint8)
 
 
-def rs_resize(arr: np.ndarray, tw: int, th: int) -> np.ndarray:
-    return sglang.srt.multimodal._core.inkling.resize_rgb(arr, tw, th).reshape(
-        th, tw, 3
+def tv_resize(arr: np.ndarray, tw: int, th: int) -> np.ndarray:
+    """torchvision's uint8 antialias bicubic — ATen's fixed-point kernel."""
+    import torch
+    from torchvision.transforms.v2 import functional as F
+
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    out = F.resize(
+        tensor, [th, tw], interpolation=F.InterpolationMode.BICUBIC, antialias=True
     )
+    return out[0].permute(1, 2, 0).numpy()
+
+
+# Every resampler the Rust resize claims, and its reference: `aten_u8` for a
+# default server, `pil_bicubic` for --disable-fast-image-processor, `pil_lanczos`
+# for inkling.
+REFERENCES = {
+    "pil_lanczos": lambda a, tw, th: pil_resize(a, tw, th, Image.Resampling.LANCZOS),
+    "pil_bicubic": lambda a, tw, th: pil_resize(a, tw, th, Image.Resampling.BICUBIC),
+    "aten_u8": tv_resize,
+}
+
+
+def rs_resize(arr, tw: int, th: int, resample: str = "pil_lanczos") -> np.ndarray:
+    return _rs_common.resize_rgb(arr, tw, th, resample).reshape(th, tw, 3)
 
 
 CASES = [
@@ -59,13 +77,36 @@ CASES = [
 ]
 
 
+@pytest.mark.parametrize("resample", sorted(REFERENCES))
 @pytest.mark.parametrize(
     "h,w,th,tw", CASES, ids=[f"{h}x{w}->{th}x{tw}" for h, w, th, tw in CASES]
 )
-def test_resize_bit_exact(h, w, th, tw):
+def test_resize_bit_exact(h, w, th, tw, resample):
     rng = np.random.default_rng(h * 10000 + w)
     arr = rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
-    np.testing.assert_array_equal(rs_resize(arr, tw, th), pil_resize(arr, tw, th))
+    np.testing.assert_array_equal(
+        rs_resize(arr, tw, th, resample), REFERENCES[resample](arr, tw, th)
+    )
+
+
+@pytest.mark.parametrize("resample", sorted(REFERENCES))
+def test_resize_bit_exact_random_sweep(resample):
+    """`aten_u8`'s weight precision varies with the scale factor, so the fixed
+    cases above are not enough coverage on their own."""
+    rng = np.random.default_rng(7)
+    for h, w, th, tw in rng.integers(1, 200, (40, 4)):
+        arr = rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+        np.testing.assert_array_equal(
+            rs_resize(arr, tw, th, resample),
+            REFERENCES[resample](arr, tw, th),
+            err_msg=f"{h}x{w}->{th}x{tw} under {resample}",
+        )
+
+
+def test_unknown_resample_rejected():
+    arr = np.zeros((4, 4, 3), dtype=np.uint8)
+    with pytest.raises(ValueError, match="unknown resample"):
+        _rs_common.resize_rgb(arr, 2, 2, "nearest")
 
 
 def test_scaled_dims_sweep():
@@ -74,9 +115,9 @@ def test_scaled_dims_sweep():
     sizes += [(2048, 1024), (2049, 100), (1024, 2048), (1, 1), (4096, 4096)]
     for frac, cap in [(2.0, 2048), (1.5, 2048), (3.0, None), (None, None), (2.0, 1)]:
         for w, h in sizes:
-            assert sglang.srt.multimodal._core.inkling.scaled_dims(
+            assert _rs_common.scaled_dims(w, h, frac, cap) == py_scaled_dims(
                 w, h, frac, cap
-            ) == py_scaled_dims(w, h, frac, cap), (
+            ), (
                 w,
                 h,
                 frac,
@@ -93,12 +134,10 @@ def test_decode_patchify_rescaled_matches_pil_pipeline():
     arr = rng.integers(0, 256, (1080, 1920, 3), dtype=np.uint8)
     buf = io.BytesIO()
     Image.fromarray(arr).save(buf, format="PNG")
-    h, w, bits = sglang.srt.multimodal._core.inkling.decode_patchify(
-        buf.getvalue(), 40, 2.0, 2048
-    )
+    h, w, bits = _rs_inkling.decode_patchify(buf.getvalue(), 40, 2.0, 2048)
     assert (w, h) == py_scaled_dims(1920, 1080, 2.0, 2048)
     ref_arr = pil_resize(arr, w, h)
-    ref_bits = sglang.srt.multimodal._core.inkling.patchify_rgb(ref_arr, 40)
+    ref_bits = _rs_inkling.patchify_rgb(ref_arr, 40)
     np.testing.assert_array_equal(bits, ref_bits)
     assert torch.from_numpy(bits).view(torch.bfloat16).shape[0] > 0
 

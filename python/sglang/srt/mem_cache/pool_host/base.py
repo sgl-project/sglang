@@ -94,8 +94,11 @@ class HostKVCache(abc.ABC):
         allocator_type: str = "default",
         dcp_size: int = 1,
         dcp_rank: int = 0,
+        *,
+        pool_label: str = "kv",
     ):
         self.device_pool = device_pool
+        self.pool_label = pool_label
         # page_size arrives widened (x dcp_size); size/page_size/page_num are physical.
         self.dcp_size = dcp_size
         self.dcp_rank = dcp_rank
@@ -127,9 +130,10 @@ class HostKVCache(abc.ABC):
 
         if self.size <= device_pool.size:
             logger.warning(
-                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                pool_label,
                 self.size,
                 device_pool.size,
             )
@@ -146,9 +150,26 @@ class HostKVCache(abc.ABC):
                 f"size of the hierarchical cache."
             )
         else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+            draft_layer_num = self.layer_num - self.target_layer_num
+            if draft_layer_num > 0:
+                logger.info(
+                    "Allocating %s hierarchical KV host pool: %d tokens, "
+                    "%.2f GB host memory, packed MTP KV layers: "
+                    "target_layers=%d, draft_layers=%d, total_layers=%d.",
+                    pool_label,
+                    self.size,
+                    requested_bytes / 1e9,
+                    self.target_layer_num,
+                    draft_layer_num,
+                    self.layer_num,
+                )
+            else:
+                logger.info(
+                    "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
+                    pool_label,
+                    self.size,
+                    requested_bytes / 1e9,
+                )
 
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)
@@ -208,7 +229,6 @@ class HostKVCache(abc.ABC):
         return start <= layer_id < end
 
     def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
-        """Map a full local device layer id to its compacted host-buffer slot."""
         start, _ = self._device_owned_layer_range(device_pool)
         return layer_id - start
 
@@ -222,7 +242,14 @@ class HostKVCache(abc.ABC):
 
     @abc.abstractmethod
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ) -> None:
         """
         Load KV data from the host memory pool to the device memory pool for a specific layer.
