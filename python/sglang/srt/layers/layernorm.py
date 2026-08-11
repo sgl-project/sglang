@@ -170,9 +170,31 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 
+_has_add_gemma_rms_norm = False
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+
+    # `sgl_kernel_npu.norm.add_rmsnorm_bias` pulls
+    # `triton.language.extra.cann.extension`, which only ships with
+    # triton-ascend 3.2.1+ / CANN 9.0.0+. Older combinations (e.g. the
+    # triton-ascend 3.2.0 wheel on pypi, which exposes
+    # `triton.language.extra.ascend` instead) raise ModuleNotFoundError at
+    # import time and abort sglang startup even though
+    # `forward_npu` already has a fully-native fallback keyed off
+    # `SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM`. Degrade gracefully: if the
+    # kernel is unavailable, log once and force that native path.
+    try:
+        from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+
+        _has_add_gemma_rms_norm = True
+    except (ImportError, AttributeError) as _sgl_kernel_npu_import_err:
+        add_gemma_rms_norm = None  # sentinel; forward_npu won't call it
+        logger.info(
+            "sgl_kernel_npu.norm.add_rmsnorm_bias unavailable (%s); "
+            "GemmaRMSNorm.forward_npu will use the native fallback "
+            "(equivalent to setting SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM=1).",
+            _sgl_kernel_npu_import_err,
+        )
 
 
 @lru_cache(maxsize=1)
@@ -1138,7 +1160,13 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
+        # Second condition matches the module-level fallback set when
+        # sgl_kernel_npu is missing (e.g. triton-ascend < 3.2.1); both routes
+        # land on forward_native, so behavior is identical to explicit opt-in.
+        if (
+            envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get()
+            or not _has_add_gemma_rms_norm
+        ):
             return self.forward_native(x, residual)
         if residual is not None:
             if post_residual_addition is not None:
