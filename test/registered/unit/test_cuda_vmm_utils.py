@@ -135,7 +135,6 @@ def test_default_handle_type_fallback(monkeypatch, rejected, expected) -> None:
         prop = make_device_allocation_prop(device_id)
         assert selected == expected
         assert prop.requestedHandleTypes == expected
-        assert isinstance(prop.requestedHandleTypes, drv.CUmemAllocationHandleType)
         assert prop.allocFlags.gpuDirectRDMACapable == 0
 
         explicit = make_device_allocation_prop(
@@ -144,20 +143,13 @@ def test_default_handle_type_fallback(monkeypatch, rejected, expected) -> None:
             gpu_direct_rdma=True,
         )
         assert explicit.requestedHandleTypes == _FABRIC
-        assert isinstance(explicit.requestedHandleTypes, drv.CUmemAllocationHandleType)
         assert explicit.allocFlags.gpuDirectRDMACapable == 1
 
         non_exportable = make_device_allocation_prop(device_id, handle_types=None)
         assert non_exportable.requestedHandleTypes == 0
-        assert isinstance(
-            non_exportable.requestedHandleTypes, drv.CUmemAllocationHandleType
-        )
 
         explicit_none = make_device_allocation_prop(device_id, handle_types=0)
         assert explicit_none.requestedHandleTypes == 0
-        assert isinstance(
-            explicit_none.requestedHandleTypes, drv.CUmemAllocationHandleType
-        )
 
         with pytest.raises(ValueError, match="handle_types must be"):
             make_device_allocation_prop(device_id, handle_types="fabric")
@@ -165,6 +157,46 @@ def test_default_handle_type_fallback(monkeypatch, rejected, expected) -> None:
             make_device_allocation_prop(device_id, handle_types=42)
     finally:
         get_device_allocation_handle_type.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("handle_types", "expected"),
+    [
+        (None, drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE),
+        (0, drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE),
+        (_POSIX_FD, _POSIX_FD),
+        (_FABRIC, _FABRIC),
+    ],
+)
+def test_allocation_prop_assigns_handle_type_enum(
+    monkeypatch, handle_types, expected
+) -> None:
+    """CUDA bindings 13.0.x reject integer VMM handle types at assignment."""
+
+    class Fields:
+        pass
+
+    class StrictAllocationProp:
+        def __init__(self):
+            self.location = Fields()
+            self.allocFlags = Fields()
+            self._requested_handle_types = None
+
+        @property
+        def requestedHandleTypes(self):
+            return self._requested_handle_types
+
+        @requestedHandleTypes.setter
+        def requestedHandleTypes(self, value):
+            if not isinstance(value, drv.CUmemAllocationHandleType):
+                raise TypeError("requestedHandleTypes requires a CUDA enum")
+            self._requested_handle_types = value
+
+    monkeypatch.setattr(drv, "CUmemAllocationProp", StrictAllocationProp)
+
+    prop = make_device_allocation_prop(0, handle_types=handle_types)
+
+    assert prop.requestedHandleTypes is expected
 
 
 def test_granularity_defaults_to_recommended(monkeypatch) -> None:
