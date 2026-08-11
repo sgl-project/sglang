@@ -45,11 +45,26 @@ def resolve_model_directory(model_path: str, revision: Optional[str] = None) -> 
     Uses mlx-lm's resolver so the directory is byte-identical to what a
     direct ``mlx_lm.load`` call would consume; existing local paths are
     returned as-is (no network access). mlx-lm 0.31.x exposes this as
-    ``mlx_lm.utils._download`` (formerly ``get_model_path``).
+    ``mlx_lm.utils._download`` (formerly ``get_model_path``); mlx-lm is an
+    unpinned dependency, so accept either name and fail with the reason
+    rather than a bare ImportError if it is renamed again.
     """
-    from mlx_lm.utils import _download
+    from mlx_lm import utils as mlx_lm_utils
 
-    return Path(_download(model_path, revision=revision))
+    resolver = getattr(mlx_lm_utils, "_download", None) or getattr(
+        mlx_lm_utils, "get_model_path", None
+    )
+    if resolver is None:
+        raise RemoteCodeGateError(
+            "this mlx-lm exposes neither mlx_lm.utils._download nor "
+            "mlx_lm.utils.get_model_path, so the checkpoint directory cannot "
+            "be resolved for inspection before mlx-lm loads it"
+        )
+    resolved = resolver(model_path, revision=revision)
+    # get_model_path returned (path, config) in some releases.
+    if isinstance(resolved, tuple):
+        resolved = resolved[0]
+    return Path(resolved)
 
 
 def ensure_remote_code_allowed(model_dir: Path, trust_remote_code: bool) -> None:

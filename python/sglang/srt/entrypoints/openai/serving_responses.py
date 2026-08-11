@@ -591,7 +591,6 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
-        processed_messages.skip_special_tokens = chat_request.skip_special_tokens
 
         if is_multimodal:
             request_prompts = [processed_messages.prompt]
@@ -2008,6 +2007,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         total_tokens_meta = 0
         reasoning_tokens_meta = 0
         finish_reason: Optional[dict[str, Any]] = None
+        flushed = False
         stream_offset = 0
         incremental = self.tokenizer_manager.server_args.incremental_streaming_output
 
@@ -2215,9 +2215,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                     stream_offset = len(text)
                 if not delta and finish_reason is None:
                     continue
+                # finish_reason is sticky, so gate on `flushed` to drain the
+                # parsers exactly once no matter how many terminal chunks arrive.
                 flush = (
-                    finish_reason is not None and finish_reason.get("type") != "abort"
+                    not flushed
+                    and finish_reason is not None
+                    and finish_reason.get("type") != "abort"
                 )
+                flushed = flushed or flush
 
                 if reasoning_parser_obj is not None:
                     reasoning_chunk, delta = reasoning_parser_obj.parse_stream_chunk(

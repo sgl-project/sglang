@@ -351,10 +351,12 @@ class BaseFormatDetector(ABC):
         raise NotImplementedError()
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
-        """Called once when the stream ends; flush any buffered state.
+        """Called when the stream ends; flush any buffered state.
 
         Detectors that hold text back while waiting for a marker that can no
         longer arrive (the stream is over) override this to release it.
+        Overrides should be idempotent: there is nothing left to release the
+        second time, and callers see several chunks carrying a finish reason.
         """
         return StreamingParseResult()
 
