@@ -842,8 +842,15 @@ class MiniMaxM3Attention(nn.Module):
         if type(ip.quant_method) is not type(qm):
             return
 
-        convert_mxfp8_to_block = getattr(qm, "convert_mxfp8_to_block", False)
         is_unquant = isinstance(qm, UnquantizedLinearMethod)
+        # Whether the loader pass would rewrite this layer's weights at load
+        # (block-fp8 or rowwise-fp8 conversion); the holder must run the same
+        # pass on the concatenated weights since the loader skips it.
+        needs_load_convert = getattr(qm, "convert_mxfp8_to_block", False) or (
+            not is_unquant
+            and getattr(qm, "use_mxfp8", False)
+            and envs.SGLANG_FORCE_MXFP8_PTPC_DENSE.get()
+        )
         use_mxfp8 = getattr(qm, "use_mxfp8", False) and hasattr(qp, "weight_scale_inv")
         if not (is_unquant or use_mxfp8):
             return
@@ -863,7 +870,7 @@ class MiniMaxM3Attention(nn.Module):
             getattr(qp, "input_size_per_partition", qp.input_size),
             [qp.output_size_per_partition, ip.output_size_per_partition],
             getattr(qp, "orig_dtype", qp.params_dtype),
-            convert_mxfp8_to_block=convert_mxfp8_to_block,
+            convert_mxfp8_to_block=needs_load_convert,
         )
         self.add_module("fused_qkv_index_proj", holder)
         self._fused_qkv_index = holder

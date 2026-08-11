@@ -694,6 +694,15 @@ class Envs:
     # the aiter block-fp8 GEMM (fast at large M). 0 disables the hybrid. Costs one
     # BF16 weight copy per dense linear.
     SGLANG_OPT_MXFP8_DENSE_BF16_DECODE_M = EnvInt(0)
+    # Convert MXFP8 *dense linear* weights to per-channel (rowwise) fp8 at load and
+    # run them through aiter's per-token x per-channel bpreshuffle GEMM (flydsl,
+    # ~1.45 TB/s at M=1 vs ~0.5 for the block-scale CK path). Coarsens the 1x32
+    # weight scales to per-row — gate accuracy (GSM8K) before adopting.
+    SGLANG_FORCE_MXFP8_PTPC_DENSE = EnvBool(False)
+    # With the dense block-convert: batches of at most this many tokens run the
+    # dense linear through the rowwise-fp8 aiter GEMM above instead of the
+    # block-fp8 GEMM (fast at large M). Takes precedence over the BF16 hybrid.
+    SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M = EnvInt(0)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
