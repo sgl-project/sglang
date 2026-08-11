@@ -207,7 +207,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
 
         with self._lock:
             inflight = self._inflight.get(key)
-            if inflight is None:
+            if inflight is None or inflight[1] != self._generation:
                 future = concurrent.futures.Future()
                 generation = self._generation
                 self._inflight[key] = (future, generation)
@@ -261,7 +261,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
 
                 self.misses += 1
                 inflight = self._inflight.get(key)
-                if inflight is None:
+                if inflight is None or inflight[1] != self._generation:
                     future: concurrent.futures.Future[V] = concurrent.futures.Future()
                     generation = self._generation
                     self._inflight[key] = (future, generation)

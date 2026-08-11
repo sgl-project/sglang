@@ -622,8 +622,24 @@ class MultimodalInputs:
 
     def release_features(self):
         """Release feature tensors to free GPU memory."""
+        from sglang.srt.mem_cache.multimodal_cache import (
+            MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+        )
+
+        lease_ids = set()
         for item in self.mm_items:
             item.feature = None
+            lease_id = item.model_specific_data.pop(
+                MM_EMBEDDING_CACHE_LEASE_ID_KEY, None
+            )
+            if lease_id is not None:
+                lease_ids.add(lease_id)
+        if lease_ids:
+            from sglang.srt.managers import mm_schedule
+
+            if mm_schedule.embedding_cache is not None:
+                for lease_id in lease_ids:
+                    mm_schedule.embedding_cache.release_lease(lease_id)
 
     @staticmethod
     def from_processor_output(obj: MultimodalProcessorOutput):

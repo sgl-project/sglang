@@ -302,7 +302,48 @@ class TokenizerControlMixin:
         )[0]
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
+        if result.success and self.server_args.language_only:
+            encoder_error = await self._flush_encoder_mm_caches()
+            if encoder_error is not None:
+                return FlushCacheReqOutput(
+                    success=False,
+                    message=f"{result.message} Encoder cache flush failed: {encoder_error}",
+                )
         return result
+
+    async def _flush_encoder_mm_caches(self: TokenizerManager) -> Optional[str]:
+        import aiohttp
+
+        urls = list(dict.fromkeys(getattr(self.mm_receiver, "encode_urls", [])))
+        if not urls:
+            return None
+        timeout = aiohttp.ClientTimeout(total=10.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                responses = await asyncio.gather(
+                    *(session.post(f"{url.rstrip('/')}/flush_cache") for url in urls),
+                    return_exceptions=True,
+                )
+                failures = []
+                for url, response in zip(urls, responses):
+                    if isinstance(response, BaseException):
+                        failures.append(f"{url}: {response}")
+                        continue
+                    if response.status >= 300:
+                        failures.append(f"{url}: HTTP {response.status}")
+                    response.release()
+                return "; ".join(failures) or None
+        except Exception as error:
+            return str(error)
+
+    async def _clear_mm_caches_after_model_update(
+        self: TokenizerManager,
+    ) -> Optional[str]:
+        if self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
+        if self.server_args.language_only:
+            return await self._flush_encoder_mm_caches()
+        return None
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
@@ -463,8 +504,11 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_distributed_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
+        if success and obj.flush_cache:
+            encoder_error = await self._clear_mm_caches_after_model_update()
+            if encoder_error is not None:
+                success = False
+                message += f" Encoder cache flush failed: {encoder_error}"
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -526,8 +570,11 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
+        if success and obj.flush_cache:
+            encoder_error = await self._clear_mm_caches_after_model_update()
+            if encoder_error is not None:
+                success = False
+                message += f" Encoder cache flush failed: {encoder_error}"
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -563,8 +610,11 @@ class TokenizerControlMixin:
             logger.error(error_msg)
             success, message = False, error_msg
 
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
+        if success and obj.flush_cache:
+            encoder_error = await self._clear_mm_caches_after_model_update()
+            if encoder_error is not None:
+                success = False
+                message += f" Encoder cache flush failed: {encoder_error}"
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."

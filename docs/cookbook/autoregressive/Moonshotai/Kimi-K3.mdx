@@ -305,6 +305,19 @@ default) on the base GPU and fall back to CPU per tensor when full. This setting
 does not control EPD encoder output or PD KV/KDA transfer. K3 already defaults to
 2 processor workers and 16 I/O workers; leave those flags unset unless tuning.
 
+#### Repeated-image cache
+
+K3 automatically uses a 256 MiB CPU preprocess cache. Keep the default for
+multi-turn agents; set `--mm-preprocess-cache-size-mb 0` to disable it. The cache
+does not reserve HBM. Only enable `--trust-mm-content-hashes` when your caller
+computes SHA-256 from immutable media bytes.
+
+In EPD, add `--enable-prefix-mm-cache` to the encoder role for complete local
+reuse; `--enable-mm-global-cache` optionally shares embeddings through Mooncake.
+The normal and low-HBM unified profiles need no extra cache flag. See
+[VLM preprocessing and caching](../../../docs/advanced_features/vlm_preprocessing_cache)
+for the data flow and APIs.
+
 #### VLM compatibility
 
 | Feature | K3 behavior |

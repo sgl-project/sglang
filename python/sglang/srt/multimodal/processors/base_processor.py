@@ -21,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
+    PreprocessCacheLookup,
     build_processor_fingerprint,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
@@ -191,6 +192,17 @@ class BaseMultimodalProcessor(ABC):
     auto_mm_io_worker_num = 4
     auto_mm_preprocess_cache_size_mb = 0
     supports_mm_processor_concurrency = False
+    supports_early_mm_cache = False
+
+    async def lookup_preprocess_cache(
+        self, image_data, request_obj
+    ) -> Optional[PreprocessCacheLookup]:
+        """Return reusable per-media metadata before full preprocessing.
+
+        Processors opt in by overriding this method. The generic serving path
+        remains unaware of model-specific artifact types.
+        """
+        return None
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -238,6 +250,7 @@ class BaseMultimodalProcessor(ABC):
         self.trust_mm_content_hashes = bool(
             getattr(self.server_args, "trust_mm_content_hashes", False)
         )
+        self._preprocess_metrics_callback = None
         self.processor_fingerprint = build_processor_fingerprint(
             self, hf_config, server_args
         )
@@ -403,6 +416,13 @@ class BaseMultimodalProcessor(ABC):
                 self.server_args.base_gpu_id,
                 self.server_args.tp_size,
             )
+
+    def set_preprocess_metrics_callback(self, callback) -> None:
+        self._preprocess_metrics_callback = callback
+
+    def observe_preprocess_phase(self, phase: str, seconds: float) -> None:
+        if self._preprocess_metrics_callback is not None:
+            self._preprocess_metrics_callback(phase, seconds)
 
     @property
     def keep_mm_features_on_device(self) -> bool:

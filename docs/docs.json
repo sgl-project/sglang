@@ -937,6 +937,7 @@
               "docs/advanced_features/lora",
               "docs/advanced_features/pd_disaggregation",
               "docs/advanced_features/epd_disaggregation",
+              "docs/advanced_features/vlm_preprocessing_cache",
               "docs/advanced_features/pipeline_parallelism",
               {
                 "group": "Hierarchical KV Caching (HiCache)",

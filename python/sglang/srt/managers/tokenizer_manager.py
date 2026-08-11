@@ -27,6 +27,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from array import array
 from collections import deque
 from contextlib import nullcontext
@@ -72,6 +73,10 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
+    MMEmbeddingCacheAcquire,
+    MMEmbeddingCacheAcquireOutput,
+    MMEmbeddingCacheLeaseMissOutput,
+    MMEmbeddingCacheRelease,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     ScaleElasticEPReqInput,
@@ -278,6 +283,13 @@ class ReqState:
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _MMCacheRetryContext:
+    request: GenerateReqInput
+    lease_id: str
+    routed_dp_rank: int
 
 
 def _slice_streaming_output_meta_info(
@@ -568,6 +580,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state: Dict[str, ReqState] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
+        self._mm_cache_acquire_futures: Dict[
+            str, asyncio.Future[MMEmbeddingCacheAcquireOutput]
+        ] = {}
+        self._mm_cache_retry_contexts: Dict[str, _MMCacheRetryContext] = {}
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -711,6 +727,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
                 bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
             )
+            if self.mm_processor is not None:
+                self.mm_processor.set_preprocess_metrics_callback(
+                    self.metrics_collector.observe_mm_preprocess_phase
+                )
 
             start_cpu_monitor_thread("tokenizer")
 
@@ -744,6 +764,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
+                (
+                    MMEmbeddingCacheAcquireOutput,
+                    self._handle_mm_embedding_cache_acquire_output,
+                ),
+                (
+                    MMEmbeddingCacheLeaseMissOutput,
+                    self._handle_mm_embedding_cache_lease_miss,
+                ),
             ]
         )
         self.init_communicators(self.server_args)
@@ -984,6 +1012,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        *,
+        allow_mm_cache_lease: bool = True,
     ):
         """Tokenize one request."""
         # Tokenize
@@ -1031,6 +1061,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             contains_mm_input or is_mossvl
         )
 
+        preprocess_cache_lookup = None
+        featureless_hit_mask = None
+        embedding_lease_id = None
+        lease_dp_rank = None
         if should_run_mm_processor:
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
@@ -1041,6 +1075,89 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if contains_mm_input:
                 self._validate_mm_limits(obj)
                 self._normalize_mm_content_hashes(obj)
+
+            if (
+                allow_mm_cache_lease
+                and isinstance(obj, GenerateReqInput)
+                and obj.parallel_sample_num == 1
+                and obj.image_data
+                and not self.server_args.language_only
+            ):
+                lookup_start = time.perf_counter()
+                try:
+                    preprocess_cache_lookup = (
+                        await self.mm_processor.lookup_preprocess_cache(
+                            obj.image_data, obj
+                        )
+                    )
+                except ValueError:
+                    if self.enable_metrics:
+                        self.metrics_collector.record_mm_preprocess_cache(
+                            "invalid", len(obj.image_data)
+                        )
+                    raise
+                finally:
+                    if self.enable_metrics:
+                        self.metrics_collector.observe_mm_preprocess_phase(
+                            "hash", time.perf_counter() - lookup_start
+                        )
+                if self.enable_metrics:
+                    if preprocess_cache_lookup is None:
+                        if self.mm_processor.supports_early_mm_cache:
+                            self.metrics_collector.record_mm_preprocess_cache(
+                                "bypass", len(obj.image_data)
+                            )
+                    else:
+                        hits = sum(
+                            value is not None
+                            for value in preprocess_cache_lookup.feature_hashes
+                        )
+                        self.metrics_collector.record_mm_preprocess_cache("hit", hits)
+                        self.metrics_collector.record_mm_preprocess_cache(
+                            "miss", len(obj.image_data) - hits
+                        )
+                        for source in preprocess_cache_lookup.identity_sources:
+                            self.metrics_collector.record_mm_content_identity(source)
+                        cache_stats = self.mm_processor.mm_preprocess_cache.stats()
+                        self.metrics_collector.set_mm_preprocess_cache_state(
+                            cache_stats["entries"],
+                            cache_stats["size_bytes"],
+                            cache_stats["evictions"],
+                            cache_stats["singleflight_joins"],
+                        )
+                if preprocess_cache_lookup is not None and any(
+                    value is not None
+                    for value in preprocess_cache_lookup.feature_hashes
+                ):
+                    try:
+                        acquire = await self._acquire_mm_embedding_cache(
+                            obj, input_ids, preprocess_cache_lookup.feature_hashes
+                        )
+                    except Exception as error:
+                        acquire = None
+                        logger.warning(
+                            "Multimodal embedding-cache acquire failed; "
+                            "continuing with processor features: %s",
+                            error,
+                        )
+                    if acquire is not None:
+                        obj.routed_dp_rank = acquire.routed_dp_rank
+                        featureless_hit_mask = acquire.hit_mask
+                        embedding_lease_id = acquire.lease_id
+                        lease_dp_rank = acquire.routed_dp_rank
+                    if self.enable_metrics:
+                        hit_count = sum(acquire.hit_mask) if acquire is not None else 0
+                        self.metrics_collector.record_mm_embedding_acquire(
+                            "hit", hit_count
+                        )
+                        self.metrics_collector.record_mm_embedding_acquire(
+                            "miss",
+                            len(preprocess_cache_lookup.feature_hashes) - hit_count,
+                        )
+                        for stage in ("processor", "transport", "vit"):
+                            self.metrics_collector.record_mm_skipped_stage(
+                                stage, hit_count
+                            )
 
             mm_inputs = None
             mm_processor_input = (
@@ -1069,12 +1186,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=mm_processor_input,
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
+                    mm_inputs = await self._run_mm_processor(
+                        obj,
+                        mm_processor_input,
+                        preprocess_cache_lookup,
+                        featureless_hit_mask,
+                        embedding_lease_id,
+                        lease_dp_rank,
                     )
             elif (
                 self.server_args.language_only
@@ -1084,12 +1202,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=mm_processor_input,
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
+                mm_inputs = await self._run_mm_processor(
+                    obj,
+                    mm_processor_input,
+                    preprocess_cache_lookup,
+                    featureless_hit_mask,
+                    embedding_lease_id,
+                    lease_dp_rank,
                 )
 
             if mm_inputs and mm_inputs.input_ids is not None:
@@ -1140,10 +1259,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
-        self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
-        )
+        try:
+            self._validate_one_request(obj, input_ids)
+            tokenized_obj = self._create_tokenized_object(
+                obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+            )
+        except BaseException:
+            if embedding_lease_id is not None:
+                self._release_mm_embedding_cache(embedding_lease_id, lease_dp_rank)
+            raise
+        if embedding_lease_id is not None:
+            self._mm_cache_retry_contexts[obj.rid] = _MMCacheRetryContext(
+                request=obj,
+                lease_id=embedding_lease_id,
+                routed_dp_rank=lease_dp_rank,
+            )
+        return tokenized_obj
 
     @staticmethod
     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
@@ -1175,6 +1306,126 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(f"Conflicting content hashes for image_data[{index}]")
             normalized.append(provided or embedded)
         obj.mm_content_hashes = normalized
+
+    async def _run_mm_processor(
+        self,
+        obj,
+        mm_processor_input,
+        preprocess_cache_lookup,
+        featureless_hit_mask,
+        embedding_lease_id,
+        lease_dp_rank,
+    ):
+        start = time.perf_counter()
+        try:
+            return await self.mm_processor.process_mm_data_async(
+                image_data=obj.image_data,
+                audio_data=obj.audio_data,
+                input_text=mm_processor_input,
+                request_obj=obj,
+                max_req_input_len=self.max_req_input_len,
+                preprocess_cache_lookups=(
+                    preprocess_cache_lookup.processor_state
+                    if preprocess_cache_lookup is not None
+                    else None
+                ),
+                featureless_hit_mask=featureless_hit_mask,
+                embedding_lease_id=embedding_lease_id,
+            )
+        except BaseException:
+            if embedding_lease_id is not None:
+                self._release_mm_embedding_cache(embedding_lease_id, lease_dp_rank)
+            raise
+        finally:
+            if self.enable_metrics:
+                self.metrics_collector.observe_mm_preprocess_phase(
+                    "total", time.perf_counter() - start
+                )
+
+    async def _acquire_mm_embedding_cache(
+        self,
+        obj: GenerateReqInput,
+        input_ids,
+        feature_hashes: tuple[Optional[int], ...],
+    ) -> MMEmbeddingCacheAcquireOutput:
+        acquire_id = f"{obj.rid}:mm-cache:{uuid.uuid4().hex}"
+        future = asyncio.get_running_loop().create_future()
+        self._mm_cache_acquire_futures[acquire_id] = future
+        request = MMEmbeddingCacheAcquire(
+            rid=acquire_id,
+            feature_hashes=list(feature_hashes),
+            input_ids=list(input_ids or []),
+            routed_dp_rank=obj.routed_dp_rank,
+            bootstrap_room=obj.bootstrap_room,
+        )
+        try:
+            await self._async_dispatch_to_scheduler(request)
+            return await asyncio.wait_for(future, timeout=30.0)
+        finally:
+            self._mm_cache_acquire_futures.pop(acquire_id, None)
+
+    def _release_mm_embedding_cache(self, lease_id: str, routed_dp_rank: int) -> None:
+        self._dispatch_to_scheduler(
+            MMEmbeddingCacheRelease(
+                lease_id=lease_id,
+                routed_dp_rank=routed_dp_rank,
+            )
+        )
+
+    def _handle_mm_embedding_cache_acquire_output(
+        self, output: MMEmbeddingCacheAcquireOutput
+    ) -> None:
+        future = self._mm_cache_acquire_futures.get(output.rid)
+        if future is not None and not future.done():
+            future.set_result(output)
+        elif output.lease_id is not None:
+            # The requester timed out or was cancelled while the control message
+            # was in flight. Do not leave its scheduler-side pins behind.
+            self._release_mm_embedding_cache(output.lease_id, output.routed_dp_rank)
+
+    def _handle_mm_embedding_cache_lease_miss(
+        self, output: MMEmbeddingCacheLeaseMissOutput
+    ) -> None:
+        context = self._mm_cache_retry_contexts.pop(output.rid, None)
+        if context is None:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._retry_after_mm_embedding_lease_miss(context)
+        )
+        self.asyncio_tasks.add(task)
+        task.add_done_callback(self.asyncio_tasks.discard)
+
+    async def _retry_after_mm_embedding_lease_miss(
+        self, context: _MMCacheRetryContext
+    ) -> None:
+        """Re-run the processor once without cache omission after a lost lease."""
+        try:
+            tokenized_obj = await self._tokenize_one_request(
+                context.request, allow_mm_cache_lease=False
+            )
+            self._send_one_request(tokenized_obj)
+        except Exception as error:
+            logger.exception("Multimodal cache fallback failed")
+            state = self.rid_to_state.pop(context.request.rid, None)
+            if state is None:
+                return
+            state.finished = True
+            state.out_list.append(
+                {
+                    "text": "",
+                    "output_ids": [],
+                    "meta_info": {
+                        "id": context.request.rid,
+                        "completion_tokens": 0,
+                        "finish_reason": {
+                            "type": "abort",
+                            "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                            "message": f"Multimodal cache fallback failed: {error}",
+                        },
+                    },
+                }
+            )
+            state.event.set()
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -1975,6 +2226,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
+        if abort_all:
+            contexts = list(self._mm_cache_retry_contexts.values())
+            self._mm_cache_retry_contexts.clear()
+        else:
+            context = self._mm_cache_retry_contexts.pop(rid, None)
+            contexts = [context] if context is not None else []
+        for context in contexts:
+            self._release_mm_embedding_cache(context.lease_id, context.routed_dp_rank)
         if (
             not abort_all
             and self.server_args.tokenizer_worker_num == 1
@@ -2036,8 +2295,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self._wait_for_model_update_from_disk(obj)
             )
 
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
+        if success and obj.flush_cache:
+            encoder_error = await self._clear_mm_caches_after_model_update()
+            if encoder_error is not None:
+                success = False
+                message += f" Encoder cache flush failed: {encoder_error}"
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -2471,6 +2733,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
+                mm_cache_context = self._mm_cache_retry_contexts.pop(rid, None)
+                if mm_cache_context is not None:
+                    # Consumption normally removes the lease. This also covers
+                    # validation failures that finish before MM scheduling.
+                    self._release_mm_embedding_cache(
+                        mm_cache_context.lease_id,
+                        mm_cache_context.routed_dp_rank,
+                    )
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.

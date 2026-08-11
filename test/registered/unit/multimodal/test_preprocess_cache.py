@@ -3,10 +3,15 @@ import base64
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from PIL import Image
 
+from sglang.srt.mem_cache.multimodal_cache import (
+    EmbeddingResult,
+    MultiModalStaticCache,
+)
 from sglang.srt.multimodal.cache import (
     CacheReservation,
     MultimodalPreprocessCache,
@@ -61,6 +66,14 @@ class TestMediaIdentity(unittest.TestCase):
             second = snapshot_media(str(path))
         self.assertNotEqual(first.content_digest, second.content_digest)
 
+    def test_same_url_with_new_contents_misses(self):
+        with patch(
+            "sglang.srt.utils.get_image_bytes", side_effect=[b"first", b"second"]
+        ):
+            first = snapshot_media("https://example.com/image.png")
+            second = snapshot_media("https://example.com/image.png")
+        self.assertNotEqual(first.content_digest, second.content_digest)
+
     def test_pil_and_noncontiguous_tensor_are_snapshotted(self):
         image = Image.new("RGBA", (3, 2), (1, 2, 3, 4))
         first = snapshot_media(image)
@@ -71,6 +84,24 @@ class TestMediaIdentity(unittest.TestCase):
         tensor_snapshot = snapshot_media(tensor)
         self.assertTrue(tensor_snapshot.data.is_contiguous())
         self.assertTrue(torch.equal(tensor_snapshot.data, tensor))
+
+    def test_pil_palette_and_transparency_are_part_of_identity(self):
+        first = Image.new("P", (2, 2), color=0)
+        second = first.copy()
+        first.putpalette([255, 0, 0] + [0, 0, 0] * 255)
+        second.putpalette([0, 255, 0] + [0, 0, 0] * 255)
+        self.assertNotEqual(
+            snapshot_media(first).content_digest,
+            snapshot_media(second).content_digest,
+        )
+
+        second.putpalette(first.getpalette())
+        first.info["transparency"] = 0
+        second.info["transparency"] = 1
+        self.assertNotEqual(
+            snapshot_media(first).content_digest,
+            snapshot_media(second).content_digest,
+        )
 
     def test_artifact_key_includes_processor_and_kwargs(self):
         digest = snapshot_media(b"image").content_digest
@@ -167,6 +198,23 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_clear_starts_a_new_singleflight_generation(self):
+        async def run():
+            cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
+            old = cache.reserve_many(["key"])[0]
+            cache.clear()
+            new = cache.reserve_many(["key"])[0]
+
+            self.assertTrue(old.owner)
+            self.assertTrue(new.owner)
+            self.assertIsNot(old.future, new.future)
+            cache.fulfill(old, b"old")
+            self.assertNotIn("key", cache)
+            cache.fulfill(new, b"new")
+            self.assertEqual(cache.get("key"), b"new")
+
+        asyncio.run(run())
+
     def test_reserve_many_batches_owners_and_joins(self):
         async def run():
             cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
@@ -201,6 +249,60 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
             self.assertEqual(cache.stats()["singleflight_joins"], 0)
 
         asyncio.run(run())
+
+
+class TestMultimodalEmbeddingCacheLease(unittest.TestCase):
+    @staticmethod
+    def _embedding(value: int) -> EmbeddingResult:
+        return EmbeddingResult(embedding=torch.tensor([value], dtype=torch.int64))
+
+    def test_lease_pins_entry_until_consumed(self):
+        cache = MultiModalStaticCache(max_size=8)
+        self.assertTrue(cache.set(1, self._embedding(1)))
+        self.assertEqual(cache.acquire_many("lease", [1], ttl_s=300), [True])
+        self.assertFalse(cache.set(2, self._embedding(2)))
+        self.assertEqual(cache.consume("lease", 1).embedding.item(), 1)
+        self.assertTrue(cache.set(2, self._embedding(2)))
+        self.assertFalse(cache.has(1))
+
+    def test_duplicate_hashes_are_consumed_individually(self):
+        cache = MultiModalStaticCache(max_size=16)
+        cache.set(1, self._embedding(1))
+        self.assertEqual(
+            cache.acquire_many("lease", [1, 1, None], ttl_s=300),
+            [True, True, False],
+        )
+        self.assertIsNotNone(cache.consume("lease", 1))
+        self.assertTrue(cache.lease_contains("lease", 1))
+        self.assertIsNotNone(cache.consume("lease", 1))
+        self.assertFalse(cache.lease_contains("lease", 1))
+
+    def test_expiry_and_clear_release_pins(self):
+        cache = MultiModalStaticCache(max_size=16)
+        cache.set(1, self._embedding(1))
+        with patch(
+            "sglang.srt.mem_cache.multimodal_cache.time.monotonic",
+            side_effect=[10.0, 10.0, 12.0],
+        ):
+            cache.acquire_many("expired", [1], ttl_s=1)
+            self.assertFalse(cache.lease_contains("expired", 1))
+
+        cache.acquire_many("cleared", [1], ttl_s=300)
+        cache.clear()
+        self.assertEqual(cache.lease_stats(), (0, 0))
+        self.assertEqual(len(cache), 0)
+
+    def test_admitted_lease_does_not_expire_while_request_is_queued(self):
+        cache = MultiModalStaticCache(max_size=16)
+        cache.set(1, self._embedding(1))
+        with patch(
+            "sglang.srt.mem_cache.multimodal_cache.time.monotonic",
+            side_effect=[10.0, 10.0, 10.5, 12.0, 12.0],
+        ):
+            cache.acquire_many("admitted", [1], ttl_s=1)
+            self.assertTrue(cache.admit_lease("admitted"))
+            self.assertTrue(cache.lease_contains("admitted", 1))
+            self.assertEqual(cache.consume("admitted", 1).embedding.item(), 1)
 
 
 if __name__ == "__main__":

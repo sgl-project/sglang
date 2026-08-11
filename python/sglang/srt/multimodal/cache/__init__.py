@@ -1,5 +1,10 @@
 """Content-addressed caches used by multimodal preprocessing."""
 
+from sglang.srt.multimodal.cache.contracts import (
+    EncoderMediaLookup,
+    EncoderPreprocessArtifact,
+    PreprocessCacheLookup,
+)
 from sglang.srt.multimodal.cache.identity import (
     CONTENT_HASH_PREFIX,
     MediaSnapshot,
@@ -19,8 +24,11 @@ __all__ = [
     "CONTENT_HASH_PREFIX",
     "CacheLookup",
     "CacheReservation",
+    "EncoderMediaLookup",
+    "EncoderPreprocessArtifact",
     "MediaSnapshot",
     "MultimodalPreprocessCache",
+    "PreprocessCacheLookup",
     "build_artifact_key",
     "build_processor_fingerprint",
     "estimate_cache_size_bytes",

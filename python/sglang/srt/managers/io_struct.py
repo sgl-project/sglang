@@ -196,7 +196,7 @@ class GenerateReqInput:
     # sglang's prefix-cache key to align. When unset, behavior is unchanged
     # (sglang hashes the processor feature tensor).
     mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
-    # Optional SHA-256 identities for the original media contents. Unlike
+    # Optional `sha256:<64-hex>` identities for the original media contents. Unlike
     # mm_hashes, these identify processor inputs and never replace the
     # processor-output feature hash used by the embedding/prefix cache.
     mm_content_hashes: Optional[
@@ -1593,6 +1593,30 @@ class FlushCacheReqInput(BaseReq, kw_only=True):
 class FlushCacheReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
+
+
+class MMEmbeddingCacheAcquire(BaseReq, kw_only=True):
+    feature_hashes: List[Optional[int]]
+    input_ids: List[int]
+    routed_dp_rank: Optional[int] = None
+    bootstrap_room: Optional[int] = None
+    ttl_s: float = 300.0
+
+
+class MMEmbeddingCacheAcquireOutput(BaseReq, kw_only=True):
+    hit_mask: List[bool]
+    lease_id: Optional[str]
+    routed_dp_rank: int
+
+
+class MMEmbeddingCacheRelease(BaseReq, kw_only=True):
+    lease_id: str
+    routed_dp_rank: int
+
+
+class MMEmbeddingCacheLeaseMissOutput(BaseReq, kw_only=True):
+    lease_id: str
+    routed_dp_rank: int
 
 
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):

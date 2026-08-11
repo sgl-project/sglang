@@ -1,0 +1,181 @@
+---
+title: "VLM preprocessing and caching"
+description: "Reuse repeated Kimi-K3 images before decode, preprocessing, feature transport, and vision encoding."
+---
+
+SGLang can identify a repeated image before running the full multimodal processor.
+This is useful for agent workloads that resend the same image on every turn.
+
+<Note>
+Per-image early reuse currently supports **Kimi-K3 image input**. Qwen3-VL image
+and video support is planned. Other VLMs continue to use their existing cache
+paths.
+</Note>
+
+## What is cached
+
+SGLang keeps four identities separate:
+
+| Layer | Key or value | Purpose |
+|---|---|---|
+| Content | SHA-256 of the media snapshot | Detect the same media bytes or image/tensor content. |
+| Artifact | Content digest + modality + processor fingerprint + per-media options | Reuse prompt-independent processor metadata and CPU artifacts. |
+| Feature | Hash of the processor output | Preserve the existing multimodal prefix/embedding-cache key. |
+| Embedding | ViT output indexed by the feature hash | Skip vision encoding when every required TP rank has the entry. |
+
+The prompt is not part of the per-image artifact key. A new turn rebuilds prompt
+tokens and image offsets while reusing image work. `mm_hashes` remains the
+processor-output/embedding identity; `mm_content_hashes` identifies input media.
+Do not substitute one for the other.
+
+## Data flow
+
+On a cold request, SGLang reads and snapshots the input, calculates its SHA-256,
+decodes it, runs the processor, transfers processor features, and runs the ViT.
+The preprocess cache stores only metadata and artifacts already on CPU. It does
+not copy a CUDA tensor to CPU just to cache it.
+
+On a hot Kimi-K3 request with the embedding cache enabled:
+
+1. The tokenizer finds per-image processor metadata from the content identity.
+2. It acquires a short-lived embedding-cache lease on the final DP route.
+3. An image whose embedding exists on every required TP rank is sent as a
+   featureless cache reference.
+4. The scheduler consumes the pinned embedding and releases the lease.
+
+This path skips decode, processor work, processor-feature transport, and ViT for
+embedding hits. Without an embedding hit, a cached CPU artifact can still skip
+processor work. Multi-image requests may mix hits and misses without changing
+image order or prompt expansion. A lost lease is retried once through the cold
+processor path inside the server. Source reads are skipped only in the trusted
+hash mode described below.
+
+The preprocess cache uses CPU memory only and does not cache CUDA IPC or CUDA VMM
+proxies. It therefore adds no fixed HBM allocation. Existing feature-transport
+pools and the embedding cache keep their own memory budgets.
+
+## Content hashes and trust
+
+By default, paths and URLs are not identities. SGLang reads the actual bytes on
+each lookup and verifies any caller-provided hash. A file or URL whose contents
+change is a cache miss even if its name is unchanged.
+
+OpenAI-compatible request:
+
+```json
+{
+  "model": "moonshotai/Kimi-K3",
+  "messages": [{
+    "role": "user",
+    "content": [{
+      "type": "image_url",
+      "image_url": {
+        "url": "https://example.com/receipt.jpg",
+        "content_hash": "sha256:<64-hex-digits>"
+      }
+    }, {
+      "type": "text",
+      "text": "Read the total."
+    }]
+  }]
+}
+```
+
+Native Engine API:
+
+```python
+import hashlib
+
+from sglang import Engine
+
+image_bytes = open("receipt.jpg", "rb").read()
+content_hash = "sha256:" + hashlib.sha256(image_bytes).hexdigest()
+
+llm = Engine(model_path="moonshotai/Kimi-K3")
+output = llm.generate(
+    prompt="<|media_pad|>Read the total.",
+    image_data=[image_bytes],
+    mm_content_hashes=[content_hash],  # one entry per image, in request order
+)
+```
+
+`--trust-mm-content-hashes` lets a metadata hit skip reading the source. Enable
+it only when the caller computes SHA-256 from immutable media bytes. A cold miss
+still reads and verifies the media. Invalid format, count, or content is rejected;
+SGLang does not silently fall back.
+
+## Configuration
+
+Kimi-K3 defaults to a 256 MiB preprocess-cache budget with at most 8192 entries.
+The CPU budget is divided across tokenizer workers or encoder TP ranks.
+
+```bash
+# Model default: 256 MiB for Kimi-K3
+sglang serve --model-path moonshotai/Kimi-K3
+
+# Explicit CPU budget
+sglang serve --model-path moonshotai/Kimi-K3 \
+  --mm-preprocess-cache-size-mb 512
+
+# Kill switch / cache-off comparison
+sglang serve --model-path moonshotai/Kimi-K3 \
+  --mm-preprocess-cache-size-mb 0
+```
+
+`POST /flush_cache`, model updates that request a cache flush, and server
+shutdown clear preprocess entries and outstanding embedding leases.
+
+## EPD behavior
+
+In EPD, the preprocess cache lives on the encoder server. Add
+`--enable-prefix-mm-cache` to the encoder to let repeated images skip decode,
+encoder preprocessing, and ViT through its local embedding cache. The source
+read is also skipped on a trusted-hash metadata hit. Add
+`--enable-mm-global-cache` when multiple encoder instances should share ViT
+embeddings through Mooncake.
+
+```bash
+# Encoder role
+sglang serve --model-path moonshotai/Kimi-K3 \
+  --encoder-only \
+  --enable-prefix-mm-cache \
+  --port 30000
+
+# Language role
+sglang serve --model-path moonshotai/Kimi-K3 \
+  --language-only \
+  --encoder-urls http://ENCODER_HOST:30000 \
+  --port 30002
+```
+
+The local preprocess cache, local encoder embedding cache, and optional global
+Mooncake cache are distinct. An encoder embedding hit still has to deliver the
+embedding to the language service using the selected EPD transfer backend; it
+does not consume a CUDA IPC/VMM processor-feature pool.
+
+## Metrics and failure behavior
+
+With `--enable-metrics`, use these low-cardinality metric families:
+
+- `sglang:mm_preprocess_cache_requests_total` and
+  `sglang:encoder_preprocess_cache_items_total`
+- `sglang:mm_content_identity_total` and
+  `sglang:encoder_content_identity_total`
+- `sglang:mm_preprocess_phase_seconds`
+- `sglang:mm_embedding_cache_acquire_total`
+- `sglang:mm_cache_skipped_stages_total` and
+  `sglang:encoder_cache_skipped_stages_total`
+- preprocess-cache entries, CPU bytes, evictions, and single-flight joins
+
+Cache eviction changes performance, not correctness. If metadata and a newly
+computed feature hash disagree, SGLang discards the entry and rejects reuse.
+If an embedding lease disappears before scheduler admission, SGLang performs one
+internal cold-path retry.
+
+## Support matrix
+
+| Model and modality | Early per-media artifact reuse | Ordinary serving | EPD |
+|---|---:|---:|---:|
+| Kimi-K3 image | Supported | Supported | Supported |
+| Qwen3-VL image | Planned | Existing cache path only | Existing cache path only |
+| Qwen3-VL video | Planned; requires FPS/frame-sampling identity | Existing cache path only | Existing cache path only |

@@ -7,6 +7,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.multimodal.cache import MediaSnapshot
+
 
 @dataclass(frozen=True)
 class KimiK3ResizeConfig:
@@ -71,3 +73,13 @@ class KimiK3ImageArtifact:
         if self.feature is None or self.feature.device.type == "cpu":
             return self
         return replace(self, feature=None)
+
+
+@dataclass(frozen=True)
+class KimiK3MediaLookup:
+    """Identity lookup result reusable by the later processor miss path."""
+
+    artifact_key: str
+    content_digest: str
+    snapshot: Optional[MediaSnapshot]
+    cached_artifact: Optional[KimiK3ImageArtifact]

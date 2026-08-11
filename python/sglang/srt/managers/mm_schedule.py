@@ -6,7 +6,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
-from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+    EmbeddingResult,
+    MultiModalStaticCache,
+)
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu
@@ -16,6 +20,19 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 
 embedding_cache: Optional[MultiModalStaticCache] = None
+
+
+def _get_cached_embedding(item: MultimodalDataItem) -> Optional[EmbeddingResult]:
+    lease_id = item.model_specific_data.pop(MM_EMBEDDING_CACHE_LEASE_ID_KEY, None)
+    if lease_id is not None:
+        cached = embedding_cache.consume(lease_id, item.hash)
+        if cached is None:
+            raise RuntimeError(
+                "Multimodal embedding-cache lease expired after scheduler "
+                "admission; this indicates an invalid cache lifecycle"
+            )
+        return cached
+    return embedding_cache.get_single(item.hash)
 
 
 def init_mm_embedding_cache(max_size: int = 0):
@@ -311,7 +328,7 @@ def _batch_encode_per_image_misses(
         for _idx, item, start, end in overlapping:
             if item.hash in hash_to_embedding:
                 continue
-            cached = embedding_cache.get_single(item.hash)
+            cached = _get_cached_embedding(item)
             if cached is not None:
                 hash_to_embedding[item.hash] = cached.embedding
             elif item.hash not in unique_misses:
@@ -384,7 +401,7 @@ def _get_chunked_embedding_by_item(
     cached_embeddings = {}
     miss_items = []
     for idx, item, start, end in overlapping:
-        cached = embedding_cache.get_single(item.hash)
+        cached = _get_cached_embedding(item)
         if cached is not None:
             cached_embeddings[idx] = cached.embedding
             _acknowledge_deferred_cuda_ipc_cache_hits([item])

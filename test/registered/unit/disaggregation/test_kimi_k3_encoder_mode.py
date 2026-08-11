@@ -26,8 +26,17 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
 )
+from sglang.srt.mem_cache.multimodal_cache import (
+    EmbeddingResult,
+    MultiModalStaticCache,
+)
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
-from sglang.srt.multimodal.cache import snapshot_media
+from sglang.srt.multimodal.cache import (
+    EncoderMediaLookup,
+    EncoderPreprocessArtifact,
+    MultimodalPreprocessCache,
+    snapshot_media,
+)
 from sglang.srt.multimodal.encoder_preprocessing import (
     LOCAL_PREPROCESSED_KEY,
     EncoderPreprocessOutput,
@@ -392,11 +401,142 @@ def test_kimi_k3_epd_verifies_content_hash_before_decode():
     load.assert_called_once_with(payload, False)
 
 
+def _cache_enabled_encoder(*, trust_content_hashes=False):
+    encoder = _encoder()
+    encoder.mm_processor_fingerprint = "processor"
+    encoder.mm_preprocess_cache = MultimodalPreprocessCache(max_size_bytes=1024 * 1024)
+    encoder.mm_cache = MultiModalStaticCache(max_size=1024 * 1024)
+    encoder.mm_cache_lock = asyncio.Lock()
+    encoder.io_executor = ThreadPoolExecutor(max_workers=2)
+    encoder.trust_mm_content_hashes = trust_content_hashes
+    encoder.profiler = None
+    return encoder
+
+
+def test_kimi_k3_epd_trusted_metadata_hit_skips_media_read():
+    payload = b"jpeg"
+    digest = snapshot_media(payload).content_digest
+    encoder = _cache_enabled_encoder(trust_content_hashes=True)
+    try:
+        key = encoder._encoder_artifact_key(digest, {"url": payload})
+        artifact = EncoderPreprocessArtifact(
+            content_digest=digest,
+            artifact_key=key,
+            feature_hash=17,
+            grid_thw=(1, 2, 2),
+            original_size=(8, 6),
+        )
+        encoder.mm_preprocess_cache.put(key, artifact)
+
+        with patch(
+            "sglang.srt.disaggregation.encode_server.snapshot_media",
+            side_effect=AssertionError("trusted metadata hit read media"),
+        ):
+            lookups = asyncio.run(
+                encoder._lookup_k3_encoder_artifacts(
+                    [{"url": payload, "content_hash": digest}]
+                )
+            )
+
+        assert lookups[0].snapshot is None
+        assert lookups[0].artifact is artifact
+    finally:
+        encoder.io_executor.shutdown()
+
+
+def test_kimi_k3_epd_embedding_hit_skips_decode_processor_and_vit():
+    payload = b"jpeg"
+    digest = snapshot_media(payload).content_digest
+    encoder = _cache_enabled_encoder()
+    try:
+        key = encoder._encoder_artifact_key(digest, payload)
+        artifact = EncoderPreprocessArtifact(
+            content_digest=digest,
+            artifact_key=key,
+            feature_hash=23,
+            grid_thw=(1, 2, 2),
+            original_size=(8, 6),
+        )
+        embedding = torch.arange(4, dtype=torch.float32).reshape(1, 4)
+        encoder.mm_preprocess_cache.put(key, artifact)
+        encoder.mm_cache.set(23, EmbeddingResult(embedding=embedding))
+        encoder._process_mm_items = AsyncMock(
+            side_effect=AssertionError("embedding hit ran processor")
+        )
+
+        grid, output, aux = asyncio.run(
+            encoder._encode_k3_with_preprocess_cache([payload], log_metrics=False)
+        )
+
+        torch.testing.assert_close(grid, torch.tensor([[1, 2, 2]]))
+        torch.testing.assert_close(output, embedding)
+        assert aux == {"original_image_sizes": [[8, 6]]}
+        encoder._process_mm_items.assert_not_awaited()
+    finally:
+        encoder.io_executor.shutdown()
+
+
+def test_kimi_k3_epd_global_cache_preprocesses_only_metadata_misses():
+    encoder = _cache_enabled_encoder()
+    encoder.rank = 0
+    hit = EncoderPreprocessArtifact(
+        content_digest="sha256:" + "11" * 32,
+        artifact_key="hit-key",
+        feature_hash=11,
+        grid_thw=(1, 2, 2),
+        original_size=(8, 6),
+    )
+    miss = EncoderPreprocessArtifact(
+        content_digest="sha256:" + "22" * 32,
+        artifact_key="miss-key",
+        feature_hash=22,
+        grid_thw=(1, 4, 4),
+        original_size=(16, 12),
+    )
+    lookups = [
+        EncoderMediaLookup("hit", None, hit.content_digest, "hit-key", None, hit),
+        EncoderMediaLookup("miss", None, miss.content_digest, "miss-key", None, None),
+    ]
+    mm_inputs = {
+        "pixel_values": torch.ones(16, 3),
+        "grid_thws": torch.tensor([[1, 4, 4]]),
+        "original_image_sizes": [[16, 12]],
+    }
+    feature_fn = object()
+    encoder._lookup_k3_encoder_artifacts = AsyncMock(return_value=lookups)
+    encoder._materialize_k3_encoder_media = AsyncMock(return_value=["miss-media"])
+    encoder._process_mm_items = AsyncMock(return_value=(mm_inputs, feature_fn))
+    encoder._store_k3_encoder_artifacts = lambda *args: [miss]
+    try:
+        ctx = asyncio.run(
+            encoder._prepare_global_cache_context(
+                ["hit-source", "miss-source"], Modality.IMAGE, "request"
+            )
+        )
+    finally:
+        encoder.io_executor.shutdown()
+
+    encoder._materialize_k3_encoder_media.assert_awaited_once_with(lookups, [1])
+    encoder._process_mm_items.assert_awaited_once_with(["miss-media"], Modality.IMAGE)
+    assert ctx.prepared_index_map == {1: 0}
+    assert ctx.str_mm_hashes == ["11", "22"]
+    assert ctx.grid_thw.tolist() == [[1, 2, 2], [1, 4, 4]]
+    assert ctx.aux_data == {"original_image_sizes": [[8, 6], [16, 12]]}
+
+
 def test_epd_receiver_keeps_content_hash_aligned_with_image():
     digest = "sha256:" + "cd" * 32
     receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
     request = SimpleNamespace(
-        image_data=[ImageData(url="image", content_hash=digest)],
+        image_data=[
+            ImageData(
+                url="image",
+                detail="high",
+                max_dynamic_patch=12,
+                preprocess_kwargs={"crop": False},
+                content_hash=digest,
+            )
+        ],
         video_data=None,
         audio_data=None,
         mm_content_hashes=[digest],
@@ -406,6 +546,9 @@ def test_epd_receiver_keeps_content_hash_aligned_with_image():
         {
             "url": "image",
             "modality": Modality.IMAGE,
+            "detail": "high",
+            "max_dynamic_patch": 12,
+            "preprocess_kwargs": {"crop": False},
             "content_hash": digest,
         }
     ]

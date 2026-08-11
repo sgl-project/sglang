@@ -80,7 +80,6 @@ class EncoderBootstrapServer:
         health_check_timeout: Optional[float] = None,
         evicted_ttl: Optional[float] = None,
     ):
-
         self.host = host
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
@@ -289,7 +288,6 @@ class EncoderBootstrapServer:
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
     def _run_server(self):
-
         config = uvicorn.Config(
             self.app,
             host=self.host,
@@ -797,7 +795,6 @@ class WaitingImageRequest:
         self.start_time = time.time()
 
     def send_encode_request(self):
-
         async def _send_single_request(session, url, payload):
             try:
                 async with session.post(url, json=payload) as response:
@@ -2230,6 +2227,21 @@ class MMReceiverBase(ABC):
                         "modality": modality,
                     }
                     if modality == Modality.IMAGE:
+                        if isinstance(mm_item, ImageData):
+                            if mm_item.detail not in (None, "auto"):
+                                entry["detail"] = mm_item.detail
+                            if mm_item.max_dynamic_patch is not None:
+                                entry["max_dynamic_patch"] = mm_item.max_dynamic_patch
+                            if mm_item.preprocess_kwargs:
+                                entry["preprocess_kwargs"] = mm_item.preprocess_kwargs
+                        elif isinstance(mm_item, dict):
+                            for key in (
+                                "detail",
+                                "max_dynamic_patch",
+                                "preprocess_kwargs",
+                            ):
+                                if key in mm_item:
+                                    entry[key] = mm_item[key]
                         inline_hash = (
                             mm_item.content_hash
                             if isinstance(mm_item, ImageData)
