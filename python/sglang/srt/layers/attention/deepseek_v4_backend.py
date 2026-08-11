@@ -320,6 +320,14 @@ class DSV4AttnMetadata:
             "c1_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
+            # Per-chunk lazy caches built by the eager _forward_trtllm_prefill;
+            # MUST be reset from the fresh metadata (None) on every breakable
+            # replay refresh, or a reused metadata object serves stale
+            # sum_q/tables to a different batch shape.
+            "trtllm_prefill_qmeta",
+            "trtllm_prefill_swa_lens",
+            "trtllm_prefill_c4_indices",
+            "trtllm_prefill_c128",
         ]
         # Keep graph-captured tensor objects alive for fields that captured
         # kernels read by address; overwrite only their contents.
@@ -674,9 +682,18 @@ class DeepseekV4AttnBackend(
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
+        self.trtllm_attn: bool = get_exec().kernel.dsv4_attn_backend == "trtllm"
+        # On the trtllm backend, speculative decoding needs metadata prepared
+        # on the host: preparing it inside the captured graphs degrades draft
+        # acceptance (plain decode is unaffected and keeps in-graph prep).
+        # needs_cpu_seq_lens below must use this effective value, because
+        # host-side prep reads the CPU seq-lens mirror.
+        self._prep_in_cuda_graph: bool = envs.SGLANG_PREP_IN_CUDA_GRAPH.get() and not (
+            self.trtllm_attn and self.mtp_enabled
+        )
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda
-            or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
+            or not self._prep_in_cuda_graph
             or self.online_c128_mtp.enabled()
         )
 
@@ -684,7 +701,6 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
 
-        self.trtllm_attn: bool = get_exec().kernel.dsv4_attn_backend == "trtllm"
         self.trtllm_workspace_buffer: Optional[torch.Tensor] = None
         if self.trtllm_attn:
             assert (
@@ -806,7 +822,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self._prep_in_cuda_graph:
             return DSV4RawDecodeMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -956,7 +972,7 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self._prep_in_cuda_graph:
             assert out_cache_loc is not None
             bs = len(seq_lens)
             if self.needs_cpu_seq_lens:
