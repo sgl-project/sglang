@@ -379,7 +379,7 @@ def _require_kimi_k3_cutedsl_dcp_support() -> None:
     except (ImportError, TypeError, ValueError) as exc:
         raise RuntimeError(
             "Kimi-K3 DCP with decode_attention_backend='cutedsl_mla' requires "
-            "FlashInfer 0.6.17rc5 or newer with "
+            "FlashInfer 0.6.17 or newer with "
             "trtllm_batch_decode_with_kv_cache_mla exposing enable_dcp."
         ) from exc
 
@@ -388,7 +388,7 @@ def _require_kimi_k3_cutedsl_dcp_support() -> None:
             "Kimi-K3 DCP with decode_attention_backend='cutedsl_mla' requires "
             "enable_dcp in the signature of "
             "flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla; upgrade "
-            "to FlashInfer 0.6.17rc5 or newer."
+            "to FlashInfer 0.6.17 or newer."
         )
 
 
@@ -538,7 +538,7 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
     # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103;
-    # FlashInfer 0.6.17rc5+ ships the required SiTU kernels and is a pinned
+    # FlashInfer 0.6.17+ ships the required SiTU kernels and is a pinned
     # project dependency.
     if server_args.moe_runner_backend != "auto":
         return {}

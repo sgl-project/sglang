@@ -1533,7 +1533,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
 
             if self.moe_runner_config.activation == "situ":
-                # FlashInfer 0.6.17rc5+ ships the SiTU TRT-LLM-gen kernels.
+                # FlashInfer 0.6.17+ ships the SiTU TRT-LLM-gen kernels.
                 # Routing must be noaux_tc (sigmoid + correction bias,
                 # DeepSeekV3), not the renormalize-softmax default below.
                 # EP is cubin-internal: each rank computes its local expert slice
