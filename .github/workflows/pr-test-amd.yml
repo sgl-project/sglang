@@ -1082,7 +1082,7 @@ jobs:
       RUNNER_LABELS: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi300') }}
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         part: [0, 1, 2, 3]
     runs-on: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi300') }}
