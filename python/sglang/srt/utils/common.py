@@ -1634,6 +1634,7 @@ class ImageData:
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     preprocess_kwargs: Optional[Dict] = None
+    content_hash: Optional[str] = None
 
 
 @dataclass

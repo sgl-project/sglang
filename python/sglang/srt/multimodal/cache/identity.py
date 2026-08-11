@@ -1,0 +1,208 @@
+"""Stable identities for multimodal inputs and processor artifacts."""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any, Mapping, Optional
+from urllib.parse import unquote, urlparse
+
+import numpy as np
+import torch
+import transformers
+from PIL import Image
+
+CONTENT_HASH_PREFIX = "sha256:"
+_SHA256_HEX_LENGTH = 64
+
+
+def parse_content_hash(value: Optional[str]) -> Optional[str]:
+    """Validate and normalize a public content digest."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.startswith(CONTENT_HASH_PREFIX):
+        raise ValueError("content_hash must use the form 'sha256:<64 hex digits>'")
+    digest = value[len(CONTENT_HASH_PREFIX) :]
+    if len(digest) != _SHA256_HEX_LENGTH:
+        raise ValueError("content_hash must contain exactly 64 SHA-256 hex digits")
+    try:
+        bytes.fromhex(digest)
+    except ValueError as exc:
+        raise ValueError("content_hash contains non-hexadecimal characters") from exc
+    return CONTENT_HASH_PREFIX + digest.lower()
+
+
+def _digest_bytes(payload: bytes) -> str:
+    return CONTENT_HASH_PREFIX + hashlib.sha256(payload).hexdigest()
+
+
+def _hash_parts(*parts: bytes) -> str:
+    hasher = hashlib.sha256()
+    for part in parts:
+        hasher.update(len(part).to_bytes(8, "big"))
+        hasher.update(part)
+    return CONTENT_HASH_PREFIX + hasher.hexdigest()
+
+
+@dataclass(frozen=True)
+class MediaSnapshot:
+    """An immutable-enough media snapshot paired with its strict identity."""
+
+    data: Any
+    content_digest: str
+    size_bytes: int
+    source: str
+
+
+def _snapshot_pil(image: Image.Image) -> MediaSnapshot:
+    snapshot = image.copy()
+    snapshot.load()
+    payload = snapshot.tobytes()
+    digest = _hash_parts(
+        b"pil",
+        snapshot.mode.encode(),
+        json.dumps(snapshot.size).encode(),
+        payload,
+    )
+    return MediaSnapshot(snapshot, digest, len(payload), "pil")
+
+
+def _snapshot_tensor(tensor: torch.Tensor) -> MediaSnapshot:
+    snapshot = tensor.detach().to("cpu").contiguous().clone()
+    payload = snapshot.view(torch.uint8).numpy().tobytes()
+    digest = _hash_parts(
+        b"torch",
+        str(snapshot.dtype).encode(),
+        json.dumps(list(snapshot.shape)).encode(),
+        payload,
+    )
+    return MediaSnapshot(snapshot, digest, len(payload), "tensor")
+
+
+def _snapshot_ndarray(array: np.ndarray) -> MediaSnapshot:
+    snapshot = np.ascontiguousarray(array).copy()
+    payload = snapshot.view(np.uint8).tobytes()
+    digest = _hash_parts(
+        b"numpy",
+        snapshot.dtype.str.encode(),
+        json.dumps(list(snapshot.shape)).encode(),
+        payload,
+    )
+    return MediaSnapshot(snapshot, digest, len(payload), "ndarray")
+
+
+def _read_media_bytes(media: str | bytes) -> bytes:
+    if isinstance(media, bytes):
+        return bytes(media)
+
+    from sglang.srt.utils import get_image_bytes
+
+    if media.startswith("file://"):
+        media = unquote(urlparse(media).path)
+    return get_image_bytes(media)
+
+
+def snapshot_media(media: Any) -> MediaSnapshot:
+    """Snapshot media and hash exactly what will be handed to the decoder.
+
+    Paths and URLs are deliberately not identities. They are resolved to bytes
+    on every untrusted lookup, so changing their contents produces a cache miss.
+    """
+    from sglang.srt.utils import ImageData
+
+    if isinstance(media, ImageData):
+        media = media.url
+    elif isinstance(media, Mapping) and "url" in media and "format" not in media:
+        media = media["url"]
+
+    if isinstance(media, (str, bytes)):
+        payload = _read_media_bytes(media)
+        return MediaSnapshot(payload, _digest_bytes(payload), len(payload), "bytes")
+    if isinstance(media, Image.Image):
+        return _snapshot_pil(media)
+    if isinstance(media, torch.Tensor):
+        return _snapshot_tensor(media)
+    if isinstance(media, np.ndarray):
+        return _snapshot_ndarray(media)
+    raise TypeError(f"Unsupported media identity input: {type(media).__name__}")
+
+
+def _canonicalize(value: Any) -> Any:
+    if dataclasses.is_dataclass(value):
+        return _canonicalize(dataclasses.asdict(value))
+    if isinstance(value, Enum):
+        return _canonicalize(value.value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonicalize(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize(item) for item in value]
+    if isinstance(value, set):
+        return sorted((_canonicalize(item) for item in value), key=repr)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, torch.dtype):
+        return str(value)
+    return f"{type(value).__module__}.{type(value).__qualname__}"
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        _canonicalize(value), sort_keys=True, separators=(",", ":")
+    ).encode()
+
+
+def build_artifact_key(
+    content_digest: str,
+    *,
+    modality: str,
+    processor_fingerprint: str,
+    preprocess_kwargs: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Build the cache key for a processor artifact."""
+    content_digest = parse_content_hash(content_digest)
+    payload = {
+        "content_digest": content_digest,
+        "modality": modality,
+        "processor_fingerprint": processor_fingerprint,
+        "preprocess_kwargs": preprocess_kwargs or {},
+    }
+    return _digest_bytes(_canonical_json(payload))
+
+
+def build_processor_fingerprint(
+    processor: Any,
+    hf_config: Any,
+    server_args: Any,
+    *,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Fingerprint preprocessing choices that can change processor output."""
+    processor_payload = (
+        processor.preprocess_fingerprint_payload()
+        if hasattr(processor, "preprocess_fingerprint_payload")
+        else {}
+    )
+    payload = {
+        "transformers": transformers.__version__,
+        "processor_class": f"{type(processor).__module__}.{type(processor).__qualname__}",
+        "model_type": getattr(hf_config, "model_type", None),
+        "architectures": getattr(hf_config, "architectures", None),
+        "model_revision": getattr(server_args, "revision", None),
+        "tokenizer_revision": getattr(server_args, "tokenizer_revision", None),
+        "disable_fast_image_processor": getattr(
+            server_args, "disable_fast_image_processor", False
+        ),
+        "mm_process_config": getattr(server_args, "mm_process_config", None) or {},
+        "processor": processor_payload,
+        "extra": extra or {},
+    }
+    return _digest_bytes(_canonical_json(payload))

@@ -369,6 +369,11 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         # See GenerateReqInput.mm_hashes / async_generate for the contract.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
+        # SHA-256 identities for the original media contents. See
+        # GenerateReqInput.mm_content_hashes.
+        mm_content_hashes: Optional[
+            Union[List[Optional[str]], List[List[Optional[str]]]]
+        ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -411,6 +416,7 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             mm_hashes=mm_hashes,
+            mm_content_hashes=mm_content_hashes,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -475,6 +481,9 @@ class Engine(EngineScoreMixin, EngineBase):
         # that compute their own per-image hash for routing decisions and need
         # sglang's prefix-cache key to align. See GenerateReqInput.mm_hashes.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
+        mm_content_hashes: Optional[
+            Union[List[Optional[str]], List[List[Optional[str]]]]
+        ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -517,6 +526,7 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             mm_hashes=mm_hashes,
+            mm_content_hashes=mm_content_hashes,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -1254,6 +1264,8 @@ class Engine(EngineScoreMixin, EngineBase):
             kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         finally:
             if isinstance(self.tokenizer_manager, TokenizerManager):
+                if self.tokenizer_manager.mm_processor is not None:
+                    self.tokenizer_manager.mm_processor.shutdown()
                 self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
     def __enter__(self):
