@@ -625,11 +625,11 @@ class ComponentResidencyManager:
         """explicitly empty cache after potential release of large component"""
         if not use.memory_intensive:
             return
-        released_accelerator_storage = (
+        released_device_storage = (
             was_on_supported_device and not self._module_on_supported_device(module)
         )
         released_layerwise_storage = isinstance(strategy, LayerwiseOffloadStrategy)
-        if not (released_accelerator_storage or released_layerwise_storage):
+        if not (released_device_storage or released_layerwise_storage):
             return
         if not torch.get_device_module().is_available():
             return

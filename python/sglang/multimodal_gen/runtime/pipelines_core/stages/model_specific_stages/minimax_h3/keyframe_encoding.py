@@ -38,7 +38,7 @@ def minimax_h3_scoped_encode_rng(seed: int, device: torch.device | None = None):
 
     The encode recipes seed the default torch generators right before a
     posterior-sampled VAE encode. Forking restores the process-global CPU and
-    accelerator generators after the encode while preserving the exact sampled
+    device generators after the encode while preserving the exact sampled
     result.
     """
     devices: list[torch.device] = []
