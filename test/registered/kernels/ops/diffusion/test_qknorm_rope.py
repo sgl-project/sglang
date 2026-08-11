@@ -216,7 +216,7 @@ def test_qknorm_rope_preserves_split_bf16_rounding() -> None:
     assert torch.equal(k_ref, k_fused)
 
 
-def test_qknorm_rope_accepts_strided_packed_gqa() -> None:
+def test_qknorm_rope_requires_opt_in_for_strided_packed_gqa() -> None:
     from sglang.kernels.ops.diffusion.qknorm_rope import (
         fused_inplace_qknorm_rope,
     )
@@ -235,14 +235,30 @@ def test_qknorm_rope_accepts_strided_packed_gqa() -> None:
 
     q_ref = qkv[:, :, :num_q_heads].contiguous()
     k_ref = qkv[:, :, num_q_heads : num_q_heads + num_kv_heads].contiguous()
-    qkv_fused = qkv.clone()
-    q_fused = qkv_fused[:, :, :num_q_heads]
-    k_fused = qkv_fused[:, :, num_q_heads : num_q_heads + num_kv_heads]
-    v_before = qkv_fused[:, :, num_q_heads + num_kv_heads :].clone()
     q_norm = RMSNorm(head_dim, eps=1e-6).to(device=DEVICE, dtype=DTYPE)
     k_norm = RMSNorm(head_dim, eps=1e-6).to(device=DEVICE, dtype=DTYPE)
     q_norm.weight.data.copy_(q_weight)
     k_norm.weight.data.copy_(k_weight)
+    qkv_default = qkv.clone()
+    q_default = qkv_default[:, :, :num_q_heads]
+    k_default = qkv_default[:, :, num_q_heads : num_q_heads + num_kv_heads]
+    q_default_out, k_default_out = apply_qk_norm_rope(
+        q=q_default,
+        k=k_default,
+        q_norm=q_norm,
+        k_norm=k_norm,
+        head_dim=head_dim,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
+        positions=positions,
+    )
+    assert q_default_out.data_ptr() != q_default.data_ptr()
+    assert k_default_out.data_ptr() != k_default.data_ptr()
+
+    qkv_fused = qkv.clone()
+    q_fused = qkv_fused[:, :, :num_q_heads]
+    k_fused = qkv_fused[:, :, num_q_heads : num_q_heads + num_kv_heads]
+    v_before = qkv_fused[:, :, num_q_heads + num_kv_heads :].clone()
 
     fused_inplace_qknorm_rope(
         q_ref.view(-1, num_q_heads, head_dim),
@@ -263,6 +279,7 @@ def test_qknorm_rope_accepts_strided_packed_gqa() -> None:
         cos_sin_cache=cos_sin_cache,
         is_neox=True,
         positions=positions,
+        allow_strided_qk=True,
     )
 
     assert q_out.data_ptr() == q_fused.data_ptr()

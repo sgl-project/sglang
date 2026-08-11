@@ -972,8 +972,13 @@ def apply_qk_norm_rope(
     positions: Optional[torch.Tensor] = None,
     position_offset: int = 0,
     allow_inplace: bool = True,
+    allow_strided_qk: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA/XPU shapes."""
+    """Apply QK RMSNorm followed by RoPE, fusing supported CUDA/XPU shapes.
+
+    Strided packed-QKV views require an explicit opt-in because selecting the fused
+    kernel changes the numerical path for models that historically used the fallback.
+    """
 
     from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
         apply_flashinfer_rope_qk_inplace,
@@ -1010,12 +1015,17 @@ def apply_qk_norm_rope(
         "off",
         "no",
     }
-    q_has_supported_strides = (
-        q.stride(-1) == 1
-        and q.stride(-2) == k.stride(-2)
-        and q.stride(0) == seq_len * q.stride(1)
-    )
-    k_has_supported_strides = k.stride(-1) == 1 and k.stride(0) == seq_len * k.stride(1)
+    q_has_supported_layout = q.is_contiguous()
+    k_has_supported_layout = k.is_contiguous()
+    if allow_strided_qk:
+        q_has_supported_layout = (
+            q.stride(-1) == 1
+            and q.stride(-2) == k.stride(-2)
+            and q.stride(0) == seq_len * q.stride(1)
+        )
+        k_has_supported_layout = k.stride(-1) == 1 and k.stride(
+            0
+        ) == seq_len * k.stride(1)
 
     if positions is None:
         pos_1d = torch.arange(
@@ -1042,8 +1052,8 @@ def apply_qk_norm_rope(
         and k.dtype == q.dtype
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
-        and q_has_supported_strides
-        and k_has_supported_strides
+        and q_has_supported_layout
+        and k_has_supported_layout
         and can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, q.dtype)
     ):
         fused_inplace_qknorm_rope(

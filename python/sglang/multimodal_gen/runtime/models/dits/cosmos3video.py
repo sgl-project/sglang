@@ -235,6 +235,7 @@ def _apply_qwen3_qk_norm_rope(
         cos_sin_cache=cos_sin_cache,
         is_neox=True,
         positions=rope_cache_positions,
+        allow_strided_qk=True,
     )
 
 
