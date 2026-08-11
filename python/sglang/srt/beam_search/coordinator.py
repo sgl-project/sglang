@@ -364,10 +364,8 @@ class BeamCoordinator:
         """Launch half: joint-select every group in this decode batch on
         device, reparent KV, and overwrite the relayed next tokens.
 
-        Group rows come from the batch's beam tail layout: the leader's raw
-        logits are the worker's pre-sample capture (one leader_logits row per
-        tail entry; the sampler overwrites its own view in place), the member
-        rows the tail slice split off before sampling."""
+        Rows come from the batch's beam tail layout, their raw logits from the
+        worker's capture -- one leader_logits row per tail entry."""
         tail = batch.beam_tail
         if tail is None:
             return
@@ -450,9 +448,8 @@ class BeamCoordinator:
         """Move rows onto surviving paths on-device: reparent by pointing each
         row at its parent's slots and relay the selected next tokens.
 
-        History authority is the backpointer DAG (built at commit); the
-        leader's output_ids carries length only (member rows have no host
-        state at all), so advance it by one placeholder.
+        The leader's output_ids carries length only (the DAG owns history, and
+        member rows have no host state), so advance it by one placeholder.
         """
         rows = group.all_rows
         if parent_idx is not None:

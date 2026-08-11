@@ -55,9 +55,8 @@ def alias_members_prompt_kv(
     leader_row: int,
     prompt_len: int,
 ) -> None:
-    """Point every member row's prompt window at the leader's slots, in one
-    indexed copy (all members share leader_row + prompt_len, so batching them
-    saves a kernel launch per member).
+    """One indexed copy for all members (they share leader_row + prompt_len,
+    so batching saves a kernel launch per member).
 
     Any tree lock on a matched prompt prefix is the leader's for the group's
     whole lifetime; member rows never touch the tree.
@@ -66,11 +65,11 @@ def alias_members_prompt_kv(
 
 
 def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> None:
-    """Release a group's decode-suffix KV [prompt_len, leader_allocated) plus
-    the member row slots. Idempotent.
+    """Release the decode-suffix KV [prompt_len, leader_allocated) plus the
+    member row slots. Idempotent.
 
-    Must run while the leader still holds its kv info: leader_allocated is
-    the lockstep allocated length of every member row, overlap overshoot slot
+    Must run while the leader still holds its kv info: leader_allocated is the
+    lockstep allocated length of every member row, overlap overshoot slot
     included.
     """
     if group.member_rows is None:
@@ -103,9 +102,8 @@ def remap_kv_mapping(
     prefix_len: int,
     seq_len: int,
 ):
-    """Reparent by pointing rows at their parent's slots instead of copying
-    KV data (share-on-fork). Returns (old_mapping, new_mapping) so the caller
-    can reclaim the slots no surviving row references any more.
+    """Returns (old_mapping, new_mapping) so the caller can reclaim the slots
+    no surviving row references any more.
 
     All rows are length-synchronized, so a survivor's history is exactly its
     parent's window [prefix_len, seq_len) -- including the token just computed
@@ -122,8 +120,8 @@ def remap_kv_mapping(
 def collect_orphan_slots(old_mapping: torch.Tensor, new_mapping: torch.Tensor):
     """Slots referenced before the remap and by nobody after it.
 
-    Data-dependent output shape (unique/isin), so this synchronizes -- keep it
-    off the launch path; the deferred commit half already syncs.
+    Data-dependent output shape (unique/isin), so this synchronizes -- callers
+    must keep it off the launch path.
     """
     old_slots = old_mapping.flatten().unique()
     new_slots = new_mapping.flatten().unique()

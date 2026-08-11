@@ -17,13 +17,8 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass
 class BeamTail:
-    """Layout of the beam member rows appended after the reqs-aligned rows.
-
-    Member rows are physical req_to_token rows without a Req; they exist in
-    the batch row tensors only between prepare_for_decode (append) and the
-    next filter/merge (strip). entries hold, per group in batch order:
-    (group, leader index in reqs, tail-relative start, tail-relative end).
-    """
+    """entries hold, per group in batch order: (group, leader index in reqs,
+    tail-relative start, tail-relative end)."""
 
     num_base_rows: int
     num_tail_rows: int
@@ -31,12 +26,12 @@ class BeamTail:
 
 
 def append_beam_tail(batch: ScheduleBatch) -> None:
-    """Append every live beam group's member rows after the reqs-aligned
-    rows, so the decode forward (allocation, relay resolve, attention)
-    covers them. Member rows decode in lockstep with their leader: their
-    seq lens are the leader's. Reqs-sized host metadata (sampling_info,
-    top_logprobs_nums, rids, ...) is intentionally NOT extended -- the
-    worker slices the member rows off the logits before sampling."""
+    """Append every live group's member rows after the reqs-aligned rows, so
+    the decode forward (allocation, relay resolve, attention) covers them.
+
+    Reqs-sized host metadata (sampling_info, top_logprobs_nums, rids, ...) is
+    intentionally NOT extended -- the worker slices the member rows off the
+    logits before sampling."""
     assert batch.beam_tail is None
     entries = []
     tails = []
@@ -89,9 +84,8 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
 
 
 def strip_beam_tail(batch: ScheduleBatch) -> None:
-    """Restore the 1:1 reqs<->rows layout by slicing the member rows off.
-    Lazily invoked at the entry of every batch mutation (filter / merge /
-    prepare), so the tail only ever spans one forward."""
+    """Restore the 1:1 reqs<->rows layout. Called at the entry of every batch
+    mutation (filter / merge / prepare), so the tail spans one forward."""
     tail = batch.beam_tail
     if tail is None:
         return
@@ -111,8 +105,8 @@ def strip_beam_tail(batch: ScheduleBatch) -> None:
 
 
 def num_beam_member_rows(reqs) -> int:
-    """Extra decode-slot demand: member rows decode in lockstep with their
-    leader, one slot per row per step (beam requires page_size == 1)."""
+    """Extra decode-slot demand: one slot per member row per step (beam
+    requires page_size == 1)."""
     return sum(r.beam_group.num_member_rows for r in reqs if r.beam_group is not None)
 
 
