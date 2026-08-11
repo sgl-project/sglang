@@ -168,6 +168,36 @@ class TestGetDcpLens(CustomTestCase):
         self.assertTrue(torch.equal(kernel_k[0], k[:, 0:1]))
         self.assertTrue(torch.equal(out, q))
 
+    def test_dense_q_indptr_matches_the_arange_it_replaces(self):
+        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+        max_bs = 16
+        for num_draft_tokens in (1, 2, 8):
+            backend = object.__new__(TRTLLMMLABackend)
+            backend.q_indptr_decode = torch.arange(0, max_bs + 1, dtype=torch.int32)
+            backend.num_draft_tokens = num_draft_tokens
+            backend.dense_q_indptr_verify = backend.q_indptr_decode * num_draft_tokens
+            # Equal hits the precomputed buffer, +1 hits the fallback.
+            for draft_token_num in (num_draft_tokens, num_draft_tokens + 1):
+                for bs in (1, 3, max_bs):
+                    with self.subTest(
+                        num_draft_tokens=num_draft_tokens,
+                        draft_token_num=draft_token_num,
+                        bs=bs,
+                    ):
+                        got = backend._dense_q_indptr(bs, draft_token_num)
+                        expected = torch.arange(
+                            0,
+                            (bs + 1) * draft_token_num,
+                            draft_token_num,
+                            dtype=torch.int32,
+                        )
+                        self.assertEqual(got.dtype, torch.int32)
+                        self.assertTrue(
+                            torch.equal(got, expected),
+                            f"{got.tolist()} != {expected.tolist()}",
+                        )
+
     def test_paged_allocator_exposes_dcp_virtual_capacity(self):
         real_kv_size = 1024
         dcp_size = 4
