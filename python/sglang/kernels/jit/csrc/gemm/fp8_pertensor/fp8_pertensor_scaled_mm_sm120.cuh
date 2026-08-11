@@ -25,8 +25,6 @@ limitations under the License.
 #include <cstdint>
 #include <cuda_runtime.h>
 
-using namespace host;
-
 // clang-format off
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -37,6 +35,10 @@ using namespace host;
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
 // clang-format on
+
+namespace sglang {
+
+using namespace host;
 
 #define CUTLASS_CHECK(status)                                                        \
   {                                                                                  \
@@ -222,3 +224,5 @@ inline void fp8_pertensor_scaled_mm_sm120(
 }
 
 #endif  // defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+
+}  // namespace sglang

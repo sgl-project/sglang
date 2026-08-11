@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "fp8_pertensor_scaled_mm_sm120.cuh"
 
+namespace sglang {
+
 void fp8_pertensor_scaled_mm(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView mat_a,
@@ -23,3 +25,5 @@ void fp8_pertensor_scaled_mm(
     tvm::ffi::TensorView scale_b) {
   fp8_pertensor_scaled_mm_sm120(out, mat_a, mat_b_nk, scale_a, scale_b);
 }
+
+}  // namespace sglang
