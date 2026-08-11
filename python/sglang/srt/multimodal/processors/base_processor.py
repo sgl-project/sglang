@@ -421,8 +421,9 @@ class BaseMultimodalProcessor(ABC):
         self._preprocess_metrics_callback = callback
 
     def observe_preprocess_phase(self, phase: str, seconds: float) -> None:
-        if self._preprocess_metrics_callback is not None:
-            self._preprocess_metrics_callback(phase, seconds)
+        callback = getattr(self, "_preprocess_metrics_callback", None)
+        if callback is not None:
+            callback(phase, seconds)
 
     @property
     def keep_mm_features_on_device(self) -> bool:
