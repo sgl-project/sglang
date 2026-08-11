@@ -673,7 +673,7 @@ class LogitsProcessor(nn.Module):
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             elif self._can_use_tp_lm_head_all_to_all(
-                logits, local_hidden_states, logits_metadata
+                logits, local_hidden_states, lm_head, logits_metadata
             ):
                 logits = self._tp_lm_head_all_to_all(logits)
                 used_tp_lm_head_all_to_all = True
@@ -790,9 +790,19 @@ class LogitsProcessor(nn.Module):
         self,
         logits: torch.Tensor,
         local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
     ) -> bool:
         if not self.use_tp_lm_head_all_to_all:
+            return False
+
+        tp_size = get_parallel().tp_size
+        base_lm_head = getattr(lm_head, "base_layer", lm_head)
+        if getattr(base_lm_head, "tp_size", None) != tp_size:
+            # Tied embeddings may be replicated across DP ranks (tp_size=1),
+            # even though the logits processor runs in a larger global TP
+            # group. Such logits are full-vocabulary rather than TP shards and
+            # therefore do not satisfy the all-to-all layout contract.
             return False
 
         # Every participant must make the same collective choice. Decode CUDA
@@ -805,14 +815,13 @@ class LogitsProcessor(nn.Module):
         )
         is_equal_eager_layout = (
             global_counts_cpu is not None
-            and len(global_counts_cpu) == get_parallel().tp_size
+            and len(global_counts_cpu) == tp_size
             and len(global_counts_cpu) > 0
             and all(count == global_counts_cpu[0] for count in global_counts_cpu)
         )
         if not (is_equal_padded_graph_layout or is_equal_eager_layout):
             return False
 
-        tp_size = get_parallel().tp_size
         local_rows = local_hidden_states.shape[0]
         return local_rows > 0 and logits.shape[0] == local_rows * tp_size
 
