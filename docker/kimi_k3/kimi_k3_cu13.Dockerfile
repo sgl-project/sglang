@@ -10,7 +10,7 @@
 #        topk 11->16, SWITCH_HIDDEN += 3584, EP>8 SourceMeta alignment,
 #        cross-node timeout headroom, CUDA-13 cccl include; rebuilt for
 #        sm_90, sm_100a, and sm_103a
-#   3. DeepGEMM upgrade to 0.1.5.post1:
+#   3. DeepGEMM upgrade to 0.1.5.post2:
 #        official MegaMoE runtime-JIT header with Kimi-K3 SiTU support
 #   4. FlashInfer CuTeDSL MLA DCP patch:
 #        apply the seven runtime-file diffs; exclude tests absent from the wheel
@@ -26,7 +26,8 @@
 
 FROM lmsysorg/sglang:v0.5.16 AS base
 
-ARG SGL_DEEP_GEMM_VERSION="0.1.5.post1"
+ARG SGL_DEEP_GEMM_VERSION="0.1.5.post2"
+ARG NVIMGCODEC_VERSION="0.9.0.20"
 
 # Current Kimi-K3 source auto-discovers and builds its PyO3 extensions.
 ARG RUST_VERSION="1.90.0"
@@ -52,10 +53,12 @@ ARG TORCH_CUDA_ARCH_LIST="9.0;10.0a;10.3a"
 # --- 1. Kimi-K3 SGLang code (replaces the base's stock sglang, editable) ---
 # Keep the installed extension modules, but discard Rust and pip build
 # artifacts that are not used at runtime.
+ARG SGLANG_COMMIT="25035bff8d34f3fcce2c1a2a5b1fe610225e84ed"
 RUN rm -rf /sgl-workspace/sglang && \
-    git clone --branch kimi-k3 \
+    git clone --no-checkout \
       https://github.com/sgl-project/sglang.git /sgl-workspace/sglang && \
     cd /sgl-workspace/sglang && \
+    git checkout --detach "${SGLANG_COMMIT}" && \
     rm -rf .git && \
     test ! -e .git && \
     pip install -e python --no-deps && \
@@ -76,6 +79,12 @@ RUN TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
 # The v0.5.16 base contains DeepGEMM 0.1.4.post1.
 RUN python3 -m pip install --no-deps --force-reinstall \
     "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}"
+
+# High-fidelity GPU JPEG decode. The K3 processor enables nvJPEG interpolated
+# chroma upsampling through nvImageCodec and zero-copy DLPack handoff to Torch.
+RUN python3 -m pip install \
+      "nvidia-nvimgcodec-cu13[all]==${NVIMGCODEC_VERSION}" && \
+    rm -rf /root/.cache/pip
 
 # Install the pinned FlashInfer MXFP4 MoE runner cubin pool.
 ARG TRTLLM_GEN_MOE_CUBIN_URL="https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip"

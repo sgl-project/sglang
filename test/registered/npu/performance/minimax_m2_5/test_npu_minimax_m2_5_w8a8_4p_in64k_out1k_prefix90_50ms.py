@@ -9,12 +9,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(
-    est_time=3600,
-    suite="npu-performance",
-    nightly=True,
-    disabled="performance testcase",
-)
+register_npu_ci(est_time=3600, suite="base-c-test-perf-8-npu-a3")
 
 MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
