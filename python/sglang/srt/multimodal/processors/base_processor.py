@@ -340,10 +340,11 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
-        if self.use_cuda_ipc and not skip_mm_pool:
+        if self.use_cuda_ipc and not skip_mm_pool and not self.server_args.language_only:
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
+            # Skip in language-only mode to save ~1GB VRAM (pool is unused without multimodal).
             worker_num = self.server_args.tokenizer_worker_num
             per_worker_pool_size = get_mm_feature_pool_size_per_worker(
                 MM_FEATURE_CACHE_SIZE, worker_num
