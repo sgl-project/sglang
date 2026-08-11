@@ -447,10 +447,9 @@ class TboDPAttentionPreparer:
 
         return local_can_run_tbo, local_forward_mode
 
-    def compute_output(self, partial_global_info):
-        # Already a host tensor: the caller does the single D2H for all fields.
-        local_can_run_tbo_aggregated = min(partial_global_info[:, 0].tolist())
-        forward_modes = partial_global_info[:, 1].tolist()
+    def compute_output(self, partial_global_info_cpu):
+        local_can_run_tbo_aggregated = min(partial_global_info_cpu[:, 0].tolist())
+        forward_modes = partial_global_info_cpu[:, 1].tolist()
 
         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
             forward_modes
