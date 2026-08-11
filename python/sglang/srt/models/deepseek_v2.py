@@ -2672,10 +2672,14 @@ class DeepseekV2Model(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
 
         self.gemm_output_zero_allocator_size = 0
+        # Read hidden_size off the config, not off self.embed_tokens: on every
+        # non-first PP rank embed_tokens is a PPMissingLayer, which has no
+        # embedding_dim. VocabParallelEmbedding above is constructed with
+        # config.hidden_size and stores it verbatim, so the two agree on rank 0.
         if (
             _use_aiter_gfx95
             and config.n_routed_experts == 256
-            and self.embed_tokens.embedding_dim == 7168
+            and config.hidden_size == 7168
         ):
             num_moe_layers = sum(
                 [
@@ -2705,7 +2709,7 @@ class DeepseekV2Model(nn.Module):
                     config.n_routed_experts,
                     num_moe_layers,
                     allocate_size,
-                    self.embed_tokens.embedding_dim,
+                    config.hidden_size,
                 )
             )
         self.layers_to_capture = []
