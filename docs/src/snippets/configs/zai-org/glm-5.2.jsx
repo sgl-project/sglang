@@ -239,6 +239,45 @@ sgl-eval run aime25 \\
         { id: "write_back",    label: "Write-back" },
       ],
     },
+
+    // ----- Card 7: "DSA Prefill Backend" (AMD only) -----
+    // Long-context prefill lever, exposed as an opt-in playground select rather
+    // than folded into a cell: it is a real behaviour change and has NOT been
+    // confirmed on MI355X (the hardware these cells pin), so no verified:true
+    // cell may carry it.
+    //
+    // The aiter DSA prefill kernel uses half the launches (390 vs 780 for
+    // 78 layers x 5 passes) with a coarser decomposition: -57.7% DSA attention
+    // time, -24 to -26% p50 TTFT and -28% p99 at ISL 8192, TPOT -8.5% and
+    // throughput +9.8% at ISL 8192 / concurrency 16.
+    //
+    // PREFILL ONLY -- switching decode to aiter as well costs TPOT (43.88 vs
+    // 41.90 ms at cc16), so --dsa-decode-backend stays tilelang.
+    //
+    // NOT a general win: at ISL 1024 it is 10-12% WORSE, because a decode-stage
+    // kernel repurposed for prefill needs enough work per launch to amortize.
+    // Prefer it only for long-context workloads.
+    //
+    // Measured on MI350X (not MI355X) with --random-range-ratio 0.8, so the "8k"
+    // prompts average ~7370 tokens and the numbers above are not comparable to
+    // the published cookbook TTFT figures (which used ratio 1.0). Needs an
+    // MI355X round at ratio 1.0 before this becomes a cell.
+    //
+    // Note the ROCm engine default is already tilelang for both prefill and
+    // decode (arg_groups/overrides.py, fires for any is_hip()), so the AMD cells
+    // are pinning the engine default rather than making a considered choice.
+    flagSelects: [
+      {
+        id: "dsaPrefillBackend",
+        title: "DSA Prefill Backend (experimental)",
+        showWhen: (base) => base.hw === "mi355x" || base.hw === "mi325x" || base.hw === "mi300x",
+        stripPrefixes: ["--dsa-prefill-backend"],
+        options: [
+          { id: "tilelang", label: "tilelang (verified)", flags: ["--dsa-prefill-backend tilelang"] },
+          { id: "aiter",    label: "aiter (long-context, unverified)", flags: ["--dsa-prefill-backend aiter"] },
+        ],
+      },
+    ],
   },
 
   cells: [
@@ -891,6 +930,28 @@ sgl-eval run aime25 \\
     // (MI325X/MI300X) cells stay verified:false (not yet benchmarked, but correct).
     // BF16 (~1.51 TB) only fits single-node on MI325X (2 TB) / MI355X (2.3 TB);
     // MI300X (1.5 TB) needs multi-node, so its BF16 cells are omitted.
+    //
+    // --chunked-prefill-size on these cells is a LONG-CONTEXT lever, not a
+    // batch-shaping one, and it is inert at the benchmarked workload:
+    //   * chunked_prefill_size auto-defaults to 16384 on any >=160 GB GPU
+    //     (server_args.py, the "B200, MI300" arm), and it is the only budget
+    //     that truncates a request: schedule_policy.py sets
+    //     `trunc_len = self.rem_chunk_tokens`.
+    //   * max_prefill_tokens (default 16384) is a SEPARATE budget that only
+    //     caps how many *further* requests join a prefill batch. It never
+    //     truncates a request, and nothing clamps one budget by the other.
+    //   * Every published GLM-5.2 benchmark is ISL 8192 (see
+    //     glm-5.2-benchmarks.jsx). 8192 is below 16384/32768/131072 alike, so
+    //     all three commit the prompt in a single un-chunked forward -- measured
+    //     bit-identical on MI350X TP8 (cc1 494.9/495.6 ms, cc8 2732.3/2738.6,
+    //     cc16 5080.9/5078.0 for 131072 vs 32768).
+    // Above ISL 16384 the flag becomes live: 131072 keeps a 128K prompt in one
+    // forward where the 16384 default would split it into 8 chunks. So it is not
+    // dead code and is kept.
+    // Do NOT "fix" this by adding --max-prefill-tokens 131072: that raises the
+    // multi-request admission budget, which makes mean TTFT ~1.6x worse
+    // (8k->64k budget: mean TTFT 2612->4505 ms, TPOT 33.2->16.9 ms, p99 flat at
+    // ~4650-4840 ms). 16384 is TTFT-optimal for the benchmarked shape.
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
