@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 from typing import TYPE_CHECKING, Optional
@@ -21,26 +20,45 @@ def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     )
 
 
+# The algorithms whose resolution depends on the draft architecture. Anything
+# else must not pay for the draft config read below, let alone fail on it.
+_GEMMA4_ALIASED_ALGORITHMS = ("NEXTN", "EAGLE", "EAGLE3")
+
+_GEMMA4_ASSISTANT_DRAFT_ARCHS = (
+    "Gemma4AssistantForCausalLM",
+    "Gemma4UnifiedAssistantForCausalLM",
+)
+
+
+def _draft_is_gemma4_assistant(server_args: ServerArgs) -> bool:
+    """Whether the draft checkpoint is a Gemma4 assistant draft.
+
+    Answers False without reading anything unless the configured algorithm
+    actually consumes the answer. The read honors --model-config-parser and a
+    pinned revision, so for every other algorithm -- including the launches
+    that never build a draft worker at all -- it is a failure mode the startup
+    has no reason to take on.
+    """
+    if server_args.speculative_algorithm not in _GEMMA4_ALIASED_ALGORITHMS:
+        return False
+    if not server_args.speculative_draft_model_path:
+        return False
+
+    from sglang.srt.configs.model_config import ModelConfig
+
+    cfg = ModelConfig.get_draft_hf_config(server_args)
+    draft_archs = getattr(cfg, "architectures", None) or []
+    return any(arch in _GEMMA4_ASSISTANT_DRAFT_ARCHS for arch in draft_archs)
+
+
 def _resolve_speculative_algorithm_alias(
-    speculative_algorithm: Optional[str],
-    speculative_draft_model_path: Optional[str],
-    trust_remote_code: bool = False,
-    kwargs: Optional[dict] = {},
+    *, speculative_algorithm: Optional[str], is_gemma4_draft: bool
 ) -> Optional[str]:
-    """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
+    """Resolve the CLI speculative algorithm to the name workers dispatch on.
 
-    is_gemma4_draft = False
-    if speculative_draft_model_path:
-        from sglang.srt.utils.hf_transformers_utils import get_config
-
-        cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
-        )
-        draft_archs = getattr(cfg, "architectures", None) or []
-        is_gemma4_draft = any(
-            arch in ("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
-            for arch in draft_archs
-        )
+    NEXTN is an alias for EAGLE. A Gemma4 assistant draft promotes NEXTN/EAGLE
+    to FROZEN_KV_MTP instead, and is rejected outright for EAGLE3.
+    """
 
     if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
         raise ValueError(
@@ -89,17 +107,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "select the non-overlap (synchronous) path."
         )
 
-    kwargs = {}
-
-    override_config_file = server_args.decrypted_draft_config_file
-    if override_config_file and override_config_file.strip():
-        kwargs["_configuration_file"] = override_config_file.strip()
-
     server_args.speculative_algorithm = _resolve_speculative_algorithm_alias(
-        server_args.speculative_algorithm,
-        server_args.speculative_draft_model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        kwargs=kwargs,
+        speculative_algorithm=server_args.speculative_algorithm,
+        is_gemma4_draft=_draft_is_gemma4_assistant(server_args),
     )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
@@ -210,30 +220,29 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
     if server_args.speculative_num_draft_tokens is None:
+        from sglang.srt.configs.model_config import DraftConfigReadError, ModelConfig
         from sglang.srt.speculative.dflash_utils import (
             parse_dflash_draft_config,
         )
 
-        model_override_args = json.loads(server_args.json_model_override_args)
         inferred_block_size = None
+        # Only an unreadable checkpoint falls back. A checkpoint that is
+        # readable but declares a malformed block_size raises out of the parse
+        # below: silently serving it with a different draft window is worse
+        # than refusing to start.
         try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
-                server_args.speculative_draft_model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
-            inferred_block_size = parse_dflash_draft_config(
-                draft_hf_config=draft_hf_config
-            ).resolve_block_size(default=None)
-        except Exception as e:
+            draft_hf_config = ModelConfig.get_draft_hf_config(server_args)
+        except DraftConfigReadError as e:
+            draft_hf_config = None
             logger.warning(
                 "Failed to infer DFLASH block_size from draft model config; "
                 "defaulting speculative_num_draft_tokens to 16. Error: %s",
                 e,
             )
+        if draft_hf_config is not None:
+            inferred_block_size = parse_dflash_draft_config(
+                draft_hf_config=draft_hf_config
+            ).resolve_block_size(default=None)
 
         if inferred_block_size is None:
             inferred_block_size = 16
@@ -367,14 +376,17 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
         gamma = int(server_args.speculative_dspark_block_size)
     else:
+        from sglang.srt.configs.model_config import DraftConfigReadError
         from sglang.srt.speculative.dspark_components.dspark_config import (
             DEFAULT_DSPARK_GAMMA,
             read_draft_checkpoint_gamma,
         )
 
+        # As in _handle_dflash: only an unreadable checkpoint falls back to the
+        # default gamma; a malformed one raises.
         try:
             gamma = read_draft_checkpoint_gamma(server_args=server_args)
-        except Exception as e:
+        except DraftConfigReadError as e:
             logger.warning(
                 "Failed to read DSpark gamma from draft model config; "
                 "cannot cross-check --speculative-num-draft-tokens. Error: %s",
@@ -480,15 +492,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     if draft_backend is None:
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
+        from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
-        from sglang.srt.utils.hf_transformers_utils import get_config
 
-        draft_hf_config = get_config(
-            server_args.speculative_draft_model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.speculative_draft_model_revision,
-            model_override_args=json.loads(server_args.json_model_override_args),
-        )
+        draft_hf_config = ModelConfig.get_draft_hf_config(server_args)
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config
         )

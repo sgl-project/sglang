@@ -18,9 +18,9 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from functools import cached_property
+from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import Any, List, Optional, Set, Union
+from typing import Any, List, Optional, Set, Tuple, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -42,6 +42,18 @@ from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+class DraftConfigReadError(Exception):
+    """The speculative draft checkpoint's hf config could not be read.
+
+    Its own type so that callers which fall back to a default on an unreadable
+    checkpoint catch exactly that, and unrelated failures raised on the same
+    line -- a malformed --json-model-override-args, a bug inside a registered
+    config parser -- stay fatal instead of being logged as a warning and
+    replaced with a default draft window.
+    """
+
 
 MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
@@ -298,24 +310,20 @@ class ModelConfig:
         self._validate_quantize_and_serve_config()
 
         # Get hf config
-        self._maybe_pull_model_for_runai(self.model_path)
-        self._maybe_pull_model_tokenizer_from_remote()
+        self.model_path, model_weights = self._resolve_hf_config_path(self.model_path)
+        if model_weights is not None:
+            # model_loader/loader.py probes this with hasattr(), so it stays
+            # unset for local paths rather than being set to None.
+            self.model_weights = model_weights
         self.model_override_args = json.loads(model_override_args)
-        kwargs = {}
-        if override_config_file and override_config_file.strip():
-            kwargs["_configuration_file"] = override_config_file.strip()
-        # get_config() is cached. ModelConfig mutates hf_config for draft-model
-        # remapping and architecture-specific normalization, so each instance
-        # must own an isolated copy.
-        self.hf_config = copy.deepcopy(
-            get_config(
-                self.model_path,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                model_override_args=self.model_override_args,
-                model_config_parser=model_config_parser,
-                **kwargs,
-            )
+        kwargs = self._configuration_file_kwargs(override_config_file)
+        self.hf_config = self._read_hf_config(
+            self.model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            model_override_args=self.model_override_args,
+            model_config_parser=model_config_parser,
+            override_config_file=override_config_file,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
@@ -614,6 +622,133 @@ class ModelConfig:
             speculative_algorithm=server_args.speculative_algorithm,
             **kwargs,
         )
+
+    @staticmethod
+    def _configuration_file_kwargs(override_config_file: Optional[str]) -> dict:
+        """`_configuration_file` kwarg naming a decrypted config, or `{}`."""
+        if override_config_file and override_config_file.strip():
+            return {"_configuration_file": override_config_file.strip()}
+        return {}
+
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _resolve_hf_config_path(model_path: str) -> Tuple[str, Optional[str]]:
+        """Where the hf config is readable from, plus a remote weights URI.
+
+        The hf parsers open local directories, so an object-store URI or a
+        remote URL is resolved to a local copy of the config first and the
+        original is handed back for the weight loader. Returns the path
+        unchanged, and no weights URI, for an ordinary local checkpoint.
+
+        Memoized because it sits outside get_config()'s own cache, so without
+        it every repeated read of one checkpoint re-resolves the path: a
+        remote URL is re-pulled over the network, and each pull strands a
+        tempdir and another link on the signal-handler chain that pins it
+        (see BaseConnector.__init__). Argument resolution reads the draft
+        checkpoint several times before any ModelConfig exists, and each
+        worker reads it again. All three branches are deterministic in
+        model_path, so one resolution per path per process is equivalent.
+        """
+        from sglang.srt.connector import create_remote_connector
+        from sglang.srt.utils import is_remote_url
+
+        if is_runai_obj_uri(model_path):
+            return ObjectStorageModel.get_path(model_path), model_path
+        if is_remote_url(model_path):
+            logger.info("Pulling model configs from remote...")
+            # The pulled config files have to outlive this call, so the client
+            # is deliberately not closed via a `with` block; it owns the
+            # returned local dir for the rest of the process.
+            client = create_remote_connector(model_path)
+            client.pull_files(allow_pattern=["*config.json"])
+            return client.get_local_dir(), model_path
+        return model_path, None
+
+    @staticmethod
+    def _read_hf_config(
+        model_path: str,
+        *,
+        trust_remote_code: bool,
+        revision: Optional[str],
+        model_override_args: dict,
+        model_config_parser: str,
+        override_config_file: Optional[str],
+    ) -> PretrainedConfig:
+        """The single hf config read, shared by the target and the draft.
+
+        Both must resolve a checkpoint the same way. An input dropped on one
+        side makes a checkpoint the other reads fine fail, or resolve
+        different override values: the reported bug was a hand-rolled draft
+        read that omitted model_config_parser, so a checkpoint whose config
+        comes from a registered parser died in the hf parser's Hub lookup.
+        Pass `model_path` through `_resolve_hf_config_path` first.
+
+        get_config() memoizes process-wide and callers mutate what they get
+        back (draft-model remapping, architecture normalization), so each one
+        is handed an isolated copy.
+        """
+        return copy.deepcopy(
+            get_config(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                model_override_args=model_override_args,
+                model_config_parser=model_config_parser,
+                **ModelConfig._configuration_file_kwargs(override_config_file),
+            )
+        )
+
+    @staticmethod
+    def get_draft_hf_config(server_args: ServerArgs) -> PretrainedConfig:
+        """Read the speculative draft checkpoint's hf config.
+
+        Goes through `_read_hf_config` with the inputs `from_server_args(...,
+        is_draft_model=True)` selects for a draft ModelConfig, so the draft
+        resolves exactly as the target does. Argument resolution needs draft
+        config fields before it is correct to build that ModelConfig --
+        `_config_draft_model` rewrites `architectures[0]` off a
+        speculative_algorithm that is itself still resolving -- so only the
+        read is shared.
+
+        Raises DraftConfigReadError when the checkpoint cannot be read. A
+        malformed --json-model-override-args and a failure inside a
+        registered config parser propagate as themselves, so callers that
+        fall back to a default on an unreadable draft do not swallow them.
+        """
+        revision = server_args.speculative_draft_model_revision or server_args.revision
+        # Parsed outside the read: a malformed override string is a
+        # target-side argument error, not an unreadable draft checkpoint.
+        model_override_args = json.loads(server_args.json_model_override_args)
+        try:
+            model_path, _ = ModelConfig._resolve_hf_config_path(
+                server_args.speculative_draft_model_path
+            )
+            return ModelConfig._read_hf_config(
+                model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=revision,
+                model_override_args=model_override_args,
+                model_config_parser=server_args.model_config_parser,
+                override_config_file=server_args.decrypted_draft_config_file,
+            )
+        except (OSError, ValueError, KeyError, ImportError) as e:
+            # Most of these reads happen while parsing CLI args, where a bare
+            # transformers/hub traceback names neither the draft nor the flag.
+            # The cause goes in the text because callers that swallow this log
+            # it with %s, which never formats __cause__.
+            decrypted = (
+                "<set>" if server_args.decrypted_draft_config_file else "<unset>"
+            )
+            raise DraftConfigReadError(
+                "Failed to read the speculative draft checkpoint config: "
+                f"--speculative-draft-model-path={server_args.speculative_draft_model_path!r} "
+                f"(revision={revision!r}, "
+                f"model_config_parser={server_args.model_config_parser!r}, "
+                # The path locates decrypted plaintext on disk and this message
+                # reaches warning-level logs, so only its presence is reported.
+                f"decrypted_draft_config_file={decrypted}): "
+                f"{type(e).__name__}: {e}"
+            ) from e
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
@@ -1674,36 +1809,6 @@ class ModelConfig:
         }
 
         return default_sampling_params
-
-    def _maybe_pull_model_for_runai(self, model: str) -> None:
-        if is_runai_obj_uri(model):
-            # local path for loading the config
-            self.model_path = ObjectStorageModel.get_path(model)
-            # remote path for loading the weights
-            self.model_weights = model
-
-    def _maybe_pull_model_tokenizer_from_remote(self) -> None:
-        """
-        Pull the model config files to a temporary
-        directory in case of remote.
-
-        Args:
-            model: The model name or path.
-
-        """
-        from sglang.srt.connector import create_remote_connector
-        from sglang.srt.utils import is_remote_url
-
-        if is_remote_url(self.model_path):
-            logger.info("Pulling model configs from remote...")
-            # BaseConnector implements __del__() to clean up the local dir.
-            # Since config files need to exist all the time, so we DO NOT use
-            # with statement to avoid closing the client.
-            client = create_remote_connector(self.model_path)
-            if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
-                self.model_weights = self.model_path
-                self.model_path = client.get_local_dir()
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
