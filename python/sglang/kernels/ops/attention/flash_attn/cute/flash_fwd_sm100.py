@@ -2764,13 +2764,16 @@ class FlashAttentionForwardSm100:
                     staggered_bias_loads = (
                         dummy_first_bias_load or (bias_max_idx0 > bias_max_idx1)
                     ) and const_expr(self.q_stage == 2)
+                # Bound outside the guard below: under is_split_kv the guard is a
+                # runtime compare, so a name first bound inside it is an scf.if
+                # live-out with no type on the path that skips the region.
+                n_block_first = n_block_max - 1 if n_block_max > 0 else 0
+                page_idx = (
+                    mPageTable[batch_idx, n_block_first]
+                    if const_expr(mPageTable is not None and self.use_tma_KV)
+                    else None
+                )
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
-                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0
-                    page_idx = (
-                        mPageTable[batch_idx, n_block_first]
-                        if const_expr(mPageTable is not None and self.use_tma_KV)
-                        else None
-                    )
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block_first)
                     # For v_dequant, load V0 first (on vq_producer_state) so the
