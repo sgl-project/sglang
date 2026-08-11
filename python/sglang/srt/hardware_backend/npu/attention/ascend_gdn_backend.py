@@ -214,9 +214,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
             batch_size = cache_indices.shape[0]
             draft_token_num = forward_batch.spec_info.draft_token_num
-            num_accepted_tokens = torch.full(
-                (batch_size,),
-                draft_token_num,
+            # The ascendc conv op reads the pre-verify window at offset
+            # (num_accepted_tokens - 1). Passing the full draft count would read
+            # the stale draft-slot region instead of the committed window and
+            # corrupt every verify output; num_accepted_tokens=1 reads the base
+            # window and leaves [P1, P2, x0..x_{D-1}] in the slot so the commit
+            # (`_commit_conv_windows`) can slice out the accepted step's window.
+            num_accepted_tokens = torch.ones(
+                batch_size,
                 dtype=torch.int32,
                 device=mixed_qkv.device,
             )
@@ -364,6 +369,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             num_accept_tokens = self.num_accept_tokens
             actual_seq_lengths = self.actual_seq_lengths
             ssm_state_indices = self.ssm_state_indices
+
+        # The NPU verify op (recurrent_gated_delta_rule) is natively V-major:
+        # it reads/writes the recurrent state at flat V-major offsets [.., V, K]
+        # and IGNORES tensor strides. The temporal pool is K-major [.., K, V] to
+        # match the triton decode kernel, so we must hand the op a physically
+        # contiguous transposed copy — a mere strided view would make it read the
+        # pool as its own transpose. The commit side mirrors this with a
+        # transposing load in move_intermediate_cache.
+        recurrent_state = recurrent_state.transpose(-1, -2).contiguous()
 
         attn_core_out = torch.ops.npu.recurrent_gated_delta_rule(
             mix_qkv,

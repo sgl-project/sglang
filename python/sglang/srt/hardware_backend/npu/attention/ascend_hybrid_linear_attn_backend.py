@@ -4,7 +4,6 @@ from typing import Optional, Union
 import torch
 import triton
 from sgl_kernel_npu.mamba.mamba_state_update_triton import (
-    conv_state_rollback,
     move_intermediate_cache,
 )
 
@@ -50,6 +49,46 @@ def _mamba_scatter_h_block_size(intermediate_state_cache: torch.Tensor) -> int:
             "--mamba-ssm-dtype bfloat16."
         )
     return max(h_block_size, 1)
+
+
+def _commit_conv_windows(
+    conv_states: torch.Tensor,
+    state_indices: torch.Tensor,
+    step_indices: torch.Tensor,
+    window_size: int,
+):
+    """Restore each slot's conv window to the accepted step.
+
+    The NPU verify conv runs with num_accepted_tokens=1, which makes the
+    ascendc op read the pre-verify window at offset 0 and write the sliding
+    buffer [P1, P2, x0, x1, ..., x_{D-1}] back into the slot (P = pre-verify
+    window, x_s = conv input of verify token s). The window that must survive
+    the commit for a request that accepted step s is the slice [s, s+window_size)
+    of that buffer, so we copy it back over the base window.
+
+    This replaces `conv_state_rollback`, which tried to reconstruct the window
+    from the post-verify final state alone and so could not recover the draft
+    inputs it no longer contained.
+    """
+    num_valid = state_indices.shape[0]
+    if num_valid == 0:
+        return
+    valid = step_indices >= 0
+    if not valid.any():
+        return
+    dst = state_indices[valid].to(torch.int64)
+    steps = step_indices[valid].to(torch.int64)
+    num_valid = dst.shape[0]
+    if num_valid == 0:
+        return
+    src_rows = dst[:, None].expand(num_valid, window_size)
+    src_cols = steps[:, None] + torch.arange(window_size, device=dst.device)
+    src = conv_states[:, src_rows, src_cols, :].clone()
+    dst_rows = dst[:, None].expand(num_valid, window_size)
+    dst_cols = torch.arange(window_size, device=dst.device)[None, :].expand(
+        num_valid, window_size
+    )
+    conv_states[:, dst_rows, dst_cols, :] = src
 
 
 class AscendMambaAttnBackendBase(MambaAttnBackendBase):
@@ -123,13 +162,19 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
             ssm_state_indices = torch.arange(
-                mamba_indices.shape[0] * spec_info.draft_token_num,
+                bs * spec_info.draft_token_num,
                 dtype=torch.int32,
                 device=mamba_indices.device,
             )
-            self.state_indices_list_gdn[bs - 1][
-                : len(mamba_indices) * spec_info.draft_token_num
-            ].copy_(ssm_state_indices)
+            self.state_indices_list_gdn[bs - 1].copy_(ssm_state_indices)
+            logger.debug(
+                f"[CAPTURE] bs={bs}, draft_token_num={spec_info.draft_token_num}, "
+                f"mamba_indices.shape={mamba_indices.shape}, "
+                f"ssm_state_indices.shape={ssm_state_indices.shape}, "
+                f"buffer_size={self.state_indices_list_gdn[bs-1].shape[0]}, "
+                f"ssm_state_indices[:5]={ssm_state_indices[:5].tolist()}, "
+                f"ssm_state_indices[-5:]={ssm_state_indices[-5:].tolist()}"
+            )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
@@ -199,6 +244,12 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 device=mamba_indices.device,
             )
             self.state_indices_list_gdn[bs - 1].copy_(ssm_state_indices)
+            logger.debug(
+                f"[REPLAY] bs={bs}, draft_token_num={spec_info.draft_token_num}, "
+                f"num_padding={num_padding}, "
+                f"ssm_state_indices.shape={ssm_state_indices.shape}, "
+                f"buffer_size={self.state_indices_list_gdn[bs-1].shape[0]}"
+            )
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -296,6 +347,15 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
 
+        logger.debug(
+            f"[UPDATE_MAMBA] request_number={request_number}, "
+            f"state_indices_tensor.shape={state_indices_tensor.shape}, "
+            f"dst_indices_tensor[:5]={dst_indices_tensor[:5].tolist() if dst_indices_tensor.numel() > 0 else []}, "
+            f"src_indices_tensor[:5]={src_indices_tensor[:5].tolist() if src_indices_tensor.numel() > 0 else []}, "
+            f"last_steps={last_steps.tolist()}, "
+            f"intermediate_cache.shape={intermediate_state_cache.shape}"
+        )
+
         h_block_size = _mamba_scatter_h_block_size(intermediate_state_cache)
 
         move_intermediate_cache(
@@ -308,6 +368,8 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
 
         draft_token_num = intermediate_state_cache.shape[2]
+        # conv window: [W + D - 1] buffer, W slots are one window.
+        window_size = conv_states.shape[2] - draft_token_num + 1
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
             mamba_track_indices = mamba_track_indices.to(torch.int64)
@@ -323,8 +385,9 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             )
 
             track_mask = mamba_steps_to_track >= 0
-            # Track conv state from the verify-time window before rolling back
-            # the working slot; NPU does not keep per-step conv intermediates.
+            # Copy the verify-time sliding buffer (base window + draft inputs)
+            # into the track slot before the working slot's window is committed;
+            # the per-step conv windows are then sliced out of it the same way.
             track_indices = mamba_track_indices[track_mask]
             if track_indices.numel() > 0:
                 conv_states[:, track_indices] = conv_states[
@@ -332,19 +395,19 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 ]
 
         if dst_indices_tensor.numel() > 0:
-            conv_state_rollback(
+            _commit_conv_windows(
                 conv_states,
                 dst_indices_tensor,
                 last_steps,
-                draft_token_num,
+                window_size,
             )
 
         if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
-            conv_state_rollback(
+            _commit_conv_windows(
                 conv_states,
                 mamba_track_indices,
                 mamba_steps_to_track,
-                draft_token_num,
+                window_size,
             )
 
         return
