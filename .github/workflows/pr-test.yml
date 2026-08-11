@@ -208,6 +208,23 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
+  # Keep the scheduled x86 build separate from the PR build above. The JIT
+  # caller depends on the PR build for mixed kernel changes, but scheduled JIT
+  # tests do not consume an SGL kernel wheel and should not wait for this job.
+  scheduled-sgl-kernel-build-wheels:
+    needs: check-changes
+    if: |
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true' &&
+      (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true)
+    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
+    with:
+      runs_on: x64-kernel-build-node
+      job_display_name: Build Scheduled Wheel
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
   # =============================================== Rust extensions ====================================================
 
   # Unlike sgl-kernel, not gated on source changes: the cache key is the source
@@ -232,11 +249,23 @@ jobs:
     secrets: inherit
 
   call-sgl-kernel-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, scheduled-sgl-kernel-build-wheels, rust-ext-build]
     if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
+      always() &&
+      !cancelled() &&
+      needs.check-changes.result == 'success' &&
+      needs.rust-ext-build.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true' &&
+      (
+        (
+          (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) &&
+          needs.scheduled-sgl-kernel-build-wheels.result == 'success'
+        ) ||
+        (
+          needs.call-gate.result == 'success' &&
+          needs.sgl-kernel-build-wheels.result == 'success'
+        )
+      )
     uses: ./.github/workflows/pr-test-sgl-kernel.yml
     with:
       runner_config: 4-gpu-b200
@@ -496,6 +525,7 @@ jobs:
 
         sgl-kernel-build-wheels,
         sgl-kernel-build-wheels-arm,
+        scheduled-sgl-kernel-build-wheels,
         call-sgl-kernel-tests,
 
         rust-ext-build,
