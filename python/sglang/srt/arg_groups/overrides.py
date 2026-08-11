@@ -502,7 +502,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     )
     overrides = {}
     if backends_unset:
-        backend = "trtllm_mla"
+        backend = "cutedsl_mla"
         overrides["decode_attention_backend"] = backend
         overrides["prefill_attention_backend"] = "trtllm_mla"
     else:
