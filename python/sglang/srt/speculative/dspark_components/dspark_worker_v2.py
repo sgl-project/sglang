@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -404,11 +405,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DSpark speculative decoding does not support return_logprob yet."
-            )
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
@@ -701,6 +697,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        self._compute_output_logprobs(
+            batch=batch,
+            logits_output=logits_output,
+            out_tokens=accept.out_tokens,
+        )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
@@ -767,6 +768,39 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _compute_output_logprobs(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output,
+        out_tokens: torch.Tensor,
+    ) -> None:
+        if not batch.return_logprob:
+            return
+
+        stride = int(self.verify_num_draft_tokens)
+        count = int(out_tokens.shape[0]) * stride
+        output_indices = self._linear_accept_index_cache
+        if (
+            output_indices is None
+            or output_indices.numel() < count
+            or output_indices.device != out_tokens.device
+        ):
+            output_indices = torch.arange(
+                count,
+                dtype=torch.int64,
+                device=out_tokens.device,
+            )
+            self._linear_accept_index_cache = output_indices
+
+        compute_spec_v2_logprobs(
+            batch,
+            logits_output,
+            out_tokens.reshape(-1),
+            output_indices[:count].view(-1, stride),
+            stride - 1,
         )
 
     def _commit_target_mamba_states_after_verify(
