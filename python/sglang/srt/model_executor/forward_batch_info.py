@@ -1161,10 +1161,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return mrope_positions
 
     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
+        rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        if self.positions is not None and (
+            rl_on_policy_target is not None
+            or batch.multimodal_inputs is None
+            or all(mm_input is None for mm_input in batch.multimodal_inputs)
+        ):
+            # Text-only rows are the regular positions replicated 3x; building
+            # them on device avoids the per-row CPU tensors and the pageable
+            # H2D copy below (cudaMemcpyAsync from pageable memory blocks).
+            self.mrope_positions = (
+                self.positions.to(torch.int64).unsqueeze(0).expand(3, -1).contiguous()
+            )
+            return
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
-        rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
