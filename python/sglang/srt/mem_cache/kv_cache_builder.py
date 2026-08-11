@@ -51,6 +51,26 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+_KIMI_K3_MM_EMBEDDING_CACHE_SIZE_MB = 1024
+
+
+def resolve_mm_embedding_cache_size_mb(model_config: ModelConfig) -> int:
+    """Resolve the per-rank GPU embedding-cache cap.
+
+    Repeated-image Kimi-K3 workloads need more than the historical 100 MiB
+    default to avoid LRU thrashing.  The cache remains lazy: this value is a
+    cap, not a fixed HBM allocation.  An explicit environment value always
+    wins, including zero for deterministic or cache-off runs.
+    """
+    if envs.SGLANG_VLM_CACHE_SIZE_MB.is_set():
+        return envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+
+    architectures = getattr(model_config.hf_config, "architectures", None) or ()
+    if "KimiK3ForConditionalGeneration" in architectures:
+        return _KIMI_K3_MM_EMBEDDING_CACHE_SIZE_MB
+    return envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+
+
 def maybe_register_hicache_draft(
     *,
     tree_cache,
@@ -268,7 +288,11 @@ def build_kv_cache(
             page_size=page_size,
         )
 
-    embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+    embedding_cache_size = resolve_mm_embedding_cache_size_mb(model_config)
+    logger.info(
+        "Multimodal embedding cache: max_size=%d MiB per rank (lazy HBM usage)",
+        embedding_cache_size,
+    )
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     return KVCacheBuildResult(

@@ -1556,8 +1556,21 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    conversation_indices = None
+    turn_indices = None
     if is_multi_turn:
-        outputs = [x for output in outputs for x in output]
+        nested_outputs = outputs
+        conversation_indices = [
+            conversation_index
+            for conversation_index, conversation in enumerate(nested_outputs)
+            for _ in conversation
+        ]
+        turn_indices = [
+            turn_index
+            for conversation in nested_outputs
+            for turn_index in range(len(conversation))
+        ]
+        outputs = [output for conversation in nested_outputs for output in conversation]
 
     # Stop profiler (only if profile_steps was not provided, as it auto-stops)
     if profile and not (
@@ -1874,11 +1887,15 @@ async def benchmark(
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": output_lens,
+        "e2e_latencies": [output.latency for output in outputs],
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    if is_multi_turn:
+        result_details["conversation_indices"] = conversation_indices
+        result_details["turn_indices"] = turn_indices
 
     if args.cache_report:
         result_details["cached_tokens"] = [o.cached_tokens for o in outputs]
