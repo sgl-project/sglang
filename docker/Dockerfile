@@ -249,7 +249,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                --no-deps; \
        fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' pyproject.toml && \
+           sed -i 's/cuda-python>=[0-9.]*/cuda-python>=12,<13/' pyproject.toml && \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
@@ -650,7 +650,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
+           sed -i 's/cuda-python>=[0-9.]*/cuda-python>=12,<13/' python/pyproject.toml && \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
        fi \

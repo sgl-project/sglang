@@ -23,7 +23,10 @@ dependencies = [
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
-  "cuda-python>=13.0",
+  # >=13.3: on 13.0.x the CUmemAllocationProp.requestedHandleTypes setter reads
+  # `.value` off its argument, so the plain-int handle types used across the VMM
+  # helpers raise AttributeError.
+  "cuda-python>=13.3",
   # Transitive dep of flashinfer-python, pinned because 1.6.0rc6 shipped no cp310 linux x86_64 wheel.
   "cuda-tile==1.6.0rc5",
   "datasets",
