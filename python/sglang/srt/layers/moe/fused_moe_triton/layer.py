@@ -154,11 +154,6 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):
-        dispatcher_kwargs = {}
-        if a2a_backend.is_deepep():
-            dispatcher_kwargs["num_trailing_shared_slots"] = (
-                moe_runner_config.num_fused_shared_experts
-            )
         return MaybeTboDeepEPDispatcher(
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
@@ -170,7 +165,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             deepep_mode=get_deepep_mode(),
             async_finish=True,
             return_recv_hook=True,
-            **dispatcher_kwargs,
+            num_trailing_shared_slots=moe_runner_config.num_fused_shared_experts,
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(

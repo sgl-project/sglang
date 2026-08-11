@@ -198,6 +198,7 @@ class _PplxDispatcherImpl:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        num_trailing_shared_slots: int,
     ):
         if not use_pplx:
             raise ImportError(
@@ -217,6 +218,7 @@ class _PplxDispatcherImpl:
         self.params_dtype = params_dtype
         self.params_bytes = torch.tensor([], dtype=params_dtype).element_size()
         self.deepep_mode = deepep_mode
+        self.num_trailing_shared_slots = num_trailing_shared_slots
 
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
@@ -352,7 +354,8 @@ class _PplxDispatcherImpl:
         expected_m,
     ):
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            out_expert_num_tokens
+            out_expert_num_tokens,
+            num_trailing_shared_slots=self.num_trailing_shared_slots,
         )
         return PplxDispatchOutput(
             out_expert_x,
@@ -431,6 +434,8 @@ class PplxDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        *,
+        num_trailing_shared_slots: int,
     ):
         super().__init__()
 
@@ -450,6 +455,7 @@ class PplxDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            num_trailing_shared_slots=num_trailing_shared_slots,
         )
 
         self._stage = _Stage.INITIAL
