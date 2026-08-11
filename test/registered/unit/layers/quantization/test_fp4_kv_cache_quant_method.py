@@ -72,10 +72,16 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         from types import SimpleNamespace
 
         from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.runtime_context import get_context
 
         runner = object.__new__(ModelRunner)
-        runner.server_args = SimpleNamespace(kv_cache_dtype="fp4_e2m1")
+        runner.server_args = SimpleNamespace()
         runner.draft_attention_backend = None
+        # The runner reads the requested dtype off the model bag, so the double
+        # publishes it rather than carrying it on a stand-in config.
+        override = get_context().override_server_args(kv_cache_dtype="fp4_e2m1")
+        override.install()
+        self.addCleanup(override.restore)
         with self.assertRaisesRegex(ValueError, "fp4_mx_block16"):
             runner.configure_kv_cache_dtype()
 
