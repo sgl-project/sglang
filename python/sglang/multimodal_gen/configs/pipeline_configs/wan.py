@@ -266,6 +266,13 @@ class FastWan2_2_TI2V_5B_Config(Wan2_2_TI2V_5B_Config):
         default_factory=lambda: [1000, 757, 522]
     )
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit",),
+        )
+
 
 @dataclass
 class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):

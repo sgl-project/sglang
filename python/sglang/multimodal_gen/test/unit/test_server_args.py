@@ -1048,10 +1048,15 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
 
-        # fasthunyuan no longer pins 150gb -- falls back to the global video default
         fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
-        self.assertIsNone(fast_hunyuan_deployment.keep_resident_min_available_gb)
-        self.assertEqual(fast_hunyuan_deployment.keep_resident_components, ("vae",))
+        self.assertEqual(fast_hunyuan_deployment.keep_resident_min_available_gb, 60)
+        self.assertEqual(
+            fast_hunyuan_deployment.keep_resident_components, ("dit", "vae")
+        )
+
+        fast_wan_deployment = FastWan2_2_TI2V_5B_Config().get_model_deployment_config()
+        self.assertEqual(fast_wan_deployment.keep_resident_min_available_gb, 60)
+        self.assertEqual(fast_wan_deployment.keep_resident_components, ("dit",))
 
         # default keeps only vae resident (encoders are large, dit owned by FSDP)
         self.assertEqual(qwen_deployment.keep_resident_components, ("vae",))
@@ -1409,9 +1414,26 @@ class TestOffloadDefaults(unittest.TestCase):
             ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_fastwan_layerwise_offload_does_not_implicitly_add_dit(self):
+    def test_auto_fastwan_keeps_dit_resident_on_h100(self):
         args = self._from_dict_with_pipeline_config(
             FastWan2_2_TI2V_5B_Config(),
+            available_memory_gb=72,
+            kwargs={
+                "model_path": "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_auto_fastwan_offloads_dit_below_resident_threshold(self):
+        args = self._from_dict_with_pipeline_config(
+            FastWan2_2_TI2V_5B_Config(),
+            memory_gb=48,
             kwargs={
                 "model_path": "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
                 "performance_mode": "auto",
@@ -1419,10 +1441,31 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertTrue(args.dit_cpu_offload)
-        self.assertEqual(
-            args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+
+    def test_auto_fast_hunyuan_keeps_dit_resident_on_h100(self):
+        args = self._from_dict_with_pipeline_config(
+            FastHunyuanConfig(),
+            available_memory_gb=72,
+            kwargs={
+                "model_path": "FastVideo/FastHunyuan-diffusers",
+                "performance_mode": "auto",
+            },
         )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_auto_fast_hunyuan_offloads_dit_below_resident_threshold(self):
+        args = self._from_dict_with_pipeline_config(
+            FastHunyuanConfig(),
+            memory_gb=48,
+            kwargs={
+                "model_path": "FastVideo/FastHunyuan-diffusers",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
 
     def test_auto_turbo_wan_layerwise_offload_does_not_implicitly_add_dit(self):
         args = self._from_dict_with_pipeline_config(
