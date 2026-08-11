@@ -426,6 +426,7 @@ def _fake_compact_planner(
     planner._schedule_cfg = DSparkScheduleConfig(gamma=verify_num_draft_tokens - 1)
     planner._dynamic_graph_tier = False
     planner._is_verify_all = False
+    planner._derived_sps_installed = False
     planner._align_verify_tokens_to_graph_tier = align
     return planner
 

@@ -39,5 +39,36 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
                 self.assertTrue(backend.supports_ragged_verify_graph)
 
 
+class TestReplayCapturedShapeCapability(CustomTestCase):
+    """Capture-time cost measurement replays a captured graph with no ForwardBatch bound.
+
+    Only backends that can do that opt in; the rest inherit a NotImplementedError and the caller
+    silently keeps its existing cost model. A backend that gained the ability but not the override
+    would leave the DSpark verify budget degenerate with nothing going red, which is what this
+    checks.
+    """
+
+    def test_base_backend_does_not_implement_it(self):
+        from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+            BaseCudaGraphBackend,
+        )
+
+        with self.assertRaises(NotImplementedError):
+            BaseCudaGraphBackend.replay_captured_shape(object(), shape_key=None)
+
+    def test_full_backend_overrides_it(self):
+        from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+            BaseCudaGraphBackend,
+        )
+        from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+            FullCudaGraphBackend,
+        )
+
+        self.assertIsNot(
+            FullCudaGraphBackend.replay_captured_shape,
+            BaseCudaGraphBackend.replay_captured_shape,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
