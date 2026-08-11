@@ -733,7 +733,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                     self.io_executor.submit(self._decode_media_snapshot, snapshot)
                 )
                 owner_entries.append((snapshot.content_digest, reservation.key, image))
-            owner_artifacts = await self._run_artifact_batch(owner_entries)
+            owner_artifacts = (
+                await self._run_artifact_batch(owner_entries) if owner_entries else []
+            )
             for reservation, artifact in zip(owners, owner_artifacts):
                 old = previous_metadata.get(reservation.key)
                 if old is not None and old.feature_hash != artifact.feature_hash:
