@@ -115,13 +115,17 @@ class MetalJitOp:
     then compiles lazily per dtype key through the module level ``get()`` and
     ``warm_once()`` seams. Subclasses implement ``can_fuse``, ``dispatch_fused``,
     and ``dispatch_fallback`` with the op's own call signature; the base owns
-    ``dispatch`` and its guard branch.
+    ``dispatch`` and its guard branch. ``can_fuse`` has no default: every op
+    declares its own eligibility predicate, and the base declares none, so a
+    missing predicate fails at first dispatch instead of silently admitting
+    every input.
     """
 
     source: str  # Body only Metal source; the decorator validates presence.
 
     def can_fuse(self, *args, **kwargs) -> bool:
-        return True  # optimistic default; forward ops override with a cheap predicate
+        """Cheap eligibility check for the fused path; no default on purpose."""
+        raise NotImplementedError
 
     def dispatch(self, *args, **kwargs):
         """Run the op: fused when eligible, fallback otherwise.

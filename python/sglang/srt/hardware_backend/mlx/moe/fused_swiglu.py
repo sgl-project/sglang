@@ -243,6 +243,24 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
                 f"fused_gate_qmv_silu_mul: dtype {x.dtype} not in {_DTYPES}."
             )
 
+    def can_fuse(
+        self,
+        x: mx.array,
+        gate_w: mx.array,
+        gate_s: mx.array,
+        gate_b: mx.array,
+        indices: mx.array,
+        x_up: mx.array,
+    ) -> bool:
+        """Structural eligibility, delegating to the same regime check
+        dispatch_fused and dispatch_fallback share, so all three stay in
+        sync by construction rather than by convention."""
+        try:
+            self._check_eligibility(x, gate_w, gate_s, gate_b)
+        except NotFusable:
+            return False
+        return True
+
     def dispatch_fused(
         self,
         x: mx.array,

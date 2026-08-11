@@ -263,6 +263,9 @@ class TestMetalJitOpDispatchTemplate(unittest.TestCase):
 
     def test_dispatch_routes_to_fallback_when_dispatch_fused_raises_not_fusable(self):
         class _Stub(metal_jit.MetalJitOp):
+            def can_fuse(self, *args, **kwargs):
+                return True
+
             def dispatch_fused(self, *args, **kwargs):
                 raise metal_jit.NotFusable("ineligible")
 
@@ -276,6 +279,9 @@ class TestMetalJitOpDispatchTemplate(unittest.TestCase):
 
     def test_dispatch_propagates_non_not_fusable_value_error(self):
         class _Stub(metal_jit.MetalJitOp):
+            def can_fuse(self, *args, **kwargs):
+                return True
+
             def dispatch_fused(self, *args, **kwargs):
                 raise ValueError("not a NotFusable")
 
@@ -293,6 +299,9 @@ class TestMetalJitOpDispatchTemplate(unittest.TestCase):
         """
 
         class _Stub(metal_jit.MetalJitOp):
+            def can_fuse(self, *args, **kwargs):
+                return True
+
             def dispatch_fused(self, *args, **kwargs):
                 raise metal_jit.NotFusable("ineligible")
 
