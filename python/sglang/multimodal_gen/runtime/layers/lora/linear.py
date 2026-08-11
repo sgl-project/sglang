@@ -75,9 +75,6 @@ class ParallelLayout(Enum):
 
 
 class Adapter:
-    def local() -> "Adapter":
-        return
-
     def to_local(weights: dict[str, torch.Tensor]):
         def _to_local(tensor: torch.Tensor):
             return tensor.to_local() if isinstance(tensor, DTensor) else tensor
@@ -99,6 +96,12 @@ class Adapter:
         self, distributed_rank: int, distributed_size: int, layout: ParallelLayout
     ) -> "Adapter":
         return self
+
+    @abstractmethod
+    def delta(self) -> torch.Tensor: ...
+
+    @abstractmethod
+    def iterate(self, input: torch.Tensor) -> torch.Tensor: ...
 
 
 class LoRAAdapter(Adapter):
@@ -134,8 +137,6 @@ class LoRAAdapter(Adapter):
         base_layer,
     ) -> "LoRAAdapter":
         if layout == ParallelLayout.ColwiseParallelLayout:
-
-            B = self.lora_B
             if self.lora_B.dim() == 3:
                 # Stacked Q/K/V (or gate/up) LoRA weights from diffusers-style adapters.
                 shard_size = base_layer.output_partition_sizes[0]
@@ -153,7 +154,9 @@ class LoRAAdapter(Adapter):
                 ):
                     local_start = distributed_rank * part_size
                     local_end = (distributed_rank + 1) * part_size
-                    shards.append(B[row_offset + local_start : row_offset + local_end, :])
+                    shards.append(
+                        self.lora_B[row_offset + local_start : row_offset + local_end, :]
+                    )
                     row_offset += full_size
                 B = torch.cat(shards, dim=0)
             return LoRAAdapter(
@@ -171,10 +174,10 @@ class LoRAAdapter(Adapter):
             )
         return self
 
-    def delta(self):
+    def delta(self) -> torch.Tensor:
         return self.lora_B @ self.lora_A
 
-    def iterate(self, input: torch.Tensor):
+    def iterate(self, input: torch.Tensor) -> torch.Tensor:
         return input @ self.lora_A.T @ self.lora_B.T
 
 
@@ -208,7 +211,7 @@ class LoKrAdapter(Adapter):
         distributed_size: int,
         layout: ParallelLayout,
         base_layer,
-    ) -> "LoRAAdapter":
+    ) -> "LoKrAdapter":
         if layout == ParallelLayout.RowwiseParallelLayout:
             shard_size = self.w1.shape[0] // distributed_size
             start_idx = distributed_rank * shard_size
@@ -229,10 +232,10 @@ class LoKrAdapter(Adapter):
             )
         return self
 
-    def delta(self):
+    def delta(self) -> torch.Tensor:
         return torch.kron(self.w1, self.w2)
 
-    def iterate(self, input: torch.Tensor):
+    def iterate(self, input: torch.Tensor) -> torch.Tensor:
         return torch.einsum(
             "bpq,pm,qn->bmn",
             input.reshape(input.shape[0], self.w1.shape[0], self.w2.shape[0]),
@@ -247,7 +250,7 @@ class BaseWeightEntry:
     def register(name=None):
         def decorator(cls):
             registry_name = name if name else cls.__name__
-            Adapter.REGISTRY[registry_name] = cls
+            BaseWeightEntry.REGISTRY[registry_name] = cls
             return cls
 
         return decorator
@@ -276,15 +279,16 @@ class BaseWeightEntry:
 
     @staticmethod
     def create_weight_from_layer(
-        adapter: dict[str, torch.Tensor],
+        adapter: dict[str, torch.Tensor], lora_path: str, strength: float
     ) -> dict[str, torch.Tensor] | None:
-        for cls in Adapter.REGISTRY.values():
-            if cls.Weight.has_adapter(adapter):
-                return {
+        for cls in BaseWeightEntry.REGISTRY.values():
+            if cls.has_adapter(adapter):
+                weight = {
                     supported_field: adapter[supported_field]
-                    for supported_field in cls.Weight.supported_fields
+                    for supported_field in cls.supported_fields
                     if supported_field in adapter
                 }
+                return cls(weight, lora_path, strength)
 
         return None
 
@@ -295,18 +299,15 @@ class LoRAWeightEntry(BaseWeightEntry):
     supported_fields: list[str] = [*parameter_fields, "alpha"]
 
     @classmethod
-    def has_adapter(cls, adapter: dict[str, torch.Tensor]) -> bool:
-        return all(
-            ("lora_A" in adapter),
-            ("lora_B" in adapter),
-        )
+    def has_adapter(cls, weights: dict[str, torch.Tensor]) -> bool:
+        return all([("lora_A" in weights), ("lora_B" in weights)])
 
     def __init__(
         self,
         weights,
         lora_path: str | None = None,
-        alpha_config: int | None = None,
         strength: float | None = None,
+        alpha_config: int | None = None,
     ):
         super().__init__(lora_path, strength)
 
@@ -335,30 +336,30 @@ class LoKrWeightEntry(BaseWeightEntry):
     supported_fields: list[str] = [*parameter_fields, "alpha"]
 
     @classmethod
-    def has_adapter(cls, adapter: dict[str, torch.Tensor]) -> bool:
+    def has_adapter(cls, weights: dict[str, torch.Tensor]) -> bool:
         return all(
-            any(
-                ("lokr_w1" in adapter),
-                all(
-                    ("lokr_w1_a" in adapter),
-                    ("lokr_w1_b" in adapter),
+            [
+                any(
+                    [
+                        ("lokr_w1" in weights),
+                        all([("lokr_w1_a" in weights), ("lokr_w1_b" in weights)]),
+                    ]
                 ),
-            ),
-            any(
-                ("lokr_w2" in adapter),
-                all(
-                    ("lokr_w2_a" in adapter),
-                    ("lokr_w2_b" in adapter),
+                any(
+                    [
+                        ("lokr_w2" in weights),
+                        all([("lokr_w2_a" in weights), ("lokr_w2_b" in weights)]),
+                    ]
                 ),
-            ),
+            ]
         )
 
     def __init__(
         self,
         weights,
         lora_path: str | None = None,
-        alpha_config: int | None = None,
         strength: float | None = None,
+        alpha_config: int | None = None,
     ):
         super().__init__(lora_path, strength)
 
@@ -389,7 +390,7 @@ def create_weight_from_layer(
         if cls.has_adapter(adapter):
             return {
                 supported_field: adapter[supported_field]
-                for supported_field in cls.Weight.supported_fields
+                for supported_field in cls.supported_fields
                 if supported_field in adapter
             }
 
@@ -494,6 +495,7 @@ class BaseLayerWithLoRA(nn.Module):
         adapter_weights,
         lora_path: str | None = None,
         strength: float = 1.0,
+        lora_alpha: int | None = None,
         clear_existing: bool = False,
         merge_weights: bool = True,
     ) -> None:
@@ -508,7 +510,9 @@ class BaseLayerWithLoRA(nn.Module):
                             If False, append to existing list (for multi-LoRA support).
         """
         # share storage with weights in the pipeline
-        adapter = BaseWeightEntry.create_weight_from_layer(adapter_weights)
+        adapter = BaseWeightEntry.create_weight_from_layer(
+            adapter_weights, lora_path, strength
+        )
 
         if clear_existing:
             self.lora_weights_list.clear()
@@ -537,16 +541,17 @@ class BaseLayerWithLoRA(nn.Module):
         """
         # Merge all LoRA adapters in order
         for adapter in lora_list:
-            weight_sliced = self.slice_weights(adapter.to(data))
+            weight_sliced = self.slice_weights(adapter.weights.to(data))
 
             # has_adapter_weights
             # adapter_params
-            scale = adapter.lora_strength
+            scale = adapter.strength
+            print("@@@ ", scale)
 
-            lora_delta = adapter.delta()
+            lora_delta = weight_sliced.delta()
             if isinstance(lora_delta, torch.Tensor) and lora_delta.dim() > 2:
                 lora_delta = lora_delta.reshape(-1, lora_delta.shape[-1])
-            data.add_(lora_delta, alpha=scale)
+            data.add_(lora_delta, alpha=(float(scale) if scale is not None else 1.0))
 
     def _should_merge_in_fp32(
         self,

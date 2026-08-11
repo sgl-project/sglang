@@ -16,7 +16,7 @@ def _make_layer(base_weight: torch.Tensor, rank: int = 2, alpha: int = 2):
     base = nn.Linear(base_weight.shape[1], base_weight.shape[0], bias=False)
     with torch.no_grad():
         base.weight.copy_(base_weight)
-    return LinearWithLoRA(base, lora_rank=rank, lora_alpha=alpha)
+    return LinearWithLoRA(base)
 
 
 def test_lora_commit_merged_as_base_promotes_weights_and_resets_state():
@@ -47,7 +47,7 @@ def test_lora_commit_merged_as_base_promotes_weights_and_resets_state():
     assert layer.merged is False
     assert layer.disable_lora is True
     assert layer.lora_weights_list == []
-    assert layer.lora_A is None and layer.lora_B is None
+    assert not layer.has_weight
 
 
 def test_lora_dynamic_delta_after_commit_does_not_unmerge_base():
@@ -146,7 +146,7 @@ def test_lokr_commit_merged_as_base_promotes_weights_and_resets_state():
     assert layer.merged is False
     assert layer.disable_lora is True
     assert layer.lora_weights_list == []
-    assert layer.lora_A is None and layer.lora_B is None
+    assert not layer.has_weight
 
 
 def test_lokr_dynamic_delta_after_commit_does_not_unmerge_base():
@@ -207,7 +207,10 @@ def test_lokr_negative_merge_after_commit_restores_original_base():
 
     # Subtract the merged delta (as _unmerge_stage1_distilled_from_base does).
     layer.set_adapter_weights(
-        w1.clone(), w2.clone(), strength=-s1, clear_existing=True, merge_weights=True
+        {"lokr_w1": w1.clone(), "lokr_w2": w2.clone()},
+        strength=-s1,
+        clear_existing=True,
+        merge_weights=True,
     )
     layer.commit_merged_as_base()
 

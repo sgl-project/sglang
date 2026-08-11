@@ -423,9 +423,9 @@ class LoRAPipeline(ComposedPipelineBase):
                     config_adapter_alpha = self.loaded_adapter_alphas.get(nickname)
                     layer.set_adapter_weights(
                         adapter_weight,
-                        lora_alpha=config_adapter_alpha,
                         lora_path=path,
                         strength=lora_strength,
+                        lora_alpha=config_adapter_alpha,
                         merge_weights=merge_weights,
                         clear_existing=(
                             clear_existing and idx == 0

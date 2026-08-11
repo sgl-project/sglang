@@ -8,7 +8,7 @@ def test_lora_merge_unmerge_handles_inference_base_weight():
     with torch.inference_mode():
         base_layer = nn.Linear(4, 3, bias=False)
 
-    layer = LinearWithLoRA(base_layer, lora_rank=2, lora_alpha=2)
+    layer = LinearWithLoRA(base_layer)
     base_weight = layer.cpu_weight.clone()
 
     assert layer.base_layer.weight.is_inference()
@@ -41,7 +41,7 @@ def test_lokr_merge_unmerge_handles_inference_base_weight():
     with torch.inference_mode():
         base_layer = nn.Linear(4, 3, bias=False)
 
-    layer = LinearWithLoRA(base_layer, lora_rank=2, lora_alpha=2)
+    layer = LinearWithLoRA(base_layer)
     base_weight = layer.cpu_weight.clone()
 
     assert layer.base_layer.weight.is_inference()

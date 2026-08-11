@@ -220,7 +220,7 @@ class LinearBase(torch.nn.Module):
         raise NotImplementedError
 
 
-class ParrallelLenear(LinearBase):
+class ParallelLinear(LinearBase):
     def __init__(
         self,
         input_size: int,
@@ -259,7 +259,7 @@ class ParrallelLenear(LinearBase):
         return output, output_bias
 
 
-class ReplicatedLinear(ParrallelLenear):
+class ReplicatedLinear(ParallelLinear):
     """Replicated linear layer.
 
     Args:
@@ -342,7 +342,7 @@ class ReplicatedLinear(ParrallelLenear):
         return s
 
 
-class ColumnParallelLinear(ParrallelLenear):
+class ColumnParallelLinear(ParallelLinear):
     """Linear layer with column parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -1014,7 +1014,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
-class RowParallelLinear(ParrallelLenear):
+class RowParallelLinear(ParallelLinear):
     """Linear layer with row parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
