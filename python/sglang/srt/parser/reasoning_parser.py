@@ -242,7 +242,9 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
-            # Check for tool_start_token interruption
+            # Check for tool_start_token interruption. Unlike detect_and_parse we
+            # cannot see whether a think_end_token follows, so a model that quotes
+            # the tool token inside its reasoning ends the block early here.
             if self.tool_start_token and self.tool_start_token in current_text:
                 tool_idx = current_text.find(self.tool_start_token)
                 reasoning_text = current_text[:tool_idx]
@@ -302,9 +304,8 @@ class BaseReasoningFormatDetector:
         return 0
 
     def finish(self) -> StreamingParseResult:
-        """Flush reasoning still buffered when the stream ends before the end token
-        (e.g. max_tokens cut it short), instead of dropping it: the whole block under
-        stream_reasoning=False, a held-back partial token under stream_reasoning=True.
+        """Flush reasoning buffered under stream_reasoning=False when the stream ends
+        before the end token (e.g. max_tokens cut it short), instead of dropping it.
         force_nonempty_content emits it as normal_text, else as reasoning_text."""
         if not self._in_reasoning:
             # A held-back partial think_start that never completed is normal text.
@@ -324,7 +325,9 @@ class BaseReasoningFormatDetector:
                 return StreamingParseResult(normal_text=normal_text)
             return StreamingParseResult()
 
-        if buffer:
+        # An unfinished end token under stream_reasoning=True is an incomplete
+        # token rather than content, and is dropped (see the test of the same name).
+        if not self.stream_reasoning and buffer:
             return StreamingParseResult(reasoning_text=buffer)
 
         return StreamingParseResult()
