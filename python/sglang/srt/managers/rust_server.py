@@ -392,7 +392,9 @@ class RustServer:
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         if dp_rank is not None:
-            http_addr = f"{server_args.host}:{server_args.port + dp_rank}"
+            dp_size_per_node = scheduler.ps.dp_size // server_args.nnodes
+            local_dp_rank = dp_rank % dp_size_per_node
+            http_addr = f"{server_args.host}:{server_args.port + local_dp_rank}"
 
         launch_cores, server_cores = cls._partition_cores(
             mm_workers=(

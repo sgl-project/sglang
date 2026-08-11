@@ -1134,9 +1134,12 @@ class Engine(EngineScoreMixin, EngineBase):
                     weight_cache_daemon_procs,
                 )
 
-            launch_dummy_health_check_server(
-                server_args.host, server_args.port, server_args.enable_metrics
-            )
+            # Multi-rank Rust serving places local DP listener 0 on the base
+            # port of every node, and that listener owns the health endpoints.
+            if not (envs.SGLANG_RUST_SERVER.get() and server_args.dp_size > 1):
+                launch_dummy_health_check_server(
+                    server_args.host, server_args.port, server_args.enable_metrics
+                )
 
             scheduler_init_result.block_until_scheduler_exits()
             return (
