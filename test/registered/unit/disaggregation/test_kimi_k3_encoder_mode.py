@@ -396,7 +396,15 @@ def test_epd_receiver_keeps_content_hash_aligned_with_image():
     digest = "sha256:" + "cd" * 32
     receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
     request = SimpleNamespace(
-        image_data=[ImageData(url="image", content_hash=digest)],
+        image_data=[
+            ImageData(
+                url="image",
+                detail="high",
+                max_dynamic_patch=12,
+                preprocess_kwargs={"crop": False},
+                content_hash=digest,
+            )
+        ],
         video_data=None,
         audio_data=None,
         mm_content_hashes=[digest],
@@ -406,6 +414,9 @@ def test_epd_receiver_keeps_content_hash_aligned_with_image():
         {
             "url": "image",
             "modality": Modality.IMAGE,
+            "detail": "high",
+            "max_dynamic_patch": 12,
+            "preprocess_kwargs": {"crop": False},
             "content_hash": digest,
         }
     ]

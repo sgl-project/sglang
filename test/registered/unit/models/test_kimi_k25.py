@@ -3,6 +3,7 @@
 import asyncio
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -25,7 +26,7 @@ from sglang.srt.models.kimi_k25 import (
     mm_projection_auto,
 )
 from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
-from sglang.srt.multimodal.cache import MultimodalPreprocessCache
+from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
@@ -52,6 +53,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -757,6 +759,51 @@ def test_kimi_k3_trusted_hot_hit_skips_media_read():
         processor.io_executor.shutdown()
 
     assert result == [artifact]
+
+
+def test_kimi_k3_default_media_options_share_one_artifact_key():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.processor_fingerprint = "processor"
+    digest = "sha256:" + "ab" * 32
+
+    keys = {
+        processor._artifact_key(digest, "image.png"),
+        processor._artifact_key(digest, ImageData(url="image.png")),
+        processor._artifact_key(digest, {"url": "image.png", "detail": "auto"}),
+    }
+
+    assert len(keys) == 1
+
+
+def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.processor_fingerprint = "processor"
+    processor.trust_mm_content_hashes = False
+    processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
+    processor.mm_processor_executor = None
+    processor.io_executor = ThreadPoolExecutor(max_workers=2)
+    image = Image.new("RGB", (2, 2), color=(1, 2, 3))
+    digest = snapshot_media(image).content_digest
+    key = processor._artifact_key(digest, image)
+    old = replace(_cached_k3_artifact(digest, key), feature=None)
+    new = replace(_cached_k3_artifact(digest, key), feature_hash=old.feature_hash + 1)
+    processor.mm_preprocess_cache.put(key, old)
+
+    async def prepare(_entries):
+        return [new]
+
+    processor._run_artifact_batch = prepare
+    try:
+        with pytest.raises(ValueError, match="feature hash changed"):
+            asyncio.run(
+                processor.prepare_media_artifacts(
+                    [image], SimpleNamespace(mm_content_hashes=None)
+                )
+            )
+    finally:
+        processor.io_executor.shutdown()
+
+    assert key not in processor.mm_preprocess_cache
 
 
 def test_kimi_k3_untrusted_path_change_is_a_cache_miss():

@@ -490,18 +490,24 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     @staticmethod
     def _artifact_preprocess_kwargs(source) -> dict:
         if isinstance(source, ImageData):
-            return {
-                "detail": source.detail,
-                "max_dynamic_patch": source.max_dynamic_patch,
-                "preprocess_kwargs": source.preprocess_kwargs or {},
-            }
-        if isinstance(source, dict):
-            return {
-                "detail": source.get("detail"),
-                "max_dynamic_patch": source.get("max_dynamic_patch"),
-                "preprocess_kwargs": source.get("preprocess_kwargs") or {},
-            }
-        return {}
+            detail = source.detail
+            max_dynamic_patch = source.max_dynamic_patch
+            preprocess_kwargs = source.preprocess_kwargs
+        elif isinstance(source, dict):
+            detail = source.get("detail")
+            max_dynamic_patch = source.get("max_dynamic_patch")
+            preprocess_kwargs = source.get("preprocess_kwargs")
+        else:
+            return {}
+        return {
+            key: value
+            for key, value in {
+                "detail": None if detail == "auto" else detail,
+                "max_dynamic_patch": max_dynamic_patch,
+                "preprocess_kwargs": preprocess_kwargs,
+            }.items()
+            if value not in (None, {})
+        }
 
     def _artifact_key(self, content_digest: str, source) -> str:
         return build_artifact_key(
