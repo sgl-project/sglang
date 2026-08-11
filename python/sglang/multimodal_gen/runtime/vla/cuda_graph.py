@@ -23,6 +23,22 @@ logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
+class VLAPrefixGraphSignature:
+    batch_size: int
+    input_shapes: tuple[tuple[int, ...], ...]
+    input_dtypes: tuple[str, ...]
+    static_layout: tuple[Any, ...]
+    parallel_layout: str
+
+
+@dataclass
+class _CapturedPrefixGraph:
+    graph: torch.cuda.CUDAGraph
+    static_inputs: tuple[torch.Tensor, ...]
+    static_output: PrefixContext
+
+
+@dataclass(frozen=True)
 class VLADenoiseGraphSignature:
     batch_size: int
     prefix_len: int
@@ -76,6 +92,103 @@ def _copy_prefix_context_(dst: PrefixContext, src: PrefixContext) -> None:
     dst.cache_key_digest = src.cache_key_digest
 
 
+class VLAPrefixGraphRunner:
+    """Full CUDA graph runner for VLA prefix encoding shape buckets."""
+
+    def __init__(self, enabled: bool = True, max_entries: int = 1):
+        self.max_entries = max(0, max_entries)
+        self.enabled = enabled and self.max_entries > 0
+        self._captured: dict[VLAPrefixGraphSignature, _CapturedPrefixGraph] = {}
+        self._disabled_signatures: set[VLAPrefixGraphSignature] = set()
+        self._capture_stream: torch.cuda.Stream | None = None
+        self._graph_pool: Any = None
+
+    def _capture(
+        self,
+        signature: VLAPrefixGraphSignature,
+        step_fn: Callable[[tuple[torch.Tensor, ...]], PrefixContext],
+        inputs: tuple[torch.Tensor, ...],
+    ) -> _CapturedPrefixGraph:
+        static_inputs = tuple(tensor.detach().clone() for tensor in inputs)
+        device_module = torch.get_device_module(inputs[0].device)
+        if self._capture_stream is None:
+            self._capture_stream = device_module.Stream(device=inputs[0].device)
+        if self._graph_pool is None:
+            self._graph_pool = get_or_create_global_graph_memory_pool(device_module)
+            set_graph_pool_id(self._graph_pool)
+
+        device_module.synchronize()
+        with device_module.stream(self._capture_stream), torch.inference_mode():
+            step_fn(static_inputs)
+        self._capture_stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with (
+            device_module.graph(
+                cuda_graph=graph,
+                pool=self._graph_pool,
+                stream=self._capture_stream,
+            ),
+            torch.inference_mode(),
+        ):
+            static_output = step_fn(static_inputs)
+        self._capture_stream.synchronize()
+        static_output.layout["mutable_graph_output"] = True
+
+        captured = _CapturedPrefixGraph(
+            graph=graph,
+            static_inputs=static_inputs,
+            static_output=static_output,
+        )
+        self._captured[signature] = captured
+        logger.info(
+            "Captured VLA prefix CUDA graph: batch=%d inputs=%s",
+            signature.batch_size,
+            signature.input_shapes,
+        )
+        return captured
+
+    def capture_or_run(
+        self,
+        signature: VLAPrefixGraphSignature,
+        step_fn: Callable[[tuple[torch.Tensor, ...]], PrefixContext],
+        inputs: tuple[torch.Tensor, ...],
+    ) -> PrefixContext:
+        if (
+            not self.enabled
+            or signature in self._disabled_signatures
+            or not inputs
+            or inputs[0].device.type != "cuda"
+        ):
+            return step_fn(inputs)
+
+        captured = self._captured.get(signature)
+        if captured is None and len(self._captured) >= self.max_entries:
+            return step_fn(inputs)
+        try:
+            if captured is None:
+                captured = self._capture(signature, step_fn, inputs)
+            else:
+                for static_input, current_input in zip(
+                    captured.static_inputs, inputs, strict=True
+                ):
+                    static_input.copy_(current_input)
+            captured.graph.replay()
+            torch.get_device_module(inputs[0].device).current_stream(
+                device=inputs[0].device
+            ).synchronize()
+            return captured.static_output
+        except Exception:
+            self._disabled_signatures.add(signature)
+            self._captured.pop(signature, None)
+            logger.warning(
+                "VLA prefix CUDA graph disabled for signature %s",
+                signature,
+                exc_info=True,
+            )
+            return step_fn(inputs)
+
+
 class VLADenoiseGraphRunner:
     """Full CUDA graph runner for one VLA action-denoise step.
 
@@ -97,13 +210,16 @@ class VLADenoiseGraphRunner:
     ) -> None:
         context_id = id(prefix_context.past_key_values)
         context_digest = prefix_context.cache_key_digest
-        if (
+        mutable_graph_output = bool(
+            prefix_context.layout.get("mutable_graph_output", False)
+        )
+        if not mutable_graph_output and (
             context_digest is not None
             and captured.current_context_digest == context_digest
         ):
             captured.current_context_id = context_id
             return
-        if captured.current_context_id == context_id:
+        if not mutable_graph_output and captured.current_context_id == context_id:
             return
         _copy_prefix_context_(captured.static_prefix_context, prefix_context)
         captured.current_context_id = context_id
