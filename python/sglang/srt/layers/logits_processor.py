@@ -16,7 +16,7 @@
 import dataclasses
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -24,6 +24,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
@@ -58,9 +59,6 @@ from sglang.srt.utils.common import (
     is_pin_memory_available,
     use_intel_amx_backend,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +200,7 @@ class LogitsProcessorOutput:
 
     # Beam search only: raw pre-sample logits for the scheduler-side joint
     # selection; see beam_search.logits_capture.
-    beam: Optional["BeamLogitsCapture"] = None
+    beam: Optional[BeamLogitsCapture] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
