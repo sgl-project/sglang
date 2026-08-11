@@ -138,8 +138,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.token_to_kv_pool_allocator.swa_available_size.side_effect = [64, 192]
         queue.tree_cache = MagicMock()
 
-        queue._reclaim_swa_tail_capacity(129, "req-1")
+        error = queue._reclaim_swa_tail_capacity(129, "req-1")
 
+        self.assertIsNone(error)
         params = queue.tree_cache.evict.call_args.args[0]
         self.assertEqual(params.num_tokens, 0)
         self.assertEqual(params.swa_num_tokens, 128)
@@ -150,8 +151,12 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.token_to_kv_pool_allocator.swa_available_size.side_effect = [64, 128]
         queue.tree_cache = MagicMock()
 
-        with self.assertRaisesRegex(RuntimeError, "needed=192, available=128"):
-            queue._reclaim_swa_tail_capacity(129, "req-1")
+        error = queue._reclaim_swa_tail_capacity(129, "req-1")
+
+        self.assertEqual(
+            error,
+            "SWA eviction insufficient: needed=192, available=128, req=req-1",
+        )
 
     def _populate_prefix(self, cache, prefix_ids, prefix_values):
         """Insert a prefix into the tree so future requests can match it."""

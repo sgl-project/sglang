@@ -396,7 +396,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         else:
             self.tree_cache.dec_lock_ref(req.last_node, params)
 
-    def _reclaim_swa_tail_capacity(self, swa_tail_len: int, req_id: str) -> None:
+    def _reclaim_swa_tail_capacity(
+        self, swa_tail_len: int, req_id: str
+    ) -> Optional[str]:
         page_size = self.token_to_kv_pool_allocator.page_size
         required = ceil_align(swa_tail_len, page_size)
         available = self.token_to_kv_pool_allocator.swa_available_size()
@@ -405,10 +407,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             available = self.token_to_kv_pool_allocator.swa_available_size()
 
         if available < required:
-            raise RuntimeError(
+            return (
                 f"SWA eviction insufficient: needed={required}, "
                 f"available={available}, req={req_id}"
             )
+
+        return None
 
     # SWA caches expose full-attention accounting through full_* accessors.
     def _radix_full_evictable(self) -> int:
@@ -1200,6 +1204,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self._release_matched_prefix_lock(decode_req.req)
                     break
 
+                reclaim_error = self._reclaim_swa_tail_capacity(
+                    swa_len, decode_req.req.rid
+                )
+                if reclaim_error is not None:
+                    if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                        self._release_matched_prefix_lock(decode_req.req)
+                    logger.error(reclaim_error)
+                    prepare_abort(
+                        decode_req.req,
+                        reclaim_error,
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    decode_req.kv_receiver.clear()
+                    decode_req.kv_receiver = None
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1401,6 +1425,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+
+        if failed_reqs:
+            failed_ids = {id(r) for r in failed_reqs}
+            self.pending_reqs = [
+                r for r in self.pending_reqs if id(r) not in failed_ids
+            ]
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -1680,8 +1710,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
         swa_tail_len = self._swa_tail_len(fill_len)
-        if uses_swa_tail:
-            self._reclaim_swa_tail_capacity(swa_tail_len, req.rid)
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
