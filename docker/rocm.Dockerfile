@@ -91,6 +91,14 @@ ARG BRANCH_TYPE=remote
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
+# ROCm 7.2 Triton (BUILD_TRITON=1 stages only). Both wheels are the same
+# upstream revision, triton-lang/triton@89002410. AITER only requires
+# triton>=3.6.0 and treats the base image as the owner of the version, so the
+# choice is ours; bump these together after checking the index.
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
+ARG TRITON_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_KERNELS_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
@@ -220,7 +228,7 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 # Compile AITER against the base image's Triton; the Triton step at the end of
-# this file swaps in AITER's own pin afterwards.
+# this file installs the pinned one afterwards.
 ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -656,16 +664,17 @@ else:
 PY
 
 # -----------------------
-# Install the Triton AITER pins, replacing the base image's. No version check
-# on purpose: the pin is AITER's to move, and its installer enforces a floor.
+# Install AMD's ROCm Triton, replacing the base image's. The local version is
+# part of the pin: `==3.7.0` alone would accept any revision the index later
+# publishes under that number, and pip would choose between them by lexical
+# order of the git hash rather than by date.
 #
 # Keep this last. Base ROCm Torch pins triton==3.5.1 and the torch patch above
 # is what drops that pin, so installing Triton any earlier lets the next pip
 # install pull CUDA torch instead. The hip check below is the tripwire.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        cd /sgl-workspace/aiter \
-     && test -f .github/scripts/install_triton.sh \
-     && PIP_NO_CACHE_DIR=1 bash .github/scripts/install_triton.sh \
+        PIP_NO_CACHE_DIR=1 pip install --extra-index-url ${TRITON_INDEX_URL} \
+            "triton==${TRITON_VERSION}" "triton-kernels==${TRITON_KERNELS_VERSION}" \
      && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
     fi
 
