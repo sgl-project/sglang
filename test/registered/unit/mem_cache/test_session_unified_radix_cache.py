@@ -217,6 +217,117 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         self.assertEqual(match_len(self.cache, [1, 2, 3, 4]), 4)
         self.assertEqual(self.full.session_ref(referenced), 1)
 
+    def test_demote_and_promote_session_cache_priority(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+
+        demoted = self.cache.set_session_cache_priority(
+            "s1", protected=False, generation=generation
+        )
+        self.assertEqual(demoted.status, "updated")
+        self.assertEqual(demoted.indexed_component_leaves, 1)
+        self.assertEqual(self.full.session_ref(leaf), 0)
+
+        unchanged = self.cache.set_session_cache_priority(
+            "s1", protected=False, generation=generation
+        )
+        self.assertEqual(unchanged.status, "unchanged")
+        self.assertEqual(self.full.session_ref(leaf), 0)
+
+        promoted = self.cache.set_session_cache_priority(
+            "s1", protected=True, generation=generation
+        )
+        self.assertEqual(promoted.status, "updated")
+        self.assertEqual(self.full.session_ref(leaf), 1)
+
+    def test_demoted_session_keeps_future_leaves_evictable(self):
+        generation = self.cache.open_radix_session("s1")
+        self.cache.set_session_cache_priority(
+            "s1", protected=False, generation=generation
+        )
+        leaf = insert(self.cache, [1, 2, 3, 4])
+
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        self.assertEqual(self.full.session_ref(leaf), 0)
+
+        self.cache.set_session_cache_priority(
+            "s1", protected=True, generation=generation
+        )
+        self.assertEqual(self.full.session_ref(leaf), 1)
+
+    def test_session_cache_priority_rejects_stale_generation(self):
+        generation = self.cache.open_radix_session("s1")
+
+        result = self.cache.set_session_cache_priority(
+            "s1", protected=False, generation=generation + 1
+        )
+
+        self.assertEqual(result.status, "stale_generation")
+        self.assertEqual(result.generation, generation)
+
+    def test_demoting_one_session_keeps_shared_prefix_protected(self):
+        shared_leaf = insert(self.cache, [1, 2, 3, 4])
+        generation_1 = self.cache.open_radix_session("s1")
+        generation_2 = self.cache.open_radix_session("s2")
+        register(self.cache, [1, 2, 3, 4], "s1", generation_1)
+        register(self.cache, [1, 2, 3, 4], "s2", generation_2)
+        self.assertEqual(self.full.session_ref(shared_leaf), 2)
+
+        self.cache.set_session_cache_priority(
+            "s1", protected=False, generation=generation_1
+        )
+
+        self.assertEqual(self.full.session_ref(shared_leaf), 1)
+
+    def test_close_and_reopen_restore_default_protection(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        self.cache.set_session_cache_priority(
+            "s1", protected=False, generation=generation
+        )
+        self.cache.release_radix_session("s1")
+
+        reopened_generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", reopened_generation)
+
+        self.assertEqual(self.full.session_ref(leaf), 1)
+
+    def test_eviction_prefers_demoted_session_over_protected_session(self):
+        demoted_leaf = insert(self.cache, [1, 2, 3])
+        protected_leaf = insert(self.cache, [7, 8, 9])
+        demoted_generation = self.cache.open_radix_session("demoted")
+        protected_generation = self.cache.open_radix_session("protected")
+        register(self.cache, [1, 2, 3], "demoted", demoted_generation)
+        register(self.cache, [7, 8, 9], "protected", protected_generation)
+        self.cache.set_session_cache_priority(
+            "demoted", protected=False, generation=demoted_generation
+        )
+
+        self.cache.evict(EvictParams(num_tokens=3))
+
+        self.assertEqual(match_len(self.cache, [1, 2, 3]), 0)
+        self.assertEqual(match_len(self.cache, [7, 8, 9]), 3)
+        self.assertEqual(self.full.session_ref(demoted_leaf), 0)
+        self.assertEqual(self.full.session_ref(protected_leaf), 1)
+
+    def test_promote_after_demoted_leaf_eviction_is_safe(self):
+        insert(self.cache, [1, 2, 3])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3], "s1", generation)
+        self.cache.set_session_cache_priority(
+            "s1", protected=False, generation=generation
+        )
+        self.cache.evict(EvictParams(num_tokens=3))
+
+        result = self.cache.set_session_cache_priority(
+            "s1", protected=True, generation=generation
+        )
+
+        self.assertEqual(result.status, "updated")
+        self.assertEqual(result.indexed_component_leaves, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

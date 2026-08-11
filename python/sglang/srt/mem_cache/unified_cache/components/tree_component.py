@@ -118,12 +118,20 @@ class TreeComponent(ABC):
         # Per-session frontier nodes (the deepest registered node per cached
         # path), not physical tree leaves: a frontier node may have children.
         self._session_leaves: dict[str, set[UnifiedTreeNode]] = defaultdict(set)
+        # A demoted session keeps its frontier index but does not contribute to
+        # session_ref. Keeping the index lets promotion restore protection for
+        # surviving leaves without rebuilding the session from request history.
+        self._demoted_session_ids: set[str] = set()
 
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
 
     def reset_session_state(self) -> None:
         self._session_leaves = defaultdict(set)
+        self._demoted_session_ids = set()
+
+    def is_session_protected(self, session_id: str) -> bool:
+        return session_id not in self._demoted_session_ids
 
     def session_ref(self, node: UnifiedTreeNode) -> int:
         return node.component_data[self.component_type].session_ref
@@ -238,16 +246,38 @@ class TreeComponent(ABC):
             return
 
         old_ancestor = self._nearest_session_ancestor(leaf, current_leaves)
-        self._advance_session_coverage(session_id, leaf, old_ancestor)
+        if self.is_session_protected(session_id):
+            self._advance_session_coverage(session_id, leaf, old_ancestor)
         self._mark_session_leaf(session_id, leaf)
         if old_ancestor is not None:
             self._unmark_session_leaf(session_id, old_ancestor)
 
+    def set_session_protected(
+        self, session_id: str, protected: bool
+    ) -> tuple[bool, int]:
+        """Change one session's eviction protection without dropping its index."""
+        was_protected = self.is_session_protected(session_id)
+        leaves = tuple(self._session_leaves.get(session_id, ()))
+        if protected == was_protected:
+            return False, len(leaves)
+
+        if protected:
+            for leaf in leaves:
+                self._advance_session_coverage(session_id, leaf, None)
+            self._demoted_session_ids.discard(session_id)
+        else:
+            for leaf in leaves:
+                self._dec_session_coverage(session_id, leaf)
+            self._demoted_session_ids.add(session_id)
+        return True, len(leaves)
+
     def release_session(self, session_id: str) -> int:
         leaves = tuple(self._session_leaves.get(session_id, ()))
         for leaf in leaves:
-            self._dec_session_coverage(session_id, leaf)
+            if self.is_session_protected(session_id):
+                self._dec_session_coverage(session_id, leaf)
             self._unmark_session_leaf(session_id, leaf)
+        self._demoted_session_ids.discard(session_id)
         return len(leaves)
 
     def discard_deleted_session_leaf(self, node: UnifiedTreeNode) -> None:
@@ -260,7 +290,8 @@ class TreeComponent(ABC):
                 session_id, ()
             ):
                 fallback = None
-            self._recede_session_coverage(session_id, node, fallback)
+            if self.is_session_protected(session_id):
+                self._recede_session_coverage(session_id, node, fallback)
             self._unmark_session_leaf(session_id, node)
             if fallback is not None:
                 self._mark_session_leaf(session_id, fallback)

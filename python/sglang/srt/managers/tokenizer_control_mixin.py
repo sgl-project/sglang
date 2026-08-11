@@ -62,6 +62,8 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    SetSessionCachePriorityReqInput,
+    SetSessionCachePriorityReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
@@ -120,6 +122,7 @@ _COMMUNICATOR_SPECS = [
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
+    ("set_session_cache_priority", SetSessionCachePriorityReqOutput),
 ]
 
 
@@ -914,6 +917,28 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         await self._async_dispatch_to_scheduler(obj)
+
+    async def set_session_cache_priority(
+        self: TokenizerManager,
+        obj: SetSessionCachePriorityReqInput,
+    ) -> List[SetSessionCachePriorityReqOutput]:
+        self.auto_create_handle_loop()
+        if obj.routed_dp_rank is not None and not (
+            0 <= obj.routed_dp_rank < self.elastic_worker_count
+        ):
+            raise ValueError(
+                f"routed_dp_rank={obj.routed_dp_rank} out of range "
+                f"[0, {self.elastic_worker_count})"
+            )
+        if (
+            obj.session_generation is not None
+            and obj.routed_dp_rank is None
+            and self.elastic_worker_count > 1
+        ):
+            raise ValueError(
+                "session_generation requires routed_dp_rank when dp_size is greater than 1"
+            )
+        return await self.set_session_cache_priority_communicator(obj)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]

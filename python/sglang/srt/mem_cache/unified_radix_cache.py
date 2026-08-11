@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
+    SessionCachePriorityResult,
     UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
@@ -2101,6 +2102,19 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def ensure_session_generation(self, session_id: str) -> int:
         return self.session_refs.ensure_session_generation(session_id)
+
+    def set_session_cache_priority(
+        self,
+        session_id: str,
+        *,
+        protected: bool,
+        generation: Optional[int] = None,
+    ) -> SessionCachePriorityResult:
+        return self.session_refs.set_session_cache_priority(
+            session_id,
+            protected=protected,
+            generation=generation,
+        )
 
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)

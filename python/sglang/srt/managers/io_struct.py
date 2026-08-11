@@ -2046,6 +2046,31 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
+class SetSessionCachePriorityReqInput(BaseReq, kw_only=True):
+    session_id: str
+    cache_priority: Literal["protected", "evictable"]
+    session_generation: Optional[int] = None
+    routed_dp_rank: Optional[int] = None
+
+
+class SetSessionCachePriorityReqOutput(BaseReq, kw_only=True):
+    success: bool
+    status: Literal[
+        "updated",
+        "unchanged",
+        "not_found",
+        "stale_generation",
+        "disabled",
+        "not_targeted",
+    ]
+    session_id: str
+    cache_priority: Literal["protected", "evictable"]
+    dp_rank: int
+    session_generation: Optional[int] = None
+    indexed_component_leaves: int = 0
+    message: str = ""
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool

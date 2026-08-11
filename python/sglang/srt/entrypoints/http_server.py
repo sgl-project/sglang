@@ -138,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    SetSessionCachePriorityReqInput,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -1572,6 +1573,36 @@ async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: R
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.post("/set_session_cache_priority")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def set_session_cache_priority(
+    obj: Annotated[SetSessionCachePriorityReqInput, Body()],
+):
+    """Change eviction protection for one radix-native session."""
+    try:
+        results = await _global_state.tokenizer_manager.set_session_cache_priority(obj)
+    except ValueError as e:
+        return _create_error_response(e)
+
+    targeted = [result for result in results if result.status != "not_targeted"]
+    success = any(result.success for result in targeted)
+    if success:
+        status_code = HTTPStatus.OK
+    elif any(result.status == "stale_generation" for result in targeted):
+        status_code = HTTPStatus.CONFLICT
+    elif any(result.status == "not_found" for result in targeted):
+        status_code = HTTPStatus.NOT_FOUND
+    else:
+        status_code = HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(
+        {
+            "success": success,
+            "results": [msgspec_to_builtins(result) for result in results],
+        },
+        status_code=status_code,
+    )
 
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])

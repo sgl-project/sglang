@@ -160,6 +160,8 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    SetSessionCachePriorityReqInput,
+    SetSessionCachePriorityReqOutput,
     ShutdownReq,
     SlowDownReqInput,
     SlowDownReqOutput,
@@ -1524,6 +1526,10 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (
+                    SetSessionCachePriorityReqInput,
+                    self.set_session_cache_priority,
+                ),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -4824,6 +4830,56 @@ class Scheduler(
             or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
+
+    def set_session_cache_priority(
+        self, recv_req: SetSessionCachePriorityReqInput
+    ) -> SetSessionCachePriorityReqOutput:
+        dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        if recv_req.routed_dp_rank is not None and recv_req.routed_dp_rank != dp_rank:
+            return SetSessionCachePriorityReqOutput(
+                success=True,
+                status="not_targeted",
+                session_id=recv_req.session_id,
+                cache_priority=recv_req.cache_priority,
+                dp_rank=dp_rank,
+            )
+
+        if not self.enable_session_radix_cache:
+            return SetSessionCachePriorityReqOutput(
+                success=False,
+                status="disabled",
+                session_id=recv_req.session_id,
+                cache_priority=recv_req.cache_priority,
+                dp_rank=dp_rank,
+                message="Session radix cache is not enabled.",
+            )
+
+        result = self.tree_cache.set_session_cache_priority(
+            recv_req.session_id,
+            protected=recv_req.cache_priority == "protected",
+            generation=recv_req.session_generation,
+        )
+        success = result.status in ("updated", "unchanged")
+        logger.info(
+            "Set session cache priority session_id=%s cache_priority=%s "
+            "status=%s generation=%s indexed_component_leaves=%s dp_rank=%s",
+            recv_req.session_id,
+            recv_req.cache_priority,
+            result.status,
+            result.generation,
+            result.indexed_component_leaves,
+            dp_rank,
+        )
+        return SetSessionCachePriorityReqOutput(
+            success=success,
+            status=result.status,
+            session_id=recv_req.session_id,
+            cache_priority=recv_req.cache_priority,
+            dp_rank=dp_rank,
+            session_generation=result.generation,
+            indexed_component_leaves=result.indexed_component_leaves,
+            message="" if success else result.status.replace("_", " "),
+        )
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

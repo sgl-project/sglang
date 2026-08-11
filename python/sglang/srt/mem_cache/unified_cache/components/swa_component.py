@@ -149,6 +149,10 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
 
         for session_id, covered_by_leaf in self._session_leaf_covered_len.items():
+            if not self.is_session_protected(session_id):
+                report_error(
+                    f"{ct} demoted session {session_id!r} still has coverage metadata"
+                )
             for leaf, covered_len in covered_by_leaf.items():
                 if leaf not in self._session_leaves.get(session_id, ()):
                     report_error(
@@ -161,6 +165,12 @@ class SWAComponent(TreeComponent):
 
         for session_id, leaves in self._session_leaves.items():
             covered_by_leaf = self._session_leaf_covered_len.get(session_id, {})
+            if not self.is_session_protected(session_id):
+                if covered_by_leaf:
+                    report_error(
+                        f"{ct} demoted session {session_id!r} has covered leaves"
+                    )
+                continue
             for leaf in leaves:
                 if leaf not in covered_by_leaf:
                     report_error(

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -23,6 +23,17 @@ logger = logging.getLogger(__name__)
 # out of this LRU after 8192 later closes, an extremely late finish can tag
 # again; explicit register_session clears the tombstone for intentional id reuse.
 _CLOSED_SESSION_TOMBSTONE_LIMIT = 8192
+
+SessionCachePriorityStatus = Literal[
+    "updated", "unchanged", "not_found", "stale_generation", "disabled"
+]
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionCachePriorityResult:
+    status: SessionCachePriorityStatus
+    generation: Optional[int]
+    indexed_component_leaves: int = 0
 
 
 @dataclass(kw_only=True)
@@ -42,6 +53,7 @@ class UnifiedSessionRefTracker:
         self._closed_session_ids: OrderedDict[str, None] = OrderedDict()
         self._session_incarnation_counter: int = 0
         self._session_generations: dict[str, int] = {}
+        self._demoted_session_ids: set[str] = set()
         for component in self.components:
             component.reset_session_state()
 
@@ -86,6 +98,9 @@ class UnifiedSessionRefTracker:
 
     def open_radix_session(self, session_id: str) -> Optional[int]:
         self._closed_session_ids.pop(session_id, None)
+        self._demoted_session_ids.discard(session_id)
+        for component in self.components:
+            component.set_session_protected(session_id, True)
         self._session_incarnation_counter += 1
         self._session_generations[session_id] = self._session_incarnation_counter
         return self._session_incarnation_counter
@@ -96,6 +111,44 @@ class UnifiedSessionRefTracker:
             generation = self.open_radix_session(session_id)
         return generation
 
+    def set_session_cache_priority(
+        self,
+        session_id: str,
+        *,
+        protected: bool,
+        generation: Optional[int] = None,
+    ) -> SessionCachePriorityResult:
+        if not self.enable_session_radix_cache:
+            return SessionCachePriorityResult(status="disabled", generation=None)
+
+        current_generation = self._session_generations.get(session_id)
+        if current_generation is None or session_id in self._closed_session_ids:
+            return SessionCachePriorityResult(status="not_found", generation=None)
+        if generation is not None and generation != current_generation:
+            return SessionCachePriorityResult(
+                status="stale_generation", generation=current_generation
+            )
+
+        was_protected = session_id not in self._demoted_session_ids
+        indexed = 0
+        for component in self.components:
+            changed, component_leaves = component.set_session_protected(
+                session_id, protected
+            )
+            assert changed == (protected != was_protected)
+            indexed += component_leaves
+
+        if protected:
+            self._demoted_session_ids.discard(session_id)
+        else:
+            self._demoted_session_ids.add(session_id)
+
+        return SessionCachePriorityResult(
+            status="updated" if protected != was_protected else "unchanged",
+            generation=current_generation,
+            indexed_component_leaves=indexed,
+        )
+
     def release_radix_session(self, session_id: str) -> int:
         if not self.enable_session_radix_cache or session_id is None:
             return 0
@@ -105,6 +158,7 @@ class UnifiedSessionRefTracker:
 
         self._remember_closed_session(session_id)
         self._session_generations.pop(session_id, None)
+        self._demoted_session_ids.discard(session_id)
 
         indexed = 0
         for component in self.components:
