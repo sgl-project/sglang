@@ -12,7 +12,10 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
+from sglang.srt.model_executor.step_span_utils import (
+    build_step_span_name,  
+    set_detailed_annotations_enabled,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_npu

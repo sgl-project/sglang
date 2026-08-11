@@ -168,7 +168,6 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.model_executor.runner_utils import make_war_read_done_event
-from sglang.srt.model_executor.step_span_utils import build_step_span_name
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -223,6 +222,7 @@ from sglang.srt.utils.offloader import (
     get_offloader,
     set_offloader,
 )
+from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 
@@ -1471,8 +1471,7 @@ class ModelRunner:
             )
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
-        # Step span (detailed-annotation folding is gated by the process-wide
-        # toggle set by the profiler manager; see step_span_utils).
+        # Step span
         step_span_ctx = profile_range(build_step_span_name(forward_batch))
 
         canary_ctx = (
