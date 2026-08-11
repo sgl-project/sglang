@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     LAYERWISE_OFFLOAD_DIT_GROUP,
     cpu_offload_flags_for_layerwise_components,
     layerwise_component_matches_any_selection,
+    normalize_cpu_offload_components,
     normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import (
@@ -301,6 +302,9 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_target_modules: list[str] | None = None
 
     # CPU offload parameters
+    # Explicitly selected coarse component offload. When set, this controls all
+    # four legacy *_cpu_offload flags.
+    cpu_offload_components: list[str] | None = None
     dit_cpu_offload: bool | None = None
     # trade checkpoint-loading peak memory for faster ordinary DiT startup
     direct_gpu_weight_loading: bool = False
@@ -486,6 +490,7 @@ class ServerArgs(DisaggServerArgsMixin):
         """set defaults and normalize values."""
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust_based_on_performance_mode()
+        self._adjust_cpu_offload_components()
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
             auto_tuner.maybe_adjust_auto_default_layerwise_offload()
@@ -738,6 +743,41 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
+
+    def _adjust_cpu_offload_components(self) -> None:
+        """Apply the unified CPU offload component selector, when provided."""
+        if self.cpu_offload_components is None:
+            return
+
+        legacy_flags = (
+            "dit_cpu_offload",
+            "text_encoder_cpu_offload",
+            "image_encoder_cpu_offload",
+            "vae_cpu_offload",
+        )
+        conflicting_flags = [
+            flag_name
+            for flag_name in legacy_flags
+            if self.is_arg_explicitly_set(flag_name)
+        ]
+        if conflicting_flags:
+            formatted_flags = ", ".join(
+                "--" + flag_name.replace("_", "-") for flag_name in conflicting_flags
+            )
+            raise ValueError(
+                "--cpu-offload-components cannot be combined with the legacy "
+                f"CPU offload flags: {formatted_flags}"
+            )
+
+        selected_components = (
+            normalize_cpu_offload_components(self.cpu_offload_components) or []
+        )
+        selected = set(selected_components)
+        self.cpu_offload_components = selected_components
+        self.dit_cpu_offload = "dit" in selected
+        self.text_encoder_cpu_offload = "text_encoder" in selected
+        self.image_encoder_cpu_offload = "image_encoder" in selected
+        self.vae_cpu_offload = "vae" in selected
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
@@ -1796,6 +1836,19 @@ class ServerArgs(DisaggServerArgsMixin):
             "onto GPU before assigning model parameters. This may reduce startup "
             "time depending on the model, but temporarily requires checkpoint "
             "weights and model weights to coexist on GPU. Disabled by default.",
+        )
+        parser.add_argument(
+            "--cpu-offload-components",
+            type=str,
+            nargs="+",
+            default=ServerArgs.cpu_offload_components,
+            help=(
+                "Select components for coarse CPU offload. Names are matched "
+                "against model_index.json component keys; legacy groups "
+                "dit, text_encoder, image_encoder, vae, plus all and none, "
+                "are also supported. This unified option cannot be combined "
+                "with the legacy per-component CPU offload flags."
+            ),
         )
         parser.add_argument(
             "--dit-layerwise-offload",

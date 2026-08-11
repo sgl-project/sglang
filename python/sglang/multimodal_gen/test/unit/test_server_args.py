@@ -385,6 +385,32 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args.layerwise_offload_components, ["transformer", "text_encoder"]
         )
 
+    def test_cpu_offload_components_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--performance-mode",
+            "manual",
+            "--cpu-offload-components",
+            "transformer",
+            "vae",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(server_args.cpu_offload_components, ["dit", "vae"])
+        self.assertTrue(server_args.dit_cpu_offload)
+        self.assertTrue(server_args.vae_cpu_offload)
+        self.assertFalse(server_args.text_encoder_cpu_offload)
+        self.assertFalse(server_args.image_encoder_cpu_offload)
+
     def test_serve_cli_preserves_config_and_dynamic_unknown_args(self):
         from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
             add_multimodal_gen_serve_args,
@@ -813,6 +839,47 @@ class TestOffloadDefaults(unittest.TestCase):
         args = self._from_dict_with_task_type(ModelTaskType.T2V)
 
         self.assertFalse(args.vae_cpu_offload)
+
+    def test_cpu_offload_components_controls_legacy_flags(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "cpu_offload_components": ["transformer", "vae"],
+            },
+        )
+
+        self.assertEqual(args.cpu_offload_components, ["dit", "vae"])
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertTrue(args.vae_cpu_offload)
+
+    def test_cpu_offload_components_none_disables_all_legacy_flags(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "cpu_offload_components": ["none"],
+            },
+        )
+
+        self.assertEqual(args.cpu_offload_components, [])
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_cpu_offload_components_rejects_legacy_flag_conflict(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            self._from_dict_with_task_type(
+                ModelTaskType.T2V,
+                kwargs={
+                    "performance_mode": "manual",
+                    "cpu_offload_components": ["dit"],
+                    "dit_cpu_offload": True,
+                },
+            )
 
     def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
         args = self._from_dict_with_task_type(
