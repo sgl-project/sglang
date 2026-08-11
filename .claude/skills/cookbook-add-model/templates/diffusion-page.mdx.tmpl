@@ -6,7 +6,8 @@ metatags:
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { DiffusionFeatureGuide } from '/src/snippets/diffusion/feature-guide.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/__HF_ORG__/__MODEL_SLUG__.jsx';
 
 <DiffusionModelTags tags={["__MODALITY__", "__PRIMARY_TASK__", "__DIFFERENTIATOR__", "__IMPORTANT_BOUNDARY__"]} />
 
@@ -30,52 +31,18 @@ uv pip install "sglang[diffusion]" --prerelease=allow
 
 ## 3. Serve the model
 
-Start from the smallest verified base recipe. Include topology-dependent recommended
-defaults in the generated command. Keep optional attention, quantization, caching,
-compile, and request sampling trade-offs in separate feature recipes.
+Use the builder to select a verified base recipe, then expose orthogonal startup
+and sampling choices under their Server and Request scopes. Topology-dependent
+defaults must be visible in the generated command.
 
-```bash Command
-sglang serve \
-  --model-path __MODEL_ID__ \
-  --num-gpus __NUM_GPUS__ \
-  --port 30010
-```
+<Deployment config={config} />
 
 ## 4. Request examples
 
 __REQUEST_EXAMPLES__
 
-## 5. Optional feature overlays
+## 5. Feature details
 
-<DiffusionFeatureGuide
-  serveFeatures={[{
-    id: "__SERVE_FEATURE_ID__",
-    title: "__SERVE_FEATURE_TITLE__",
-    summary: "__SERVE_FEATURE_SUMMARY__",
-    quality: { label: "__QUALITY_LABEL__", tone: "__QUALITY_TONE__" },
-    scope: "__VERIFIED_SCOPE__",
-    defaultValue: "__DEFAULT_VALUE__",
-    contract: "__QUALITY_CONTRACT__",
-    compatibility: "__COMPATIBILITY_BOUNDARY__",
-    recipes: [{
-      label: "__RECIPE_LABEL__",
-      quality: { label: "__RECIPE_QUALITY__", tone: "__RECIPE_TONE__" },
-      code: "__INCREMENTAL_FLAG__",
-    }],
-  }]}
-  requestFeatures={[{
-    id: "__REQUEST_FEATURE_ID__",
-    title: "__REQUEST_FEATURE_TITLE__",
-    summary: "__REQUEST_FEATURE_SUMMARY__",
-    quality: { label: "__QUALITY_LABEL__", tone: "__QUALITY_TONE__" },
-    scope: "__VERIFIED_SCOPE__",
-    defaultValue: "__DEFAULT_VALUE__",
-    contract: "__QUALITY_CONTRACT__",
-    compatibility: "__COMPATIBILITY_BOUNDARY__",
-    recipes: [{
-      label: "__RECIPE_LABEL__",
-      quality: { label: "__RECIPE_QUALITY__", tone: "__RECIPE_TONE__" },
-      code: "__REQUEST_FIELD__",
-    }],
-  }]}
-/>
+Document quality contracts, installation requirements, and benchmark scope for
+the Server and Request choices exposed in the builder. Keep `torch.compile` and
+other experimental controls here until they have a broadly compatible recipe.

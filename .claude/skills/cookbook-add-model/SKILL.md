@@ -136,10 +136,11 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
 ## Phase 2 — Instantiate the template
 
 For a diffusion model, instantiate `templates/diffusion-page.mdx.tmpl` and keep the
-shared `DiffusionModelTags` component. The first two paragraphs are not generic filler:
+shared `DiffusionModelTags` component, plus `templates/diffusion-config.jsx.tmpl` for the
+opt-in scoped command builder. The first two paragraphs are not generic filler:
 they must state the model's capability range, strongest differentiator, when to choose it,
-and at least one real deployment or capability boundary. Keep orthogonal runtime features
-out of the base deployment matrix; use the overlay format from
+and at least one real deployment or capability boundary. Put orthogonal runtime features
+in `scope: "serve"` or `scope: "request"`, not in the base recipe; use the schema from
 `references/diffusion-authoring.md`.
 
 1. **Copy** the three template files to their target paths (above). Note the two

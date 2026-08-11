@@ -6,7 +6,6 @@ metatags:
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { DiffusionFeatureGuide } from '/src/snippets/diffusion/feature-guide.jsx';
 
 <DiffusionModelTags tags={["video + audio", "T2VA / FL2VA / Ref2VA", "multimodal references", "4–15 seconds", "768p"]} />
 
@@ -48,57 +47,35 @@ For platform-specific setup, see the [SGLang Diffusion installation guide](/docs
 
 ## 3. Serve MiniMax-H3
 
-Use the interactive selector to choose a hardware platform, deployment profile,
-one of the two checkpoint partitions, and a request mode.
-It generates Python and, where available, Docker launch forms. AMD selections
-use the Python form until an H3-capable ROCm image is validated. The **$ cURL**
-button follows the selected request mode and switches the payload across
-text-only, all three first/last-frame signatures, and the image/audio/video
-reference combinations listed below.
-Set **Outputs per prompt** in the picker’s **Env** panel to generate more than
-one output without mixing request sampling controls into the deployment
-matrix.
+Use the builder below to choose hardware, resources, checkpoint weights, and
+request mode. It starts from the fastest verified recipe for each platform,
+then lets you change the GPU count or inspect TP, Ulysses, and Ring under
+**Advanced topology**. A valid custom topology remains copyable and is marked
+**Unverified**; a shape that violates H3's head or partition constraints is
+blocked before it reaches `sglang serve`.
 
 The Docker form does not assume the base SGLang image contains optional
 diffusion dependencies. It installs the platform-specific diffusion extra from
 the source bundled in the image before starting the server. Set **Host media
-directory** in the **Env** panel for FL2VA, V2V, or Ref2VA; the picker mounts
+directory** under **Variables** for FL2VA, V2V, or Ref2VA; the builder mounts
 that directory read-only at `/data/minimax-h3` inside the container.
 
-Every hardware/topology cell in this picker has completed a real request on
-that exact GPU model. The generated command includes the recommended encoder
-policy for the selected topology. Optional attention overrides, online
-quantization, Cache-DiT, and graph execution are explained below and expanded
-in section 7.
-
-**Deployment Profile** exposes resident and FSDP placement on B200, B300,
-H200, and H100. Resident is the latency-oriented default; FSDP reduces DiT
-weight residency at the cost of per-block parameter collectives. On H200 it
-also selects the verified 2-node cross-node topology. AMD keeps its resident
-AITER recipe, while RTX 5090 uses its dedicated layerwise-offload profile.
+**Server options** change the complete launch command and make topology-dependent
+defaults—especially encoder placement—visible. **Request options** change only
+the cURL payload, including the audited quality preset and 1–10 outputs. The
+Serve and Request cards stay visible together so the lifecycle boundary is
+explicit. AMD currently offers the Python form; NVIDIA also offers Docker.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
-import { config, featureGuide } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
+import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
 
 <Deployment config={config} />
 
 <Note>
-The ready-to-run request template lives behind the **$ cURL** button in the
-picker above. It regenerates as you change the selection, so the payload it
-shows always matches the serve command next to it.
+The generated Server command already includes the recommended encoder policy.
+Change a Server option only for a deliberate trade-off; Request options do not
+reload the model.
 </Note>
-
-### Add orthogonal features
-
-**The generated command above is ready to run and already includes the
-recommended settings for the selected hardware, including encoder placement.**
-Open an option below only when you want a different trade-off. Server options
-require a restart; generation options change only the request.
-
-<DiffusionFeatureGuide
-  serveFeatures={featureGuide.serveFeatures}
-  requestFeatures={featureGuide.requestFeatures}
-/>
 
 The selector uses the verified Hugging Face ID. To use ModelScope through the
 same normal `sglang serve` path, prefix the copied command with
@@ -578,7 +555,7 @@ task profile. A real B200 request has completed, but the `quality: "high"`
 path above remains fail-closed to the audited 4×H200 workload.
 </Warning>
 
-## 7. Optional feature overlays
+## 7. Feature contracts and advanced recipes
 
 The generated command already contains the recommended topology and encoder
 setting. Use the detailed reference below only when applying an optional

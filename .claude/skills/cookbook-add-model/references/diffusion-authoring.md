@@ -34,48 +34,52 @@ Keep the lead prose between roughly 45 and 180 words. Replace marketing superlat
 concrete capabilities. A reader should learn more than “this is a powerful image/video
 model,” but should not have to read the architecture section to choose the right model.
 
-## Deployment picker versus feature overlays
+## Scoped command builder
 
-The command picker emits a verified **base deployment recipe**. Keep an axis in the picker
-only when it changes one of these:
+New diffusion pages use `templates/diffusion-config.jsx.tmpl` and opt into the shared
+`commandBuilder` renderer. Base, Server, and Request choices share one semantic selection and
+one command composer; do not create a second command engine or assemble fragments in MDX.
 
-- hardware topology or required GPU count;
-- checkpoint/weight partition;
-- pipeline or request mode needed to produce the matching command and cURL;
-- a placement policy with a separately validated capacity/performance cell.
+Classify every dimension by lifecycle:
 
-Do not multiply the matrix for independent feature knobs. Use the shared
-`DiffusionFeatureGuide` after the base recipe and separate controls by lifecycle:
+- `scope: "base"`: hardware-independent required decisions such as checkpoint weights and
+  request mode. Hardware and Nodes × GPUs/node are supplied by the shared builder.
+- `scope: "serve"`: startup flags such as placement, attention, precision, encoder scheduling,
+  and graph execution. They modify only the complete Serve command.
+- `scope: "request"`: sampling fields such as quality and outputs. They modify only the complete
+  Request command.
 
-- **Serve-time overlays** are startup flags that change kernels, precision, placement, or
-  execution policy without creating a new base topology. Examples include attention backend,
-  online quantization, encoder scheduling, and graph execution.
-- **Request-time features** are sampling fields that may change between requests on the same
-  resident server. Examples include an audited Cache-DiT quality level or multiple outputs.
+Keep the topology registry small and honest. `verifiedRecipes` contains only exact end-to-end
+runs on that hardware and resource shape. `autoTopology(selection)` may construct a legal custom
+shape, but `resolveDeployment` must mark it `unverified` unless it exactly matches a recipe.
+`validateTopology` returns static errors for impossible world-size, head, partition, or placement
+combinations; errors disable both Copy actions. Never silently label a nearby GPU or topology as
+verified.
 
-If a verified best setting depends on the selected topology, emit it explicitly in the base
-command instead of asking the reader to remember an overlay. Encoder placement is a common
-example: the picker may emit `auto` for a single host and `replicate` across nodes. Mark that
-feature as handled by the picker; reserve copied fragments for deliberate overrides.
+Expose topology-dependent best values explicitly. A Server row may remain `Auto`, but its summary
+and generated flag must show the effective policy—for example, encoder `auto` resolving to
+`replicate` across nodes. Disable hardware-gated options rather than generating commands outside
+their validated capability boundary. Keep `torch.compile` and similarly narrow experiments in
+the detailed prose until they have a broadly compatible recipe.
 
-Each feature entry must expose its default, exact incremental flag/config, quality contract,
-incompatible combinations, and verified hardware/task. Use the quality labels to distinguish
-native or lossless execution from approximate and experimental paths. Keep the collapsed
-summary decision-complete; put installation steps, full commands, and benchmark methodology in
-the detailed reference below the widget.
+Each dimension should provide a concise `description`, an optional quality label, and a
+`learnMore` anchor. Each option should provide at most two lines of decision-relevant explanation,
+its exact `flags`/`stripPrefixes`/`env`/`hints`, and a `disabled` or `verifiedWhen` predicate when
+support is conditional. The builder stores all semantic choices in the URL hash; active scope,
+expanded state, head address, and node rank stay local.
 
-Do not make the guide another stateful command builder. Its copy action emits only the overlay
-fragment, and its choices do not join the deployment matrix or URL state. Sampling controls stay
-with request examples even when the guide summarizes them.
+Legacy configs without `commandBuilder` continue to use the old matrix renderer. Do not migrate
+an existing page opportunistically; use the new schema for new diffusion models and deliberate
+model-by-model migrations.
 
 ## Review checklist
 
 - tags render before section 1 and describe the model rather than the runtime;
 - the first screen explains capability, strength, and boundary without marketing filler;
 - checkpoint variants and request modes are unambiguous;
-- the picker remains a small base-recipe selector;
-- topology-dependent recommended defaults are explicit in the generated command;
-- the feature guide separates serve-time startup flags from request-time sampling fields;
+- the builder separates Base, Server, and Request inputs while keeping both output commands visible;
+- topology-dependent recommended defaults are explicit in the setting summary and generated command;
+- legal custom topologies are Unverified and copyable; statically illegal combinations block Copy;
 - attention, quantization, caching, compile, and similar orthogonal features have explicit
   quality contracts and verified scopes;
 - unverified hardware or performance claims are absent;

@@ -86,11 +86,14 @@ const selectionSpace = (config) => {
     ...(config.matchDims || []),
     ...(config.overlayDims || []),
   ];
-  let space = [{}];
+  let space = [{ ...(config.commandBuilder?.defaultSelection || {}) }];
   for (const d of dims) {
     const next = [];
+    const options = d.kind === "number"
+      ? [...new Set([d.default, d.min, d.max])].map((id) => ({ id }))
+      : (d.options || []);
     for (const partial of space) {
-      for (const opt of (d.options || [])) next.push({ ...partial, [d.id]: opt.id });
+      for (const opt of options) next.push({ ...partial, [d.id]: opt.id });
     }
     space = next.length ? next : space;
     if (space.length > 20000) return space.slice(0, 20000); // cheap blow-up guard
@@ -152,8 +155,141 @@ for (const path of walk(CONFIGS)) {
 
   for (const dim of (config.overlayDims || [])) {
     const ids = (dim.options || []).map((o) => o.id);
-    if (dim.default !== undefined && !ids.includes(dim.default)) {
+    if (dim.kind === "number") {
+      if (!Number.isInteger(dim.min) || !Number.isInteger(dim.max) || dim.min > dim.max) {
+        fail(where, `overlayDims.${dim.id} has invalid numeric bounds`);
+      }
+      if (!Number.isInteger(dim.default) || dim.default < dim.min || dim.default > dim.max) {
+        fail(where, `overlayDims.${dim.id}.default is outside [${dim.min}, ${dim.max}]`);
+      }
+    } else if (dim.default !== undefined && !ids.includes(dim.default)) {
       fail(where, `overlayDims.${dim.id}.default="${dim.default}" is not one of [${ids}]`);
+    }
+  }
+
+  const builder = config.commandBuilder;
+  if (builder) {
+    const scopes = new Set(["base", "serve", "request"]);
+    for (const dim of (config.overlayDims || [])) {
+      if (!scopes.has(dim.scope)) {
+        fail(where, `builder dimension ${dim.id} has invalid scope "${dim.scope}"`);
+      }
+    }
+    if (!builder.defaultSelection || typeof builder.defaultSelection !== "object") {
+      fail(where, "commandBuilder.defaultSelection is required");
+    }
+    if (typeof builder.resource?.autoTopology !== "function") {
+      fail(where, "commandBuilder.resource.autoTopology must be a function");
+    }
+    if (typeof builder.resource?.validateTopology !== "function") {
+      fail(where, "commandBuilder.resource.validateTopology must be a function");
+    }
+    if (typeof builder.resolveDeployment !== "function") {
+      fail(where, "commandBuilder.resolveDeployment must be a function");
+    }
+    for (const [key, bounds] of Object.entries(builder.resource?.limits || {})) {
+      if (!Number.isInteger(bounds.min) || !Number.isInteger(bounds.max) || bounds.min > bounds.max) {
+        fail(where, `commandBuilder.resource.limits.${key} is invalid`);
+      }
+      const value = builder.defaultSelection?.[key];
+      if (!Number.isInteger(value) || value < bounds.min || value > bounds.max) {
+        fail(where, `commandBuilder.defaultSelection.${key} is outside its bounds`);
+      }
+    }
+
+    const selectionOf = (extra = {}) => {
+      const defaults = { ...(builder.defaultSelection || {}) };
+      for (const dim of (config.overlayDims || [])) defaults[dim.id] = dim.default;
+      return { ...defaults, ...extra };
+    };
+    const validateResolved = (selection, label, expectVerified = false) => {
+      let resolved;
+      try {
+        resolved = builder.resolveDeployment(selection);
+      } catch (e) {
+        fail(where, `${label} resolver throws: ${e.message}`);
+        return null;
+      }
+      if (!resolved || !Array.isArray(resolved.flags) || !resolved.builder) {
+        fail(where, `${label} resolver must return a cell with flags and builder metadata`);
+        return resolved;
+      }
+      if (!Array.isArray(resolved.builder.errors) || !Array.isArray(resolved.builder.warnings)) {
+        fail(where, `${label} resolver errors/warnings must be arrays`);
+      }
+      if (expectVerified && (resolved.builder.errors?.length || resolved.builder.verification?.serve !== "verified")) {
+        fail(where, `${label} is declared verified but resolved as ${resolved.builder.verification?.serve || "invalid"}`);
+      }
+
+      let flags = [...resolved.flags];
+      for (const dim of (config.overlayDims || [])) {
+        const option = (dim.options || []).find((entry) => entry.id === selection[dim.id]);
+        if (!option) continue;
+        const strip = typeof option.stripPrefixes === "function"
+          ? option.stripPrefixes(selection) : (option.stripPrefixes || []);
+        if (strip.length) flags = flags.filter((flag) => !strip.includes(flag.split(/[\s=]/)[0]));
+        const extra = typeof option.flags === "function" ? option.flags(selection) : option.flags;
+        flags.push(...(extra || []));
+      }
+      const families = flags.map((flag) => flag.split(/[\s=]/)[0]);
+      const duplicate = families.find((family, index) => families.indexOf(family) !== index);
+      if (duplicate) fail(where, `${label} emits duplicate flag family ${duplicate}`);
+      return resolved;
+    };
+
+    validateResolved(selectionOf(), "commandBuilder default");
+    const recipeIds = new Set();
+    const recipeSignatures = new Set();
+    for (const [index, recipe] of (builder.resource?.verifiedRecipes || []).entries()) {
+      if (!recipe.id || recipeIds.has(recipe.id)) fail(where, `verifiedRecipes[${index}] has a duplicate/missing id`);
+      recipeIds.add(recipe.id);
+      const signature = [recipe.hw, recipe.nodes, recipe.gpus_per_node, recipe.placement,
+        recipe.tp_size, recipe.ulysses_degree, recipe.ring_degree].join("|");
+      if (recipeSignatures.has(signature)) fail(where, `verifiedRecipes[${index}] duplicates ${signature}`);
+      recipeSignatures.add(signature);
+      const selection = selectionOf({ ...recipe, topology_mode: "auto" });
+      const topology = builder.resource.autoTopology(selection);
+      const errors = builder.resource.validateTopology(selection, topology);
+      if (!Array.isArray(errors) || errors.length) {
+        fail(where, `verifiedRecipes[${index}] fails topology validation: ${(errors || []).join("; ")}`);
+      }
+      validateResolved(selection, `verifiedRecipes[${index}]`, true);
+    }
+
+    // H3's architectural contract is important enough to pin directly: exact
+    // platform recipes, legal custom admission, and each invalidity family.
+    if (config.modelName === "MiniMax-H3") {
+      const checkH3 = (label, extra, expected, verified = true) => {
+        const selection = selectionOf(extra);
+        const resolved = validateResolved(selection, `H3 ${label}`, verified);
+        if (!resolved) return;
+        for (const [key, value] of Object.entries(expected)) {
+          if (resolved.builder.topology?.[key] !== value) {
+            fail(where, `H3 ${label} topology.${key}=${resolved.builder.topology?.[key]}, expected ${value}`);
+          }
+        }
+      };
+      checkH3("B200 1x8", { hw: "b200", nodes: 1, gpus_per_node: 8, placement: "resident" }, { tp_size: 1, ulysses_degree: 8, ring_degree: 1 });
+      checkH3("H100 1x4", { hw: "h100", nodes: 1, gpus_per_node: 4, placement: "resident" }, { tp_size: 2, ulysses_degree: 2, ring_degree: 1 });
+      checkH3("H200 2x8", { hw: "h200", nodes: 2, gpus_per_node: 8, placement: "resident" }, { tp_size: 1, ulysses_degree: 8, ring_degree: 2 });
+      for (const hw of ["mi300x", "mi355x"]) {
+        for (const count of [1, 2, 4, 8]) {
+          checkH3(`${hw} 1x${count}`, { hw, nodes: 1, gpus_per_node: count, placement: "resident" }, { tp_size: 1, ulysses_degree: count, ring_degree: 1 });
+        }
+      }
+      const custom = validateResolved(selectionOf({ hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident" }), "H3 legal custom");
+      if (custom?.builder.errors?.length || custom?.builder.verification?.serve !== "unverified") {
+        fail(where, "H3 legal custom topology must be copyable and Unverified");
+      }
+      for (const [label, extra] of [
+        ["3 GPU", { hw: "h200", nodes: 1, gpus_per_node: 3, placement: "resident" }],
+        ["TP3", { hw: "h100", nodes: 1, gpus_per_node: 4, placement: "resident", topology_mode: "manual", tp_size: 3, ulysses_degree: 1, ring_degree: 1 }],
+        ["head divisibility", { hw: "h200", nodes: 2, gpus_per_node: 8, placement: "resident", topology_mode: "manual", tp_size: 2, ulysses_degree: 8, ring_degree: 1 }],
+        ["sequence alignment", { hw: "mi300x", nodes: 2, gpus_per_node: 3, placement: "resident", topology_mode: "manual", tp_size: 1, ulysses_degree: 2, ring_degree: 3 }],
+      ]) {
+        const resolved = validateResolved(selectionOf(extra), `H3 invalid ${label}`);
+        if (!resolved?.builder.errors?.length) fail(where, `H3 invalid ${label} was not rejected`);
+      }
     }
   }
 
@@ -169,10 +305,12 @@ for (const path of walk(CONFIGS)) {
   };
   for (const dim of [...(config.matchDims || []), ...(config.overlayDims || [])]) {
     if (typeof dim.showWhen === "function") probe(dim.showWhen, `${dim.id}.showWhen`);
+    if (typeof dim.verifiedWhen === "function") probe(dim.verifiedWhen, `${dim.id}.verifiedWhen`);
     for (const opt of (dim.options || [])) {
       const tag = `${dim.id}.${opt.id}`;
       if (typeof opt.showWhen === "function") probe(opt.showWhen, `${tag}.showWhen`);
       if (typeof opt.disabled === "function") probe(opt.disabled, `${tag}.disabled`);
+      if (typeof opt.verifiedWhen === "function") probe(opt.verifiedWhen, `${tag}.verifiedWhen`);
       for (const key of ["flags", "env", "hints"]) {
         if (typeof opt[key] !== "function") continue;
         probe((sel) => {
