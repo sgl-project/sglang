@@ -434,13 +434,12 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "")
 
-        # Tool interruption should still work - flushes buffered reasoning.
-        # Note: when stream_reasoning=False, the <think> tag is stripped from the
-        # local `current_text` variable but NOT from `self._buffer` (which is never
-        # cleared in the non-streaming path). So the flushed reasoning content
-        # includes the raw <think> tag.
+        # Tool interruption should still work - flushes buffered reasoning. The
+        # opening tag is stripped from `self._buffer` as well as from the local
+        # view, so the flush matches detect_and_parse instead of carrying the raw
+        # <think> tag into reasoning_content.
         result = detector.parse_streaming_increment("<tool_call>tool call")
-        self.assertEqual(result.reasoning_text, "<think>thinking")
+        self.assertEqual(result.reasoning_text, "thinking")
         self.assertEqual(result.normal_text, "<tool_call>tool call")
 
     def test_streaming_empty_reasoning_with_tool(self):
