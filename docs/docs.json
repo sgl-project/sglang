@@ -1340,6 +1340,7 @@
                     "group": "InclusionAI",
                     "pages": [
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash",
+                      "cookbook/autoregressive/InclusionAI/Ling-3.0-tiny",
                       "cookbook/autoregressive/InclusionAI/Ring-2.6-1T",
                       "cookbook/autoregressive/InclusionAI/Ling-2.6",
                       "cookbook/autoregressive/InclusionAI/Ling-2.5-1T",
@@ -1350,6 +1351,7 @@
                   {
                     "group": "InternLM",
                     "pages": [
+                      "cookbook/autoregressive/InternLM/Intern-S2-Mobius",
                       "cookbook/autoregressive/InternLM/Intern-S2-Preview",
                       "cookbook/autoregressive/InternLM/Intern-S1"
                     ]

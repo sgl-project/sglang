@@ -77,6 +77,22 @@ livenessProbe:
 See [Health endpoints](/docs/sglang-diffusion/api/cli#health-endpoints) for the
 status-code contract and warmup-mode behavior.
 
+## Stable Model Identity
+
+Use `--served-model-name` when the public model name must remain stable across replicas, hosts, or checkpoint mount paths:
+
+```bash
+sglang serve \
+  --model-path /mnt/checkpoints/Qwen-Image \
+  --model-id Qwen-Image \
+  --served-model-name image-production \
+  --port 30010
+```
+
+The resolved public name follows `--served-model-name`, then `--model-id`, then `--model-path`. `--model-id` remains an internal model registry and configuration-resolution hint; it is not a replacement for a deployment alias. The resolved name is exposed through `/server_info` and `/v1/models` and is used by video and action responses when a request does not supply its own model.
+
+See [OpenAI API: Served model name](/docs/sglang-diffusion/api/openai_api#served-model-name) for discovery and retrieval examples.
+
 ## Performance Modes
 
 `--performance-mode` applies safe presets without overriding explicit offload, FSDP, or parallelism flags. `auto` is the default. Use `manual` when you need to keep performance-related server args under explicit user control. `--mode` is a short alias.

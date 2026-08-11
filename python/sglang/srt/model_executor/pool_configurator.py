@@ -81,14 +81,16 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
 
     Unlike an EAGLE draft, which reuses the target's attention config and is
     therefore priced by layer count, a DFLASH draft has its own geometry and is
-    a flat additive term.
+    a flat additive term. Under DCP, the target pool is sharded while the draft
+    pool spans the allocator's widened virtual location space, so the draft
+    term is replicated across DCP ranks.
     """
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return 0
     cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
-    return int(cell_size)
+    return int(cell_size) * get_parallel().attn_dcp_size
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:

@@ -14,6 +14,7 @@ framework-specific optimization workflow.
 - `python/sglang/kernels/ops/diffusion/modulate_scale_shift.py`
 - `python/sglang/kernels/ops/diffusion/fused_ln_modulate.py`
 - `python/sglang/kernels/ops/diffusion/quality_gate.py`
+- `python/sglang/kernels/ops/diffusion/bitexact_gate.py`
 - `python/sglang/kernels/ops/diffusion/group_norm_silu.py`
 - `python/sglang/kernels/ops/diffusion/triton/group_norm_silu.py`
 - `python/sglang/kernels/ops/diffusion/triton/group_norm_silu_twopass.py`
@@ -24,6 +25,8 @@ framework-specific optimization workflow.
 - `python/sglang/kernels/ops/diffusion/triton/zimage_native_norm.py`
 - `python/sglang/kernels/ops/diffusion/triton/rotary.py`
 - `python/sglang/kernels/ops/diffusion/triton/ltx2_rotary.py`
+- `python/sglang/kernels/ops/diffusion/ltx2_qknorm_split_rope.py`
+- `python/sglang/kernels/ops/diffusion/ltx2_rmsnorm_modulate.py`
 - `python/sglang/kernels/ops/diffusion/triton/indexed_modulation.py`
 - `python/sglang/kernels/ops/diffusion/triton/ulysses_qkv.py`
 - `python/sglang/kernels/ops/diffusion/usp_relayout.py`
@@ -48,6 +51,8 @@ framework-specific optimization workflow.
 - `test/registered/kernels/ops/diffusion/test_glm_image_ln_modulate.py`
 - `test/registered/kernels/ops/diffusion/test_sana_ln_modulate.py`
 - `test/registered/kernels/ops/diffusion/test_quality_gate.py`
+- `test/registered/kernels/ops/diffusion/test_ltx2_rms_norm_modulate.py`
+- `test/registered/kernels/ops/diffusion/test_bitexact_gate.py`
 - `test/registered/kernels/ops/diffusion/test_wan_causal_cache.py`
 - `test/registered/kernels/ops/diffusion/test_stage_profiler_sync.py`
 - `test/registered/kernels/benchmark/diffusion/bench_qwen_image_modulation.py`
@@ -116,9 +121,9 @@ framework-specific optimization workflow.
   `test_vae_fast_path_gate.py`.
 
 5. Z-Image bf16-native RMSNorm modulation (Triton)
-- Kernels: `zimage_rmsnorm_scale`, `zimage_rmsnorm_tanh_residual`
-- Locations: `triton/native_bf16_rmsnorm.py`, compatibility exports in
-  `triton/zimage_native_norm.py`, and `zimage.py`
+- Kernels: `rmsnorm_scale`, `rmsnorm_tanh_residual`
+- Locations: `triton/native_bf16_rmsnorm.py`, with wrappers in `zimage.py` and
+  `fused_gate_rmsnorm.py`. Note: `triton/zimage_native_norm.py` is QK-only.
 - Use cases:
   - `y = rmsnorm(x) * scale`
   - `y = residual + tanh(gate) * rmsnorm(x)`
@@ -162,7 +167,7 @@ framework-specific optimization workflow.
 - Locations: `diffusion/residual_gate_add.py`, `csrc/diffusion/residual_gate_add.cuh`, `runtime/models/dits/ltx_2.py`
 - Use case: `residual + update * gate` in LTX2 self-attention, prompt cross-attention, audio/video cross-attention, and feed-forward residual updates.
 - Constraints: `residual`, `update`, and `gate` must be CUDA tensors on the same device, contiguous, same dtype (`fp16`, `bf16`, or `fp32`), with `update.shape == residual.shape`; `gate` can match `residual` or be row-broadcast with the last dimension matching.
-- Behavior: `_ltx2_residual_gate_add(...)` uses the CUDA custom op while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for the process, and falls back to `residual + update * gate`.
+- Behavior: LTX2 calls `residual_gate_add(...)` from the kernels package directly. The CUDA custom op is used while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for the process, and falls back to `residual + update * gate`.
 - Validation: `test/registered/kernels/ops/diffusion/test_residual_gate_add.py`.
 - Microbench: `test/registered/kernels/benchmark/diffusion/bench_residual_gate_add.py`.
 - Workflow rule: if LTX2 traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, check whether this existing CUDA path was disabled by shape, dtype, contiguity, or a prior runtime failure before proposing another elementwise fusion.
@@ -291,17 +296,27 @@ framework-specific optimization workflow.
 - Request-scoped high-quality acceleration: `QualityGatedFusion` in
   `quality_gate.py`, `_maybe_toggle_quality_fusions` in `denoising.py`, and
   `use_vae_fast_path` in `decoding.py`.
+- Bit-exact first-sight verify/disable: `BitExactFusionGate` in
+  `bitexact_gate.py`, used by FLUX / GLM / Sana / Ernie fused norm sites.
 - Qwen-Image gating: `fuse_layernorm_scale_shift_gate_select01_kernel` and `fuse_residual_layernorm_scale_shift_gate_select01_kernel` through `fused_scale_shift_gate.py` and `qwen_image.py`.
-- Z-Image native norm modulation: `zimage_rmsnorm_scale` and
-  `zimage_rmsnorm_tanh_mul_add` in `zimage.py`, backed by the shared
-  `triton/native_bf16_rmsnorm.py` kernels.
+- Z-Image native norm modulation: `rmsnorm_scale` and `rmsnorm_tanh_residual`
+  in `triton/native_bf16_rmsnorm.py`, with wrappers in `zimage.py` /
+  `fused_gate_rmsnorm.py`. `zimage_native_norm.py` is QK-only.
 - HunyuanVideo VAE and LTX upsampler GroupNorm+SiLU: `apply_group_norm_silu` in `hunyuanvae.py` and `latent_upsampler.py`; default-eligible when wrapper guards pass.
 - MiniMax-H3 indexed modulation: `_modulate_scale_shift` and `_modulate_gate` in `minimax_h3.py`, backed by `triton/indexed_modulation.py`.
 - MiniMax-H3 Ulysses relayout: `_usp_input_all_to_all_packed_qkv` and `usp_merge_heads` through `runtime/layers/usp.py`.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.
 - LTX2 split RoPE: `apply_ltx2_split_rotary_emb` in `ltx_2.py`.
-- LTX2 residual-gate add: `_ltx2_residual_gate_add` in `ltx_2.py` wraps the CUDA `diffusion_residual_gate_add` custom op for attention, cross-attention, and MLP residual updates.
+- LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="high"`:
+  `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
+  `kernels/ops/diffusion/ltx2_rmsnorm_modulate.py` (mount-based
+  `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
+  kernel is <=1 ULP off aten, so it is request-gated instead of verified),
+  wired at the six `LTX2TransformerBlock` adaLN sites in `ltx_2.py`.
+- LTX2 residual-gate add: `ltx_2.py` calls `residual_gate_add` from
+  `kernels/ops/diffusion/residual_gate_add.py` directly for attention,
+  cross-attention, and MLP residual updates.
 - Wan causal VAE: `cat_pad_channels_last_3d` and `dup_up3d_add` in
   `wanvae.py`, backed by `triton/wan_causal_cache.py`.
 - Varlen USP attention: `fused_pack_qkv` and `fused_scatter_to_padded` in `attention/layer.py`.

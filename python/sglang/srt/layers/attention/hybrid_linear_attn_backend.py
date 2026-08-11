@@ -1204,6 +1204,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
 
+        # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
+        if mamba_track_indices is not None:
+            mamba_track_indices = self.linear_attn_backend._translate_mamba_indices(
+                mamba_track_indices
+            )
+
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
                 :request_number
