@@ -40,6 +40,9 @@ class DSV4SharedCacheAccess:
             "shared_kv_cache_stats": view.stats,
             "shared_kv_cache_epoch": view.epoch,
             "shared_kv_cache_ways": view.ways,
+            "shared_kv_cache_direct_slots": (
+                self._pool.prefill_demand_cache_direct_slots
+            ),
             "shared_kv_rank": shared_rank,
             "shared_kv_size": shared_size,
             "shared_swa_page_size": swa_page_size,

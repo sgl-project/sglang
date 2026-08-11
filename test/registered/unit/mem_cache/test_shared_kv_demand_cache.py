@@ -42,6 +42,24 @@ class TestTransientRowDemandCache(unittest.TestCase):
         self.assertTrue(torch.all(cache.rows == 7))
         self.assertEqual(cache.stats.shape, (5,))
 
+    def test_storage_rows_can_reserve_untagged_kernel_scratch(self):
+        cache = TransientRowDemandCache(
+            rows=16,
+            tagged_rows=8,
+            row_bytes=592,
+            ways=1,
+            device="cpu",
+            collect_stats=False,
+        )
+
+        view = cache.next_view()
+
+        self.assertEqual(view.rows.shape, (16, 592))
+        self.assertEqual(view.tags.shape, (8, 1))
+        self.assertEqual(cache.num_rows, 16)
+        self.assertEqual(cache.num_tagged_rows, 8)
+        self.assertEqual(cache.allocated_bytes, 16 * 592 + 8 * 8)
+
     def test_rejects_geometry_that_cannot_use_masked_set_indexing(self):
         with self.assertRaisesRegex(ValueError, "power-of-two"):
             TransientRowDemandCache(

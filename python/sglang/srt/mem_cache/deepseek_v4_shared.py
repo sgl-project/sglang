@@ -77,6 +77,36 @@ def dsv4_prefill_demand_cache_fits_direct_slots(
     return swa_rows <= rows_per_family and max(c4_rows, c128_rows) <= rows_per_family
 
 
+def dsv4_prefill_demand_cache_mode(
+    *,
+    swa_rows: int,
+    c4_rows: int,
+    c128_rows: int,
+    cache_rows: int,
+    supports_tagged_hash: bool,
+) -> str | None:
+    """Prefer fixed-capacity tagged hashing; retain direct slots as fallback."""
+    if supports_tagged_hash:
+        return "tagged_hash"
+    if dsv4_prefill_demand_cache_fits_direct_slots(
+        swa_rows=swa_rows,
+        c4_rows=c4_rows,
+        c128_rows=c128_rows,
+        cache_rows=cache_rows,
+    ):
+        return "direct_slots"
+    return None
+
+
+def dsv4_prefill_demand_cache_tagged_rows(
+    *, cache_rows: int, needs_tma_collision_scratch: bool
+) -> int:
+    """Reserve the upper half for per-SM TMA scratch on Blackwell."""
+    if cache_rows <= 0 or cache_rows & (cache_rows - 1):
+        raise ValueError("DSV4 demand-cache rows must be a power of two")
+    return cache_rows // 2 if needs_tma_collision_scratch else cache_rows
+
+
 def build_dsv4_shared_page_layout(
     *, logical_size: int, page_size: int, cp_size: int
 ) -> DSV4SharedPageLayout:
@@ -406,9 +436,12 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
         self.shared_write_publisher: SharedWritePublisher | None = None
         self.shared_cache_access: DSV4SharedCacheAccess | None = None
         self.prefill_demand_cache: TransientRowDemandCache | None = None
+        self.prefill_demand_cache_direct_slots = True
         try:
             super().__init__(*args, **kwargs)
             if enable_prefill_demand_cache:
+                from sglang.srt.utils import is_sm100_supported
+
                 families = (
                     self.swa_kv_pool.shared_family,
                     self.c4_kv_pool.shared_family,
@@ -418,23 +451,41 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
                 family_rows = tuple(
                     family.layout.owner_layout.logical_rows for family in families
                 )
-                if dsv4_prefill_demand_cache_fits_direct_slots(
+                demand_cache_mode = dsv4_prefill_demand_cache_mode(
                     swa_rows=family_rows[0],
                     c4_rows=family_rows[1],
                     c128_rows=family_rows[2],
                     cache_rows=DSV4_PREFILL_DEMAND_CACHE_ROWS,
-                ):
+                    supports_tagged_hash=supports_dsv4_shared_demand_cache(),
+                )
+                if demand_cache_mode is not None:
+                    tagged_rows = dsv4_prefill_demand_cache_tagged_rows(
+                        cache_rows=DSV4_PREFILL_DEMAND_CACHE_ROWS,
+                        needs_tma_collision_scratch=is_sm100_supported(),
+                    )
                     self.prefill_demand_cache = TransientRowDemandCache(
                         rows=DSV4_PREFILL_DEMAND_CACHE_ROWS,
+                        tagged_rows=tagged_rows,
                         row_bytes=DSV4_MODEL1_DEMAND_CACHE_ROW_BYTES,
                         ways=1,
                         device=self.device,
                         collect_stats=False,
                     )
+                    self.prefill_demand_cache_direct_slots = (
+                        demand_cache_mode == "direct_slots"
+                    )
+                    if demand_cache_mode == "tagged_hash":
+                        logger.info(
+                            "DSV4 Shared Prefill demand cache uses one-way tagged "
+                            "hash with %d tagged rows for logical family rows %s",
+                            tagged_rows,
+                            family_rows,
+                        )
                 else:
                     logger.warning(
                         "DSV4 Shared Prefill demand cache disabled because "
-                        "logical family rows %s exceed the direct-slot capacity %d",
+                        "logical family rows %s exceed the direct-slot "
+                        "fallback capacity %d",
                         family_rows,
                         DSV4_PREFILL_DEMAND_CACHE_ROWS // 2,
                     )

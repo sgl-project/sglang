@@ -117,7 +117,9 @@ class TestDSV4FlashMLADemandCache(CustomTestCase):
         *,
         extra_page_size: int,
         cache_rows: int | None = None,
+        tagged_rows: int | None = None,
         cache_ways: int | None = None,
+        direct_slots: bool | None = None,
         shared_rank: int = 0,
         hash_alias: bool = False,
         hash_alias_batches: bool = False,
@@ -132,12 +134,18 @@ class TestDSV4FlashMLADemandCache(CustomTestCase):
             cache_rows = 1 << 18 if is_sm100 else 384
         if cache_ways is None:
             cache_ways = 1 if is_sm100 else 3
+        if direct_slots is None:
+            direct_slots = False
+        if tagged_rows is None:
+            tagged_rows = (
+                cache_rows if not is_sm100 or direct_slots else cache_rows // 2
+            )
 
         cp_size = 2
         self.assertIn(shared_rank, range(cp_size))
         swa_page_size = 128
         if hash_alias_batches or hash_alias:
-            num_sets = cache_rows // cache_ways
+            num_sets = tagged_rows // cache_ways
             swa_indices = _hash_alias_batches(
                 page_size=swa_page_size, num_sets=num_sets
             )
@@ -202,7 +210,7 @@ class TestDSV4FlashMLADemandCache(CustomTestCase):
             **common,
         )
 
-        num_sets, remainder = divmod(cache_rows, cache_ways)
+        num_sets, remainder = divmod(tagged_rows, cache_ways)
         self.assertEqual(remainder, 0)
         self.assertEqual(num_sets & (num_sets - 1), 0)
         row_cache = torch.empty(
@@ -220,6 +228,7 @@ class TestDSV4FlashMLADemandCache(CustomTestCase):
             shared_kv_cache_stats=stats,
             shared_kv_cache_epoch=1,
             shared_kv_cache_ways=cache_ways,
+            shared_kv_cache_direct_slots=direct_slots,
             shared_kv_rank=shared_rank,
             shared_kv_size=cp_size,
             shared_swa_page_size=swa_page_size,
@@ -276,30 +285,32 @@ class TestDSV4FlashMLADemandCache(CustomTestCase):
         self._run_base_and_demand(extra_page_size=64, shared_rank=1)
 
     def test_collision_fallback_preserves_base_result(self):
-        if torch.cuda.get_device_capability()[0] == 10:
-            self.skipTest("SM100 release path uses collision-free direct slots")
+        is_sm100 = torch.cuda.get_device_capability()[0] == 10
         first_stats, _ = self._run_base_and_demand(
-            extra_page_size=64, cache_rows=1, cache_ways=1
+            extra_page_size=64,
+            cache_rows=1 << 18 if is_sm100 else 1,
+            tagged_rows=1,
+            cache_ways=1,
         )
         self.assertGreater(first_stats[3].item(), 0)
 
     def test_one_way_hash_aliases_preserve_base_result(self):
-        if torch.cuda.get_device_capability()[0] == 10:
-            self.skipTest("SM100 release path uses collision-free direct slots")
+        is_sm100 = torch.cuda.get_device_capability()[0] == 10
         self._run_base_and_demand(
             extra_page_size=64,
-            cache_rows=1 << 10,
+            cache_rows=1 << 18 if is_sm100 else 1 << 10,
+            tagged_rows=1 << 10,
             cache_ways=1,
             hash_alias=True,
             expect_collision=True,
         )
 
     def test_one_way_concurrent_hash_aliases_are_race_safe(self):
-        if torch.cuda.get_device_capability()[0] == 10:
-            self.skipTest("SM100 release path uses collision-free direct slots")
+        is_sm100 = torch.cuda.get_device_capability()[0] == 10
         self._run_base_and_demand(
             extra_page_size=64,
-            cache_rows=1 << 10,
+            cache_rows=1 << 18 if is_sm100 else 1 << 10,
+            tagged_rows=1 << 10,
             cache_ways=1,
             hash_alias_batches=True,
             expect_collision=True,
@@ -310,7 +321,9 @@ class TestDSV4FlashMLADemandCache(CustomTestCase):
         first_stats, _ = self._run_base_and_demand(
             extra_page_size=64,
             cache_rows=1 << 18,
+            tagged_rows=1 << 18,
             cache_ways=1,
+            direct_slots=True,
             hash_alias_batches=torch.cuda.get_device_capability()[0] != 10,
             reuse_repeats=20,
         )

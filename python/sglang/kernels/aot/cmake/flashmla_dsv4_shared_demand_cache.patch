@@ -1,6 +1,6 @@
 diff -rN -U0 pristine/csrc/api/sparse_decode.h desired/csrc/api/sparse_decode.h
 --- pristine/csrc/api/sparse_decode.h	2026-06-24 14:52:45
-+++ desired/csrc/api/sparse_decode.h	2026-08-11 12:04:01
++++ desired/csrc/api/sparse_decode.h	2026-08-11 20:01:15
 @@ -2,0 +3,2 @@
 +#include <bit>
 +
@@ -37,7 +37,7 @@ diff -rN -U0 pristine/csrc/api/sparse_decode.h desired/csrc/api/sparse_decode.h
 +                } else {
 +                    sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, false>(cur_params);
 +                }
-@@ -196 +222,12 @@
+@@ -196 +222,13 @@
 -    float sm_scale
 +    float sm_scale,
 +    const std::optional<at::Tensor> &shared_kv_row_cache = std::nullopt,
@@ -45,30 +45,31 @@ diff -rN -U0 pristine/csrc/api/sparse_decode.h desired/csrc/api/sparse_decode.h
 +    const std::optional<at::Tensor> &shared_kv_cache_stats = std::nullopt,
 +    int64_t shared_kv_cache_epoch = 0,
 +    int64_t shared_kv_cache_ways = 0,
++    bool shared_kv_cache_direct_slots = true,
 +    int64_t shared_kv_rank = 0,
 +    int64_t shared_kv_size = 1,
 +    int64_t shared_swa_page_size = 0,
 +    int64_t shared_swa_pages_per_rank = 0,
 +    int64_t shared_extra_page_size = 0,
 +    int64_t shared_extra_pages_per_rank = 0
-@@ -219,0 +257,4 @@
+@@ -219,0 +258,4 @@
 +    bool have_shared_kv_cache = shared_kv_row_cache.has_value();
 +    TORCH_CHECK(
 +        have_shared_kv_cache == shared_kv_cache_tags.has_value(),
 +        "shared_kv_row_cache and shared_kv_cache_tags must be provided together");
-@@ -256,0 +298,3 @@
+@@ -256,0 +299,3 @@
 +    KU_CHECK_DEVICE(shared_kv_row_cache);
 +    KU_CHECK_DEVICE(shared_kv_cache_tags);
 +    KU_CHECK_DEVICE(shared_kv_cache_stats);
-@@ -270,0 +315,3 @@
+@@ -270,0 +316,3 @@
 +    KU_CHECK_DTYPE(shared_kv_row_cache, torch::kUInt8);
 +    KU_CHECK_DTYPE(shared_kv_cache_tags, torch::kInt64);
 +    KU_CHECK_DTYPE(shared_kv_cache_stats, torch::kInt64);
-@@ -284,0 +332,3 @@
+@@ -284,0 +333,3 @@
 +    KU_CHECK_CONTIGUOUS(shared_kv_row_cache);
 +    KU_CHECK_CONTIGUOUS(shared_kv_cache_tags);
 +    KU_CHECK_CONTIGUOUS(shared_kv_cache_stats);
-@@ -311,0 +362,29 @@
+@@ -311,0 +363,39 @@
 +    int shared_kv_cache_sets = 0;
 +    if (have_shared_kv_cache) {
 +        TORCH_CHECK(
@@ -82,11 +83,21 @@ diff -rN -U0 pristine/csrc/api/sparse_decode.h desired/csrc/api/sparse_decode.h
 +        shared_kv_cache_sets = static_cast<int>(shared_kv_cache_tags->size(0));
 +        TORCH_CHECK(shared_kv_cache_sets > 0);
 +        TORCH_CHECK(std::has_single_bit(static_cast<uint32_t>(shared_kv_cache_sets)));
-+        TORCH_CHECK(shared_kv_row_cache->size(0) == shared_kv_cache_sets * shared_kv_cache_ways);
++        TORCH_CHECK(
++            shared_kv_row_cache->size(0) >= shared_kv_cache_sets * shared_kv_cache_ways,
++            "DSV4 Shared demand-cache storage must cover every tagged slot");
 +        if (arch.is_sm100f()) {
-+            TORCH_CHECK(
-+                shared_kv_cache_ways == 1 && shared_kv_cache_sets >= (1 << 18),
-+                "SM100 DSV4 Shared demand cache requires the collision-free one-way layout");
++            if (shared_kv_cache_direct_slots) {
++                TORCH_CHECK(
++                    shared_kv_cache_ways == 1 && shared_kv_cache_sets >= (1 << 18) &&
++                        shared_kv_row_cache->size(0) == shared_kv_cache_sets,
++                    "SM100 direct-slot demand cache requires one storage row per tagged slot");
++            } else {
++                TORCH_CHECK(
++                    shared_kv_cache_ways == 1 &&
++                        shared_kv_row_cache->size(0) >= 2 * shared_kv_cache_sets,
++                    "SM100 tagged demand cache requires an equally sized TMA collision scratch");
++            }
 +        }
 +        if (shared_kv_cache_stats.has_value()) {
 +            TORCH_CHECK(shared_kv_cache_stats->dim() == 1 && shared_kv_cache_stats->size(0) == 5);
@@ -98,10 +109,10 @@ diff -rN -U0 pristine/csrc/api/sparse_decode.h desired/csrc/api/sparse_decode.h
 +            TORCH_CHECK(shared_extra_page_size > 0 && shared_extra_pages_per_rank > 0);
 +        }
 +    }
-@@ -367 +446 @@
+@@ -367 +457 @@
 -            if (d_qk == 576) {
 +            if (d_qk == 576 || have_shared_kv_cache) {
-@@ -413,0 +493,15 @@
+@@ -413,0 +504,17 @@
 +
 +        have_shared_kv_cache ? shared_kv_row_cache->data_ptr<uint8_t>() : nullptr,
 +        have_shared_kv_cache ? reinterpret_cast<uint64_t*>(shared_kv_cache_tags->data_ptr<int64_t>()) : nullptr,
@@ -109,8 +120,10 @@ diff -rN -U0 pristine/csrc/api/sparse_decode.h desired/csrc/api/sparse_decode.h
 +            ? reinterpret_cast<uint64_t*>(shared_kv_cache_stats->data_ptr<int64_t>())
 +            : nullptr,
 +        static_cast<uint32_t>(shared_kv_cache_epoch),
++        have_shared_kv_cache ? static_cast<int>(shared_kv_row_cache->size(0)) : 0,
 +        shared_kv_cache_sets,
 +        static_cast<int>(shared_kv_cache_ways),
++        shared_kv_cache_direct_slots,
 +        static_cast<int>(shared_kv_rank),
 +        static_cast<int>(shared_kv_size),
 +        static_cast<int>(shared_swa_page_size),
@@ -119,25 +132,26 @@ diff -rN -U0 pristine/csrc/api/sparse_decode.h desired/csrc/api/sparse_decode.h
 +        static_cast<int>(shared_extra_pages_per_rank),
 diff -rN -U0 pristine/csrc/params.h desired/csrc/params.h
 --- pristine/csrc/params.h	2026-06-24 14:52:45
-+++ desired/csrc/params.h	2026-08-11 12:03:09
++++ desired/csrc/params.h	2026-08-11 20:01:15
 @@ -2,0 +3,2 @@
 +#include <cstdint>
 +
-@@ -91,0 +94,11 @@
+@@ -91,0 +94,12 @@
 +
 +    // Optional MODEL1 Shared-KV demand-row cache. Null preserves the upstream
 +    // architecture-specific direct-load path.
-+    uint8_t* __restrict__ shared_kv_row_cache;       // [sets * ways, 592]
++    uint8_t* __restrict__ shared_kv_row_cache;       // [storage_rows, 592]
 +    uint64_t* __restrict__ shared_kv_cache_tags;     // [sets, ways]
 +    uint64_t* __restrict__ shared_kv_cache_stats;    // Optional [5]
 +    uint32_t shared_kv_cache_epoch;
-+    int shared_kv_cache_sets, shared_kv_cache_ways;
++    int shared_kv_cache_rows, shared_kv_cache_sets, shared_kv_cache_ways;
++    bool shared_kv_cache_direct_slots;
 +    int shared_kv_rank, shared_kv_size;
 +    int shared_swa_page_size, shared_swa_pages_per_rank;
 +    int shared_extra_page_size, shared_extra_pages_per_rank;
 diff -rN -U0 pristine/csrc/sm100/decode/head64/config.h desired/csrc/sm100/decode/head64/config.h
 --- pristine/csrc/sm100/decode/head64/config.h	2026-06-24 14:52:45
-+++ desired/csrc/sm100/decode/head64/config.h	2026-08-11 12:03:35
++++ desired/csrc/sm100/decode/head64/config.h	2026-08-11 20:00:19
 @@ -31 +31 @@
 -template<ModelType MODEL_TYPE>
 +template<ModelType MODEL_TYPE, bool USE_SHARED_CACHE>
@@ -150,7 +164,7 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/config.h desired/csrc/sm100/decod
 +}
 diff -rN -U0 pristine/csrc/sm100/decode/head64/instantiations/model1.cu desired/csrc/sm100/decode/head64/instantiations/model1.cu
 --- pristine/csrc/sm100/decode/head64/instantiations/model1.cu	2026-06-24 14:52:45
-+++ desired/csrc/sm100/decode/head64/instantiations/model1.cu	2026-08-11 12:03:35
++++ desired/csrc/sm100/decode/head64/instantiations/model1.cu	2026-08-11 20:00:19
 @@ -6 +6,4 @@
 -void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1>(const SparseAttnDecodeParams &params);
 +void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, false>(const SparseAttnDecodeParams &params);
@@ -159,13 +173,13 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/instantiations/model1.cu desired/
 +void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, true>(const SparseAttnDecodeParams &params);
 diff -rN -U0 pristine/csrc/sm100/decode/head64/instantiations/v32.cu desired/csrc/sm100/decode/head64/instantiations/v32.cu
 --- pristine/csrc/sm100/decode/head64/instantiations/v32.cu	2026-06-24 14:52:45
-+++ desired/csrc/sm100/decode/head64/instantiations/v32.cu	2026-08-11 12:03:35
++++ desired/csrc/sm100/decode/head64/instantiations/v32.cu	2026-08-11 20:00:19
 @@ -6 +6 @@
 -void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32>(const SparseAttnDecodeParams &params);
 +void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, false>(const SparseAttnDecodeParams &params);
 diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/decode/head64/kernel.cuh
 --- pristine/csrc/sm100/decode/head64/kernel.cuh	2026-06-24 14:52:45
-+++ desired/csrc/sm100/decode/head64/kernel.cuh	2026-08-11 12:22:07
++++ desired/csrc/sm100/decode/head64/kernel.cuh	2026-08-11 20:02:23
 @@ -12,0 +13 @@
 +#include "sm90/decode/sparse_fp8/components/shared_demand_cache.h"
 @@ -19 +20,3 @@
@@ -208,9 +222,15 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +                        shared_demand_cache::Access::DIRECT
 +                    };
 +                    bool token_valid[2];
-@@ -701,0 +725 @@
+@@ -695,0 +719,5 @@
++                    const bool use_direct_address_cache =
++                        params.shared_kv_cache_direct_slots &&
++                        params.shared_kv_cache_ways == 1 &&
++                        params.shared_kv_cache_sets >=
++                            shared_demand_cache::DIRECT_MIN_ROWS;
+@@ -701,0 +730 @@
 +                        token_valid[i] = is_token_valid;
-@@ -703 +727,41 @@
+@@ -703 +732,69 @@
 -                        tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
 +                        if constexpr (USE_SHARED_CACHE) {
 +                            static_assert(MODEL_TYPE == ModelType::MODEL1);
@@ -235,13 +255,41 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +                                source_row_indices[i] =
 +                                    static_cast<unsigned int>(physical_row) %
 +                                    cur_block_size;
-+                                auto result = shared_demand_cache::probe_direct(
-+                                    params.shared_kv_cache_tags,
-+                                    params.shared_kv_cache_sets,
-+                                    params.shared_kv_cache_epoch,
-+                                    IS_EXTRA_BLOCK ? 1u : 0u,
-+                                    static_cast<uint32_t>(my_indices[i])
-+                                );
++                                auto result = use_direct_address_cache
++                                    ? shared_demand_cache::probe_direct(
++                                          params.shared_kv_cache_tags,
++                                          params.shared_kv_cache_sets,
++                                          params.shared_kv_cache_epoch,
++                                          IS_EXTRA_BLOCK ? 1u : 0u,
++                                          static_cast<uint32_t>(my_indices[i])
++                                      )
++                                    : shared_demand_cache::probe(
++                                          params.shared_kv_cache_tags,
++                                          params.shared_kv_cache_sets,
++                                          params.shared_kv_cache_ways,
++                                          params.shared_kv_cache_epoch,
++                                          IS_EXTRA_BLOCK ? 1u : 0u,
++                                          static_cast<uint32_t>(physical_row)
++                                      );
++                                if (!use_direct_address_cache && result.slot < 0) {
++                                    // TMA cannot consume the peer-VMM fallback address.
++                                    // Give this exact row a private local slot for the
++                                    // lifetime of the current index-ring buffer. The
++                                    // kernel occupies more than half of SM100 shared
++                                    // memory, so only one CTA can use a given SM slot.
++                                    const int scratch_slot =
++                                        params.shared_kv_cache_sets *
++                                            params.shared_kv_cache_ways +
++                                        (static_cast<int>(ku::get_sm_id()) *
++                                             NUM_INDEX_BUFS +
++                                         rs.index_buf_idx) *
++                                            B_TOPK +
++                                        lane_idx * 2 + i;
++                                    KU_TRAP_ONLY_DEVICE_ASSERT(
++                                        scratch_slot < params.shared_kv_cache_rows
++                                    );
++                                    result.slot = scratch_slot;
++                                }
 +                                KU_TRAP_ONLY_DEVICE_ASSERT(result.slot >= 0);
 +                                cache_slots[i] = result.slot;
 +                                cache_accesses[i] = result.access;
@@ -253,7 +301,7 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +                        } else {
 +                            tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
 +                        }
-@@ -715,3 +779,5 @@
+@@ -715,3 +812,5 @@
 -                            int64_t offset = block_idx*cur_k_block_stride + idx_in_block*8; // Each token has 7 scale factors with an extra 1B padding
 -                            uint64_t scalesx8 = is_token_valid ? __ldg((uint64_t*)(cur_k_scales_ptr + offset)) : 0;
 -                            *(uint64_t*)(scales+i*NUM_SCALES_EACH_TOKEN) = scalesx8;
@@ -262,7 +310,7 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +                                uint64_t scalesx8 = is_token_valid ? __ldg((uint64_t*)(cur_k_scales_ptr + offset)) : 0;
 +                                *(uint64_t*)(scales+i*NUM_SCALES_EACH_TOKEN) = scalesx8;
 +                            }
-@@ -719,0 +786,74 @@
+@@ -719,0 +819,94 @@
 +                    if constexpr (USE_SHARED_CACHE) {
 +                        uint8_t* cur_k_base = IS_EXTRA_BLOCK
 +                            ? reinterpret_cast<uint8_t*>(params.extra_kv)
@@ -271,7 +319,11 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +                        for (int i = 0; i < 2; ++i) {
 +                            if (
 +                                token_valid[i] &&
-+                                cache_accesses[i] == shared_demand_cache::Access::FILL
++                                (cache_accesses[i] ==
++                                     shared_demand_cache::Access::FILL ||
++                                 (!use_direct_address_cache &&
++                                  cache_accesses[i] !=
++                                      shared_demand_cache::Access::HIT))
 +                            ) {
 +                                uint8_t* dst = params.shared_kv_row_cache +
 +                                    static_cast<int64_t>(cache_slots[i]) *
@@ -305,22 +357,38 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +                                token_valid[i] &&
 +                                cache_accesses[i] == shared_demand_cache::Access::FILL
 +                            ) {
-+                                shared_demand_cache::publish_ready_direct(
-+                                    params.shared_kv_cache_tags,
-+                                    cache_slots[i],
-+                                    params.shared_kv_cache_epoch
-+                                );
++                                if (use_direct_address_cache) {
++                                    shared_demand_cache::publish_ready_direct(
++                                        params.shared_kv_cache_tags,
++                                        cache_slots[i],
++                                        params.shared_kv_cache_epoch
++                                    );
++                                } else {
++                                    shared_demand_cache::publish_ready(
++                                        params.shared_kv_cache_tags,
++                                        cache_slots[i],
++                                        params.shared_kv_cache_epoch,
++                                        IS_EXTRA_BLOCK ? 1u : 0u,
++                                        static_cast<uint32_t>(
++                                            source_block_indices[i] *
++                                                cur_block_size +
++                                            source_row_indices[i]
++                                        )
++                                    );
++                                }
 +                            }
 +                        }
 +                        __syncwarp();
 +                        CUTE_UNROLL
 +                        for (int i = 0; i < 2; ++i) {
 +                            if (token_valid[i]) {
-+                                shared_demand_cache::wait_ready_direct(
-+                                    params.shared_kv_cache_tags,
-+                                    cache_slots[i],
-+                                    params.shared_kv_cache_epoch
-+                                );
++                                if (use_direct_address_cache) {
++                                    shared_demand_cache::wait_ready_direct(
++                                        params.shared_kv_cache_tags,
++                                        cache_slots[i],
++                                        params.shared_kv_cache_epoch
++                                    );
++                                }
 +                                uint8_t* row = params.shared_kv_row_cache +
 +                                    static_cast<int64_t>(cache_slots[i]) *
 +                                        shared_demand_cache::ROW_STRIDE;
@@ -337,15 +405,15 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +                            }
 +                        }
 +                    }
-@@ -856,2 +996,2 @@
+@@ -856,2 +1049,2 @@
 -template<ModelType MODEL_TYPE>
 -void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
 +template<ModelType MODEL_TYPE, bool USE_SHARED_CACHE>
 +void KernelTemplate<MODEL_TYPE, USE_SHARED_CACHE>::run(const SparseAttnDecodeParams &params) {
-@@ -933 +1073 @@
+@@ -933 +1126 @@
 -    auto [tensor_map_kv_nope, tensor_map_kv_rope] = get_nope_rope_tensormap(false, params.kv, params.num_blocks, params.stride_kv_block);
 +    CUtensorMap tensor_map_kv_nope{}, tensor_map_kv_rope{};
-@@ -935,2 +1075,14 @@
+@@ -935,2 +1128,14 @@
 -    if (params.extra_topk > 0) {
 -        std::tie(tensor_map_extra_kv_nope, tensor_map_extra_kv_rope) = get_nope_rope_tensormap(true, params.extra_kv, params.extra_num_blocks, params.stride_extra_kv_block);
 +    if constexpr (!USE_SHARED_CACHE) {
@@ -362,7 +430,7 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +                    params.stride_extra_kv_block
 +                );
 +        }
-@@ -938,0 +1091,27 @@
+@@ -938,0 +1144,27 @@
 +    CUtensorMap tensor_map_shared_kv_nope{}, tensor_map_shared_kv_rope{};
 +    if constexpr (USE_SHARED_CACHE) {
 +        static_assert(MODEL_TYPE == ModelType::MODEL1);
@@ -371,7 +439,7 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +            "shared_kv_row_cache must be 16B aligned on sm100f"
 +        );
 +        tensor_map_shared_kv_nope = ku::make_tensor_map(
-+            {D_NOPE/8, static_cast<uint64_t>(params.shared_kv_cache_sets * params.shared_kv_cache_ways)},
++            {D_NOPE/8, static_cast<uint64_t>(params.shared_kv_cache_rows)},
 +            {shared_demand_cache::ROW_STRIDE},
 +            {D_NOPE/8, 1},
 +            params.shared_kv_row_cache,
@@ -380,7 +448,7 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
 +        );
 +        tensor_map_shared_kv_rope = ku::make_tensor_map(
-+            {D_ROPE, static_cast<uint64_t>(params.shared_kv_cache_sets * params.shared_kv_cache_ways)},
++            {D_ROPE, static_cast<uint64_t>(params.shared_kv_cache_rows)},
 +            {shared_demand_cache::ROW_STRIDE},
 +            {K_ROPE_SW/2, 1},
 +            params.shared_kv_row_cache + D_NOPE,
@@ -390,23 +458,25 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/dec
 +        );
 +    }
 +
-@@ -949 +1128,3 @@
+@@ -949 +1181,3 @@
 -        tensor_map_extra_kv_rope
 +        tensor_map_extra_kv_rope,
 +        tensor_map_shared_kv_nope,
 +        tensor_map_shared_kv_rope
-@@ -951 +1132 @@
+@@ -951 +1185 @@
 -    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE>, decltype(tma_params)>;
 +    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, USE_SHARED_CACHE>, decltype(tma_params)>;
-@@ -962 +1143 @@
+@@ -953,0 +1188 @@
++    static_assert(smem_size > 227*1024/2, "SM100 demand-cache scratch assumes one CTA per SM");
+@@ -962 +1197 @@
 -template<ModelType MODEL_TYPE>
 +template<ModelType MODEL_TYPE, bool USE_SHARED_CACHE>
-@@ -964 +1145 @@
+@@ -964 +1199 @@
 -    KernelTemplate<MODEL_TYPE>::run(params);
 +    KernelTemplate<MODEL_TYPE, USE_SHARED_CACHE>::run(params);
 diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.h desired/csrc/sm100/decode/head64/kernel.h
 --- pristine/csrc/sm100/decode/head64/kernel.h	2026-06-24 14:52:45
-+++ desired/csrc/sm100/decode/head64/kernel.h	2026-08-11 12:03:35
++++ desired/csrc/sm100/decode/head64/kernel.h	2026-08-11 20:00:19
 @@ -7 +7 @@
 -template<ModelType MODEL_TYPE>
 +template<ModelType MODEL_TYPE, bool USE_SHARED_CACHE>
@@ -414,7 +484,7 @@ diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.h desired/csrc/sm100/decod
 -
 diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h desired/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h
 --- pristine/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h	1970-01-01 08:00:00
-+++ desired/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h	2026-08-11 12:03:09
++++ desired/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h	2026-08-11 20:00:19
 @@ -0,0 +1,221 @@
 +#pragma once
 +
@@ -639,20 +709,20 @@ diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache
 +}  // namespace flashmla::shared_demand_cache
 diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/config.h desired/csrc/sm90/decode/sparse_fp8/config.h
 --- pristine/csrc/sm90/decode/sparse_fp8/config.h	2026-06-24 14:52:45
-+++ desired/csrc/sm90/decode/sparse_fp8/config.h	2026-08-11 12:01:38
++++ desired/csrc/sm90/decode/sparse_fp8/config.h	2026-08-11 20:00:19
 @@ -15 +15 @@
 -template<ModelType MODEL_TYPE, int NUM_HEADS>
 +template<ModelType MODEL_TYPE, int NUM_HEADS, bool USE_SHARED_CACHE>
 diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu desired/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu
 --- pristine/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu	2026-06-24 14:52:45
-+++ desired/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu	2026-08-11 12:01:38
++++ desired/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu	2026-08-11 20:00:19
 @@ -5 +5,2 @@
 -template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 128>(const SparseAttnDecodeParams &params);
 +template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 128, false>(const SparseAttnDecodeParams &params);
 +template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 128, true>(const SparseAttnDecodeParams &params);
 diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu desired/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu
 --- pristine/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu	2026-06-24 14:52:45
-+++ desired/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu	2026-08-11 12:01:38
++++ desired/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu	2026-08-11 20:00:19
 @@ -5 +5,2 @@
 -template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 64>(const SparseAttnDecodeParams &params);
 +template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 64, false>(const SparseAttnDecodeParams &params);
@@ -661,19 +731,19 @@ diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/instantiations/model1_persiste
 -
 diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu desired/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu
 --- pristine/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu	2026-06-24 14:52:45
-+++ desired/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu	2026-08-11 12:01:38
++++ desired/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu	2026-08-11 20:00:19
 @@ -5 +5 @@
 -template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 128>(const SparseAttnDecodeParams &params);
 +template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 128, false>(const SparseAttnDecodeParams &params);
 diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu desired/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu
 --- pristine/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu	2026-06-24 14:52:45
-+++ desired/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu	2026-08-11 12:01:38
++++ desired/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu	2026-08-11 20:00:19
 @@ -5 +5 @@
 -template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64>(const SparseAttnDecodeParams &params);
 +template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64, false>(const SparseAttnDecodeParams &params);
 diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh desired/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh
 --- pristine/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-06-24 14:52:45
-+++ desired/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-08-11 12:03:09
++++ desired/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-08-11 20:00:19
 @@ -16,0 +17 @@
 +#include "components/shared_demand_cache.h"
 @@ -21,0 +23,2 @@
@@ -720,7 +790,7 @@ diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh desired/csrc/s
 +                    const int source_lane = lane_idx % 8;
 +                    const unsigned row_group_mask = 0x01010101u << source_lane;
 +                    const bool use_direct_address_cache =
-+                        params.shared_kv_cache_ways == 1 &&
++                        params.shared_kv_cache_direct_slots && params.shared_kv_cache_ways == 1 &&
 +                        params.shared_kv_cache_sets >=
 +                            shared_demand_cache::DIRECT_MIN_ROWS;
 @@ -555,0 +590,71 @@
@@ -865,7 +935,7 @@ diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh desired/csrc/s
 +    KernelTemplate<MODEL_TYPE, NUM_HEADS, USE_SHARED_CACHE>::run(params);
 diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/splitkv_mla.h desired/csrc/sm90/decode/sparse_fp8/splitkv_mla.h
 --- pristine/csrc/sm90/decode/sparse_fp8/splitkv_mla.h	2026-06-24 14:52:45
-+++ desired/csrc/sm90/decode/sparse_fp8/splitkv_mla.h	2026-08-11 12:01:38
++++ desired/csrc/sm90/decode/sparse_fp8/splitkv_mla.h	2026-08-11 20:00:19
 @@ -7 +7 @@
 -template<ModelType MODEL_TYPE, int NUM_HEADS>
 +template<ModelType MODEL_TYPE, int NUM_HEADS, bool USE_SHARED_CACHE>

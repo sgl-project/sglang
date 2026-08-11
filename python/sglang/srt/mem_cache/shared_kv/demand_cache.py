@@ -38,6 +38,7 @@ class TransientRowDemandCache:
         self,
         *,
         rows: int,
+        tagged_rows: int | None = None,
         row_bytes: int,
         ways: int,
         device: str | torch.device,
@@ -45,7 +46,11 @@ class TransientRowDemandCache:
     ) -> None:
         if ways <= 0:
             raise ValueError("row demand-cache ways must be positive")
-        sets, remainder = divmod(rows, ways)
+        if tagged_rows is None:
+            tagged_rows = rows
+        if tagged_rows <= 0 or tagged_rows > rows:
+            raise ValueError("tagged rows must be within the cache storage")
+        sets, remainder = divmod(tagged_rows, ways)
         if remainder or sets <= 0 or sets & (sets - 1):
             raise ValueError(
                 "row demand-cache rows must form a power-of-two number of sets"
@@ -54,6 +59,7 @@ class TransientRowDemandCache:
             raise ValueError("row demand-cache row bytes must be 16-byte aligned")
 
         self.num_rows = rows
+        self.num_tagged_rows = tagged_rows
         self.row_bytes = row_bytes
         self.ways = ways
         self.num_sets = sets
@@ -87,6 +93,7 @@ class TransientRowDemandCache:
     def allocated_bytes(self) -> int:
         stats_bytes = self.stats.nbytes if self.stats is not None else 0
         return (
-            row_demand_cache_bytes(rows=self.num_rows, row_bytes=self.row_bytes)
+            self.num_rows * self.row_bytes
+            + self.num_tagged_rows * DEMAND_CACHE_TAG_BYTES
             + stats_bytes
         )

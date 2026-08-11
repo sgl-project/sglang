@@ -39,6 +39,7 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
     const std::optional<at::Tensor>& shared_kv_cache_stats,
     int64_t shared_kv_cache_epoch,
     int64_t shared_kv_cache_ways,
+    bool shared_kv_cache_direct_slots,
     int64_t shared_kv_rank,
     int64_t shared_kv_size,
     int64_t shared_swa_page_size,
@@ -63,6 +64,7 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       shared_kv_cache_stats,
       shared_kv_cache_epoch,
       shared_kv_cache_ways,
+      shared_kv_cache_direct_slots,
       shared_kv_rank,
       shared_kv_size,
       shared_swa_page_size,
@@ -126,7 +128,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
       "Tensor? extra_topk_length, int d_v, float sm_scale, Tensor? shared_kv_row_cache=None, "
       "Tensor? shared_kv_cache_tags=None, Tensor? shared_kv_cache_stats=None, int shared_kv_cache_epoch=0, "
-      "int shared_kv_cache_ways=0, int shared_kv_rank=0, int shared_kv_size=1, "
+      "int shared_kv_cache_ways=0, bool shared_kv_cache_direct_slots=True, int shared_kv_rank=0, int shared_kv_size=1, "
       "int shared_swa_page_size=0, int shared_swa_pages_per_rank=0, "
       "int shared_extra_page_size=0, int shared_extra_pages_per_rank=0) "
       "-> (Tensor, Tensor, Tensor?, Tensor?)");

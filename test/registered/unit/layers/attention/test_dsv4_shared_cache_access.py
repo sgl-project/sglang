@@ -133,6 +133,7 @@ class TestDSV4SharedPageLayout(CustomTestCase):
             ways=1,
         )
         pool.get_flashmla_demand_layout.return_value = (3, 8, 256, 64, 2, 32)
+        pool.prefill_demand_cache_direct_slots = False
         access = DSV4SharedCacheAccess(pool)
 
         self.assertEqual(
@@ -143,6 +144,7 @@ class TestDSV4SharedPageLayout(CustomTestCase):
                 "shared_kv_cache_stats": "stats",
                 "shared_kv_cache_epoch": 17,
                 "shared_kv_cache_ways": 1,
+                "shared_kv_cache_direct_slots": False,
                 "shared_kv_rank": 3,
                 "shared_kv_size": 8,
                 "shared_swa_page_size": 256,

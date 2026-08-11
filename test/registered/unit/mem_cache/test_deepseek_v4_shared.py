@@ -25,6 +25,8 @@ from sglang.srt.mem_cache.deepseek_v4_shared import (
     _translate_shared_slots_fused,
     build_dsv4_shared_page_layout,
     dsv4_prefill_demand_cache_fits_direct_slots,
+    dsv4_prefill_demand_cache_mode,
+    dsv4_prefill_demand_cache_tagged_rows,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -86,6 +88,57 @@ class TestDeepSeekV4SharedPageLayout(CustomTestCase):
                 c128_rows=1,
                 cache_rows=1_048_576,
             )
+        )
+
+    def test_prefill_demand_large_pool_uses_tagged_hash_on_sm90(self):
+        large_pool = dict(
+            swa_rows=3_200_000,
+            c4_rows=4_000_000,
+            c128_rows=125_000,
+            cache_rows=1_048_576,
+        )
+        self.assertEqual(
+            dsv4_prefill_demand_cache_mode(**large_pool, supports_tagged_hash=True),
+            "tagged_hash",
+        )
+        self.assertIsNone(
+            dsv4_prefill_demand_cache_mode(**large_pool, supports_tagged_hash=False)
+        )
+        self.assertEqual(
+            dsv4_prefill_demand_cache_mode(
+                swa_rows=223_232,
+                c4_rows=275_968,
+                c128_rows=8_624,
+                cache_rows=1_048_576,
+                supports_tagged_hash=True,
+            ),
+            "tagged_hash",
+        )
+        self.assertEqual(
+            dsv4_prefill_demand_cache_mode(
+                swa_rows=223_232,
+                c4_rows=275_968,
+                c128_rows=8_624,
+                cache_rows=1_048_576,
+                supports_tagged_hash=False,
+            ),
+            "direct_slots",
+        )
+
+    def test_sm100_reserves_half_of_fixed_cache_for_tma_collision_scratch(self):
+        self.assertEqual(
+            dsv4_prefill_demand_cache_tagged_rows(
+                cache_rows=1_048_576,
+                needs_tma_collision_scratch=False,
+            ),
+            1_048_576,
+        )
+        self.assertEqual(
+            dsv4_prefill_demand_cache_tagged_rows(
+                cache_rows=1_048_576,
+                needs_tma_collision_scratch=True,
+            ),
+            524_288,
         )
 
     @staticmethod
