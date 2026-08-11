@@ -27,6 +27,7 @@ from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.multimodal.cache import snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     LOCAL_PREPROCESSED_KEY,
     EncoderPreprocessOutput,
@@ -41,6 +42,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import resolve_encoder_transfer_backend
+from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -190,6 +192,19 @@ def test_kimi_k3_epd_preprocess_preserves_raw_per_image_items():
         deferred = item.model_specific_data[DEFERRED_PREPROCESSING_KEY]
         assert deferred["image_mean"] == [0.5, 0.5, 0.5]
         assert deferred["image_std"] == [0.5, 0.5, 0.5]
+
+
+def test_kimi_k3_epd_preserves_verified_content_identity():
+    image = Image.new("RGB", (8, 6), color=(1, 2, 3))
+    digest = "sha256:" + "ab" * 32
+
+    output = prepare_kimi_k3_encoder_inputs(
+        [{"type": "image", "image": image, "content_hash": digest}],
+        _kimi_k3_image_processor(),
+    )
+
+    item = get_encoder_preprocessed_items(output)[0]
+    assert item.model_specific_data["content_digest"] == digest
 
 
 def test_kimi_k3_epd_model_preprocessor_receives_image_processor():
@@ -352,6 +367,48 @@ def test_kimi_k3_epd_selects_matching_jpeg_decode_mode(
 
     assert output is expected
     load.assert_called_once_with(b"jpeg", expected_decode_mode)
+
+
+def test_kimi_k3_epd_verifies_content_hash_before_decode():
+    payload = b"jpeg"
+    digest = snapshot_media(payload).content_digest
+    expected = torch.zeros((3, 2, 3), dtype=torch.uint8)
+    encoder = _encoder()
+    encoder.use_image_processor_gpu = False
+
+    with patch(
+        "sglang.srt.disaggregation.encode_server.load_image",
+        return_value=(expected, None),
+    ) as load:
+        output = encoder._load_single_item(
+            {"url": payload, "content_hash": digest}, Modality.IMAGE
+        )
+
+    assert output == {
+        "type": "image",
+        "image": expected,
+        "content_hash": digest,
+    }
+    load.assert_called_once_with(payload, False)
+
+
+def test_epd_receiver_keeps_content_hash_aligned_with_image():
+    digest = "sha256:" + "cd" * 32
+    receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
+    request = SimpleNamespace(
+        image_data=[ImageData(url="image", content_hash=digest)],
+        video_data=None,
+        audio_data=None,
+        mm_content_hashes=[digest],
+    )
+
+    assert receiver._extract_url_data(request) == [
+        {
+            "url": "image",
+            "modality": Modality.IMAGE,
+            "content_hash": digest,
+        }
+    ]
 
 
 def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():

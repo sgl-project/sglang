@@ -1,6 +1,9 @@
 """CPU coverage for Kimi-K2.5/K2.7 encoder-DP wiring."""
 
 import asyncio
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -22,6 +25,7 @@ from sglang.srt.models.kimi_k25 import (
     mm_projection_auto,
 )
 from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
+from sglang.srt.multimodal.cache import MultimodalPreprocessCache
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
@@ -30,6 +34,10 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
     KimiK3ImageProcessor,
     _expand_k3_image_prompt_text,
     _expand_k3_image_prompt_token_ids,
+)
+from sglang.srt.multimodal.processors.kimi_k3_artifact import (
+    KimiK3ImageArtifact,
+    KimiK3ResizeConfig,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
@@ -685,6 +693,109 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
     torch.testing.assert_close(
         output.mm_items[1].precomputed_embeddings, embeddings[Modality.IMAGE][3:]
     )
+
+
+def _cached_k3_artifact(content_digest, artifact_key, value=1):
+    return KimiK3ImageArtifact(
+        content_digest=content_digest,
+        artifact_key=artifact_key,
+        feature_hash=123,
+        original_size=(1536, 1024),
+        resize_config=KimiK3ResizeConfig(
+            num_tokens=3,
+            new_width=6,
+            new_height=2,
+            pad_width=0,
+            pad_height=0,
+        ),
+        grid_thw=(1, 2, 6),
+        feature=torch.full((12, 2), value, dtype=torch.float32),
+    )
+
+
+def test_kimi_k3_cached_artifact_is_composed_per_prompt():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor._tokenizer = _Tokenizer()
+    processor.mm_feature_transport = "cpu"
+    processor.use_cuda_ipc = False
+    artifact = _cached_k3_artifact("sha256:" + "ab" * 32, "artifact")
+
+    first = processor.compose_request([1, 99, 2], [artifact])
+    second = processor.compose_request([3, 4, 99, 5], [artifact])
+
+    assert first.input_ids != second.input_ids
+    assert first.mm_items[0].offsets == [(3, 5)]
+    assert second.mm_items[0].offsets == [(4, 6)]
+    assert first.mm_items[0].hash == second.mm_items[0].hash == 123
+    torch.testing.assert_close(first.mm_items[0].feature, second.mm_items[0].feature)
+
+
+def test_kimi_k3_trusted_hot_hit_skips_media_read():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.processor_fingerprint = "processor"
+    processor.trust_mm_content_hashes = True
+    processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
+    processor.io_executor = ThreadPoolExecutor(max_workers=1)
+    digest = "sha256:" + "ab" * 32
+    key = processor._artifact_key(digest, "unread-source")
+    artifact = _cached_k3_artifact(digest, key)
+    processor.mm_preprocess_cache.put(key, artifact)
+
+    try:
+        with patch(
+            "sglang.srt.multimodal.processors.kimi_k3.snapshot_media",
+            side_effect=AssertionError("trusted cache hit must not read media"),
+        ):
+            result = asyncio.run(
+                processor.prepare_media_artifacts(
+                    ["unread-source"],
+                    SimpleNamespace(mm_content_hashes=[digest]),
+                )
+            )
+    finally:
+        processor.io_executor.shutdown()
+
+    assert result == [artifact]
+
+
+def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.processor_fingerprint = "processor"
+    processor.trust_mm_content_hashes = False
+    processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
+    processor.mm_processor_executor = None
+    processor.io_executor = ThreadPoolExecutor(max_workers=2)
+
+    async def prepare(entries):
+        return [
+            _cached_k3_artifact(digest, key, image.getpixel((0, 0))[0])
+            for digest, key, image in entries
+        ]
+
+    processor._run_artifact_batch = prepare
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mutable.png"
+            Image.new("RGB", (2, 2), color=(1, 0, 0)).save(path)
+            first = asyncio.run(
+                processor.prepare_media_artifacts(
+                    [str(path)], SimpleNamespace(mm_content_hashes=None)
+                )
+            )[0]
+            Image.new("RGB", (2, 2), color=(2, 0, 0)).save(path)
+            second = asyncio.run(
+                processor.prepare_media_artifacts(
+                    [str(path)], SimpleNamespace(mm_content_hashes=None)
+                )
+            )[0]
+    finally:
+        processor.io_executor.shutdown()
+
+    assert first.content_digest != second.content_digest
+    assert first.artifact_key != second.artifact_key
+    assert first.feature[0, 0].item() == 1
+    assert second.feature[0, 0].item() == 2
 
 
 def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():

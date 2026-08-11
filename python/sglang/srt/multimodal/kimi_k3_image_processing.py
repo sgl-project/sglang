@@ -52,12 +52,16 @@ def prepare_kimi_k3_encoder_inputs(
         )
 
     concrete_images = []
+    content_digests = []
     for image in images:
+        content_digest = None
         if isinstance(image, dict):
             if image.get("type") != "image" or "image" not in image:
                 raise ValueError(f"Unsupported Kimi-K3 encoder media item: {image}")
+            content_digest = image.get("content_hash")
             image = image["image"]
         concrete_images.append(image)
+        content_digests.append(content_digest)
 
     patch_size = int(media_proc_cfg["patch_size"])
     merge_kernel_size = int(media_proc_cfg["merge_kernel_size"])
@@ -71,7 +75,7 @@ def prepare_kimi_k3_encoder_inputs(
     items = []
     grids = []
     original_image_sizes = []
-    for image in concrete_images:
+    for image, content_digest in zip(concrete_images, content_digests):
         width, height = (
             (int(image.shape[-1]), int(image.shape[-2]))
             if isinstance(image, torch.Tensor)
@@ -88,17 +92,20 @@ def prepare_kimi_k3_encoder_inputs(
         )
         grid_thw = _grid_thw_from_resize_config(resize_config, patch_size)
         grid_tensor = torch.tensor([grid_thw], dtype=torch.int64)
+        model_specific_data = {
+            "grid_thws": grid_tensor,
+            DEFERRED_PREPROCESSING_KEY: {
+                **common_deferred_config,
+                "feature_layout": "chw" if use_gpu_preprocessing else "raw",
+                "resize_config": resize_config,
+            },
+        }
+        if content_digest is not None:
+            model_specific_data["content_digest"] = content_digest
         item = MultimodalDataItem(
             modality=Modality.IMAGE,
             feature=to_chw_uint8(image) if use_gpu_preprocessing else image,
-            model_specific_data={
-                "grid_thws": grid_tensor,
-                DEFERRED_PREPROCESSING_KEY: {
-                    **common_deferred_config,
-                    "feature_layout": "chw" if use_gpu_preprocessing else "raw",
-                    "resize_config": resize_config,
-                },
-            },
+            model_specific_data=model_specific_data,
         )
         if not use_gpu_preprocessing:
             item.set_hash(hash_raw_encoder_item(image))

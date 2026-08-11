@@ -17,6 +17,7 @@ from PIL import Image
 
 K = TypeVar("K")
 V = TypeVar("V")
+_USE_RESULT = object()
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,14 @@ class CacheLookup(Generic[V]):
     value: V
     hit: bool
     joined: bool = False
+
+
+@dataclass(frozen=True)
+class CacheReservation(Generic[K, V]):
+    key: K
+    future: concurrent.futures.Future[V]
+    generation: int
+    owner: bool
 
 
 @dataclass
@@ -57,7 +66,13 @@ def estimate_cache_size_bytes(value: Any) -> Optional[int]:
         if isinstance(item, str):
             return len(item.encode())
         if dataclasses.is_dataclass(item):
-            return visit(dataclasses.asdict(item))
+            total = 0
+            for field in dataclasses.fields(item):
+                child_size = visit(getattr(item, field.name))
+                if child_size is None:
+                    return None
+                total += child_size
+            return total
         if isinstance(item, dict):
             total = 0
             for key, child in item.items():
@@ -122,6 +137,12 @@ class MultimodalPreprocessCache(Generic[K, V]):
             self.hits += 1
             return entry.value
 
+    def peek(self, key: K) -> Optional[V]:
+        """Return a value without changing LRU order or counters."""
+        with self._lock:
+            entry = self._entries.get(key)
+            return None if entry is None else entry.value
+
     def put(
         self,
         key: K,
@@ -177,6 +198,9 @@ class MultimodalPreprocessCache(Generic[K, V]):
         *,
         size_bytes: Optional[Callable[[V], Optional[int]]] = None,
     ) -> CacheLookup[V]:
+        if not self.enabled:
+            return CacheLookup(await compute(), hit=False)
+
         cached = self.get(key)
         if cached is not None:
             return CacheLookup(cached, hit=True)
@@ -213,6 +237,83 @@ class MultimodalPreprocessCache(Generic[K, V]):
             with self._lock:
                 if self._inflight.get(key) == (future, generation):
                     self._inflight.pop(key, None)
+
+    def reserve_many(
+        self, keys: list[K]
+    ) -> list[CacheLookup[V] | CacheReservation[K, V]]:
+        """Reserve cache misses so owners can compute them in one batch."""
+        results: list[CacheLookup[V] | CacheReservation[K, V]] = []
+        with self._lock:
+            for key in keys:
+                if not self.enabled:
+                    future: concurrent.futures.Future[V] = concurrent.futures.Future()
+                    results.append(
+                        CacheReservation(key, future, self._generation, owner=True)
+                    )
+                    continue
+
+                entry = self._entries.get(key)
+                if entry is not None:
+                    self._entries.move_to_end(key)
+                    self.hits += 1
+                    results.append(CacheLookup(entry.value, hit=True))
+                    continue
+
+                self.misses += 1
+                inflight = self._inflight.get(key)
+                if inflight is None:
+                    future: concurrent.futures.Future[V] = concurrent.futures.Future()
+                    generation = self._generation
+                    self._inflight[key] = (future, generation)
+                    results.append(
+                        CacheReservation(key, future, generation, owner=True)
+                    )
+                else:
+                    future, generation = inflight
+                    self.singleflight_joins += 1
+                    results.append(
+                        CacheReservation(key, future, generation, owner=False)
+                    )
+        return results
+
+    def fulfill(
+        self,
+        reservation: CacheReservation[K, V],
+        value: V,
+        *,
+        cache_value: V | object = _USE_RESULT,
+        size_bytes: Optional[int] = None,
+    ) -> None:
+        if not reservation.owner:
+            raise ValueError("Only an owning reservation can be fulfilled")
+        self.put(
+            reservation.key,
+            value if cache_value is _USE_RESULT else cache_value,
+            size_bytes,
+            _generation=reservation.generation,
+        )
+        reservation.future.set_result(value)
+        with self._lock:
+            if self._inflight.get(reservation.key) == (
+                reservation.future,
+                reservation.generation,
+            ):
+                self._inflight.pop(reservation.key, None)
+
+    def fail(self, reservation: CacheReservation[K, V], error: BaseException) -> None:
+        if not reservation.owner:
+            raise ValueError("Only an owning reservation can fail")
+        reservation.future.set_exception(error)
+        reservation.future.exception()
+        with self._lock:
+            if self._inflight.get(reservation.key) == (
+                reservation.future,
+                reservation.generation,
+            ):
+                self._inflight.pop(reservation.key, None)
+
+    async def wait(self, reservation: CacheReservation[K, V]) -> V:
+        return await asyncio.wrap_future(reservation.future)
 
     def stats(self) -> dict[str, int]:
         with self._lock:

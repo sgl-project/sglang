@@ -10,6 +10,7 @@ from sglang.srt.multimodal.cache.identity import (
 )
 from sglang.srt.multimodal.cache.preprocess_cache import (
     CacheLookup,
+    CacheReservation,
     MultimodalPreprocessCache,
     estimate_cache_size_bytes,
 )
@@ -17,6 +18,7 @@ from sglang.srt.multimodal.cache.preprocess_cache import (
 __all__ = [
     "CONTENT_HASH_PREFIX",
     "CacheLookup",
+    "CacheReservation",
     "MediaSnapshot",
     "MultimodalPreprocessCache",
     "build_artifact_key",

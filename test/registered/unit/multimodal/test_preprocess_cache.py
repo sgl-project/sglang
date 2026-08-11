@@ -8,6 +8,7 @@ import torch
 from PIL import Image
 
 from sglang.srt.multimodal.cache import (
+    CacheReservation,
     MultimodalPreprocessCache,
     build_artifact_key,
     estimate_cache_size_bytes,
@@ -163,6 +164,41 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
             release.set()
             self.assertEqual((await task).value, b"old-generation")
             self.assertNotIn("key", cache)
+
+        asyncio.run(run())
+
+    def test_reserve_many_batches_owners_and_joins(self):
+        async def run():
+            cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
+            reservations = cache.reserve_many(["a", "b", "a"])
+            owners = [
+                item
+                for item in reservations
+                if isinstance(item, CacheReservation) and item.owner
+            ]
+            self.assertEqual([item.key for item in owners], ["a", "b"])
+
+            cache.fulfill(owners[0], b"value-a")
+            cache.fulfill(owners[1], b"value-b")
+            self.assertEqual(await cache.wait(reservations[2]), b"value-a")
+            self.assertEqual(cache.get("b"), b"value-b")
+
+        asyncio.run(run())
+
+    def test_disabled_cache_does_not_join_or_retain(self):
+        async def run():
+            cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=0)
+            reservations = cache.reserve_many(["a", "a"])
+            self.assertTrue(
+                all(
+                    isinstance(item, CacheReservation) and item.owner
+                    for item in reservations
+                )
+            )
+            for item in reservations:
+                cache.fulfill(item, b"value")
+            self.assertEqual(len(cache), 0)
+            self.assertEqual(cache.stats()["singleflight_joins"], 0)
 
         asyncio.run(run())
 

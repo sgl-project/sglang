@@ -722,6 +722,14 @@ def extract_original_req_id(part_req_id: str) -> str:
     return part_req_id
 
 
+def _encoder_media_item(mm_item: dict):
+    """Keep optional content identity aligned with one encoder media item."""
+    content_hash = mm_item.get("content_hash")
+    if content_hash is None:
+        return mm_item.get("url")
+    return {"url": mm_item.get("url"), "content_hash": content_hash}
+
+
 def calculate_modality_num_parts(modalities, num_items_assigned):
     """
     Calculate total number of parts and number of parts per modality.
@@ -1099,7 +1107,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                     {
                         "encoder_idx": idx,
                         "mm_items": [
-                            d["url"]
+                            _encoder_media_item(d)
                             for d in mm_data_modality[
                                 cum_num_items : cum_num_items + assigned_num
                             ]
@@ -2206,6 +2214,8 @@ class MMReceiverBase(ABC):
             return mm_item
 
         mm_data = []
+        image_hashes = getattr(request_obj, "mm_content_hashes", None)
+        image_index = 0
         for attr, modality in [
             ("image_data", Modality.IMAGE),
             ("video_data", Modality.VIDEO),
@@ -2215,12 +2225,30 @@ class MMReceiverBase(ABC):
             if mm_items:
                 mm_items = flatten_mm_items(mm_items)
                 for mm_item in mm_items:
-                    mm_data.append(
-                        {
-                            "url": to_raw_url(mm_item),
-                            "modality": modality,
-                        }
-                    )
+                    entry = {
+                        "url": to_raw_url(mm_item),
+                        "modality": modality,
+                    }
+                    if modality == Modality.IMAGE:
+                        inline_hash = (
+                            mm_item.content_hash
+                            if isinstance(mm_item, ImageData)
+                            else None
+                        )
+                        explicit_hash = (
+                            image_hashes[image_index]
+                            if image_hashes is not None
+                            and image_index < len(image_hashes)
+                            else None
+                        )
+                        entry["content_hash"] = explicit_hash or inline_hash
+                        image_index += 1
+                    mm_data.append(entry)
+        if image_hashes is not None and image_index != len(image_hashes):
+            raise ValueError(
+                f"mm_content_hashes has {len(image_hashes)} entries for "
+                f"{image_index} images"
+            )
         return mm_data
 
 
@@ -2342,7 +2370,7 @@ class MMReceiverHTTP(MMReceiverBase):
                         "encoder_idx": idx,
                         "encoder_url": effective_urls[idx],
                         "mm_items": [
-                            mm_item.get("url")
+                            _encoder_media_item(mm_item)
                             for mm_item in mm_data_modality[
                                 cum_num_items : cum_num_items + assigned_num
                             ]
