@@ -125,13 +125,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -140,13 +137,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -155,13 +149,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h800", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -170,13 +161,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -185,13 +173,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -200,13 +185,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -215,14 +197,11 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -231,14 +210,11 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -247,14 +223,11 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h800", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--ep-size 8",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -263,14 +236,11 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--ep-size 8",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -279,14 +249,11 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -295,14 +262,11 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -311,12 +275,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -325,12 +286,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -339,12 +297,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h800", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -353,12 +308,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -367,12 +319,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -381,12 +330,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -395,13 +341,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -410,13 +353,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -425,13 +365,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h800", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--ep-size 8",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -440,13 +377,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--ep-size 8",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -455,13 +389,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -470,13 +401,10 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--context-length 262144",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -489,7 +417,6 @@ sgl-eval run gsm8k \\
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "hicache", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
         "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
         "MOONCAKE_PROTOCOL=tcp",
         "MC_MS_AUTO_DISC=0",
@@ -500,9 +427,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--enable-hierarchical-cache",
         "--hicache-storage-backend mooncake",
@@ -520,7 +445,6 @@ sgl-eval run gsm8k \\
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "hicache", nodes: "single" },
       verified: false,
       env: [
-        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
         "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
         "MOONCAKE_PROTOCOL=tcp",
         "MC_MS_AUTO_DISC=0",
@@ -532,9 +456,7 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--enable-hierarchical-cache",
         "--hicache-storage-backend mooncake",
@@ -552,7 +474,6 @@ sgl-eval run gsm8k \\
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "hicache", nodes: "single" },
       verified: false,
       env: [
-        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
         "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
         "MOONCAKE_PROTOCOL=tcp",
         "MC_MS_AUTO_DISC=0",
@@ -563,9 +484,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--enable-hierarchical-cache",
         "--hicache-storage-backend mooncake",
@@ -583,7 +502,6 @@ sgl-eval run gsm8k \\
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "hicache", nodes: "single" },
       verified: false,
       env: [
-        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
         "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
         "MOONCAKE_PROTOCOL=tcp",
         "MC_MS_AUTO_DISC=0",
@@ -595,9 +513,7 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--mem-fraction-static 0.8",
         "--enable-hierarchical-cache",
         "--hicache-storage-backend mooncake",
