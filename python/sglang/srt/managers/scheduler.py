@@ -850,6 +850,7 @@ class Scheduler(
         resolve_auto_parsers(
             self.server_args,
             self.tokenizer,
+            processor=self.processor,
             config_writer=get_context().override,
         )
 

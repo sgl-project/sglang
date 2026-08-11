@@ -243,6 +243,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     resolve_auto_parsers(
         server_args,
         tokenizer_manager.tokenizer,
+        processor=tokenizer_manager.processor,
         config_writer=tokenizer_manager.record_config_updates,
     )
 

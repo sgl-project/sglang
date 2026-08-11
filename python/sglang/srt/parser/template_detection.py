@@ -654,6 +654,45 @@ def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[
         return f.read().replace("\\n", "\n")
 
 
+def resolve_hf_chat_template(
+    tokenizer,
+    *,
+    processor=None,
+    preferred_name: Optional[str] = None,
+) -> Optional[str]:
+    try:
+        template = getattr(processor, "chat_template", None) or getattr(
+            tokenizer, "chat_template", None
+        )
+        if template is None:
+            logger.warning("No HuggingFace chat template found")
+            return None
+        if not isinstance(template, dict):
+            return template
+        if not template:
+            raise ValueError("Empty templates dict provided")
+
+        available_names = list(template)
+        logger.info(
+            "Multiple HuggingFace chat templates available: %s", available_names
+        )
+        if preferred_name:
+            if preferred_name not in template:
+                raise ValueError(
+                    f"Specified template '{preferred_name}' not found. "
+                    f"Available templates: {available_names}"
+                )
+            logger.info("Using specified chat template: '%s'", preferred_name)
+            return template[preferred_name]
+
+        first_name = available_names[0]
+        logger.info("Using first available template: '%s'", first_name)
+        return template[first_name]
+    except Exception as e:
+        logger.warning("Error getting chat template: %s", e)
+        return None
+
+
 def _log_undetected_parser(attr: str, label: str) -> None:
     logger.warning(
         f"--{attr.replace('_', '-')}=auto specified but could not detect "
@@ -701,6 +740,7 @@ def resolve_auto_parsers(
     server_args,
     tokenizer,
     *,
+    processor=None,
     config_writer: Optional[Callable[..., None]] = None,
 ) -> None:
     """Resolve auto parsers using a tokenizer already owned by the caller."""
@@ -723,8 +763,12 @@ def resolve_auto_parsers(
     )
 
     template = explicit_jinja_template
-    if template is None and tokenizer is not None:
-        template = getattr(tokenizer, "chat_template", None)
+    if template is None:
+        template = resolve_hf_chat_template(
+            tokenizer,
+            processor=processor,
+            preferred_name=getattr(server_args, "hf_chat_template_name", None),
+        )
 
     force_reasoning, reasoning_config = detect_reasoning_pattern(template)
     ctx = build_detection_context(

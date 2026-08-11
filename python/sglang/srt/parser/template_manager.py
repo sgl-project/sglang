@@ -14,7 +14,7 @@
 import json
 import logging
 import os
-from typing import Dict, Optional
+from typing import Optional
 
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.parser.code_completion_parser import (
@@ -35,6 +35,7 @@ from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content
 from sglang.srt.parser.template_detection import (
     ReasoningToggleConfig,
     detect_reasoning_pattern,
+    resolve_hf_chat_template,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,11 @@ class TemplateManager:
             self.guess_chat_template_from_model_path(model_path)
 
             if self._chat_template_name is None:
-                hf_template = self._resolve_hf_chat_template(tokenizer_manager)
+                hf_template = resolve_hf_chat_template(
+                    tokenizer_manager.tokenizer,
+                    processor=tokenizer_manager.processor,
+                    preferred_name=tokenizer_manager.server_args.hf_chat_template_name,
+                )
                 if hf_template:
                     if tokenizer_manager.tokenizer:
                         tokenizer_manager.tokenizer.chat_template = hf_template
@@ -228,52 +233,3 @@ class TemplateManager:
                 override=True,
             )
         self._completion_template_name = template["name"]
-
-    def _resolve_hf_chat_template(
-        self, tokenizer_manager: TokenizerManager
-    ) -> Optional[str]:
-        try:
-            template = (
-                getattr(tokenizer_manager.processor, "chat_template", None)
-                if tokenizer_manager.processor
-                else None
-            ) or (
-                getattr(tokenizer_manager.tokenizer, "chat_template", None)
-                if tokenizer_manager.tokenizer
-                else None
-            )
-
-            if template is None:
-                logger.warning("No HuggingFace chat template found")
-                return None
-
-            if isinstance(template, dict):
-                return self._select_named_template(template, tokenizer_manager)
-
-            return template
-
-        except Exception as e:
-            logger.warning(f"Error getting chat template: {e}")
-            return None
-
-    def _select_named_template(
-        self, templates: Dict[str, str], tokenizer_manager: TokenizerManager
-    ) -> str:
-        if not templates:
-            raise ValueError("Empty templates dict provided")
-
-        available_names = list(templates.keys())
-        logger.info(f"Multiple HuggingFace chat templates available: {available_names}")
-
-        if preferred_name := tokenizer_manager.server_args.hf_chat_template_name:
-            if preferred_name not in templates:
-                raise ValueError(
-                    f"Specified template '{preferred_name}' not found. "
-                    f"Available templates: {available_names}"
-                )
-            logger.info(f"Using specified chat template: '{preferred_name}'")
-            return templates[preferred_name]
-
-        first_name = available_names[0]
-        logger.info(f"Using first available template: '{first_name}'")
-        return templates[first_name]
