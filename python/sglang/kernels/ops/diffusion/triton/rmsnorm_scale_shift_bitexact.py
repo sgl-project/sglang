@@ -55,6 +55,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.jit.utils import get_jit_cuda_arch
 from sglang.kernels.ops.diffusion.triton.numerics import (
     mul_rn_f32,
     round_bf16_to_fp32,
@@ -145,6 +146,87 @@ def _rmsnorm_scale_shift_kernel(
         tl.store(out_ptr + row_base + cols, prod + sh)  # store rounds to bf16
 
 
+@triton.jit
+def _scale_shift_precomputed_norm_kernel(
+    out_ptr,
+    norm_ptr,
+    scale_ptr,
+    shift_ptr,
+    seq_len,
+    D: tl.constexpr,
+):
+    """Fuse the three eager modulation kernels after an exact AOT RMSNorm."""
+    row = tl.program_id(0).to(tl.int64)
+    batch = row // seq_len
+    row_base = row * D
+    vec_base = batch * D
+    for i in tl.static_range(D // 1024):
+        cols = i * 1024 + tl.arange(0, 1024)
+        y = tl.load(norm_ptr + row_base + cols).to(tl.float32)
+        scale = tl.load(scale_ptr + vec_base + cols).to(tl.float32)
+        shift = tl.load(shift_ptr + vec_base + cols).to(tl.float32)
+        one_plus = round_bf16_to_fp32(1.0 + scale)
+        prod = round_bf16_to_fp32(y * one_plus)
+        tl.store(out_ptr + row_base + cols, prod + shift)
+
+
+@triton.jit
+def _batch_residual_gate_add_kernel(
+    out_ptr,
+    residual_ptr,
+    update_ptr,
+    gate_ptr,
+    seq_len,
+    D: tl.constexpr,
+):
+    """Exact residual + gate * update with a per-batch broadcast gate."""
+    row = tl.program_id(0).to(tl.int64)
+    batch = row // seq_len
+    row_base = row * D
+    gate_base = batch * D
+    for i in tl.static_range(D // 1024):
+        cols = i * 1024 + tl.arange(0, 1024)
+        residual = tl.load(residual_ptr + row_base + cols).to(tl.float32)
+        update = tl.load(update_ptr + row_base + cols).to(tl.float32)
+        gate = tl.load(gate_ptr + gate_base + cols).to(tl.float32)
+        product = round_bf16_to_fp32(gate * update)
+        tl.store(out_ptr + row_base + cols, residual + product)
+
+
+def _is_sm120_or_newer() -> bool:
+    arch = get_jit_cuda_arch()
+    return arch.major * 10 + arch.minor >= 120
+
+
+def _sm120_exact_scale_shift(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    # The AOT RMSNorm implementation selected by SGLang has a slightly
+    # different SM120 reduction result than the replicated Triton reduction
+    # for a few rows. Keep that exact implementation and fuse the remaining
+    # three eager modulation launches into one SM120-specialized kernel.
+    from sgl_kernel import rmsnorm
+
+    batch, seq_len, hidden = x.shape
+    normed = rmsnorm(x.view(-1, hidden), weight, eps).view_as(x)
+    out = torch.empty_like(x)
+    with torch.cuda.device(x.device):
+        _scale_shift_precomputed_norm_kernel[(batch * seq_len,)](
+            out,
+            normed,
+            scale,
+            shift,
+            seq_len,
+            D=hidden,
+            num_warps=4,
+        )
+    return out
+
+
 def _threads_per_row(hidden: int) -> int | None:
     # mirror of flashinfer RMSNormKernel._compute_threads_per_row for the
     # regime this kernel replicates (one 8-wide vector per (thread, block))
@@ -230,6 +312,8 @@ def fused_rmsnorm_scale_shift_bitexact(
     """``norm(x) * (1 + scale) + shift``, bit-exact vs the eager chain."""
     batch, seq_len, hidden = x.shape
     tpr = _threads_per_row(hidden)
+    if _is_sm120_or_newer():
+        return _sm120_exact_scale_shift(x, weight, scale, shift, eps)
     out = torch.empty_like(x)
     with torch.cuda.device(x.device):
         _rmsnorm_scale_shift_kernel[(batch * seq_len,)](
@@ -288,6 +372,22 @@ def fused_scale_residual_rmsnorm_scale_shift_bitexact(
     """
     batch, seq_len, hidden = residual.shape
     tpr = _threads_per_row(hidden)
+    if _is_sm120_or_newer():
+        res_out = torch.empty_like(residual)
+        with torch.cuda.device(residual.device):
+            _batch_residual_gate_add_kernel[(batch * seq_len,)](
+                res_out,
+                residual,
+                update,
+                gate,
+                seq_len,
+                D=hidden,
+                num_warps=4,
+            )
+        return (
+            _sm120_exact_scale_shift(res_out, weight, scale, shift, eps),
+            res_out,
+        )
     out = torch.empty_like(residual)
     res_out = torch.empty_like(residual)
     with torch.cuda.device(residual.device):
