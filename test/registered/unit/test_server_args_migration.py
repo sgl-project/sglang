@@ -87,6 +87,12 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         self.assertEqual(sa.deepep_mode, "low_latency")
         self.assertEqual(sa.elastic_ep_backend, "none")
 
+    def test_image_processor_backend_choices(self):
+        for backend in ("auto", "torchvision", "pil"):
+            with self.subTest(backend=backend):
+                sa = self._parse(["--image-processor-backend", backend])
+                self.assertEqual(sa.image_processor_backend, backend)
+
     def test_startup_weight_load_mode(self):
         """The startup loading mode keeps serial as the safe default."""
         serial = self._parse([])
