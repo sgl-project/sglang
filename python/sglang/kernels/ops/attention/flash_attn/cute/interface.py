@@ -14,6 +14,9 @@ from cutlass import Float32, Int32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+    is_batch_invariant,
+)
 from sglang.kernels.ops.attention.flash_attn.cute.cache_utils import get_jit_cache
 from sglang.kernels.ops.attention.flash_attn.cute.testing import is_fake_mode
 
@@ -705,6 +708,10 @@ def _flash_attn_fwd(
         else:
             num_splits = 1
 
+    if qv is not None:
+        # The qv kernel has no split-KV variant.
+        num_splits = 1
+
     is_split_kv = num_splits > 1
     if is_split_kv:
         out_partial = torch.empty(
@@ -1071,6 +1078,7 @@ def _flash_attn_fwd(
             # Benchmark hook: time just the shear-prep kernels, skip the attention kernel.
             return out, lse
 
+    batch_invariant = is_batch_invariant()
     compile_key = (
         dtype,
         head_dim,
@@ -1130,6 +1138,7 @@ def _flash_attn_fwd(
         sfq.ndim if sfq is not None else None,
         sfk.ndim if sfk is not None else None,
         sfv.ndim if sfv is not None else None,
+        batch_invariant,
         fa_logging.get_fa_log_level(),
     )
 
@@ -1353,6 +1362,7 @@ def _flash_attn_fwd(
                             v_dequant=v_blockscaled,
                             q_sf_interleaved=q_sf_interleaved,
                             kv_sf_interleaved=kv_sf_interleaved,
+                            batch_invariant=batch_invariant,
                         )
                     ),
                 )

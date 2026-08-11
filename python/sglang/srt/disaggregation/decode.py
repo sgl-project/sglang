@@ -88,7 +88,7 @@ from sglang.srt.observability.req_time_stats import (
     set_time_batch,
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel
-from sglang.srt.utils import get_num_new_pages, is_npu
+from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -211,7 +211,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         speculative_eagle_topk: Optional[int] = None,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
-        enable_gdn_replayssm_spec: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -258,7 +258,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             speculative_eagle_topk=speculative_eagle_topk,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
-            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
         )
 
     def clear(self):
@@ -406,6 +406,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if page_size > 1:
+            # Match the allocator, which charges whole pages for both pools.
+            full_len = ceil_align(full_len, page_size)
+            swa_len = ceil_align(swa_len, page_size)
         swa_reserved = self.num_reserved_decode_tokens
         if self.scheduler.server_args.disable_radix_cache:
             swa_reserved = 0
@@ -651,9 +656,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
+        # HiSparse admits up to the host-backed logical capacity.
+        if self.scheduler.enable_hisparse:
+            capacity = self.scheduler.tp_worker.model_runner.max_token_pool_size
+        else:
+            capacity = self.max_total_num_tokens
         input_len = self._rebootstrap_prefill_len(req)
-        if input_len > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {self.max_total_num_tokens}"
+        if input_len > capacity:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {capacity}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
@@ -1120,8 +1130,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 hicache_reserved_tokens=reserved_restore_tokens,
             )
             if uses_swa_tail_prealloc:
-                # SWA budget uses simple decrement (no radix cache eviction in
-                # the SWA pool, so page-rounding drift is negligible).
+                # SWA has no radix cache eviction, so decrement its
+                # page-aligned requirement directly.
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = total_prefix_len
 
