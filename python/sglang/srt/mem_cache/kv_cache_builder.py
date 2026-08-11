@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-_KIMI_K3_MM_EMBEDDING_CACHE_SIZE_MB = 1024
+_KIMI_K3_MM_EMBEDDING_CACHE_SIZE_MB = 4096
 
 
 def resolve_mm_embedding_cache_size_mb(model_config: ModelConfig) -> int:

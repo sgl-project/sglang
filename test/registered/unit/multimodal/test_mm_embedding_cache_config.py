@@ -24,7 +24,7 @@ def test_kimi_k3_uses_larger_lazy_embedding_cache(monkeypatch):
         resolve_mm_embedding_cache_size_mb(
             _model_config("KimiK3ForConditionalGeneration")
         )
-        == 1024
+        == 4096
     )
 
 

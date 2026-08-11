@@ -53,10 +53,10 @@ hash mode described below.
 The preprocess cache uses CPU memory only and does not cache CUDA IPC or CUDA VMM
 proxies. It therefore adds no fixed HBM allocation. Existing feature-transport
 pools and the embedding cache keep their own memory budgets. Kimi-K3 raises the
-lazy per-rank embedding-cache cap to 1 GiB so concurrent agent conversations do
-not repeatedly evict and recompute image embeddings. Set
-`SGLANG_VLM_CACHE_SIZE_MB` to override this cap; memory is allocated only as
-embeddings are inserted.
+lazy per-rank embedding-cache cap to 4 GiB so concurrent multi-image agent
+conversations do not repeatedly evict and recompute image embeddings. Set
+`SGLANG_VLM_CACHE_SIZE_MB=1024` for a smaller cache, or `0` to disable it;
+memory is allocated only as embeddings are inserted.
 
 ## Content hashes and trust
 
@@ -116,6 +116,10 @@ The CPU budget is divided across tokenizer workers or encoder TP ranks.
 ```bash
 # Model default: 256 MiB for Kimi-K3
 sglang serve --model-path moonshotai/Kimi-K3
+
+# Lower-HBM profile: retain a smaller per-rank embedding cache
+SGLANG_VLM_CACHE_SIZE_MB=1024 sglang serve \
+  --model-path moonshotai/Kimi-K3
 
 # Explicit CPU budget
 sglang serve --model-path moonshotai/Kimi-K3 \
