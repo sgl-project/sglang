@@ -19,11 +19,13 @@ dependencies = [
   "aiohttp",
   "anthropic>=0.20.0",
   "apache-tvm-ffi==0.1.11",
-  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+  "av==16.1.0 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
   "cuda-python>=13.0",
+  # Transitive dep of flashinfer-python, pinned because 1.6.0rc6 shipped no cp310 linux x86_64 wheel.
+  "cuda-tile==1.6.0rc5",
   "datasets",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "distro",
@@ -33,7 +35,6 @@ dependencies = [
   "flash-attn-4>=4.0.0b18",
   "flashinfer_python[cu13]==0.6.15.post1", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
-  "helion==0.2.6",
   "humming-kernels[cu13]==0.1.10",
   "interegular",
   "IPython",
@@ -67,19 +68,20 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-deep-gemm==0.1.4.post1",
-  "sglang-kernel==0.4.5",
+  "sgl-deep-ep==0.1.0",
+  "sgl-deep-gemm==0.1.5.post2",
+  "sglang-kernel==0.4.6.post1",
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
   "tiktoken",
   "tilelang==0.1.11",
   "timm==1.0.16",
   "tokenspeed_mla==0.1.8",
-  "torch==2.11.0",
+  "torch==2.13.0",
   "torch_memory_saver>=0.0.9.post1",
   "torchao==0.17.0",
   "torchaudio==2.11.0",
-  "torchcodec==0.11.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.11.1 for torch 2.11.x (0.10 is ABI-incompatible: references the pre-2.11 c10::MessageLogger ctor signature). Not available on Linux ARM.
+  "torchcodec==0.15.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # Not available on Linux ARM.
   "torchvision",
   "tqdm",
   "transformers==5.12.1",
@@ -87,6 +89,7 @@ dependencies = [
   "uvloop",
   "watchfiles",
   "xgrammar==0.2.1",
+  "xxhash",
   "zstandard",
 ]
 
@@ -121,6 +124,14 @@ diffusion = [
   "xatlas",
 ]
 
+diffusion-qvg = [
+  # quant-videogen 0.1.0 pins an incompatible Torch version, so it is
+  # installed separately with --no-deps; this extra provides its missing
+  # import-time dependencies.
+  "loguru>=0.7",
+  "termcolor>=2.3",
+]
+
 ray = [
   "ray[default]>=2.55.1",
 ]
@@ -144,6 +155,7 @@ test = [
   "accelerate",
   "addict",
   "auto-round>=0.13.1",
+  "av==16.1.0",
   "bitsandbytes",
   "pymupdf",
   "diff-cover",
@@ -152,12 +164,13 @@ test = [
   "jsonlines",
   "lm-eval[api]>=0.4.9.2",
   "matplotlib",
-  # Pin sgl-eval to a git SHA: upgrading changes zero-shot \boxed{} grading, so
-  # re-baseline MODEL_SCORE_THRESHOLDS in test_text_models_gsm8k_eval.py first.
-  # antlr4 4.9.3 is forced because latex2sympy2_extended raises ImportError on
-  # 4.7.x, and an older transitive pin can win during install.
+  # 4.9.3 is what sgl-eval's math_verify grader needs (latex2sympy2_extended
+  # raises ImportError on 4.7.x), so a `sglang[test]` environment is already
+  # compatible when sgl-eval is installed on top of it.
+  # Do NOT declare sgl-eval itself here: it is git-only, and PyPI rejects any
+  # uploaded distribution whose metadata carries a direct URL requirement.
+  # CUDA CI installs it in scripts/ci/cuda/ci_install_dependency.sh.
   "antlr4-python3-runtime==4.9.3",
-  "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@b2a2703c42cae379bbcb8b7ff092df6601a61694",
   "pandas",
   "parameterized",
   "peft>=0.18.0",
@@ -196,6 +209,12 @@ killall_sglang = "sglang.cli.killall:main"
   "multimodal_gen/apps/realtime_webui/**/*"
 ]
 
+[tool.setuptools.exclude-package-data]
+"sglang" = [
+  "kernels/aot/*",
+  "kernels/aot/**/*",
+]
+
 [tool.setuptools.packages.find]
 exclude = [
   "assets*",
@@ -204,6 +223,7 @@ exclude = [
   "dist*",
   "playground*",
   "scripts*",
+  "sglang.kernels.aot*",
   "tests*",
 ]
 
@@ -215,6 +235,7 @@ exclude = [
   "dist*",
   "playground*",
   "scripts*",
+  "sglang/kernels/aot*",
   "tests*",
 ]
 
@@ -225,16 +246,10 @@ git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
-[[tool.setuptools-rust.ext-modules]]
-target = "sglang.srt.grpc._core"
-path = "../rust/sglang-grpc/Cargo.toml"
-binding = "PyO3"
-
-[[tool.setuptools-rust.ext-modules]]
-target = "sglang.srt.multimodal._core"
-path = "../rust/sglang-mm/Cargo.toml"
-binding = "PyO3"
-debug = false
+# Rust extension modules are auto-discovered by setup.py from the cargo
+# workspace in ../rust ([package.metadata.sglang] python-module in each crate).
+# This CUDA pyproject builds all of them; platform variants restrict the set
+# via [tool.sglang] rust-extensions (see pyproject_other.toml).
 
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1

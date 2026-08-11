@@ -1,6 +1,6 @@
 """fused_decode_sconv_metadata must be bit-identical to the unfused prep.
 
-The unfused reference is the exact op sequence `_prepare_decode_sconv_metadata`
+The unfused reference is the exact op sequence the decode metadata prep
 used to launch: two arange calls + ones + precompute_helion_decode_metadata
 (!= PAD, &, clamp, long, arange x2).
 """

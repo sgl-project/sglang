@@ -64,11 +64,28 @@ class TestShmRoundTrip(CustomTestCase):
         writer = ShmLoadSnapshotWriter(path, dp_size=1, dp_rank=0)
         reader = ShmLoadSnapshotReader(path, dp_size=1)
         try:
-            writer.write(LoadSnapshot(dp_rank=0, num_running_reqs=5, timestamp=1.0))
+            writer.write(
+                LoadSnapshot(
+                    dp_rank=0,
+                    num_running_reqs=5,
+                    timestamp=1.0,
+                    num_active_tokens=4096,
+                    total_prefill_uncached_tokens=1000,
+                    total_prefill_busy_us=250_000,
+                    decode_moments=[2, 30, 3000, 500, 50_000, 60],
+                )
+            )
             load = reader.read(0)
             self.assertIsNotNone(load)
             self.assertEqual(load.num_running_reqs, 5)
             self.assertEqual(load.timestamp, 1.0)
+            self.assertEqual(load.num_active_tokens, 4096)
+            # The cumulative total_* counters round-trip like any other
+            # core scalar.
+            self.assertEqual(load.total_prefill_uncached_tokens, 1000)
+            self.assertEqual(load.total_prefill_busy_us, 250_000)
+            self.assertEqual(load.decode_moments[0], 2)
+            self.assertEqual(load.decode_moments[5], 60)
         finally:
             reader.close()
             writer.close()

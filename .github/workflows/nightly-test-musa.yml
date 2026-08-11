@@ -74,11 +74,11 @@ jobs:
         if: steps.gate.outputs.run_job == 'true'
         timeout-minutes: 30
         run: |
-          pytest sgl-kernel/tests/test_per_token_quant_fp8.py
-          pytest sgl-kernel/tests/speculative/test_eagle_utils.py
-          pytest sgl-kernel/tests/speculative/test_ngram_utils.py
-          pytest sgl-kernel/tests/speculative/test_speculative_sampling.py
-          pytest sgl-kernel/tests/test_torch_defaults_reset.py
+          pytest python/sglang/kernels/aot/tests/test_per_token_quant_fp8.py
+          pytest python/sglang/kernels/aot/tests/speculative/test_eagle_utils.py
+          pytest python/sglang/kernels/aot/tests/speculative/test_ngram_utils.py
+          pytest python/sglang/kernels/aot/tests/speculative/test_speculative_sampling.py
+          pytest python/sglang/kernels/aot/tests/test_torch_defaults_reset.py
 
   # ==================== General: multimodal layer ====================
   nightly-test-musa-general-multimodal-layer:

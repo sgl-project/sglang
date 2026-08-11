@@ -37,7 +37,10 @@ jobs:
         run: echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
 
       - name: Install docker/build.py dependencies
-        run: python3 -m pip install --quiet typer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          python3 -m pip install --break-system-packages --quiet typer
 
       - name: Build image via miles docker/build.py and tag with date
         run: |

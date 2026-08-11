@@ -166,7 +166,7 @@ def _create_unified_radix_cache(
     params: CacheInitParams,
 ) -> BasePrefixCache:
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
-    from sglang.srt.mem_cache.unified_cache_components import ComponentType
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     tree_components = [ComponentType.FULL]
@@ -209,6 +209,16 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     else:
         cache = default_radix_cache_factory(ctx)
         source = "default"
+
+    if ctx.server_args.enable_session_radix_cache and not getattr(
+        cache, "enable_session_radix_cache", False
+    ):
+        raise ValueError(
+            "--enable-session-radix-cache requires UnifiedRadixCache, but "
+            f"tree_cache is {type(cache).__name__}. Set "
+            "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 (or remove "
+            "--enable-session-radix-cache)."
+        )
 
     streaming_wrapped = False
     if (
