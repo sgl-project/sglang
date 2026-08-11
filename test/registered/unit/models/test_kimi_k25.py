@@ -845,6 +845,59 @@ def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
     assert second.feature[0, 0].item() == 2
 
 
+def test_kimi_k3_partial_hits_deduplicate_misses_and_preserve_order():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.processor_fingerprint = "processor"
+    processor.trust_mm_content_hashes = False
+    processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
+    processor.mm_processor_executor = None
+    processor.io_executor = ThreadPoolExecutor(max_workers=4)
+    cached_image = Image.new("RGB", (2, 2), color=(1, 0, 0))
+    missed_image = Image.new("RGB", (2, 2), color=(2, 0, 0))
+    cached_digest = snapshot_media(cached_image).content_digest
+    missed_digest = snapshot_media(missed_image).content_digest
+    cached_key = processor._artifact_key(cached_digest, cached_image)
+    cached = _cached_k3_artifact(cached_digest, cached_key, value=1)
+    processor.mm_preprocess_cache.put(cached_key, cached)
+    batches = []
+
+    async def prepare(entries):
+        batches.append(entries)
+        return [
+            replace(
+                _cached_k3_artifact(digest, key, image.getpixel((0, 0))[0]),
+                feature_hash=456,
+            )
+            for digest, key, image in entries
+        ]
+
+    processor._run_artifact_batch = prepare
+    try:
+        artifacts = asyncio.run(
+            processor.prepare_media_artifacts(
+                [cached_image, missed_image, missed_image, cached_image],
+                SimpleNamespace(mm_content_hashes=None),
+            )
+        )
+    finally:
+        processor.io_executor.shutdown()
+
+    assert len(batches) == 1
+    assert len(batches[0]) == 1
+    assert batches[0][0][:2] == (
+        missed_digest,
+        processor._artifact_key(missed_digest, missed_image),
+    )
+    assert [artifact.content_digest for artifact in artifacts] == [
+        cached_digest,
+        missed_digest,
+        missed_digest,
+        cached_digest,
+    ]
+    assert artifacts[0] is artifacts[3]
+    assert artifacts[1] is artifacts[2]
+
+
 def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     from sglang.srt.multimodal.kimi_k3_image_processing import (
         DEFERRED_PREPROCESSING_KEY,
