@@ -297,8 +297,10 @@ fn handle_chunk(
     let no_stop_trim = st.no_stop_trim;
 
     // Queued → Streaming on the first chunk (the scheduler picked it).
-    if matches!(st.fsm, RequestState::Queued) {
+    let first_chunk = matches!(st.fsm, RequestState::Queued);
+    if first_chunk {
         let _ = st.fsm.apply(Event::SchedulerPicked);
+        crate::ttft_stamp::stamp("detok_first_recv", rid.as_str());
     }
 
     let finished = ev.finish_reason.is_some();
@@ -366,6 +368,9 @@ fn handle_chunk(
     if finished {
         // The Done frame *is* the final frame: Finalizing → Completed.
         let sent = st.sink.try_send(EgressItem::Done(ev)).is_ok();
+        if sent && first_chunk {
+            crate::ttft_stamp::stamp("detok_first_emit", rid.as_str());
+        }
         let _ = st.fsm.apply(if sent {
             Event::FinalFrameSent
         } else {
@@ -379,7 +384,13 @@ fn handle_chunk(
         // silently dropping the frame would truncate the response and still look
         // like success at EOS. So treat both as terminal: drop the request AND
         // abort scheduler work for it.
-        if let Err(e) = st.sink.try_send(EgressItem::Frame(ev)) {
+        match st.sink.try_send(EgressItem::Frame(ev)) {
+            Ok(()) => {
+                if first_chunk {
+                    crate::ttft_stamp::stamp("detok_first_emit", rid.as_str());
+                }
+            }
+            Err(e) => {
             match e {
                 SinkError::Full => {
                     tracing::warn!(
@@ -403,6 +414,7 @@ fn handle_chunk(
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
             }
             table.remove(&rid);
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -56,6 +57,9 @@ class SchedulerOutputStreamer:
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
+    # TTFT profiling (kan/rust-tm-ttft-breakdown, throwaway): rids whose
+    # first-output stamp line has been logged.
+    _ttft_stamped: set = field(default_factory=set)
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -177,9 +181,41 @@ class SchedulerOutputStreamer:
         )
         if payload is not None:
             if self.rust_server is not None:
+                # TTFT profiling: capture the push time BEFORE the push — the
+                # rust egress thread can process the batch before this returns.
+                push_ns = time.perf_counter_ns()
                 self.rust_server.push_generation(payload)
+                self._log_ttft_stamps(reqs=reqs, skip_req=skip_req, push_ns=push_ns)
             else:
                 self.send_to_detokenizer.send_output(payload)
+
+    def _log_ttft_stamps(
+        self, *, reqs: List[Req], skip_req: Optional[Req], push_ns: int
+    ) -> None:
+        """TTFT profiling (kan/rust-tm-ttft-breakdown, throwaway): log the raw
+        scheduler-side perf_counter stamps once per request, at the step its
+        first output was pushed to the rust egress ring. `push_ns` is captured
+        just before `push_generation`; the T7-T10 fields are seconds
+        (multiply by 1e9 to compare with the rust CLOCK_MONOTONIC ns stamps).
+        """
+        for req in reqs:
+            if req is skip_req or not req.output_ids:
+                continue
+            if req.rid not in self._ttft_stamped:
+                self._ttft_stamped.add(req.rid)
+                ts = req.time_stats
+                logger.info(
+                    "TTFT_STAMP_PY rid=%s recv=%.9f waitq=%.9f fwd_entry=%.9f "
+                    "prefill_fin=%.9f push_ns=%d",
+                    req.rid,
+                    ts.scheduler_recv_time,
+                    ts.wait_queue_entry_time,
+                    ts.forward_entry_time,
+                    ts.prefill_finished_time,
+                    push_ns,
+                )
+            if req.finished():
+                self._ttft_stamped.discard(req.rid)
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (

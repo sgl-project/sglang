@@ -140,8 +140,11 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
 /// message, instead of axum's default 422.
 async fn generate(
     State(state): State<AppState>,
+    start: Option<axum::Extension<super::RequestStartNs>>,
     body: Result<Json<GenerateBody>, JsonRejection>,
 ) -> Response {
+    // TTFT profiling: handler entry = body fully read + JSON parsed.
+    let t_entry = crate::ttft_stamp::mono_ns();
     let body = match body {
         Ok(Json(body)) => body,
         // A body that fails to parse has no readable `stream` flag, so this one
@@ -166,6 +169,14 @@ async fn generate(
     // — never on the MM worker pool (see `prefetch`).
     if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
         return pre_submit_error(StatusCode::BAD_REQUEST, &e, stream);
+    }
+    // TTFT profiling: emit the pre-submit stamps now that rids exist.
+    for p in &payloads {
+        if let Some(axum::Extension(t0)) = &start {
+            crate::ttft_stamp::stamp_at("http_recv", p.rid.as_str(), t0.0);
+        }
+        crate::ttft_stamp::stamp_at("handler_entry", p.rid.as_str(), t_entry);
+        crate::ttft_stamp::stamp("submit_ready", p.rid.as_str());
     }
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
@@ -341,6 +352,14 @@ fn generation_event_stream(
         let rid_strs: Vec<Rid> = receivers.iter().map(|(rid, _)| rid.clone()).collect();
         let mut accs: Vec<OutputAccumulator> =
             (0..n).map(|_| OutputAccumulator::default()).collect();
+        // TTFT profiling: stamp the first yielded frame per item.
+        let mut first_sent: Vec<bool> = vec![false; n];
+        let stamp_first = |first_sent: &mut Vec<bool>, i: usize| {
+            if !first_sent[i] {
+                first_sent[i] = true;
+                crate::ttft_stamp::stamp("sse_first_yield", rid_strs[i].as_str());
+            }
+        };
 
         // Batch position, tagged onto every frame (a single request omits it).
         let idx = |i: usize| with_index.then_some(i);
@@ -371,6 +390,7 @@ fn generation_event_stream(
                     EgressItem::Frame(out) => {
                         accs[i].fold(&out);
                         if incremental {
+                            stamp_first(&mut first_sent, i);
                             yield stream_frame_string(out, &accs[i], true, rid_strs[i].client_facing(), idx(i));
                         } else {
                             coalesced = true;
@@ -389,6 +409,7 @@ fn generation_event_stream(
                 yield tag_value(error_value(e.http_status(), &e.to_string()), idx(i));
                 guard.disarm(&rid_strs[i]);
             } else if let Some(out) = terminal {
+                stamp_first(&mut first_sent, i);
                 // A validation abort → an error object, not a frame. The final frame
                 // carries the full cumulative state, so any coalesced ones are moot.
                 yield match out.finish_reason.as_ref().and_then(|f| f.abort_status()) {
@@ -398,6 +419,7 @@ fn generation_event_stream(
                 guard.disarm(&rid_strs[i]); // terminal → not re-pushed
             } else {
                 if coalesced {
+                    stamp_first(&mut first_sent, i);
                     yield cumulative_frame_string(&accs[i], rid_strs[i].client_facing(), idx(i));
                 }
                 futs.push(recv_indexed(i, rx)); // keep this item flowing
