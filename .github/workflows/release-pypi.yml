@@ -93,7 +93,7 @@ jobs:
       fail-fast: false
       matrix:
         # CPython 3.10 does not publish a native Windows ARM64 distribution.
-        python-version: ["3.11.8", "3.12.10", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
     runs-on: windows-11-arm
     timeout-minutes: 60
     steps:
