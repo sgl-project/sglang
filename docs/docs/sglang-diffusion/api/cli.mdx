@@ -208,7 +208,7 @@ sglang generate \
   --prompt "A quiet city street after rain"
 ```
 
-Supported components are `dit`, `text_encoder`, `image_encoder`, and `vae`. Use `all` to offload all components or `none` to disable coarse component CPU offload. This unified option cannot be combined with the legacy per-component CPU offload flags. Layerwise offload remains independently controlled by `--layerwise-offload-components`.
+Component names are matched against the loaded pipeline's component keys from `model_index.json`, so names such as `transformer_2`, `audio_vae`, and `connectors` are supported without adding them to a registry. The group aliases `dit`, `text_encoder`, `image_encoder`, and `vae` remain available. Use `all` to offload every loaded `torch.nn.Module`, or `none` to disable coarse component CPU offload. Non-module components such as tokenizers and schedulers are unaffected. This unified option cannot be combined with the legacy per-component CPU offload flags. Layerwise offload remains independently controlled by `--layerwise-offload-components`.
 
 ### Layerwise Offload
 

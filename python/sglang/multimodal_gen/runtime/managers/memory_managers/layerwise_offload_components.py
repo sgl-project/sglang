@@ -47,23 +47,7 @@ CPU_OFFLOAD_FLAG_NAMES = (
     "image_encoder_cpu_offload",
     "vae_cpu_offload",
 )
-CPU_OFFLOAD_COMPONENT_NAMES = ("dit", "text_encoder", "image_encoder", "vae")
-CPU_OFFLOAD_COMPONENT_ALIASES = {
-    "dit": "dit",
-    "transformer": "dit",
-    "transformer_2": "dit",
-    "video_dit": "dit",
-    "video_dit_2": "dit",
-    "audio_dit": "dit",
-    "text_encoder": "text_encoder",
-    "text_encoder_2": "text_encoder",
-    "image_encoder": "image_encoder",
-    "condition_image_encoder": "image_encoder",
-    "vae": "vae",
-    "video_vae": "vae",
-    "audio_vae": "vae",
-    "vocoder": "vae",
-}
+CPU_OFFLOAD_ALL_COMPONENTS = "all"
 
 
 def is_dit_component_name(component_name: str) -> bool:
@@ -73,7 +57,7 @@ def is_dit_component_name(component_name: str) -> bool:
 def normalize_cpu_offload_components(
     component_names: str | Sequence[str] | None,
 ) -> list[str] | None:
-    """Normalize component names accepted by ``--cpu-offload-components``."""
+    """Normalize component keys accepted by ``--cpu-offload-components``."""
     if component_names is None:
         return None
 
@@ -92,22 +76,35 @@ def normalize_cpu_offload_components(
                 if len(raw_components) != 1 or normalized_components:
                     raise ValueError("'none' cannot be combined with other components.")
                 return []
-            if component_name == "all":
-                for name in CPU_OFFLOAD_COMPONENT_NAMES:
-                    if name not in normalized_components:
-                        normalized_components.append(name)
+            if component_name == CPU_OFFLOAD_ALL_COMPONENTS:
+                if CPU_OFFLOAD_ALL_COMPONENTS not in normalized_components:
+                    normalized_components.append(CPU_OFFLOAD_ALL_COMPONENTS)
                 continue
-            canonical_name = CPU_OFFLOAD_COMPONENT_ALIASES.get(component_name)
-            if canonical_name is None:
-                valid_names = ", ".join((*CPU_OFFLOAD_COMPONENT_NAMES, "all", "none"))
-                raise ValueError(
-                    f"Invalid CPU offload component name: {component_name!r}. "
-                    f"Expected one of: {valid_names}."
-                )
-            if canonical_name not in normalized_components:
-                normalized_components.append(canonical_name)
+            if component_name not in normalized_components:
+                normalized_components.append(component_name)
 
     return normalized_components or None
+
+
+def cpu_offload_component_matches(
+    component_name: str,
+    selected_component_names: Collection[str] | None,
+) -> bool:
+    if selected_component_names is None:
+        return False
+    if CPU_OFFLOAD_ALL_COMPONENTS in selected_component_names:
+        return True
+    if component_name in selected_component_names:
+        return True
+    if LAYERWISE_OFFLOAD_DIT_GROUP in selected_component_names:
+        return is_dit_component_name(component_name)
+    if LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in selected_component_names:
+        return is_text_encoder_component_name(component_name)
+    if LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in selected_component_names:
+        return component_name in ("image_encoder", "condition_image_encoder")
+    if LAYERWISE_OFFLOAD_VAE_GROUP in selected_component_names:
+        return is_vae_component_name(component_name)
+    return False
 
 
 def is_text_encoder_component_name(component_name: str) -> bool:

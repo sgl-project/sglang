@@ -1,3 +1,4 @@
+import torch
 from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
@@ -50,7 +51,13 @@ class AdapterLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        target_device = get_local_torch_device()
+        target_device = (
+            torch.device("cpu")
+            if self._should_offload_component(
+                server_args, "connectors", server_args.dit_cpu_offload
+            )
+            else get_local_torch_device()
+        )
         default_dtype = resolve_precision(
             server_args, "connectors", precision_attr="dit_precision"
         )

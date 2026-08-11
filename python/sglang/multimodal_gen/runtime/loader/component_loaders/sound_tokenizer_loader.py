@@ -26,9 +26,16 @@ class SoundTokenizerLoader(ComponentLoader):
     expected_library = "diffusers"
 
     def should_offload(
-        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+        self,
+        server_args: ServerArgs,
+        model_config: ModelConfig | None = None,
+        component_name: str | None = None,
     ) -> bool:
-        return server_args.vae_cpu_offload
+        return self._should_offload_component(
+            server_args,
+            component_name or "sound_tokenizer",
+            server_args.vae_cpu_offload,
+        )
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
@@ -46,7 +53,9 @@ class SoundTokenizerLoader(ComponentLoader):
         except AttributeError:
             precision = "bf16"
         dtype = PRECISION_TO_TYPE[precision]
-        target_device = self.target_device(self.should_offload(server_args))
+        target_device = self.target_device(
+            self.should_offload(server_args, component_name=component_name)
+        )
 
         with set_default_torch_dtype(dtype), skip_init_modules():
             model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
