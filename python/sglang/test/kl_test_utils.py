@@ -364,10 +364,9 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         output_logprobs.append(_extract_output_logprobs(result))
 
     if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
-        # Whether a prompt hits depends on where its last decode checkpoint falls
-        # relative to the page-aligned window a sliding-window model retains, so the
-        # default only screens out a vacuous run. A caller that makes every prompt
-        # hit by construction raises this to pin that down instead.
+        # Page-aligned SWA retention decides which prompts hit at all, so the default
+        # only screens out a vacuous run. A caller whose checkpoint interval makes
+        # every prompt hit raises this to pin that down.
         assert len(new_input_ids) > min_cache_hit_ratio * len(
             second_turn_input_ids
         ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"

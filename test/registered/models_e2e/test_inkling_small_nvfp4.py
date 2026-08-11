@@ -58,6 +58,12 @@ KL_DIV_THRESHOLD = 1e-9
 # checkpoint or a mis-restored prefix would surface.
 KL_MAX_NEW_TOKENS = 1024
 
+# Equal to the page size below. Out-of-window SWA slots are freed a page at a
+# time, so only a checkpoint sitting on a page boundary still has a full window
+# of SWA data below it -- at the default 256 half the sequence lengths land off
+# that boundary and lose their decode prefix entirely.
+KL_TRACK_INTERVAL = 128
+
 
 class TestInklingSmallNvfp4(CustomTestCase):
     @classmethod
@@ -162,14 +168,8 @@ class TestInklingSmallNvfp4Deterministic(CustomTestCase):
                 "0.1",
                 "--mem-fraction-static",
                 "0.85",
-                # A decode checkpoint is reusable only when a full sliding window of
-                # live SWA data survives below it, and out-of-window SWA slots are
-                # freed a whole page at a time. Setting the interval to the page size
-                # puts every checkpoint exactly on that boundary; at the default 256
-                # a checkpoint clears it only when the sequence length happens to fall
-                # in the first half of an interval, which halves the hit rate.
                 "--mamba-track-interval",
-                "128",
+                str(KL_TRACK_INTERVAL),
                 "--enable-deterministic-inference",
             ],
             env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
@@ -198,9 +198,8 @@ class TestInklingSmallNvfp4Deterministic(CustomTestCase):
         self._run(assert_logprobs_match_prefill_cache_hit)
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
-        # The interval set above makes every prompt reuse its decode checkpoint, so
-        # anything short of that is a state-reuse regression rather than a geometry
-        # coincidence.
+        # 0.99 is every prompt: the interval above makes the reuse unconditional, so
+        # a single miss is a state-reuse regression rather than a geometry coincidence.
         self._run(assert_logprobs_match_decode_cache_hit, min_cache_hit_ratio=0.99)
 
 
