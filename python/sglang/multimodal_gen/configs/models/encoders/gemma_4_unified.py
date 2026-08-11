@@ -12,15 +12,6 @@ from sglang.multimodal_gen.configs.models.fsdp import (
     is_layer,
 )
 
-# LTX-2.5 saved its text encoder with a transformers build that names the vision
-# embedder differently from the installed one. Only the vision path is affected --
-# text-to-video never runs it -- but the loader is strict about uninitialized
-# weights, so map the names rather than let them go missing.
-GEMMA_4_UNIFIED_PARAM_NAMES_MAPPING: dict[str, str] = {
-    r"^model\.embed_vision\.embedding_projection\.(.*)$": r"model.embed_vision.multimodal_embedder.embedding_projection.\1",
-    r"^model\.vision_embedder\.(.*)$": r"model.embed_vision.\1",
-}
-
 
 @dataclass
 class Gemma4UnifiedArchConfig(TextEncoderArchConfig):
@@ -33,11 +24,21 @@ class Gemma4UnifiedArchConfig(TextEncoderArchConfig):
 
     LTX-2.5 consumes all 48 hidden layers plus the embedding output, which is why
     the connector's `text_proj_in_factor` is 49 and `caption_channels` is 3840.
-    """
 
-    param_names_mapping: dict = field(
-        default_factory=lambda: dict(GEMMA_4_UNIFIED_PARAM_NAMES_MAPPING)
-    )
+    No `param_names_mapping` here: this encoder currently loads through
+    `TextEncoderLoader.load_native`, i.e. `transformers.from_pretrained`, which
+    never consults SGLang's mapping. If a customized (FSDP/TP) implementation is
+    added the way LTX-2/2.3 have `FSDPGemma3ForConditionalGeneration`, it will
+    need one, because 10 keys drift between the checkpoint and the installed
+    transformers:
+
+        model.vision_embedder.*                 -> model.embed_vision.*
+        model.embed_vision.embedding_projection.* ->
+            model.embed_vision.multimodal_embedder.embedding_projection.*
+
+    plus a tied `lm_head.weight`. All of it is on the vision path, which
+    text-to-video never runs; `from_pretrained` tolerates the drift today.
+    """
 
     hidden_size: int = 3840
     num_hidden_layers: int = 48
