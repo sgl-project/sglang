@@ -222,8 +222,8 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # leak into AITER's version when AITER uses setuptools_scm)
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-# Keep the Triton selected for this image: ROCm 7.0 retains its base package;
-# ROCm 7.2 installs and validates AITER's pin below before compiling AITER.
+# Keep the base Triton while compiling AITER. ROCm 7.2 switches to AITER's
+# pinned Triton only after all dependency resolution is complete.
 ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -236,14 +236,6 @@ RUN git clone ${AITER_REPO} \
  && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
-
-# AITER's installer selects its ROCm-specific pinned Triton wheel before
-# AITER compilation.
-RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        cd aiter \
-     && test -f .github/scripts/install_triton.sh \
-     && bash .github/scripts/install_triton.sh; \
-    fi
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
@@ -636,21 +628,6 @@ RUN cd /tmp/whl \
         ;; \
     esac
 
-
-# -----------------------
-# Hot patch: Triton
-# Finalize ROCm 7.2 on AITER's pinned Triton 3.7 source revision.
-RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        pip uninstall -y triton \
-     && apt install -y cmake \
-     && git clone ${TRITON_REPO} triton-custom \
-     && cd triton-custom \
-     && git checkout ${TRITON_COMMIT} \
-     && pip install -r python/requirements.txt \
-     && pip install -e . \
-     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
-    fi
-
 # -----------------------
 # Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
 # _compute_local_source_files_hash calls Path(...).resolve() on custom-code
@@ -680,6 +657,16 @@ else:
     path.write_text(patched)
     print("patched transformers dynamic_module_utils.py (symlink hash fix)")
 PY
+
+# -----------------------
+# Finalize Triton only after every pip dependency install and the ROCm Torch
+# metadata patch, so pip cannot replace ROCm Torch while resolving dependencies.
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        cd /sgl-workspace/aiter \
+     && test -f .github/scripts/install_triton.sh \
+     && bash .github/scripts/install_triton.sh \
+     && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; assert v.startswith('3.7.'), v; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
+    fi
 
 # -----------------------
 # Performance environment variable.
