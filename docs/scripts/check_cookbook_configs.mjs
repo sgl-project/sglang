@@ -347,18 +347,28 @@ for (const path of walkMdx(DIFFUSION_COOKBOOK)) {
 
   const where = relative(join(SNIPPETS, "..", ".."), path);
   const src = readFileSync(path, "utf8");
-  const heading = /^## 1\. Model Introduction\s*$/m.exec(src);
-  if (!heading) {
-    fail(where, "missing exact `## 1. Model Introduction` heading");
+  const quickStart = /^## 1\. Quick start\s*$/m.exec(src);
+  const legacyIntroduction = /^## 1\. Model Introduction\s*$/m.exec(src);
+  const sectionOne = quickStart || legacyIntroduction;
+  if (!sectionOne) {
+    fail(where, "missing `## 1. Quick start` or legacy `## 1. Model Introduction` heading");
+    continue;
+  }
+
+  const capabilityHeading = quickStart
+    ? /^## 2\. Model capabilities\s*$/m.exec(src)
+    : legacyIntroduction;
+  if (!capabilityHeading) {
+    fail(where, "Quick start pages need an exact `## 2. Model capabilities` heading");
     continue;
   }
 
   const importPattern = /import\s+\{\s*DiffusionModelTags\s*\}\s+from\s+['"]\/src\/snippets\/diffusion\/model-tags\.jsx['"]/;
-  if (!importPattern.test(src.slice(0, heading.index))) {
+  if (!importPattern.test(src.slice(0, sectionOne.index))) {
     fail(where, "missing the shared DiffusionModelTags import before section 1");
   }
 
-  const tagMatch = /<DiffusionModelTags\s+tags=\{\[([^\]]+)]}\s*\/>/.exec(src.slice(0, heading.index));
+  const tagMatch = /<DiffusionModelTags\s+tags=\{\[([^\]]+)]}\s*\/>/.exec(src.slice(0, sectionOne.index));
   if (!tagMatch) {
     fail(where, "missing `<DiffusionModelTags tags={[...]} />` before section 1");
   } else {
@@ -369,15 +379,25 @@ for (const path of walkMdx(DIFFUSION_COOKBOOK)) {
     if (tags.some((tag) => !tag)) fail(where, "tag widget contains an empty tag");
   }
 
-  const introStart = heading.index + heading[0].length;
+  if (quickStart) {
+    const quickStartBody = src.slice(quickStart.index + quickStart[0].length, capabilityHeading.index);
+    if (!quickStartBody.includes("<Deployment config={config} />")) {
+      fail(where, "Quick start must render the command builder before model capabilities");
+    }
+    if (!quickStartBody.includes('uv pip install "sglang[diffusion]"')) {
+      fail(where, "Quick start must include the diffusion installation command");
+    }
+  }
+
+  const introStart = capabilityHeading.index + capabilityHeading[0].length;
   const rest = src.slice(introStart);
-  const boundaries = ["\n|", "\n<Warning", "\n<Note", "\n## 2"]
+  const boundaries = ["\n|", "\n<Warning", "\n<Note", quickStart ? "\n## 3" : "\n## 2"]
     .map((marker) => rest.indexOf(marker))
     .filter((i) => i >= 0);
   const lead = rest.slice(0, boundaries.length ? Math.min(...boundaries) : rest.length).trim();
   const paragraphs = lead.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
   if (paragraphs.length < 2) {
-    fail(where, "model introduction needs at least two lead paragraphs");
+    fail(where, "model capability introduction needs at least two lead paragraphs");
   }
   const prose = lead
     .replace(/\[([^\]]+)]\([^)]+\)/g, "$1")

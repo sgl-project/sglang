@@ -236,7 +236,6 @@ html.dark table tbody tr:nth-child(even) td,
   --sgdb-ok: oklch(52% 0.11 153);
   --sgdb-warn: oklch(59% 0.12 78);
   --sgdb-error: oklch(53% 0.16 25);
-  --sgdb-code-height: 180px;
   max-width: 100%;
   margin: 24px 0 40px;
   overflow: clip;
@@ -286,7 +285,8 @@ html.dark table tbody tr:nth-child(even) td,
 
 .sgd-builder-scope-tabs button[data-active="true"] { color: var(--sgdb-ink); }
 .sgd-builder-scope-tabs button[data-active="true"]::after { opacity: 1; transform: scaleX(1); }
-.sgd-builder-main, .sgd-builder-controls, .sgd-builder-output-rail { min-width: 0; }
+.sgd-builder-main { display: flex; min-width: 0; flex-direction: column; }
+.sgd-builder-controls, .sgd-builder-output-rail { min-width: 0; }
 .sgd-builder-controls { container: builder-controls / inline-size; padding: 4px 16px 20px; }
 
 .sgd-builder-scope-panel { display: grid; gap: 0; }
@@ -468,7 +468,7 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-request-setting:last-child { border-bottom: 0; }
 .sgd-builder-request-setting .sgd-builder-context { padding: 16px 0; }
 
-.sgd-builder-output-rail { display: grid; gap: 12px; padding: 0 12px 16px; }
+.sgd-builder-output-rail { display: grid; gap: 12px; padding: 0 12px 16px; align-items: start; }
 .sgd-builder-output {
   --output-accent: var(--sgdb-serve);
   display: grid;
@@ -499,7 +499,8 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-node-fields label { display: grid; min-width: 0; gap: 4px; color: var(--sgdb-muted); font-size: 10px; }
 .sgd-builder-node-fields input { width: 100%; min-width: 0; min-height: 34px; padding: 0 7px; border: 1px solid var(--sgdb-line); border-radius: 6px; background: var(--sgdb-surface); color: var(--sgdb-ink); font-size: 11px; }
 .sgd-builder-output > pre {
-  height: var(--sgdb-code-height);
+  height: auto;
+  max-height: calc(13.95em + 24px);
   min-width: 0;
   margin: 0;
   padding: 12px;
@@ -516,7 +517,7 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-output code { background: transparent; color: inherit; font: inherit; font-variant-ligatures: none; }
 .sgd-builder-output-error { padding: 8px 10px; border-top: 1px solid color-mix(in oklch, var(--sgdb-error) 35%, var(--sgdb-line)); background: color-mix(in oklch, var(--sgdb-error) 8%, transparent); color: var(--sgdb-error); font-size: 10.5px; line-height: 1.4; }
 .sgd-builder-output > footer { display: flex; min-height: 44px; padding: 5px 10px; align-items: center; justify-content: space-between; border-top: 1px solid var(--sgdb-line); }
-.sgd-builder-output > footer > div { display: flex; gap: 12px; align-items: center; }
+.sgd-builder-output > footer > div { display: flex; margin-left: auto; gap: 12px; align-items: center; }
 .sgd-builder-copy { min-height: 32px; padding: 0 11px; border: 1px solid color-mix(in oklch, var(--output-accent) 42%, var(--sgdb-line)); border-radius: 6px; background: color-mix(in oklch, var(--output-accent) 6%, var(--sgdb-raised)); color: var(--sgdb-ink); cursor: pointer; font-size: 11px; font-weight: 680; }
 .sgd-builder-copy:disabled { cursor: not-allowed; opacity: 0.38; }
 
@@ -549,8 +550,21 @@ html.dark table tbody tr:nth-child(even) td,
 
 /* Container queries measure the content box; subtract the two 1px borders so
    the documented 420 / 720 / 960px outer widths switch at the intended point. */
+@container command-builder (max-width: 717px) {
+  .sgd-builder-output-rail { display: contents; }
+  .sgd-builder-controls { order: 0; }
+  .sgd-builder-output { width: calc(100% - 24px); margin: 12px 12px 16px; order: 1; }
+  .sgd-builder-main[data-scope="base"] .sgd-builder-output[data-output="serve"],
+  .sgd-builder-main[data-scope="serve"] .sgd-builder-output[data-output="serve"],
+  .sgd-builder-main[data-scope="request"] .sgd-builder-output[data-output="request"] { order: -1; }
+}
+
+@container command-builder (min-width: 718px) and (max-width: 957px) {
+  .sgd-builder-output-rail { order: -1; padding-top: 12px; }
+  .sgd-builder-output[data-emphasized="false"] { order: 1; }
+}
+
 @container command-builder (min-width: 418px) {
-  .sgd-builder-main { --sgdb-code-height: 220px; }
   .sgd-builder-scope-tabs { padding-inline: 16px; }
   .sgd-builder-scope-tabs button { font-size: 13px; }
   .sgd-builder-hardware-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -569,7 +583,6 @@ html.dark table tbody tr:nth-child(even) td,
 }
 
 @container command-builder (min-width: 958px) {
-  .sgd-builder-main { --sgdb-code-height: 260px; }
   .sgd-builder-scope-tabs { padding-inline: 20px; }
   .sgd-builder-scope-tabs button { font-size: 14px; }
   .sgd-builder-main { display: grid; grid-template-columns: minmax(0, 38fr) minmax(0, 62fr); }

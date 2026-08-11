@@ -1923,6 +1923,7 @@ export const Deployment = ({ config, benchmarks }) => {
     const renderOutputCard = (type) => {
       const serve = type === "serve";
       const text = serve ? command : curlText;
+      const canExpand = text.split("\n").length > 9;
       const expanded = serve ? serveExpanded : requestExpanded;
       const setExpanded = serve ? setServeExpanded : setRequestExpanded;
       const status = serve ? serveStatus : requestStatus;
@@ -1976,9 +1977,11 @@ export const Deployment = ({ config, benchmarks }) => {
           <pre className={expanded ? "is-expanded" : ""}><code>{text}</code></pre>
           {invalid && <div className="sgd-builder-output-error">{errors[0]}</div>}
           <footer>
-            <button type="button" className="sgd-builder-text-action" onClick={() => setExpanded(!expanded)}>
-              {expanded ? "Collapse" : "Expand"}
-            </button>
+            {canExpand && (
+              <button type="button" className="sgd-builder-text-action" onClick={() => setExpanded(!expanded)}>
+                {expanded ? "Collapse" : "Expand"}
+              </button>
+            )}
             <div>
               <button type="button" className="sgd-builder-text-action" onClick={() => setModal("env")}>Variables</button>
               <button
@@ -2019,7 +2022,7 @@ export const Deployment = ({ config, benchmarks }) => {
           ))}
         </nav>
 
-        <div className="sgd-builder-main">
+        <div className="sgd-builder-main" data-scope={builderScope}>
           <div
             id={`${DEPLOYMENT_COMPONENT_ID}-controls`}
             className="sgd-builder-controls"

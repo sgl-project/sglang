@@ -137,10 +137,11 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
 
 For a diffusion model, instantiate `templates/diffusion-page.mdx.tmpl` and keep the
 shared `DiffusionModelTags` component, plus `templates/diffusion-config.jsx.tmpl` for the
-opt-in scoped command builder. The first two paragraphs are not generic filler:
-they must state the model's capability range, strongest differentiator, when to choose it,
-and at least one real deployment or capability boundary. Put orthogonal runtime features
-in `scope: "serve"` or `scope: "request"`, not in the base recipe; use the schema from
+opt-in scoped command builder. Put the compact install command and builder in §1 Quick
+start. The first two paragraphs in §2 Model capabilities are not generic filler: they must
+state the model's capability range, strongest differentiator, when to choose it, and at
+least one real deployment or capability boundary. Put orthogonal runtime features in
+`scope: "serve"` or `scope: "request"`, not in the base recipe; use the schema from
 `references/diffusion-authoring.md`.
 
 1. **Copy** the three template files to their target paths (above). Note the two
@@ -218,7 +219,7 @@ user notes: §1 Model Introduction (description, links, params, license, variant
 Tool-Calling / HiCache — keep only what applies; match the reasoning example to the
 parser's output shape; each runnable block gets an `**Output Example:**`).
 
-For diffusion pages, follow the shorter category-specific opening contract in
+For diffusion pages, follow the category-specific Quick start and capability contract in
 `references/diffusion-authoring.md`. Run `node docs/scripts/check_cookbook_configs.mjs` to
 verify the tag widget and introduction structure before rendering the page.
 

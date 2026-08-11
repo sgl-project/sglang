@@ -24,13 +24,18 @@ Do not spend tags on generic claims such as `native`, `fast`, `high quality`, or
 `SGLang`. Attention backends, Cache-DiT, and online quantization are feature overlays,
 not model identity, unless a published checkpoint is intrinsically tied to that format.
 
-The page must start with `## 1. Model Introduction` followed by 2–3 short paragraphs:
+The page must start with `## 1. Quick start`: keep installation to one runnable
+command, add at most one short orientation paragraph, and render the scoped command
+builder before detailed capability tables or deployment commentary. A reader should
+reach a generated Serve command without scrolling through model background first.
+
+Follow it with `## 2. Model capabilities` and 2–3 short paragraphs:
 
 - paragraph 1: what the model does and where it is genuinely strong;
 - paragraph 2: when to choose it and the most important limitation or tradeoff;
 - optional paragraph/table: checkpoint or mode routing that a user must understand before serving.
 
-Keep the lead prose between roughly 45 and 180 words. Replace marketing superlatives with
+Keep the capability lead between roughly 45 and 180 words. Replace marketing superlatives with
 concrete capabilities. A reader should learn more than “this is a powerful image/video
 model,” but should not have to read the architecture section to choose the right model.
 
@@ -76,9 +81,11 @@ model-by-model migrations.
 ## Review checklist
 
 - tags render before section 1 and describe the model rather than the runtime;
-- the first screen explains capability, strength, and boundary without marketing filler;
+- Quick start puts installation and the generated commands before detailed model background;
+- the capability section explains strength and boundary without marketing filler;
 - checkpoint variants and request modes are unambiguous;
-- the builder separates Setup, Server, and Request inputs while keeping both output commands visible;
+- the builder separates Setup, Server, and Request inputs while keeping both output commands available;
+- command bodies grow naturally up to their collapsed limit and do not reserve empty height;
 - topology-dependent recommended defaults are explicit in the setting summary and generated command;
 - legal custom topologies are Unverified and copyable; statically illegal combinations block Copy;
 - attention, quantization, caching, compile, and similar orthogonal features have explicit

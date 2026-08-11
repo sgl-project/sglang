@@ -6,10 +6,38 @@ metatags:
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
 
 <DiffusionModelTags tags={["video + audio", "T2VA / FL2VA / Ref2VA", "multimodal references", "4–15 seconds", "768p"]} />
 
-## 1. Model Introduction
+## 1. Quick start
+
+Install with `uv pip install "sglang[diffusion]" --prerelease=allow`, then choose
+a verified recipe below. Setup changes the deployment; Server and Request expose
+orthogonal startup and sampling choices.
+
+<Deployment config={config} />
+
+<Note>
+The generated Server command already includes the recommended encoder policy.
+Change a Server option only for a deliberate trade-off; Request options do not
+reload the model.
+</Note>
+
+The Docker form installs the platform-specific diffusion extra from the source
+bundled in the image. For conditioned requests, set **Host media directory**
+under **Variables**; the builder mounts it read-only at `/data/minimax-h3`.
+AMD currently offers the Python form, while NVIDIA also offers Docker.
+
+To use ModelScope through the same normal `sglang serve` path, prefix the copied
+command with `SGLANG_USE_MODELSCOPE=true` and replace the model path with
+`MiniMax/MiniMax-H3`. Keep the selected variant and topology flags unchanged.
+
+For platform-specific installation details, see the
+[SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 2. Model capabilities
 
 [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) is a native joint video-and-audio model for text-to-video-and-audio, first/last-frame control, and multimodal reference conditioning. Its main strength is producing the picture and stereo soundtrack together, so speech, music, ambient sound, and visible events can stay aligned without a separate audio-generation pass.
 
@@ -35,52 +63,12 @@ mapping; do not point `--model-path` at a manually downloaded subdirectory.
 Review the license and usage terms in the MiniMax-H3 model card before production or commercial use. SGLang support does not grant additional model usage rights.
 </Warning>
 
-## 2. Installation
+## 3. Deployment details
 
-Install SGLang with the diffusion dependencies:
-
-```bash Command
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
-
-For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
-
-## 3. Serve MiniMax-H3
-
-Use the builder below to choose hardware, resources, checkpoint weights, and
-request mode. It starts from the fastest verified recipe for each platform,
-then lets you change the GPU count or inspect TP, Ulysses, and Ring under
-**Advanced topology**. A valid custom topology remains copyable and is marked
-**Unverified**; a shape that violates H3's head or partition constraints is
-blocked before it reaches `sglang serve`.
-
-The Docker form does not assume the base SGLang image contains optional
-diffusion dependencies. It installs the platform-specific diffusion extra from
-the source bundled in the image before starting the server. Set **Host media
-directory** under **Variables** for FL2VA, V2V, or Ref2VA; the builder mounts
-that directory read-only at `/data/minimax-h3` inside the container.
-
-**Server options** change the complete launch command and make topology-dependent
-defaults—especially encoder placement—visible. **Request options** change only
-the cURL payload, including the audited quality preset and 1–10 outputs. The
-Serve and Request cards stay visible together so the lifecycle boundary is
-explicit. AMD currently offers the Python form; NVIDIA also offers Docker.
-
-import { Deployment } from "/src/snippets/_deployment.jsx";
-import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
-
-<Deployment config={config} />
-
-<Note>
-The generated Server command already includes the recommended encoder policy.
-Change a Server option only for a deliberate trade-off; Request options do not
-reload the model.
-</Note>
-
-The selector uses the verified Hugging Face ID. To use ModelScope through the
-same normal `sglang serve` path, prefix the copied command with
-`SGLANG_USE_MODELSCOPE=true` and replace the model path with
-`MiniMax/MiniMax-H3`; keep its selected variant and topology flags unchanged.
+The builder accepts legal custom GPU counts and topologies, marking them
+**Unverified** until the exact recipe has completed end-to-end validation.
+Static H3 head or partition violations disable Copy before they reach
+`sglang serve`.
 
 For a four-card H200 host, keep the full BF16/FP32 model resident by default.
 The model fits without FSDP, so this path avoids the per-block parameter
