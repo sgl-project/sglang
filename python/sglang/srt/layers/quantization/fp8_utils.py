@@ -1766,8 +1766,9 @@ def apply_fp8_linear(
     use_cutlass_channelwise_gemm = (
         channelwise_cutlass and cutlass_compatible_b and not use_triton_w8a8_fp8_kernel
     )
-    # Opt-in: consider a tuned Triton tile only where the shape would otherwise
-    # go to CUTLASS (that is the path the offline sweep tuned against).
+    # Consider a tuned Triton tile only where the shape would otherwise go to
+    # CUTLASS (that is the path the offline sweep tuned against). On by default;
+    # SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 is the kill switch.
     use_tuned_triton_channelwise = (
         use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
     )
