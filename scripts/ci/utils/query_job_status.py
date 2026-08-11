@@ -9,7 +9,7 @@ Usage:
     python scripts/ci/utils/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x-rocm720" --workflow "pr-test-amd-rocm720.yml" --input-data-file actions-job-snapshot.json --summary
 
     # Runner fleet report (cross-workflow runner analytics)
-    python scripts/ci/utils/query_job_status.py --runner-report --workflow "pr-test-amd-rocm720.yml,nightly-test-amd.yml" --hours 24
+    python scripts/ci/utils/query_job_status.py --runner-report --workflow "pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" --hours 24
     python scripts/ci/utils/query_job_status.py --runner-report --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" --summary
     python scripts/ci/utils/query_job_status.py --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" --dump-data-file actions-job-snapshot.json
 

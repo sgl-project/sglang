@@ -120,7 +120,7 @@ jobs:
       pr_jobs: ${{ steps.parse.outputs.pr_jobs }}
       nightly_jobs: ${{ steps.parse.outputs.nightly_jobs }}
       pr_rocm700_jobs: ${{ steps.parse.outputs.pr_rocm700_jobs }}
-      nightly_rocm720_jobs: ${{ steps.parse.outputs.nightly_rocm720_jobs }}
+      nightly_rocm700_jobs: ${{ steps.parse.outputs.nightly_rocm700_jobs }}
       disagg_jobs: ${{ steps.parse.outputs.disagg_jobs }}
     steps:
       - name: Checkout code
@@ -137,9 +137,9 @@ jobs:
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"
 
-          # Parse nightly-test-amd.yml and extract job names (exclude utility jobs)
+          # Parse the default ROCm 7.2 nightly (exclude utility jobs)
           # Excluded: check-all-jobs
-          nightly_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd.yml | \
+          nightly_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd-rocm720.yml | \
             grep -v -E '^(check-all-jobs)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "nightly_jobs=$nightly_jobs" >> $GITHUB_OUTPUT
@@ -153,13 +153,13 @@ jobs:
           echo "pr_rocm700_jobs=$pr_rocm700_jobs" >> $GITHUB_OUTPUT
           echo "PR ROCm 7.0 shadow jobs: $pr_rocm700_jobs"
 
-          # Parse nightly-test-amd-rocm720.yml (exclude utility jobs)
+          # Parse the ROCm 7.0 rollback shadow nightly (exclude utility jobs)
           # Excluded: check-all-jobs
-          nightly_rocm720_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd-rocm720.yml | \
+          nightly_rocm700_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd.yml | \
             grep -v -E '^(check-all-jobs)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "nightly_rocm720_jobs=$nightly_rocm720_jobs" >> $GITHUB_OUTPUT
-          echo "Nightly ROCm 7.2 jobs: $nightly_rocm720_jobs"
+          echo "nightly_rocm700_jobs=$nightly_rocm700_jobs" >> $GITHUB_OUTPUT
+          echo "Nightly ROCm 7.0 shadow jobs: $nightly_rocm700_jobs"
 
           # Parse nightly-amd-mi355x-disagg.yml (exclude utility jobs)
           # Excluded: setup, collect-results -- both run on ubuntu-latest and the
@@ -243,7 +243,7 @@ jobs:
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --job "${{ matrix.job_name }}" \
-            --workflow "nightly-test-amd.yml" \
+            --workflow "nightly-test-amd-rocm720.yml" \
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
@@ -287,16 +287,16 @@ jobs:
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
 
-  # Nightly ROCm 7.2 reports using dynamic matrix
-  nightly-rocm720-reports:
-    name: Nightly ROCm720 - ${{ matrix.job_name }}
+  # ROCm 7.0 rollback-shadow nightly reports using dynamic matrix
+  nightly-rocm700-reports:
+    name: Nightly ROCm700 Shadow - ${{ matrix.job_name }}
     needs: [parse-workflows, fetch-actions-data]
     if: ${{ !inputs.job_filter }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        job_name: ${{ fromJson(needs.parse-workflows.outputs.nightly_rocm720_jobs) }}
+        job_name: ${{ fromJson(needs.parse-workflows.outputs.nightly_rocm700_jobs) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -315,13 +315,13 @@ jobs:
           name: actions-job-snapshot
           path: ci-data
 
-      - name: Generate Nightly ROCm 7.2 Report
+      - name: Generate Nightly ROCm 7.0 Shadow Report
         timeout-minutes: 15
         run: |
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --job "${{ matrix.job_name }}" \
-            --workflow "nightly-test-amd-rocm720.yml" \
+            --workflow "nightly-test-amd.yml" \
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
