@@ -253,6 +253,7 @@ class ServerArgsAutoTuner:
         if (
             args.layerwise_offload_components is not None
             or args.dit_layerwise_offload is True
+            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             return
         if not current_platform.is_cuda():
@@ -410,6 +411,7 @@ class ServerArgsAutoTuner:
         if (
             args.is_arg_explicitly_set("layerwise_offload_components")
             or args.dit_layerwise_offload is True
+            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             # The legacy --dit-layerwise-offload flag is a DiT-only selector.
             # Do not merge implicit defaults into that explicit mode.
@@ -478,6 +480,7 @@ class ServerArgsAutoTuner:
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.is_arg_explicitly_set("dit_cpu_offload")
+            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             return False
 
@@ -545,6 +548,7 @@ class ServerArgsAutoTuner:
                 "dit_cpu_offload",
                 "dit_layerwise_offload",
                 "layerwise_offload_components",
+                "cpu_offload_components",
             )
         )
 
@@ -555,6 +559,7 @@ class ServerArgsAutoTuner:
             for arg_name in (
                 "dit_layerwise_offload",
                 "layerwise_offload_components",
+                "cpu_offload_components",
             )
         )
 
