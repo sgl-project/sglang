@@ -1889,10 +1889,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             committed_output_id = output_id[0].item()
         decode_req.req.output_ids.append(committed_output_id)
         if not replayed_boundary:
-            think_end_id = self.scheduler.model_config.think_end_id
-            if decode_req.req.require_reasoning and think_end_id is not None:
+            think_end_ids = self.scheduler.model_config.think_end_ids
+            if decode_req.req.require_reasoning and think_end_ids:
                 decode_req.req.update_reasoning_tokens(
-                    committed_output_id, think_end_id
+                    committed_output_id, think_end_ids
                 )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
