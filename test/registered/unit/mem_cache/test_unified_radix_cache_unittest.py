@@ -2564,6 +2564,13 @@ class UnifiedRadixCacheSuite:
         )
         req_id = "abort-req"
 
+        cc = cons.cache_controller
+        kv_pool_available_size_before = cc.mem_pool_host.get_pool(
+            PoolName.KV
+        ).available_size()
+        swa_pool_available_size_before = cc.mem_pool_host.get_pool(
+            PoolName.SWA
+        ).available_size()
         occupied_before = cons.cache_controller.prefetch_tokens_occupied
         cons.prefetch_from_storage(
             req_id, cons.root_node.id, array("q", seq), None, None
@@ -2581,76 +2588,85 @@ class UnifiedRadixCacheSuite:
             HybridCacheController,
         )
 
-        original_sidecar = HybridCacheController._page_transfer_sidecar
+        original_sidecar = HybridCacheController._page_transfer
         entered = threading.Event()
         gate = threading.Event()
+        swa_release_q = cc.extra_host_mem_release_queues.get(PoolName.SWA)
 
-        def sidecar_barrier(self_, op):
+        def _page_transfer_hook(_self, op):
             # Signal that the worker has reached the sidecar step, then block
             # until the main thread releases the gate.
             entered.set()
             gate.wait(timeout=10.0)
             # Forward to the real implementation so the worker runs the
             # terminate-aware release path itself.
-            original_sidecar(self_, op)
+            original_sidecar(_self, op)
 
+        # Simulate a slow prefetch IO.  Hook on _page_transfer.
         with mock.patch.object(
-            HybridCacheController, "_page_transfer", sidecar_barrier
+            HybridCacheController, "_page_transfer", _page_transfer_hook
         ):
-            # Pump until the storage-hit queue has been drained, host_indices
-            # are bound, and the IO aux thread has entered the sidecar barrier.
+            # Pump until the IO aux thread has entered the sidecar barrier.
             deadline = time.time() + 10.0
             while time.time() < deadline:
                 cons.drain_storage_control_queues()
                 op = cons.ongoing_prefetch[req_id].operation
-                if op.host_indices is not None and entered.is_set():
+                if entered.is_set():
                     break
                 time.sleep(0.01)
             else:
                 self.fail("prefetch did not reach the sidecar barrier in time")
 
-            op = cons.ongoing_prefetch[req_id].operation
-            self.assertIsNotNone(op.host_indices)
-            self.assertFalse(op.pool_transfers_done)
+        # Now, the prefetch IO thread is stopping at _page_transfer.
+        # Let the scheduler thread calls release_aborted_request.
+        # Assert that everything will not be released.
+        op = cons.ongoing_prefetch[req_id].operation
+        self.assertFalse(op.pool_transfers_done)
+        self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
+        self.assertEqual(swa_release_q.qsize(), 0)
+        cons.release_aborted_request(req_id)
+        self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
+        self.assertEqual(swa_release_q.qsize(), 0)
 
-            # Extra pool (SWA) must not have been released yet.
-            swa_release_q = cons.cache_controller.extra_host_mem_release_queues.get(
-                PoolName.SWA
-            )
-            self.assertIsNotNone(swa_release_q)
-            self.assertEqual(swa_release_q.qsize(), 0)
-
-            # --- Act: abort while the worker is blocked in the sidecar. ---
-            cons.release_aborted_request(req_id)
-
-        # Release the worker: it now sees _terminated_flag set, so
-        # complete_pool_transfers returns False and the worker falls through to
-        # `append_host_mem_release(extra_pools=operation.pool_transfers)`.
+        # Let the prefetch IO thread continue to run.
         gate.set()
 
-        # Wait for the worker to push the SWA pool into the release queue.
+        # Wait for the IO thread has completed prefetch.
+        # We don't consume release queue, as we will use that later to check whether
+        # the host memory was released yet (as used by the prefetch IO thread).
         deadline = time.time() + 10.0
         while time.time() < deadline:
+            cons._drain_storage_control_queues_impl(
+                n_storage_hit=0,
+                n_ack_prefetch=min(1, cc.ack_prefetch_queue.qsize()),
+                n_backup=0,
+                n_release=0,
+                extra_release_counts=None,
+                log_metrics=True,
+            )
             if swa_release_q.qsize() > 0:
                 break
             time.sleep(0.01)
         else:
             self.fail("SWA extra pool was not released after the abort")
 
-        # --- Asserts after the abort. ---
-        # pool_transfers_done never flipped (terminate raced ahead of
-        # complete_pool_transfers); the SWA extra pool was released by the
-        # worker's fallback path.
+        # Asserts that everything is correctly released.
         self.assertFalse(op.pool_transfers_done)
-        cc = cons.cache_controller
         self.assertGreater(cc.host_mem_release_queue.qsize(), 0)
         self.assertGreater(swa_release_q.qsize(), 0)
         self.assertNotIn(req_id, cons.ongoing_prefetch)
         self.assertNotIn(req_id, cons.prefetch_loaded_tokens_by_reqid)
-        self.assertEqual(
-            cons.cache_controller.prefetch_tokens_occupied, occupied_before
-        )
+        self.assertEqual(cc.prefetch_tokens_occupied, occupied_before)
 
+        cons.drain_storage_control_queues()  # Drain release queue.
+        self.assertEqual(
+            cc.mem_pool_host.get_pool(PoolName.KV).available_size(),
+            kv_pool_available_size_before,
+        )
+        self.assertEqual(
+            cc.mem_pool_host.get_pool(PoolName.SWA).available_size(),
+            swa_pool_available_size_before,
+        )
         cons.sanity_check()
 
     def test_release_aborted_request_l3_prefetch_io_done(self):
@@ -2703,7 +2719,14 @@ class UnifiedRadixCacheSuite:
         )
         req_id = "abort-req"
 
-        occupied_before = cons.cache_controller.prefetch_tokens_occupied
+        cc = cons.cache_controller
+        kv_pool_available_size_before = cc.mem_pool_host.get_pool(
+            PoolName.KV
+        ).available_size()
+        swa_pool_available_size_before = cc.mem_pool_host.get_pool(
+            PoolName.SWA
+        ).available_size()
+        occupied_before = cc.prefetch_tokens_occupied
         cons.prefetch_from_storage(
             req_id, cons.root_node.id, array("q", seq), None, None
         )
@@ -2711,24 +2734,35 @@ class UnifiedRadixCacheSuite:
             cons.cache_controller.prefetch_tokens_occupied,
             occupied_before + len(seq),
         )
-        self.assertIn(req_id, cons.ongoing_prefetch)
+        op = cons.ongoing_prefetch[req_id].operation
 
-        cc = cons.cache_controller
         swa_release_q = cc.extra_host_mem_release_queues.get(PoolName.SWA)
         self.assertIsNotNone(swa_release_q)
 
-        # Pump drain until the completion of L3 prefetch IO.
+        # Simulate polling check_hicache_events.
+        # There will be a sequence of events populated from queue:
+        # 1. a storage hit notification (from cc.prefetch_hit_queue).
+        # 2. a HiCacheAck, indicating the copmletion of KV pool read.
+        # 3. a HiCacheAck, indicating the completion of SWA pool read.
+        # 4. a HiCacheACk, idnicating the completion of entire prefetch request.
+        # We are going to stop at the exact timing-window between 3 and 4.  So we have to
+        # consume ONE event from the queue at each iteration.
         deadline = time.time() + 10.0
         while time.time() < deadline:
-            cons.drain_storage_control_queues()
-            op = cons.ongoing_prefetch[req_id].operation
-            if op.host_indices is not None and op.pool_transfers_done:
+            cons._drain_storage_control_queues_impl(
+                n_storage_hit=min(1, cc.prefetch_hit_queue.qsize()),
+                n_ack_prefetch=min(1, cc.ack_prefetch_queue.qsize()),
+                n_backup=0,
+                n_release=0,
+                extra_release_counts=None,
+                log_metrics=True,
+            )
+            if op.pool_transfers_done:
                 break
             time.sleep(0.01)
         else:
             self.fail("prefetch IO did not complete (pool_transfers_done) in time")
 
-        op = cons.ongoing_prefetch[req_id].operation
         self.assertIsNotNone(op.host_indices)
         self.assertTrue(op.pool_transfers_done)
         self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
@@ -2743,6 +2777,16 @@ class UnifiedRadixCacheSuite:
         self.assertNotIn(req_id, cons.ongoing_prefetch)
         self.assertNotIn(req_id, cons.prefetch_loaded_tokens_by_reqid)
         self.assertEqual(cc.prefetch_tokens_occupied, occupied_before)
+
+        cons.drain_storage_control_queues()  # Drain release queue.
+        self.assertEqual(
+            cc.mem_pool_host.get_pool(PoolName.KV).available_size(),
+            kv_pool_available_size_before,
+        )
+        self.assertEqual(
+            cc.mem_pool_host.get_pool(PoolName.SWA).available_size(),
+            swa_pool_available_size_before,
+        )
 
         cons.sanity_check()
 
@@ -2886,7 +2930,7 @@ class UnifiedRadixCacheSuite:
 
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
-        self._patch_tp_all_reduce(cons, drop_swa=True)
+        self._patch_tp_prefetch_sync(cons, drop_swa=True)
         avail_before = cons.swa_kv_pool_host.available_size()
         self._consume_prefetch(cons, seq, "drop")
 
@@ -2897,6 +2941,7 @@ class UnifiedRadixCacheSuite:
             0,
         )
         # Whole window dropped -> its host buffer is fully released back.
+        cons.drain_storage_control_queues()  # Drain the release queue.
         self.assertEqual(cons.swa_kv_pool_host.available_size(), avail_before)
 
     def test_hicache_write_back_evict_drops_unbacked_leaf_when_host_full(self):
@@ -6372,12 +6417,14 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         insert_result.prefix_len = 4
         insert_result.host_insert_dropped = False
         cache.tree_core.insert_host.return_value = insert_result
+        operation = mock.MagicMock()
+        operation.request_id = "req"
         cache.ongoing_prefetch = {
-            "req": (
+            operation.request_id: (
                 7,
                 list(range(8)),
                 list(range(100, 108)),
-                mock.MagicMock(),
+                operation,
                 None,
                 {},
             )
@@ -6386,9 +6433,11 @@ class TestPrefetchCommitOrdering(CustomTestCase):
             8,
             [f"h{i}" for i in range(8)],
         )
-        cache._sync_and_check_hybrid_prefetch_result.return_value = 8
+        cache._check_hybrid_prefetch_result.return_value = 8
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.can_terminate_prefetch.return_value = True
+        cache.pp_rank = 0
 
         order = mock.MagicMock()
         applied = []
@@ -6400,6 +6449,11 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         order.apply.side_effect = record_apply
         cache._apply_cache_actions = order.apply
         cache.tree_core.commit_hicache_transfers = order.commit
+
+        def _handle_prefetch_result(operation):
+            UnifiedRadixCache._handle_prefetch_result(cache, operation)
+
+        cache._handle_prefetch_result = _handle_prefetch_result
 
         self.assertTrue(UnifiedRadixCache.check_prefetch_progress(cache, "req"))
 
@@ -6536,6 +6590,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
 
         operation = mock.Mock()
         operation.host_indices = host_indices
+        operation.completed_tokens = completed_tokens
         operation.pool_storage_result = PoolTransferResult(
             kv_hit_pages=completed_tokens // self.ps,
             extra_pool_hit_pages={
@@ -6545,6 +6600,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         )
         anchor_lock_params = cache.inc_host_lock_ref(parent_id).to_dec_params()
         req_id = "drop-all-resources"
+        operation.request_id = req_id
         cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
             parent_id,
             prefetch_key,
@@ -6555,6 +6611,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         )
         cache.cache_controller.prefetch_tokens_occupied = completed_tokens
         hashes = [f"h{i}" for i in range(completed_tokens // self.ps)]
+        operation.hash_value = hashes
 
         with (
             mock.patch.object(cache, "can_terminate_prefetch", return_value=True),
@@ -6562,7 +6619,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
             # step: treat the whole fetched prefix as usable so the insert runs.
             mock.patch.object(
                 cache,
-                "_sync_and_check_hybrid_prefetch_result",
+                "_check_hybrid_prefetch_result",
                 return_value=completed_tokens,
             ),
             mock.patch.object(
@@ -6575,6 +6632,11 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
             mock.patch.object(
                 cache.cache_controller, "append_host_mem_release"
             ) as release,
+            mock.patch.object(
+                operation,
+                "is_terminated",
+                return_value=False,
+            ),
         ):
             self.assertTrue(cache.check_prefetch_progress(req_id))
 
