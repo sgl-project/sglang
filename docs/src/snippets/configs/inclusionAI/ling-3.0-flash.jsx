@@ -62,6 +62,7 @@ export const config = {
   --model {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
+  --random-range-ratio 1 \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
   --flush-cache`,
     accuracy: {
@@ -421,11 +422,6 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
         "--mem-fraction-static 0.85",
-        "--disable-flashinfer-autotune",
-        "--enable-fp32-lm-head",
-        "--max-mamba-cache-size 320",
-        "--chunked-prefill-size 8192",
-        "--allow-auto-truncate",
         "--tool-call-parser ling3",
         "--reasoning-parser ling3",
         "--host {{HOST_IP}}",
@@ -439,11 +435,6 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
         "--mem-fraction-static 0.85",
-        "--disable-flashinfer-autotune",
-        "--enable-fp32-lm-head",
-        "--max-mamba-cache-size 320",
-        "--chunked-prefill-size 8192",
-        "--allow-auto-truncate",
         "--tool-call-parser ling3",
         "--reasoning-parser ling3",
         "--host {{HOST_IP}}",
@@ -458,11 +449,6 @@ sgl-eval run gsm8k \\
         "--tp 2",
         "--moe-runner-backend flashinfer_mxfp4",
         "--mem-fraction-static 0.85",
-        "--disable-flashinfer-autotune",
-        "--enable-fp32-lm-head",
-        "--max-mamba-cache-size 320",
-        "--chunked-prefill-size 8192",
-        "--allow-auto-truncate",
         "--tool-call-parser ling3",
         "--reasoning-parser ling3",
         "--host {{HOST_IP}}",
@@ -472,19 +458,12 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_DSV4_FP4_DEQUANT=1",
-      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
+        "--moe-runner-backend flashinfer_mxfp4",
         "--fp8-gemm-backend triton",
-        "--mem-fraction-static 0.8",
-        "--disable-flashinfer-autotune",
-        "--enable-fp32-lm-head",
-        "--max-mamba-cache-size 320",
-        "--chunked-prefill-size 8192",
-        "--allow-auto-truncate",
+        "--mem-fraction-static 0.85",
         "--tool-call-parser ling3",
         "--reasoning-parser ling3",
         "--host {{HOST_IP}}",
