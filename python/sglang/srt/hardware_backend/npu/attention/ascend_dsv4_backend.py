@@ -1826,9 +1826,7 @@ class DeepseekV4AscendAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            max_seqlen_q = self._draft_token_num_from_spec_info(
-                forward_batch.spec_info
-            )
+            max_seqlen_q = self._draft_token_num_from_spec_info(forward_batch.spec_info)
         else:
             max_seqlen_q = 1
         return self._kernel_metadata_from_parts(
