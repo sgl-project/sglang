@@ -4,7 +4,7 @@ Both run on the speculative target-verify path only, and only on dcp_rank 0:
 
 * stage B  -- ``dense_causal_mla_attn_base2``: dense causal attention over the
   in-hand ``gamma + 1`` window, returning ``(out, base-2 lse)``.
-* the merge -- ``lse_combine_base2``: folds stage B into stage A (the rank's
+* the merge -- ``dcp_lse_combine_base2``: folds stage B into stage A (the rank's
   committed KV shard) over disjoint key sets.
 
 Both were torch before; the ``torch`` provider below is the implementation they
@@ -30,8 +30,8 @@ import torch
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.attention.dcp_kernels import (
+    dcp_lse_combine_base2,
     dense_causal_mla_attn_base2,
-    lse_combine_base2,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -123,7 +123,7 @@ def benchmark_lse_combine(bs: int, q_len: int, impl: str):
     out_b = torch.randn(n_rows, NUM_HEADS, KV_LORA_RANK, dtype=DTYPE, device=DEV)
     lse_a = torch.randn(n_rows, NUM_HEADS, dtype=torch.float32, device=DEV)
     lse_b = torch.randn(n_rows, NUM_HEADS, dtype=torch.float32, device=DEV)
-    fn = lse_combine_base2 if impl == "triton" else _torch_lse_combine
+    fn = dcp_lse_combine_base2 if impl == "triton" else _torch_lse_combine
     return marker.do_bench(
         fn,
         input_args=(out_a, lse_a, out_b, lse_b, DTYPE),

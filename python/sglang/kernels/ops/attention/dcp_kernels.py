@@ -584,18 +584,6 @@ def _lse_weighted_combine_cpu(
 
 # ---------------------------------------------------------------------------
 # aiter MLA DCP: page-table build, KV page packing, and the split-KV reduce.
-#
-# aiter's ``mla_decode_fwd(..., skip_reduce=True)`` returns the per-segment
-# partials ``(segm_output, segm_max, segm_expsum)`` but its own reduce kernel
-# only writes the merged ``output`` -- no LSE. DCP needs the LSE of each rank's
-# KV shard to merge partial attention across ranks (``cp_lse_ag_out_rs_mla`` ->
-# ``correct_attn_out``, base-2), so ``dcp_reduce_kv_segments`` below replicates aiter's
-# reduce math and additionally writes
-# ``lse = overall_max + log2(overall_expsum)``.
-#
-# Note these are an INTRA-rank reduce over aiter's split-KV segments, distinct
-# from ``correct_attn_out`` / ``dcp_lse_combine_triton`` above, which merge
-# across ranks.
 # ---------------------------------------------------------------------------
 
 
@@ -612,22 +600,22 @@ def build_dcp_page_table(
 ):
     """Build this rank's PAGE table for aiter's ``mla_decode_fwd``.
 
-    mla_decode_fwd derives its KV tile straight from the paged block size
-    (``TILE_SIZE == block_size``; the MLA kernel asserts
-    ``NUM_BLOCKS_GATHER_PER_TILE == 1``), so a block size of 1 collapses every
-    tile to a single token: measured on gfx950 that is ~19x slower than a block
-    size of 16 at the same KV volume (27 vs 511 GB/s), and it dominated the DCP
-    decode step (~96% of a 128k-context ITL).
+    Args:
+        req_to_token:     [max_reqs, max_context_len] virtual token locations
+        req_pool_indices: [B] row of req_to_token per request
+        local_kv_lens:    [B] this rank's shard length per request, in TOKENS
+                          (the kernel's ``seqused_k``); the table itself is
+                          indexed in PAGES
+        bs:               number of requests
+        max_pages:        columns to allocate, i.e. the per-graph page bound
+        page_size:        PHYSICAL page size; the allocator's virtual page is
+                          ``page_size * dcp_size``
+        dcp_size:         DCP world size
+        dcp_rank:         this rank
+        out:              [B, max_pages] int32 to fill, allocated if None
 
-    Under DCP the allocator's page is ``page_size * dcp_size`` (see
-    kv_cache_builder), so each rank holds ``page_size`` CONTIGUOUS physical
-    slots per virtual page and the shard can be addressed by page. The
-    per-token owner rule is unchanged (``pos % dcp_size == rank``, physical
-    ``pos // dcp_size``); paging only guarantees the contiguity that lets the
-    tile match the page.
-
-    ``local_kv_lens`` is this rank's shard length per request, in TOKENS
-    (the kernel's ``seqused_k``); the table itself is indexed in pages.
+    Returns:
+        [B, max_pages] int32 page table (``out`` when provided)
     """
     if out is None:
         out = torch.zeros(bs, max_pages, dtype=torch.int32, device=req_to_token.device)
@@ -679,22 +667,19 @@ def pack_dcp_kv_into_pages(
     bs: int,
     page_size: int,
 ):
-    """Repack the per-forward ``dcp_kv_buffer`` into a paged staging buffer for
-    aiter's ``mla_prefill_fwd``.
+    """Repack the assembled ``dcp_kv_buffer`` into pages for ``mla_prefill_fwd``.
 
-    The assembled buffer is laid out as [all requests' gathered prefixes | all
-    requests' extend tokens], so a request's sequence is split across two
-    regions and cannot be addressed by page (the kernel requires every page but the
-    sequence's last to be full). Repacking into per-request page-aligned regions
-    lets the KV tile match the page: the kernel takes TILE_SIZE straight from
-    the block size, and at block size 1 a 16384x16384 chunk measured 5156 ms vs
-    39 ms at 64 on gfx950 (~131x).
+    Args:
+        kv_buffer:  [total_tokens, 1, D] the all-gathered full-sequence latent KV
+        kv_indptr:  [bs + 1] per-request boundaries into ``kv_indices``
+        kv_indices: [total_tokens] sequence position -> row of ``kv_buffer``
+        bs:         number of requests
+        page_size:  staging page size (``_DCP_PREFILL_PAGE_SIZE``, independent of
+                    the KV pool's --page-size)
 
-    The layout of ``dcp_kv_buffer`` itself is left alone -- flashinfer_mla reads
-    the same buffer. The copy is one pass over the batch's KV (a prefill batch
-    holds only the few requests of one chunk), which the attention saving dwarfs.
-
-    Returns (paged_kv [n_pages, page_size, 1, D], block_tables [bs, max_pages]).
+    Returns:
+        paged_kv:     [n_pages, page_size, 1, D] page-aligned per request
+        block_tables: [bs, max_pages] int32
     """
     total, _, dim = kv_buffer.shape[0], kv_buffer.shape[1], kv_buffer.shape[-1]
     device = kv_buffer.device
@@ -754,7 +739,7 @@ def _dcp_reduce_kv_segments_kernel(
     # A rank owns no committed KV for a request whose prefix is shorter than the
     # rank index, so an all-zero shard length is a normal input here (the planner
     # clamps local_kv_lens to min 0, not min 1). Emit the identity element of the
-    # LSE merge -- out = 0 with lse = -inf, which lse_combine_base2 and
+    # LSE merge -- out = 0 with lse = -inf, which dcp_lse_combine_base2 and
     # cp_lse_ag_out_rs_mla both weight to zero.
     #
     # This has to be an early return, not a mask on the result: with seq_len 0
@@ -822,16 +807,27 @@ def dcp_reduce_kv_segments(
     tile_size: int,
     out_dtype: torch.dtype,
 ):
-    """Reduce mla_decode_fwd skip_reduce partials to (out, lse2).
+    """Reduce ``mla_decode_fwd(skip_reduce=True)`` partials to (out, base-2 lse).
 
     Args:
-        segm_output: [num_tokens, H, NUM_SEGMENTS, KV_LORA_RANK]
-        segm_max / segm_expsum: [num_tokens, H, NUM_SEGMENTS]
-        seq_lens: [num_tokens] local (this-rank) kv length per token
-        tile_size: kernel TILE_SIZE (== paged block_size passed to mla_decode_fwd)
+        segm_output: [num_tokens, H, NUM_SEGMENTS, KV_LORA_RANK] unnormalized
+                     per-segment output
+        segm_max:    [num_tokens, H, NUM_SEGMENTS] per-segment score max
+        segm_expsum: [num_tokens, H, NUM_SEGMENTS] per-segment softmax denominator
+        seq_lens:    [num_tokens] this rank's shard length per token; 0 is legal
+                     and yields the merge identity (out 0, lse -inf)
+        tile_size:   kernel TILE_SIZE (== the paged block_size handed to
+                     mla_decode_fwd), which sets how segments were sized
+        out_dtype:   dtype of the returned output
+
     Returns:
-        out: [num_tokens, H, KV_LORA_RANK] (out_dtype)
+        out: [num_tokens, H, KV_LORA_RANK] in ``out_dtype``
         lse: [num_tokens, H] float32, base-2
+
+    The segments are a split-KV device INSIDE one rank, not the cross-rank DCP
+    shards -- see the section header above. aiter's own reduce writes only the
+    merged output, so this one exists to additionally emit the LSE that the
+    cross-rank merge needs as a weight.
     """
     num_tokens, num_heads, num_segments, kv_lora_rank = segm_output.shape
     out = torch.empty(
@@ -982,22 +978,20 @@ def dense_causal_mla_attn_base2(
 ):
     """Dense causal MLA attention over one in-hand ``q_len``-token window.
 
-    Stage B of the DCP target-verify decomposition. The window is tiny
-    (``gamma + 1`` queries over the same ``gamma + 1`` keys), which is why this
-    is a purpose-built kernel rather than a paged one -- and it sidesteps two
-    kernel limitations that only bite inside the window: mla_decode_fwd derives
-    its causal mask from the LOCAL shard index (which under DCP is not the
-    global position), and its segmented reduce would need to mask the segments
-    the causal mask empties.
-
     Args:
-        q: [bs * q_len, num_heads, kv_lora_rank + qk_rope_head_dim]
-        k_window: [bs * q_len, 1, kv_lora_rank + qk_rope_head_dim] latent KV of
-            the window tokens, in query order. ``v`` is its first
-            ``kv_lora_rank`` columns (MLA absorb form).
+        q:            [bs * q_len, num_heads, kv_lora_rank + qk_rope_head_dim]
+        k_window:     [bs * q_len, 1, kv_lora_rank + qk_rope_head_dim] latent KV
+                      of the window tokens, in query order; ``v`` is its first
+                      ``kv_lora_rank`` columns (MLA absorb form), not a separate
+                      tensor
+        scaling:      softmax scale
+        bs:           number of requests
+        q_len:        window length per request (``gamma + 1``)
+        kv_lora_rank: nope width, i.e. where the rope half starts
 
-    Returns (out [bs * q_len, num_heads, kv_lora_rank] fp32,
-    lse [bs * q_len, num_heads] fp32 base-2).
+    Returns:
+        out: [bs * q_len, num_heads, kv_lora_rank] float32
+        lse: [bs * q_len, num_heads] float32, base-2
     """
     n_rows, num_heads, head_dim = q.shape
     pe_dim = head_dim - kv_lora_rank
@@ -1112,7 +1106,7 @@ def _dcp_lse_combine_pair_kernel(
     tl.store(out_lse_ptr + tok * out_lse_stride_t + head * out_lse_stride_h, lse)
 
 
-def lse_combine_base2(
+def dcp_lse_combine_base2(
     out_a: torch.Tensor,
     lse_a: torch.Tensor,
     out_b: torch.Tensor,
@@ -1121,10 +1115,19 @@ def lse_combine_base2(
 ):
     """Merge two partial attentions over DISJOINT key sets, given base-2 LSEs.
 
-    ``out_*`` are [tokens, heads, dim] and ``lse_*`` are [tokens, heads]. A
-    partial that saw no keys carries ``lse = -inf`` (what dcp_reduce_kv_segments writes
-    for an empty shard); its weight is 0. If BOTH are empty the result is
-    ``out = 0, lse = -inf`` rather than NaN.
+    Args:
+        out_a:     [tokens, heads, dim] first partial's output
+        lse_a:     [tokens, heads] its base-2 LSE; ``-inf`` means it saw no keys
+                   (what dcp_reduce_kv_segments writes for an empty shard), and
+                   weights it to 0
+        out_b:     [tokens, heads, dim] second partial's output
+        lse_b:     [tokens, heads] its base-2 LSE
+        out_dtype: dtype of the returned output
+
+    Returns:
+        out: [tokens, heads, dim] in ``out_dtype``; 0 where both partials are
+             empty, rather than NaN
+        lse: [tokens, heads] float32, base-2; ``-inf`` where both are empty
 
     This is the two-input case of ``dcp_lse_combine_triton`` above. It is a
     separate kernel because that one takes a stacked ``[N, B, H, D]`` tensor,

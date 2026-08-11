@@ -1038,14 +1038,14 @@ class AiterAttnBackend(AttentionBackend):
             return out_a, lse_a
 
         from sglang.kernels.ops.attention.dcp_kernels import (
+            dcp_lse_combine_base2,
             dense_causal_mla_attn_base2,
-            lse_combine_base2,
         )
 
         out_b, lse_b = dense_causal_mla_attn_base2(
             q, k_window, layer.scaling, bs, q_len, kv_lora_rank
         )
-        return lse_combine_base2(out_a, lse_a, out_b, lse_b, self.input_dtype)
+        return dcp_lse_combine_base2(out_a, lse_a, out_b, lse_b, self.input_dtype)
 
     def _mla_prefill_fwd_dcp(self, q, layer, k_descale, forward_batch):
         """DCP prefill (extend) on aiter's Triton absorb-prefill kernel."""
