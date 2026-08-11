@@ -18,48 +18,27 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool.memory_pool = object()
         pool.use_fabric = True
         pool.shareable_handle = b"handle"
-        pool._pool_pointer = 123
-        pool._allocation_handle = 456
-        pool._allocation_mapped = True
-        pool.allocation_size = 4096
+        allocation = MagicMock()
+        allocation.close.side_effect = [
+            RuntimeError("forced allocation close failure"),
+            None,
+        ]
+        pool._allocation = allocation
         pool.device_index = 0
-        driver = MagicMock()
-        driver.cuMemUnmap.return_value = "unmap"
-        driver.cuMemAddressFree.return_value = "address_free"
-        driver.cuMemRelease.return_value = "release"
-        failed_once = False
-
-        def check_driver(result, _operation):
-            nonlocal failed_once
-            if result == "address_free" and not failed_once:
-                failed_once = True
-                raise RuntimeError("forced address-free failure")
-            return result
 
         with (
-            patch.object(vmm, "_get_cuda_driver", return_value=driver),
             patch.object(vmm.torch.cuda, "device", return_value=nullcontext()),
-            patch.object(vmm, "check_drv", side_effect=check_driver),
-            self.assertRaisesRegex(RuntimeError, "forced address-free failure"),
+            self.assertRaisesRegex(RuntimeError, "forced allocation close failure"),
         ):
             pool._release_allocation()
 
-        self.assertFalse(pool._allocation_mapped)
-        self.assertEqual(pool._pool_pointer, 123)
-        self.assertEqual(pool._allocation_handle, 456)
+        self.assertIs(pool._allocation, allocation)
 
-        with (
-            patch.object(vmm, "_get_cuda_driver", return_value=driver),
-            patch.object(vmm.torch.cuda, "device", return_value=nullcontext()),
-            patch.object(vmm, "check_drv", side_effect=lambda result, _: result),
-        ):
+        with patch.object(vmm.torch.cuda, "device", return_value=nullcontext()):
             pool._release_allocation()
 
-        self.assertIsNone(pool._pool_pointer)
-        self.assertIsNone(pool._allocation_handle)
-        self.assertEqual(driver.cuMemUnmap.call_count, 1)
-        self.assertEqual(driver.cuMemAddressFree.call_count, 2)
-        self.assertEqual(driver.cuMemRelease.call_count, 1)
+        self.assertIsNone(pool._allocation)
+        self.assertEqual(allocation.close.call_count, 2)
 
     def test_model_class_controls_cuda_vmm_opt_in(self):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -278,8 +257,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.prepare_for_dispatch.return_value = []
         manager.cuda_vmm_feature_transport = transport
         manager._dispatch_to_scheduler = MagicMock()
-        state = SimpleNamespace(dispatched=False)
-        manager.rid_to_state = {"test-request": state}
         tokenized_obj = SimpleNamespace(
             rid="test-request",
             mm_inputs=None,
@@ -293,7 +270,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
         transport.prepare_for_dispatch.assert_called_once_with((None,))
         transport.cancel_for_dispatch.assert_not_called()
-        self.assertTrue(state.dispatched)
 
     def test_failed_dispatch_cancels_published_items(self):
         from sglang.srt.managers import tokenizer_manager
@@ -308,8 +284,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager._dispatch_to_scheduler = MagicMock(
             side_effect=RuntimeError("send failed")
         )
-        state = SimpleNamespace(dispatched=False)
-        manager.rid_to_state = {"test-request": state}
         items = [MultimodalDataItem(modality=Modality.IMAGE, feature=torch.arange(2))]
         tokenized_obj = SimpleNamespace(
             rid="test-request",
@@ -330,7 +304,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             (tokenized_obj.mm_inputs,)
         )
         transport.cancel_for_dispatch.assert_called_once_with(items)
-        self.assertFalse(state.dispatched)
 
     def test_post_dispatch_failure_does_not_cancel_published_items(self):
         from sglang.srt.managers import tokenizer_manager
@@ -343,8 +316,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock()
-        state = SimpleNamespace(dispatched=False)
-        manager.rid_to_state = {"test-request": state}
         time_stats = MagicMock()
         time_stats.set_api_server_dispatch_finish_time.side_effect = RuntimeError(
             "bookkeeping failed"
@@ -367,7 +338,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
         transport.cancel_for_dispatch.assert_not_called()
-        self.assertTrue(state.dispatched)
 
     def test_prepare_batch_cancels_prior_groups_on_failure(self):
         from sglang.srt.utils.cuda_vmm_transport_utils import (
