@@ -708,6 +708,10 @@ def _flash_attn_fwd(
         else:
             num_splits = 1
 
+    if qv is not None:
+        # The qv kernel has no split-KV variant.
+        num_splits = 1
+
     is_split_kv = num_splits > 1
     if is_split_kv:
         out_partial = torch.empty(
