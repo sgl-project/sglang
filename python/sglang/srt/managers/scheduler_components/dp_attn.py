@@ -38,8 +38,7 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
-# Keyed by group so a process holding several groups gets one region each; the
-# region must persist for the process lifetime (see symm_mem_gather).
+# Keyed by group: one region per group, kept for the process lifetime.
 _SYMM_GATHERERS: dict = {}
 
 

@@ -1,10 +1,8 @@
 """One-sided fixed-shape gather over torch symmetric memory.
 
-Each rank stores its row directly into every peer's buffer and then waits on a
-barrier. No NCCL communicator takes part, so this cannot contend with the
-forward's collectives for cross-communicator ordering -- the reason the
-scheduler's metadata gather can deadlock against draft-model collectives when
-it runs as an NCCL all-gather on a second communicator.
+Each rank stores its row into every peer's buffer, then waits on a barrier. No
+communicator takes part, so unlike an all-gather this needs no ordering against
+the forward's collectives.
 """
 
 import logging
@@ -16,19 +14,15 @@ logger = logging.getLogger(__name__)
 
 # A stuck peer raises instead of spinning forever.
 _BARRIER_TIMEOUT_MS = 10_000
-# Rows are read after the barrier while peers may already be storing the next
-# round; alternating regions gives the one round of slack that bounds it.
+# A peer's stores for round N+1 land before its barrier(N+1) returns, so one
+# region would be overwritten while a slower rank still reads round N.
 _NUM_SLOTS = 2
 
 
 class SymmMemGather:
-    """Fixed-shape all-gather over a persistent symmetric region.
-
-    The region is allocated once and rendezvoused once: a symmetric operand
-    must keep its address for its whole lifetime and resolve to the same
-    (region, offset) on every rank, which a per-forward pool allocation does
-    not satisfy.
-    """
+    """Allocated and rendezvoused once: a symmetric operand must keep its
+    address for its whole lifetime and resolve to the same (region, offset) on
+    every rank, which a per-forward pool allocation does not satisfy."""
 
     def __init__(
         self,
@@ -56,8 +50,8 @@ class SymmMemGather:
         self._width = width
         self._slot = 0
         rank = self._handle.rank
-        # A peer row is a plain tensor view of that peer's memory; writing it is
-        # a store over NVLink, which never blocks on the peer.
+        # A peer row is a tensor view of that peer's memory; writing it is a
+        # store that never blocks on the peer.
         self._peer_rows = [
             [
                 self._handle.get_buffer(peer, (_NUM_SLOTS, world_size, width), dtype)[
