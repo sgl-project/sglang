@@ -229,22 +229,16 @@ class BaseReasoningFormatDetector:
                 )
             if self.stream_reasoning:
                 # Minus any trailing slice that could be a token split across chunks.
-                holdback = self._ends_with_partial_token(
-                    current_text, self.think_end_token
-                )
+                holdback_tokens = [self.think_end_token]
                 if self.tool_start_token:
-                    holdback = max(
-                        holdback,
-                        self._ends_with_partial_token(
-                            current_text, self.tool_start_token
-                        ),
-                    )
+                    holdback_tokens.append(self.tool_start_token)
                 if not self.stripped_think_start:
                     # force_reasoning never saw the opening token; it can still split.
-                    holdback = max(
-                        holdback,
-                        self._ends_with_partial_token(current_text, think_start_text),
-                    )
+                    holdback_tokens.append(think_start_text)
+                holdback = max(
+                    self._ends_with_partial_token(current_text, token)
+                    for token in holdback_tokens
+                )
                 self._buffer = current_text[len(current_text) - holdback :]
                 return StreamingParseResult(
                     reasoning_text=current_text[: len(current_text) - holdback]
