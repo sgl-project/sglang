@@ -43,6 +43,20 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def _get_dflash_attention_type(config) -> AttentionType:
+    """Causality of a DFLASH draft, from the checkpoint.
+
+    DFLASH drafts attend over the whole draft block, so they are bidirectional
+    unless the checkpoint declares itself causal.
+    """
+    text_config = getattr(config, "text_config", None) or config
+    return (
+        AttentionType.DECODER
+        if getattr(text_config, "is_causal", False)
+        else AttentionType.ENCODER_ONLY
+    )
+
+
 def _get_dflash_layer_attention_params(
     config, layer_id: int
 ) -> Tuple[int, AttentionType]:
@@ -57,20 +71,13 @@ def _get_dflash_layer_attention_params(
 
     layer_type = layer_types[layer_id]
     if layer_type == "full_attention":
-        text_config = getattr(config, "text_config", None) or config
-        attention_type = (
-            AttentionType.DECODER
-            if getattr(text_config, "is_causal", False)
-            else AttentionType.ENCODER_ONLY
-        )
-        return -1, attention_type
+        return -1, _get_dflash_attention_type(config)
     if layer_type == "sliding_attention":
-        # DFlash uses non-causal attention over the draft block on every layer --
-        # the reference sets it on the whole draft context, so a sliding layer is
-        # windowed but still bidirectional (masking only p1 - p0 >= sliding_window).
+        # Windowing is orthogonal to causality: the layer masks only
+        # p1 - p0 >= sliding_window and keeps the checkpoint's causality.
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
-        return sliding_window_size, AttentionType.ENCODER_ONLY
+        return sliding_window_size, _get_dflash_attention_type(config)
     raise ValueError(
         "Unsupported DFLASH draft layer type. "
         f"layer_types[{layer_id}]={layer_type!r}."
