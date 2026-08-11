@@ -2495,59 +2495,71 @@ class MooncakeKVManager(CommonKVManager):
                 if lifetime is not None:
                     lifetime.end_lease()
 
+    def _handle_prefill_message(self, waiting_req_bytes) -> None:
+        """Dispatch one message from the prefill-side manager socket."""
+        room = waiting_req_bytes[0].decode("ascii")
+        # Staging: decode reports consumption watermark back to prefill
+        if room == "WATERMARK":
+            from sglang.srt.disaggregation.common.staging_handler import (
+                handle_watermark_msg,
+            )
+
+            handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+            return
+        # Staging: decode replies with allocated staging offset
+        if room == "STAGING_RSP":
+            from sglang.srt.disaggregation.common.staging_handler import (
+                handle_staging_rsp,
+            )
+
+            handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+            return
+        # Decode-side abort notification: mark room as failed and ACK
+        if room == "ABORT":
+            self._handle_abort_notification(waiting_req_bytes)
+            return
+        mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+        if room == "None":
+            decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+            decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+                decode_kv_args.dst_dcp_size,
+                decode_kv_args.dst_dcp_rank,
+            )
+            if decode_kv_args.requires_dcp_relayout:
+                decode_kv_args.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
+                    [decode_kv_args.dst_kv_item_len] * len(self.kv_args.kv_item_lens)
+                )
+            self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
+            with self.session_lock:
+                if mooncake_session_id in self.failed_sessions:
+                    self.failed_sessions.remove(mooncake_session_id)
+                if mooncake_session_id in self.session_failures:
+                    del self.session_failures[mooncake_session_id]
+            logger.debug(f"Register KVArgs from {mooncake_session_id} successfully")
+            return
+        else:
+            self._handle_bootstrap_metadata(waiting_req_bytes)
+
     def start_prefill_thread(self):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                room = waiting_req_bytes[0].decode("ascii")
-                # Staging: decode reports consumption watermark back to prefill
-                if room == "WATERMARK":
-                    from sglang.srt.disaggregation.common.staging_handler import (
-                        handle_watermark_msg,
+                # Sole reader of this socket, and the only thread that can
+                # receive a decode ABORT: if it dies, this rank never closes
+                # aborted rooms and never ACKs, so every decode peer withholds
+                # its pages until MAX_UNQUIESCED_ROOMS tears it down. The loop
+                # must outlive any bug in a handler; a poisoned message is
+                # dropped loudly, never fatal. recv stays outside the guard so
+                # a closed socket still ends the thread at shutdown.
+                try:
+                    self._handle_prefill_message(waiting_req_bytes)
+                except Exception:
+                    logger.exception(
+                        "Mooncake prefill-side message handling failed; "
+                        "dropping message and continuing"
                     )
-
-                    handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
-                    continue
-                # Staging: decode replies with allocated staging offset
-                if room == "STAGING_RSP":
-                    from sglang.srt.disaggregation.common.staging_handler import (
-                        handle_staging_rsp,
-                    )
-
-                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
-                    continue
-                # Decode-side abort notification: mark room as failed and ACK
-                if room == "ABORT":
-                    self._handle_abort_notification(waiting_req_bytes)
-                    continue
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
-                    if decode_kv_args.requires_dcp_relayout:
-                        decode_kv_args.dcp_token_item_lens = (
-                            self.prepare_dcp_token_item_lens(
-                                [decode_kv_args.dst_kv_item_len]
-                                * len(self.kv_args.kv_item_lens)
-                            )
-                        )
-                    self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
-                    with self.session_lock:
-                        if mooncake_session_id in self.failed_sessions:
-                            self.failed_sessions.remove(mooncake_session_id)
-                        if mooncake_session_id in self.session_failures:
-                            del self.session_failures[mooncake_session_id]
-                    logger.debug(
-                        f"Register KVArgs from {mooncake_session_id} successfully"
-                    )
-                    continue
-                else:
-                    self._handle_bootstrap_metadata(waiting_req_bytes)
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -2623,83 +2635,98 @@ class MooncakeKVManager(CommonKVManager):
                 self.update_status(room, KVPoll.WaitingForInput)
         return True
 
+    def _handle_decode_message(self, msg) -> None:
+        """Dispatch one message from the decode-side manager socket."""
+        if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
+            self._handle_aux_data(msg)
+            return
+
+        # Staging: prefill notifies a chunk written to staging buffer
+        if msg[0] == b"CHUNK_READY":
+            room = int(msg[1].decode("ascii"))
+            if self._is_tearing_down(room):
+                return
+            chunk_idx = int(msg[2].decode("ascii"))
+            page_start = int(msg[3].decode("ascii"))
+            num_pages = int(msg[4].decode("ascii"))
+            # Prefer the prefill's unique rank id when present so that
+            # writers are counted per rank rather than per session.
+            writer_id = (
+                msg[6].decode("ascii") if len(msg) > 6 else msg[5].decode("ascii")
+            )
+            handler = self._staging_handler
+            assert (
+                handler is not None
+            ), "CHUNK_READY received before staging handler initialized"
+            handler.handle_chunk_arrived(
+                room,
+                chunk_idx,
+                page_start,
+                num_pages,
+                writer_id,
+            )
+            return
+
+        # Staging: prefill pre-requests staging allocation before forward
+        if msg[0] == b"STAGING_REQ":
+            if self._is_tearing_down(int(msg[1].decode("ascii"))):
+                return
+            self._handle_staging_req(msg)
+            return
+
+        # Prefill acknowledges abort notification
+        if msg[0] == b"ABORT_ACK":
+            self._handle_abort_ack(msg)
+            return
+
+        bootstrap_room, status, prefill_rank = msg
+        status = int(status.decode("ascii"))
+        bootstrap_room = int(bootstrap_room.decode("ascii"))
+        prefill_rank = int(prefill_rank.decode("ascii"))
+
+        if self._is_tearing_down(bootstrap_room):
+            return
+
+        if status == KVPoll.Success:
+            if bootstrap_room in self.request_status:
+                self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+                expected_response_num = self.required_prefill_response_num_table[
+                    bootstrap_room
+                ]
+                arrived_response_num = len(
+                    self.prefill_response_tracker[bootstrap_room]
+                )
+                if arrived_response_num == expected_response_num:
+                    if self.enable_staging:
+                        handler = self._staging_handler
+                        if handler.is_staging_room(bootstrap_room):
+                            handler.submit_last_scatter_async(bootstrap_room)
+                    self.update_status(bootstrap_room, KVPoll.Success)
+        elif status == KVPoll.Failed:
+            self.record_failure(
+                bootstrap_room,
+                "Failed to get kvcache from prefill instance, it might be dead",
+            )
+            self.update_status(bootstrap_room, status)
+
     def start_decode_thread(self):
         def decode_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
-                if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
-                    self._handle_aux_data(msg)
-                    continue
-
-                # Staging: prefill notifies a chunk written to staging buffer
-                if msg[0] == b"CHUNK_READY":
-                    room = int(msg[1].decode("ascii"))
-                    if self._is_tearing_down(room):
-                        continue
-                    chunk_idx = int(msg[2].decode("ascii"))
-                    page_start = int(msg[3].decode("ascii"))
-                    num_pages = int(msg[4].decode("ascii"))
-                    # Prefer the prefill's unique rank id when present so that
-                    # writers are counted per rank rather than per session.
-                    writer_id = (
-                        msg[6].decode("ascii")
-                        if len(msg) > 6
-                        else msg[5].decode("ascii")
+                # Sole reader of this socket, and the only thread that can
+                # record an ABORT_ACK: if it dies, no abort is ever proven
+                # quiesced and every aborted room withholds its pages until
+                # MAX_UNQUIESCED_ROOMS tears the engine down. The loop must
+                # outlive any bug in a handler; a poisoned message is dropped
+                # loudly, never fatal. recv stays outside the guard so a
+                # closed socket still ends the thread at shutdown.
+                try:
+                    self._handle_decode_message(msg)
+                except Exception:
+                    logger.exception(
+                        "Mooncake decode-side message handling failed; "
+                        "dropping message and continuing"
                     )
-                    handler = self._staging_handler
-                    assert (
-                        handler is not None
-                    ), "CHUNK_READY received before staging handler initialized"
-                    handler.handle_chunk_arrived(
-                        room,
-                        chunk_idx,
-                        page_start,
-                        num_pages,
-                        writer_id,
-                    )
-                    continue
-
-                # Staging: prefill pre-requests staging allocation before forward
-                if msg[0] == b"STAGING_REQ":
-                    if self._is_tearing_down(int(msg[1].decode("ascii"))):
-                        continue
-                    self._handle_staging_req(msg)
-                    continue
-
-                # Prefill acknowledges abort notification
-                if msg[0] == b"ABORT_ACK":
-                    self._handle_abort_ack(msg)
-                    continue
-
-                bootstrap_room, status, prefill_rank = msg
-                status = int(status.decode("ascii"))
-                bootstrap_room = int(bootstrap_room.decode("ascii"))
-                prefill_rank = int(prefill_rank.decode("ascii"))
-
-                if self._is_tearing_down(bootstrap_room):
-                    continue
-
-                if status == KVPoll.Success:
-                    if bootstrap_room in self.request_status:
-                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
-                        expected_response_num = (
-                            self.required_prefill_response_num_table[bootstrap_room]
-                        )
-                        arrived_response_num = len(
-                            self.prefill_response_tracker[bootstrap_room]
-                        )
-                        if arrived_response_num == expected_response_num:
-                            if self.enable_staging:
-                                handler = self._staging_handler
-                                if handler.is_staging_room(bootstrap_room):
-                                    handler.submit_last_scatter_async(bootstrap_room)
-                            self.update_status(bootstrap_room, KVPoll.Success)
-                elif status == KVPoll.Failed:
-                    self.record_failure(
-                        bootstrap_room,
-                        "Failed to get kvcache from prefill instance, it might be dead",
-                    )
-                    self.update_status(bootstrap_room, status)
 
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()

@@ -777,6 +777,69 @@ class TestNoUnboundedWaits(unittest.TestCase):
             "a faulty entry must not starve the ones behind it",
         )
 
+    def test_decode_reader_survives_a_poisoned_message(self):
+        # The decode reader is the only thread that can record an ABORT_ACK;
+        # a message that killed it would leave every subsequently aborted room
+        # withholding its pages until escalation. A poisoned message must be
+        # dropped, never fatal.
+        mgr = make_decode_manager()
+        done = threading.Event()
+        messages = iter(
+            [
+                [b"7", b"4", b"0", b"unexpected-extra-frame"],
+                [b"7", b"0", b"0"],  # well-formed Failed status
+            ]
+        )
+
+        def recv_multipart():
+            try:
+                return next(messages)
+            except StopIteration:
+                done.set()
+                raise zmq.ZMQError()  # ends the reader, as a closed socket would
+
+        mgr.server_socket = SimpleNamespace(recv_multipart=recv_multipart)
+        mgr._start_heartbeat_checker_thread = Mock()
+        mgr.start_decode_thread()
+
+        self.assertTrue(done.wait(5), "the reader died on the poisoned message")
+        mgr.record_failure.assert_called_once()
+        mgr.update_status.assert_called_once_with(7, KVPoll.Failed)
+
+    def test_prefill_reader_survives_a_poisoned_message(self):
+        # The bootstrap reader is the only thread that can receive a decode
+        # ABORT; a message that killed it would leave every peer waiting out
+        # its whole quiescence deadline. A poisoned message must be dropped.
+        mgr = make_prefill_manager()
+        mgr._start_transfer_bookkeeping()
+        mgr._send_manager_message = lambda *args, **kwargs: None
+        mgr.open_room_transfers(ROOM)
+        mgr.request_status[ROOM] = KVPoll.WaitingForInput
+        done = threading.Event()
+        messages = iter(
+            [
+                [b"ABORT"],  # poisoned: missing every frame after the header
+                [b"ABORT", str(ROOM).encode("ascii"), b"127.0.0.1", b"1", b""],
+            ]
+        )
+
+        def recv_multipart():
+            try:
+                return next(messages)
+            except StopIteration:
+                done.set()
+                raise zmq.ZMQError()
+
+        mgr.server_socket = SimpleNamespace(recv_multipart=recv_multipart)
+        mgr.start_prefill_thread()
+
+        self.assertTrue(done.wait(5), "the reader died on the poisoned message")
+        lifetime = mgr._room_lifetime(ROOM, create=False)
+        self.assertIsNotNone(lifetime)
+        self.assertTrue(
+            lifetime.is_closed(), "the well-formed abort behind it must still land"
+        )
+
     def test_a_backed_up_peer_does_not_delay_other_peers(self):
         mgr = make_prefill_manager()
         mgr._start_transfer_bookkeeping()
