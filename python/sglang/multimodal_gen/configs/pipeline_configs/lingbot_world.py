@@ -338,6 +338,13 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     interactive_kv_still_chunks: int = 2
     lazy_vae_encode_black_frames: int = 0
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("dit",),
+        )
+
     def preprocess_vae_encode(self, image, vae):
         image = super().preprocess_vae_encode(image, vae)
         lazy_black_frames = envs.SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES

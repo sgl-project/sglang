@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
+    LingBotWorldCausalDMDConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -1000,6 +1003,7 @@ class TestOffloadDefaults(unittest.TestCase):
         wan_deployment = WanT2V480PConfig().get_model_deployment_config()
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
+        lingbot_deployment = LingBotWorldCausalDMDConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
         ltx23_config = LTX23PipelineConfig()
         sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
@@ -1018,8 +1022,13 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(mova_deployment.keep_resident_components, ("dit", "vae"))
 
         self.assertEqual(zimage_deployment.fsdp_auto_min_available_memory_gb, 40)
+        self.assertEqual(zimage_deployment.keep_resident_min_available_gb, 30)
         self.assertTrue(zimage_deployment.fsdp_auto_requires_cfg)
         self.assertEqual(zimage_deployment.dit_layerwise_offload_modes, ())
+
+        self.assertTrue(lingbot_deployment.auto_dit_layerwise_offload)
+        self.assertEqual(lingbot_deployment.keep_resident_min_available_gb, 70)
+        self.assertEqual(lingbot_deployment.keep_resident_components, ("dit",))
 
         self.assertEqual(ltx_deployment.keep_resident_min_available_gb, 70)
         self.assertEqual(ltx_deployment.keep_resident_components, ("dit",))
@@ -1167,6 +1176,42 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_auto_zimage_keeps_dit_resident_on_5090(self):
+        args = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            memory_gb=32,
+            available_memory_gb=31,
+            kwargs={
+                "model_path": "Tongyi-MAI/Z-Image-Turbo",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder"],
+        )
+
+    def test_auto_lingbot_keeps_dit_resident_on_h100(self):
+        args = self._from_dict_with_pipeline_config(
+            LingBotWorldCausalDMDConfig(),
+            memory_gb=80,
+            available_memory_gb=72,
+            kwargs={
+                "model_path": "robbyant/lingbot-world-fast-diffusers",
+                "performance_mode": "auto",
+                "text_encoder_cpu_offload": True,
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["image_encoder", "vae"],
         )
 
     def test_auto_image_preserves_explicit_dit_cpu_offload(self):
