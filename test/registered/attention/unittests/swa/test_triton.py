@@ -5,11 +5,12 @@ from pathlib import Path
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
     make_swa_no_prefix_input_config_cases,
@@ -29,6 +30,7 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -297,6 +299,11 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_cuda_graph_decode_case(self, case)
 
+    @unittest.skipIf(
+        is_hip(),
+        "split-op extend runner exercises the piecewise-CUDA-graph path "
+        "(TcPiecewiseForwardContext.num_tokens), which is not wired on ROCm.",
+    )
     def test_runner_mode_split_op_extend_cases(self):
         for case, static_num_tokens in self.SPLIT_OP_CASES:
             for breakable in (False, True):

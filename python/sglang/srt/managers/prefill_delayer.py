@@ -33,6 +33,11 @@ class _NegotiateOutput(NamedTuple):
     output_reason: str
     num_prefillable: int
     num_token_watermark_force_allow: int
+    # Accumulated wait of the prefill being released on this pass. Carried
+    # explicitly because `next_state` is None on every release path and thus
+    # cannot convey it to the metrics observation.
+    wait_forward_passes: int = 0
+    wait_seconds: float = 0.0
 
 
 class PrefillDelayer:
@@ -47,9 +52,11 @@ class PrefillDelayer:
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         device: Optional["torch.device"] = "cpu",
         device_group=None,
+        debug_log_enabled: bool = True,
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
+        self._debug_log_enabled = _DEBUG_LOG and debug_log_enabled
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
         # is explicitly set. Additive with the slot-based trigger.
         self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
@@ -175,6 +182,16 @@ class PrefillDelayer:
             num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
         )
 
+        # Wait accumulated so far, taken from prev_state. Release paths attach
+        # this so the wait histograms observe the real value; delay paths leave
+        # the defaults (0) since the wait isn't finished and isn't observed.
+        wait_info = dict(
+            wait_forward_passes=prev_state.delayed_count if prev_state else 0,
+            wait_seconds=(
+                (time.perf_counter() - prev_state.start_time) if prev_state else 0.0
+            ),
+        )
+
         # Compute outputs
         if prefillable_status == "all":
             # Safety valve: low KV usage means GPU is underutilized, skip
@@ -185,6 +202,7 @@ class PrefillDelayer:
                     output_allow=True,
                     output_reason="token_watermark",
                     **debug_info,
+                    **wait_info,
                 )
 
             if not self.enable_dp_attention:
@@ -228,13 +246,25 @@ class PrefillDelayer:
                     self.skip_first_delayer = False
                     pass
                 else:
-                    next_state = prev_state or _State()
-                    next_state = next_state.bump_delayed_count()
+                    # Bound the wait like the "mixed" branch: on a saturated
+                    # engine slot_condition may never turn false, so cap the
+                    # delay by max_delay_passes.
+                    prev_delayed_count = prev_state.delayed_count if prev_state else 0
+                    if prev_delayed_count < self._max_delay_passes - 1:
+                        next_state = prev_state or _State()
+                        next_state = next_state.bump_delayed_count()
+                        return _NegotiateOutput(
+                            next_state=next_state,
+                            output_allow=False,
+                            output_reason="delay",
+                            **debug_info,
+                        )
                     return _NegotiateOutput(
-                        next_state=next_state,
-                        output_allow=False,
-                        output_reason="delay",
+                        next_state=None,
+                        output_allow=True,
+                        output_reason="wait_timeout",
                         **debug_info,
+                        **wait_info,
                     )
             exist_previous_wait = prev_state is not None
             return _NegotiateOutput(
@@ -242,6 +272,7 @@ class PrefillDelayer:
                 output_allow=True,
                 output_reason="wait_success" if exist_previous_wait else "no_wait",
                 **debug_info,
+                **wait_info,
             )
         elif prefillable_status == "none":
             return _NegotiateOutput(
@@ -250,6 +281,7 @@ class PrefillDelayer:
                 output_allow=True,
                 output_reason="",
                 **debug_info,
+                **wait_info,
             )
         elif prefillable_status == "mixed":
             if global_exists_token_watermark_force_allow:
@@ -258,6 +290,7 @@ class PrefillDelayer:
                     output_allow=True,
                     output_reason="token_watermark",
                     **debug_info,
+                    **wait_info,
                 )
 
             prev_delayed_count = prev_state.delayed_count if prev_state else 0
@@ -276,6 +309,7 @@ class PrefillDelayer:
                     output_allow=True,
                     output_reason="wait_timeout",
                     **debug_info,
+                    **wait_info,
                 )
         else:
             raise NotImplementedError
@@ -326,6 +360,7 @@ class PrefillDelayerSinglePassExecutor:
             actual_execution=actual_prefill,
             output=self._result,
             metrics_collector=self._prefill_delayer._metrics_collector,
+            debug_log_enabled=self._prefill_delayer._debug_log_enabled,
         )
 
     def negotiate_should_allow_prefill(
@@ -352,8 +387,10 @@ def _record_single_pass_result(
     actual_execution: bool,
     output: _NegotiateOutput,
     metrics_collector: Optional["SchedulerMetricsCollector"],
+    *,
+    debug_log_enabled: bool,
 ) -> None:
-    if _DEBUG_LOG:
+    if debug_log_enabled:
         if output.output_allow and (output.output_reason == "wait_timeout"):
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
@@ -376,14 +413,9 @@ def _record_single_pass_result(
             }
 
     if metrics_collector is not None:
-        if (s := output.next_state) is not None:
-            wait_seconds = time.perf_counter() - s.start_time
-            forward_passes = s.delayed_count
-        else:
-            wait_seconds = forward_passes = 0
         metrics_collector.observe_prefill_delayer_outcome(
-            forward_passes=forward_passes,
-            wait_seconds=wait_seconds,
+            forward_passes=output.wait_forward_passes,
+            wait_seconds=output.wait_seconds,
             input_estimation=output.input_estimation,
             output_allow=output.output_allow,
             output_reason=output.output_reason,

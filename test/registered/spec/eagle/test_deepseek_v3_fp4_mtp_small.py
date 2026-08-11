@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=340, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=340, stage="base-c", runner_config="4-gpu-b200")
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1200
@@ -48,11 +48,15 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
+        env = {
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        }
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=other_args,
+            env=env,
         )
 
     @classmethod

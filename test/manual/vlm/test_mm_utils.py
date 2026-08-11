@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.managers import mm_utils, schedule_batch
-from sglang.srt.managers.mm_utils import (
+from sglang.srt.managers.mm_schedule import (
     _get_chunked_prefill_embedding,
     init_mm_embedding_cache,
 )

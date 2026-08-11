@@ -15,16 +15,17 @@
 
 import asyncio
 from collections import OrderedDict
-from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Union
 from uuid import NAMESPACE_URL, uuid4, uuid5
+
+import msgspec
+from msgspec.structs import fields
 
 from sglang.srt.utils import ConcurrentCounter
 from sglang.srt.utils.aio_rwlock import RWLock
 
 
-@dataclass(frozen=True)
-class LoRARef:
+class LoRARef(msgspec.Struct, frozen=True, array_like=True):
     """
     Reference record for a LoRA model.
 
@@ -33,7 +34,7 @@ class LoRARef:
     keys (e.g., radix cache).
     """
 
-    lora_id: str = field(default_factory=lambda: uuid4().hex)
+    lora_id: str = msgspec.field(default_factory=lambda: uuid4().hex)
     lora_name: Optional[str] = None
     lora_path: Optional[str] = None
     pinned: Optional[bool] = None

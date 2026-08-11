@@ -17,11 +17,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          path: sglang-nightly-build
           fetch-depth: 0
 
       - name: Set date and commit hash
         id: image_meta
         run: |
+          cd sglang-nightly-build
           date_tag=$(date +%Y%m%d)
           commit_hash=$(git rev-parse --short=7 HEAD)
           if [ -z "${commit_hash}" ]; then
@@ -43,8 +45,8 @@ jobs:
       - name: Build intel/sglang-dev
         run: |
           echo "Building intel/sglang-dev:${{ env.IMAGE_TAG }}"
-          docker build . \
-            -f docker/xpu.Dockerfile \
+          docker build sglang-nightly-build \
+            -f sglang-nightly-build/docker/xpu.Dockerfile \
             --build-arg SG_LANG_REPO=https://github.com/sgl-project/sglang.git \
             --build-arg SG_LANG_BRANCH=main \
             --no-cache --progress=plain \
@@ -53,5 +55,13 @@ jobs:
 
       - name: Push intel/sglang-dev
         run: |
-          docker push "intel/sglang-dev:${{ env.IMAGE_TAG }}"
-          docker push "intel/sglang-dev:latest"
+          push_with_retry() {
+            for i in 1 2 3 4 5; do
+              docker push "$1" && return 0
+              echo "push failed (attempt $i), retrying in $((i*15))s..."
+              sleep $((i*15))
+            done
+            return 1
+          }
+          push_with_retry "intel/sglang-dev:${{ env.IMAGE_TAG }}"
+          push_with_retry "intel/sglang-dev:latest"

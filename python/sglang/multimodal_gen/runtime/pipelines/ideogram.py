@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
+
+from huggingface_hub import hf_hub_download, snapshot_download
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
@@ -18,6 +21,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.i
     Ideogram4DenoisingStage,
     Ideogram4TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
+    ProgressiveDenoisingStageRouter,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.ideogram import (
+    Ideogram4ProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
@@ -28,6 +37,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 _IDEOGRAM4_BASE_MODEL = "ideogram-ai/ideogram-4-fp8"
+_IDEOGRAM4_DISTILLED_COMPONENTS_MODEL = "ideogram-ai/ideogram-4-nf4-diffusers"
+_IDEOGRAM4_DISTILLED_COMPONENTS_REVISION = "1874bc70267ba2c823a7239e1d70dd308c8d64dc"
+_IDEOGRAM4_DISTILLED_COMPONENT_PATTERNS = [
+    "model_index.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "tokenizer/*",
+    "vae/*",
+]
 _IDEOGRAM4_NVFP4_COND_FILE = "diffusion_models/ideogram4_nvfp4_mixed.safetensors"
 _IDEOGRAM4_NVFP4_UNCOND_FILE = (
     "diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors"
@@ -45,6 +63,20 @@ class Ideogram4Nvfp4ModelResolution:
 @lru_cache(maxsize=1)
 def _resolve_ideogram4_base_model_path() -> str:
     return maybe_download_model(_IDEOGRAM4_BASE_MODEL, force_diffusers_model=True)
+
+
+@lru_cache(maxsize=1)
+def _resolve_ideogram4_distilled_components_path() -> str:
+    # fal's model cards explicitly reference the NF4 Diffusers repository for
+    # these shared components. Download only those components: its conditional
+    # and unconditional base transformers are unused by distilled variants.
+    return snapshot_download(
+        repo_id=_IDEOGRAM4_DISTILLED_COMPONENTS_MODEL,
+        revision=_IDEOGRAM4_DISTILLED_COMPONENTS_REVISION,
+        allow_patterns=_IDEOGRAM4_DISTILLED_COMPONENT_PATTERNS,
+        ignore_patterns=["*.onnx", "*.msgpack"],
+        max_workers=8,
+    )
 
 
 def _resolve_ideogram4_unconditional_transformer_weights_path(
@@ -115,6 +147,22 @@ class Ideogram4Pipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
     ]
 
+    def _create_denoising_stage(self):
+        transformer = self.get_module("transformer")
+        unconditional_transformer = self.get_module("unconditional_transformer")
+        return ProgressiveDenoisingStageRouter(
+            standard_stage=Ideogram4DenoisingStage(
+                transformer=transformer,
+                unconditional_transformer=unconditional_transformer,
+                pipeline=self,
+            ),
+            progressive_stage_factory=lambda: Ideogram4ProgressiveDenoisingStage(
+                transformer=transformer,
+                unconditional_transformer=unconditional_transformer,
+                pipeline=self,
+            ),
+        )
+
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stage(InputValidationStage())
         self.add_stage_factory(
@@ -128,11 +176,7 @@ class Ideogram4Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_latent_preparation_stage()
         self.add_stage_factory(
             RoleType.DENOISER,
-            lambda: Ideogram4DenoisingStage(
-                transformer=self.get_module("transformer"),
-                unconditional_transformer=self.get_module("unconditional_transformer"),
-                pipeline=self,
-            ),
+            self._create_denoising_stage,
             "ideogram4_denoising_stage",
         )
         self.add_stage_factory(
@@ -223,4 +267,86 @@ class Ideogram4Nvfp4Pipeline(Ideogram4Pipeline):
         return super().load_modules(server_args, loaded_modules)
 
 
-EntryClass = [Ideogram4Pipeline, Ideogram4Nvfp4Pipeline]
+class Ideogram4DistilledPipeline(Ideogram4Pipeline):
+    _required_config_modules = [
+        "text_encoder",
+        "tokenizer",
+        "vae",
+        "transformer",
+        "scheduler",
+    ]
+    _distilled_transformer_path: str | None = None
+
+    def _load_config(self) -> dict[str, Any]:
+        logger.info(
+            "Using '%s' for distilled config and non-transformer components",
+            _IDEOGRAM4_DISTILLED_COMPONENTS_MODEL,
+        )
+        model_index_path = hf_hub_download(
+            repo_id=_IDEOGRAM4_DISTILLED_COMPONENTS_MODEL,
+            filename="model_index.json",
+            revision=_IDEOGRAM4_DISTILLED_COMPONENTS_REVISION,
+        )
+        with open(model_index_path, encoding="utf-8") as model_index_file:
+            return cast(dict[str, Any], json.load(model_index_file))
+
+    def _resolve_distilled_transformer_path(self) -> str:
+        if self._distilled_transformer_path is None:
+            model_path = (
+                self.model_path
+                if os.path.exists(self.model_path)
+                else snapshot_download(
+                    repo_id=self.model_path,
+                    allow_patterns=["transformer/*"],
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    max_workers=8,
+                )
+            )
+            self._distilled_transformer_path = os.path.join(model_path, "transformer")
+        return self._distilled_transformer_path
+
+    def _resolve_component_path(
+        self,
+        server_args: ServerArgs,
+        module_name: str,
+        load_module_name: str,
+    ) -> str:
+        override_path = server_args.component_paths.get(module_name)
+        if override_path is not None:
+            return maybe_download_model(override_path)
+        if module_name == "transformer":
+            return self._resolve_distilled_transformer_path()
+        return os.path.join(
+            _resolve_ideogram4_distilled_components_path(), load_module_name
+        )
+
+    def _create_denoising_stage(self):
+        transformer = self.get_module("transformer")
+        return ProgressiveDenoisingStageRouter(
+            standard_stage=Ideogram4DenoisingStage(
+                transformer=transformer,
+                unconditional_transformer=None,
+                pipeline=self,
+            ),
+            progressive_stage_factory=lambda: Ideogram4ProgressiveDenoisingStage(
+                transformer=transformer,
+                unconditional_transformer=None,
+                pipeline=self,
+            ),
+        )
+
+
+class Ideogram4FastPipeline(Ideogram4DistilledPipeline):
+    pipeline_name = "Ideogram4FastPipeline"
+
+
+class Ideogram4InstantPipeline(Ideogram4DistilledPipeline):
+    pipeline_name = "Ideogram4InstantPipeline"
+
+
+EntryClass = [
+    Ideogram4Pipeline,
+    Ideogram4Nvfp4Pipeline,
+    Ideogram4FastPipeline,
+    Ideogram4InstantPipeline,
+]

@@ -2,7 +2,8 @@ import dataclasses
 import glob
 import os
 import re
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
+from contextlib import nullcontext
 from typing import cast
 
 import torch
@@ -15,7 +16,14 @@ from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_group,
+)
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    patch_tensor_parallel_group,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -30,6 +38,11 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    TextEncoder,
+    finalize_encoder_folding,
+    get_folding_tp_group,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -38,6 +51,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
 
@@ -98,16 +112,26 @@ class TextEncoderLoader(ComponentLoader):
         component_model_path: str,
         server_args: ServerArgs,
         transformers_or_diffusers: str,
+        component_name: str | None = None,
     ):
         if transformers_or_diffusers != "transformers":
             return super().load_native(
-                component_model_path, server_args, transformers_or_diffusers
+                component_model_path,
+                server_args,
+                transformers_or_diffusers,
+                component_name,
             )
 
         encoder_idx = (
-            1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
+            self._extract_encoder_index(component_name or "text_encoder_2")
+            if component_name
+            else 1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
         )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
+        dtype = precision_to_dtype(
+            encoder_dtype,
+            f"text_encoder_precisions[{encoder_idx}]",
+        )
         transformers_model_class = self._resolve_transformers_text_encoder_class(
             component_model_path, server_args
         )
@@ -115,7 +139,7 @@ class TextEncoderLoader(ComponentLoader):
             component_model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
-            torch_dtype=PRECISION_TO_TYPE[encoder_dtype],
+            torch_dtype=dtype,
         )
 
     @staticmethod
@@ -161,6 +185,7 @@ class TextEncoderLoader(ComponentLoader):
         model_name_or_path: str,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
+        key_filter: Callable[[str], bool] | None = None,
     ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
@@ -193,7 +218,10 @@ class TextEncoderLoader(ComponentLoader):
 
         if use_safetensors:
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                key_filter=key_filter,
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
@@ -214,20 +242,39 @@ class TextEncoderLoader(ComponentLoader):
         self,
         source: "Source",
         to_cpu: bool,
+        key_filter: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """get an iterator for the model weights based on the load format."""
+        source_key_filter: Callable[[str], bool] | None
+        if key_filter is None:
+            source_key_filter = None
+        else:
+
+            def include_source_weight(name: str) -> bool:
+                return key_filter(source.prefix + name)
+
+            source_key_filter = include_source_weight
+
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
+            key_filter=source_key_filter,
         )
         if use_safetensors:
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
                 to_cpu=to_cpu,
+                key_filter=source_key_filter,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
+            if source_key_filter is not None:
+                weights_iterator = (
+                    (name, tensor)
+                    for name, tensor in weights_iterator
+                    if source_key_filter(name)
+                )
 
         # apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
@@ -238,6 +285,10 @@ class TextEncoderLoader(ComponentLoader):
         model_path: str,
         to_cpu: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        key_filter = cast(
+            Callable[[str], bool] | None,
+            getattr(model, "should_materialize_checkpoint_weight", None),
+        )
         primary_weights = TextEncoderLoader.Source(
             model_path,
             prefix="",
@@ -247,6 +298,7 @@ class TextEncoderLoader(ComponentLoader):
         yield from self._get_weights_iterator(
             primary_weights,
             to_cpu,
+            key_filter,
         )
 
         secondary_weights = cast(
@@ -257,6 +309,7 @@ class TextEncoderLoader(ComponentLoader):
             yield from self._get_weights_iterator(
                 source,
                 to_cpu,
+                key_filter,
             )
 
     def load_customized(
@@ -291,6 +344,21 @@ class TextEncoderLoader(ComponentLoader):
         )
         if post_diffusers_config_update is not None:
             post_diffusers_config_update()
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            getattr(encoder_config, "architectures", [])
+        )
+        # real dims are populated now; resolve fold vs replicate
+        finalize_encoder_folding(
+            encoder_config,
+            server_args.encoder_parallel,
+            prefer_dp=(
+                server_args.batching_max_size > 1
+                and (server_args.tp_size or 1) == 1
+                and (server_args.dp_size or 1) == 1
+                and issubclass(model_cls, TextEncoder)
+                and model_cls.supports_dp_encode
+            ),
+        )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]
@@ -363,7 +431,20 @@ class TextEncoderLoader(ComponentLoader):
         else:
             model_device = local_torch_device
 
-        with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
+        # Parallel folding: build + shard the encoder over the folding group (the
+        # idle DiT replica during the encoding stage) instead of the default TP
+        # group, so every encoder folds without threading the group through each layer.
+        fold_ctx = nullcontext()
+        if getattr(model_config, "parallel_folding_mode", None) is not None:
+            folding_group = get_folding_tp_group(model_config)
+            if (
+                isinstance(folding_group, GroupCoordinator)
+                and folding_group is not get_tp_group()
+            ):
+                fold_ctx = patch_tensor_parallel_group(folding_group)
+
+        # patch tp group with folding group to achieve TP among folding group
+        with fold_ctx, set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)

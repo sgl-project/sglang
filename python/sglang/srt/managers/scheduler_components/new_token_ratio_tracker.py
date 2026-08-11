@@ -18,7 +18,7 @@ class NewTokenRatioTracker:
     current: float
 
     @classmethod
-    def from_server_args(cls, server_args: ServerArgs) -> "NewTokenRatioTracker":
+    def from_server_args(cls, server_args: ServerArgs) -> NewTokenRatioTracker:
         init = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * server_args.schedule_conservativeness,

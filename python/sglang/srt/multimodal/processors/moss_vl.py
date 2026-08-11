@@ -16,15 +16,11 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
-    SGL_USE_CUDA_IPC,
-)
-from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -238,7 +234,15 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             device=device,
         )
 
-        if len(flat_eff_h) == 0 or len(image_token_indices) == 0:
+        frame_count = len(flat_eff_h)
+        image_token_count = len(image_token_indices)
+        if frame_count != image_token_count:
+            raise ValueError(
+                "Moss-VL vision metadata must map one-to-one to image tokens: "
+                f"found {frame_count} frame(s) and {image_token_count} token(s)"
+            )
+
+        if frame_count == 0:
             rope_deltas = (
                 position_ids.max(dim=0).values.max(dim=-1).values
                 + 1
@@ -246,18 +250,11 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             )
             return vision_pos_ids, position_ids, rope_deltas
 
-        num_matches = min(len(flat_eff_h), len(image_token_indices))
-        flat_eff_h = torch.tensor(
-            flat_eff_h[:num_matches], device=device, dtype=torch.long
-        )
-        flat_eff_w = torch.tensor(
-            flat_eff_w[:num_matches], device=device, dtype=torch.long
-        )
-        flat_vis_starts = torch.tensor(
-            flat_vis_starts[:num_matches], device=device, dtype=torch.long
-        )
+        flat_eff_h = torch.tensor(flat_eff_h, device=device, dtype=torch.long)
+        flat_eff_w = torch.tensor(flat_eff_w, device=device, dtype=torch.long)
+        flat_vis_starts = torch.tensor(flat_vis_starts, device=device, dtype=torch.long)
 
-        target_indices = image_token_indices[:num_matches]
+        target_indices = image_token_indices
         batch_rows = target_indices[:, 0]
         text_cols = target_indices[:, 1]
 
@@ -551,44 +548,14 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             if mm_items and vision_token_info:
                 mm_items[0].set("vision_token_info", vision_token_info[0])
 
-            if SGL_USE_CUDA_IPC:
+            if self.use_cuda_ipc:
                 for item in mm_items:
-                    if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                        sync_flag, available_slice = (
-                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                                item.feature
-                            )
+                    if isinstance(item.feature, torch.Tensor):
+                        item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+                    if isinstance(item.precomputed_embeddings, torch.Tensor):
+                        item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
+                            item.precomputed_embeddings
                         )
-                        if isinstance(available_slice, torch.Tensor):
-                            available_slice.copy_(
-                                item.feature.reshape(-1).view(torch.int8),
-                                non_blocking=True,
-                            )
-                            item.feature = CudaIpcTensorTransportProxy(
-                                data=available_slice,
-                                info_data=item.feature,
-                                sync_buffer_meta=sync_flag,
-                            )
-                    elif (
-                        isinstance(item.precomputed_embeddings, torch.Tensor)
-                        and item.precomputed_embeddings.is_cuda
-                    ):
-                        sync_flag, available_slice = (
-                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                                item.precomputed_embeddings
-                            )
-                        )
-                        if isinstance(available_slice, torch.Tensor):
-                            flattened = item.precomputed_embeddings.reshape(-1)
-                            available_slice.copy_(
-                                flattened.view(torch.int8),
-                                non_blocking=True,
-                            )
-                            item.precomputed_embeddings = CudaIpcTensorTransportProxy(
-                                data=available_slice,
-                                info_data=item.precomputed_embeddings,
-                                sync_buffer_meta=sync_flag,
-                            )
 
             return MultimodalProcessorOutput(
                 input_ids=input_ids.tolist(),

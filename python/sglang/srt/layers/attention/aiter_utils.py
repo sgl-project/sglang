@@ -33,8 +33,8 @@ except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backen
     pa_decode_gluon = None
     get_recommended_splits = None
 
-from sglang.srt.layers.attention.utils import launch_gather_shuffle_5d_to_linear
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.kernels.ops.attention.utils import launch_gather_shuffle_5d_to_linear
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -43,12 +43,12 @@ if TYPE_CHECKING:
 
 
 def forward_extend_vectorized_5d(
-    backend: "AiterAttnBackend",
+    backend: AiterAttnBackend,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    layer: "RadixAttention",
-    forward_batch: "ForwardBatch",
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
     bs0: int,
     window_size,
     sinks,
@@ -207,10 +207,10 @@ def forward_extend_vectorized_5d(
 
 
 def forward_decode_vectorized_5d(
-    backend: "AiterAttnBackend",
+    backend: AiterAttnBackend,
     q: torch.Tensor,
-    layer: "RadixAttention",
-    forward_batch: "ForwardBatch",
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     o: torch.Tensor,

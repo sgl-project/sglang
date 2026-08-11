@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
@@ -47,20 +47,21 @@ class CanaryManager:
         perturb_config: PerturbConfig,
         buffer_groups: tuple[CanaryBufferGroup, ...],
         device: torch.device,
-        req_to_token_pool: "ReqToTokenPool",
+        req_to_token_pool: ReqToTokenPool,
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
         token_oracle_manager: Optional[TokenOracleManager] = None,
-        swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
+        swa_allocator: Optional[SWATokenToKVPoolAllocator] = None,
         speculative_num_steps: int = 1,
         is_eagle_draft_decode: bool = False,
     ) -> None:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
-        self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
+        self._swa_allocator: Optional[SWATokenToKVPoolAllocator] = swa_allocator
         self._outer_step_counter: int = 0
         self._active_single_forward_manager_index: Optional[int] = None
+        self._model_forward_bracket_depth: int = 0
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
@@ -182,8 +183,24 @@ class CanaryManager:
             )
             self._active_single_forward_manager_index = None
 
+    @contextlib.contextmanager
+    def model_forward_bracket_scope(self) -> Iterator[bool]:
+        """Return whether this is the outermost patched ``model.forward`` call.
+
+        Some model implementations enter another patched forward from inside the
+        top-level forward (for example, a vision-language model calling its inner
+        language model). Kv-canary owns one pre/post bracket per active
+        SingleForwardManager; nested brackets would run a second pre-op while the
+        phase checker is already in the first bracket.
+        """
+        self._model_forward_bracket_depth += 1
+        try:
+            yield self._model_forward_bracket_depth == 1
+        finally:
+            self._model_forward_bracket_depth -= 1
+
     def pre_ops_maybe_inside_graph(
-        self, forward_batch: "ForwardBatch"
+        self, forward_batch: ForwardBatch
     ) -> _PreOpsMaybeInsideGraphOutput:
         assert self._active_single_forward_manager_index is not None, (
             "kv-canary: pre_ops_maybe_inside_graph called without active SingleForwardManager; "
@@ -194,7 +211,7 @@ class CanaryManager:
 
     def post_ops_maybe_inside_graph(
         self,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         pre_ops_output: _PreOpsMaybeInsideGraphOutput,
     ) -> None:
         assert self._active_single_forward_manager_index is not None, (
@@ -209,7 +226,7 @@ class CanaryManager:
         self,
         *,
         single_forward_indices: Sequence[int],
-        maybe_inaccurate_forward_batch: "ForwardBatch",
+        maybe_inaccurate_forward_batch: ForwardBatch,
     ) -> Iterator[None]:
         self._pre_ops_outside_graph(
             single_forward_indices=single_forward_indices,
@@ -227,7 +244,7 @@ class CanaryManager:
         self,
         *,
         single_forward_indices: Sequence[int],
-        maybe_inaccurate_forward_batch: "ForwardBatch",
+        maybe_inaccurate_forward_batch: ForwardBatch,
     ) -> None:
         for idx in single_forward_indices:
             self._single_forward_managers[idx].pre_ops_outside_graph(
@@ -241,7 +258,7 @@ class CanaryManager:
         self,
         *,
         single_forward_indices: Sequence[int],
-        maybe_inaccurate_forward_batch: "ForwardBatch",
+        maybe_inaccurate_forward_batch: ForwardBatch,
     ) -> None:
         for idx in single_forward_indices:
             self._single_forward_managers[idx].post_ops_outside_graph()
@@ -264,7 +281,7 @@ class CanaryManager:
             single_forward_manager.phase_checker.enable_assert()
         self._device_state.enable_chain_position_assert.fill_(1)
 
-    def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
+    def attach_radix_cache(self, radix_cache: BasePrefixCache) -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
         self._perturb_manager.attach_radix_cache(radix_cache)
 

@@ -78,7 +78,7 @@ class BatchingRule:
     source: str = "user"
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, source: str) -> "BatchingRule":
+    def from_dict(cls, data: dict[str, Any], *, source: str) -> BatchingRule:
         if not isinstance(data, dict):
             raise ValueError(
                 f"batching config rule from {source} must be an object, "
@@ -156,7 +156,7 @@ class BatchingRule:
 class BatchAdmissionController:
     """Applies configured caps before adding requests to a batch."""
 
-    def __init__(self, server_args: "ServerArgs", gpu_id: int):
+    def __init__(self, server_args: ServerArgs, gpu_id: int):
         self._mode = getattr(server_args, "batching_mode", "dynamic")
         self._user_max_batch_size = max(1, int(server_args.batching_max_size))
         self._model_path = server_args.model_path
@@ -185,7 +185,7 @@ class BatchAdmissionController:
         proposed = current_reqs + [candidate_req]
         limit = self.limit_for(proposed[0])
         return limit.reject_reason(
-            batch_size=len(proposed),
+            batch_size=self._effective_batch_size(proposed),
             batch_cost=self.estimate_batch_cost(proposed),
         )
 
@@ -195,7 +195,7 @@ class BatchAdmissionController:
             return len(reqs) >= self._user_max_batch_size
 
         limit = self.limit_for(reqs[0])
-        if len(reqs) >= limit.max_batch_size:
+        if self._effective_batch_size(reqs) >= limit.max_batch_size:
             return True
 
         next_cost = self.estimate_batch_cost(reqs + [reqs[0]])
@@ -206,7 +206,7 @@ class BatchAdmissionController:
             return None
 
         limit = self.limit_for(reqs[0])
-        if len(reqs) >= limit.max_batch_size:
+        if self._effective_batch_size(reqs) >= limit.max_batch_size:
             return limit.cap_reason or f"config_cap:{limit.max_batch_size}"
 
         next_cost = self.estimate_batch_cost(reqs + [reqs[0]])
@@ -239,6 +239,10 @@ class BatchAdmissionController:
         return sum(
             float(self._pipeline_config.estimate_request_cost(req)) for req in reqs
         )
+
+    @staticmethod
+    def _effective_batch_size(reqs: list[Req]) -> int:
+        return sum(max(1, int(req.num_outputs_per_prompt or 1)) for req in reqs)
 
     def _matching_rules(self, req: Req) -> list[BatchingRule]:
         return [

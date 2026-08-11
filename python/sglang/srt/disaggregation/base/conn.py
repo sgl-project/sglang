@@ -18,12 +18,20 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     DSA = "dsa"
+    MINIMAX_INDEX_K = "minimax_index_k"
+    # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
+    # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
+    SWA_RING = "swa_ring"
+    # DeepSeek-V4 online C128 request-scoped state.
+    C128_STATE = "c128_state"
 
 
 @dataclasses.dataclass
 class KVTransferMetric:
     # Backends that cannot isolate transfer latency can leave this as None.
     transfer_latency_s: Optional[float] = None
+    # Backends that cannot isolate allocation wait latency can leave this as None.
+    alloc_latency_s: Optional[float] = None
     transfer_total_bytes: Optional[int] = None
 
 
@@ -32,6 +40,8 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    kv_layer_ids: List[int]
+    kv_cache_dtype_str: str
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -39,8 +49,16 @@ class KVArgs:
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
+    state_layer_ids: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    # Number of rows before the slice axis in each per-slot state tensor.
+    state_slice_outer_counts: List[List[int]]
+    is_hybrid_mla_backend: bool
+    # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
+    # scatter transfer can slice each independently head-sharded sub-block; None
+    # per tensor when the single contiguous slice already matches the layout.
+    state_conv_shard_groups: List[List[Optional[List[int]]]]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -95,7 +113,6 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
-
     @abstractmethod
     def __init__(
         self,
@@ -104,6 +121,7 @@ class BaseKVSender(ABC):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
     @abstractmethod
@@ -118,6 +136,7 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
@@ -149,9 +168,20 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def clear(self):
+        """
+        Clear any internal states.
+        """
+        pass
+
+    def abort(self):
+        """
+        Abort the current transfer.
+        """
+        pass
+
 
 class BaseKVReceiver(ABC):
-
     @abstractmethod
     def __init__(
         self,

@@ -6,7 +6,7 @@ if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
-def engine_stats(ctx: "ScriptedContext") -> Dict[str, int]:
+def engine_stats(ctx: ScriptedContext) -> Dict[str, int]:
     s = ctx.scheduler
     return {
         "kv_pool_free": s.token_to_kv_pool_allocator.available_size(),

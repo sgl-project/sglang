@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="base-c-test-cpu")
 
 
 _GOOD_LINE: str = SwaDivergenceLog(
@@ -43,7 +43,7 @@ class _DummyHarness(CanaryE2EBase):
 class TestAssertSwaDivergenceObserved(CustomTestCase):
     def _make_harness(
         self, log_text_or_sequence
-    ) -> tuple[_DummyHarness, "patch._patch[None]"]:
+    ) -> tuple[_DummyHarness, patch._patch[None]]:
         harness = _DummyHarness()
         harness._stderr_buf = None
         harness._stdout_buf = None

@@ -110,6 +110,16 @@ def normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:
     return parsed
 
 
+def parse_size(size: str) -> tuple[int | None, int | None]:
+    try:
+        parts = size.lower().replace(" ", "").split("x")
+        if len(parts) != 2:
+            raise ValueError
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None, None
+
+
 def parse_tcp_host_port(value: str | None, field_name: str) -> tuple[str, int]:
     if value is None or not str(value).strip():
         raise ValueError(f"{field_name} is required")

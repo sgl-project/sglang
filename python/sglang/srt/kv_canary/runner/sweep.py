@@ -34,7 +34,7 @@ class SweepOrchestrator:
         self._endpoints = endpoints
         self._swa_window_size = swa_window_size
         self._outer_step_counter_getter = outer_step_counter_getter
-        self._radix_cache: Optional["BasePrefixCache"] = None
+        self._radix_cache: Optional[BasePrefixCache] = None
 
         self._last_sweep_step: int = -1
         self._sweep_passes: int = 0
@@ -43,7 +43,7 @@ class SweepOrchestrator:
     def sweep_passes(self) -> int:
         return self._sweep_passes
 
-    def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
+    def attach_radix_cache(self, radix_cache: BasePrefixCache) -> None:
         self._radix_cache = radix_cache
 
     def maybe_run_sweep(self) -> None:

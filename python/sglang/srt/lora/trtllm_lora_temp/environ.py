@@ -1,14 +1,10 @@
 """Local env registry for the experimental TRT-LLM LoRA fast path.
 
 Every flag here is gated by the single global master switch
-``SGLANG_EXPERIMENTAL_LORA_OPTI`` (defined in ``sglang.srt.environ``). When the master
-switch is OFF (the default), every flag reads ``False`` (its default is
-suppressed), so the no-LoRA path, other MoE backends, and the default
-(non-experimental) LoRA path are byte-identical to upstream.
+``SGLANG_EXPERIMENTAL_LORA_OPTI`` (defined in ``sglang.srt.environ``). When it is
+off, every local flag reads ``False``.
 
-Keeping these flags out of the global ``Envs`` class is deliberate: the only
-sglang-global addition for this feature is ``SGLANG_EXPERIMENTAL_LORA_OPTI``; all the
-fine-grained opt switches live here, next to the code that consumes them.
+Fine-grained switches live here beside their consumers.
 
 Default policy (applies only when ``SGLANG_EXPERIMENTAL_LORA_OPTI=1``):
   * **common** flags — used by BOTH the qwen3.5 (FP8) and kimi (NVFP4) configs —
@@ -72,13 +68,17 @@ class _LoraEnvs:
         "SGLANG_OPT_LORA_FUSED_TOPK_PACK", True
     )
     SGLANG_OPT_LORA_QKV_B_STORE = _GatedBool("SGLANG_OPT_LORA_QKV_B_STORE", True)
+    # F1-①: prefill routing reuse — unify the A (shrink) stage's routing BLOCK_SIZE_M with
+    # the B stage's at prefill (>=512 tokens) so the per-layer routing_cache key matches
+    # across stages and the Triton align/sort runs once per layer-forward instead of once
+    # per stage (4x at prefill). Dtype-agnostic (the chain is shared by fp8/nvfp4/bf16).
+    # Decode (<512) keeps the opt1 fused merged-align path and its tuned shrink block.
+    SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE = _GatedBool(
+        "SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE", True
+    )
 
     # ---- correctness fixes: on by default when experimental ----
-    # gate_up gated-split fix (up_A shrink for the up half); set =0 only to A/B bisect.
-    SGLANG_ENABLE_LORA_MOE_GATEUP_GATED_SPLIT = _GatedBool(
-        "SGLANG_ENABLE_LORA_MOE_GATEUP_GATED_SPLIT", True
-    )
-    # feed bf16 router logits straight to the JIT kimi gate (bitwise-identical).
+    # Feed bf16 router logits straight to the JIT kimi gate (bitwise-identical).
     SGLANG_OPT_KIMI_GATE_BF16_INPUT = _GatedBool(
         "SGLANG_OPT_KIMI_GATE_BF16_INPUT", True
     )
@@ -108,7 +108,7 @@ class _LoraEnvs:
     # diagnostics / tuning:
     SGLANG_OPT_LORA_SHRINK_TUNE = _GatedBool("SGLANG_OPT_LORA_SHRINK_TUNE", False)
 
-    # kimi NVFP4 permute+quant fuse — read in jit_kernel/trtllm_lora_temp/core.py (Python) to pass
+    # kimi NVFP4 permute+quant fuse — read in kernels/ops/moe/trtllm_lora_temp/core.py (Python) to pass
     # a bool to the kernel, AND C++-side via getenv in the launcher. Default off (kimi-only).
     SGLANG_OPT_FUSED_PERMUTE_QUANT = _GatedBool("SGLANG_OPT_FUSED_PERMUTE_QUANT", False)
 

@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 def run(
     *,
-    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional[ForwardBatch],
     config: PerturbConfig,
     buffer_groups: tuple[CanaryBufferGroup, ...],
     warmup_gate: WarmupGate,

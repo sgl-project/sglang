@@ -37,6 +37,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+# Module-level aliases for test discoverability and external reuse.
+_qwen_image_unpack = unpack_2x2_latent
+_qwen_image_pack = pack_2x2_latent
+
 # Power-law spectrum constants P(ω) = A·|ω|^{-β} for Qwen-Image VAE latents.
 # TODO: fit these from Qwen-Image VAE latent statistics on a representative
 #       dataset (e.g. Aesthetics-Train-V2). Using FLUX.1-dev fitted values as
