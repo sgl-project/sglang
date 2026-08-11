@@ -10,12 +10,18 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from transformers import PretrainedConfig
+from transformers import (
+    Gemma4UnifiedAudioConfig,
+    Gemma4UnifiedConfig,
+    Gemma4UnifiedVisionConfig,
+    PretrainedConfig,
+)
 from transformers.image_processing_utils import BaseImageProcessor
 
 import sglang.srt.utils.hf_transformers.processor as processor_utils
 from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers.common import (
+    _CONFIG_REGISTRY,
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
@@ -31,6 +37,26 @@ from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_comp
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+class TestGemma4UnifiedConfigRegistration(unittest.TestCase):
+    def test_uses_unified_subconfigs(self):
+        config_cls = _CONFIG_REGISTRY["gemma4_unified"]
+        self.assertIs(config_cls, Gemma4UnifiedConfig)
+
+        config = config_cls(
+            audio_config={"audio_embed_dim": 640},
+            vision_config={
+                "mm_embed_dim": 3840,
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+            },
+        )
+
+        self.assertIsInstance(config.audio_config, Gemma4UnifiedAudioConfig)
+        self.assertEqual(config.audio_config.output_proj_dims, 640)
+        self.assertIsInstance(config.vision_config, Gemma4UnifiedVisionConfig)
+        self.assertEqual(config.vision_config.model_patch_size, 48)
 
 
 # ---------------------------------------------------------------------------

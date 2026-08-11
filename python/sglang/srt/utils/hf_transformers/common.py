@@ -191,12 +191,9 @@ except ImportError:
 
 
 try:
-    from transformers import Gemma4Config as _HFGemma4Config
+    from transformers import Gemma4UnifiedConfig
 
-    class _Gemma4UnifiedConfigAlias(_HFGemma4Config):
-        model_type = "gemma4_unified"
-
-    _CONFIG_REGISTRY["gemma4_unified"] = _Gemma4UnifiedConfigAlias
+    _CONFIG_REGISTRY["gemma4_unified"] = Gemma4UnifiedConfig
 except ImportError:
     pass
 
