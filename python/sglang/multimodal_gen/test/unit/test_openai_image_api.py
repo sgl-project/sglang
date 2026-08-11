@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _fallback_image_urls,
     _get_response_resize,
     _raise_if_image_variant_not_found,
+    _runtime_sampling_quality,
     _select_image_variant_cloud_url,
     _select_image_variant_path,
 )
@@ -38,6 +39,13 @@ def test_url_response_returns_one_item_per_output_path():
         os.path.abspath("first.png"),
         os.path.abspath("second.png"),
     ]
+
+
+def test_runtime_sampling_quality_preserves_the_openai_default():
+    assert _runtime_sampling_quality(None) is None
+    assert _runtime_sampling_quality("auto") is None
+    assert _runtime_sampling_quality("lossless") == "lossless"
+    assert _runtime_sampling_quality("high") == "high"
 
 
 def test_image_response_includes_resize_for_every_output():

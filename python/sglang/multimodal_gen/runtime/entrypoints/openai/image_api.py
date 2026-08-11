@@ -76,6 +76,11 @@ def _get_request_field_or_extra(request, field_name):
     return _get_extra_field(request, field_name)
 
 
+def _runtime_sampling_quality(quality: str | None) -> str | None:
+    """Keep OpenAI's automatic default out of SGLang's sampling contract."""
+    return None if quality in (None, "auto") else quality
+
+
 def _parse_extra_container(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         try:
@@ -311,6 +316,7 @@ async def generations(
             use_system_prompt=_get_extra_field(request, "use_system_prompt"),
             use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
+            quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
             diffusers_kwargs=request.diffusers_kwargs,
@@ -420,6 +426,7 @@ async def edits(
     guidance_scale: Optional[float] = Form(None),
     true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
+    quality: Optional[str] = Form(None),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
@@ -480,6 +487,7 @@ async def edits(
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
             num_frames=num_frames,
+            quality=_runtime_sampling_quality(quality),
             output_compression=output_compression,
             output_quality=output_quality,
             enable_upscaling=enable_upscaling,
