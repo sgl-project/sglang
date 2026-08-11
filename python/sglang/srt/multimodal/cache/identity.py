@@ -62,10 +62,26 @@ def _snapshot_pil(image: Image.Image) -> MediaSnapshot:
     snapshot = image.copy()
     snapshot.load()
     payload = snapshot.tobytes()
+    palette = snapshot.palette.tobytes() if snapshot.palette is not None else b""
+    palette_mode = (
+        snapshot.palette.mode.encode() if snapshot.palette is not None else b""
+    )
+    transparency = snapshot.info.get("transparency")
+    if transparency is None:
+        transparency_payload = b"none"
+    elif isinstance(transparency, bytes):
+        transparency_payload = b"bytes:" + transparency
+    else:
+        transparency_payload = (
+            f"{type(transparency).__name__}:{transparency!r}".encode()
+        )
     digest = _hash_parts(
         b"pil",
         snapshot.mode.encode(),
         json.dumps(snapshot.size).encode(),
+        palette_mode,
+        palette,
+        transparency_payload,
         payload,
     )
     return MediaSnapshot(snapshot, digest, len(payload), "pil")
