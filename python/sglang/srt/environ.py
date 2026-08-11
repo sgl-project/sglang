@@ -843,6 +843,14 @@ class Envs:
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
+    # HiSparse
+    # Kill-switch for the shared-index (IndexShare) swap-in prefetch
+    # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
+    SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Timing probe: run the swap-in fully but skip the host->device KV bytes,
+    # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
+    SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for
     # large ones, with an optional fused residual add. Covers the KDA o_proj

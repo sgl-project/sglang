@@ -76,6 +76,7 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
+
     from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
     # FlashInfer's MergeState CUDA kernel uses blockDim = (head_dim/vec_size, num_heads).
