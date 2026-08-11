@@ -4,7 +4,7 @@
 import json
 import os
 from collections import defaultdict
-from collections.abc import Callable, Hashable
+from collections.abc import Hashable
 from contextlib import contextmanager, nullcontext
 from typing import Any
 
@@ -37,79 +37,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = init_logger(__name__)
-
-
-def _map_lora_param_name(
-    name: str,
-    lora_mapping_fn: Callable[[str], tuple[str, Any, Any]],
-    dit_mapping_fn: Callable[[str], tuple[str, Any, Any]],
-) -> tuple[str, int | None, int | None]:
-    """Apply both LoRA-format and DiT mappings without losing merge metadata."""
-    name, lora_merge_index, lora_merge_count = lora_mapping_fn(name)
-    target_name, dit_merge_index, dit_merge_count = dit_mapping_fn(name)
-
-    if lora_merge_index is None:
-        return target_name, dit_merge_index, dit_merge_count
-    if dit_merge_index is not None and (
-        dit_merge_index != lora_merge_index or dit_merge_count != lora_merge_count
-    ):
-        raise ValueError(
-            f"Conflicting LoRA merge mappings for {name}: "
-            f"{(lora_merge_index, lora_merge_count)} and "
-            f"{(dit_merge_index, dit_merge_count)}"
-        )
-    return target_name, lora_merge_index, lora_merge_count
-
-
-def _validate_lora_pair_shapes(
-    layer_name: str,
-    layer: BaseLayerWithLoRA,
-    lora_a: torch.Tensor,
-    lora_b: torch.Tensor,
-) -> None:
-    base_layer = layer.base_layer
-    expected_input = getattr(
-        base_layer, "input_size", getattr(base_layer, "in_features", None)
-    )
-    expected_output = getattr(
-        base_layer, "output_size", getattr(base_layer, "out_features", None)
-    )
-    if expected_input is None or expected_output is None:
-        return
-
-    if lora_a.dim() != lora_b.dim() or lora_a.dim() not in (2, 3):
-        raise ValueError(
-            f"LoRA layer {layer_name} requires matching 2D or 3D A/B tensors, "
-            f"got {tuple(lora_a.shape)} and {tuple(lora_b.shape)}"
-        )
-    if lora_a.shape[-1] != expected_input or lora_b.shape[-1] != lora_a.shape[-2]:
-        raise ValueError(
-            f"LoRA layer {layer_name} has incompatible A/B dimensions "
-            f"{tuple(lora_a.shape)} and {tuple(lora_b.shape)}; expected input "
-            f"width {expected_input}"
-        )
-
-    if lora_a.dim() == 2:
-        if lora_b.shape[0] != expected_output:
-            raise ValueError(
-                f"LoRA layer {layer_name} has output width {lora_b.shape[0]}, "
-                f"expected {expected_output}"
-            )
-        return
-
-    output_sizes = getattr(base_layer, "output_sizes", None)
-    if output_sizes is None or len(output_sizes) != lora_a.shape[0]:
-        raise ValueError(
-            f"Stacked LoRA layer {layer_name} has {lora_a.shape[0]} projections, "
-            "but the base layer does not expose the same fused layout"
-        )
-    if lora_a.shape[0] != lora_b.shape[0] or any(
-        size != lora_b.shape[1] for size in output_sizes
-    ):
-        raise ValueError(
-            f"Stacked LoRA layer {layer_name} has incompatible output shape "
-            f"{tuple(lora_b.shape)} for fused widths {output_sizes}"
-        )
 
 
 class LoRAPipeline(ComposedPipelineBase):
@@ -829,11 +756,10 @@ class LoRAPipeline(ComposedPipelineBase):
         for name, weight in lora_state_dict.items():
             name = name.replace("diffusion_model.", "")
             name = name.replace(".weight", "")
-            target_name, merge_index, num_params_to_merge = _map_lora_param_name(
-                name,
-                lora_param_names_mapping_fn,
-                param_names_mapping_fn,
-            )
+            # misc-format -> HF-format
+            name, _, _ = lora_param_names_mapping_fn(name)
+            # HF-format (LoRA) -> SGLang-dit-format
+            target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
             # for fuse B(out_dim, r) @ A(r, in_dim) -> (N, out_dim, r) @ (N, r, in_dim)
             # see param mapping in HunyuanVideoArchConfig
             if merge_index is not None:
@@ -855,39 +781,6 @@ class LoRAPipeline(ComposedPipelineBase):
                 )
             self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
 
-        lora_layers_by_name: defaultdict[str, list[BaseLayerWithLoRA]] = defaultdict(
-            list
-        )
-        for layers in (
-            self.lora_layers,
-            self.lora_layers_transformer_2,
-            self.lora_layers_critic,
-        ):
-            for name, layer in layers.items():
-                lora_layers_by_name[name].append(layer)
-        matched_layers = set()
-        for name, layers in lora_layers_by_name.items():
-            lora_a = self.lora_adapters[lora_nickname].get(name + ".lora_A")
-            lora_b = self.lora_adapters[lora_nickname].get(name + ".lora_B")
-            if lora_a is None or lora_b is None:
-                continue
-            shape_errors = []
-            for layer in layers:
-                try:
-                    _validate_lora_pair_shapes(name, layer, lora_a, lora_b)
-                    break
-                except ValueError as error:
-                    shape_errors.append(error)
-            else:
-                raise shape_errors[0]
-            matched_layers.add(name)
-        if not matched_layers:
-            sample_keys = list(self.lora_adapters[lora_nickname])[:8]
-            self.lora_adapters[lora_nickname].clear()
-            raise ValueError(
-                f"LoRA adapter {lora_path} did not match any supported layer after "
-                f"name conversion. Sample converted keys: {sample_keys}"
-            )
         self.loaded_adapter_paths[lora_nickname] = lora_path
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)

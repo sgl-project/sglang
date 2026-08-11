@@ -3,16 +3,10 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
-    LoRAPipeline,
-    _map_lora_param_name,
-    _validate_lora_pair_shapes,
-)
+from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
 _RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline.dist.get_rank"
@@ -165,34 +159,3 @@ def test_pinned_lora_weight_limits_snapshot_download(tmp_path):
         weight_name,
         f"**/{weight_name}",
     ]
-
-
-def test_lora_shape_validation_rejects_pruned_model_adapter():
-    with pytest.raises(ValueError, match="expected input width 2"):
-        _validate_lora_pair_shapes(
-            "linear",
-            _make_layer(),
-            torch.ones(1, 1),
-            torch.ones(2, 1),
-        )
-
-
-def test_lora_mapping_keeps_split_projection_merge_metadata():
-    lora_mapping = get_param_names_mapping(
-        {
-            rf"^transformer_blocks\.(\d+)\.attn\.to_{projection}\.(lora_[AB])$": (
-                r"blocks.\1.attn.qkv_proj.\2",
-                index,
-                3,
-            )
-            for index, projection in enumerate(("q", "k", "v"))
-        }
-    )
-    target_mapping = get_param_names_mapping({})
-
-    for index, projection in enumerate(("q", "k", "v")):
-        assert _map_lora_param_name(
-            f"transformer_blocks.7.attn.to_{projection}.lora_A",
-            lora_mapping,
-            target_mapping,
-        ) == ("blocks.7.attn.qkv_proj.lora_A", index, 3)

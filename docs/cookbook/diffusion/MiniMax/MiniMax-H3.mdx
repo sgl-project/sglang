@@ -388,8 +388,7 @@ refer to files visible inside the SGLang server environment.
 H3 accepts both native fused adapters and standard Diffusers/PEFT adapters.
 Native adapters target modules such as `blocks.*.attn.qkv_proj`; PEFT adapters
 may instead provide separate `to_q`, `to_k`, and `to_v` projections and the
-`default` adapter namespace. SGLang normalizes both layouts and rejects an
-adapter that does not match any H3 layer.
+`default` adapter namespace. SGLang normalizes both layouts.
 
 The following FL2VA adapters have distinct purposes:
 
@@ -451,9 +450,8 @@ that combination has not been quality-validated.
 
 <Warning>
 LoRAs trained for a pruned or structurally modified ComfyUI graph are not
-automatically compatible with the native H3 weights. SGLang fails the load if
-no converted adapter key matches a supported layer instead of silently running
-the base model.
+automatically compatible with the native H3 weights. Use only adapters whose
+architecture and target modules match the full native H3 checkpoint.
 </Warning>
 
 ## 6. Sampling and output controls

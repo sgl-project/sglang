@@ -43,7 +43,6 @@ def _ensure_single_process_parallel_runtime() -> None:
 
 def test_native_weight_names_and_grouped_qkv_reorder():
     arch = MiniMaxH3DiTArchConfig()
-    assert arch.param_names_mapping == {}
     assert arch.reverse_param_names_mapping == {}
     mapping = get_param_names_mapping(arch.param_names_mapping)
     for key in (
@@ -54,25 +53,31 @@ def test_native_weight_names_and_grouped_qkv_reorder():
     ):
         assert mapping(key) == (key, None, None)
 
-    lora_mapping = get_param_names_mapping(arch.lora_param_names_mapping)
-    assert lora_mapping(
-        "base_model.model.transformer.transformer_blocks.7.attn.to_k.lora_A"
+    assert mapping(
+        "base_model.model.transformer.transformer_blocks.7.attn.to_k.lora_A.default"
     ) == ("blocks.7.attn.qkv_proj.lora_A", 1, 3)
-    assert lora_mapping("token_refiner.refiner_blocks.1.ff.net.0.proj.lora_B") == (
+    assert mapping("token_refiner.refiner_blocks.1.ff.net.0.proj.lora_B") == (
         "token_refiner.blocks.1.mlp.fc1.lora_B",
         None,
         None,
     )
-    assert lora_mapping(
-        "transformer.transformer_blocks.3.adaln_proj.linear.lora_A"
-    ) == ("blocks.3.adaln_proj.linear.lora_A", None, None)
-    assert lora_mapping("transformer.audio_proj_out.lora_B") == (
+    assert mapping("transformer.transformer_blocks.3.adaln_proj.linear.lora_A") == (
+        "blocks.3.adaln_proj.linear.lora_A",
+        None,
+        None,
+    )
+    assert mapping("transformer.audio_proj_out.lora_B") == (
         "final_layer.audio_out.lora_B",
         None,
         None,
     )
-    assert lora_mapping("blocks.3.attn.out_proj.lora_A") == (
+    assert mapping("blocks.3.attn.out_proj.lora_A") == (
         "blocks.3.attn.out_proj.lora_A",
+        None,
+        None,
+    )
+    assert mapping("transformer.blocks.0.attn.qkv_proj.weight") == (
+        "transformer.blocks.0.attn.qkv_proj.weight",
         None,
         None,
     )

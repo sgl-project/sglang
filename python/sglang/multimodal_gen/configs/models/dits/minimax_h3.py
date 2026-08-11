@@ -12,13 +12,14 @@ MINIMAX_H3_ADALN_MODALITY_NUM = 3
 class MiniMaxH3DiTArchConfig(DiTArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
 
-    # Accept both the native MiniMax names used by most H3 LoRAs and the
-    # Diffusers/PEFT layout.  H3 fuses Q/K/V, so split PEFT projections are
+    # Accept the Diffusers/PEFT aliases in the same source-to-native mapping
+    # used by the model loader. H3 fuses Q/K/V, so split PEFT projections are
     # stacked and consumed by MergedColumnParallelLinearWithLoRA.
-    lora_param_names_mapping: dict = field(
+    param_names_mapping: dict = field(
         default_factory=lambda: {
-            r"^base_model\.model\.(.*)$": r"\1",
-            r"^transformer\.(.*)$": r"\1",
+            r"^(.*\.lora_[AB])\.[^.]+$": r"\1",
+            r"^base_model\.model\.(.*\.lora_[AB])$": r"\1",
+            r"^transformer\.(.*\.lora_[AB])$": r"\1",
             r"^proj_in\.(lora_[AB])$": r"video_patch_proj.\1",
             r"^audio_proj_in\.(lora_[AB])$": r"audio_patch_proj.\1",
             r"^context_embedder\.(lora_[AB])$": r"condition_proj.\1",

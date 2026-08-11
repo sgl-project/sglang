@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from enum import Enum
 from typing import Dict, Iterable, Mapping, Optional
 
@@ -9,8 +8,6 @@ import torch
 from diffusers.loaders import lora_conversion_utils as lcu
 
 logger = logging.getLogger("LoRAFormatAdapter")
-
-_PEFT_ADAPTER_NAMESPACE = re.compile(r"(\.lora_[AB])\.[^.]+(\.weight)$")
 
 
 class LoRAFormat(str, Enum):
@@ -561,20 +558,6 @@ def normalize_lora_state_dict(
     log.info("[LoRAFormatAdapter] detected format: %s", fmt)
 
     normalized = convert_lora_state_dict_by_format(state_dict, fmt, log)
-
-    # PEFT stores the active adapter name between lora_A/lora_B and weight,
-    # most commonly ``default``.  Runtime module names do not contain that
-    # namespace, so canonicalize it here for every supported architecture.
-    canonicalized: Dict[str, torch.Tensor] = {}
-    for key, value in normalized.items():
-        canonical_key = _PEFT_ADAPTER_NAMESPACE.sub(r"\1\2", key)
-        if canonical_key in canonicalized:
-            raise ValueError(
-                "LoRA key collision after removing the PEFT adapter namespace: "
-                f"{canonical_key}"
-            )
-        canonicalized[canonical_key] = value
-    normalized = canonicalized
 
     norm_keys = list(normalized.keys())
     if norm_keys:
