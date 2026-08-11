@@ -253,6 +253,69 @@ class TestBailingMoeV3Gate(_FusionGateCase):
     def test_compressed_tensors_uniform_expert_layout_can_fuse(self):
         self.assertIsNone(self._reason_on_cuda(self._compressed_tensors([])))
 
+    def test_nextn_uses_its_rewritten_architecture(self):
+        from sglang.srt.models import bailing_moe_v3
+        from sglang.srt.models.bailing_moe_nextn import BailingMoeForCausalLMNextN
+
+        config = self._config()
+        config.architectures = ["BailingMoeForCausalLMNextN"]
+        config.model_type = "bailing_hybrid"
+        config.use_kda = True
+        self._seed()
+        with (
+            unittest.mock.patch.object(bailing_moe_v3, "_is_cuda", True),
+            unittest.mock.patch.object(
+                bailing_moe_v3.torch.cuda,
+                "get_device_capability",
+                return_value=(9, 0),
+            ),
+        ):
+            reason = self._reason(
+                BailingMoeForCausalLMNextN,
+                config,
+                self._compressed_tensors(
+                    ["re:.*(mlp|shared_experts)\\.(gate|up|gate_up|down|eh)_proj.*"]
+                ),
+            )
+
+        self.assertIn("different quant methods", reason)
+
+    def test_nextn_constructor_calls_v3_fusion_setup(self):
+        from sglang.srt.models import bailing_moe_nextn, bailing_moe_v3
+
+        config = SimpleNamespace(
+            architectures=["BailingMoeForCausalLMNextN"],
+            model_type="bailing_hybrid",
+            use_kda=True,
+            num_shared_experts=1,
+            vocab_size=32000,
+            hidden_size=4096,
+        )
+        parallel = SimpleNamespace(
+            tp_size=1,
+            moe_ep_size=1,
+            enable_dp_lm_head=False,
+        )
+        with (
+            unittest.mock.patch.object(
+                bailing_moe_nextn, "get_parallel", return_value=parallel
+            ),
+            unittest.mock.patch.object(
+                bailing_moe_v3, "get_parallel", return_value=parallel
+            ),
+            unittest.mock.patch.object(
+                bailing_moe_v3,
+                "is_shared_experts_fusion_disabled",
+                return_value=False,
+            ),
+            unittest.mock.patch.object(bailing_moe_nextn, "BailingMoEModelNextN"),
+            unittest.mock.patch.object(bailing_moe_nextn, "ParallelLMHead"),
+            unittest.mock.patch.object(bailing_moe_nextn, "LogitsProcessor"),
+        ):
+            model = bailing_moe_nextn.BailingMoeForCausalLMNextN(config)
+
+        self.assertEqual(model.num_fused_shared_experts, 1)
+
 
 class TestQwen3_5Gate(_FusionGateCase):
     def test_every_entry_class_answers(self):

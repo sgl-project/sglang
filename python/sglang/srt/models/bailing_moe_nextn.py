@@ -51,7 +51,6 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator, add_prefix
 
-LoraConfig = None
 logger = logging.getLogger(__name__)
 
 
@@ -194,7 +193,6 @@ class BailingMoEModelNextN(nn.Module):
 
 
 class BailingMoeForCausalLMNextN(nn.Module):
-
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -205,6 +203,16 @@ class BailingMoeForCausalLMNextN(nn.Module):
             "attention.dense": "attention.o_proj",
         },
     )
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        if not _is_bailing_moe_v3_config(hf_config):
+            return None
+        return BailingMoeV3ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config,
+            quant_config,
+            expected_architecture="BailingMoeForCausalLMNextN",
+        )
 
     def __init__(
         self,
@@ -219,14 +227,7 @@ class BailingMoeForCausalLMNextN(nn.Module):
         self.num_fused_shared_experts = 0
         is_bailing_moe_v3 = _is_bailing_moe_v3_config(config)
         if is_bailing_moe_v3:
-            # NOTE: architectures[0] is rewritten to "BailingMoeForCausalLMNextN"
-            # for the draft model in `configs/model_config.py` (search for that
-            # string). The architecture name passed here MUST match that rewrite,
-            # otherwise V3's determine_num_fused_shared_experts() will disable
-            # fusion via the `config.architectures[0] != architecture` check.
-            BailingMoeV3ForCausalLM.determine_num_fused_shared_experts(
-                self, "BailingMoeForCausalLMNextN"
-            )
+            BailingMoeV3ForCausalLM.determine_num_fused_shared_experts(self)
         elif hasattr(self, "determine_num_fused_shared_experts"):
             # Asystem has determine_num_fused_shared_experts but theta does not.
             self.determine_num_fused_shared_experts("BailingMoeForCausalLMNextN")

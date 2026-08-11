@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +23,7 @@ from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
@@ -76,7 +77,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu_amx_available,
     _is_cuda,
     _is_hip,
-    _use_aiter_gfx95,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
@@ -89,7 +89,6 @@ from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
     bind_or_assign,
-    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_sm100_supported,
@@ -98,10 +97,6 @@ from sglang.srt.utils import (
 )
 
 _is_fp8_fnuz = is_fp8_fnuz()
-
-if _use_aiter_gfx95:
-
-    pass
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize
@@ -112,18 +107,14 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 
-else:
+elif not (_is_cpu and _is_cpu_amx_available):
     from vllm._custom_ops import awq_dequantize
-
-if _is_hip:
-    pass
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
 
 
 class DsV3MLA(DeepseekV2AttentionMLA):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -232,7 +223,6 @@ class DsV3MLA(DeepseekV2AttentionMLA):
         return attn_output
 
 
-LoraConfig = None
 logger = logging.getLogger(__name__)
 
 
@@ -287,26 +277,7 @@ def is_pp_missing_parameter(
     return False
 
 
-def weight_loader_with_alias(alias: str):
-    def wrapper(func: Callable):
-        def inner_func(
-            param: torch.Tensor,
-            loaded_weight: torch.Tensor,
-            *args,
-            prefix: str = None,
-            **kwargs,
-        ):
-            # pf = "[vLLM][load]" + " " if prefix is None else f"[{prefix}] "
-            value = func(param, loaded_weight, *args, **kwargs)
-            return value
-
-        return inner_func
-
-    return wrapper
-
-
 class BailingMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -453,19 +424,11 @@ class BailingMoEGate(nn.Module):
 
 
 class BailingMoE(nn.Module):
-
     @staticmethod
     def _get_swiglu_limit(limit_list, layer_num):
-        try:
-            if (
-                limit_list is None
-                or len(limit_list) <= layer_num
-                or limit_list[layer_num] == 0
-            ):
-                return None
-            return limit_list[layer_num]
-        except Exception:
+        if limit_list is None or not 0 <= layer_num < len(limit_list):
             return None
+        return limit_list[layer_num] or None
 
     def __init__(
         self,
@@ -865,7 +828,6 @@ class BailingKDA(KimiDeltaAttention):
 
 
 class BailingMoEAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -974,7 +936,6 @@ class BailingMoEAttention(nn.Module):
 
 
 class BailingMoELinearDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -989,9 +950,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.use_mla = getattr(config, "full_attention_type", "mla") == "mla"
         self.attention_type = config.attention_type
-        # todo nextn
-
-        is_kda = True
         self.config = config
 
         if config.attention_type == 0:  # Linear layer
@@ -1030,7 +988,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     ),
                 )
             else:
-                logger.info(f"==={layer_id=} use gqa")
                 self.attention = BailingMoEAttention(
                     config,
                     quant_config=quant_config,
@@ -1209,7 +1166,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
 
 class BailingMoELinearModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1377,7 +1333,6 @@ class BailingMoELinearModel(nn.Module):
 
 
 class BailingMoeV3ForCausalLM(nn.Module):
-
     def __init__(
         self,
         *,
@@ -1432,7 +1387,12 @@ class BailingMoeV3ForCausalLM(nn.Module):
         return self.model.end_layer
 
     @classmethod
-    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+    def shared_experts_fusion_disable_reason(
+        cls,
+        hf_config,
+        quant_config,
+        expected_architecture="BailingMoeV3ForCausalLM",
+    ):
         """Why this checkpoint cannot fuse its shared experts, or None."""
         num_shared_experts = getattr(hf_config, "num_shared_experts", 0)
         if num_shared_experts == 0:
@@ -1443,7 +1403,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                 "incompatible with A2A backends because the extra shared expert ID cannot "
                 "be correctly routed."
             )
-        if hf_config.architectures[0] != "BailingMoeV3ForCausalLM":
+        if hf_config.architectures[0] != expected_architecture:
             return "Config does not support fused shared expert(s)."
         if (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
@@ -1567,8 +1527,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
                             and layer_id >= self.model.start_layer
                         ):
                             layer_ids.add(layer_id)
-        logger.info(f"=====layer_ids {layer_ids}")
-
         for layer_id in layer_ids:
             self_attn = (
                 self.model.layers[layer_id].attention
@@ -1629,7 +1587,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                             and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
-                            and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                            and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                         ):
                             block_scale = weight_scale
                             use_deep_gemm_bmm = True
@@ -1810,7 +1768,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
                 return
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", self.weight_direct_load)
-            weight_loader = weight_loader_with_alias(name)(weight_loader)
             if "A_log" in name:
                 # Temporary use this way
                 # As our A_log param's shape is different from kimi's
@@ -1870,199 +1827,178 @@ class BailingMoeV3ForCausalLM(nn.Module):
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         for name, loaded_weight in weights:
-            try:
-                found = False
-                name0 = name
-                if name.startswith("model.mtp"):
+            if name.startswith("model.mtp"):
+                continue
+            layer_idx = None
+            if "model.layers." in name:
+                layer_idx = int(name.split(".")[2])
+                if not is_nextn and layer_idx >= self.config.num_hidden_layers:
                     continue
-                layer_idx = None
-                if "model.layers." in name:
-                    layer_idx = int(name.split(".")[2])
-                    if not is_nextn and layer_idx >= self.config.num_hidden_layers:
-                        continue
-                if (
-                    ("v_head" in name)
-                    or ("inv_freq" in name)
-                    or (self.config.tie_word_embeddings and "lm_head" in name)
-                ):
+            if (
+                ("v_head" in name)
+                or ("inv_freq" in name)
+                or (self.config.tie_word_embeddings and "lm_head" in name)
+            ):
+                continue
+
+            if is_nextn:
+                if not name.startswith(nextn_layer_prefix):
                     continue
+                rewritten = rewrite_nextn_weight_name(name, nextn_layer_prefix)
+                if rewritten is None:
+                    continue
+                name = rewritten
+                layer_idx = 0
 
-                if is_nextn:
-                    if not name.startswith(nextn_layer_prefix):
-                        continue
-                    rewritten = rewrite_nextn_weight_name(name, nextn_layer_prefix)
-                    if rewritten is None:
-                        continue
-                    name = rewritten
-                    layer_idx = 0
+            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+                name = name.replace(
+                    "mlp.shared_experts",
+                    f"mlp.experts.{self.config.num_experts}",
+                )
 
-                # Redirect shared_experts weights to FusedMoE when fusion is enabled
-                if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-                    name = name.replace(
-                        "mlp.shared_experts",
-                        f"mlp.experts.{self.config.num_experts}",
+            weight_names.append(name)
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                if "mlp.experts" in name:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                if param_name in {
+                    ".fused_qkvbfg_a_proj",
+                    ".fused_fg_b_proj",
+                    ".fused_qkvbfg_proj",
+                }:
+                    layer = (
+                        self.model.decoder
+                        if is_nextn
+                        else self.model.layers[int(name.split(".")[2])]
                     )
+                    if is_pp_missing_parameter(name, layer):
+                        continue
+                    layer_attn = layer.attention
+                    if not getattr(layer_attn, "do_fuse_qkvbfg", False):
+                        continue
+                    if param_name == ".fused_qkvbfg_proj":
+                        if not getattr(layer_attn, "no_kda_lora", False):
+                            continue
+                        if weight_name == ".b_proj" and not getattr(
+                            layer_attn, "fuse_no_lora_beta", False
+                        ):
+                            continue
+                        if weight_name in {".f_proj", ".g_proj"} and getattr(
+                            layer_attn, "fuse_no_lora_beta", False
+                        ):
+                            shard_id += 1
+                    elif getattr(layer_attn, "no_kda_lora", False):
+                        continue
 
-                weight_names.append(name)
+                new_name = name.replace(weight_name, param_name)
+                if new_name not in params_dict:
+                    continue
 
-                for param_name, weight_name, shard_id in stacked_params_mapping:
+                param = params_dict[new_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    if "mlp.experts" in name:
+                    name = name.replace(weight_name, param_name)
+
+                    if name not in params_dict:
                         continue
                     if is_pp_missing_parameter(name, self):
                         continue
-                    # Check if this mapping targets a fused projection (only apply fusion check to fused params)
-                    if param_name in {
-                        ".fused_qkvbfg_a_proj",
-                        ".fused_fg_b_proj",
-                        ".fused_qkvbfg_proj",
-                    }:
-                        layer = (
-                            self.model.decoder
-                            if is_nextn
-                            else self.model.layers[int(name.split(".")[2])]
-                        )
-                        if is_pp_missing_parameter(name, layer):
-                            continue
-                        layer_attn = layer.attention
-                        # Only load to fused projection if fusion is enabled
-                        if not getattr(layer_attn, "do_fuse_qkvbfg", False):
-                            continue
-                        if param_name == ".fused_qkvbfg_proj":
-                            if not getattr(layer_attn, "no_kda_lora", False):
-                                continue
-                            if weight_name == ".b_proj" and not getattr(
-                                layer_attn, "fuse_no_lora_beta", False
-                            ):
-                                continue
-                            if weight_name in {".f_proj", ".g_proj"} and getattr(
-                                layer_attn, "fuse_no_lora_beta", False
-                            ):
-                                shard_id += 1
-                        elif getattr(layer_attn, "no_kda_lora", False):
-                            continue
-
-                    new_name = name.replace(weight_name, param_name)
-                    if new_name not in params_dict:
-                        continue
-
-                    param = params_dict[new_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
-                    found = True
-                    weight_loader(param, loaded_weight, shard_id)
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
                     break
                 else:
-                    for mapping in expert_params_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name = name.replace(weight_name, param_name)
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    if "slope" in name:
+                        continue
 
-                        if name not in params_dict:
-                            continue
-                        if is_pp_missing_parameter(name, self):
-                            continue
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        found = True
-                        weight_loader(
-                            param,
-                            loaded_weight,
-                            name,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
+                    if fuse_qkv_a_proj and (
+                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                    ):
+                        cached_a_proj[name] = loaded_weight
+                        q_a_proj_name = (
+                            name
+                            if "q_a_proj" in name
+                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
                         )
-                        break
-                    else:
+                        kv_a_proj_name = (
+                            name
+                            if "kv_a_proj_with_mqa" in name
+                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                        )
 
-                        if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        if "slope" in name:
-                            continue
-
-                        if fuse_qkv_a_proj and (
-                            "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                        if (
+                            q_a_proj_name in cached_a_proj
+                            and kv_a_proj_name in cached_a_proj
                         ):
-                            found = True
-                            cached_a_proj[name] = loaded_weight
-                            q_a_proj_name = (
-                                name
+                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
+                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                            cat_dim = 0
+                            if self.quant_config is not None and (
+                                self.quant_config.get_name() == "awq"
+                                or self.quant_config.get_name() == "awq_marlin"
+                                or self.quant_config.get_name() == "moe_wna16"
+                            ):
+                                cat_dim = 1
+                            fused_weight = torch.cat(
+                                [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                            )
+                            param_name = (
+                                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
                                 if "q_a_proj" in name
-                                else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                                else name.replace(
+                                    "kv_a_proj_with_mqa",
+                                    "fused_qkv_a_proj_with_mqa",
+                                )
                             )
-                            kv_a_proj_name = (
-                                name
-                                if "kv_a_proj_with_mqa" in name
-                                else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                            )
-
-                            # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                            if (
-                                q_a_proj_name in cached_a_proj
-                                and kv_a_proj_name in cached_a_proj
-                            ):
-                                q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                                kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                                cat_dim = 0
-                                if self.quant_config is not None and (
-                                    self.quant_config.get_name() == "awq"
-                                    or self.quant_config.get_name() == "awq_marlin"
-                                    or self.quant_config.get_name() == "moe_wna16"
-                                ):
-                                    cat_dim = 1
-                                fused_weight = torch.cat(
-                                    [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                )
-                                param_name = (
-                                    name.replace(
-                                        "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                                    )
-                                    if "q_a_proj" in name
-                                    else name.replace(
-                                        "kv_a_proj_with_mqa",
-                                        "fused_qkv_a_proj_with_mqa",
-                                    )
-                                )
-                                if param_name not in params_dict:
-                                    continue
-                                param = params_dict[param_name]
-                                weight_loader = getattr(
-                                    param, "weight_loader", default_weight_loader
-                                )
-
-                                weight_loader(param, fused_weight)
-                                cached_a_proj.pop(q_a_proj_name)
-                                cached_a_proj.pop(kv_a_proj_name)
-                        else:
-                            if name not in params_dict:
-                                name = name.replace(".dense.", ".o_proj.")
-                                if name not in params_dict:
-                                    continue
-                            if is_pp_missing_parameter(name, self):
+                            if param_name not in params_dict:
                                 continue
-                            if (
-                                "attention" in name
-                                and "slope" not in name
-                                and is_linear_layer(
-                                    layer_idx, self.model.layer_group_size
-                                )
-                            ):
-                                load_linear_attn_weight(name, loaded_weight, self)
-                                loaded_params.add(name)
-                                found = True
-                                continue
-
-                            param = params_dict[name]
-                            found = True
+                            param = params_dict[param_name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            weight_loader(param, loaded_weight)
-            finally:
-                if not found:
-                    # print(f"fail load: {name0}")
-                    pass
+
+                            weight_loader(param, fused_weight)
+                            cached_a_proj.pop(q_a_proj_name)
+                            cached_a_proj.pop(kv_a_proj_name)
+                    else:
+                        if name not in params_dict:
+                            name = name.replace(".dense.", ".o_proj.")
+                            if name not in params_dict:
+                                continue
+                        if is_pp_missing_parameter(name, self):
+                            continue
+                        if (
+                            "attention" in name
+                            and "slope" not in name
+                            and is_linear_layer(layer_idx, self.model.layer_group_size)
+                        ):
+                            load_linear_attn_weight(name, loaded_weight, self)
+                            loaded_params.add(name)
+                            continue
+
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
             loaded_params.add(name)
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

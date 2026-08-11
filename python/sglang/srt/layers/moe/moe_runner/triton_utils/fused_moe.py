@@ -95,6 +95,32 @@ if not _is_cuda and not _is_hip and not _is_xpu:
 padding_size = get_moe_padding_size(_use_aiter)
 
 
+def _validate_fused_swiglu_interleaved(
+    *,
+    activation: str,
+    is_gated: bool,
+    has_gemm1_modifiers: bool,
+    has_bias: bool,
+    is_quantized: bool,
+    apply_router_weight_on_input: bool,
+    has_hooks: bool,
+    dtype: torch.dtype,
+) -> None:
+    if not (
+        activation == "silu"
+        and is_gated
+        and not has_gemm1_modifiers
+        and not has_bias
+        and not is_quantized
+        and not apply_router_weight_on_input
+        and not has_hooks
+        and dtype == torch.bfloat16
+    ):
+        raise ValueError(
+            "fuse_swiglu_interleaved set on an incompatible fused_moe call"
+        )
+
+
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
@@ -548,25 +574,20 @@ def _fused_moe_kernel_sequence(
     )
 
     if fuse_swiglu_interleaved:
-        # W13 rows are physically interleaved (permuted once at load), so the
-        # activation MUST come from the fused up-GEMM epilogue -- any
-        # standalone activation kernel would read halves layout and be
-        # silently wrong. Fail loudly on an incompatible call instead.
-        assert (
-            activation == "silu"
-            and is_gated
-            and gemm1_alpha is None
-            and gemm1_limit is None
-            and swiglu_limit is None
-            and b1 is None
-            and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
-            and not apply_router_weight_on_input
-            and hooks is None
-            and hidden_states.dtype == torch.bfloat16
-        ), "fuse_swiglu_interleaved set on an incompatible fused_moe call"
-        # The up-GEMM epilogue applies silu(gate) * up in-register and writes
-        # the half-width activation directly; intermediate_cache1 and the
-        # standalone activation kernel are skipped entirely.
+        _validate_fused_swiglu_interleaved(
+            activation=activation,
+            is_gated=is_gated,
+            has_gemm1_modifiers=any(
+                value is not None for value in (gemm1_alpha, gemm1_limit, swiglu_limit)
+            ),
+            has_bias=b1 is not None,
+            is_quantized=any(
+                (use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16)
+            ),
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            has_hooks=hooks is not None,
+            dtype=hidden_states.dtype,
+        )
         intermediate_cache1 = None
         gemm1_out = intermediate_cache2 = torch.empty(
             (total_tokens, N // 2),
@@ -972,7 +993,7 @@ def fused_experts_impl(
     else:
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), f"Hidden size mismatch"
+        ), "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
