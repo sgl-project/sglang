@@ -398,6 +398,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             "musa": EAGLEDraftCudaGraphRunner,
         }
         supports_hip_aiter_draft_extend_graph = False
+        supports_hip_dsa_draft_extend_graph = False
         if _is_hip:
             # Keep import local so non-HIP environments do not require aiter.
             from sglang.srt.layers.attention.aiter_backend import (
@@ -406,6 +407,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             supports_hip_aiter_draft_extend_graph = isinstance(
                 self.draft_attn_backend, AiterMultiStepDraftBackend
+            )
+            # On HIP the DSA backend is already instantiated as the running
+            # attention backend, so the import is safe and does not pull in
+            # the CUDA-only sparse-attention stack at module load time.
+            from sglang.srt.layers.attention.dsa_backend import (
+                DeepseekSparseAttnBackend,
+            )
+
+            supports_hip_dsa_draft_extend_graph = isinstance(
+                self.draft_extend_attn_backend, DeepseekSparseAttnBackend
             )
 
         graph_supported_backend_types = [
@@ -452,6 +463,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 or _is_xpu
                 or supports_cuda_draft_extend_graph
                 or supports_hip_aiter_draft_extend_graph
+                or supports_hip_dsa_draft_extend_graph
             )
         ):
             tic = time.perf_counter()
