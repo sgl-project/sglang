@@ -543,17 +543,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 "intermediate_size_per_partition="
                 f"{layer.intermediate_size_per_partition} is not 128-aligned"
             )
-        from sglang.srt.layers.moe.moe_runner.aiter import aiter_swiglu_oai_limit
 
         cfg = layer.moe_runner_config
         wants_swiglu_oai = (
             cfg.gemm1_alpha is not None or cfg.gemm1_clamp_limit is not None
         )
-        if wants_swiglu_oai and aiter_swiglu_oai_limit(cfg) is None:
+        if wants_swiglu_oai:
             return (
                 f"activation={cfg.activation} with gemm1_alpha={cfg.gemm1_alpha} / "
-                f"gemm1_beta={cfg.gemm1_beta} / "
-                f"gemm1_clamp_limit={cfg.gemm1_clamp_limit} has no aiter ActivationType"
+                f"gemm1_clamp_limit={cfg.gemm1_clamp_limit} (SwiGLU-OAI) is not "
+                "implemented by the aiter CK bf16 fused-MoE kernels"
             )
         return None
 
