@@ -65,6 +65,18 @@ on:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
         default: false
+      auto_partition_size:
+        description: 'Split the suite into N partitions; each partition job runs a subset via run_suite.py --auto-partition-size'
+        type: string
+        default: ''
+      auto_partition_id:
+        description: 'Which partition (0-based) this job runs when auto_partition_size is set'
+        type: string
+        default: ''
+      partition_label:
+        description: 'Short suffix (e.g. p0/p1) appended to the run/output directory and metrics artifact name to distinguish parallel partition jobs of the same suite'
+        type: string
+        default: ''
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -74,7 +86,7 @@ env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
 
 concurrency:
-  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_suite }}
+  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_suite }}-${{ inputs.auto_partition_id }}
   cancel-in-progress: true
 
 jobs:
@@ -221,6 +233,9 @@ jobs:
           GDN_ATTN_BACKEND_TRITON: 1
         shell: bash
         run: |
+          # Ensure the pipeline exit code reflects run_suite.py, not the final
+          # tee in the pipe, so test failures are reported to the job status.
+          set -o pipefail
           sglang_source_path=$(pwd)
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
@@ -229,6 +244,11 @@ jobs:
           test_suite="${{ inputs.test_suite }}"
           echo "Test mode: suite (${test_suite})"
           tc_name="${test_suite}"
+          # Parallel partition jobs of the same suite get distinct run/output
+          # directory suffixes so their artifacts do not collide.
+          if [ -n "${{ inputs.partition_label }}" ]; then
+            tc_name="${test_suite}-${{ inputs.partition_label }}"
+          fi
 
           # run_id / branch_label / workflow_name form the persistence directory prefix.
           # run_attempt distinguishes re-runs of the same workflow run (1, 2, 3, ...).
@@ -338,7 +358,13 @@ jobs:
           # Nightly additionally persists the full suite log to ${log_path}/${tc_name}.log;
           # PR runs only tee to /tmp/test_output.log (empty expansion adds no arg).
           LOG_TEE_TARGET="$([ "${{ inputs.is_nightly_pipeline_job }}" = "true" ] && echo "${log_path}/${tc_name}.log")"
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log ${LOG_TEE_TARGET} || test_exit_code=$?
+          # When the suite is split across parallel jobs, run only this job's
+          # partition of cases (run_suite.py balances by est_time).
+          PARTITION_ARGS=""
+          if [ -n "${{ inputs.auto_partition_size }}" ]; then
+            PARTITION_ARGS="--auto-partition-id ${{ inputs.auto_partition_id }} --auto-partition-size ${{ inputs.auto_partition_size }}"
+          fi
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log ${LOG_TEE_TARGET} || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
@@ -392,7 +418,7 @@ jobs:
         if: always() && inputs.is_nightly_pipeline_job == true && env.METRICS_DATA_FILE != ''
         uses: actions/upload-artifact@v4
         with:
-          name: metrics-${{ inputs.test_suite }}
+          name: metrics-${{ env.tc_name }}
           path: ${{ env.METRICS_DATA_FILE }}
           if-no-files-found: ignore
           retention-days: 7
