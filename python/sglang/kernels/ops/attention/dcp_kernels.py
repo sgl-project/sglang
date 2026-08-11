@@ -854,19 +854,6 @@ def dcp_reduce_kv_segments(
     return out, lse
 
 
-# ---------------------------------------------------------------------------
-# DCP target-verify stage B, and the two-partial merge that folds it into
-# stage A.
-#
-# Target-verify splits in two because aiter's mla_decode_fwd derives its causal
-# mask from the LOCAL shard index, which under round-robin DCP is not the
-# global position: stage A attends the committed shard with the window
-# flattened to single-token rows (mask degenerates), stage B attends the
-# in-hand window densely here, and the two are merged by LSE. Only rank 0 runs
-# stage B, so the window is counted exactly once across the group.
-# ---------------------------------------------------------------------------
-
-
 @triton.jit
 def _dense_causal_mla_window_kernel(
     q_ptr,  # [bs * q_len, H, NOPE + PE]
