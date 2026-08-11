@@ -95,6 +95,13 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             logger.warning(
                 "Detected MUSA with SGLANG_DEEPEP_BF16_DISPATCH for bf16 model, using deep_gemm kernel."
             )
+        elif get_platform().is_xpu:
+            # XPU installs triton_kernels, but the native sgl-kernel-xpu MoE stays
+            # the default; triton/triton_kernel are explicit opt-ins.
+            overrides["moe_runner_backend"] = "intel_xpu"
+            logger.warning(
+                "Detected XPU for GPT-OSS model, using intel_xpu MOE kernel."
+            )
         elif (
             cfg.ep_size == 1
             and is_triton_kernels_available()

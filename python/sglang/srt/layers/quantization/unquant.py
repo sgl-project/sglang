@@ -1655,7 +1655,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         ], f"activation = {moe_runner_config.activation} is not supported."
 
         backend = self.runner.runner_backend
-        if not get_moe_runner_backend().is_triton():
+        if backend.is_triton_kernels():
+            # create_weights already allocated the triton_kernels layout, and
+            # TopK.forward_xpu emits its 5-field routing for this backend.
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
+        elif not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
