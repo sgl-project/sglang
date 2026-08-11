@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_world_size,
@@ -53,6 +54,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
+
+
+def is_cosmos_layer(name: str, _module: object) -> bool:
+    return is_module_list_entry_in(name, ("layers", "gen_layers"))
 
 
 # -----------------------------------------------------------------------------
@@ -916,9 +921,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
     - Generation (GEN): cross-attention from visual to UND K/V
     """
 
-    _fsdp_shard_conditions = Cosmos3VideoConfig()._fsdp_shard_conditions
-    _compile_conditions = Cosmos3VideoConfig()._compile_conditions
-    _supported_attention_backends = Cosmos3VideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_cosmos_layer]
+    _compile_conditions = [is_cosmos_layer]
     param_names_mapping = Cosmos3VideoConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         Cosmos3VideoConfig().arch_config.reverse_param_names_mapping
@@ -1050,7 +1054,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     layer_idx=i,
                     prefix=f"gen_layers.{i}",
                     quant_config=quant_config,
-                    supported_attention_backends=arch._supported_attention_backends,
+                    supported_attention_backends=self._supported_attention_backends,
                 )
                 for i in range(arch.num_hidden_layers)
             ]

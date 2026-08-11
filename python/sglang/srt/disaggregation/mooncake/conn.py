@@ -520,6 +520,7 @@ class MooncakeKVManager(CommonKVManager):
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            requester_pp_rank=self.pp_rank,
         )
 
     def send_kvcache_staged(
@@ -531,6 +532,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
+        dst_layer_ids: List[int],
         staging_buffer=None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
@@ -563,7 +565,19 @@ class MooncakeKVManager(CommonKVManager):
 
         num_tokens = len(prefill_kv_indices) * page_size
         per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
-        per_rank_bytes = per_layer_bytes * num_layers * 2
+        local_bytes = per_layer_bytes * num_layers * 2
+
+        if self.pp_size > 1:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                dst_layer_ids,
+                num_layers * 2,
+                len(dst_layer_ids),
+            )
+            dst_num_layers = len(dst_layer_ids) // 2
+        else:
+            pairs = None
+            dst_num_layers = num_layers
 
         num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
@@ -572,21 +586,20 @@ class MooncakeKVManager(CommonKVManager):
             total_kv_heads,
             num_tokens,
             head_dim * dtype_size,
-            num_layers,
+            dst_num_layers,
         )
         writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
         rank_offset = sum(writer_rank_bytes[:writer_idx])
 
-        if not staging_buffer.fits(per_rank_bytes):
+        if not staging_buffer.fits(local_bytes):
             logger.warning(
-                f"Prefill staging too small for {per_rank_bytes} bytes, falling back"
+                f"Prefill staging too small for {local_bytes} bytes, falling back"
             )
             return -1
         if dst_staging_size < total_staging_needed:
             logger.warning(
                 f"Decode staging too small: need {total_staging_needed} bytes "
-                f"({num_writers if self.attn_tp_size > dst_attn_tp_size else 1} writers "
-                f"x {per_rank_bytes} bytes/rank), have {dst_staging_size}, falling back"
+                f"for {dst_num_layers} layers, have {dst_staging_size}, falling back"
             )
             return -1
 
@@ -605,16 +618,29 @@ class MooncakeKVManager(CommonKVManager):
             self.kv_args.gpu_id,
         )
 
-        dst_write_ptr = dst_staging_ptr + rank_offset
-        ret = self._transfer_data(
-            mooncake_session_id,
-            [(staging_buffer.get_ptr(), dst_write_ptr, per_rank_bytes)],
-        )
+        if pairs is None:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr(),
+                    dst_staging_ptr + rank_offset,
+                    local_bytes,
+                )
+            ]
+        else:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr() + src_idx * per_layer_bytes,
+                    dst_staging_ptr + rank_offset + dst_idx * per_layer_bytes,
+                    per_layer_bytes,
+                )
+                for src_idx, dst_idx in pairs
+            ]
+        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
         if ret != 0:
             raise RuntimeError(
                 f"[Staging] Bulk RDMA transfer failed with ret={ret}. "
                 f"src_ptr=0x{staging_buffer.get_ptr():x}, "
-                f"dst_ptr=0x{dst_write_ptr:x}, size={per_rank_bytes}. "
+                f"dst_ptr=0x{dst_staging_ptr + rank_offset:x}, size={local_bytes}. "
                 f"The decode staging buffer may not be properly registered."
             )
         return ret
