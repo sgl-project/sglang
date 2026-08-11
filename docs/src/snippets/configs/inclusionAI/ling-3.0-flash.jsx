@@ -10,6 +10,8 @@ export const config = {
   quantizations: [
     { id: "bf16", label: "BF16" },
     { id: "fp8", label: "FP8" },
+    { id: "int4", label: "INT4" },
+    { id: "mxfp4", label: "MXFP4" },
   ],
   strategies: [
     { id: "low-latency", label: "Low-Latency" },
@@ -23,6 +25,8 @@ export const config = {
   modelNames: {
     "default|bf16": "inclusionAI/Ling-3.0-flash",
     "default|fp8": "inclusionAI/Ling-3.0-flash-fp8",
+    "default|int4": "inclusionAI/Ling-3.0-flash-int4",
+    "default|mxfp4": "inclusionAI/Ling-3.0-flash-fp4",
   },
 
   placeholders: {
@@ -58,6 +62,7 @@ export const config = {
   --model {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
+  --random-range-ratio 1 \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
   --flush-cache`,
     accuracy: {
@@ -406,6 +411,61 @@ sgl-eval run gsm8k \\
         "--tp 4",
         "--ep-size 4",
         "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--mem-fraction-static 0.85",
+        "--tool-call-parser ling3",
+        "--reasoning-parser ling3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--mem-fraction-static 0.85",
+        "--tool-call-parser ling3",
+        "--reasoning-parser ling3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--mem-fraction-static 0.85",
+        "--tool-call-parser ling3",
+        "--reasoning-parser ling3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--fp8-gemm-backend triton",
+        "--mem-fraction-static 0.85",
+        "--tool-call-parser ling3",
+        "--reasoning-parser ling3",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
