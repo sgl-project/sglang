@@ -319,6 +319,10 @@ RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
+# Speculative algorithms whose verify forward presents a uniform per-request
+# token width, which is what the LoRA segment layout assumes.
+_LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
+
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 ENCODER_TRANSFER_BACKEND_CHOICES = [
@@ -9571,7 +9575,7 @@ class ServerArgs:
         if self.speculative_algorithm in ["NGRAM", None]:
             return
 
-        if self.speculative_algorithm not in ["EAGLE", "EAGLE3"]:
+        if self.speculative_algorithm not in _LORA_SPEC_ALGORITHMS:
             promoted = (
                 " (NEXTN/EAGLE with a Gemma4 assistant draft is automatically "
                 "promoted to FROZEN_KV_MTP, which does not support LoRA)"
@@ -9579,13 +9583,22 @@ class ServerArgs:
                 else ""
             )
             raise ValueError(
-                "LoRA is only compatible with NGRAM, EAGLE, NEXTN, or EAGLE3 "
-                f"speculative decoding, not {self.speculative_algorithm}{promoted}."
+                "LoRA is only compatible with NGRAM, EAGLE, NEXTN, EAGLE3, "
+                "DFLASH, or DSPARK speculative decoding, not "
+                f"{self.speculative_algorithm}{promoted}."
             )
+
+        ragged_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
 
         # Each entry: (is unsupported, why). Reasons are appended to a shared
         # prefix so the message names the combination, not just the flag.
         unsupported = [
+            (
+                self.speculative_algorithm == "DSPARK" and ragged_mode != "static",
+                f"does not support SGLANG_RAGGED_VERIFY_MODE={ragged_mode!r}: "
+                "the per-request verify lengths it schedules break the "
+                "uniform-width LoRA segment layout",
+            ),
             (
                 self.speculative_adaptive,
                 "does not support --speculative-adaptive: the draft is built "

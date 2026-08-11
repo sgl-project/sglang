@@ -126,26 +126,6 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
-def _unwrap_lora_lm_head(target_lm_head):
-    """Return the plain lm_head module behind a LoRA wrapper.
-
-    A draft sharing the wrapped module would apply the target's adapter
-    deltas using the target's LoRA batch metadata, which describes a
-    different batch shape than the draft's activations.
-    """
-    from sglang.srt.lora.layers import BaseLayerWithLoRA
-
-    if not isinstance(target_lm_head, BaseLayerWithLoRA):
-        return target_lm_head
-
-    logger.warning(
-        "The draft shares the target's LoRA-wrapped lm_head; sharing the base "
-        "layer instead. Adapter lm_head deltas will not influence drafting, "
-        "which may reduce the accept rate. Outputs are unaffected."
-    )
-    return target_lm_head.base_layer
-
-
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -298,8 +278,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
+        from sglang.srt.lora.layers import unwrap_lora_layer
+
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        target_lm_head = _unwrap_lora_lm_head(
+        # A draft sharing a LoRA-wrapped lm_head would apply the target's
+        # adapter deltas against the target's batch metadata, whose shape does
+        # not match the draft's activations.
+        target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
 

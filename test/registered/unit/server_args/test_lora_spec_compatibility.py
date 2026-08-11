@@ -53,16 +53,41 @@ class TestLoRASpeculativeCompatibility(CustomTestCase):
                         speculative_algorithm="EAGLE", **overrides
                     )._check_lora_speculative_compatibility()
 
-    def test_unsupported_algorithms_are_rejected(self):
-        """FROZEN_KV_MTP matters here: EAGLE/NEXTN with a Gemma4 assistant
-        draft is silently promoted to it during resolution, so the error has
-        to name the promotion or the user sees an algorithm they never typed."""
-        for algo in ["STANDALONE", "DFLASH", "DSPARK"]:
+    def test_supported_algorithms_pass(self):
+        """Every algorithm whose verify presents a uniform per-request width,
+        which is what the LoRA segment layout assumes."""
+        for algo in ["EAGLE", "EAGLE3", "DFLASH", "DSPARK"]:
             with self.subTest(algo=algo):
-                with self.assertRaises(ValueError):
+                _args(
+                    speculative_algorithm=algo
+                )._check_lora_speculative_compatibility()
+
+    def test_dspark_ragged_modes_are_rejected(self):
+        """cap-accept and compact schedule per-request verify lengths from the
+        draft confidence head, so the uniform-width segment layout no longer
+        describes the batch. Only DSPARK reads this mode."""
+        for mode in ["cap-accept", "compact"]:
+            with self.subTest(mode=mode):
+                with envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
+                    with self.assertRaisesRegex(ValueError, "RAGGED_VERIFY_MODE"):
+                        _args(
+                            speculative_algorithm="DSPARK"
+                        )._check_lora_speculative_compatibility()
+                    # Other algorithms never consult it.
                     _args(
-                        speculative_algorithm=algo
+                        speculative_algorithm="EAGLE"
                     )._check_lora_speculative_compatibility()
+
+    def test_unsupported_algorithms_are_rejected(self):
+        """STANDALONE's draft is an independent LM, so it has no verify width
+        contract to rely on. FROZEN_KV_MTP matters differently: EAGLE/NEXTN
+        with a Gemma4 assistant draft is silently promoted to it during
+        resolution, so the error has to name the promotion or the user sees an
+        algorithm they never typed."""
+        with self.assertRaisesRegex(ValueError, "only compatible"):
+            _args(
+                speculative_algorithm="STANDALONE"
+            )._check_lora_speculative_compatibility()
         with self.assertRaisesRegex(ValueError, "promoted"):
             _args(
                 speculative_algorithm="FROZEN_KV_MTP"

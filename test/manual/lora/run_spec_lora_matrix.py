@@ -155,6 +155,53 @@ CONFIGS = {
         env={"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"},
         tp=4,
     ),
+    # DFLASH: fixed-size block drafting, verified in one TARGET_VERIFY pass.
+    # Its target is the one base with several genuinely distinct public
+    # adapters, so no synthesis is needed.
+    "dflash-llama31": dict(
+        model="meta-llama/Llama-3.1-8B-Instruct",
+        spec_args=[
+            "--speculative-algorithm=DFLASH",
+            "--speculative-draft-model-path=z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat",
+            "--speculative-num-draft-tokens=4",
+        ],
+        adapters=[
+            ("fact", "algoprog/fact-generation-llama-3.1-8b-instruct-lora"),
+            ("guard", "nvidia/llama-3.1-nemoguard-8b-topic-control"),
+        ],
+        common_args=["--mem-fraction-static=0.7", "--max-lora-rank=64"],
+        # The draft checkpoint derives a 40960 context against the target's
+        # 131072; the draft follows the target, so waive the guard.
+        env={"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"},
+        tp=1,
+    ),
+    # DSPARK with a separate DSpark draft head, on the one base that has two
+    # distinct public adapters. Only the default static ragged-verify mode is
+    # supported: the others schedule per-request verify lengths, which the
+    # uniform-width LoRA segment layout cannot express.
+    "dspark-inkling": dict(
+        model="thinkingmachines/Inkling-Small",
+        spec_args=[
+            "--speculative-algorithm=DSPARK",
+            "--speculative-draft-model-path=RadixArk/Inkling-Small-DSpark",
+            "--speculative-dspark-block-size=5",
+        ],
+        adapters=[
+            ("gutenberg", "nbeerbower/Inkling-Small-Gutenberg-DPO-LoRA"),
+            ("hemlock", "hemlang/Inkling-Small-Hemlock-SFT-LoRA"),
+        ],
+        common_args=[
+            "--max-lora-rank=32",
+            "--moe-runner-backend=triton",
+            "--experts-shared-outer-loras",
+            "--mem-fraction-static=0.8",
+        ],
+        env={"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"},
+        # A ~500GB checkpoint over network storage does not load inside the
+        # default launch budget.
+        launch_timeout=3600,
+        tp=8,
+    ),
     # Flagship MLA + MoE NextN. 8 GPUs.
     "nextn-deepseek-v31": dict(
         model="deepseek-ai/DeepSeek-V3.1-Base",
@@ -318,7 +365,7 @@ def launch(config: dict, adapters, base_url: str, with_spec: bool):
     return popen_launch_server(
         config["model"],
         base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        timeout=config.get("launch_timeout", DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH),
         other_args=other_args,
         env=env,
     )
