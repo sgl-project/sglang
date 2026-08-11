@@ -21,6 +21,13 @@ on:
         description: 'Hard cap on PRs closed in one run'
         default: '32'
 
+# Two runs must never sweep at once - they would pick the same candidates and
+# double-comment on them. Queue instead of cancelling, so a manual dry-run does
+# not silently kill the scheduled sweep half way through.
+concurrency:
+  group: close-stale-prs
+  cancel-in-progress: false
+
 permissions:
   pull-requests: write
   contents: read
