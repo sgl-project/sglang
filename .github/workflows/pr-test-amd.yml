@@ -119,6 +119,8 @@ env:
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
   # Validation branch: pin every job to one image instead of the nightly lookup.
   CUSTOM_IMAGE: rocm/sgl-dev:v0.5.15.post1-ubuntu24.04-py3.14-rocm10rc2
+  # The pinned image is Python 3.14, where sglang[dev_hip] cannot be resolved.
+  NO_DEP_RESOLUTION: "1"
 
 concurrency:
   # Scheduled, run_all_tests, and manual dispatch runs get unique groups (never cancel each other).

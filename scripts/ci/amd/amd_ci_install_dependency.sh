@@ -131,7 +131,23 @@ else
   docker exec -w /sglang-checkout/python/sglang/kernels/aot ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
 
   docker exec ci_sglang bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
-  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
+  if [ -n "${NO_DEP_RESOLUTION:-}" ]; then
+    echo "NO_DEP_RESOLUTION set: installing the checkout with --no-deps, ignoring extras [${EXTRAS}]"
+    # sglang[dev_hip] is unresolvable on the Python 3.14 CI images: st_attn==0.0.7,
+    # vsa==0.0.4, petit_kernel==0.0.2 and wave-lang==3.8.2 publish neither a cp314
+    # wheel nor an sdist, so pip backtracks every other candidate until it gives up
+    # with `resolution-too-deep`. Such an image already ships the runtime, so install
+    # the checkout without the resolver and add back only what the image lacks.
+    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --no-deps -e python
+    # Version specifiers go through a file because install_with_retry evals its
+    # argument, which would turn `>=` / `<` into shell redirections.
+    docker exec ci_sglang bash -c 'printf "%s\n" \
+      opentelemetry-api opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc opentelemetry-sdk \
+      "cache-dit==1.3.0" "peft>=0.18.0,<0.19.0" "runai_model_streamer>=0.15.5" > /tmp/no-dep-resolution-reqs.txt'
+    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -r /tmp/no-dep-resolution-reqs.txt
+  else
+    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
+  fi
 fi
 
 if [[ -n "${SKIP_TT_DEPS}" ]]; then

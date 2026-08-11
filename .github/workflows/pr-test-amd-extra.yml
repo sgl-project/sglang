@@ -91,6 +91,8 @@ env:
   # A called workflow does not inherit the caller's env, so this repeats the
   # value set in pr-test-amd.yml.
   CUSTOM_IMAGE: rocm/sgl-dev:v0.5.15.post1-ubuntu24.04-py3.14-rocm10rc2
+  # The pinned image is Python 3.14, where sglang[dev_hip] cannot be resolved.
+  NO_DEP_RESOLUTION: "1"
 
 concurrency:
   # Mirror pr-test-amd.yml: schedule/dispatch runs key on run_id (unique group,
