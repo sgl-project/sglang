@@ -474,7 +474,13 @@ class HiCacheNixl(HiCacheStorage):
         self, buf: torch.Tensor, page_bytes: int, page_num: int
     ) -> List[tuple]:
         base = buf.data_ptr()
-        return [(base + i * page_bytes, page_bytes) for i in range(page_num)]
+        # Slot stride may exceed page_bytes when _alloc_registered rounded the
+        # slot size up to an OS-page multiple (O_DIRECT alignment). Using
+        # page_bytes as the stride would compute addresses that drift into the
+        # padding region of the previous slot, so every slot past the first
+        # would be misaligned for O_DIRECT I/O.
+        stride = buf.shape[1] * buf.element_size()
+        return [(base + i * stride, page_bytes) for i in range(page_num)]
 
     def _get_hybrid_key_multiplier(
         self, pool_name: PoolName, host_pool: HostKVCache
@@ -570,9 +576,10 @@ class HiCacheNixl(HiCacheStorage):
             return host_pool, [], [], [], 0
 
         if for_write:
+            page_numel = ctx.bounce_page_bytes // bounce.element_size()
             for i, page_offset in enumerate(page_offsets):
                 src = host_pool.get_data_page(page_offset, flat=True)
-                bounce[i].copy_(src)
+                bounce[i, :page_numel].copy_(src)
 
         host_buffers = self._get_bounce_slot_buffers(
             bounce, ctx.bounce_page_bytes, len(page_offsets)
@@ -587,12 +594,24 @@ class HiCacheNixl(HiCacheStorage):
         pin_memory: bool,
         kind: str,
     ) -> torch.Tensor:
-        """Allocate a ``(STORAGE_BATCH_SIZE, page_numel)`` bounce buffer and
+        """Allocate a ``(STORAGE_BATCH_SIZE, slot_numel)`` bounce buffer and
         pre-register it as a DRAM region with NIXL. Uses alloc_mmap so the
         buffer is page-aligned -- required when O_DIRECT is on for any
         file-based backend (POSIX/GDS/GDS_MT/3FS). pin_memory is currently
-        unused (alloc_mmap does not support it)."""
-        buf = alloc_mmap((STORAGE_BATCH_SIZE, page_numel), dtype)
+        unused (alloc_mmap does not support it).
+
+        ``slot_numel`` is ``page_numel`` rounded up so each slot's byte
+        stride is an OS-page multiple. O_DIRECT requires every I/O buffer
+        address to be page-aligned; pools whose page size is not a 4096
+        multiple (e.g. the DSA indexer pool) would otherwise place slots
+        1+ at misaligned addresses and every aio_write past the first slot
+        fails with EINVAL.
+        """
+        elem_size = dtype.itemsize
+        page_bytes = page_numel * elem_size
+        aligned_page_bytes = ((page_bytes + 4095) // 4096) * 4096
+        slot_numel = aligned_page_bytes // elem_size
+        buf = alloc_mmap((STORAGE_BATCH_SIZE, slot_numel), dtype)
         self._pre_register_host(buf.data_ptr(), buf.numel() * buf.element_size(), kind)
         return buf
 
@@ -690,8 +709,11 @@ class HiCacheNixl(HiCacheStorage):
         ``page_num`` slots of ``buf``.
         """
         base = buf.data_ptr()
+        # Slot stride may exceed page_bytes when _alloc_registered rounded the
+        # slot size up to an OS-page multiple (O_DIRECT alignment).
+        stride = buf.shape[1] * buf.element_size()
         return [
-            (base + i * self._bounce_page_bytes, self._bounce_page_bytes)
+            (base + i * stride, self._bounce_page_bytes)
             for i in range(page_num)
         ]
 
@@ -733,11 +755,12 @@ class HiCacheNixl(HiCacheStorage):
             if self._logical_anchor:
                 bounce[:page_num].fill_(1)
             else:
+                page_numel = self._bounce_page_bytes // bounce.element_size()
                 for i in range(page_num):
                     src = self.mem_pool_host.get_data_page(
                         host_indices[i * page_size], flat=True
                     )
-                    bounce[i].copy_(src)
+                    bounce[i, :page_numel].copy_(src)
 
         host_buffers = self._bounce_slot_buffers(bounce, page_num)
         key_list = [self._get_suffixed_key(key) for key in keys]
@@ -791,11 +814,12 @@ class HiCacheNixl(HiCacheStorage):
             return results
 
         # non zero copy: copy data from the get-side bounce buffer to mem_pool_host
+        page_numel = self._bounce_page_bytes // self._bounce_get.element_size()
         for i in range(page_num):
             if not results[i]:
                 break
             self.mem_pool_host.set_from_flat_data_page(
-                host_indices[i * page_size], self._bounce_get[i]
+                host_indices[i * page_size], self._bounce_get[i, :page_numel]
             )
         return results
 
@@ -950,11 +974,18 @@ class HiCacheNixl(HiCacheStorage):
     ) -> dict[str, List[bool]]:
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
+            keys = transfer.keys or []
+            if len(keys) > STORAGE_BATCH_SIZE:
+                results[transfer.name] = self._get_v2_chunked(
+                    transfer, extra_info
+                )
+                continue
+
             host_pool, key_strs, host_buffers, page_offsets, key_multiplier = (
                 self._prepare_pool_transfer(transfer, for_write=False)
             )
             if host_pool is None or not key_strs:
-                results[transfer.name] = [False] * len(transfer.keys or [])
+                results[transfer.name] = [False] * len(keys)
                 continue
 
             start_time = time.perf_counter()
@@ -964,7 +995,7 @@ class HiCacheNixl(HiCacheStorage):
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_xfer_stats(
                 f"batch_get_v2[{transfer.name}]",
-                len(transfer.keys or []),
+                len(keys),
                 transfer.host_indices,
                 [size for _, size in host_buffers],
                 elapsed_ms,
@@ -972,12 +1003,15 @@ class HiCacheNixl(HiCacheStorage):
             ctx = self._hybrid_pool_ctx[transfer.name]
             page_results = self._page_results(transfer_results, key_multiplier)
             if not ctx.is_zero_copy:
-                for ok, page_offset, data_page in zip(
-                    page_results, page_offsets, ctx.bounce_get
+                page_numel = ctx.bounce_page_bytes // ctx.bounce_get.element_size()
+                for i, (ok, page_offset) in enumerate(
+                    zip(page_results, page_offsets)
                 ):
                     if not ok:
                         break
-                    host_pool.set_from_flat_data_page(page_offset, data_page)
+                    host_pool.set_from_flat_data_page(
+                        page_offset, ctx.bounce_get[i, :page_numel]
+                    )
             results[transfer.name] = page_results
         return results
 
@@ -988,11 +1022,22 @@ class HiCacheNixl(HiCacheStorage):
     ) -> dict[str, List[bool]]:
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
+            keys = transfer.keys or []
+            # The bounce buffer only holds STORAGE_BATCH_SIZE slots. Hybrid
+            # pools (e.g. the DSA indexer) routinely deliver 200+ pages per
+            # backup op; chunk the transfer instead of rejecting it wholesale,
+            # which silently dropped the indexer cache data for large requests.
+            if len(keys) > STORAGE_BATCH_SIZE:
+                results[transfer.name] = self._set_v2_chunked(
+                    transfer, extra_info
+                )
+                continue
+
             _, key_strs, host_buffers, _, key_multiplier = self._prepare_pool_transfer(
                 transfer, for_write=True
             )
             if not key_strs:
-                results[transfer.name] = [False] * len(transfer.keys or [])
+                results[transfer.name] = [False] * len(keys)
                 continue
 
             start_time = time.perf_counter()
@@ -1002,7 +1047,7 @@ class HiCacheNixl(HiCacheStorage):
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self._log_xfer_stats(
                 f"batch_set_v2[{transfer.name}]",
-                len(transfer.keys or []),
+                len(keys),
                 transfer.host_indices,
                 [size for _, size in host_buffers],
                 elapsed_ms,
@@ -1011,3 +1056,67 @@ class HiCacheNixl(HiCacheStorage):
                 transfer_results, key_multiplier
             )
         return results
+
+    def _set_v2_chunked(
+        self, transfer: PoolTransfer, extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> List[bool]:
+        """Split a > STORAGE_BATCH_SIZE transfer into sub-batches and run each."""
+        keys = transfer.keys or []
+        ctx = self._hybrid_pool_ctx.get(transfer.name)
+        page_size = getattr(ctx.host_pool, "page_size", 1) if ctx else 1
+        if page_size is None:
+            page_size = 1
+        host_indices = transfer.host_indices
+        chunk_results: List[bool] = []
+        for i in range(0, len(keys), STORAGE_BATCH_SIZE):
+            chunk_keys = keys[i : i + STORAGE_BATCH_SIZE]
+            chunk = PoolTransfer(
+                name=transfer.name,
+                keys=chunk_keys,
+                host_indices=(
+                    host_indices[
+                        i * page_size : (i + len(chunk_keys)) * page_size
+                    ]
+                    if host_indices is not None
+                    else None
+                ),
+                hit_policy=transfer.hit_policy,
+            )
+            chunk_results.extend(
+                self.batch_set_v2([chunk], extra_info).get(
+                    transfer.name, [False] * len(chunk_keys)
+                )
+            )
+        return chunk_results
+
+    def _get_v2_chunked(
+        self, transfer: PoolTransfer, extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> List[bool]:
+        """Split a > STORAGE_BATCH_SIZE transfer into sub-batches and run each."""
+        keys = transfer.keys or []
+        ctx = self._hybrid_pool_ctx.get(transfer.name)
+        page_size = getattr(ctx.host_pool, "page_size", 1) if ctx else 1
+        if page_size is None:
+            page_size = 1
+        host_indices = transfer.host_indices
+        chunk_results: List[bool] = []
+        for i in range(0, len(keys), STORAGE_BATCH_SIZE):
+            chunk_keys = keys[i : i + STORAGE_BATCH_SIZE]
+            chunk = PoolTransfer(
+                name=transfer.name,
+                keys=chunk_keys,
+                host_indices=(
+                    host_indices[
+                        i * page_size : (i + len(chunk_keys)) * page_size
+                    ]
+                    if host_indices is not None
+                    else None
+                ),
+                hit_policy=transfer.hit_policy,
+            )
+            chunk_results.extend(
+                self.batch_get_v2([chunk], extra_info).get(
+                    transfer.name, [False] * len(chunk_keys)
+                )
+            )
+        return chunk_results
