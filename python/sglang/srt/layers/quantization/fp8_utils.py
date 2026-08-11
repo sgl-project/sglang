@@ -350,7 +350,7 @@ def _fp8_pertensor_backend():
     from sglang.kernels.ops.gemm import fp8_pertensor_gemm as pertensor
 
     return pertensor if pertensor.is_available() else None
-    
+
 
 if flashinfer_per_tensor_fp8_supported():
     from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
@@ -372,7 +372,7 @@ if flashinfer_per_tensor_fp8_supported():
         m, n = q_input.shape[0], weight.shape[1]
         k = weight.shape[0]
         pertensor = _fp8_pertensor_backend()
-        if(
+        if (
             pertensor is not None
             and out_dtype == torch.bfloat16
             and pertensor.is_profitable(m, n, k)
