@@ -162,6 +162,14 @@ class TestInklingSmallNvfp4Deterministic(CustomTestCase):
                 "0.1",
                 "--mem-fraction-static",
                 "0.85",
+                # A decode checkpoint is reusable only when a full sliding window of
+                # live SWA data survives below it, and out-of-window SWA slots are
+                # freed a whole page at a time. Setting the interval to the page size
+                # puts every checkpoint exactly on that boundary; at the default 256
+                # a checkpoint clears it only when the sequence length happens to fall
+                # in the first half of an interval, which halves the hit rate.
+                "--mamba-track-interval",
+                "128",
                 "--enable-deterministic-inference",
             ],
             env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
@@ -172,7 +180,7 @@ class TestInklingSmallNvfp4Deterministic(CustomTestCase):
         if getattr(cls, "process", None) is not None:
             kill_process_tree(cls.process.pid)
 
-    def _run(self, helper):
+    def _run(self, helper, **kwargs):
         helper(
             self.base_url,
             {self.model: {"kl_div": KL_DIV_THRESHOLD}},
@@ -180,6 +188,7 @@ class TestInklingSmallNvfp4Deterministic(CustomTestCase):
             max_samples=32,
             max_new_tokens=KL_MAX_NEW_TOKENS,
             trust_remote_code=True,
+            **kwargs,
         )
 
     def test_input_output_logprobs_match(self):
@@ -189,7 +198,10 @@ class TestInklingSmallNvfp4Deterministic(CustomTestCase):
         self._run(assert_logprobs_match_prefill_cache_hit)
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
-        self._run(assert_logprobs_match_decode_cache_hit)
+        # The interval set above makes every prompt reuse its decode checkpoint, so
+        # anything short of that is a state-reuse regression rather than a geometry
+        # coincidence.
+        self._run(assert_logprobs_match_decode_cache_hit, min_cache_hit_ratio=0.99)
 
 
 if __name__ == "__main__":

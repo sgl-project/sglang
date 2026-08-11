@@ -308,6 +308,7 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     max_samples=None,
     max_new_tokens=8192,
     trust_remote_code=False,
+    min_cache_hit_ratio=0.5,
 ):
     server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
@@ -363,7 +364,11 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         output_logprobs.append(_extract_output_logprobs(result))
 
     if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
-        assert len(new_input_ids) > 0.5 * len(
+        # Whether a prompt hits depends on where its last decode checkpoint falls
+        # relative to the page-aligned window a sliding-window model retains, so the
+        # default only screens out a vacuous run. A caller that makes every prompt
+        # hit by construction raises this to pin that down instead.
+        assert len(new_input_ids) > min_cache_hit_ratio * len(
             second_turn_input_ids
         ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
 
