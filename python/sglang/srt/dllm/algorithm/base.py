@@ -10,6 +10,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 DllmRunOutput = Tuple[
     Union[LogitsProcessorOutput, torch.Tensor],
@@ -81,6 +84,11 @@ class DllmAlgorithm:
             return out.logits_output, [], None, None, out.can_run_graph
 
         states = self.init_step_state(forward_batch)
+        # NPU: attention metadata is stable across a block's denoise steps (the
+        # first forward above already planned it), so mark it ready once and let
+        # every later forward skip re-planning.
+        if _is_npu:
+            forward_batch.mark_forward_metadata_ready()
         for _ in range(self.max_steps(self.block_size)):
             done = self.step(forward_batch, out.logits_output.full_logits, states)
             if all(done):

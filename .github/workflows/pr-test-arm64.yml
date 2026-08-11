@@ -55,7 +55,7 @@ jobs:
               - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_cpu.toml"
               - "test/**/!(*.md)"
-              - "sgl-kernel/**/*.!(md|txt)"
+              - "python/sglang/kernels/aot/**/*.!(md|txt)"
               - ".github/workflows/pr-test-arm64.yml"
               - "docker/arm64.Dockerfile"
 

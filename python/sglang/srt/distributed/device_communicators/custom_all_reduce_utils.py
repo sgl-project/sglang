@@ -391,6 +391,53 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
         return True
 
 
+# NVML_GPU_FABRIC_STATE_COMPLETED: the GPU has joined its NVLink fabric clique.
+_NVML_GPU_FABRIC_STATE_COMPLETED = 3
+
+
+def _gpu_fabric_clique(device: torch.device):
+    """(cluster_uuid, clique_id) of the local GPU's NVLink fabric clique, or None if
+    the GPU has not joined a fabric (single-node box / fabric init incomplete)."""
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if cuda_visible_devices:
+        device_ids = list(map(int, cuda_visible_devices.split(",")))
+    else:
+        device_ids = list(range(torch.cuda.device_count()))
+    handle = pynvml.nvmlDeviceGetHandleByIndex(device_ids[device.index])
+    fabric = pynvml.c_nvmlGpuFabricInfo_v3_t()
+    fabric.version = pynvml.nvmlGpuFabricInfo_v3
+    pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric))
+    if fabric.state != _NVML_GPU_FABRIC_STATE_COMPLETED:
+        return None
+    return (bytes(fabric.clusterUuid), int(fabric.cliqueId))
+
+
+@with_nvml_context
+def is_one_nvlink_clique(
+    group: torch.distributed.ProcessGroup, device: torch.device
+) -> bool:
+    """True iff every rank's GPU is in the same NVLink fabric clique (one NVL72 /
+    MNNVL domain). Such a clique shares a single NVLink address space even across
+    nodes, so custom-AR v2's symm-mem storage + fabric peer VAs are valid group-wide."""
+    if _is_hip:
+        return False
+    try:
+        clique = _gpu_fabric_clique(device)
+    except Exception as e:
+        logger.warning(
+            "GPU fabric clique query failed (%r); custom-AR stays intra-node.", e
+        )
+        clique = None
+    # Always all-gather (every rank calls it once) so a failed query on any rank
+    # resolves to a clean False rather than a collective mismatch.
+    world_size = dist.get_world_size(group=group)
+    gathered: List[object] = [None] * world_size
+    dist.all_gather_object(gathered, clique, group=group)
+    if any(c is None for c in gathered):
+        return False
+    return len(set(gathered)) == 1
+
+
 def is_weak_contiguous(inp: torch.Tensor):
     return inp.is_contiguous() or (
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()

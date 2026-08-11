@@ -394,6 +394,24 @@ class FlashInferWorkspaceManager:
         self._max_token_num_seen: Optional[int] = None
         self._max_hidden_dim_seen: Optional[int] = None
         self._logged_init = False
+        self._workspace_size_check_kwarg = None
+        self._workspace_size_check_strategy_type = None
+
+    def _configure_workspace_size_check(self):
+        """Cache the backend-specific size-check API for this workspace."""
+        size_check_params = inspect.signature(
+            self.workspace.is_buffer_size_sufficient
+        ).parameters
+        if "use_oneshot" in size_check_params:
+            self._workspace_size_check_kwarg = "use_oneshot"
+            self._workspace_size_check_strategy_type = None
+        elif "strategy" in size_check_params:
+            strategy_default = size_check_params["strategy"].default
+            self._workspace_size_check_kwarg = "strategy"
+            self._workspace_size_check_strategy_type = type(strategy_default)
+        else:
+            self._workspace_size_check_kwarg = None
+            self._workspace_size_check_strategy_type = None
 
     def initialize(
         self,
@@ -498,6 +516,7 @@ class FlashInferWorkspaceManager:
             if use_fp32_lamport:
                 create_kw["use_fp32_lamport"] = True
             self.workspace = _create_allreduce_fusion_workspace(**create_kw)
+            self._configure_workspace_size_check()
             self.world_size = world_size
             self.rank = rank
             self.group = (device_group, cpu_group)
@@ -526,6 +545,8 @@ class FlashInferWorkspaceManager:
                 "Disabling flashinfer allreduce fusion permanently."
             )
             self.workspace = None
+            self._workspace_size_check_kwarg = None
+            self._workspace_size_check_strategy_type = None
             self.initialized = False
             return
 
@@ -539,13 +560,25 @@ class FlashInferWorkspaceManager:
         if not self.initialized or self.workspace is None:
             return False
         try:
-            return self.workspace.is_buffer_size_sufficient(
+            check_kw = dict(
                 tp_size=self.world_size,
                 num_tokens=token_num,
                 hidden_dim=hidden_dim,
                 dtype=dtype,
-                use_oneshot=use_oneshot,
             )
+            if self._workspace_size_check_kwarg == "use_oneshot":
+                check_kw["use_oneshot"] = use_oneshot
+            elif (
+                self._workspace_size_check_kwarg == "strategy"
+                and use_oneshot is not None
+            ):
+                # FlashInfer's MNNVL workspace expresses the same choice with
+                # an enum-valued `strategy` argument rather than `use_oneshot`.
+                check_kw["strategy"] = getattr(
+                    self._workspace_size_check_strategy_type,
+                    "ONESHOT" if use_oneshot else "TWOSHOT",
+                )
+            return self.workspace.is_buffer_size_sufficient(**check_kw)
         except Exception as e:
             logger.debug(f"FlashInfer workspace size check failed: {e}")
             # Fallback: some backends may not implement is_buffer_size_sufficient;
@@ -569,6 +602,8 @@ class FlashInferWorkspaceManager:
                 logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
             finally:
                 self.workspace = None
+                self._workspace_size_check_kwarg = None
+                self._workspace_size_check_strategy_type = None
                 self.initialized = False
                 self.world_size = None
                 self.rank = None

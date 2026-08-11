@@ -38,6 +38,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+from sglang.kernels.ops.attention.dsv4.gemm import mark_hpc_bf16xfp32_gemm_enabled
 from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
@@ -87,7 +88,7 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -220,6 +221,12 @@ class LongcatFlashRouter(nn.Module):
         self.hpc_kernel_min_m = _LONGCAT_FLASH_ROUTER_HPC_GEMM_MIN_M.get(
             (config.hidden_size, self.n_routed_experts)
         )
+        if (
+            self.hpc_kernel_min_m is not None
+            and self.rounter_params_dtype == torch.float32
+            and self.classifier.bias is None
+        ):
+            mark_hpc_bf16xfp32_gemm_enabled()
 
     def forward(self, hidden_states):
         if (
@@ -714,7 +721,7 @@ class LongcatFlashForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False

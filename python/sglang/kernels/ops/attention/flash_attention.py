@@ -297,6 +297,7 @@ def flash_attn_varlen_func(
             cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            qv=qv,
             seqused_q=seqused_q,
             seqused_k=seqused_k,
             page_table=page_table,

@@ -11,9 +11,11 @@ from sglang.srt.distributed import get_world_group, parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import ServerArgs
-from sglang.srt.utils import broadcast_pyobj, is_cpu, is_cuda
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cpu, is_cuda
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.eplb.eplb_manager import EPLBManager
 
 logger = logging.getLogger(__name__)
@@ -307,13 +309,10 @@ def elastic_expanded_world_enabled() -> bool:
 
     Launch-time TP groups exclude ranks admitted during scale-up.
     """
-    from sglang.srt.runtime_context import get_server_args
-
     inst = ElasticEPStateManager.instance()
     if inst is None:
         return False
-    sa = get_server_args()
-    if sa.max_ep_size is None:
+    if get_parallel().max_ep_size is None:
         return False
     active_target_size = inst.effective_ep_size
     if inst.pending_ep_size is not None and inst.scale_phase in (
@@ -352,8 +351,10 @@ def _map_global_to_group_local_ranks(
     return [rank_to_local[rank] for rank in global_ranks if rank in rank_to_local]
 
 
-def _wait_for_peer_state(mooncake_ep, backend, ranks: List[int]) -> None:
-    while not all(mooncake_ep.get_peer_state(backend, ranks)):
+def _wait_for_peer_state(backend, ranks: List[int]) -> None:
+    from mooncake.pg import get_peer_state
+
+    while not all(get_peer_state(backend, ranks)):
         time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
 
 
@@ -369,13 +370,13 @@ def _maybe_create_message_queue(group) -> None:
 
 
 def _try_recover_world(global_ranks: List[int]) -> bool:
-    from mooncake import ep as mooncake_ep
+    from mooncake.pg import get_peer_state, recover_ranks
 
     world_backend = torch.distributed.group.WORLD
-    if not all(mooncake_ep.get_peer_state(world_backend, global_ranks)):
+    if not all(get_peer_state(world_backend, global_ranks)):
         return False
 
-    mooncake_ep.recover_ranks(world_backend, global_ranks)
+    recover_ranks(world_backend, global_ranks)
     logger.debug("[Elastic EP][recover] WORLD recover_ranks(%s) done", global_ranks)
     return True
 
@@ -394,17 +395,17 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
     if not _try_recover_world(global_ranks):
         return False
 
-    from mooncake import ep as mooncake_ep
+    from mooncake.pg import recover_ranks
 
     for group in _iter_live_parallel_groups():
         local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
         if not local_ranks:
             continue
 
-        _wait_for_peer_state(mooncake_ep, group.device_group, local_ranks)
-        mooncake_ep.recover_ranks(group.device_group, local_ranks)
-        _wait_for_peer_state(mooncake_ep, group.cpu_group, local_ranks)
-        mooncake_ep.recover_ranks(group.cpu_group, local_ranks)
+        _wait_for_peer_state(group.device_group, local_ranks)
+        recover_ranks(group.device_group, local_ranks)
+        _wait_for_peer_state(group.cpu_group, local_ranks)
+        recover_ranks(group.cpu_group, local_ranks)
         _maybe_create_message_queue(group)
 
     _refresh_ep_members()
@@ -412,9 +413,9 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
 
 
 def _join_world_group() -> None:
-    from mooncake import ep as mooncake_ep
+    from mooncake.pg import join_group
 
-    mooncake_ep.join_group(torch.distributed.group.WORLD)
+    join_group(torch.distributed.group.WORLD)
 
 
 def join_scale_process_group() -> None:
@@ -425,14 +426,14 @@ def join_scale_process_group() -> None:
 
 def join_process_groups() -> None:
     """Rejoin WORLD and every launch-time parallel group after recovery."""
-    from mooncake import ep as mooncake_ep
+    from mooncake.pg import join_group
 
     _join_world_group()
     for group in _iter_live_parallel_groups():
         if group.world_size <= 1:
             continue
-        mooncake_ep.join_group(group.device_group)
-        mooncake_ep.join_group(group.cpu_group)
+        join_group(group.device_group)
+        join_group(group.cpu_group)
         _maybe_create_message_queue(group)
 
     _refresh_ep_members()
@@ -462,7 +463,8 @@ def maybe_recover_ep_ranks(
     *,
     tp_group: parallel_state.GroupCoordinator,
     eplb_manager: EPLBManager,
-    random_seed: int,
+    model_config: ModelConfig,
+    moe_ep_rank: int,
 ) -> bool:
     # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
     # synchronization, and this function is on the forward-path.
@@ -489,17 +491,13 @@ def maybe_recover_ep_ranks(
     if ranks_to_recover and try_recover_ranks(ranks_to_recover):
         eplb_manager.reset_generator()
         broadcast_global_expert_location_metadata(
+            model_config=model_config,
+            moe_ep_rank=moe_ep_rank,
             src_rank=get_healthy_expert_location_src_rank(
                 invoked_in_elastic_ep_rejoin_path=False
-            )
+            ),
         )
         ElasticEPStateManager.instance().reset()
-        broadcast_pyobj(
-            [random_seed],
-            parallel_state.get_world_group().rank,
-            parallel_state.get_world_group().cpu_group,
-            src=parallel_state.get_world_group().ranks[0],
-        )
         logger.info(f"recover ranks {ranks_to_recover} done")
         return True
 

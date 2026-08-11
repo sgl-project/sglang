@@ -108,6 +108,74 @@ def build_page_major_mha_views(
     return k_buffer, v_buffer
 
 
+def mla_entry_bytes(*, layer_num: int, kv_cache_dim: int, itemsize: int) -> int:
+    """Bytes occupied by one MLA slot across all layers (single latent row, no V)."""
+    return layer_num * kv_cache_dim * itemsize
+
+
+def build_dense_mla_views(
+    raw: torch.Tensor,
+    *,
+    layer_num: int,
+    kv_cache_dim: int,
+    store_dtype: torch.dtype,
+    page_size: int,
+    num_pages: int,
+    anchor_bytes: int = 0,
+) -> List[torch.Tensor]:
+    """Per-layer DENSE views over ``raw`` for MLA in the page-major layout.
+
+    The page envelope is ``[L0_latent * ps | L1_latent * ps | ...]``. Because all
+    MLA layers share one uniform row size (``kv_cache_dim``), the envelope is
+    itself a valid dense paged pool under a re-numbered index space: folding the
+    layer offset ``l * ps * kv_cache_dim`` into each view's storage_offset makes
+    every per-layer view a plain CONTIGUOUS ``(num_pages * layer_num * ps, 1,
+    kv_cache_dim)`` tensor, addressed by the layer-independent dense id
+
+        dense(t) = (t // ps) * (ps * layer_num) + t % ps      (t = physical token)
+
+    so one shared block table (entry = page * layer_num) serves every layer, and
+    kernels that require ``.view(-1, page_size, kv_cache_dim)`` (trtllm/cutlass/
+    flashmla) work on the views natively.
+
+    The views overlap each other (view ``l+1`` is view ``l`` shifted by ``ps``
+    rows); that is safe because layer ``l`` is only ever indexed at dense ids,
+    which always resolve to layer-``l`` bytes relative to view ``l``'s origin.
+    Layer ``layer_num-1``'s view extends ``(layer_num-1) * ps`` rows past the
+    last page envelope, so ``raw`` must carry at least one extra page envelope
+    of tail padding (``UnifiedKVPool``'s ``view_tail_pad_bytes``).
+    """
+    itemsize = store_dtype.itemsize
+    row_bytes = kv_cache_dim * itemsize
+    page_bytes = page_size * layer_num * row_bytes
+    n_dense = num_pages * layer_num * page_size
+    assert anchor_bytes % itemsize == 0
+    last_view_end = (
+        anchor_bytes + (layer_num - 1) * page_size * row_bytes + (n_dense * row_bytes)
+    )
+    assert last_view_end <= raw.numel() * raw.itemsize, (
+        f"build_dense_mla_views: layer {layer_num - 1}'s view ends at byte "
+        f"{last_view_end} but the raw buffer holds only "
+        f"{raw.numel() * raw.itemsize} bytes; allocate the tail pad "
+        f"(one page envelope = {page_bytes} B) via view_tail_pad_bytes"
+    )
+
+    as_dtype_view = raw.view(store_dtype)
+    views: List[torch.Tensor] = []
+    for layer in range(layer_num):
+        base_bytes = anchor_bytes + layer * page_size * row_bytes
+        assert base_bytes % itemsize == 0
+        views.append(
+            torch.as_strided(
+                as_dtype_view,
+                size=(n_dense, 1, kv_cache_dim),
+                stride=(kv_cache_dim, kv_cache_dim, 1),
+                storage_offset=base_bytes // itemsize,
+            )
+        )
+    return views
+
+
 def mamba_entry_bytes(
     *,
     layer_num: int,
