@@ -1264,8 +1264,9 @@ class Engine(EngineScoreMixin, EngineBase):
             kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         finally:
             if isinstance(self.tokenizer_manager, TokenizerManager):
-                if self.tokenizer_manager.mm_processor is not None:
-                    self.tokenizer_manager.mm_processor.shutdown()
+                mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
+                if mm_processor is not None:
+                    mm_processor.shutdown()
                 self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
     def __enter__(self):

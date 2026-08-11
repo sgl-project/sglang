@@ -84,6 +84,9 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         server_args.mm_process_config = mm_process_config
         server_args.mm_processor_worker_num = mm_processor_worker_num
         server_args.mm_io_worker_num = mm_io_worker_num
+        server_args.mm_preprocess_cache_size_mb = None
+        server_args.tokenizer_worker_num = 1
+        server_args.trust_mm_content_hashes = False
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
