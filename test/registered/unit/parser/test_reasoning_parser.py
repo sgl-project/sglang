@@ -981,11 +981,11 @@ class TestBufferLossBugFix(CustomTestCase):
 
 class TestStreamingChunkSizeInvariance(CustomTestCase):
     """Accumulated (reasoning, normal) output must not depend on how the decode
-    steps happen to batch tokens.
+    steps happen to batch tokens, and must match one-shot detect_and_parse.
 
     Speculative decoding and stream_interval > 1 deliver multiple tokens per
     step, which splits multi-character tokens like `</think>` across chunk
-    boundaries.
+    boundaries. The two `_is_chunk_dependent` tests pin known exceptions.
     """
 
     CHUNK_SIZES = [1, 2, 3, 5, 7, 11, 23, 1000]
@@ -1041,6 +1041,45 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
                     self._feed(DeepSeekR1Detector(), "<think>compare a <", chunk_size),
                     ("compare a <", ""),
                 )
+
+    def test_normal_text_ending_in_token_prefix_survives(self):
+        """Content after the reasoning block that happens to end in a `</think>`
+        prefix is buffered by the prefix check; the stream ending must flush it."""
+        for text in ("<think>a</think>b<", "<think>a</think>b</thi"):
+            expected = (
+                text.split("</think>", 1)[0].removeprefix("<think>"),
+                text.split("</think>", 1)[1],
+            )
+            for chunk_size in self.CHUNK_SIZES:
+                with self.subTest(text=text, chunk_size=chunk_size):
+                    self.assertEqual(
+                        self._feed(DeepSeekR1Detector(), text, chunk_size), expected
+                    )
+
+    def test_text_before_think_token_is_chunk_dependent(self):
+        """Accepted divergence inherited from main, pinned so a future fix has to
+        update this test rather than silently change behaviour.
+
+        When reasoning is not forced and the model emits text before `<think>`,
+        `replace(think_start, "", 1)` pulls that text into the reasoning branch,
+        while the prefix check may instead flush it as content first. Which one
+        happens depends on where the chunk boundary lands.
+        """
+        text = "lead<think>r</think>tail"
+        variants = {
+            self._feed(Qwen3Detector(), text, chunk_size)
+            for chunk_size in self.CHUNK_SIZES
+        }
+
+        self.assertEqual(
+            variants,
+            {("r", "leadtail"), ("", text), ("leadr", "tail")},
+        )
+        # And the non-streaming path produces yet a fourth split.
+        one_shot = Qwen3Detector().detect_and_parse(text)
+        self.assertEqual(
+            (one_shot.reasoning_text, one_shot.normal_text), ("lead<think>r", "tail")
+        )
 
     def test_dsv4_reasoning_quoting_dsml_is_chunk_dependent(self):
         """Accepted divergence, pinned so it is not mistaken for a regression.
