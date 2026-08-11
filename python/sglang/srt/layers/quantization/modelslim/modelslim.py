@@ -191,7 +191,10 @@ class ModelSlimConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             moe_schemes = self.get_moe_scheme(layer, prefix)
             if moe_schemes is None:
-                raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
+                # Experts are stored unquantized (FLOAT). Returning None lets
+                # FusedMoE install UnquantizedFusedMoEMethod, the same fallback
+                # the linear path takes via UnquantizedLinearMethod.
+                return None
             layer.w13_scheme, layer.w2_scheme = moe_schemes
             layer.w13_kernel, layer.w2_kernel = (
                 layer.w13_scheme.kernel,
@@ -296,6 +299,17 @@ class ModelSlimConfig(QuantizationConfig):
                 f"Missing ModelSlim MoE quantization description for layer {prefix}: "
                 + "; ".join(all_attempted)
             )
+
+        # Experts left in bf16/fp16 by the quantizer are marked FLOAT. This is how
+        # ModelSlim ships the MTP/NextN module of an otherwise-quantized
+        # checkpoint, so treat it as "no scheme" and let the caller fall back to
+        # the unquantized MoE method rather than failing to start.
+        if w13_scheme_name == "FLOAT" and w2_scheme_name == "FLOAT":
+            logger.info_once(
+                f"ModelSlim experts are unquantized (FLOAT) for layer {prefix}; "
+                "using the unquantized MoE method."
+            )
+            return None
 
         # Map scheme names to classes
         scheme_map = dict(
