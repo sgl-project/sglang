@@ -2745,8 +2745,12 @@ class Scheduler(
         These rejections are invisible to the tokenizer-side abort counter, which
         only tracks aborts the frontend initiates, and to HTTP status codes for
         streaming requests, whose 200 is committed before the rejection is sent.
+
+        Gated on current_scheduler_metrics_enabled, not enable_metrics: requests are
+        broadcast to every TP rank, so each rank runs the rejection path for the same
+        logical request and gating on enable_metrics would report it tp_size times.
         """
-        if self.metrics_reporter.enable_metrics and count > 0:
+        if self.metrics_reporter.current_scheduler_metrics_enabled and count > 0:
             self.metrics_reporter.metrics_collector.increment_queue_rejected_reqs(
                 reason, count
             )

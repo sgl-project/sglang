@@ -50,6 +50,11 @@ def _scheduler(waiting_queue):
     s.waiting_queue = waiting_queue
     s.enable_hicache_storage = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
+    # The waiting-timeout path reports dropped requests to the rejection counter.
+    # Accounting itself is asserted in test_scheduler_queue_rejection_metrics.py.
+    s.metrics_reporter = SimpleNamespace(
+        current_scheduler_metrics_enabled=True, metrics_collector=MagicMock()
+    )
     return s
 
 
