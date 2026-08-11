@@ -118,6 +118,12 @@ Pass as a JSON string via `--hisparse-config`:
 
 Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'`
 
+### Shared-index prefetch (automatic)
+
+When a model reuses one anchor layer's top-k selection across a run of subsequent "skip" layers (DSA `index_topk_freq` / `index_topk_pattern`; native in GLM-5.2 as IndexShare), the working set of every skip layer is known the moment the anchor's index is computed. HiSparse exploits this automatically: the anchor's swap-in kernel records its miss plan (which host slots go to which device-buffer slots), and each skip layer replays that plan with a copy-only kernel issued ahead on a side stream, so the skip layers' host→device IO overlaps the intervening layers' compute instead of sitting on the decode critical path. The replay kernel uses a small fixed grid to keep its SM footprint low while overlapped.
+
+The prefetch is enabled automatically for eligible models (no pipeline parallelism, no speculative decoding) and can be turned off for A/B comparison with `SGLANG_DISABLE_HISPARSE_PREFETCH=1`.
+
 ## Deployment
 
 HiSparse currently requires **PD disaggregation mode** and is enabled only on the **decode instance**.
