@@ -457,7 +457,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
-        if self.draft_token_to_kv_pool is not None:
+        dspark_draft_kv = self.scheduler.spec_algorithm.is_dspark()
+
+        if self.draft_token_to_kv_pool is not None and not dspark_draft_kv:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -473,7 +475,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_item_lens = kv_item_lens
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
+            if (self.draft_token_to_kv_pool is None or dspark_draft_kv)
             and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
@@ -491,6 +493,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            dspark_draft_kv=dspark_draft_kv,
         )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
@@ -1224,9 +1227,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 if clear_c128_state is not None:
                     clear_c128_state(int(decode_req.req.req_pool_idx))
+
+            def _dspark_draft_kv_payload():
+                # Replicated draft pool: rows are addressed by the target's
+                # virtual locs, so send them verbatim and let the state channel
+                # match by position.
+                return (
+                    self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx, :seq_len
+                    ]
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32)
+                )
+
             # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
             # as main KV on the same page_size.
             payloads = {
+                StateType.DSPARK_DRAFT_KV: _dspark_draft_kv_payload,
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _dsa_payload,
