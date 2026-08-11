@@ -198,7 +198,8 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
-        # Raise libzmq's per-context socket cap before creating any sockets.
+        # Raise libzmq's per-context socket cap because this manager caches two
+        # sockets per decode endpoint, so large fleets can exceed the default.
         self._zmq_ctx.set(
             zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get()
         )
