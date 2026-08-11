@@ -38,8 +38,8 @@ __device__ __forceinline__ float dot8_f32(const float4 wv, const float4 xv) {
 }
 
 template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
-__global__ void __launch_bounds__(kNumWarps * 32) hopper_bf16_gemv_kernel(
-    bf16_t* __restrict__ out, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
+__global__ void __launch_bounds__(kNumWarps * 32)
+    hopper_bf16_gemv_kernel(bf16_t* __restrict__ out, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
   __shared__ bf16_t sx[K];
 
   const uint32_t tid = threadIdx.x;
