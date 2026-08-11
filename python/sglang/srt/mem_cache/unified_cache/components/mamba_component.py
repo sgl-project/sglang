@@ -199,7 +199,7 @@ class MambaComponent(TreeComponent):
                 # stops at this request's window boundary instead of walking to
                 # root and over-decrementing locks held by other requests.
                 lock_result = self.cache.inc_lock_ref(result.best_match_node)
-                self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                self._evict_for_one_slot()
                 dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
@@ -479,11 +479,21 @@ class MambaComponent(TreeComponent):
                 self.tree_core.component_protected_size_[ct] -= vlen
             cd.lock_ref -= 1
 
+    def _evict_for_one_slot(self) -> None:
+        """Free one mamba slot. On a shared byte buffer the full side has to
+        fund it, so it is evicted too."""
+        allocator = self.cache.token_to_kv_pool_allocator
+        self.cache.evict(
+            EvictParams(
+                num_tokens=allocator.full_tokens_for_mamba_slots(1), mamba_num=1
+            )
+        )
+
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
-            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            self._evict_for_one_slot()
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             assert slot is not None, "Can not alloc mamba cache"
         return slot
@@ -656,7 +666,7 @@ class MambaComponent(TreeComponent):
             return PrepareLoadBackResult()
         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is None:
-            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            self._evict_for_one_slot()
             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             assert dst is not None, "Cannot alloc mamba for load_back"
         req.mamba_pool_idx = dst[0]

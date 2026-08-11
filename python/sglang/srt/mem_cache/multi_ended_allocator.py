@@ -1845,6 +1845,9 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def full_available_size(self) -> int:
         return self.full_attn_allocator.schedulable_available_size()
 
+    def full_tokens_for_mamba_slots(self, slots: int) -> int:
+        return slots * self.mamba_slot_full_token_cost()
+
     def mamba_slot_full_token_cost(self) -> int:
         """Full-token-equivalents of shared-gap bytes ONE mamba state consumes.
 

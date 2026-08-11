@@ -280,7 +280,15 @@ def alloc_req_slots(
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+                allocator = tree_cache.token_to_kv_pool_allocator
+                # A mamba slot's bytes can only come back from the full side here,
+                # so evict it too instead of asking mamba to free what it lacks.
+                tree_cache.evict(
+                    EvictParams(
+                        num_tokens=allocator.full_tokens_for_mamba_slots(mamba_num),
+                        mamba_num=mamba_num,
+                    )
+                )
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(

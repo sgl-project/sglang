@@ -1768,7 +1768,60 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # And .size matches this conserved sum.
         self.assertEqual(allocator.size, full_avail_before)
 
-    # 16. REGRESSION: the page-math helper used by
+    # 16. `full_tokens_for_mamba_slots` prices a mamba slot in full-side
+    # tokens. The two sub-pools grow toward each other out of one byte buffer,
+    # so a mamba slot can only be funded by bytes the full side gives up; the
+    # mamba-shortfall eviction in `alloc_req_slots` is sized with this. Base
+    # allocators return 0 so pools that do not share bytes keep evicting
+    # exactly as before.
+    def test_full_tokens_for_mamba_slots(self):
+        from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedMambaTokenToKVPoolAllocator,
+        )
+
+        PS = self.PAGE_SIZE
+        full_spec = _make_mha_spec("full", "up")
+        mamba_spec = _make_mamba_spec("mamba", "down")
+        pool = UnifiedKVPool(
+            total_bytes=16 * PS * full_spec.entry_bytes()
+            + 8 * mamba_spec.entry_bytes(),
+            sub_pool_specs=[full_spec, mamba_spec],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        full_kv = _FakeKVCache(pool.max_slots("full"))
+        full_kv.attach_allocator = lambda allocator: None
+        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        mamba_kv.attach_allocator = lambda allocator: None
+        mamba_kv._copy_from_physical = lambda src, dst: None
+
+        class _FakeHybridLinearKVPool:
+            full_kv_pool = full_kv
+            mamba_pool = mamba_kv
+
+        allocator = UnifiedMambaTokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=_FakeHybridLinearKVPool(),
+            device=_DEV,
+            page_size=PS,
+            need_sort=False,
+            forward_stream=None,
+        )
+
+        cost = allocator.mamba_slot_full_token_cost()
+        self.assertGreater(cost, 0)
+        for slots in (0, 1, 5):
+            self.assertEqual(allocator.full_tokens_for_mamba_slots(slots), slots * cost)
+
+        # The base default is what every non-shared allocator inherits: 0, so
+        # `EvictParams(num_tokens=...)` on the mamba-shortfall path stays 0
+        # there and those pools are untouched.
+        self.assertEqual(
+            BaseTokenToKVPoolAllocator.full_tokens_for_mamba_slots(allocator, 5), 0
+        )
+
+    # 17. REGRESSION: the page-math helper used by
     # `UnifiedSWAKVPool.translate_loc_from_full_to_swa`,
     # `UnifiedSWAKVPool.get_cpu_copy`, and `load_cpu_copy` must do
     # `virt_pages = loc // page_size; offsets = loc % page_size;
