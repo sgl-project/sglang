@@ -13,7 +13,6 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     ceil_align,
@@ -666,20 +665,6 @@ def cute_dsl_backend_selected() -> bool:
     return get_server_args().flashinfer_allreduce_fusion_backend == CUTE_DSL_BACKEND
 
 
-def cute_dsl_serves_group(use_attn_tp_group: bool) -> bool:
-    """Whether the CuTe DSL backend owns this group's fusion.
-
-    ``SGLANG_USE_CUTEDSL_ATTN_ALLREDUCE_FUSION=0`` narrows the backend to the
-    MoE/MLP output group — the one the deferred MoE finalize folds into — and
-    leaves the attention output fusion on mnnvl.
-    """
-    if not cute_dsl_backend_selected():
-        return False
-    if use_attn_tp_group:
-        return envs.SGLANG_USE_CUTEDSL_ATTN_ALLREDUCE_FUSION.get()
-    return True
-
-
 def _classic_backend(backend: Optional[str]) -> Optional[str]:
     """The backend name for a workspace the CuTe DSL kernels do not serve."""
     return "mnnvl" if backend == CUTE_DSL_BACKEND else backend
@@ -692,7 +677,7 @@ def get_cute_dsl_workspace(use_attn_tp_group: bool):
     up front (see ``pre_initialize_workspaces``); nothing creates one lazily
     from inside a forward pass.
     """
-    if not cute_dsl_serves_group(use_attn_tp_group):
+    if not cute_dsl_backend_selected():
         return None
     from sglang.srt.runtime_context import get_resources
 
@@ -717,8 +702,6 @@ def _init_cute_dsl_workspaces(
     buffers = get_resources().buffers
     by_group: dict[int, object] = {}
     for use_attn_tp_group in (False, True):
-        if not cute_dsl_serves_group(use_attn_tp_group):
-            continue
         world_size, rank, coordinator = _fusion_group(use_attn_tp_group)
         if world_size <= 1:
             continue
@@ -1015,12 +998,9 @@ def pre_initialize_workspaces(
         ):
             _flashinfer_allreduce_unavailable = True
         _sync_allreduce_unavailable_across_tp()
-        if _flashinfer_allreduce_unavailable or cute_dsl_serves_group(True):
-            return
+        return
 
     for use_attn_tp_group in (False, True):
-        if cute_dsl_serves_group(use_attn_tp_group):
-            continue
         ensure_workspace_initialized(
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,

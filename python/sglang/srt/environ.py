@@ -919,11 +919,6 @@ class Envs:
     # MNNVL-fabric devices (GB200/GB300) when nnodes > 1; set 0/1 to
     # override in either direction.
     SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE = EnvBool(False)
-    # With --flashinfer-allreduce-fusion-backend cute-dsl, whether the attention
-    # output all-reduce also uses the CuTe DSL backend. Set 0 to keep the MoE
-    # output fusion (where the deferred MoE finalize folds in) on cute-dsl while
-    # the attention fusion stays on mnnvl.
-    SGLANG_USE_CUTEDSL_ATTN_ALLREDUCE_FUSION = EnvBool(True)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
