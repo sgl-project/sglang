@@ -161,10 +161,9 @@ DEFAULT_IMAGE_URL = "https://raw.githubusercontent.com/sgl-project/sglang/main/e
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
-# Loading a few hundred GB of weights across 8 GPUs runs 600-820s on a warm
-# cache. Declared per test rather than inferred from the runner: these files
-# also run on b200, and a machine-keyed default has to be re-derived by every
-# workflow that launches tests (which is how the nightly reorg lost it once).
+# A few hundred GB of weights across 8 GPUs takes 600-820s to load warm.
+# Declared per test, not per runner: the same files run on h200 and b200, and a
+# machine-keyed default has to be re-derived by every workflow that runs tests.
 LARGE_MODEL_LAUNCH_TIMEOUT = 1800
 
 

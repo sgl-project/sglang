@@ -52,11 +52,8 @@ on:
         type: string
         default: ""
 
-# Mirrors _pr-test-stage.yml's env. A rerun that does not reproduce the stage
-# environment cannot validate a fix: the same file can pass here and keep
-# failing in CI, or the reverse. Values that the stage derives from its suite
-# are taken at their widest here, so a green rerun is trustworthy for every
-# suite the file is registered on.
+# Mirrors _pr-test-stage.yml's env, so a rerun validates what CI actually ran.
+# Where the stage derives a value from its suite, take the widest one here.
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_ENABLE_ASYNC_ASSERT: true
@@ -65,15 +62,12 @@ env:
   NCCL_NVLS_ENABLE: "0"
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 300
-  # The stage sets this only for scheduled suites. A file registered on both a
-  # per-commit and a nightly suite collapses to one rerun, so run the full grid
-  # unconditionally -- it is the superset of both.
+  # Scheduled-only in the stage, but a file registered on both a per-commit and
+  # a nightly suite collapses to one rerun, so run the superset.
   SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
-  # Deliberately absent: SGLANG_PRECISION_*. test_nightly_precision_regression
-  # pushes to the shared baseline dataset on every run, pass or fail, so handing
-  # a rerun the write token would let an ad-hoc dispatch become everyone's next
-  # comparison baseline. That test is nightly-only; a rerun fails fast on the
-  # missing SGLANG_PRECISION_HF_REPO instead.
+  # SGLANG_PRECISION_* stays out: that test pushes to the shared baseline on
+  # every run, so a rerun holding the write token could become everyone's next
+  # comparison baseline. Without the repo var it fails fast instead.
 
 permissions:
   actions: write
