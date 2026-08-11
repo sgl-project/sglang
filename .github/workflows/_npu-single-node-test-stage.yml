@@ -395,19 +395,3 @@ jobs:
           path: ${{ env.METRICS_DATA_FILE }}
           if-no-files-found: ignore
           retention-days: 7
-
-      - name: Backup plog
-        if: always() && inputs.nightly == true
-        shell: bash
-        run: |
-          plog_path="/root/ascend/log/debug/plog"
-          if [ -d "$plog_path" ];then
-            echo "Plog files found. Begin to backup them."
-            # tc_name is persisted to the environment by the Run test step
-            # Keep plog under the same run prefix as logs/log
-            target_plog_path="/root/.cache/tests/logs/plog/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${tc_name}/${HOSTNAME}"
-            echo "Save path: ${target_plog_path}"
-            rm -rf ${target_plog_path}
-            mkdir -p ${target_plog_path}
-            cp ${plog_path}/* ${target_plog_path}
-          fi

@@ -141,7 +141,8 @@ jobs:
       nightly: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a2 }}
-      install_sglang_deps: false
+      install_sglang_deps: true
+      device_type_for_deps: '910b'
       branch_label: ${{ needs.set-image-config.outputs.branch_label }}
       workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
       create_date: ${{ needs.set-image-config.outputs.create_date }}
@@ -374,14 +375,6 @@ jobs:
 
       - name: Generate results table
         run: |
-          status_emoji() {
-            case "$1" in
-              pass)   echo "✅" ;;
-              fail)   echo "❌" ;;
-              *)      echo "❓" ;;
-            esac
-          }
-
           single_result_a2="${{ needs.nightly-mix-single-node-a2-tests.result }}"
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
@@ -467,5 +460,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           FAIL=0
-          if [ "${single_result}" != "success" ] && [ "${single_result}" != "skipped" ]; then FAIL=1; fi
+          for r in "${single_result_a2}" "${single_result}" "${multi_result}" "${mix_result}"; do
+            if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then FAIL=1; fi
+          done
           exit $FAIL
