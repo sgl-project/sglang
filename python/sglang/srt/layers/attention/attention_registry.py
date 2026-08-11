@@ -460,8 +460,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
             if spec_result is not None:
                 spec, _ = spec_result
+                cfg = runner.model_config
                 BackendClass = import_backend_class(spec.backend_class_name)
                 linear_attn_backend = BackendClass(runner)
+                if spec.hybrid_backend_class_name is not None:
+                    hybrid_backend_cls = import_backend_class(
+                        spec.hybrid_backend_class_name
+                    )
             else:
                 raise ValueError(
                     "Expected hybrid GDN or NemotronH models, but got unknown model. "
