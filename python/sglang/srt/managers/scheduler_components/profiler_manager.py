@@ -22,7 +22,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.profile_utils import ProfileManager
+from sglang.srt.utils.profile_utils import ProfileManager, get_profile_stage
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
@@ -390,14 +390,15 @@ class SchedulerProfilerManager:
             return
 
         if self.profile_by_stage:
-            if batch.forward_mode.is_prefill():
+            stage = get_profile_stage(batch.forward_mode)
+            if stage == "prefill":
                 if self.profiler_prefill_ct == 0:
                     self._start_profile(batch.forward_mode)
                 self.profiler_prefill_ct += 1
                 if self.profiler_prefill_ct > self.profiler_target_prefill_ct:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.EXTEND)
-            elif batch.forward_mode.is_decode():
+            elif stage == "decode":
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
                         # force trace flush
@@ -407,10 +408,8 @@ class SchedulerProfilerManager:
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.DECODE)
-            elif batch.forward_mode.is_idle():
+            elif stage is None:
                 pass
-            else:
-                raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
         else:
             # Check profiler
             if (

@@ -962,39 +962,18 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if input_scale is not None:
-        # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): ``input`` is
-        # the fp8 per-token-group-128 q with rows padded to a multiple of 4
-        # and ``input_scale`` the matching column-major fp32 scales
-        # (stride == (1, padded_rows)) -- identical to the MN-major
-        # TMA-aligned layout this path's own quant would produce below.
-        # Output keeps the padded row count; the caller slices back.
-        # UE8M0 packed scales (Blackwell DeepGEMM) use a different layout;
-        # the caller gates on it.
-        assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-        assert input.dtype == torch.float8_e4m3fn
-        assert weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0, (
-            "pre-quantized fp8 input requires DeepGEMM-supported weight shapes "
-            f"(got {tuple(weight.shape)})"
-        )
-        input_2d = input.view(-1, input.shape[-1])
-        output = w8a8_block_fp8_matmul_deepgemm(
-            input_2d,
-            weight,
-            input_scale,
-            weight_scale,
-            block_size,
-            output_dtype=torch.bfloat16,
-        )
-        if bias is not None:
-            output += bias
-        return output.view(*input.shape[:-1], weight.shape[0])
-
-    output_dtype = input.dtype
+    # Prequantized rows may arrive padded (SGLANG_OPT_MOE_QUANT_ONCE pads to a
+    # multiple of 4); the output keeps the padded row count and the caller
+    # slices back.
+    prequantized = input_scale is not None
+    output_dtype = torch.bfloat16 if prequantized else input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+
+    if prequantized and not shape_supported:
+        raise ValueError("Prequantized DeepGEMM input requires a supported GEMM shape")
 
     if not (shape_supported and dtype_supported):
         # fall back to triton
@@ -1012,7 +991,25 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    if not _is_musa:
+    if prequantized:
+        scale_groups = input_2d.shape[1] // block_size[1]
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            expected_scale_shape = (input_2d.shape[0], ceil_div(scale_groups, 4))
+            expected_scale_dtype = torch.int32
+        else:
+            expected_scale_shape = (input_2d.shape[0], scale_groups)
+            expected_scale_dtype = torch.float32
+        if input.dtype != fp8_dtype or input_scale.dtype != expected_scale_dtype:
+            raise TypeError(
+                "Prequantized DeepGEMM input has an incompatible data or scale dtype"
+            )
+        if input_scale.shape != expected_scale_shape or input_scale.stride(0) != 1:
+            raise ValueError(
+                "Prequantized DeepGEMM scales require a TMA-aligned column-major "
+                f"{expected_scale_shape} layout"
+            )
+        q_input, x_scale = input_2d, input_scale
+    elif not _is_musa:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d,
             block_size[1],
