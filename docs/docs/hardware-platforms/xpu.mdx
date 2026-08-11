@@ -282,6 +282,39 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 | Memory saver (`--enable-memory-saver`) | Not yet supported |
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
 | Speculative decoding | Not yet implemented |
+| Symmetric memory (`--enable-symm-mem`) | Not supported (requires pynccl); auto-disabled |
+
+## Decode Context Parallel (DCP) on Intel XPU [Experimental]
+
+DCP shards the KV cache across TP ranks by token position
+(`pos % dcp_size == dcp_rank`), so each rank stores roughly `1/dcp_size` of the
+KV cache and `max_total_num_tokens` scales up accordingly. Each rank attends over
+only its own shard, then the partial outputs are merged across ranks by
+log-sum-exp. The cross-rank collectives run over oneCCL (`xccl`) through
+`torch.distributed`.
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --attention-backend triton \
+    --tp 2 --dcp-size 2
+```
+
+Both MHA/GQA models (e.g. Qwen, Llama) and MLA models (e.g. DeepSeek-V3) are
+supported.
+
+### Requirements
+
+| Requirement | Reason |
+|---|---|
+| `--attention-backend triton` | The `intel_xpu` kernels return no usable softmax LSE (`flash_attn_with_kvcache` leaves it zero-filled; `flash_mla_decode` has no LSE output), which the cross-rank merge needs. Rejected at startup. |
+| `dcp_size` divides `tp_size` | DCP groups are formed inside each TP group. |
+
+### Limitations
+
+| Feature | Status |
+|---|---|
+| Decode graph capture under DCP | Auto-disabled: the per-layer collectives are not capturable in an XPU graph |
+| `--dcp-comm-backend fi_a2a` | CUDA-only (needs FlashInfer MNNVL); use the default `ag_rs` or `a2a` |
 
 ## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
 

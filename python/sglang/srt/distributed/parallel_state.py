@@ -50,10 +50,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
-from sglang.srt.runtime_context import (
-    get_global_dwdp_manager,
-    set_global_dwdp_manager,
-)
+from sglang.srt.runtime_context import get_global_dwdp_manager, set_global_dwdp_manager
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -2282,12 +2279,12 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
         )
-    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda()):
+    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda() or _is_xpu):
         raise RuntimeError(
             "Decode context parallel (decode_context_parallel_size > 1) is "
-            "currently only supported on the AMD HIP platform or CUDA platform, but got "
-            f"decode_context_parallel_size ({decode_context_parallel_size}) "
-            "on a non-HIP or non-CUDA platform."
+            "currently only supported on the CUDA, AMD HIP, and Intel XPU "
+            f"platforms, but got decode_context_parallel_size "
+            f"({decode_context_parallel_size}) on an unsupported platform."
         )
     if tensor_model_parallel_size % decode_context_parallel_size != 0:
         raise RuntimeError(

@@ -25,13 +25,33 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_xpu
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(
     est_time=120,
     stage="extra-b",
     runner_config="8-gpu-h200",
 )
+register_xpu_ci(est_time=120, suite="nightly-xpu-4-gpu", nightly=True)
+
+
+def _platform() -> Tuple[str, str]:
+    """(device_type, distributed_backend) for this host.
+
+    reduce_scatter_along_dim is the collective behind the MLA DCP LSE merge, so
+    it must be validated on every platform that admits DCP. XPU has no pynccl:
+    the GroupCoordinator falls through to torch.distributed on the xccl group,
+    which is exactly the path under test here.
+    """
+    if torch.cuda.is_available():
+        return "cuda", "nccl"
+    if is_xpu():
+        return "xpu", "xccl"
+    return "cpu", "gloo"
+
+
+_DEVICE_TYPE, _DIST_BACKEND = _platform()
 
 # ---------------------------------------------------------------------------
 # Test parameters
@@ -104,7 +124,7 @@ def multiprocess_main(file: str, main_fn) -> None:
 
 @pytest.mark.parametrize("nproc", [2, 4, 8])
 def test_reduce_scatter_along_dim(nproc: int) -> None:
-    device_count = torch.cuda.device_count()
+    device_count = torch.get_device_module(_DEVICE_TYPE).device_count()
     if device_count < nproc:
         pytest.skip(
             f"Requires at least {nproc} GPUs, but only {device_count} available"
@@ -122,21 +142,21 @@ def init_distributed():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     rank = local_rank
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
+    device = torch.device(f"{_DEVICE_TYPE}:{rank}")
+    torch.get_device_module(_DEVICE_TYPE).set_device(device)
 
     dist.init_process_group(backend="gloo")
     ps._WORLD = coord = ps.init_world_group(
         ranks=list(range(world_size)),
         local_rank=local_rank,
-        backend="nccl",
+        backend=_DIST_BACKEND,
     )
 
     cpu_group = coord.cpu_group
-    nccl_group = coord.device_group
-    assert nccl_group is not None
+    device_group = coord.device_group
+    assert device_group is not None
 
-    return rank, device, cpu_group, nccl_group, coord
+    return rank, device, cpu_group, device_group, coord
 
 
 def _reference_reduce_scatter_along_dim(
@@ -171,7 +191,7 @@ def _reference_reduce_scatter_along_dim(
 @torch.inference_mode()
 def worker_test(
     device: torch.device,
-    nccl_group: dist.ProcessGroup,
+    device_group: dist.ProcessGroup,
     coord: ps.GroupCoordinator,
     shape: Tuple[int, ...],
     dim: int,
@@ -186,7 +206,7 @@ def worker_test(
         out = coord.reduce_scatter_along_dim(inp, dim=dim)
 
         # Reference
-        ref = _reference_reduce_scatter_along_dim(inp, dim, world_size, nccl_group)
+        ref = _reference_reduce_scatter_along_dim(inp, dim, world_size, device_group)
 
         if not torch.all(out == ref):
             return RuntimeError(f"Mismatch for shape={shape}, dim={dim}, dtype={dtype}")
@@ -195,10 +215,11 @@ def worker_test(
 
 def worker_main() -> None:
     """Entry point for each torchrun worker process."""
-    rank, device, cpu_group, nccl_group, coord = init_distributed()
+    rank, device, cpu_group, device_group, coord = init_distributed()
     world_size = coord.world_size
 
-    torch.cuda.set_stream(torch.cuda.Stream())
+    device_module = torch.get_device_module(_DEVICE_TYPE)
+    device_module.set_stream(device_module.Stream())
 
     errors: List[str] = []
     for shape in TEST_SHAPES:
@@ -210,7 +231,7 @@ def worker_main() -> None:
 
             for dtype in TEST_DTYPES:
                 error = worker_test(
-                    device, nccl_group, coord, shape, dim, dtype, world_size
+                    device, device_group, coord, shape, dim, dtype, world_size
                 )
                 if error is not None:
                     errors.append(str(error))

@@ -4261,6 +4261,35 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
 
+            # XPU DCP decode runs per-layer all-gather / reduce-scatter /
+            # all-to-all through torch.distributed (xccl; there is no pynccl on
+            # XPU). Those calls are not validated inside an XPUGraph capture, so
+            # keep decode capture off under DCP. Prefill capture is already
+            # disabled for dcp_size > 1 by _apply_cuda_graph_compatibility.
+            if (
+                self.dcp_size > 1
+                and self.cuda_graph_config.decode.backend != Backend.DISABLED
+            ):
+                logger.warning(
+                    "Disabling XPU decode graph capture: decode context "
+                    "parallelism (--dcp-size %d) issues per-layer collectives "
+                    "that are not supported inside an XPU graph.",
+                    self.dcp_size,
+                )
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+
+            # Symmetric memory is a pynccl/ncclMemAlloc feature. XPU groups are
+            # always built with use_pynccl=False, so SymmetricMemoryContext would
+            # dereference a None pynccl_comm. Every collective that opts into it
+            # (all_gather, reduce_scatter_along_dim, the DCP LSE merge) falls back
+            # to a plain torch.distributed call when it is off.
+            if self.enable_symm_mem:
+                logger.warning(
+                    "Disabling --enable-symm-mem on XPU: symmetric memory "
+                    "requires pynccl, which is not available on this platform."
+                )
+                self.enable_symm_mem = False
+
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
@@ -5887,6 +5916,19 @@ class ServerArgs:
         if self.use_mla_backend() and prefill_backend == "intel_xpu":
             raise ValueError(
                 "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
+            )
+
+        # DCP merges each rank's partial attention by log-sum-exp, so the decode
+        # kernel must return a populated LSE. The intel_xpu kernels do not:
+        # flash_attn_with_kvcache leaves softmax_lse zero-filled on XPU and
+        # flash_mla_decode has no LSE output at all, which would silently produce
+        # wrong (unnormalized) results rather than fail.
+        if self.dcp_size > 1 and "intel_xpu" in (prefill_backend, decode_backend):
+            raise ValueError(
+                "--dcp-size > 1 is not supported with the intel_xpu attention "
+                "backend: its decode kernels do not return the softmax LSE that "
+                "the DCP cross-rank merge requires. Use --attention-backend "
+                "triton for decode context parallelism on Intel XPU."
             )
 
         run_post_process_pass(self, _intel_xpu_page_constraint)

@@ -62,6 +62,7 @@ if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
@@ -204,6 +205,11 @@ class TritonAttnBackend(AttentionBackend):
         ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        # Number of local query heads per local KV head (the kernel's
+        # kv_group_num before the DCP query all-gather inflates the head count).
+        self.dcp_q_per_kv_head = (self.num_head // self.dcp_size) // max(
+            1, self.num_kv_head
         )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
@@ -384,6 +390,60 @@ class TritonAttnBackend(AttentionBackend):
 
     def _dcp_lens(self, lens: torch.Tensor, start: Optional[torch.Tensor] = None):
         return get_dcp_lens(lens, self.dcp_size, self.dcp_rank, start)
+
+    def _dcp_gather_q(self, q: torch.Tensor, group: GroupCoordinator) -> torch.Tensor:
+        """All-gather query heads across the DCP group in KV-head-major order.
+
+        ``all_gather(dim=1)`` concatenates each rank's head block, giving a
+        RANK-major layout ``[rank][local_head]``. The decode/extend kernels map
+        query head ``h`` to KV head ``h // (num_q_heads / num_kv_heads)``, and
+        the gather multiplies num_q_heads by ``dcp_size`` while the local KV
+        shard keeps its original head count. Under that inflated divisor a
+        rank-major layout points every query head at the wrong KV head (a silent
+        wrong-output bug for num_kv_heads > 1; harmless only at
+        num_kv_heads == 1, where the mapping is always 0).
+
+        Transposing to KV-head-major ``[kv_head][rank][q_per_kv_head]`` restores
+        the invariant: query heads sharing a KV head stay contiguous, so the
+        kernel's floor-division lands on that KV head again. Bit-exact against
+        each rank's standalone output; see ``_dcp_ungather_heads`` for the
+        inverse applied to the kernel results.
+        """
+        q = group.all_gather(q, dim=1)
+        g = self.dcp_q_per_kv_head
+        if self.num_kv_head <= 1 or g <= 0:
+            # Single KV head: every query head maps to KV head 0 regardless of
+            # layout, so skip the permutation (and its copy) entirely.
+            return q.contiguous()
+        tokens, _, head_dim = q.shape
+        return (
+            q.view(tokens, self.dcp_size, self.num_kv_head, g, head_dim)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(tokens, -1, head_dim)
+            .contiguous()
+        )
+
+    def _dcp_ungather_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """Invert ``_dcp_gather_q``'s head permutation (KV-major -> rank-major).
+
+        Applies to any kernel result carried on the gathered head dim: the
+        attention output ``[tokens, heads, head_dim]`` and, via a size-1 trailing
+        dim, the per-head LSE ``[tokens, heads]``. Callers below the merge expect
+        rank-major heads (rank r owns ``[r * local_heads, (r+1) * local_heads)``).
+        """
+        g = self.dcp_q_per_kv_head
+        if self.num_kv_head <= 1 or g <= 0:
+            return x
+        squeeze = x.dim() == 2
+        if squeeze:
+            x = x.unsqueeze(-1)
+        tokens, _, trailing = x.shape
+        x = (
+            x.view(tokens, self.num_kv_head, self.dcp_size, g, trailing)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(tokens, -1, trailing)
+        )
+        return x.squeeze(-1) if squeeze else x
 
     def _dcp_kv_indices(
         self,
@@ -1571,7 +1631,10 @@ class TritonAttnBackend(AttentionBackend):
 
         # Prefix KV is sharded across DCP ranks, so compute each rank's
         # partial attention with all gathered query heads and merge by LSE.
-        q_all = group.all_gather(q_local, dim=1).contiguous()
+        # KV-head-major gather order (see _dcp_gather_q) keeps the kernel's
+        # query-head -> KV-head mapping correct once the gather inflates the
+        # query head count.
+        q_all = self._dcp_gather_q(q_local, group)
         total_heads = q_all.shape[1]
         prefix_out = torch.zeros(
             (total_tokens, total_heads, layer.v_head_dim),
@@ -1609,6 +1672,10 @@ class TritonAttnBackend(AttentionBackend):
             skip_extend=True,
         )
 
+        # Back to rank-major heads before the merge, which slices this rank's
+        # head block as [rank * local_heads, (rank + 1) * local_heads).
+        prefix_out = self._dcp_ungather_heads(prefix_out)
+        prefix_lse = self._dcp_ungather_heads(prefix_lse)
         prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
             prefix_out, prefix_lse, group, return_lse=True
         )
@@ -1860,11 +1927,20 @@ class TritonAttnBackend(AttentionBackend):
                     "DCP Triton decode does not support score_mod"
                 )
             group = get_parallel().dcp_group
-            with use_symmetric_memory(group):
+            if self.use_mla:
+                # MLA already all-gathered Q across the DCP group in the model
+                # (all_gather_q_for_mla_decode) and merges the partials itself
+                # from the returned LSE, so don't gather or merge again here.
+                # Absorbed MQA has one KV head, so no head reorder is needed.
                 q_for_decode = q.view(
                     -1, layer.tp_q_head_num, layer.qk_head_dim
                 ).contiguous()
-            q_for_decode = group.all_gather(q_for_decode, dim=1).contiguous()
+            else:
+                with use_symmetric_memory(group):
+                    q_local = q.view(
+                        -1, layer.tp_q_head_num, layer.qk_head_dim
+                    ).contiguous()
+                q_for_decode = self._dcp_gather_q(q_local, group)
             o_for_decode = torch.empty(
                 (q_for_decode.shape[0], q_for_decode.shape[1], layer.v_head_dim),
                 dtype=torch.float32,
@@ -1888,6 +1964,7 @@ class TritonAttnBackend(AttentionBackend):
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
+                has_mla=self.use_mla,
             )
             local_lse = torch.logsumexp(
                 self.forward_metadata.attn_lse[
@@ -1895,6 +1972,19 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
+            if self.use_mla:
+                # Hand the per-rank partial + natural-log LSE back to the model,
+                # which owns the MLA cross-rank merge (cp_lse_ag_out_rs_mla /
+                # dcp_a2a_lse_reduce). See is_mla_dcp_lse_base_on_e: 'triton' is
+                # listed base-e to match torch.logsumexp above.
+                return (
+                    o_for_decode.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(
+                        q.dtype
+                    ),
+                    local_lse,
+                )
+            o_for_decode = self._dcp_ungather_heads(o_for_decode)
+            local_lse = self._dcp_ungather_heads(local_lse)
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 

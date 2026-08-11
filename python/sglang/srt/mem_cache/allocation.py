@@ -29,7 +29,6 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     is_cpu,
-    is_cuda,
     is_hip,
     is_npu,
     next_power_of_2,
@@ -39,7 +38,6 @@ from sglang.srt.utils.common import is_pin_memory_available
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_cuda = is_cuda()
 _is_cpu = is_cpu()
 
 if _is_cpu:
@@ -295,7 +293,9 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # DCP swaps in an allocator whose page_size is the configured page_size *
     # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
     # the real allocator's page_size there. Elsewhere the two are equal.
-    if (_is_hip or _is_cuda) and get_parallel().dcp_enabled:
+    # Platform-independent: every platform that admits dcp_size > 1 (CUDA, HIP,
+    # XPU -- see initialize_model_parallel) installs that widened allocator.
+    if get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
