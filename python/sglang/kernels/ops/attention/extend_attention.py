@@ -456,7 +456,35 @@ def _fwd_kernel(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
-    for start_n in range(0, prefix_end, BLOCK_N):
+    # Sliding window: the extend stage's bound, shifted by the prefix length.
+    #
+    # The window mask below keeps (q, kv) iff q <= kv + SLIDING_WINDOW_SIZE, here
+    # with q = cur_seq_len_prefix + cur_block_m * BLOCK_M + i and kv = start_n + j.
+    # Row i = 0 always exists (the early return above guarantees
+    # cur_block_m * BLOCK_M < cur_seq_len_extend) and the largest kv in a tile is
+    # start_n + BLOCK_N - 1, so a tile can hold an unmasked element only if
+    #     cur_seq_len_prefix + cur_block_m * BLOCK_M
+    #         <= start_n + BLOCK_N - 1 + SLIDING_WINDOW_SIZE,
+    # whose smallest BLOCK_N-aligned solution is (A // BLOCK_N) * BLOCK_N for
+    # A = cur_seq_len_prefix + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE (same
+    # ceil-to-floor identity as the extend stage, so tight and conservative for any
+    # BLOCK_M / BLOCK_N). Every tile below that floor is entirely masked out, where
+    # SKIP_TILE already suppresses the MMA and the online-softmax rescale alike.
+    #
+    # Once cur_block_m * BLOCK_M >= SLIDING_WINDOW_SIZE the floor reaches
+    # cur_seq_len_prefix and the loop empties: no query in this m-block can see any
+    # prefix token. That is every m-block but the first window's worth, so under
+    # chunked prefill or a radix-cache hit this removes ceil(window / BLOCK_N) tiles
+    # per m-block -- the residual the extend-stage bound alone leaves behind.
+    prefix_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        prefix_start = (
+            tl.maximum(
+                cur_seq_len_prefix + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
+            )
+            // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(prefix_start, prefix_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
 
