@@ -326,8 +326,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             f"Peak allocated: {peak_allocated_gb:.2f} GB, "
             f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
             f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
-            f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
-            f"Related offload server args to disable: {suggested_args_str}"
+            f"Components that can stay on GPU for faster requests: {can_stay_resident}. "
+            f"Disable their CPU offload with: {suggested_args_str}"
         )
 
     def _format_offload_disable_suggestions(self, components: List[str]) -> str:
@@ -341,16 +341,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
             arg = None
             if component == "vae":
-                arg = "--vae-cpu-offload"
+                arg = "--vae-cpu-offload false"
             elif component == "image_encoder":
-                arg = "--image-encoder-cpu-offload"
+                arg = "--image-encoder-cpu-offload false"
             elif component in ("text_encoder", "text_encoder_2"):
-                arg = "--text-encoder-cpu-offload"
+                arg = "--text-encoder-cpu-offload false"
             elif component == "transformer":
                 if self.server_args.is_dit_layerwise_offload_selected:
-                    arg = "--dit-layerwise-offload"
-                elif self.server_args.dit_cpu_offload:
-                    arg = "--dit-cpu-offload"
+                    suggestions.append("--dit-layerwise-offload false")
+                if self.server_args.dit_cpu_offload:
+                    suggestions.append("--dit-cpu-offload false")
+                continue
 
             if arg is not None and arg not in seen_args:
                 suggestions.append(arg)
