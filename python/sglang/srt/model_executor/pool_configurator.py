@@ -76,6 +76,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
+    """Bytes/token the DFLASH draft KV pool adds to the target's budget, 0 if none.
+
+    Unlike an EAGLE draft, which reuses the target's attention config and is
+    therefore priced by layer count, a DFLASH draft has its own geometry and is
+    a flat additive term. Under DCP, the target pool is sharded while the draft
+    pool spans the allocator's widened virtual location space, so the draft
+    term is replicated across DCP ranks.
+    """
+    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+        return 0
+    cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
+    if cell_size is None or int(cell_size) <= 0:
+        return 0
+    return int(cell_size) * get_parallel().attn_dcp_size
+
+
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -182,6 +199,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
                     * get_parallel().attn_dcp_size,
+                    draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
@@ -412,6 +430,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 self._draft_swa_full_layers_num = banded_depths
                 self._draft_full_layers_num = draft_layers - banded_depths
 
+        self._draft_cell_size = _dflash_draft_cell_size(kvc)
+
         # Bytes per token of max_total_num_tokens.
         #
         # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
@@ -426,6 +446,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 self._swa_per_token * self._swa_layers_num
                 + self._full_per_token * self._draft_full_layers_num
                 + self._swa_per_token * self._draft_swa_full_layers_num
+                + self._draft_cell_size
             )
         else:
             self._cell_size = (
@@ -435,6 +456,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
+                + self._draft_cell_size
             )
 
     def _solve_pool_sizes(
