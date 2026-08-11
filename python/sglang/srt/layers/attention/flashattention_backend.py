@@ -1042,7 +1042,8 @@ class FlashAttentionBackend(AttentionBackend):
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
 
             if (
-                self.use_mla
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and self.use_mla
                 and self.use_sliding_window_kv_pool
                 and self.sliding_window_size is not None
             ):

@@ -11,6 +11,7 @@ EP_SIZE="${EP_SIZE:-8}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-393216}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-256}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.87}"
+CUDA_GRAPH_MIN_MEMORY_MIB="${CUDA_GRAPH_MIN_MEMORY_MIB:-120000}"
 WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-1800}"
 SGLANG_BIN="${SGLANG_BIN:-sglang}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -28,8 +29,18 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   exit 1
 fi
 
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)"
-if [[ "${GPU_NAME}" == *H200* ]]; then
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | sed -n '1p')"
+GPU_MEMORY_MIB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | awk 'NR == 1 { min = $1 } $1 < min { min = $1 } END { print min }')"
+if [[ ! "${GPU_MEMORY_MIB}" =~ ^[0-9]+$ ]]; then
+  echo "Unable to determine GPU memory from nvidia-smi: ${GPU_MEMORY_MIB}" >&2
+  exit 1
+fi
+if [[ ! "${CUDA_GRAPH_MIN_MEMORY_MIB}" =~ ^[0-9]+$ ]]; then
+  echo "CUDA_GRAPH_MIN_MEMORY_MIB must be an integer" >&2
+  exit 1
+fi
+
+if (( GPU_MEMORY_MIB >= CUDA_GRAPH_MIN_MEMORY_MIB )); then
   DEFAULT_CUDA_GRAPH_MODE="decode"
   DEFAULT_CUDA_GRAPH_MAX_BS_DECODE=32
 elif [[ "${LANGUAGE_ONLY:-0}" == "1" ]]; then
@@ -108,7 +119,7 @@ case "${CUDA_GRAPH_MODE}" in
     exit 1
     ;;
 esac
-echo "GPU=${GPU_NAME}; decode CUDA graph mode=${CUDA_GRAPH_MODE}; prefill CUDA graph is disabled."
+echo "GPU=${GPU_NAME} (${GPU_MEMORY_MIB} MiB minimum); decode CUDA graph mode=${CUDA_GRAPH_MODE}; prefill CUDA graph is disabled."
 
 SPECULATIVE_ARGS=()
 if [[ "${DISABLE_SPECULATIVE:-0}" != "1" ]]; then
@@ -122,9 +133,8 @@ if [[ "${DISABLE_SPECULATIVE:-0}" != "1" ]]; then
   )
 fi
 
-MODEL_OVERRIDE_ARGS='{"im_start_token":"<|img|>","im_token":"<|imgpad|>","im_end_token":"<|endofimg|>","audio_start_token":"<|audio_comp_start|>","audio_token":"<|audio_comp_pad|>","audio_end_token":"<|audio_comp_end|>"}'
 if [[ "${DISABLE_DSA:-0}" == "1" ]]; then
-  MODEL_OVERRIDE_ARGS='{"im_start_token":"<|img|>","im_token":"<|imgpad|>","im_end_token":"<|endofimg|>","audio_start_token":"<|audio_comp_start|>","audio_token":"<|audio_comp_pad|>","audio_end_token":"<|audio_comp_end|>","index_topk":null}'
+  EXTRA_SERVER_ARGS+=(--json-model-override-args '{"index_topk":null}')
 fi
 
 exec "${SGLANG_BIN}" serve \
@@ -154,6 +164,5 @@ exec "${SGLANG_BIN}" serve \
   --deepep-mode "${DEEPEP_MODE}" \
   --enable-nccl-nvls \
   --enable-multimodal \
-  --json-model-override-args "${MODEL_OVERRIDE_ARGS}" \
   --enable-metrics \
   "${EXTRA_SERVER_ARGS[@]}"

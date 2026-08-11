@@ -706,7 +706,11 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     ) -> MemoryPoolConfig:
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         swa_tokens = ceil_align(self._swa_cap, page_size)
-        fixed_swa_bytes = swa_tokens * self._swa_per_token * self._swa_layers_num
+        fixed_swa_bytes = (
+            swa_tokens
+            * self._swa_per_token
+            * (self._swa_layers_num + self._draft_swa_layers_num)
+        )
         full_cell_size = (
             self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
             + self._swa_per_token * self._draft_swa_full_layers_num

@@ -899,6 +899,16 @@ class Dots3AttentionMLA(nn.Module):
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> Dots3AttnForwardMethod:
+        if (
+            self.use_swa
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            raise NotImplementedError(
+                "Dots3 SWA attention does not support context-parallel prefill yet. "
+                "Please disable --enable-prefill-cp."
+            )
+
         backend = get_attn_backend()
         from sglang.srt.layers.attention.dots_hybrid_backend import (
             DotsHybridAttnBackend,

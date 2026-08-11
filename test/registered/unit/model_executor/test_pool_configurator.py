@@ -96,6 +96,7 @@ def _make_model_runner(
     mr.sliding_window_size = sliding_window_size
 
     mc = SimpleNamespace()
+    mc.attention_arch = AttentionArch.MHA
     mc.head_dim = head_dim
     mc.v_head_dim = v_head_dim
     mc.kv_lora_rank = kv_lora_rank
@@ -446,6 +447,39 @@ class TestHybridSWAConfigurator(CustomTestCase):
 
         self.assertEqual(config.swa_max_total_num_tokens, 91)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
+
+    def test_chunk_cache_cap_accounts_for_draft_swa_layers(self):
+        """Draft SWA tensors consume the same fixed-capacity pool as target SWA."""
+        available = 1_000_000
+        mr = _make_model_runner(
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            disable_radix_cache=True,
+            chunked_prefill_size=4,
+            sliding_window_size=8,
+            page_size=1,
+            max_running_requests=2,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 1
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        full_tokens = config.full_max_total_num_tokens
+        swa_tokens = config.swa_max_total_num_tokens
+        used = full_tokens * _full_per_token(mr) + swa_tokens * _swa_per_token(mr) * 2
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
 
     def test_chunk_cache_cap_drops_prefill_for_disagg_decode(self):
         available = 1_000_000
