@@ -4292,8 +4292,11 @@ class Scheduler(
             if _is_stale_start_version(req, stale_below):
                 # Retracted requests are re-prefilled on resume, so one already
                 # too stale to train on would pay a full recompute just to be
-                # discarded. retract_all above released its KV, so finishing it
-                # here is only the echo the waiting-queue abort path sends.
+                # discarded. Not re-queueing it is what stops that; the echo is
+                # what the caller needs, since retract_all already released the
+                # KV and skipping the queue leaves nothing to finish the request
+                # later -- without it rid_to_state leaks and the client hangs.
+                # Same contract as abort method 1 on the waiting queue.
                 logger.debug(f"Abort stale request on pause. {req.rid=}")
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(rid=req.rid, abort_message="Aborted by pause_generation"),
