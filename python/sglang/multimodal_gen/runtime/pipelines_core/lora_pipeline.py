@@ -15,6 +15,9 @@ from safetensors.torch import load_file
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
+    WeightItem,
+    create_weight_from_layer,
+    has_any_registered_adapter,
     replace_submodule,
     wrap_with_lora_layer,
 )
@@ -30,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline_utils import (
     VALID_TARGETS,
+    _filter_weights_by_layer,
     _has_active_unmerged_lora,
     _normalize_lora_params,
     _resolve_lora_merge_mode,
@@ -52,7 +56,7 @@ class LoRAPipeline(ComposedPipelineBase):
     # Type annotations for instance attributes (initialized in __init__)
     # [lora_nickname][target_LoRA_weight_name_in_SGLang_dit] = weight
     # e.g., [jinx][transformer_blocks.0.attn.to_v.lora_A]
-    lora_adapters: dict[str, dict[str, torch.Tensor]]
+    lora_adapters: dict[str, dict[str, WeightItem]]
     loaded_adapter_paths: dict[str, str]  # nickname -> lora_path
     loaded_adapter_alphas: dict[str, int | None]
     # nickname -> adapter_config lora_alpha
@@ -269,8 +273,6 @@ class LoRAPipeline(ComposedPipelineBase):
 
             lora_layer = wrap_with_lora_layer(
                 layer,
-                lora_rank=self.lora_rank,
-                lora_alpha=self.lora_alpha,
             )
             if lora_layer is not None:
                 target_lora_layers[name] = lora_layer
@@ -413,41 +415,21 @@ class LoRAPipeline(ComposedPipelineBase):
             for idx, (nickname, path, lora_strength) in enumerate(
                 zip(lora_nicknames, lora_paths, strengths)
             ):
-                lora_A_name = name + ".lora_A"
-                lora_B_name = name + ".lora_B"
-                if (
-                    lora_A_name in self.lora_adapters[nickname]
-                    and lora_B_name in self.lora_adapters[nickname]
-                ):
-                    inferred_rank = int(
-                        self.lora_adapters[nickname][lora_A_name].shape[0]
-                    )
-                    alpha_key = name + ".alpha"
-                    adapter_lora_alpha = self.loaded_adapter_alphas.get(nickname)
-                    if alpha_key in self.lora_adapters[nickname]:
-                        inferred_alpha = int(
-                            self.lora_adapters[nickname][alpha_key].item()
-                        )
-                    elif adapter_lora_alpha is not None:
-                        inferred_alpha = adapter_lora_alpha
-                    else:
-                        # Some distilled LoRAs omit per-layer alpha and rely on the
-                        # default LoRA scale of alpha == rank. Falling back to rank
-                        # keeps the effective delta consistent with the official path.
-                        inferred_alpha = inferred_rank
-
-                    layer.lora_rank = inferred_rank
-                    layer.lora_alpha = inferred_alpha
-
-                    layer.set_lora_weights(
-                        self.lora_adapters[nickname][lora_A_name],
-                        self.lora_adapters[nickname][lora_B_name],
+                adapter_by_layer = _filter_weights_by_layer(
+                    name, self.lora_adapters[nickname]
+                )
+                adapter_weight = create_weight_from_layer(adapter_by_layer)
+                if adapter_weight is not None:
+                    config_adapter_alpha = self.loaded_adapter_alphas.get(nickname)
+                    layer.set_adapter_weights(
+                        adapter_weight,
+                        lora_alpha=config_adapter_alpha,
                         lora_path=path,
                         strength=lora_strength,
                         merge_weights=merge_weights,
                         clear_existing=(
                             clear_existing and idx == 0
-                        ),  # Only clear on first LoRA
+                        ),  # Only clear on first adapter
                     )
                     adapted_count += 1
                     applied_count_by_adapter[idx] += 1
@@ -455,12 +437,13 @@ class LoRAPipeline(ComposedPipelineBase):
                     missing_layers_by_adapter[idx].append(name)
                     # Only disable if no LoRA was applied at all
                     if idx == len(lora_nicknames) - 1:
-                        has_any_lora = any(
-                            name + ".lora_A" in self.lora_adapters[n]
-                            and name + ".lora_B" in self.lora_adapters[n]
+                        has_any_adapter = any(
+                            has_any_registered_adapter(
+                                _filter_weights_by_layer(name, self.lora_adapters[n])
+                            )
                             for n in lora_nicknames
                         )
-                        if not has_any_lora:
+                        if not has_any_adapter:
                             layer.disable_lora = True
 
         if distributed_rank == 0:
@@ -526,12 +509,10 @@ class LoRAPipeline(ComposedPipelineBase):
         for name, layer in lora_layers.items():
             if layer.merged or len(layer.lora_weights_list) != 1:
                 return None
-            has_adapter = name + ".lora_A" in adapter and name + ".lora_B" in adapter
-            if not has_adapter:
+            if not has_any_registered_adapter(_filter_weights_by_layer(name, adapter)):
                 continue
             if (
-                layer.lora_A is None
-                or layer.lora_B is None
+                not layer.has_weight
                 or layer.lora_path != path
                 or layer.strength != strength
             ):
@@ -542,7 +523,9 @@ class LoRAPipeline(ComposedPipelineBase):
             return None
 
         for name, layer in lora_layers.items():
-            has_adapter = name + ".lora_A" in adapter and name + ".lora_B" in adapter
+            has_adapter = has_any_registered_adapter(
+                _filter_weights_by_layer(name, adapter)
+            )
             layer.disable_lora = not has_adapter
 
         return active_count
@@ -579,7 +562,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self,
         lora_path: str,
         lora_nickname: str,
-        rank: int,
+        distributed_rank: int,
         weight_name: str | None = None,
     ):
         """
@@ -590,9 +573,9 @@ class LoRAPipeline(ComposedPipelineBase):
         if weight_name is None and lora_path == self.server_args.lora_path:
             weight_name = self.server_args.lora_weight_name
 
-        # Only rank 0 downloads to avoid race conditions where other ranks
+        # Only distributed rank 0 downloads to avoid race conditions where other ranks
         # try to load incomplete downloads
-        if rank == 0:
+        if distributed_rank == 0:
             lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
         else:
             lora_local_path = None
@@ -601,8 +584,8 @@ class LoRAPipeline(ComposedPipelineBase):
         if dist.is_initialized():
             dist.barrier()
 
-        # Non-rank-0 workers now download (will hit cache since rank 0 completed)
-        if rank != 0:
+        # Non-rank-0 workers now download (will hit cache since distributed rank 0 completed)
+        if distributed_rank != 0:
             lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
 
         raw_state_dict = load_file(lora_local_path)
@@ -648,8 +631,9 @@ class LoRAPipeline(ComposedPipelineBase):
                         to_merge_params[target_name][i]
                         for i in range(num_params_to_merge)
                     ]
+                    # TODO: rework for using weight class for adapter
                     # Use stack instead of cat because it needs to be compatible with TP.
-                    weight = torch.stack(sorted_tensors, dim=0)
+                    weight = sorted_tensors
                     del to_merge_params[target_name]
                 else:
                     continue
@@ -661,7 +645,7 @@ class LoRAPipeline(ComposedPipelineBase):
             self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
         self.loaded_adapter_paths[lora_nickname] = lora_path
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
-        logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
+        logger.info("Rank %d: loaded LoRA adapter %s", distributed_rank, lora_path)
 
     def set_lora(
         self,
@@ -891,7 +875,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     module_name, lora_layers_dict, self.server_args.lora_merge_mode
                 ):
                     for layer in lora_layers_dict.values():
-                        if layer.lora_A is None:
+                        if not layer.has_weight:
                             continue
                         if layer.merged:
                             layer.unmerge_lora_weights()
@@ -921,7 +905,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     )
                 for name, layer in lora_layers_dict.items():
                     # Only re-enable LoRA for layers that actually have LoRA weights
-                    if layer.lora_A is None:
+                    if not layer.has_weight:
                         continue
                     layer.disable_lora = False
                     try:

@@ -133,7 +133,7 @@ def run_single_test(
     filename: str,
     local_name: str,
     expected_before: LoRAFormat,
-    expected_after: LoRAFormat = LoRAFormat.STANDARD,
+    expected_after: LoRAFormat = LoRAFormat.LORA_STANDARD,
 ):
     """
     Run a single end-to-end test for one LoRA checkpoint.
@@ -179,8 +179,8 @@ def _run_all_tests() -> List[Dict]:
             repo_id="jbilcke-hf/sdxl-cinematic-1",
             filename="pytorch_lora_weights.safetensors",
             local_name="sdxl_cinematic1_pytorch_lora_weights.safetensors",
-            expected_before=LoRAFormat.STANDARD,
-            expected_after=LoRAFormat.STANDARD,
+            expected_before=LoRAFormat.LORA_STANDARD,
+            expected_after=LoRAFormat.LORA_STANDARD,
         )
     )
 
@@ -191,8 +191,8 @@ def _run_all_tests() -> List[Dict]:
             repo_id="XLabs-AI/flux-RealismLora",
             filename="lora.safetensors",
             local_name="flux_realism_lora.safetensors",
-            expected_before=LoRAFormat.XLABS_FLUX,
-            expected_after=LoRAFormat.STANDARD,
+            expected_before=LoRAFormat.LORA_XLABS_FLUX,
+            expected_after=LoRAFormat.LORA_STANDARD,
         )
     )
 
@@ -203,8 +203,8 @@ def _run_all_tests() -> List[Dict]:
             repo_id="kohya-ss/misc-models",
             filename="flux-hasui-lora-d4-sigmoid-raw-gs1.0.safetensors",
             local_name="flux_hasui_lora_d4_sigmoid_raw_gs1_0.safetensors",
-            expected_before=LoRAFormat.KOHYA_FLUX,
-            expected_after=LoRAFormat.STANDARD,
+            expected_before=LoRAFormat.LORA_KOHYA_FLUX,
+            expected_after=LoRAFormat.LORA_STANDARD,
         )
     )
 
@@ -215,8 +215,8 @@ def _run_all_tests() -> List[Dict]:
             repo_id="fal/flux-2-klein-4b-spritesheet-lora",
             filename="flux-spritesheet-lora.safetensors",
             local_name="flux_spritesheet_lora.safetensors",
-            expected_before=LoRAFormat.AI_TOOLKIT_FLUX,
-            expected_after=LoRAFormat.STANDARD,
+            expected_before=LoRAFormat.LORA_AI_TOOLKIT_FLUX,
+            expected_after=LoRAFormat.LORA_STANDARD,
         )
     )
 
@@ -227,8 +227,8 @@ def _run_all_tests() -> List[Dict]:
             repo_id="kohya-ss/misc-models",
             filename="fp-1f-chibi-1024.safetensors",
             local_name="fp_1f_chibi_1024.safetensors",
-            expected_before=LoRAFormat.NON_DIFFUSERS_SD,
-            expected_after=LoRAFormat.STANDARD,
+            expected_before=LoRAFormat.LORA_NON_DIFFUSERS_SD,
+            expected_after=LoRAFormat.LORA_STANDARD,
         )
     )
 
@@ -239,8 +239,8 @@ def _run_all_tests() -> List[Dict]:
             repo_id="alibaba-pai/Wan2.1-Fun-Reward-LoRAs",
             filename="Wan2.1-Fun-1.3B-InP-MPS.safetensors",
             local_name="wan21_fun_1_3b_inp_mps.safetensors",
-            expected_before=LoRAFormat.NON_DIFFUSERS_SD,
-            expected_after=LoRAFormat.STANDARD,
+            expected_before=LoRAFormat.LORA_NON_DIFFUSERS_SD,
+            expected_after=LoRAFormat.LORA_STANDARD,
         )
     )
 
@@ -251,8 +251,8 @@ def _run_all_tests() -> List[Dict]:
             repo_id="starsfriday/Qwen-Image-EVA-LoRA",
             filename="qwen_image_eva.safetensors",
             local_name="qwen_image_eva.safetensors",
-            expected_before=LoRAFormat.STANDARD,
-            expected_after=LoRAFormat.STANDARD,
+            expected_before=LoRAFormat.LORA_STANDARD,
+            expected_after=LoRAFormat.LORA_STANDARD,
         )
     )
 
@@ -263,8 +263,8 @@ def _run_all_tests() -> List[Dict]:
             repo_id="lightx2v/Qwen-Image-Lightning",
             filename="Qwen-Image-Lightning-4steps-V1.0-bf16.safetensors",
             local_name="qwen_image_lightning_4steps_v1_bf16.safetensors",
-            expected_before=LoRAFormat.NON_DIFFUSERS_SD,
-            expected_after=LoRAFormat.STANDARD,
+            expected_before=LoRAFormat.LORA_NON_DIFFUSERS_SD,
+            expected_after=LoRAFormat.LORA_STANDARD,
         )
     )
 
@@ -275,8 +275,20 @@ def _run_all_tests() -> List[Dict]:
             repo_id="renderartist/Classic-Painting-Z-Image-Turbo-LoRA",
             filename="Classic_Painting_Z_Image_Turbo_v1_renderartist_1750.safetensors",
             local_name="classic_painting_z_image_turbo_v1_renderartist_1750.safetensors",
-            expected_before=LoRAFormat.STANDARD,
-            expected_after=LoRAFormat.STANDARD,
+            expected_before=LoRAFormat.LORA_STANDARD,
+            expected_after=LoRAFormat.LORA_STANDARD,
+        )
+    )
+
+    # LOKR Z-Image Turbo LoRA (LOKR → STANDARD).
+    results.append(
+        run_single_test(
+            name="LOKR Z-Image Turbo LoRA",
+            repo_id="F16/z-image-turbo-flow-dpo",
+            filename="zit_fdpo_v1.safetensors",
+            local_name="zit_fdpo_v1.safetensors",
+            expected_before=LoRAFormat.LOKR_STANDARD,
+            expected_after=LoRAFormat.LOKR_STANDARD,
         )
     )
 

@@ -1,3 +1,4 @@
+from torch import Tensor
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
@@ -11,6 +12,16 @@ VALID_TARGETS = ("all", "transformer", "transformer_2", "critic")
 
 def _uses_dtensor_weights(lora_layers: dict[str, BaseLayerWithLoRA]) -> bool:
     return any(isinstance(layer.weight, DTensor) for layer in lora_layers.values())
+
+
+def _filter_weights_by_layer(
+    layer_name: str, adapter: dict[str, Tensor]
+) -> dict[str, Tensor]:
+    return {
+        key.removeprefix(f"{layer_name}."): tensor
+        for key, tensor in adapter.items()
+        if key.startswith(layer_name)
+    }
 
 
 def _has_active_unmerged_lora(
