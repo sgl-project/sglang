@@ -603,8 +603,6 @@ class DeepseekV2WeightLoaderMixin:
                             weight_scale=self_attn.kv_b_proj.weight_scale,
                             input_scale=None,
                         )
-                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                        self_attn.w_scale = scale
                     else:
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale
@@ -612,8 +610,9 @@ class DeepseekV2WeightLoaderMixin:
                         # broadcasts correctly against weight [out, in].
                         if weight_scale.dim() == 1:
                             weight_scale = weight_scale.view(-1, 1)
-                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                        self_attn.w_scale = scale
+
+                    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+                    self_attn.w_scale = scale
 
             if w.dtype == torch.int8:
                 if hasattr(self.quant_config, "weight_block_size"):
