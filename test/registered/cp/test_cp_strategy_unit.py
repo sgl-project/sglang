@@ -14,6 +14,7 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
+from sglang.srt.layers.cp.bcg import PrefillCPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import (
     get_cp_padding_align_size,
@@ -28,6 +29,14 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -100,6 +109,164 @@ class TestCPStrategyUnit(CustomTestCase):
             "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
         ):
             self.assertIsNotNone(get_cp_strategy())
+
+
+class TestPrefillCPBCGReplay(CustomTestCase):
+    def tearDown(self):
+        init_cp_strategy(SimpleNamespace(enable_prefill_cp=False))
+
+    def _make_runner(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = False
+        runner.enable_lora = False
+        runner._capture_chunked_prefix = False
+        runner.prefill_backend_name = Backend.TC_PIECEWISE
+        runner.has_mha_companion_layers = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.capture_num_tokens = [2048, 2304]
+        runner.max_num_tokens = 2304
+        runner.enable_cp_v2_bcg_capture = True
+        return runner
+
+    def _make_forward_batch(self):
+        return SimpleNamespace(
+            batch_size=3,
+            input_embeds=None,
+            replace_embeds=None,
+            mm_inputs=None,
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            global_num_tokens_cpu=None,
+            return_logprob=False,
+            input_ids=list(range(2048)),
+            seq_lens_cpu=[1534, 161, 353],
+            extend_seq_lens_cpu=[1534, 161, 353],
+            extend_prefix_lens_cpu=[0, 0, 0],
+        )
+
+    def _enable_zigzag(self):
+        init_cp_strategy(
+            SimpleNamespace(
+                enable_prefill_cp=True,
+                cp_strategy="zigzag",
+                attn_cp_size=4,
+            )
+        )
+
+    def test_local_capacity_overflow_uses_next_capture_bucket(self):
+        runner = self._make_runner()
+        runner.capture_num_tokens.append(2560)
+        runner.max_num_tokens = 2560
+        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+            input_embeds=torch.empty(0),
+            positions=torch.empty(0),
+            bucket_local_tokens={2048: 512, 2304: 576, 2560: 640},
+        )
+        forward_batch = self._make_forward_batch()
+        self._enable_zigzag()
+
+        with (
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                return_value=8,
+            ),
+        ):
+            selected_buckets = []
+            for cp_rank in range(4):
+                with get_parallel().override(attn_cp_rank=cp_rank, attn_cp_size=4):
+                    selected_buckets.append(
+                        runner.prefill_cp_bcg_input.select_replay_bucket_for_batch(
+                            num_tokens=2048,
+                            extend_seq_lens=[1534, 161, 353],
+                            capture_num_tokens=runner.capture_num_tokens,
+                            max_padding_factor=2,
+                        )
+                    )
+
+            self.assertEqual(selected_buckets, [2304, 2304, 2304, 2304])
+            with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+                self.assertTrue(runner.can_run_graph(forward_batch))
+
+    def test_bucket_search_preserves_two_x_padding_limit(self):
+        runner = self._make_runner()
+        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+            input_embeds=torch.empty(0),
+            positions=torch.empty(0),
+            bucket_local_tokens={2048: 512, 2304: 576},
+        )
+
+        self.assertIsNone(
+            runner.prefill_cp_bcg_input.select_replay_bucket(
+                num_tokens=1024,
+                required_local_tokens=520,
+                capture_num_tokens=runner.capture_num_tokens,
+                max_padding_factor=2,
+            )
+        )
+
+    def test_bucket_search_falls_back_when_no_capture_has_capacity(self):
+        runner = self._make_runner()
+        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+            input_embeds=torch.empty(0),
+            positions=torch.empty(0),
+            bucket_local_tokens={2048: 512, 2304: 516},
+        )
+        forward_batch = self._make_forward_batch()
+        self._enable_zigzag()
+
+        with (
+            get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                return_value=8,
+            ),
+        ):
+            self.assertFalse(runner.can_run_graph(forward_batch))
+
+    def test_load_batch_uses_selected_larger_bucket(self):
+        class StopAfterRecordingFill(Exception):
+            pass
+
+        class RecordingRegistry:
+            padded_num_tokens = None
+
+            def fill_from(self, _source, **kwargs):
+                self.padded_num_tokens = kwargs["padded_num_tokens"]
+                raise StopAfterRecordingFill
+
+        runner = self._make_runner()
+        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+            input_embeds=torch.empty(0),
+            positions=torch.empty(0),
+            bucket_local_tokens={2048: 512, 2304: 576},
+        )
+        runner.buffer_registry = RecordingRegistry()
+        forward_batch = self._make_forward_batch()
+        self._enable_zigzag()
+
+        with (
+            get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                return_value=8,
+            ),
+            self.assertRaises(StopAfterRecordingFill),
+        ):
+            runner.load_batch(forward_batch)
+
+        self.assertEqual(runner.buffer_registry.padded_num_tokens, 2304)
 
 
 class TestCPZigzagStrategy(CustomTestCase):
@@ -546,6 +713,108 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(calls[0][0], q[:2]))
         self.assertTrue(torch.equal(calls[1][0], q[2:]))
         self.assertTrue(torch.equal(out, q + 100))
+
+    def test_zigzag_combined_attention_matches_two_half_reference(self):
+        def reference_attention(
+            q,
+            cu_seqlens_q,
+            cache_seqlens,
+            cu_seqlens_kv,
+            *,
+            sequence_offset,
+        ):
+            outputs = []
+            for seq_id in range(cache_seqlens.numel()):
+                q_start = int(cu_seqlens_q[seq_id])
+                q_end = int(cu_seqlens_q[seq_id + 1])
+                q_seq = q[q_start:q_end]
+                q_len = q_end - q_start
+                kv_len = int(cache_seqlens[seq_id])
+                self.assertEqual(
+                    int(cu_seqlens_kv[seq_id + 1] - cu_seqlens_kv[seq_id]),
+                    kv_len,
+                )
+
+                absolute_seq_id = sequence_offset + seq_id + 1
+                positions = torch.arange(kv_len, dtype=q.dtype)
+                k_seq = torch.stack(
+                    (
+                        positions / (kv_len + 1),
+                        torch.sin(positions + absolute_seq_id),
+                        torch.full_like(positions, absolute_seq_id / 10),
+                    ),
+                    dim=1,
+                )
+                v_seq = torch.stack(
+                    (
+                        torch.cos(positions + absolute_seq_id),
+                        positions / (absolute_seq_id + 1),
+                        torch.full_like(positions, absolute_seq_id),
+                    ),
+                    dim=1,
+                )
+                q_positions = kv_len - q_len + torch.arange(q_len)
+                allowed = torch.arange(kv_len)[None, :] <= q_positions[:, None]
+                scores = q_seq @ k_seq.T / q.shape[-1] ** 0.5
+                outputs.append(
+                    torch.softmax(scores.masked_fill(~allowed, -torch.inf), dim=-1)
+                    @ v_seq
+                )
+            return torch.cat(outputs, dim=0)
+
+        cp_size = 4
+        seq_lens = [19, 27]
+        extend_seq_lens = [11, 13]
+        for rank in range(cp_size):
+            with self.subTest(rank=rank):
+                metadata = self._metadata_for_rank(
+                    rank,
+                    cp_size=cp_size,
+                    seq_lens=seq_lens,
+                    extend_seq_lens=extend_seq_lens,
+                )
+                logical_tokens = (
+                    metadata.total_q_prev_tokens + metadata.total_q_next_tokens
+                )
+                q = torch.linspace(
+                    -0.75,
+                    0.75,
+                    steps=logical_tokens * 3,
+                    dtype=torch.float32,
+                ).view(logical_tokens, 3)
+                q_prev = q[: metadata.total_q_prev_tokens]
+                q_next = q[metadata.total_q_prev_tokens :]
+
+                two_half_out = torch.cat(
+                    (
+                        reference_attention(
+                            q_prev,
+                            metadata.cu_seqlens_q_prev_tensor,
+                            metadata.kv_len_prev_tensor,
+                            metadata.cu_seqlens_kv_prev_tensor,
+                            sequence_offset=0,
+                        ),
+                        reference_attention(
+                            q_next,
+                            metadata.cu_seqlens_q_next_tensor,
+                            metadata.kv_len_next_tensor,
+                            metadata.cu_seqlens_kv_next_tensor,
+                            sequence_offset=metadata.bs,
+                        ),
+                    ),
+                    dim=0,
+                )
+                combined_out = reference_attention(
+                    q,
+                    metadata.cu_seqlens_q_combined_tensor,
+                    metadata.kv_len_combined_tensor,
+                    metadata.cu_seqlens_kv_combined_tensor,
+                    sequence_offset=0,
+                )
+
+                torch.testing.assert_close(
+                    combined_out, two_half_out, atol=1e-5, rtol=1e-5
+                )
 
 
 class TestCPInterleaveStrategy(CustomTestCase):

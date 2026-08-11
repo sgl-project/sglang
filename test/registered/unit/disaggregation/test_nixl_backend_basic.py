@@ -215,6 +215,10 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
             b"64",
             b"DRAM,DRAM",
             b"".join(struct.pack("Q", item_len) for item_len in [1024, 2048]),
+            pack_int_lists([[4], [4, 5]], "I"),
+            b"".join(struct.pack("I", layer_id) for layer_id in [2, 7]),
+            b"4",
+            b"3",
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -236,9 +240,12 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_kv_mem_kinds, ["DRAM", "DRAM"])
         self.assertEqual(info.dst_state_item_lens, state_item_lens)
         self.assertEqual(info.dst_state_dim_per_tensor, state_dims)
-        self.assertIsNotNone(info.staging)
-        self.assertEqual(info.staging.base_ptr, staging_ptr)
-        self.assertEqual(info.staging.total_size, 1048576)
+        self.assertEqual(info.dst_dcp_size, 4)
+        self.assertEqual(info.dst_dcp_rank, 3)
+        self.assertEqual(info.dst_state_layer_ids, [[4], [4, 5]])
+        self.assertEqual(info.dst_kv_layer_ids, [2, 7])
+        self.assertEqual(info.staging_base_ptr, staging_ptr)
+        self.assertEqual(info.staging_total_size, 1048576)
 
     def test_from_zmq_allows_missing_state_and_staging_fields(self):
         msg = [
@@ -262,7 +269,10 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_state_item_lens, [])
         self.assertEqual(info.dst_state_dim_per_tensor, [])
         self.assertEqual(info.dst_kv_item_lens, [256])
-        self.assertIsNone(info.staging)
+        self.assertEqual(info.dst_dcp_size, 1)
+        self.assertEqual(info.dst_dcp_rank, 0)
+        self.assertEqual(info.staging_base_ptr, 0)
+        self.assertEqual(info.staging_total_size, 0)
 
 
 class TestNixlTransferStatus(CustomTestCase):
@@ -442,14 +452,22 @@ class TestNixlTransferWorker(CustomTestCase):
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
                 gpu_id=0,
-                staging=None,
+                staging_base_ptr=0,
+                staging_total_size=0,
                 kv_xfer_segments=None,
                 dst_homogeneous_mem_kind="VRAM",
+                # Non-DCP peer. Without this the worker raises AttributeError
+                # and lands in the same Failed status the assertions expect,
+                # so the transfer path would go unexercised.
+                requires_dcp_relayout=False,
+                dcp_dst_region_indices=None,
+                dcp_token_item_lens=None,
             )
         }
         mgr.req_to_decode_prefix_len = {room: 4}
         mgr.enable_staging = False
         mgr._staging_ctx = None
+        mgr._staging_outstanding = defaultdict(int)
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
@@ -496,6 +514,7 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertNotIn(room, mgr.transfer_infos)
         self.assertNotIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_aux.assert_called_once()
+        self.assertEqual(mgr.send_aux.call_args.args[-1], "21_aux_nokv_0_0")
 
     def test_given_non_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
         self,
@@ -918,7 +937,8 @@ class TestNixlStaging(CustomTestCase):
             decode_tp_rank=0,
             dst_kv_item_len=128,
             dst_kv_item_lens=[],
-            staging=SimpleNamespace(base_ptr=0x8000, total_size=4096),
+            staging_base_ptr=0x8000,
+            staging_total_size=4096,
         )
         calls = []
         mgr.send_kvcache_staged = (
