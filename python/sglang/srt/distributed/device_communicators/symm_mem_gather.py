@@ -49,6 +49,12 @@ class SymmMemGather:
         self._world_size = world_size
         self._width = width
         self._slot = 0
+        # Private stream: this exchange depends only on peer stores, never on
+        # the forward, so it must not inherit the schedule stream's WAR fence.
+        self._stream = torch.cuda.Stream(device=device)
+        self._staging = torch.zeros(width, dtype=dtype, device=device)
+        self._host_in = torch.zeros(width, dtype=dtype).pin_memory()
+        self._host_out = torch.zeros(world_size, width, dtype=dtype).pin_memory()
         rank = self._handle.rank
         # A peer row is a tensor view of that peer's memory; writing it is a
         # store that never blocks on the peer.
@@ -68,14 +74,19 @@ class SymmMemGather:
             _NUM_SLOTS,
         )
 
-    def gather(self, local_row: torch.Tensor) -> torch.Tensor:
-        """Return the (world_size, width) gathered rows for this round."""
+    def gather(self, local_row_cpu: torch.Tensor) -> torch.Tensor:
+        """Host row in, (world_size, width) host rows out."""
         slot = self._slot
         self._slot = (slot + 1) % _NUM_SLOTS
-        for row in self._peer_rows[slot]:
-            row.copy_(local_row)
-        self._handle.barrier(0, _BARRIER_TIMEOUT_MS)
-        return self._region[slot]
+        self._host_in.copy_(local_row_cpu)
+        with torch.cuda.stream(self._stream):
+            self._staging.copy_(self._host_in, non_blocking=True)
+            for row in self._peer_rows[slot]:
+                row.copy_(self._staging)
+            self._handle.barrier(0, _BARRIER_TIMEOUT_MS)
+            self._host_out.copy_(self._region[slot], non_blocking=True)
+        self._stream.synchronize()
+        return self._host_out
 
 
 def maybe_create_symm_mem_gather(

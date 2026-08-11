@@ -157,9 +157,23 @@ class MLPSyncBatchInfo:
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
     ):
-        local_info_tensor = self._get_local_tensor(device=device)
+        # Build on host first: it is cheap, it gives info_width, and it lets the
+        # transport be chosen before anything lands on a device. The symmetric
+        # path then keeps every staging tensor on the host, so none of them sync
+        # the schedule stream -- which the WAR barrier has fenced behind the
+        # in-flight forward.
+        local_info_cpu = self._get_local_tensor(device="cpu")
+        info_width = local_info_cpu.numel()
+        gatherer = (
+            None if use_all_reduce else _maybe_symm_gatherer(group, device, info_width)
+        )
+        if gatherer is not None:
+            device = "cpu"
+
+        local_info_tensor = (
+            local_info_cpu if device == "cpu" else local_info_cpu.to(device)
+        )
         fallback_tensor = self._get_fallback_tensor(device=device)
-        info_width = local_info_tensor.numel()
         # Inactive max_world_size slots must decode as IDLE.
         global_info_tensor = fallback_tensor.expand(
             self.dp_size, self.tp_size * self.cp_size, info_width
@@ -179,7 +193,7 @@ class MLPSyncBatchInfo:
             )
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
-        elif (gatherer := _maybe_symm_gatherer(group, device, info_width)) is not None:
+        elif gatherer is not None:
             global_info_tensor = gatherer.gather(local_info_tensor).view(
                 self.dp_size, self.tp_size * self.cp_size, info_width
             )
