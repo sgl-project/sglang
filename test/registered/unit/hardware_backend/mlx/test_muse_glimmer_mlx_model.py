@@ -1,8 +1,7 @@
 """Unit tests for the Muse Glimmer MLX model file's load path — no weights, no server.
 
-The e2e suite (``test/registered/mlx/models_e2e/test_muse_glimmer_mlx_correctness.py``)
-needs the private packaged artifact, so the checkpoint-schema logic it relies
-on is pinned here with tiny synthetic weights instead:
+End-to-end coverage needs the private packaged artifact, so the checkpoint-schema
+logic is pinned here with tiny synthetic weights instead:
 
 1. ``flatten_rc_config`` — RC nested-config translation, including the two
    convention conversions (qk_scale_factor gains sqrt(head_dim); NoPE layers
