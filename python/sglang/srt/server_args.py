@@ -266,6 +266,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+    "megamoe",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -3504,6 +3505,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -3671,6 +3673,20 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_moe_runner_backend_alias(self):
+        if self.moe_runner_backend != "megamoe":
+            return
+
+        if self.moe_a2a_backend not in ("none", "megamoe"):
+            logger.warning(
+                "--moe-runner-backend megamoe is an alias for "
+                "--moe-a2a-backend megamoe; overriding "
+                "--moe-a2a-backend %s.",
+                self.moe_a2a_backend,
+            )
+        self.moe_runner_backend = "auto"
+        self.moe_a2a_backend = "megamoe"
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):

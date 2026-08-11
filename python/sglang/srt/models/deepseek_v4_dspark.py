@@ -319,6 +319,7 @@ class DSparkV4MarkovHead(nn.Module):
             self.markov_rank, self.vocab_size, bias=False, dtype=markov_w2_dtype
         )
         self._tp_shard: Optional[MarkovW2ShardGeometry] = None
+        self._shard_group = None
 
     def configure_tp_shard(self, *, lm_head: nn.Module) -> None:
         if not self._opt_markov_w2_tp_shard:
@@ -338,16 +339,23 @@ class DSparkV4MarkovHead(nn.Module):
                 f"num_embeddings_per_partition({per_partition}) * tp_size({tp_size}) != "
                 f"num_embeddings_padded({num_padded})."
             )
-        attn_tp_size = get_parallel().attn_tp_group.world_size
-        if attn_tp_size != tp_size:
+        # Follow lm_head's group choice; attn_tp_group degenerates to size 1
+        # under prefill CP while lm_head still shards over the full TP group.
+        parallel = get_parallel()
+        shard_group = (
+            parallel.attn_tp_group
+            if getattr(lm_head, "use_attn_tp_group", False)
+            else parallel.tp_group
+        )
+        shard_group_size = shard_group.world_size
+        if shard_group_size != tp_size:
             raise ValueError(
-                "DSpark markov_w2 TP-shard needs the attn-TP group (used for the per-step "
-                f"all-gather) to equal the lm_head shard group, got attn_tp_size="
-                f"{attn_tp_size} vs lm_head tp_size={tp_size}. This config (e.g. DP "
-                "attention without --enable-dp-lm-head, where lm_head shards over the "
-                "global TP group) is unsupported; disable "
-                "SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
+                "DSpark markov_w2 TP-shard needs the per-step all-gather group to "
+                f"equal the lm_head shard group, got shard_group_size="
+                f"{shard_group_size} vs lm_head tp_size={tp_size}. "
+                "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
+        self._shard_group = shard_group
         self._tp_shard = MarkovW2ShardGeometry(
             tp_size=tp_size,
             org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
@@ -400,7 +408,8 @@ class DSparkV4MarkovHead(nn.Module):
             bias = F.linear(latent.float(), weight_local)
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
         if shard.tp_size > 1:
-            full = get_parallel().attn_tp_group.all_gather(step_local, dim=-1)
+            assert self._shard_group is not None
+            full = self._shard_group.all_gather(step_local, dim=-1)
         else:
             full = step_local
         return full[..., : self.vocab_size]
