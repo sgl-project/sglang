@@ -43,7 +43,10 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
     wrap_as_pickle,
 )
-from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
+from sglang.srt.managers.load_snapshot import (
+    create_load_snapshot_reader,
+    is_load_aware_method,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -171,23 +174,18 @@ class DataParallelController:
             LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
-        self.refresh_load_budget_on_dispatch = self.load_balance_method in (
-            LoadBalanceMethod.TOTAL_REQUESTS,
-            LoadBalanceMethod.TOTAL_TOKENS,
-            # PREFIX_AFFINITY's overload guard compares per-rank load against the
-            # fleet average, so it needs the same fresh snapshots the load-aware
-            # methods rely on.
-            LoadBalanceMethod.PREFIX_AFFINITY,
+        self.refresh_load_budget_on_dispatch = is_load_aware_method(
+            self.load_balance_method.name
         )
 
         # prefix_affinity routing config (only consulted when that method is active).
         self._affinity_fallback = LoadBalanceMethod.from_str(
-            server_args.prefix_affinity_fallback
+            get_parallel().prefix_affinity_fallback
         )
-        self._affinity_max_load_skew = server_args.prefix_affinity_max_load_skew
-        self._affinity_hash_tokens = server_args.prefix_affinity_hash_tokens
+        self._affinity_max_load_skew = get_parallel().prefix_affinity_max_load_skew
+        self._affinity_hash_tokens = get_parallel().prefix_affinity_hash_tokens
         self._affinity_disable_token_fallback = (
-            server_args.prefix_affinity_disable_token_fallback
+            get_parallel().prefix_affinity_disable_token_fallback
         )
 
         self.launch_dp_size: int = get_parallel().dp_size
@@ -857,7 +855,9 @@ class DataParallelController:
             self._affinity_fallback_dispatch(req)
             return
 
-        live = self._live_ranks()
+        live = self._active_workers
+        if not live:
+            raise RuntimeError("No active DP workers are available for routing.")
         ranked = self._rendezvous_ranked(route_key, live)
 
         if len(live) <= 1:
@@ -896,11 +896,6 @@ class DataParallelController:
             self.round_robin_scheduler(req)
         else:
             self.total_tokens_scheduler(req)
-
-    def _live_ranks(self) -> List[int]:
-        """Ranks currently marked active; fall back to all ranks if none are."""
-        ranks = [i for i in range(len(self.workers)) if self.status[i]]
-        return ranks or list(range(len(self.workers)))
 
     @staticmethod
     def _hash64(data: bytes) -> int:

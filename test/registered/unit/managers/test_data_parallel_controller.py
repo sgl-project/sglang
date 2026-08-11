@@ -389,6 +389,7 @@ class TestPrefixAffinityHRWStability(CustomTestCase):
         for k in keys:
             c = _make_affinity_controller(dp_size=8)
             c.status[dropped] = False
+            c._active_workers.remove(dropped)
             c.prefix_affinity_scheduler(_areq(routing_key=k))
             after[k] = _dispatched_rank(c)
 
@@ -428,6 +429,7 @@ class TestPrefixAffinityOverloadGuard(CustomTestCase):
         ctl = _make_affinity_controller(dp_size=4)
         for r in (1, 2, 3):
             ctl.status[r] = False
+        ctl._active_workers = [0]
         ctl.dp_budget.total_tokens = [10_000, 0, 0, 0]
         ctl.prefix_affinity_scheduler(_areq(routing_key="k", input_ids=[1]))
         ctl.workers[0].send_pyobj.assert_called_once()
