@@ -219,8 +219,8 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # leak into AITER's version when AITER uses setuptools_scm)
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-# Compile AITER against the base image's Triton. ROCm 7.2 swaps in AITER's
-# pinned Triton 3.7 at the very end of this file (see the Triton step below).
+# Compile AITER against the base image's Triton; the Triton step at the end of
+# this file swaps in AITER's own pin afterwards.
 ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -656,19 +656,12 @@ else:
 PY
 
 # -----------------------
-# Triton: hand the choice to AITER's installer, replacing the base image's Triton
-# with whatever revision AITER is built and tested against. Deliberately no
-# version assertion here — AITER's pin is the source of truth (its installer
-# enforces its own floor), so repeating it would only break this build the day
-# AITER moves. The version lands in the build log below.
+# Install the Triton AITER pins, replacing the base image's. No version check
+# on purpose: the pin is AITER's to move, and its installer enforces a floor.
 #
-# This MUST stay the last pip step, after the torch-ROCm metadata patch above.
-# The base ROCm Torch wheel pins `triton==3.5.1`, so once a different Triton is
-# installed, any pip install that resolves torch drags in PyPI's CUDA triton and
-# replaces ROCm Torch with a CUDA build. The metadata patch above is what drops
-# that pin (see the `Requires-Dist` rewrite in hack.py) — do not install Triton
-# before it, and do not add pip steps after this one. The Torch check below is
-# what catches it if either rule is broken.
+# Keep this last. Base ROCm Torch pins triton==3.5.1 and the torch patch above
+# is what drops that pin, so installing Triton any earlier lets the next pip
+# install pull CUDA torch instead. The hip check below is the tripwire.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         cd /sgl-workspace/aiter \
      && test -f .github/scripts/install_triton.sh \
