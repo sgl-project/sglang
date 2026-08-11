@@ -16,9 +16,6 @@ improvements in agentic workflows, long-context tasks, and production reliabilit
 This document demonstrates the deployment of Hy3 on Ascend NPUs using SGLang, including single-node (Atlas 800I A3) and
 multi-node (Atlas 800I A2) PD mixed mode and speculative decoding.
 
-> Hy3 currently uses a daily build image. The deployment commands and image tags in this document will be updated to a
-> stable release once the required support lands in a stable SGLang release.
-
 ## Supported features
 
 | Feature                  | Example usage                                                                                                                          |
@@ -81,8 +78,8 @@ The dependencies required for the NPU runtime environment have been integrated i
 online platform. You can directly pull it.
 
 <Note>
-The following command uses a daily build tag. These tags will be switched to a stable release image after the support
-lands in a stable release. For details, see
+Both **stable releases** and **daily builds** are available. The following command is based on the stable release tag.
+For details, see
 [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 </Note>
 
@@ -90,7 +87,7 @@ lands in a stable release. For details, see
   <Tab title="Atlas 800I A3">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
+docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 
 docker run -itd --shm-size=64g --name ${NAME} \
 --privileged=true --net=host \
@@ -118,14 +115,14 @@ docker run -itd --shm-size=64g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:main-cann9.0.0-a3
+quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 ```
 
   </Tab>
   <Tab title="Atlas 800I A2">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:main-cann9.0.0-910b
+docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 
 docker run -itd --shm-size=64g --name ${NAME} \
 --privileged=true --net=host \
@@ -145,7 +142,7 @@ docker run -itd --shm-size=64g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:main-cann9.0.0-910b
+quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 ```
 
   </Tab>
