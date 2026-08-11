@@ -2814,16 +2814,14 @@ def normalize_serialized_named_tensor_payloads(
 
 
 class SafeUnpickler(pickle.Unpickler):
+    # Modules for which *every* member may be loaded. Only trusted internal
+    # modules that SGLang itself serializes may appear here. Generic "building
+    # block" modules (builtins/operator/pickletools/...) are deliberately
+    # absent: their full-prefix allowlisting lets an attacker reach reflective
+    # primitives (e.g. builtins.getattr + builtins.__import__, or
+    # operator.attrgetter + pickletools.sys) to chain into os.system() and
+    # achieve RCE (CVE-2026-15969).
     ALLOWED_MODULE_PREFIXES = {
-        # --- Python types ---
-        "builtins.",
-        "collections.",
-        "copyreg.",
-        "functools.",
-        "itertools.",
-        "operator.",
-        "types.",
-        "weakref.",
         # --- PyTorch types ---
         "torch.",
         "torch._tensor.",
@@ -2840,7 +2838,6 @@ class SafeUnpickler(pickle.Unpickler):
         # --- multiprocessing ---
         "multiprocessing.resource_sharer.",
         "multiprocessing.reduction.",
-        "pickletools.",
         # --- PEFT / LoRA ---
         "peft.",
         "transformers.",
@@ -2854,6 +2851,79 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.disaggregation.",
         "sglang.srt.managers.",
         "torch_npu.",
+    }
+
+    # Modules whose members must match an exact name allowlist instead of being
+    # allowlisted by module prefix. Only the side-effect-free primitives that
+    # SGLang's own serialized payloads actually need are permitted. Anything
+    # reflective or reachable-to-syscalls (getattr, __import__, eval, open,
+    # operator.attrgetter/itemgetter, pickletools.*, types.CodeType/...,
+    # types.FunctionType/...) is rejected.
+    ALLOWED_CLASSES = {
+        "builtins": {
+            "bool",
+            "bytearray",
+            "bytes",
+            "complex",
+            "dict",
+            "enumerate",
+            "filter",
+            "float",
+            "frozenset",
+            "int",
+            "iter",
+            "list",
+            "map",
+            "object",
+            "range",
+            "reversed",
+            "set",
+            "slice",
+            "str",
+            "tuple",
+            "type",
+            "zip",
+        },
+        "collections": {
+            "Counter",
+            "OrderedDict",
+            "defaultdict",
+            "deque",
+            "namedtuple",
+        },
+        "copyreg": {
+            "_reconstructor",
+            "__newobj__",
+            "__newobj_ex__",
+            "_slotnames",
+        },
+        "functools": {
+            "partial",
+            "reduce",
+        },
+        "itertools": {
+            "chain",
+            "count",
+            "cycle",
+            "islice",
+            "repeat",
+            "starmap",
+            "takewhile",
+            "zip_longest",
+        },
+        # operator.attrgetter / itemgetter / getitem / methodcaller are RCE
+        # primitives; nothing in SGLang's own payloads needs them.
+        "operator": {},
+        # pickletools is only a debugging utility and exposes module refs
+        # (e.g. sys) that enable bypass chains.
+        "pickletools": {},
+        "types": {
+            "ModuleType",
+            "SimpleNamespace",
+        },
+        "weakref": {
+            "ref",
+        },
     }
 
     DENY_CLASSES = {
@@ -2871,6 +2941,15 @@ class SafeUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
         # Block deterministic attacks
         if (module, name) in self.DENY_CLASSES:
+            raise RuntimeError(
+                f"Blocked unsafe class loading ({module}.{name}), "
+                f"to prevent exploitation of CVE-2025-10164"
+            )
+        # Exact-name allowlist for generic building-block modules.
+        allowed_names = self.ALLOWED_CLASSES.get(module)
+        if allowed_names is not None:
+            if name in allowed_names:
+                return super().find_class(module, name)
             raise RuntimeError(
                 f"Blocked unsafe class loading ({module}.{name}), "
                 f"to prevent exploitation of CVE-2025-10164"
