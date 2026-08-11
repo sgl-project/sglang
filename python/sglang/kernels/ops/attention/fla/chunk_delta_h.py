@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import os
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -18,12 +18,54 @@ from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
 )
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx95_supported
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
-GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
-GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
-GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
+GDN_CHUNK_H_BV = envs.SGLANG_GDN_CHUNK_H_BV.get()
+GDN_CHUNK_H_NUM_WARPS = envs.SGLANG_GDN_CHUNK_H_NUM_WARPS.get()
+GDN_CHUNK_H_NUM_STAGES = envs.SGLANG_GDN_CHUNK_H_NUM_STAGES.get()
+GDN_CHUNK_H_DEFAULT_BV = 32
+GDN_CHUNK_H_MIN_BV = 16
+# gfx95 (CDNA4) only: the tile-vs-occupancy trade-off below was measured there,
+# and NVIDIA parts have ~10x fewer SMs, so the upstream 32 already covers them.
+GDN_CHUNK_H_ADAPTIVE_BV = is_gfx95_supported()
+
+
+@lru_cache(maxsize=1)
+def _num_compute_units() -> int:
+    return torch.cuda.get_device_properties(0).multi_processor_count
+
+
+def _select_block_v(*, value_dim: int, num_state_programs: int) -> int:
+    """Pick the V tile so a short grid still covers the GPU.
+
+    The NT-chunk walk in the kernel is strictly serial, and K cannot be split
+    across programs (``b_v`` sums over every K slab), so ``grid.x = cdiv(V, BV)``
+    is the only axis that adds parallelism. With ``num_state_programs = N * H``
+    as ``grid.y``, one long prefill of Qwen3.5-27B at TP4 (N*H = 12) launches
+    just 48 CTAs on a 256-CU part, where the kernel is latency-bound -- neither
+    bandwidth- (~115 GB/s of ~8 TB/s) nor FLOP-bound (<1% of peak).
+
+    Shrinking the tile is precision-neutral: BV partitions V into disjoint
+    output slices, and every reduction (K in fixed 64-wide slabs, and the
+    64-token chunk) keeps its order, so the result is bit-identical.
+
+    Only shrink while underfilled. Once the default tile already covers the CUs,
+    halving it *costs* 15-31%, because k and w are re-read by each of the
+    ``cdiv(V, BV)`` V-blocks, so a smaller tile multiplies their traffic.
+    Measured on MI350X at the Qwen3.5-27B GDN shape (H=12, K=V=128), against
+    the fixed BV=32: 1.22x at N*H=12, 1.19x at 24, 1.13x at 48, 1.15x at 60,
+    then 0.80x at 72 and 0.70x at 96 -- so the crossover sits just below the
+    point where ``cdiv(V, 32) * N * H`` reaches the CU count.
+    """
+    if (
+        triton.cdiv(value_dim, GDN_CHUNK_H_DEFAULT_BV) * num_state_programs
+        < _num_compute_units()
+    ):
+        return GDN_CHUNK_H_MIN_BV
+    return GDN_CHUNK_H_DEFAULT_BV
 
 
 @triton.autotune(
@@ -39,9 +81,13 @@ GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
     # state to a separate output buffer). The env knobs keep this single-config
     # property while allowing model/hardware-local validation of the selected
     # tile without corrupting the state pool through multi-config autotune.
+    # BV is deliberately NOT a config kwarg: it is chosen per launch from the
+    # grid shape (see _select_block_v) and passed as an explicit constexpr, which
+    # triton already specializes on. Leaving it here would pin one tile for every
+    # shape, which is what makes short grids underfill the GPU.
     configs=[
         triton.Config(
-            {"BV": GDN_CHUNK_H_BV},
+            {},
             num_warps=GDN_CHUNK_H_NUM_WARPS,
             num_stages=GDN_CHUNK_H_NUM_STAGES,
         )
@@ -350,8 +396,13 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), N * H)
+    if GDN_CHUNK_H_BV is not None:
+        block_v = GDN_CHUNK_H_BV
+    elif GDN_CHUNK_H_ADAPTIVE_BV:
+        block_v = _select_block_v(value_dim=V, num_state_programs=N * H)
+    else:
+        block_v = GDN_CHUNK_H_DEFAULT_BV
+    grid = (triton.cdiv(V, block_v), N * H)
 
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
@@ -374,6 +425,7 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
+        BV=block_v,
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
