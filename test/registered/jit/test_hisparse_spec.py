@@ -5,10 +5,10 @@ from typing import NamedTuple
 import pytest
 import torch
 
-from sglang.kernels.ops.kvcache.hisparse import copy_cache_planned_mla
-from sglang.kernels.ops.kvcache.hisparse_mtp import (
-    HiSparseMTPSwapState,
-    load_cache_to_device_buffer_mtp_mla,
+from sglang.kernels.ops.kvcache.hisparse import (
+    HiSparseSpecState,
+    copy_cache_planned_mla,
+    load_cache_to_device_buffer_spec_mla,
 )
 from sglang.srt.utils import is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -18,7 +18,7 @@ register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or is_npu() or is_xpu(),
-    reason="HiSparse MTP swap tests require a CUDA GPU.",
+    reason="HiSparse speculative swap tests require a CUDA GPU.",
 )
 
 DEVICE = "cuda"
@@ -31,7 +31,7 @@ class _SwapState(NamedTuple):
     host_cache_locs: torch.Tensor
     host_cache: torch.Tensor
     device_buffer: torch.Tensor
-    swap_state: HiSparseMTPSwapState
+    swap_state: HiSparseSpecState
 
 
 def _make_cache_index(num_reqs: int, hot_buffer_size: int) -> torch.Tensor:
@@ -103,7 +103,7 @@ def _make_state(
         device=DEVICE,
     )
     scratch_state[0].zero_()
-    swap_state = HiSparseMTPSwapState(
+    swap_state = HiSparseSpecState(
         cache_index=_make_cache_index(num_reqs, hot_buffer_size),
         cache_policy=torch.zeros(
             (num_reqs + 1, hot_buffer_size),
@@ -144,7 +144,7 @@ def _run_swap(
         req_pool_indices = torch.arange(num_reqs, dtype=torch.int64, device=DEVICE)
     if num_real_reqs is None:
         num_real_reqs = torch.tensor([num_reqs], dtype=torch.int32, device=DEVICE)
-    load_cache_to_device_buffer_mtp_mla(
+    load_cache_to_device_buffer_spec_mla(
         top_k_tokens=top_k_tokens,
         device_buffer_tokens=state.device_buffer_tokens,
         host_cache_locs=state.host_cache_locs,
@@ -173,7 +173,7 @@ def _assert_output_matches_tokens(
     torch.testing.assert_close(actual, expected)
 
 
-class TestHiSparseMTPSwap(CustomTestCase):
+class TestHiSparseSpec(CustomTestCase):
     def test_deduplicates_repeated_misses_and_copies_full_items(self) -> None:
         hot_size, page_size = 4096, 64
         num_steps, top_k, item_words = 4, 2048, 72

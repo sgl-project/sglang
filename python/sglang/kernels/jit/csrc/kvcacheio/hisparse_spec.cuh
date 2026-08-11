@@ -1,6 +1,7 @@
 #pragma once
 
-// Multi-step HiSparse swap kernels. DSv4 cache transfer remains in hisparse.cuh.
+// Multi-step speculative HiSparse cache-management kernels.
+// DSv4 cache transfer remains in hisparse.cuh.
 
 #include <sgl_kernel/tensor.h>  // TensorMatcher and symbolic tensor validation
 #include <sgl_kernel/utils.h>   // RuntimeCheck and host utilities
@@ -33,7 +34,7 @@ constexpr int32_t CLOCK_VICTIM_SAMPLES = 6;
 constexpr uint32_t HASH_DEGRADED_FLAG = uint32_t{1} << 31;
 constexpr uint32_t SCRATCH_EPOCH_MASK = HASH_DEGRADED_FLAG - 1;
 
-struct MtpCacheState {
+struct SpecCacheState {
   int64_t* __restrict__ hash_primary;
   int64_t* __restrict__ hash_secondary;
   int32_t* __restrict__ ring_state;
@@ -43,7 +44,7 @@ struct MtpCacheState {
   int64_t ref_epoch_stride;
 };
 
-struct MtpMissWorkspace {
+struct SpecMissWorkspace {
   int32_t* __restrict__ locs;
   int32_t* __restrict__ metadata;
   int32_t* __restrict__ counters;
@@ -69,8 +70,8 @@ struct PackedRingState {
   static constexpr uint32_t CURSOR_MASK = (uint32_t{1} << CURSOR_BITS) - 1;
   static constexpr uint32_t EPOCH_MASK = (uint32_t{1} << EPOCH_BITS) - 1;
 
-  static_assert(HOT_BUFFER_SIZE > 1, "MTP hot buffer must contain at least two slots.");
-  static_assert(CURSOR_BITS <= 15, "MTP CLOCK cursor requires hot_buffer_size <= 32768.");
+  static_assert(HOT_BUFFER_SIZE > 1, "speculative hot buffer must contain at least two slots.");
+  static_assert(CURSOR_BITS <= 15, "speculative CLOCK cursor requires hot_buffer_size <= 32768.");
 
   __device__ static int32_t next_epoch(int32_t packed_state) {
     int32_t epoch = static_cast<int32_t>((static_cast<uint32_t>(packed_state) >> CURSOR_BITS) + 1) & EPOCH_MASK;
@@ -413,7 +414,7 @@ __device__ __forceinline__ bool try_get_extra_page_device_loc(
 // Flatten all speculative steps. Each lane resolves one occurrence; the warp
 // cooperatively copies only lanes that won a unique-miss claim.
 template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan>
-__global__ void load_cache_to_device_buffer_mtp_gather_kernel(
+__global__ void load_cache_to_device_buffer_spec_gather_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
     const int64_t* __restrict__ host_cache_locs,
@@ -423,8 +424,8 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
     int32_t* __restrict__ top_k_device_locs,
     const int64_t* __restrict__ req_pool_indices,
     const int32_t* __restrict__ seq_lens,
-    MtpCacheState cache_state,
-    MtpMissWorkspace miss_workspace,
+    SpecCacheState cache_state,
+    SpecMissWorkspace miss_workspace,
     const int32_t* __restrict__ num_real_reqs,
     int64_t* __restrict__ miss_src_out,
     int32_t* __restrict__ miss_dst_out,
@@ -505,7 +506,7 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
   }
 
   // The flattened occurrence mapping places the same top-k position from
-  // different MTP steps in one warp. Stable hits only need one Ring lookup.
+  // different speculative steps in one warp. Stable hits only need one Ring lookup.
   int32_t lookup_owner_lane = lane_id;
   bool reuse_owner_loc = false;
   if (total_warps <= NUM_TOP_K && NUM_TOP_K % total_warps == 0) {
@@ -606,7 +607,7 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
 }
 
 template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan, bool USE_PDL>
-__global__ void load_cache_to_device_buffer_mtp_commit_kernel(
+__global__ void load_cache_to_device_buffer_spec_commit_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ top_k_device_locs,
     int32_t* __restrict__ device_buffer_tokens,
@@ -615,8 +616,8 @@ __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
     const void* __restrict__ host_cache_k,
     void* __restrict__ device_buffer_k,
     const int64_t* __restrict__ req_pool_indices,
-    MtpCacheState cache_state,
-    MtpMissWorkspace miss_workspace,
+    SpecCacheState cache_state,
+    SpecMissWorkspace miss_workspace,
     const int32_t* __restrict__ num_real_reqs,
     int64_t* __restrict__ miss_src_out,
     int32_t* __restrict__ miss_dst_out,
@@ -665,7 +666,7 @@ __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
   const int64_t compact_iterations = (miss_count + blockDim.x - 1) / blockDim.x;
   const bool lock_free_single_pass = compact_iterations == 1;
 
-  // The union fast path can preserve every token needed by this MTP group.
+  // The union fast path can preserve every token needed by this speculative group.
   // Its victim selection below partitions the ring by miss ordinal, avoiding
   // a full hot-cache scan while keeping all current union hits protected.
   __shared__ int32_t s_use_union_clock;
@@ -935,7 +936,7 @@ template <
     int NUM_STEPS,
     bool RecordMissPlan,
     bool USE_PDL>
-void load_cache_to_device_buffer_mtp(
+void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
     tvm::ffi::TensorView host_cache_locs,
@@ -956,42 +957,43 @@ void load_cache_to_device_buffer_mtp(
     tvm::ffi::TensorView miss_count_out) {
   using namespace host;
 
-  static_assert(NUM_STEPS > 1 && NUM_STEPS <= 4, "HiSparse MTP swap requires 2-4 steps.");
-  static_assert(NUM_TOP_K >= 1024, "HiSparse MTP swap requires top_k >= 1024.");
-  static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse MTP swap supports at most 8192 occurrences.");
+  static_assert(NUM_STEPS > 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 2-4 steps.");
+  static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
+  static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
 
   const int64_t bs = top_k_tokens.shape()[0];
   constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
-  RuntimeCheck(top_k_tokens.ndim() == 3, "MTP top_k_tokens must have shape [batch, steps, top_k].");
-  RuntimeCheck(top_k_device_locs.ndim() == 3, "MTP output must have shape [batch, steps, top_k].");
+  RuntimeCheck(top_k_tokens.ndim() == 3, "speculative top_k_tokens must have shape [batch, steps, top_k].");
+  RuntimeCheck(top_k_device_locs.ndim() == 3, "speculative output must have shape [batch, steps, top_k].");
   RuntimeCheck(top_k_tokens.shape()[1] == NUM_STEPS, "top_k_tokens step dimension mismatch.");
   RuntimeCheck(top_k_tokens.shape()[2] == NUM_TOP_K, "top_k_tokens top-k dimension mismatch.");
   RuntimeCheck(
       cache_index.ndim() == 3 && cache_index.shape()[1] == 2,
-      "MTP cache_index must have shape [num_requests, 2, hash_size].");
+      "speculative cache_index must have shape [num_requests, 2, hash_size].");
   const int64_t ring_hash_size = cache_index.shape()[2];
   RuntimeCheck(
       ring_hash_size > 0 && (ring_hash_size & (ring_hash_size - 1)) == 0, "ring hash capacity must be a power of two.");
   RuntimeCheck(
       scratch_locs.ndim() == 2 && scratch_locs.shape()[1] > 0,
-      "MTP scratch_locs must have shape [num_requests, scratch_capacity].");
+      "speculative scratch_locs must have shape [num_requests, scratch_capacity].");
   const int64_t num_request_slots = scratch_locs.shape()[0];
   RuntimeCheck(
-      cache_index.shape()[0] >= num_request_slots, "MTP cache_index request capacity is smaller than scratch_locs.");
+      cache_index.shape()[0] >= num_request_slots,
+      "speculative cache_index request capacity is smaller than scratch_locs.");
   RuntimeCheck(
       cache_policy.ndim() == 2 && cache_policy.shape()[0] >= num_request_slots + 1 &&
           cache_policy.shape()[1] >= HOT_BUFFER_SIZE,
-      "MTP cache_policy must contain one CLOCK control row and one reference-epoch row per request.");
+      "speculative cache_policy must contain one CLOCK control row and one reference-epoch row per request.");
   RuntimeCheck(
       scratch_state.ndim() == 2 && scratch_state.shape()[0] >= num_request_slots + 1 &&
           scratch_state.shape()[1] >= 4 * num_request_slots && scratch_state.shape()[1] >= 5 * total_occurrences,
-      "MTP scratch_state must contain one counter row and one miss-metadata row per request.");
-  RuntimeCheck(scratch_state.strides()[0] % 2 == 0, "MTP scratch metadata stride must be 64-bit aligned.");
+      "speculative scratch_state must contain one counter row and one miss-metadata row per request.");
+  RuntimeCheck(scratch_state.strides()[0] % 2 == 0, "speculative scratch metadata stride must be 64-bit aligned.");
 
   const int64_t host_stride = host_cache_locs.shape()[1];
   RuntimeCheck(
       host_stride <= PackedRingEntry<HOT_BUFFER_SIZE>::TOKEN_CAPACITY,
-      "MTP packed ring metadata supports sequence lengths up to ",
+      "speculative packed ring metadata supports sequence lengths up to ",
       PackedRingEntry<HOT_BUFFER_SIZE>::TOKEN_CAPACITY,
       ", got ",
       host_stride);
@@ -1010,13 +1012,14 @@ void load_cache_to_device_buffer_mtp(
   if constexpr (RecordMissPlan) {
     RuntimeCheck(
         miss_src_out.ndim() == 2 && miss_src_out.shape()[0] >= bs && miss_src_out.shape()[1] >= total_occurrences,
-        "MTP miss_src must have shape [batch, >= steps * top_k].");
+        "speculative miss_src must have shape [batch, >= steps * top_k].");
     RuntimeCheck(
         miss_dst_out.ndim() == 2 && miss_dst_out.shape()[0] >= bs && miss_dst_out.shape()[1] >= total_occurrences,
-        "MTP miss_dst must have shape [batch, >= steps * top_k].");
+        "speculative miss_dst must have shape [batch, >= steps * top_k].");
     RuntimeCheck(
-        miss_count_out.ndim() == 1 && miss_count_out.shape()[0] >= bs, "MTP miss_count must have shape [batch].");
-    RuntimeCheck(miss_dst_out.strides()[0] == plan_stride, "MTP miss_src/miss_dst row strides differ.");
+        miss_count_out.ndim() == 1 && miss_count_out.shape()[0] >= bs,
+        "speculative miss_count must have shape [batch].");
+    RuntimeCheck(miss_dst_out.strides()[0] == plan_stride, "speculative miss_src/miss_dst row strides differ.");
   }
 
   // Preserve the device kernels' independent restrict-qualified views while
@@ -1025,7 +1028,7 @@ void load_cache_to_device_buffer_mtp(
   auto* cache_index_ptr = static_cast<int64_t*>(cache_index.data_ptr());
   auto* cache_policy_ptr = static_cast<int32_t*>(cache_policy.data_ptr());
   auto* scratch_state_ptr = static_cast<int32_t*>(scratch_state.data_ptr());
-  const MtpCacheState cache_state{
+  const SpecCacheState cache_state{
       cache_index_ptr,
       cache_index_ptr + cache_index_stride_1,
       cache_policy_ptr,
@@ -1033,7 +1036,7 @@ void load_cache_to_device_buffer_mtp(
       cache_index_stride_0,
       ring_hash_size,
       cache_policy_stride_0};
-  const MtpMissWorkspace miss_workspace{
+  const SpecMissWorkspace miss_workspace{
       static_cast<int32_t*>(scratch_locs.data_ptr()),
       scratch_state_ptr + scratch_state_stride_0,
       scratch_state_ptr,
@@ -1048,7 +1051,7 @@ void load_cache_to_device_buffer_mtp(
 
   const uint32_t tiles = static_cast<uint32_t>((total_occurrences + BLOCK_SIZE - 1) / BLOCK_SIZE);
   LaunchKernel(dim3(static_cast<uint32_t>(bs), tiles), BLOCK_SIZE, device)(
-      load_cache_to_device_buffer_mtp_gather_kernel<
+      load_cache_to_device_buffer_spec_gather_kernel<
           BLOCK_SIZE,
           NUM_TOP_K,
           HOT_BUFFER_SIZE,
@@ -1079,7 +1082,7 @@ void load_cache_to_device_buffer_mtp(
 
   LaunchKernel(dim3(static_cast<uint32_t>(bs)), 512, device)
       .enable_pdl(USE_PDL)(
-          load_cache_to_device_buffer_mtp_commit_kernel<
+          load_cache_to_device_buffer_spec_commit_kernel<
               NUM_TOP_K,
               HOT_BUFFER_SIZE,
               ITEM_SIZE_BYTES,
