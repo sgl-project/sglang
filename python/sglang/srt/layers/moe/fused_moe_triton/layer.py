@@ -141,11 +141,14 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
+        or a2a_backend.is_flashinfer_megamoe()
         or a2a_backend.is_ascend_fuseep()
     ):
         # ascend_fuseep bypasses the dispatcher abstraction (see
         # forward_fuseep in hardware_backend/npu/moe/fuseep.py); a
-        # StandardDispatcher is created but never invoked.
+        # StandardDispatcher is created but never invoked. FlashInfer MegaMOE
+        # also keeps this dispatcher as a pure passthrough because its kernel
+        # owns EP communication.
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
@@ -442,6 +445,7 @@ class FusedMoE(torch.nn.Module):
                 and (
                     get_moe_runner_backend().is_cutlass()
                     or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                    or get_moe_runner_backend().is_flashinfer_megamoe()
                 )
             )
             or (

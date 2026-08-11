@@ -37,6 +37,7 @@ class MoeA2ABackend(Enum):
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     PPLX = "pplx"
     CUSTOMIZED = "customized"
 
@@ -76,6 +77,9 @@ class MoeA2ABackend(Enum):
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
 
+    def is_flashinfer_megamoe(self):
+        return self == MoeA2ABackend.FLASHINFER_MEGAMOE
+
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
 
@@ -105,6 +109,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     HUMMING = "humming"
@@ -152,6 +157,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_mxfp4(self):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
+
+    def is_flashinfer_megamoe(self):
+        return self == MoeRunnerBackend.FLASHINFER_MEGAMOE
 
     def is_cutlass(self):
         return self == MoeRunnerBackend.CUTLASS
@@ -496,7 +504,11 @@ def is_deepep_class_backend() -> bool:
 
 def uses_per_rank_fused_shared_slots() -> bool:
     """Check whether fused shared experts use per-rank physical slots."""
-    return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
+    return (
+        is_deepep_class_backend()
+        or get_moe_a2a_backend().is_megamoe()
+        or get_moe_a2a_backend().is_flashinfer_megamoe()
+    )
 
 
 def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
@@ -614,6 +626,9 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
         return True
     if get_moe_a2a_backend().is_flashinfer():
+        return True
+    if get_moe_a2a_backend().is_flashinfer_megamoe():
+        # FlashInfer MegaMOE performs EP all-to-all and combine internally.
         return True
     if get_moe_a2a_backend().is_pplx():
         # pplx's AllToAll.combine already sums each token's expert outputs back

@@ -1217,7 +1217,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
-
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_CUTLASS, moe_runner_config
             )
@@ -2120,6 +2119,27 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def _input_scale_to_local_experts(
+    input_scale: torch.Tensor,
+    num_local_experts: int,
+    num_experts: int,
+    moe_ep_rank: int,
+) -> torch.Tensor:
+    """Normalize a checkpoint input scale to this rank's local experts."""
+    input_scale = input_scale.detach().to(torch.float32)
+    if input_scale.dim() == 0:
+        return input_scale.expand(num_local_experts).contiguous()
+    if input_scale.shape == (num_local_experts,):
+        return input_scale.contiguous()
+    if input_scale.shape == (num_experts,):
+        start = moe_ep_rank * num_local_experts
+        return input_scale[start : start + num_local_experts].contiguous()
+    raise ValueError(
+        f"input scale must be scalar, ({num_local_experts},), or "
+        f"({num_experts},); got {tuple(input_scale.shape)}"
+    )
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2267,7 +2287,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
         # swizzle+allocate here to avoid GPU memory fragmentation
-        if self.enable_flashinfer_trtllm_moe:
+        if (
+            self.enable_flashinfer_trtllm_moe
+            or get_moe_runner_backend().is_flashinfer_megamoe()
+        ):
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2287,7 +2310,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if self.enable_flashinfer_trtllm_moe:
+        if (
+            self.enable_flashinfer_trtllm_moe
+            or get_moe_runner_backend().is_flashinfer_megamoe()
+        ):
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
@@ -2410,6 +2436,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
+        elif moe_runner_backend.is_flashinfer_megamoe():
+            w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
+            w2_input_scale = _input_scale_to_local_experts(
+                layer.w2_input_scale,
+                layer.num_local_experts,
+                layer.num_experts,
+                layer.moe_ep_rank,
+            )
         elif self.enable_flashinfer_cutedsl_moe:
             # CuteDSL standard path uses a single scalar input scale (all experts).
             w13_input_scale = (
@@ -2537,6 +2571,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
 
         # Weight processing based on strategy
+        if moe_runner_backend.is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                prepare_nvfp4_moe_weights_for_flashinfer_megamoe,
+            )
+
+            prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
+            return
+
         if (
             self.enable_flashinfer_trtllm_moe
             and reorder_rows_for_gated_act_gemm is not None
@@ -2755,6 +2797,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation in _SUPPORTED_ACT_STRS
         ), f"{activation=} not in supported {_SUPPORTED_ACT_STRS}"
         moe_runner_config = self.moe_runner_config
+
+        if moe_runner_backend.is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                FlashInferMegaMoeQuantInfo,
+                ensure_nvfp4_moe_layer_for_flashinfer_megamoe,
+            )
+
+            quant_info = FlashInferMegaMoeQuantInfo(
+                mega=ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer),
+                fc1_alpha=layer.g1_alphas,
+                fc2_alpha=layer.g2_alphas,
+                fc1_norm_const=layer.w2_input_scale_quant,
+                apply_routed_scaling_factor=(
+                    not layer.should_fuse_routed_scaling_factor_in_topk
+                ),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if moe_runner_backend.is_marlin():
             quant_info = self.get_marlin_quant_info(layer)

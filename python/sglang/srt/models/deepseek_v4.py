@@ -1930,9 +1930,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             if moe_a2a_backend.is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
-                assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
-                    "CP requires DeepEP or megaMoE "
-                    "(moe_a2a_backend == deepep or megamoe). "
+                assert (
+                    moe_a2a_backend.is_deepep()
+                    or moe_a2a_backend.is_megamoe()
+                    or moe_a2a_backend.is_flashinfer_megamoe()
+                ), (
+                    "CP requires DeepEP or MegaMOE "
+                    "(moe_a2a_backend == deepep, megamoe, or flashinfer_megamoe). "
                     f"Got {moe_a2a_backend.value}."
                 )
         elif _use_tp_moe_gather:
