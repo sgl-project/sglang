@@ -307,7 +307,7 @@ jobs:
             await core.summary.write();
         env:
           # Precedence: manual input > repository variable > built-in default.
-          # The repository variables let the scheduled run be retuned from
+          # The repository variables let the scheduled run be adjusted from
           # Settings -> Actions -> Variables without touching this file:
           #   STALE_MAX_ACTIONS=64  speed up once the reopen rate looks healthy
           #   STALE_MAX_ACTIONS=0   kill switch - MAX=0 breaks the loop immediately
