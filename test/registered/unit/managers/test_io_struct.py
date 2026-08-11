@@ -12,9 +12,6 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    _restore_torch_tensor,
-    enc_hook,
-    ext_hook,
     msgpack_decode,
     msgpack_encode,
 )
@@ -26,6 +23,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
