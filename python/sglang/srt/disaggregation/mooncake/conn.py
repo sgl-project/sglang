@@ -203,6 +203,7 @@ class MooncakeKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.owner_sharded_buffer_tensors = None
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -242,6 +243,14 @@ class MooncakeKVManager(CommonKVManager):
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
+            self._owner_sharded_staging_buffers = (
+                self._init_owner_sharded_staging_buffers(len(self.transfer_queues))
+                if self._uses_owner_sharded_source_staging()
+                else []
+            )
+            transfer_staging_buffers = self._owner_sharded_staging_buffers or (
+                self._staging_ctx.buffers if self.enable_staging else []
+            )
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
@@ -251,8 +260,8 @@ class MooncakeKVManager(CommonKVManager):
                         queue,
                         executor,
                         (
-                            self._staging_ctx.buffers[i]
-                            if self.enable_staging and self._staging_ctx.buffers
+                            transfer_staging_buffers[i]
+                            if transfer_staging_buffers
                             else None
                         ),
                         i,
@@ -298,12 +307,15 @@ class MooncakeKVManager(CommonKVManager):
                     seen.add((ptr, length))
                     regions.append((ptr, length))
 
-        add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        register_cache_buffers = not self._uses_owner_sharded_source_staging()
+        if register_cache_buffers:
+            add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
         add(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
-        for ptrs, lens in zip(
-            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-        ):
-            add(ptrs, lens)
+        if register_cache_buffers:
+            for ptrs, lens in zip(
+                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+            ):
+                add(ptrs, lens)
         return regions
 
     def register_buffer_to_engine(self):
@@ -336,6 +348,51 @@ class MooncakeKVManager(CommonKVManager):
             "v_buffers": v_buffers,
             "page_size": page_size,
         }
+
+    def _uses_owner_sharded_source_staging(self) -> bool:
+        return (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and get_parallel().enable_dsa_shared_kv_cache
+        )
+
+    def _new_owner_staging_cache(self, kv_chunk):
+        if not self._uses_owner_sharded_source_staging() or kv_chunk.is_last_chunk:
+            return None
+        from sglang.srt.disaggregation.common.shared_kv_staging import (
+            OwnerShardedStagingCache,
+        )
+
+        return OwnerShardedStagingCache()
+
+    def set_owner_sharded_transfer_buffers(
+        self,
+        kv_buffers: list,
+        state_buffers: list[list],
+        rank_aggregated_kv_buffers: list | None = None,
+    ) -> None:
+        self.owner_sharded_buffer_tensors = {
+            "kv": kv_buffers,
+            "state": state_buffers,
+            "rank_aggregated_kv": rank_aggregated_kv_buffers or [],
+        }
+
+    def _is_rank_aggregated_kv_target(self, target_info) -> bool:
+        return (
+            target_info.dst_attn_tp_size == self.attn_cp_size
+            and target_info.dst_tp_rank % target_info.dst_attn_tp_size
+            == self.attn_cp_rank
+        )
+
+    def _init_owner_sharded_staging_buffers(self, count: int):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_staging_buffers,
+        )
+
+        return init_staging_buffers(
+            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self.kv_args,
+            count,
+        )
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -827,6 +884,33 @@ class MooncakeKVManager(CommonKVManager):
                 "must enable it and use the same page size and model spec."
             )
 
+    def _send_owner_sharded_staged(
+        self,
+        mooncake_session_id: str,
+        src_buffers: list,
+        src_indices: npt.NDArray[np.int32],
+        dst_ptrs: list[int],
+        dst_indices: npt.NDArray[np.int32],
+        staging_buffer,
+        cache=None,
+    ) -> int:
+        from sglang.srt.disaggregation.common.shared_kv_staging import (
+            send_owner_sharded_staged,
+        )
+
+        return send_owner_sharded_staged(
+            transfer=self._transfer_data,
+            session_id=mooncake_session_id,
+            src_buffers=src_buffers,
+            logical_src_indices=src_indices,
+            dst_ptrs=dst_ptrs,
+            logical_dst_indices=dst_indices,
+            cp_rank=self.attn_cp_rank,
+            cp_size=self.attn_cp_size,
+            staging_buffer=staging_buffer,
+            cache=cache,
+        )
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -1204,6 +1288,7 @@ class MooncakeKVManager(CommonKVManager):
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
+            and not get_parallel().enable_dsa_shared_kv_cache
         ):
             skip_state = True
 
@@ -1241,6 +1326,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        staging_buffer=None,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
@@ -1385,14 +1471,31 @@ class MooncakeKVManager(CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
+                src_indices_array = np.array(src_indices, dtype=np.int32)
+                dst_indices_array = np.array(dst_indices_local, dtype=np.int32)
+                if self._uses_owner_sharded_source_staging():
+                    if self.owner_sharded_buffer_tensors is None:
+                        raise RuntimeError("shared PD transfer buffers are unavailable")
+                    state_buffers = self.owner_sharded_buffer_tensors["state"][i]
+                    if state_buffers:
+                        status = self._send_owner_sharded_staged(
+                            req.mooncake_session_id,
+                            state_buffers,
+                            src_indices_array,
+                            dst_data_ptrs,
+                            dst_indices_array,
+                            staging_buffer,
+                        )
+                        rc = status or rc
+                        continue
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
                         src_data_ptrs=src_data_ptrs,
                         dst_data_ptrs=dst_data_ptrs,
                         item_lens=src_item_lens,
-                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
-                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
+                        prefill_data_indices=src_indices_array,
+                        dst_data_indices=dst_indices_array,
                         executor=executor,
                         state_type=st,
                     )
@@ -1643,6 +1746,7 @@ class MooncakeKVManager(CommonKVManager):
                     if kv_chunk.room in self.transfer_infos
                     else []
                 )
+                owner_staging_cache = self._new_owner_staging_cache(kv_chunk)
                 polls = []
                 dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
@@ -1747,6 +1851,40 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
                             )
+                        elif self._uses_owner_sharded_source_staging():
+                            if self.owner_sharded_buffer_tensors is None:
+                                raise RuntimeError(
+                                    "shared PD transfer buffers are unavailable"
+                                )
+                            aggregated_buffers = self.owner_sharded_buffer_tensors[
+                                "rank_aggregated_kv"
+                            ]
+                            use_rank_aggregation = (
+                                bool(aggregated_buffers)
+                                and target_rank_registration_info.dst_attn_tp_size
+                                == self.attn_cp_size
+                            )
+                            if (
+                                use_rank_aggregation
+                                and not self._is_rank_aggregated_kv_target(
+                                    target_rank_registration_info
+                                )
+                            ):
+                                ret = 0
+                            else:
+                                ret = self._send_owner_sharded_staged(
+                                    req.mooncake_session_id,
+                                    (
+                                        aggregated_buffers
+                                        if use_rank_aggregation
+                                        else self.owner_sharded_buffer_tensors["kv"]
+                                    ),
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    staging_buffer,
+                                    owner_staging_cache,
+                                )
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
@@ -1828,6 +1966,7 @@ class MooncakeKVManager(CommonKVManager):
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
+                                    staging_buffer,
                                 )
                                 if state_rc != 0:
                                     with self.session_lock:

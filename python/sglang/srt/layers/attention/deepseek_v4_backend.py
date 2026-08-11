@@ -56,9 +56,13 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     copy_metadata,
     maybe_copy_inplace,
 )
+from sglang.srt.layers.attention.dsv4.shared_cache_access import (
+    get_dsv4_shared_cache_access,
+)
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
+    compute_sparse_prefill_total_swa,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -95,6 +99,45 @@ C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
+def _synchronize_dsv4_shared_writes(
+    pool, *, core_attn_metadata=None, layer_id: Optional[int] = None
+) -> None:
+    del core_attn_metadata, layer_id
+    access = get_dsv4_shared_cache_access(pool)
+    if access is not None:
+        access.publish_writes()
+
+
+def _view_dsv4_flashmla_pages(
+    cache: torch.Tensor,
+    *,
+    page_size: int,
+    token_bytes: int,
+) -> torch.Tensor:
+    payload_bytes = page_size * token_bytes
+    if cache.ndim != 2 or cache.element_size() != 1 or cache.stride(1) != 1:
+        raise ValueError(
+            "DSV4 FlashMLA page storage must be a byte-addressable contiguous row"
+        )
+    if cache.data_ptr() % 16:
+        raise ValueError("DSV4 FlashMLA page storage must be 16-byte aligned")
+    if cache.shape[1] < payload_bytes:
+        raise ValueError(
+            "invalid DSV4 FlashMLA page buffer: "
+            f"shape={tuple(cache.shape)}, payload_bytes={payload_bytes}"
+        )
+    page_stride_bytes = cache.stride(0) * cache.element_size()
+    if page_stride_bytes % 576 != 0:
+        raise ValueError(
+            "DSV4 FlashMLA page stride must be a multiple of 576 bytes; "
+            f"got {page_stride_bytes}"
+        )
+    return cache.as_strided(
+        size=(cache.shape[0], page_size, 1, token_bytes),
+        stride=(cache.stride(0), token_bytes, token_bytes, 1),
+    )
+
+
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
@@ -106,6 +149,10 @@ def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
         getattr(forward_batch, "_original_forward_mode", None)
         or forward_batch.forward_mode
     )
+
+
+def _use_dsv4_shared_prefill_demand_cache(forward_mode: ForwardMode) -> bool:
+    return forward_mode in (ForwardMode.EXTEND, ForwardMode.SPLIT_PREFILL)
 
 
 def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
@@ -281,7 +328,12 @@ class DSV4AttnMetadata:
         for field_name in reference_assign_fields:
             setattr(self, field_name, getattr(other, field_name))
 
-    def init_compression_metadata(self, num_tokens: Optional[int] = None) -> None:
+    def init_compression_metadata(
+        self,
+        num_tokens: Optional[int] = None,
+        *,
+        compute_page_indices: bool = True,
+    ) -> None:
         assert self.page_table.dim() == 2
         # CP-v2 pads causal metadata for per-rank partitioning, while cache-write
         # locations remain one-per-logical-token. num_tokens tracks that unpadded
@@ -308,11 +360,30 @@ class DSV4AttnMetadata:
             self.raw_out_loc,
             self.page_table,
             self.page_size,
-            compute_page_indices=True,
+            compute_page_indices=compute_page_indices,
         )
 
-        self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
+        if self.c128_page_indices is None:
+            self.c128_page_indices = torch.empty(
+                (self.seq_lens_casual.shape[0], 0),
+                dtype=torch.int32,
+                device=self.seq_lens_casual.device,
+            )
+        else:
+            self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
+
+    def init_c128_page_indices_from(self, page_table: torch.Tensor) -> None:
+        local_len = self.seq_lens_casual.shape[0]
+        result = _init_compression_metadata_triton(
+            self.seq_lens_casual,
+            self.positions_casual,
+            self.raw_out_loc[:local_len],
+            page_table,
+            self.page_size,
+            compute_page_indices=True,
+        )
+        self.c128_page_indices = _pad_last_dim(result[-1])
 
     # Cache-write locations stay in global logical order and are intentionally
     # excluded from CP reindexing.
@@ -706,7 +777,6 @@ class DeepseekV4AttnBackend(
             out_loc=out_cache_loc,
             need_compress=True,
         )
-
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
 
         create = functools.partial(
@@ -1660,10 +1730,22 @@ class DeepseekV4AttnBackend(
         core_attn_metadata = metadata.core_attn_metadata
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        shared_access = get_dsv4_shared_cache_access(token_to_kv_pool)
+        use_shared_demand = bool(
+            shared_access is not None
+            and shared_access.has_prefill_demand_cache
+            and _use_dsv4_shared_prefill_demand_cache(forward_batch.forward_mode)
+        )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
+            _synchronize_dsv4_shared_writes(
+                token_to_kv_pool,
+                core_attn_metadata=core_attn_metadata,
+                layer_id=layer_id,
+            )
+
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
@@ -1672,32 +1754,63 @@ class DeepseekV4AttnBackend(
                 extra_indices = core_attn_metadata.c4_sparse_page_indices
                 extra_topk_lengths = core_attn_metadata.c4_sparse_topk_lengths
             elif compress_ratio == 128:
+                assert core_attn_metadata.c128_page_indices is not None
+                if core_attn_metadata.c128_page_indices.shape[-1] == 0:
+                    core_attn_metadata.init_c128_page_indices_from(
+                        core_attn_metadata.page_table
+                    )
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
+            swa_page_indices = core_attn_metadata.swa_page_indices
+            swa_topk_lengths = core_attn_metadata.swa_topk_lengths
+            if shared_access is not None and not use_shared_demand:
+                swa_page_indices = shared_access.translate_slots(
+                    "swa", swa_page_indices, layer_id=layer_id
+                )
+            if extra_indices is not None:
+                assert extra_k_cache is not None
+                assert compress_ratio in (4, 128)
+                if shared_access is not None and not use_shared_demand:
+                    extra_indices = shared_access.translate_slots(
+                        "extra", extra_indices, layer_id=layer_id
+                    )
+
             swa_window_size = token_to_kv_pool.swa_window_size
             assert swa_k_cache.ndim == 2
             k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
-            swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
-                swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
-            )
+            if shared_access is not None:
+                swa_k_cache = _view_dsv4_flashmla_pages(
+                    swa_k_cache,
+                    page_size=swa_window_size,
+                    token_bytes=k_cache_total_dim,
+                )
+            else:
+                swa_k_cache = swa_k_cache[
+                    :, : swa_window_size * k_cache_total_dim
+                ].view(swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim)
 
             if extra_k_cache is not None:
                 page_sizes = {
                     4: token_to_kv_pool.page_size // 4,
                     128: token_to_kv_pool.page_size // 128,
                 }
-                extra_k_cache = extra_k_cache[
-                    :, : page_sizes[compress_ratio] * k_cache_total_dim
-                ].view(
-                    extra_k_cache.shape[0],
-                    page_sizes[compress_ratio],
-                    1,
-                    k_cache_total_dim,
-                )
-            swa_page_indices = core_attn_metadata.swa_page_indices
-            swa_topk_lengths = core_attn_metadata.swa_topk_lengths
+                if shared_access is not None:
+                    extra_k_cache = _view_dsv4_flashmla_pages(
+                        extra_k_cache,
+                        page_size=page_sizes[compress_ratio],
+                        token_bytes=k_cache_total_dim,
+                    )
+                else:
+                    extra_k_cache = extra_k_cache[
+                        :, : page_sizes[compress_ratio] * k_cache_total_dim
+                    ].view(
+                        extra_k_cache.shape[0],
+                        page_sizes[compress_ratio],
+                        1,
+                        k_cache_total_dim,
+                    )
 
             def match_num_queries(x, value):
                 if x is None or x.shape[0] == q.shape[0]:
@@ -1730,9 +1843,11 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            # sparse_prefill_fwd does not support SM120.
+            # sparse_prefill_fwd does not support SM120. Keep the upstream
+            # non-Shared selection path unchanged.
             if (
-                forward_batch.forward_mode.is_extend_without_speculative()
+                shared_access is None
+                and forward_batch.forward_mode.is_extend_without_speculative()
                 and not _is_sm120
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
@@ -1772,6 +1887,12 @@ class DeepseekV4AttnBackend(
                 else:
                     from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
+                shared_demand_kwargs = (
+                    shared_access.flashmla_prefill_demand_kwargs(layer_id)
+                    if use_shared_demand
+                    else {}
+                )
+
                 o = flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
@@ -1787,6 +1908,7 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
+                    **shared_demand_kwargs,
                 )[0]
 
             o = o.squeeze(1)
@@ -1826,14 +1948,13 @@ class DeepseekV4AttnBackend(
             assert seq_lens_cpu is not None
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert extend_seq_lens_cpu is not None
-            total_swa = sum(
-                min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
-                for seq_len, extend_len in zip(
-                    seq_lens_cpu.tolist(), extend_seq_lens_cpu, strict=True
-                )
-            )
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
+            query_positions = None
+            if forward_batch.forward_mode.is_context_parallel_extend():
+                query_positions = core_attn_metadata.positions[: q_flat.shape[0]].to(
+                    torch.int32
+                )
             cache = SparsePrefillChunkCache.build(
                 seq_lens=forward_batch.seq_lens.to(torch.int32),
                 extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
@@ -1844,7 +1965,12 @@ class DeepseekV4AttnBackend(
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
-                total_swa=total_swa,
+                total_swa=compute_sparse_prefill_total_swa(
+                    seq_lens_cpu,
+                    extend_seq_lens_cpu,
+                    SWA_WINDOW,
+                ),
+                query_positions=query_positions,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -1888,17 +2014,42 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
+            extra_dequant_kwargs = {}
+            shared_access = get_dsv4_shared_cache_access(token_to_kv_pool)
+            if shared_access is not None:
+                shared_cp_size, shared_pages_per_rank = (
+                    shared_access.shared_dequant_params("extra", layer_id=layer_id)
+                )
+                extra_dequant_kwargs = {
+                    "shared_cp_size": shared_cp_size,
+                    "shared_pages_per_rank": shared_pages_per_rank,
+                }
             dequantize_k_cache_paged(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
+                **extra_dequant_kwargs,
             )
+
+        swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+        swa_token_ids = cache.swa_token_ids
+        swa_dequant_kwargs = {}
+        shared_access = get_dsv4_shared_cache_access(token_to_kv_pool)
+        if shared_access is not None:
+            shared_cp_size, shared_pages_per_rank = shared_access.shared_dequant_params(
+                "swa", layer_id=layer_id
+            )
+            swa_dequant_kwargs = {
+                "shared_cp_size": shared_cp_size,
+                "shared_pages_per_rank": shared_pages_per_rank,
+            }
         dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
+            swa_k_cache,
+            swa_token_ids,
             page_size=cache.swa_page_size,
             out=swa_slice,
+            **swa_dequant_kwargs,
         )
         kv = workspace
 

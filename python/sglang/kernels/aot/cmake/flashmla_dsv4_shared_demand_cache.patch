@@ -1,0 +1,871 @@
+diff -rN -U0 pristine/csrc/api/sparse_decode.h desired/csrc/api/sparse_decode.h
+--- pristine/csrc/api/sparse_decode.h	2026-06-24 14:52:45
++++ desired/csrc/api/sparse_decode.h	2026-08-11 12:04:01
+@@ -2,0 +3,2 @@
++#include <bit>
++
+@@ -72 +74,9 @@
+-                sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
++                if constexpr (MODEL_TYPE == ModelType::MODEL1) {
++                    if (params.shared_kv_row_cache != nullptr) {
++                        sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS, true>(params);
++                    } else {
++                        sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS, false>(params);
++                    }
++                } else {
++                    sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS, false>(params);
++                }
+@@ -104 +114,9 @@
+-            sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE>(params);
++            if constexpr (MODEL_TYPE == ModelType::MODEL1) {
++                if (params.shared_kv_row_cache != nullptr) {
++                    sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, true>(params);
++                } else {
++                    sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, false>(params);
++                }
++            } else {
++                sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, false>(params);
++            }
+@@ -149 +167,9 @@
+-                sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE>(cur_params);
++                if constexpr (MODEL_TYPE == ModelType::MODEL1) {
++                    if (cur_params.shared_kv_row_cache != nullptr) {
++                        sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, true>(cur_params);
++                    } else {
++                        sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, false>(cur_params);
++                    }
++                } else {
++                    sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, false>(cur_params);
++                }
+@@ -196 +222,12 @@
+-    float sm_scale
++    float sm_scale,
++    const std::optional<at::Tensor> &shared_kv_row_cache = std::nullopt,
++    const std::optional<at::Tensor> &shared_kv_cache_tags = std::nullopt,
++    const std::optional<at::Tensor> &shared_kv_cache_stats = std::nullopt,
++    int64_t shared_kv_cache_epoch = 0,
++    int64_t shared_kv_cache_ways = 0,
++    int64_t shared_kv_rank = 0,
++    int64_t shared_kv_size = 1,
++    int64_t shared_swa_page_size = 0,
++    int64_t shared_swa_pages_per_rank = 0,
++    int64_t shared_extra_page_size = 0,
++    int64_t shared_extra_pages_per_rank = 0
+@@ -219,0 +257,4 @@
++    bool have_shared_kv_cache = shared_kv_row_cache.has_value();
++    TORCH_CHECK(
++        have_shared_kv_cache == shared_kv_cache_tags.has_value(),
++        "shared_kv_row_cache and shared_kv_cache_tags must be provided together");
+@@ -256,0 +298,3 @@
++    KU_CHECK_DEVICE(shared_kv_row_cache);
++    KU_CHECK_DEVICE(shared_kv_cache_tags);
++    KU_CHECK_DEVICE(shared_kv_cache_stats);
+@@ -270,0 +315,3 @@
++    KU_CHECK_DTYPE(shared_kv_row_cache, torch::kUInt8);
++    KU_CHECK_DTYPE(shared_kv_cache_tags, torch::kInt64);
++    KU_CHECK_DTYPE(shared_kv_cache_stats, torch::kInt64);
+@@ -284,0 +332,3 @@
++    KU_CHECK_CONTIGUOUS(shared_kv_row_cache);
++    KU_CHECK_CONTIGUOUS(shared_kv_cache_tags);
++    KU_CHECK_CONTIGUOUS(shared_kv_cache_stats);
+@@ -311,0 +362,29 @@
++    int shared_kv_cache_sets = 0;
++    if (have_shared_kv_cache) {
++        TORCH_CHECK(
++            arch.is_sm90a() || arch.is_sm100f(),
++            "DSV4 Shared demand cache requires SM90 or SM100");
++        TORCH_CHECK(d_qk == 512, "DSV4 Shared demand cache requires MODEL1 KV rows");
++        TORCH_CHECK(shared_kv_row_cache->dim() == 2 && shared_kv_row_cache->size(1) == 592);
++        TORCH_CHECK(shared_kv_cache_tags->dim() == 2);
++        TORCH_CHECK(shared_kv_cache_ways >= 1 && shared_kv_cache_ways <= 4);
++        TORCH_CHECK(shared_kv_cache_tags->size(1) == shared_kv_cache_ways);
++        shared_kv_cache_sets = static_cast<int>(shared_kv_cache_tags->size(0));
++        TORCH_CHECK(shared_kv_cache_sets > 0);
++        TORCH_CHECK(std::has_single_bit(static_cast<uint32_t>(shared_kv_cache_sets)));
++        TORCH_CHECK(shared_kv_row_cache->size(0) == shared_kv_cache_sets * shared_kv_cache_ways);
++        if (arch.is_sm100f()) {
++            TORCH_CHECK(
++                shared_kv_cache_ways == 1 && shared_kv_cache_sets >= (1 << 18),
++                "SM100 DSV4 Shared demand cache requires the collision-free one-way layout");
++        }
++        if (shared_kv_cache_stats.has_value()) {
++            TORCH_CHECK(shared_kv_cache_stats->dim() == 1 && shared_kv_cache_stats->size(0) == 5);
++        }
++        TORCH_CHECK(shared_kv_cache_epoch > 0 && shared_kv_cache_epoch < (1ll << 31));
++        TORCH_CHECK(shared_kv_size > 1 && shared_kv_rank >= 0 && shared_kv_rank < shared_kv_size);
++        TORCH_CHECK(shared_swa_page_size > 0 && shared_swa_pages_per_rank > 0);
++        if (have_extra_kcache) {
++            TORCH_CHECK(shared_extra_page_size > 0 && shared_extra_pages_per_rank > 0);
++        }
++    }
+@@ -367 +446 @@
+-            if (d_qk == 576) {
++            if (d_qk == 576 || have_shared_kv_cache) {
+@@ -413,0 +493,15 @@
++
++        have_shared_kv_cache ? shared_kv_row_cache->data_ptr<uint8_t>() : nullptr,
++        have_shared_kv_cache ? reinterpret_cast<uint64_t*>(shared_kv_cache_tags->data_ptr<int64_t>()) : nullptr,
++        shared_kv_cache_stats.has_value()
++            ? reinterpret_cast<uint64_t*>(shared_kv_cache_stats->data_ptr<int64_t>())
++            : nullptr,
++        static_cast<uint32_t>(shared_kv_cache_epoch),
++        shared_kv_cache_sets,
++        static_cast<int>(shared_kv_cache_ways),
++        static_cast<int>(shared_kv_rank),
++        static_cast<int>(shared_kv_size),
++        static_cast<int>(shared_swa_page_size),
++        static_cast<int>(shared_swa_pages_per_rank),
++        static_cast<int>(shared_extra_page_size),
++        static_cast<int>(shared_extra_pages_per_rank),
+diff -rN -U0 pristine/csrc/params.h desired/csrc/params.h
+--- pristine/csrc/params.h	2026-06-24 14:52:45
++++ desired/csrc/params.h	2026-08-11 12:03:09
+@@ -2,0 +3,2 @@
++#include <cstdint>
++
+@@ -91,0 +94,11 @@
++
++    // Optional MODEL1 Shared-KV demand-row cache. Null preserves the upstream
++    // architecture-specific direct-load path.
++    uint8_t* __restrict__ shared_kv_row_cache;       // [sets * ways, 592]
++    uint64_t* __restrict__ shared_kv_cache_tags;     // [sets, ways]
++    uint64_t* __restrict__ shared_kv_cache_stats;    // Optional [5]
++    uint32_t shared_kv_cache_epoch;
++    int shared_kv_cache_sets, shared_kv_cache_ways;
++    int shared_kv_rank, shared_kv_size;
++    int shared_swa_page_size, shared_swa_pages_per_rank;
++    int shared_extra_page_size, shared_extra_pages_per_rank;
+diff -rN -U0 pristine/csrc/sm100/decode/head64/config.h desired/csrc/sm100/decode/head64/config.h
+--- pristine/csrc/sm100/decode/head64/config.h	2026-06-24 14:52:45
++++ desired/csrc/sm100/decode/head64/config.h	2026-08-11 12:03:35
+@@ -31 +31 @@
+-template<ModelType MODEL_TYPE>
++template<ModelType MODEL_TYPE, bool USE_SHARED_CACHE>
+@@ -70,0 +71,2 @@
++    CUtensorMap tensor_map_shared_kv_nope;
++    CUtensorMap tensor_map_shared_kv_rope;
+@@ -214 +216 @@
+-}
+\ No newline at end of file
++}
+diff -rN -U0 pristine/csrc/sm100/decode/head64/instantiations/model1.cu desired/csrc/sm100/decode/head64/instantiations/model1.cu
+--- pristine/csrc/sm100/decode/head64/instantiations/model1.cu	2026-06-24 14:52:45
++++ desired/csrc/sm100/decode/head64/instantiations/model1.cu	2026-08-11 12:03:35
+@@ -6 +6,4 @@
+-void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1>(const SparseAttnDecodeParams &params);
++void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, false>(const SparseAttnDecodeParams &params);
++
++template
++void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, true>(const SparseAttnDecodeParams &params);
+diff -rN -U0 pristine/csrc/sm100/decode/head64/instantiations/v32.cu desired/csrc/sm100/decode/head64/instantiations/v32.cu
+--- pristine/csrc/sm100/decode/head64/instantiations/v32.cu	2026-06-24 14:52:45
++++ desired/csrc/sm100/decode/head64/instantiations/v32.cu	2026-08-11 12:03:35
+@@ -6 +6 @@
+-void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32>(const SparseAttnDecodeParams &params);
++void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, false>(const SparseAttnDecodeParams &params);
+diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.cuh desired/csrc/sm100/decode/head64/kernel.cuh
+--- pristine/csrc/sm100/decode/head64/kernel.cuh	2026-06-24 14:52:45
++++ desired/csrc/sm100/decode/head64/kernel.cuh	2026-08-11 12:22:07
+@@ -12,0 +13 @@
++#include "sm90/decode/sparse_fp8/components/shared_demand_cache.h"
+@@ -19 +20,3 @@
+-template<ModelType MODEL_TYPE>
++namespace shared_demand_cache = ::flashmla::shared_demand_cache;
++
++template<ModelType MODEL_TYPE, bool USE_SHARED_CACHE>
+@@ -22 +25 @@
+-KernelTemplate<MODEL_TYPE>
++KernelTemplate<MODEL_TYPE, USE_SHARED_CACHE>
+@@ -39,2 +42,7 @@
+-        cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_nope);
+-        cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_rope);
++        if constexpr (USE_SHARED_CACHE) {
++            cute::prefetch_tma_descriptor(&tma_params.tensor_map_shared_kv_nope);
++            cute::prefetch_tma_descriptor(&tma_params.tensor_map_shared_kv_rope);
++        } else {
++            cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_nope);
++            cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_rope);
++        }
+@@ -602 +610,5 @@
+-                            block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv_nope : &tma_params.tensor_map_kv_nope,
++                            USE_SHARED_CACHE
++                                ? &tma_params.tensor_map_shared_kv_nope
++                                : (block_idx >= args.num_orig_kv_blocks
++                                    ? &tma_params.tensor_map_extra_kv_nope
++                                    : &tma_params.tensor_map_kv_nope),
+@@ -638 +650,5 @@
+-                                block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv_rope : &tma_params.tensor_map_kv_rope,
++                                USE_SHARED_CACHE
++                                    ? &tma_params.tensor_map_shared_kv_rope
++                                    : (block_idx >= args.num_orig_kv_blocks
++                                        ? &tma_params.tensor_map_extra_kv_rope
++                                        : &tma_params.tensor_map_kv_rope),
+@@ -694,0 +711,7 @@
++                    int source_block_indices[2], source_row_indices[2];
++                    int cache_slots[2] = {-1, -1};
++                    shared_demand_cache::Access cache_accesses[2] = {
++                        shared_demand_cache::Access::DIRECT,
++                        shared_demand_cache::Access::DIRECT
++                    };
++                    bool token_valid[2];
+@@ -701,0 +725 @@
++                        token_valid[i] = is_token_valid;
+@@ -703 +727,41 @@
+-                        tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
++                        if constexpr (USE_SHARED_CACHE) {
++                            static_assert(MODEL_TYPE == ModelType::MODEL1);
++                            if (is_token_valid) {
++                                const int shared_page_size = IS_EXTRA_BLOCK
++                                    ? params.shared_extra_page_size
++                                    : params.shared_swa_page_size;
++                                const int shared_pages_per_rank = IS_EXTRA_BLOCK
++                                    ? params.shared_extra_pages_per_rank
++                                    : params.shared_swa_pages_per_rank;
++                                const int logical_page = static_cast<unsigned int>(my_indices[i]) / shared_page_size;
++                                const int page_offset = static_cast<unsigned int>(my_indices[i]) % shared_page_size;
++                                const int owner = logical_page % params.shared_kv_size;
++                                const int owner_page = logical_page / params.shared_kv_size;
++                                const int physical_row =
++                                    (owner * shared_pages_per_rank + owner_page) *
++                                        shared_page_size +
++                                    page_offset;
++                                source_block_indices[i] =
++                                    static_cast<unsigned int>(physical_row) /
++                                    cur_block_size;
++                                source_row_indices[i] =
++                                    static_cast<unsigned int>(physical_row) %
++                                    cur_block_size;
++                                auto result = shared_demand_cache::probe_direct(
++                                    params.shared_kv_cache_tags,
++                                    params.shared_kv_cache_sets,
++                                    params.shared_kv_cache_epoch,
++                                    IS_EXTRA_BLOCK ? 1u : 0u,
++                                    static_cast<uint32_t>(my_indices[i])
++                                );
++                                KU_TRAP_ONLY_DEVICE_ASSERT(result.slot >= 0);
++                                cache_slots[i] = result.slot;
++                                cache_accesses[i] = result.access;
++                                shared_demand_cache::count(
++                                    params.shared_kv_cache_stats, result.access
++                                );
++                            }
++                            tma_coords[i] = -1;
++                        } else {
++                            tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
++                        }
+@@ -715,3 +779,5 @@
+-                            int64_t offset = block_idx*cur_k_block_stride + idx_in_block*8; // Each token has 7 scale factors with an extra 1B padding
+-                            uint64_t scalesx8 = is_token_valid ? __ldg((uint64_t*)(cur_k_scales_ptr + offset)) : 0;
+-                            *(uint64_t*)(scales+i*NUM_SCALES_EACH_TOKEN) = scalesx8;
++                            if constexpr (!USE_SHARED_CACHE) {
++                                int64_t offset = block_idx*cur_k_block_stride + idx_in_block*8; // Each token has 7 scale factors with an extra 1B padding
++                                uint64_t scalesx8 = is_token_valid ? __ldg((uint64_t*)(cur_k_scales_ptr + offset)) : 0;
++                                *(uint64_t*)(scales+i*NUM_SCALES_EACH_TOKEN) = scalesx8;
++                            }
+@@ -719,0 +786,74 @@
++                    if constexpr (USE_SHARED_CACHE) {
++                        uint8_t* cur_k_base = IS_EXTRA_BLOCK
++                            ? reinterpret_cast<uint8_t*>(params.extra_kv)
++                            : reinterpret_cast<uint8_t*>(params.kv);
++                        CUTE_UNROLL
++                        for (int i = 0; i < 2; ++i) {
++                            if (
++                                token_valid[i] &&
++                                cache_accesses[i] == shared_demand_cache::Access::FILL
++                            ) {
++                                uint8_t* dst = params.shared_kv_row_cache +
++                                    static_cast<int64_t>(cache_slots[i]) *
++                                        shared_demand_cache::ROW_STRIDE;
++                                const uint8_t* src = cur_k_base +
++                                    static_cast<int64_t>(source_block_indices[i]) *
++                                        cur_k_block_stride +
++                                    source_row_indices[i] * 576;
++                                CUTE_UNROLL
++                                for (int byte = 0; byte < 576; byte += 16) {
++                                    *reinterpret_cast<uint4*>(dst + byte) = __ldg(
++                                        reinterpret_cast<const uint4*>(src + byte)
++                                    );
++                                }
++                                const int64_t scale_offset =
++                                    static_cast<int64_t>(source_block_indices[i]) *
++                                        cur_k_block_stride +
++                                    source_row_indices[i] * 8;
++                                *reinterpret_cast<uint64_t*>(dst + 576) = __ldg(
++                                    reinterpret_cast<const uint64_t*>(
++                                        cur_k_scales_ptr + scale_offset
++                                    )
++                                );
++                            }
++                        }
++                        shared_demand_cache::fence_async_global();
++                        __syncwarp();
++                        CUTE_UNROLL
++                        for (int i = 0; i < 2; ++i) {
++                            if (
++                                token_valid[i] &&
++                                cache_accesses[i] == shared_demand_cache::Access::FILL
++                            ) {
++                                shared_demand_cache::publish_ready_direct(
++                                    params.shared_kv_cache_tags,
++                                    cache_slots[i],
++                                    params.shared_kv_cache_epoch
++                                );
++                            }
++                        }
++                        __syncwarp();
++                        CUTE_UNROLL
++                        for (int i = 0; i < 2; ++i) {
++                            if (token_valid[i]) {
++                                shared_demand_cache::wait_ready_direct(
++                                    params.shared_kv_cache_tags,
++                                    cache_slots[i],
++                                    params.shared_kv_cache_epoch
++                                );
++                                uint8_t* row = params.shared_kv_row_cache +
++                                    static_cast<int64_t>(cache_slots[i]) *
++                                        shared_demand_cache::ROW_STRIDE;
++                                tma_coords[i] = cache_slots[i];
++                                *reinterpret_cast<uint64_t*>(
++                                    scales + i * NUM_SCALES_EACH_TOKEN
++                                ) = __ldg(
++                                    reinterpret_cast<const uint64_t*>(row + 576)
++                                );
++                            } else {
++                                *reinterpret_cast<uint64_t*>(
++                                    scales + i * NUM_SCALES_EACH_TOKEN
++                                ) = 0;
++                            }
++                        }
++                    }
+@@ -856,2 +996,2 @@
+-template<ModelType MODEL_TYPE>
+-void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
++template<ModelType MODEL_TYPE, bool USE_SHARED_CACHE>
++void KernelTemplate<MODEL_TYPE, USE_SHARED_CACHE>::run(const SparseAttnDecodeParams &params) {
+@@ -933 +1073 @@
+-    auto [tensor_map_kv_nope, tensor_map_kv_rope] = get_nope_rope_tensormap(false, params.kv, params.num_blocks, params.stride_kv_block);
++    CUtensorMap tensor_map_kv_nope{}, tensor_map_kv_rope{};
+@@ -935,2 +1075,14 @@
+-    if (params.extra_topk > 0) {
+-        std::tie(tensor_map_extra_kv_nope, tensor_map_extra_kv_rope) = get_nope_rope_tensormap(true, params.extra_kv, params.extra_num_blocks, params.stride_extra_kv_block);
++    if constexpr (!USE_SHARED_CACHE) {
++        std::tie(tensor_map_kv_nope, tensor_map_kv_rope) =
++            get_nope_rope_tensormap(
++                false, params.kv, params.num_blocks, params.stride_kv_block
++            );
++        if (params.extra_topk > 0) {
++            std::tie(tensor_map_extra_kv_nope, tensor_map_extra_kv_rope) =
++                get_nope_rope_tensormap(
++                    true,
++                    params.extra_kv,
++                    params.extra_num_blocks,
++                    params.stride_extra_kv_block
++                );
++        }
+@@ -938,0 +1091,27 @@
++    CUtensorMap tensor_map_shared_kv_nope{}, tensor_map_shared_kv_rope{};
++    if constexpr (USE_SHARED_CACHE) {
++        static_assert(MODEL_TYPE == ModelType::MODEL1);
++        KU_ASSERT(
++            reinterpret_cast<int64_t>(params.shared_kv_row_cache) % 16 == 0,
++            "shared_kv_row_cache must be 16B aligned on sm100f"
++        );
++        tensor_map_shared_kv_nope = ku::make_tensor_map(
++            {D_NOPE/8, static_cast<uint64_t>(params.shared_kv_cache_sets * params.shared_kv_cache_ways)},
++            {shared_demand_cache::ROW_STRIDE},
++            {D_NOPE/8, 1},
++            params.shared_kv_row_cache,
++            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
++            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
++            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
++        );
++        tensor_map_shared_kv_rope = ku::make_tensor_map(
++            {D_ROPE, static_cast<uint64_t>(params.shared_kv_cache_sets * params.shared_kv_cache_ways)},
++            {shared_demand_cache::ROW_STRIDE},
++            {K_ROPE_SW/2, 1},
++            params.shared_kv_row_cache + D_NOPE,
++            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
++            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
++            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
++        );
++    }
++
+@@ -949 +1128,3 @@
+-        tensor_map_extra_kv_rope
++        tensor_map_extra_kv_rope,
++        tensor_map_shared_kv_nope,
++        tensor_map_shared_kv_rope
+@@ -951 +1132 @@
+-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE>, decltype(tma_params)>;
++    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, USE_SHARED_CACHE>, decltype(tma_params)>;
+@@ -962 +1143 @@
+-template<ModelType MODEL_TYPE>
++template<ModelType MODEL_TYPE, bool USE_SHARED_CACHE>
+@@ -964 +1145 @@
+-    KernelTemplate<MODEL_TYPE>::run(params);
++    KernelTemplate<MODEL_TYPE, USE_SHARED_CACHE>::run(params);
+diff -rN -U0 pristine/csrc/sm100/decode/head64/kernel.h desired/csrc/sm100/decode/head64/kernel.h
+--- pristine/csrc/sm100/decode/head64/kernel.h	2026-06-24 14:52:45
++++ desired/csrc/sm100/decode/head64/kernel.h	2026-08-11 12:03:35
+@@ -7 +7 @@
+-template<ModelType MODEL_TYPE>
++template<ModelType MODEL_TYPE, bool USE_SHARED_CACHE>
+@@ -11 +10,0 @@
+-
+diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h desired/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h
+--- pristine/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h	1970-01-01 08:00:00
++++ desired/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h	2026-08-11 12:03:09
+@@ -0,0 +1,221 @@
++#pragma once
++
++#include <cstdint>
++
++namespace flashmla::shared_demand_cache {
++
++static constexpr int ROW_BYTES = 584;
++static constexpr int ROW_STRIDE = 592;
++static constexpr int MAX_WAYS = 4;
++static constexpr int DIRECT_MIN_ROWS = 1 << 18;
++static constexpr uint64_t READY_BIT = 1ull << 63;
++
++enum class Access : int {
++    DIRECT = 0,
++    HIT = 1,
++    FILL = 2,
++    COLLISION = 3,
++    FILLING = 4,
++};
++
++struct ProbeResult {
++    int slot;
++    Access access;
++};
++
++static __forceinline__ __device__ uint64_t load_acquire(const uint64_t* ptr) {
++    uint64_t value;
++    asm volatile(
++        "ld.global.acquire.gpu.u64 %0, [%1];"
++        : "=l"(value)
++        : "l"(ptr)
++        : "memory"
++    );
++    return value;
++}
++
++static __forceinline__ __device__ uint64_t compare_exchange_acq_rel(
++    uint64_t* ptr, uint64_t expected, uint64_t desired
++) {
++    uint64_t old;
++    asm volatile(
++        "atom.global.acq_rel.gpu.cas.b64 %0, [%1], %2, %3;"
++        : "=l"(old)
++        : "l"(ptr), "l"(expected), "l"(desired)
++        : "memory"
++    );
++    return old;
++}
++
++static __forceinline__ __device__ void store_release(
++    uint64_t* ptr, uint64_t value
++) {
++    asm volatile(
++        "st.global.release.gpu.u64 [%0], %1;"
++        :
++        : "l"(ptr), "l"(value)
++        : "memory"
++    );
++}
++
++static __forceinline__ __device__ uint64_t filling_tag(
++    uint32_t epoch, uint32_t family, uint32_t physical_row
++) {
++    return (static_cast<uint64_t>(epoch) << 32) |
++           (static_cast<uint64_t>(family) << 31) |
++           (static_cast<uint64_t>(physical_row) + 1);
++}
++
++static __forceinline__ __device__ ProbeResult probe(
++    uint64_t* tags,
++    int num_sets,
++    int ways,
++    uint32_t epoch,
++    uint32_t family,
++    uint32_t physical_row
++) {
++    const uint64_t filling = filling_tag(epoch, family, physical_row);
++    const uint64_t ready = filling | READY_BIT;
++    const uint32_t set = (physical_row ^ (physical_row >> 13) ^
++                          (family * 0x9e3779b9u)) &
++                         static_cast<uint32_t>(num_sets - 1);
++    uint64_t* set_tags = tags + set * ways;
++    int candidate = -1;
++    uint64_t candidate_tag = 0;
++
++    #pragma unroll
++    for (int way = 0; way < MAX_WAYS; ++way) {
++        if (way >= ways) break;
++        const uint64_t observed = load_acquire(set_tags + way);
++        if (observed == ready) return {static_cast<int>(set * ways + way), Access::HIT};
++        if (observed == filling) return {-1, Access::FILLING};
++        const uint32_t observed_epoch =
++            static_cast<uint32_t>((observed & ~READY_BIT) >> 32);
++        if (candidate < 0 && observed_epoch != epoch) {
++            candidate = way;
++            candidate_tag = observed;
++        }
++    }
++
++    if (candidate >= 0) {
++        const uint64_t old = compare_exchange_acq_rel(
++            set_tags + candidate, candidate_tag, filling
++        );
++        if (old == candidate_tag) {
++            return {static_cast<int>(set * ways + candidate), Access::FILL};
++        }
++        if (old == ready) {
++            return {static_cast<int>(set * ways + candidate), Access::HIT};
++        }
++        if (old == filling) return {-1, Access::FILLING};
++    }
++    return {-1, Access::COLLISION};
++}
++
++static __forceinline__ __device__ uint32_t load_direct_acquire(
++    const uint64_t* tags, int slot
++) {
++    uint32_t value;
++    const uint32_t* ptr = reinterpret_cast<const uint32_t*>(tags) + slot;
++    asm volatile(
++        "ld.global.acquire.gpu.u32 %0, [%1];"
++        : "=r"(value)
++        : "l"(ptr)
++        : "memory"
++    );
++    return value;
++}
++
++static __forceinline__ __device__ uint32_t compare_exchange_direct_relaxed(
++    uint64_t* tags, int slot, uint32_t expected, uint32_t desired
++) {
++    uint32_t old;
++    uint32_t* ptr = reinterpret_cast<uint32_t*>(tags) + slot;
++    asm volatile(
++        "atom.global.relaxed.gpu.cas.b32 %0, [%1], %2, %3;"
++        : "=r"(old)
++        : "l"(ptr), "r"(expected), "r"(desired)
++        : "memory"
++    );
++    return old;
++}
++
++static __forceinline__ __device__ void store_direct_release(
++    uint64_t* tags, int slot, uint32_t value
++) {
++    uint32_t* ptr = reinterpret_cast<uint32_t*>(tags) + slot;
++    asm volatile(
++        "st.global.release.gpu.u32 [%0], %1;"
++        :
++        : "l"(ptr), "r"(value)
++        : "memory"
++    );
++}
++
++static __forceinline__ __device__ ProbeResult probe_direct(
++    uint64_t* tags,
++    int num_rows,
++    uint32_t epoch,
++    uint32_t family,
++    uint32_t logical_row
++) {
++    const uint32_t rows_per_family = static_cast<uint32_t>(num_rows >> 1);
++    if (logical_row >= rows_per_family) return {-1, Access::DIRECT};
++    const int slot = static_cast<int>(family * rows_per_family + logical_row);
++    const uint32_t filling = epoch << 1;
++    const uint32_t ready = filling | 1u;
++    const uint32_t observed = load_direct_acquire(tags, slot);
++    if (observed == ready) return {slot, Access::HIT};
++    if (observed == filling) return {slot, Access::FILLING};
++    const uint32_t old = compare_exchange_direct_relaxed(
++        tags, slot, observed, filling
++    );
++    if (old == observed) return {slot, Access::FILL};
++    if (old == ready) return {slot, Access::HIT};
++    if (old == filling) return {slot, Access::FILLING};
++    return {-1, Access::COLLISION};
++}
++
++static __forceinline__ __device__ void publish_ready(
++    uint64_t* tags,
++    int slot,
++    uint32_t epoch,
++    uint32_t family,
++    uint32_t physical_row
++) {
++    store_release(
++        tags + slot,
++        filling_tag(epoch, family, physical_row) | READY_BIT
++    );
++}
++
++static __forceinline__ __device__ void publish_ready_direct(
++    uint64_t* tags, int slot, uint32_t epoch
++) {
++    store_direct_release(tags, slot, (epoch << 1) | 1u);
++}
++
++static __forceinline__ __device__ void wait_ready_direct(
++    const uint64_t* tags, int slot, uint32_t epoch
++) {
++    const uint32_t ready = (epoch << 1) | 1u;
++    while (load_direct_acquire(tags, slot) != ready) {}
++}
++
++static __forceinline__ __device__ void fence_async_global() {
++    asm volatile("fence.proxy.async.global;" ::: "memory");
++}
++
++static __forceinline__ __device__ void count(
++    uint64_t* stats, Access access
++) {
++    if (stats != nullptr) {
++        atomicAdd(
++            reinterpret_cast<unsigned long long*>(stats) +
++                static_cast<int>(access),
++            1ull
++        );
++    }
++}
++
++}  // namespace flashmla::shared_demand_cache
+diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/config.h desired/csrc/sm90/decode/sparse_fp8/config.h
+--- pristine/csrc/sm90/decode/sparse_fp8/config.h	2026-06-24 14:52:45
++++ desired/csrc/sm90/decode/sparse_fp8/config.h	2026-08-11 12:01:38
+@@ -15 +15 @@
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
++template<ModelType MODEL_TYPE, int NUM_HEADS, bool USE_SHARED_CACHE>
+diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu desired/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu
+--- pristine/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu	2026-06-24 14:52:45
++++ desired/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu	2026-08-11 12:01:38
+@@ -5 +5,2 @@
+-template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 128>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 128, false>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 128, true>(const SparseAttnDecodeParams &params);
+diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu desired/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu
+--- pristine/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu	2026-06-24 14:52:45
++++ desired/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu	2026-08-11 12:01:38
+@@ -5 +5,2 @@
+-template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 64>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 64, false>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 64, true>(const SparseAttnDecodeParams &params);
+@@ -8 +8,0 @@
+-
+diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu desired/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu
+--- pristine/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu	2026-06-24 14:52:45
++++ desired/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu	2026-08-11 12:01:38
+@@ -5 +5 @@
+-template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 128>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 128, false>(const SparseAttnDecodeParams &params);
+diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu desired/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu
+--- pristine/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu	2026-06-24 14:52:45
++++ desired/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu	2026-08-11 12:01:38
+@@ -5 +5 @@
+-template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64, false>(const SparseAttnDecodeParams &params);
+diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh desired/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh
+--- pristine/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-06-24 14:52:45
++++ desired/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-08-11 12:03:09
+@@ -16,0 +17 @@
++#include "components/shared_demand_cache.h"
+@@ -21,0 +23,2 @@
++namespace shared_demand_cache = ::flashmla::shared_demand_cache;
++
+@@ -86 +89 @@
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
++template<ModelType MODEL_TYPE, int NUM_HEADS, bool USE_SHARED_CACHE>
+@@ -88 +91 @@
+-__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
++__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, USE_SHARED_CACHE>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
+@@ -538,2 +541,21 @@
+-                    int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
+-                    int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
++                    int physical_token_index = token_index;
++                    bool is_local_shared_row = true;
++                    if constexpr (MODEL_TYPE == ModelType::MODEL1 && USE_SHARED_CACHE) {
++                        if (token_index != -1) {
++                            const int shared_page_size = IS_EXTRA_BLOCK
++                                ? params.shared_extra_page_size
++                                : params.shared_swa_page_size;
++                            const int shared_pages_per_rank = IS_EXTRA_BLOCK
++                                ? params.shared_extra_pages_per_rank
++                                : params.shared_swa_pages_per_rank;
++                            const int logical_page = static_cast<uint32_t>(token_index) / static_cast<uint32_t>(shared_page_size);
++                            const int page_offset = static_cast<uint32_t>(token_index) % static_cast<uint32_t>(shared_page_size);
++                            const int owner = logical_page % params.shared_kv_size;
++                            const int owner_page = logical_page / params.shared_kv_size;
++                            physical_token_index =
++                                (owner * shared_pages_per_rank + owner_page) *
++                                    shared_page_size +
++                                page_offset;
++                            is_local_shared_row = owner == params.shared_kv_rank;
++                        }
++                    }
+@@ -540,0 +563,3 @@
++                    int block_index = physical_token_index == -1 ? 0 : (int)((uint32_t)physical_token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
++                    int rel_idx_in_block = (uint32_t)physical_token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
++
+@@ -542,0 +568,9 @@
++                    int shared_cache_slot = -1;
++                    auto shared_cache_access = shared_demand_cache::Access::DIRECT;
++                    uint8_t* shared_cache_row = nullptr;
++                    const int source_lane = lane_idx % 8;
++                    const unsigned row_group_mask = 0x01010101u << source_lane;
++                    const bool use_direct_address_cache =
++                        params.shared_kv_cache_ways == 1 &&
++                        params.shared_kv_cache_sets >=
++                            shared_demand_cache::DIRECT_MIN_ROWS;
+@@ -555,0 +590,71 @@
++                        if constexpr (USE_SHARED_CACHE) {
++                            if (token_index != -1 && !is_local_shared_row) {
++                                uint32_t packed_probe_result = 0;
++                                if (lane_idx < 8) {
++                                    auto result = use_direct_address_cache
++                                        ? shared_demand_cache::probe_direct(
++                                              params.shared_kv_cache_tags,
++                                              params.shared_kv_cache_sets,
++                                              params.shared_kv_cache_epoch,
++                                              IS_EXTRA_BLOCK ? 1u : 0u,
++                                              static_cast<uint32_t>(token_index)
++                                          )
++                                        : shared_demand_cache::probe(
++                                              params.shared_kv_cache_tags,
++                                              params.shared_kv_cache_sets,
++                                              params.shared_kv_cache_ways,
++                                              params.shared_kv_cache_epoch,
++                                              IS_EXTRA_BLOCK ? 1u : 0u,
++                                              static_cast<uint32_t>(physical_token_index)
++                                          );
++                                    packed_probe_result =
++                                        (static_cast<uint32_t>(result.access) << 29) |
++                                        static_cast<uint32_t>(result.slot + 1);
++                                    shared_demand_cache::count(
++                                        params.shared_kv_cache_stats, result.access
++                                    );
++                                }
++                                packed_probe_result = __shfl_sync(
++                                    row_group_mask, packed_probe_result, source_lane
++                                );
++                                shared_cache_slot = static_cast<int>(
++                                    packed_probe_result & 0x1fffffffu
++                                ) - 1;
++                                shared_cache_access = static_cast<
++                                    shared_demand_cache::Access
++                                >(packed_probe_result >> 29);
++                                if (shared_cache_access == shared_demand_cache::Access::HIT) {
++                                    // Each row-loading lane must observe the release
++                                    // that published this cache row. A warp shuffle
++                                    // transfers values, not memory-ordering effects.
++                                    if (use_direct_address_cache) {
++                                        (void)shared_demand_cache::load_direct_acquire(
++                                            params.shared_kv_cache_tags,
++                                            shared_cache_slot
++                                        );
++                                    } else {
++                                        (void)shared_demand_cache::load_acquire(
++                                            params.shared_kv_cache_tags + shared_cache_slot
++                                        );
++                                    }
++                                }
++                                if (shared_cache_slot >= 0) {
++                                    shared_cache_row =
++                                        params.shared_kv_row_cache +
++                                        static_cast<int64_t>(shared_cache_slot) *
++                                            shared_demand_cache::ROW_STRIDE;
++                                }
++                                if (shared_cache_access == shared_demand_cache::Access::HIT) {
++                                    gK_base = reinterpret_cast<fp8*>(shared_cache_row);
++                                    gK_scales_base = reinterpret_cast<fp8_e8m0*>(
++                                        shared_cache_row + HEAD_DIM_NOPE +
++                                        HEAD_DIM_ROPE * sizeof(bf16)
++                                    );
++                                }
++                            } else if (token_index != -1 && lane_idx < 8) {
++                                shared_demand_cache::count(
++                                    params.shared_kv_cache_stats,
++                                    shared_demand_cache::Access::DIRECT
++                                );
++                            }
++                        }
+@@ -557,0 +663,11 @@
++                        if constexpr (USE_SHARED_CACHE) {
++                            if (
++                                shared_cache_access == shared_demand_cache::Access::FILL &&
++                                lane_idx < 8
++                            ) {
++                                *reinterpret_cast<int64_t*>(
++                                    shared_cache_row + HEAD_DIM_NOPE +
++                                    HEAD_DIM_ROPE * sizeof(bf16)
++                                ) = *reinterpret_cast<int64_t*>(scales_e8m0);
++                            }
++                        }
+@@ -584,0 +701,8 @@
++                        if constexpr (MODEL_TYPE == ModelType::MODEL1 && USE_SHARED_CACHE) {
++                            if (shared_cache_access == shared_demand_cache::Access::FILL) {
++                                *reinterpret_cast<uint128_t*>(
++                                    shared_cache_row + (lane_idx / 8) * 16 +
++                                    dim_idx * 64
++                                ) = *reinterpret_cast<uint128_t*>(&cur_fp8x16);
++                            }
++                        }
+@@ -611,0 +736,8 @@
++                        if constexpr (MODEL_TYPE == ModelType::MODEL1 && USE_SHARED_CACHE) {
++                            if (shared_cache_access == shared_demand_cache::Access::FILL) {
++                                *reinterpret_cast<bf16x8*>(
++                                    shared_cache_row + HEAD_DIM_NOPE +
++                                    (lane_idx / 8) * 16 + dim_idx * 64
++                                ) = cur_bf16x8;
++                            }
++                        }
+@@ -623,0 +756,23 @@
++
++                    if constexpr (MODEL_TYPE == ModelType::MODEL1 && USE_SHARED_CACHE) {
++                        if (shared_cache_access == shared_demand_cache::Access::FILL) {
++                            __syncwarp(row_group_mask);
++                            if (lane_idx < 8) {
++                                if (use_direct_address_cache) {
++                                    shared_demand_cache::publish_ready_direct(
++                                        params.shared_kv_cache_tags,
++                                        shared_cache_slot,
++                                        params.shared_kv_cache_epoch
++                                    );
++                                } else {
++                                    shared_demand_cache::publish_ready(
++                                        params.shared_kv_cache_tags,
++                                        shared_cache_slot,
++                                        params.shared_kv_cache_epoch,
++                                        IS_EXTRA_BLOCK ? 1u : 0u,
++                                        static_cast<uint32_t>(physical_token_index)
++                                    );
++                                }
++                            }
++                        }
++                    }
+@@ -686,2 +841,2 @@
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
+-void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &params) {
++template<ModelType MODEL_TYPE, int NUM_HEADS, bool USE_SHARED_CACHE>
++void KernelTemplate<MODEL_TYPE, NUM_HEADS, USE_SHARED_CACHE>::run(const SparseAttnDecodeParams &params) {
+@@ -751 +906 @@
+-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params)>;
++    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS, USE_SHARED_CACHE>, decltype(tma_params)>;
+@@ -782 +937 @@
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
++template<ModelType MODEL_TYPE, int NUM_HEADS, bool USE_SHARED_CACHE>
+@@ -784 +939 @@
+-    KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(params);
++    KernelTemplate<MODEL_TYPE, NUM_HEADS, USE_SHARED_CACHE>::run(params);
+diff -rN -U0 pristine/csrc/sm90/decode/sparse_fp8/splitkv_mla.h desired/csrc/sm90/decode/sparse_fp8/splitkv_mla.h
+--- pristine/csrc/sm90/decode/sparse_fp8/splitkv_mla.h	2026-06-24 14:52:45
++++ desired/csrc/sm90/decode/sparse_fp8/splitkv_mla.h	2026-08-11 12:01:38
+@@ -7 +7 @@
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
++template<ModelType MODEL_TYPE, int NUM_HEADS, bool USE_SHARED_CACHE>

@@ -1061,6 +1061,10 @@ class KVCacheConfigurator:
         # needs cache_mode=1 (paged); Atlas A3 rejects cache_mode=2 (ring),
         # so the CUDA ring-buffer state path can't be shared. CUDA keeps
         # DeepSeekV4TokenToKVPool unchanged; NPU recomputes state sizes below.
+        from sglang.srt.arg_groups.deepseek_v4_hook import get_dsv4_shared_info
+
+        dsv4_shared_rank, dsv4_shared_size = get_dsv4_shared_info(self)
+        pool_kwargs = {}
         if _is_npu:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
                 DSV4NPUTokenToKVPool,
@@ -1083,6 +1087,18 @@ class KVCacheConfigurator:
                 ratio=128,
                 page_size=get_schedule().page_size,
                 max_num_reqs=max_running_requests,
+            )
+        elif dsv4_shared_rank is not None:
+            from sglang.srt.mem_cache.deepseek_v4_shared import (
+                SharedDeepSeekV4TokenToKVPool,
+                supports_dsv4_shared_demand_cache,
+            )
+
+            pool_cls = SharedDeepSeekV4TokenToKVPool
+            pool_kwargs["shared_rank"] = dsv4_shared_rank
+            pool_kwargs["shared_size"] = dsv4_shared_size
+            pool_kwargs["enable_prefill_demand_cache"] = (
+                supports_dsv4_shared_demand_cache()
             )
         else:
             pool_cls = DeepSeekV4TokenToKVPool
@@ -1116,6 +1132,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            **pool_kwargs,
         )
         return token_to_kv_pool
 

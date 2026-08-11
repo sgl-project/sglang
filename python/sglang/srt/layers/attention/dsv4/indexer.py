@@ -32,6 +32,9 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
 )
+from sglang.srt.layers.attention.dsv4.shared_cache_access import (
+    get_dsv4_shared_cache_access,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -644,6 +647,7 @@ class C4IndexerBackendMixin:
         if forward_batch.forward_mode.is_idle():
             return
         token_to_kv_pool = self.token_to_kv_pool
+        shared_access = get_dsv4_shared_cache_access(token_to_kv_pool)
 
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -684,6 +688,9 @@ class C4IndexerBackendMixin:
                 forward_batch=forward_batch,
                 skip_compressor=skip_compressor,
             )
+
+        if shared_access is not None:
+            shared_access.publish_writes()
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
 

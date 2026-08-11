@@ -255,6 +255,8 @@ struct FusedKNormRopeFlashMLAParams {
   int64_t kv_stride_batch;
   uint32_t batch_size;
   float eps;
+  uint32_t owner_rank;
+  uint32_t owner_size;
 };
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, int32_t kPageBits, bool kUsePDL>
@@ -323,7 +325,11 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   // here, not at the load, so the out_loc prefetch overlaps the norm above.
   if (out_loc < 0) return;
 
-  const int32_t page = out_loc >> kPageBits;
+  int32_t page = out_loc >> kPageBits;
+  if (params.owner_size > 1) {
+    if (static_cast<uint32_t>(page) % params.owner_size != params.owner_rank) return;
+    page /= static_cast<int32_t>(params.owner_size);
+  }
   const int32_t offset = out_loc & ((1 << kPageBits) - 1);
   const auto page_ptr = params.kvcache + page * kPageBytes;
   const auto value_ptr = page_ptr + offset * 576;
@@ -373,7 +379,9 @@ struct FusedKNormRopeFlashMLAKernel {
       const tvm::ffi::TensorView positions,
       const tvm::ffi::TensorView out_loc,
       const tvm::ffi::TensorView kvcache,
-      float eps) {
+      float eps,
+      const int64_t owner_rank,
+      const int64_t owner_size) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -410,6 +418,8 @@ struct FusedKNormRopeFlashMLAKernel {
 
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     if (batch_size == 0) return;
+    RuntimeCheck(owner_size > 0);
+    RuntimeCheck(owner_rank >= 0 && owner_rank < owner_size);
 
     const auto params = FusedKNormRopeFlashMLAParams{
         .kv = kv.data_ptr(),
@@ -421,6 +431,8 @@ struct FusedKNormRopeFlashMLAKernel {
         .kv_stride_batch = kv.stride(0),
         .batch_size = batch_size,
         .eps = eps,
+        .owner_rank = static_cast<uint32_t>(owner_rank),
+        .owner_size = static_cast<uint32_t>(owner_size),
     };
     const auto k_int32 = kernel<int32_t>;
     const auto k_int64 = kernel<int64_t>;
