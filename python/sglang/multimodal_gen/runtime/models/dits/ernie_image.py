@@ -19,6 +19,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
+from sglang.kernels.ops.diffusion.bitexact_gate import (
+    BitExactFusionGate,
+    tensors_equal,
+)
 from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.kernels.ops.diffusion.triton.rmsnorm_scale_shift_bitexact import (
     can_use_fused_rmsnorm_scale_shift,
@@ -53,10 +57,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-_ERNIE_FUSED_NORM_DISABLED = False
-_ERNIE_FUSED_NORM_VERIFIED = False
-_ERNIE_FUSED_GATED_NORM_DISABLED = False
-_ERNIE_FUSED_GATED_NORM_VERIFIED = False
+_ERNIE_NORM = BitExactFusionGate("ERNIE fused-norm")
+_ERNIE_GATED_NORM = BitExactFusionGate("ERNIE fused gated-norm")
 
 
 def _eager_norm_scale_shift(
@@ -76,36 +78,31 @@ def _ernie_norm_scale_shift(
     first call verifies ``torch.equal`` against the eager chain and disables
     the fast path permanently on any mismatch.
     """
-    global _ERNIE_FUSED_NORM_DISABLED, _ERNIE_FUSED_NORM_VERIFIED
-
+    verified = _ERNIE_NORM.verified
     if (
-        not _ERNIE_FUSED_NORM_DISABLED
+        not _ERNIE_NORM.disabled
         and norm.variance_size_override is None
         and can_use_fused_rmsnorm_scale_shift(x, norm.weight, scale, shift)
-        and (_ERNIE_FUSED_NORM_VERIFIED or not torch.compiler.is_compiling())
+        and (verified or _ERNIE_NORM.can_attempt_once())
     ):
         try:
             out = fused_rmsnorm_scale_shift_bitexact(
                 x, norm.weight, scale, shift, norm.variance_epsilon
             )
         except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling ERNIE fused-norm fast path: {exc}")
-            _ERNIE_FUSED_NORM_DISABLED = True
+            _ERNIE_NORM.on_exception(exc, logger=logger)
         else:
-            if _ERNIE_FUSED_NORM_VERIFIED:
+            if verified:
                 return out
-            ref = _eager_norm_scale_shift(norm, x, scale, shift)
-            if torch.equal(out, ref):
-                _ERNIE_FUSED_NORM_VERIFIED = True
-                return out
-            logger.warning_once(
-                "ERNIE fused-norm fast path is not bit-exact against this "
-                "platform's rmsnorm dispatch; falling back to eager"
+            return _ERNIE_NORM.accept_or_fallback(
+                out,
+                _eager_norm_scale_shift(norm, x, scale, shift),
+                logger=logger,
+                mismatch_msg=(
+                    "ERNIE fused-norm fast path is not bit-exact against this "
+                    "platform's rmsnorm dispatch; falling back to eager"
+                ),
             )
-            _ERNIE_FUSED_NORM_DISABLED = True
-            return ref
 
     return _eager_norm_scale_shift(norm, x, scale, shift)
 
@@ -124,15 +121,14 @@ def _ernie_gated_norm_scale_shift(
     (and the ``residual_gate_add_cuda`` fast path) + norm chain; first call
     self-verifies like :func:`_ernie_norm_scale_shift`.
     """
-    global _ERNIE_FUSED_GATED_NORM_DISABLED, _ERNIE_FUSED_GATED_NORM_VERIFIED
-
+    verified = _ERNIE_GATED_NORM.verified
     if (
-        not _ERNIE_FUSED_GATED_NORM_DISABLED
+        not _ERNIE_GATED_NORM.disabled
         and norm.variance_size_override is None
         and can_use_fused_scale_residual_rmsnorm_scale_shift(
             residual, update, gate, norm.weight, scale, shift
         )
-        and (_ERNIE_FUSED_GATED_NORM_VERIFIED or not torch.compiler.is_compiling())
+        and (verified or _ERNIE_GATED_NORM.can_attempt_once())
     ):
         try:
             out, res = fused_scale_residual_rmsnorm_scale_shift_bitexact(
@@ -145,24 +141,22 @@ def _ernie_gated_norm_scale_shift(
                 norm.variance_epsilon,
             )
         except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling ERNIE fused gated-norm fast path: {exc}")
-            _ERNIE_FUSED_GATED_NORM_DISABLED = True
+            _ERNIE_GATED_NORM.on_exception(exc, logger=logger)
         else:
-            if _ERNIE_FUSED_GATED_NORM_VERIFIED:
+            if verified:
                 return out, res
             res_ref = residual + gate * update
             ref = _eager_norm_scale_shift(norm, res_ref, scale, shift)
-            if torch.equal(out, ref) and torch.equal(res, res_ref):
-                _ERNIE_FUSED_GATED_NORM_VERIFIED = True
-                return out, res
-            logger.warning_once(
-                "ERNIE fused gated-norm fast path is not bit-exact against "
-                "this platform's rmsnorm dispatch; falling back to eager"
+            return _ERNIE_GATED_NORM.accept_or_fallback(
+                (out, res),
+                (ref, res_ref),
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "ERNIE fused gated-norm fast path is not bit-exact against "
+                    "this platform's rmsnorm dispatch; falling back to eager"
+                ),
             )
-            _ERNIE_FUSED_GATED_NORM_DISABLED = True
-            return ref, res_ref
 
     res = residual_gate_add(residual, update, gate)
     return _eager_norm_scale_shift(norm, res, scale, shift), res

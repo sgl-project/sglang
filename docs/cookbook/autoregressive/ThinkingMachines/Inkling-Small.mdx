@@ -307,6 +307,6 @@ To try it, select the **Long Context** strategy in the Deploy panel above for an
 
 ### 3.7 DSpark (Speculative Decoding)
 
-The **DSpark** deploy strategy is the second speculative-decoding path for Inkling-Small. Unlike **MTP**, which drives Inkling-Small's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — `RadixArk/Inkling-Small-DSpark-Preview` — served unquantized alongside the NVFP4 target.
+The **DSpark** deploy strategy is the second speculative-decoding path for Inkling-Small. Unlike **MTP**, which drives Inkling-Small's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — `RadixArk/Inkling-Small-DSpark` — served unquantized alongside the NVFP4 target.
 
 DSpark support ships in the images listed in §1 (`dev-inkling-dspark` for CUDA 13, `dev-cu12-inkling-dspark` for CUDA 12), so no separate build is needed. Verified end-to-end on B200 (TP=8, NVFP4).
