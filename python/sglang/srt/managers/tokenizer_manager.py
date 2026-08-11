@@ -73,10 +73,10 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
-    MMEmbeddingCacheAcquire,
-    MMEmbeddingCacheAcquireOutput,
-    MMEmbeddingCacheLeaseMissOutput,
-    MMEmbeddingCacheRelease,
+    MMEmbeddingCacheAcquireReqInput,
+    MMEmbeddingCacheAcquireReqOutput,
+    MMEmbeddingCacheLeaseMissReqOutput,
+    MMEmbeddingCacheReleaseReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     ScaleElasticEPReqInput,
@@ -581,7 +581,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.event_loop = None
         self.asyncio_tasks = set()
         self._mm_cache_acquire_futures: Dict[
-            str, asyncio.Future[MMEmbeddingCacheAcquireOutput]
+            str, asyncio.Future[MMEmbeddingCacheAcquireReqOutput]
         ] = {}
         self._mm_cache_retry_contexts: Dict[str, _MMCacheRetryContext] = {}
 
@@ -765,11 +765,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
                 (
-                    MMEmbeddingCacheAcquireOutput,
+                    MMEmbeddingCacheAcquireReqOutput,
                     self._handle_mm_embedding_cache_acquire_output,
                 ),
                 (
-                    MMEmbeddingCacheLeaseMissOutput,
+                    MMEmbeddingCacheLeaseMissReqOutput,
                     self._handle_mm_embedding_cache_lease_miss,
                 ),
             ]
@@ -1347,11 +1347,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: GenerateReqInput,
         input_ids,
         feature_hashes: tuple[Optional[int], ...],
-    ) -> MMEmbeddingCacheAcquireOutput:
+    ) -> MMEmbeddingCacheAcquireReqOutput:
         acquire_id = f"{obj.rid}:mm-cache:{uuid.uuid4().hex}"
         future = asyncio.get_running_loop().create_future()
         self._mm_cache_acquire_futures[acquire_id] = future
-        request = MMEmbeddingCacheAcquire(
+        request = MMEmbeddingCacheAcquireReqInput(
             rid=acquire_id,
             feature_hashes=list(feature_hashes),
             input_ids=list(input_ids or []),
@@ -1366,14 +1366,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _release_mm_embedding_cache(self, lease_id: str, routed_dp_rank: int) -> None:
         self._dispatch_to_scheduler(
-            MMEmbeddingCacheRelease(
+            MMEmbeddingCacheReleaseReqInput(
                 lease_id=lease_id,
                 routed_dp_rank=routed_dp_rank,
             )
         )
 
     def _handle_mm_embedding_cache_acquire_output(
-        self, output: MMEmbeddingCacheAcquireOutput
+        self, output: MMEmbeddingCacheAcquireReqOutput
     ) -> None:
         future = self._mm_cache_acquire_futures.get(output.rid)
         if future is not None and not future.done():
@@ -1384,7 +1384,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._release_mm_embedding_cache(output.lease_id, output.routed_dp_rank)
 
     def _handle_mm_embedding_cache_lease_miss(
-        self, output: MMEmbeddingCacheLeaseMissOutput
+        self, output: MMEmbeddingCacheLeaseMissReqOutput
     ) -> None:
         context = self._mm_cache_retry_contexts.pop(output.rid, None)
         if context is None:

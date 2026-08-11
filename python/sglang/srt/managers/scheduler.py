@@ -145,10 +145,10 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
-    MMEmbeddingCacheAcquire,
-    MMEmbeddingCacheAcquireOutput,
-    MMEmbeddingCacheLeaseMissOutput,
-    MMEmbeddingCacheRelease,
+    MMEmbeddingCacheAcquireReqInput,
+    MMEmbeddingCacheAcquireReqOutput,
+    MMEmbeddingCacheLeaseMissReqOutput,
+    MMEmbeddingCacheReleaseReqInput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -1522,8 +1522,8 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
-                (MMEmbeddingCacheAcquire, self.acquire_mm_embedding_cache),
-                (MMEmbeddingCacheRelease, self.release_mm_embedding_cache),
+                (MMEmbeddingCacheAcquireReqInput, self.acquire_mm_embedding_cache),
+                (MMEmbeddingCacheReleaseReqInput, self.release_mm_embedding_cache),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -1613,15 +1613,15 @@ class Scheduler(
         )
 
     def acquire_mm_embedding_cache(
-        self, recv_req: MMEmbeddingCacheAcquire
-    ) -> MMEmbeddingCacheAcquireOutput:
+        self, recv_req: MMEmbeddingCacheAcquireReqInput
+    ) -> MMEmbeddingCacheAcquireReqOutput:
         """Pin per-image embeddings only when every required TP rank has them."""
         from sglang.srt.managers import mm_schedule
 
         # The vision tower and its embedding cache live on the first PP stage.
         # Later stages still receive control messages but must not create pins.
         if self.ps.pp_rank != 0:
-            return MMEmbeddingCacheAcquireOutput(
+            return MMEmbeddingCacheAcquireReqOutput(
                 rid=recv_req.rid,
                 hit_mask=[False] * len(recv_req.feature_hashes),
                 lease_id=None,
@@ -1653,7 +1653,7 @@ class Scheduler(
             ]
             cache.release_lease_hashes(lease_id, rejected_hashes)
 
-        return MMEmbeddingCacheAcquireOutput(
+        return MMEmbeddingCacheAcquireReqOutput(
             rid=recv_req.rid,
             hit_mask=hit_mask,
             lease_id=lease_id if any(hit_mask) else None,
@@ -1661,7 +1661,7 @@ class Scheduler(
         )
 
     @staticmethod
-    def release_mm_embedding_cache(recv_req: MMEmbeddingCacheRelease) -> None:
+    def release_mm_embedding_cache(recv_req: MMEmbeddingCacheReleaseReqInput) -> None:
         from sglang.srt.managers import mm_schedule
 
         if mm_schedule.embedding_cache is not None:
@@ -1669,7 +1669,7 @@ class Scheduler(
 
     def _validate_mm_embedding_leases(
         self, recv_req: TokenizedGenerateReqInput
-    ) -> Optional[MMEmbeddingCacheLeaseMissOutput]:
+    ) -> Optional[MMEmbeddingCacheLeaseMissReqOutput]:
         """Reject a featureless request before it enters scheduler queues."""
         from sglang.srt.managers import mm_schedule
         from sglang.srt.mem_cache.multimodal_cache import (
@@ -1712,7 +1712,7 @@ class Scheduler(
         if cache is not None:
             for lease_id in lease_ids:
                 cache.release_lease(lease_id)
-        return MMEmbeddingCacheLeaseMissOutput(
+        return MMEmbeddingCacheLeaseMissReqOutput(
             rid=recv_req.rid,
             lease_id=invalid_lease_id,
             routed_dp_rank=self.ps.dp_rank or 0,

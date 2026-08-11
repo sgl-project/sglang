@@ -1595,7 +1595,7 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
-class MMEmbeddingCacheAcquire(BaseReq, kw_only=True):
+class MMEmbeddingCacheAcquireReqInput(BaseReq, kw_only=True):
     feature_hashes: List[Optional[int]]
     input_ids: List[int]
     routed_dp_rank: Optional[int] = None
@@ -1603,18 +1603,18 @@ class MMEmbeddingCacheAcquire(BaseReq, kw_only=True):
     ttl_s: float = 300.0
 
 
-class MMEmbeddingCacheAcquireOutput(BaseReq, kw_only=True):
+class MMEmbeddingCacheAcquireReqOutput(BaseReq, kw_only=True):
     hit_mask: List[bool]
     lease_id: Optional[str]
     routed_dp_rank: int
 
 
-class MMEmbeddingCacheRelease(BaseReq, kw_only=True):
+class MMEmbeddingCacheReleaseReqInput(BaseReq, kw_only=True):
     lease_id: str
     routed_dp_rank: int
 
 
-class MMEmbeddingCacheLeaseMissOutput(BaseReq, kw_only=True):
+class MMEmbeddingCacheLeaseMissReqOutput(BaseReq, kw_only=True):
     lease_id: str
     routed_dp_rank: int
 
