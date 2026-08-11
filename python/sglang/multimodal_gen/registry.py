@@ -1077,6 +1077,7 @@ def _register_configs():
         pipeline_config_cls=Cosmos3Config,
         hf_model_paths=[
             "nvidia/Cosmos3-Nano",
+            "nvidia/Cosmos3-Nano-Policy-DROID",
             "nvidia/Cosmos3-Super",
             "nvidia/Cosmos3-Super-Text2Image",
             "nvidia/Cosmos3-Super-Image2Video",
