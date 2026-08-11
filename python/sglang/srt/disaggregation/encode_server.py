@@ -2666,7 +2666,13 @@ class MMEncoder:
             offset = 0
             for req, n in zip(requests, items_per_req):
                 slices = final_slices[offset : offset + n]
-                emb = slices[0] if n == 1 else torch.cat(slices, dim=0)
+                emb = (
+                    slices[0]
+                    if n == 1
+                    else torch.cat(
+                        [s if s.is_cuda else s.cuda() for s in slices], dim=0
+                    ).cpu()
+                )
                 req_aux_data = {}
                 if aux_data.get("original_image_sizes") is not None:
                     req_aux_data["original_image_sizes"] = aux_data[
