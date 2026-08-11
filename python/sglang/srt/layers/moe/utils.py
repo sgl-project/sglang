@@ -232,10 +232,11 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     0. Parse server argument.
     1. Parse deprecated environment variables.
     2. If quant_config contains input_global_scale → NVFP4 path.
-    3. Parse quant config
-    4. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
-    5. Otherwise default for NPU → BF16 (the default for NPU).
-    6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
+    3. Parse a mode-specific dtype from quant_config.
+    4. Parse a generic dtype from quant_config.
+    5. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
+    6. Otherwise default for NPU → BF16 (the default for NPU).
+    7. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
 
     # 0. Parse server argument.
@@ -258,12 +259,23 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
         if input_global_scale is not None:
             return DispatcherOutputDtype.NVFP4
 
-        # 3. Parse quant config to determine the output dtype of dispatcher
+        # 3. Some MoE kernels require different wire formats for prefill and
+        # decode. Prefer a mode-specific override when the dispatcher exposes
+        # its concrete mode (normal or low_latency).
+        dispatch_mode = getattr(self, "dispatch_mode", None)
+        if dispatch_mode is not None:
+            mode_dispatcher_output_dtype = self.quant_config.get(
+                f"{dispatch_mode.value}_dispatcher_output_dtype", None
+            )
+            if mode_dispatcher_output_dtype is not None:
+                return DispatcherOutputDtype(mode_dispatcher_output_dtype)
+
+        # 4. Parse quant config to determine the output dtype of dispatcher
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 4. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
+    # 5. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
     if (
         get_moe_runner_backend().is_flashinfer_cutedsl()
         or get_moe_runner_backend().is_cutlass()
@@ -271,11 +283,11 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     ):
         return DispatcherOutputDtype.BF16
 
-    # 5. Default on NPU → BF16
+    # 6. Default on NPU → BF16
     if _is_npu:
         return DispatcherOutputDtype.BF16
 
-    # 6. Default → FP8
+    # 7. Default → FP8
     return DispatcherOutputDtype.FP8
 
 

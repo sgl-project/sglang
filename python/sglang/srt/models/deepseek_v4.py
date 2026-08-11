@@ -1942,7 +1942,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            # self_attn has already reduced across attention TP, so these hidden
+            # states are replicated and must not be summed by a partial gather.
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
@@ -2465,7 +2467,10 @@ class DeepseekV4Model(nn.Module):
             )
             # Token ids are replicated within an attention-TP group. Use replicate
             # gather here to avoid summing duplicated ids when attention_tp_size > 1.
-            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
+            # Clone because the MAX_LEN gather may zero its local input in place.
+            dp_gather_replicate(
+                input_ids_global, input_ids[:, None].clone(), forward_batch
+            )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
