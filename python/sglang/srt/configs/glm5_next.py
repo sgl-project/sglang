@@ -280,10 +280,20 @@ class Glm5NextTextConfig(PretrainedConfig):
         return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
 
 
+class Glm5NextVisionConfig(GlmOcrVisionConfig):
+    def __init__(
+        self,
+        swiglu_limit: float,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.swiglu_limit = swiglu_limit
+
+
 class Glm5NextConfig(PretrainedConfig):
     model_type = "glm5_next"
     sub_configs = {
-        "vision_config": GlmOcrVisionConfig,
+        "vision_config": Glm5NextVisionConfig,
         "text_config": Glm5NextTextConfig,
     }
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -306,13 +316,6 @@ class Glm5NextConfig(PretrainedConfig):
             if key in kwargs
         }
 
-        if isinstance(vision_config, dict):
-            self.vision_config = self.sub_configs["vision_config"](**vision_config)
-        elif vision_config is None:
-            self.vision_config = self.sub_configs["vision_config"]()
-        else:
-            self.vision_config = vision_config
-
         if isinstance(text_config, dict):
             text_config = {**top_level_text_config, **text_config}
             self.text_config = self.sub_configs["text_config"](**text_config)
@@ -320,6 +323,20 @@ class Glm5NextConfig(PretrainedConfig):
             self.text_config = self.sub_configs["text_config"](**top_level_text_config)
         else:
             self.text_config = text_config
+
+        text_swiglu_limit = getattr(self.text_config, "swiglu_limit", None)
+        if isinstance(vision_config, dict):
+            vision_config = dict(vision_config)
+        elif vision_config is None:
+            vision_config = {}
+        else:
+            vision_config = vision_config.to_dict()
+
+        swiglu_limit = vision_config.get("swiglu_limit", text_swiglu_limit)
+        if swiglu_limit is None:
+            raise ValueError("GLM-5 Next vision_config requires swiglu_limit")
+        vision_config["swiglu_limit"] = swiglu_limit
+        self.vision_config = self.sub_configs["vision_config"](**vision_config)
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
