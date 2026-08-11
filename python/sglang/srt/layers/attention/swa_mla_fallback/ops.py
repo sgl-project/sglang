@@ -86,9 +86,7 @@ def gather_page64_kv_latent(
         dtype=k_cache.dtype,
         device=k_cache.device,
     )
-    kv_valid = torch.empty(
-        (bs, gather_len), dtype=torch.bool, device=k_cache.device
-    )
+    kv_valid = torch.empty((bs, gather_len), dtype=torch.bool, device=k_cache.device)
 
     block_t = 8
     block_d = 128

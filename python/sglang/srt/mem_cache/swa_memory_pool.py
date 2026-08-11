@@ -100,9 +100,7 @@ class SWAKVPool(BaseSWAKVPool):
         self.kv_cache_dim = None
         self.index_head_dim = None
         if isinstance(self.full_kv_pool, MLATokenToKVPool):
-            self.dsa_kv_cache_store_fp8 = (
-                self.full_kv_pool.dsa_kv_cache_store_fp8
-            )
+            self.dsa_kv_cache_store_fp8 = self.full_kv_pool.dsa_kv_cache_store_fp8
             self.kv_cache_dim = self.full_kv_pool.kv_cache_dim
         if isinstance(self.full_kv_pool, DSATokenToKVPool):
             self.index_head_dim = self.full_kv_pool.index_head_dim
@@ -290,9 +288,7 @@ class SWAKVPool(BaseSWAKVPool):
     def get_index_k_continuous(self, layer_id: int, *args, **kwargs):
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         assert not is_swa_layer
-        return self.full_kv_pool.get_index_k_continuous(
-            layer_id_pool, *args, **kwargs
-        )
+        return self.full_kv_pool.get_index_k_continuous(layer_id_pool, *args, **kwargs)
 
     def get_index_k_scale_continuous(self, layer_id: int, *args, **kwargs):
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]

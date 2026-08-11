@@ -8,6 +8,11 @@ from deep_gemm import (
     get_mn_major_tma_aligned_tensor,
     per_block_cast_to_fp8,
 )
+from torch import nn
+from torch.nn import LayerNorm
+from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_utils import PreTrainedModel
+
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
@@ -15,10 +20,6 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention as SGLVisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.layernorm import RMSNorm
-from torch import nn
-from torch.nn import LayerNorm
-from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_utils import PreTrainedModel
 
 
 class VisionRotaryEmbedding(nn.Module):

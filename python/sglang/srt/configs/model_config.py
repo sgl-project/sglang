@@ -937,9 +937,7 @@ class ModelConfig:
 
             if isinstance(self.hf_text_config, Dots3Config):
                 self.swa_kv_lora_rank = self.hf_text_config.swa_kv_lora_rank
-                self.swa_qk_rope_head_dim = (
-                    self.hf_text_config.swa_qk_rope_head_dim
-                )
+                self.swa_qk_rope_head_dim = self.hf_text_config.swa_qk_rope_head_dim
             else:
                 self.swa_kv_lora_rank = self.kv_lora_rank
                 self.swa_qk_rope_head_dim = self.qk_rope_head_dim

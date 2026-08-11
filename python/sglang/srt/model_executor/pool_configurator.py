@@ -531,9 +531,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     )
                     self._draft_swa_full_layers_num = banded_depths
                 else:
-                    draft_swa_layers = (
-                        kvc.spec_aux_config.eagle_draft_swa_num_layers
-                    )
+                    draft_swa_layers = kvc.spec_aux_config.eagle_draft_swa_num_layers
                     if draft_swa_layers is not None:
                         self._draft_swa_layers_num = min(
                             max(int(draft_swa_layers), 0), draft_layers

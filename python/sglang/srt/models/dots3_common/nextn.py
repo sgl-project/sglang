@@ -4,6 +4,9 @@ import logging
 from collections.abc import Iterable
 
 import torch
+from torch import nn
+from transformers import PretrainedConfig
+
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -22,8 +25,6 @@ from sglang.srt.models.dots3_common.modeling import (
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix
-from torch import nn
-from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 

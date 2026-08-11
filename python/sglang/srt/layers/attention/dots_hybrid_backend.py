@@ -34,10 +34,7 @@ class DotsHybridAttnBackend(AttentionBackend):
 
     @staticmethod
     def _is_swa_layer(layer: RadixAttention) -> bool:
-        return (
-            layer.sliding_window_size is not None
-            and layer.sliding_window_size > -1
-        )
+        return layer.sliding_window_size is not None and layer.sliding_window_size > -1
 
     def backend_for_layer(self, layer: RadixAttention) -> AttentionBackend:
         return self.swa_backend if self._is_swa_layer(layer) else self.dsa_backend

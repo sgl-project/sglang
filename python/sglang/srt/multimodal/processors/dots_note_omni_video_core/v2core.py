@@ -78,9 +78,7 @@ def v2_solve_degrade(
 
     def _patch_of(pf):
         if _use_real:
-            return real_patches_at(
-                orig_h, orig_w, max(pf_floor, round(pf)), pf_floor
-            )
+            return real_patches_at(orig_h, orig_w, max(pf_floor, round(pf)), pf_floor)
         return round(pf)
 
     def usage(r):

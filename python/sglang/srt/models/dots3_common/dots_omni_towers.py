@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+
 from sglang.srt.models.dots3_common.dots_omni_audio import (
     OmniAudioConfig,
     OmniAudioModel,

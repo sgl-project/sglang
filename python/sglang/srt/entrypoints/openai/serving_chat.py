@@ -38,11 +38,11 @@ from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
-    ChatCompletionMessageGenericParam,
-    ChatCompletionRequest,
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
+    ChatCompletionMessageGenericParam,
     ChatCompletionMessageUserParam,
+    ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionResponseStreamChoice,
@@ -206,6 +206,8 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
             for key, item in value.items()
         }
     return value
+
+
 def _extract_video_question(request: ChatCompletionRequest) -> Optional[str]:
     """Return text paired with a video in the last user turn."""
     for message in reversed(request.messages or []):
@@ -215,8 +217,7 @@ def _extract_video_question(request: ChatCompletionRequest) -> Optional[str]:
         if not isinstance(content, list):
             continue
         has_video = any(
-            isinstance(part, ChatCompletionMessageContentVideoPart)
-            for part in content
+            isinstance(part, ChatCompletionMessageContentVideoPart) for part in content
         )
         if not has_video:
             continue

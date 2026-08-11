@@ -11,6 +11,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 import torch
+
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import (
     Modality,

@@ -10,8 +10,6 @@ from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-from sglang.srt.layers.rotary_embedding.utils import rotate_neox
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.audio_utils import mel_filter_bank
@@ -19,6 +17,9 @@ from transformers.modeling_outputs import BaseModelOutput
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.whisper.configuration_whisper import WhisperConfig
 from transformers.utils import logging
+
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.srt.layers.rotary_embedding.utils import rotate_neox
 
 logger = logging.get_logger(__name__)
 
@@ -917,7 +918,8 @@ class DotsEncoderWithMask(nn.Module):
         while time_step * SAMPLE_RATE < audio_waveform.shape[0]:
             segments.append(
                 audio_waveform[
-                    time_step * SAMPLE_RATE : (time_step + self.chunk_seconds)
+                    time_step
+                    * SAMPLE_RATE : (time_step + self.chunk_seconds)
                     * SAMPLE_RATE
                 ]
             )

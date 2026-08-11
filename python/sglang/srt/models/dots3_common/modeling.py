@@ -21,14 +21,31 @@ import logging
 import math
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import Any, Callable, Iterable, List, Optional, Protocol, Tuple, Union
-from typing import runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+    runtime_checkable,
+)
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+    per_token_group_quant_einsum_fp8,
+)
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    MaybeTboDeepEPDispatcher,
+    model_forward_maybe_tbo,
+)
 from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -43,6 +60,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.communicator import (
@@ -64,18 +82,13 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     SupportsWeightBlockSize,
-)
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    is_fp8_fnuz,
-    per_token_group_quant_einsum_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
@@ -97,6 +110,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -106,11 +120,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
 )
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.batch_overlap.two_batch_overlap import (
-    MaybeTboDeepEPDispatcher,
-    model_forward_maybe_tbo,
-)
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -125,8 +135,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
-
 
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -136,6 +144,7 @@ if not _is_cuda:
     raise RuntimeError("Dots3 model only supports CUDA backend.")
 
 from sgl_kernel import merge_state_v2
+
 from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
 
 logger = logging.getLogger(__name__)
@@ -368,8 +377,7 @@ class Dots3MoE(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
-                config.n_routed_experts
-                + get_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_server_args().ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -725,16 +733,14 @@ class Dots3AttentionMLA(nn.Module):
         self.num_heads = attn_config.num_attention_heads
         assert self.num_heads % attn_tp_size == 0
         self.num_local_heads = self.num_heads // attn_tp_size
-        assert attn_config.num_attention_heads == attn_config.num_key_value_heads, (
-            "Dots3 Only supports equal number of query and key value heads."
-        )
+        assert (
+            attn_config.num_attention_heads == attn_config.num_key_value_heads
+        ), "Dots3 Only supports equal number of query and key value heads."
         self.attention_gate_type = attn_config.attention_gate_type
         assert self.attention_gate_type in {
             "headwise",
             "elementwise",
-        }, (
-            f"Unsupported attention_gate_type: {self.attention_gate_type}. Expected 'headwise' or 'elementwise'."
-        )
+        }, f"Unsupported attention_gate_type: {self.attention_gate_type}. Expected 'headwise' or 'elementwise'."
         self.g_proj_local_dim = self.num_local_heads * (
             1 if self.attention_gate_type == "headwise" else self.v_head_dim
         )
@@ -745,9 +751,7 @@ class Dots3AttentionMLA(nn.Module):
         # For tensor parallel attention
         assert self.q_lora_rank is not None, "Dots3AttentionMLA requires q_lora_rank."
         scale_block_n = _get_scale_block_n(quant_config)
-        self.qk_rope_head_dim_padded = ceil_align(
-            self.qk_rope_head_dim, scale_block_n
-        )
+        self.qk_rope_head_dim_padded = ceil_align(self.qk_rope_head_dim, scale_block_n)
         # NOTE(xiaozhi): For the sake of DeepGEMM kernel, we align the g_proj_local_dim to 8.
         self.g_proj_local_dim_padded = ceil_align(
             self.g_proj_local_dim, max(8, scale_block_n)
@@ -826,9 +830,9 @@ class Dots3AttentionMLA(nn.Module):
 
         # Optional NSA (Native Sparse Attention) indexer.
         if self.use_nsa:
-            assert self.q_lora_rank is not None, (
-                "Dots3 NSA requires q_lora_rank to be set in the config."
-            )
+            assert (
+                self.q_lora_rank is not None
+            ), "Dots3 NSA requires q_lora_rank to be set in the config."
             self.indexer = Indexer(
                 hidden_size=self.hidden_size,
                 index_n_heads=config.index_n_heads,
@@ -1052,9 +1056,9 @@ class Dots3AttentionMLA(nn.Module):
         zero_allocator: BumpAllocator,
     ):
         if hidden_states.shape[0] == 0:
-            assert not self.o_proj.reduce_results, (
-                "short-circuiting allreduce will lead to hangs"
-            )
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
@@ -1076,9 +1080,7 @@ class Dots3AttentionMLA(nn.Module):
         return None, attn_forward_method, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
-        hidden_states, attn_forward_method, _, inner_state = (
-            intermediate_state
-        )
+        hidden_states, attn_forward_method, _, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
 
@@ -1381,9 +1383,7 @@ class Dots3AttentionMLA(nn.Module):
                 FlashAttentionBackend,
             )
 
-            if isinstance(
-                backend, (DotsHybridAttnBackend, FlashAttentionBackend)
-            ):
+            if isinstance(backend, (DotsHybridAttnBackend, FlashAttentionBackend)):
                 backend.init_mha_chunk_metadata(forward_batch)
 
         # Zero padded V rows because FA3 tiles may read past cu_seqlens_q[-1].
@@ -1501,9 +1501,7 @@ class Dots3AttentionMLA(nn.Module):
             q, k, v, self.attn_mha, forward_batch
         )
         attn_output = self._apply_attention_gate(attn_output, g)
-        attn_output = attn_output.reshape(
-            -1, self.num_local_heads * self.v_head_dim
-        )
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         return self.o_proj(attn_output)[0]
 
 
@@ -1850,9 +1848,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         # for quark model load
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
         self.fuse_qkv_a_g_proj = True
-        assert config.q_lora_rank is not None, (
-            "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
-        )
+        assert (
+            config.q_lora_rank is not None
+        ), "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
         if self.fuse_qkv_a_g_proj:
             self.packed_modules_mapping["fused_qkv_a_g_proj_with_mqa"] = [
                 "q_a_proj",
@@ -1895,8 +1893,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         if (
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
-            or hf_config.architectures[0]
-            != cls.fused_shared_experts_architecture
+            or hf_config.architectures[0] != cls.fused_shared_experts_architecture
             or hf_config.n_routed_experts != 256
             or hf_config.n_shared_experts != 1
         ):
@@ -1904,14 +1901,14 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         if get_moe_expert_parallel_world_size() > 1:
             return "Dots3 shared-expert fusion is unsupported with expert parallelism."
         if quant_config is not None and quant_config.get_name() == "w4afp8":
-            return "Dots3 W4AFP8 shared and routed experts use incompatible quantization."
+            return (
+                "Dots3 W4AFP8 shared and routed experts use incompatible quantization."
+            )
         return None
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = (
-            0
-            if is_shared_experts_fusion_disabled()
-            else self.config.n_shared_experts
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -2037,16 +2034,12 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 assert (
                     isinstance(self.quant_config, SupportsWeightBlockSize)
                     and self.quant_config.weight_block_size is not None
-                ), (
-                    "Dots3 MLA kv_b_proj only supports FP8 block quantization with weight_block_size=(128, 128)."
-                )
+                ), "Dots3 MLA kv_b_proj only supports FP8 block quantization with weight_block_size=(128, 128)."
                 weight_block_size = tuple(self.quant_config.weight_block_size)
                 assert weight_block_size == (
                     128,
                     128,
-                ), (
-                    f"Dots3 MLA kv_b_proj only supports FP8 block_size=(128, 128), got {weight_block_size}."
-                )
+                ), f"Dots3 MLA kv_b_proj only supports FP8 block_size=(128, 128), got {weight_block_size}."
                 block_scale = self_attn.kv_b_proj.weight_scale_inv
 
                 if not (
@@ -2064,9 +2057,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         torch.bfloat16,
                     )
             else:
-                assert w.dtype == torch.bfloat16, (
-                    f"Dots3 MLA kv_b_proj only supports BF16 or FP8(128x128), got dtype={w.dtype}."
-                )
+                assert (
+                    w.dtype == torch.bfloat16
+                ), f"Dots3 MLA kv_b_proj only supports BF16 or FP8(128x128), got dtype={w.dtype}."
 
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
@@ -2219,9 +2212,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         def shard_g_proj_for_attention_tp(
             weight: torch.Tensor, cat_dim: int, is_scale: bool
         ):
-            assert weight.ndim > cat_dim, (
-                f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
-            )
+            assert (
+                weight.ndim > cat_dim
+            ), f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
             dim_size = weight.shape[cat_dim]
             if not is_scale:
                 assert dim_size % attn_tp_size == 0, (
@@ -2747,9 +2740,7 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         self.pp_group = language_model.pp_group
         self.tp_size = language_model.tp_size
         self.quant_config = language_model.quant_config
-        self.num_fused_shared_experts = (
-            language_model.num_fused_shared_experts
-        )
+        self.num_fused_shared_experts = language_model.num_fused_shared_experts
         self.forward = self.thinker.forward
         self.pad_input_ids = self.thinker.pad_input_ids
 

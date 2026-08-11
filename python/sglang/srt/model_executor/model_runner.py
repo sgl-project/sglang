@@ -1690,9 +1690,7 @@ class ModelRunner:
             self._prepare_eager_forward_batch(forward_batch)
 
             # Refresh rebuildable metadata after speculative DP padding.
-            get_attn_backend().normalize_forward_metadata_for_dp_padding(
-                forward_batch
-            )
+            get_attn_backend().normalize_forward_metadata_for_dp_padding(forward_batch)
 
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.

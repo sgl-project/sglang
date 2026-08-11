@@ -174,10 +174,7 @@ def _per_token_group_quant_einsum_fp8(
         + k_ids[None, :]
     )
     s_ptrs = (
-        x_s_ptr
-        + m_ids * x_s_stride_m
-        + b_ids * x_s_stride_b
-        + group_id * x_s_stride_g
+        x_s_ptr + m_ids * x_s_stride_m + b_ids * x_s_stride_b + group_id * x_s_stride_g
     )
     tl.store(q_ptrs, quant, mask=mask)
     tl.store(s_ptrs, scale, mask=row_ids < total_rows)
@@ -195,17 +192,13 @@ def per_token_group_quant_einsum_fp8(
     num_groups = (k + group_size - 1) // group_size
     aligned_m = ceil_align(m, 4)
     x_q = x.new_empty((m, b, k), dtype=torch.float8_e4m3fn)
-    scale_storage = x.new_empty(
-        (b, num_groups, aligned_m), dtype=torch.float32
-    )
+    scale_storage = x.new_empty((b, num_groups, aligned_m), dtype=torch.float32)
     x_s = scale_storage.permute(2, 0, 1)[:m]
     if m == 0 or b == 0 or num_groups == 0:
         return x_q, x_s
     block_m = 16
     block_k = triton.next_power_of_2(group_size)
-    _per_token_group_quant_einsum_fp8[
-        (triton.cdiv(m * b, block_m), num_groups)
-    ](
+    _per_token_group_quant_einsum_fp8[(triton.cdiv(m * b, block_m), num_groups)](
         x,
         x_q,
         x_s,
@@ -1502,9 +1495,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     block_size: List[int],
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    M, N, K, C = prepare_block_fp8_matmul_inputs(
-        A, B, As, Bs, block_size, output_dtype
-    )
+    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM

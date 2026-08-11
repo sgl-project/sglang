@@ -1047,9 +1047,7 @@ class FlashAttentionBackend(AttentionBackend):
                 and self.use_sliding_window_kv_pool
                 and self.sliding_window_size is not None
             ):
-                self._init_swa_mla_prefill_metadata(
-                    forward_batch, metadata, device
-                )
+                self._init_swa_mla_prefill_metadata(forward_batch, metadata, device)
 
             if self.is_prefill_aware_swa:
                 self._pa_swa_prefill_lens[
@@ -2736,9 +2734,9 @@ class FlashAttentionBackend(AttentionBackend):
             and self.speculative_num_steps > 0
             and out_cache_loc.numel() == expected_numel
         ):
-            return out_cache_loc.reshape(
-                bs, self.topk, self.speculative_num_steps
-            )[:, :, self.speculative_step_id].reshape(-1)
+            return out_cache_loc.reshape(bs, self.topk, self.speculative_num_steps)[
+                :, :, self.speculative_step_id
+            ].reshape(-1)
         return out_cache_loc
 
     def _apply_cuda_graph_metadata(
@@ -3200,9 +3198,7 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         """Prepare the logical tail of each SWA sequence for latent expansion."""
         assert forward_batch.seq_lens_cpu is not None
-        batch_kv_indices = self.req_to_token[
-            forward_batch.req_pool_indices, :
-        ]
+        batch_kv_indices = self.req_to_token[forward_batch.req_pool_indices, :]
         sliced_indices = []
         kv_lens = []
         for i in range(forward_batch.batch_size):
@@ -3213,18 +3209,14 @@ class FlashAttentionBackend(AttentionBackend):
             )
             kv_len = int(forward_batch.seq_lens_cpu[i])
             tail_len = min(q_len + self.sliding_window_size, kv_len)
-            sliced_indices.append(
-                batch_kv_indices[i, kv_len - tail_len : kv_len]
-            )
+            sliced_indices.append(batch_kv_indices[i, kv_len - tail_len : kv_len])
             kv_lens.append(tail_len)
 
         full_kv_indices = torch.cat(sliced_indices)
         kv_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
             full_kv_indices
         ).to(torch.int32)
-        lens_cpu = torch.tensor(
-            [0, *kv_lens], dtype=torch.int32, pin_memory=True
-        )
+        lens_cpu = torch.tensor([0, *kv_lens], dtype=torch.int32, pin_memory=True)
         cu_seqlens_k = torch.cumsum(
             lens_cpu.to(device=device, non_blocking=True),
             dim=0,
@@ -3245,9 +3237,7 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         metadata = self.forward_metadata.swa_mla_prefill_metadata
         assert metadata is not None
-        return self.token_to_kv_pool.get_key_buffer(layer_id)[
-            metadata.kv_indices
-        ]
+        return self.token_to_kv_pool.get_key_buffer(layer_id)[metadata.kv_indices]
 
     def forward_swa_mla_expanded(self, q, k, v, layer, forward_batch=None):
         """Run dense SWA after the model expands its compact MLA cache."""

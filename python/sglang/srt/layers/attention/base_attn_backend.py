@@ -32,6 +32,7 @@ class SharedReadEnds(Enum):
         # Ordered by lateness: the latest end covers every child.
         return max(items, key=lambda x: x.value)
 
+
 def normalize_page_table_rows(
     page_table: torch.Tensor, batch_size: int
 ) -> torch.Tensor:
