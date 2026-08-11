@@ -12,7 +12,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Above this N there are enough N-tiles to keep cuBLAS competitive at small M.
+# Above this N there are enough N-tiles to fill the GPU at a lower M.
 _NARROW_N = 8192
 
 
@@ -80,8 +80,9 @@ def is_profitable(m: int, n: int, k: int) -> bool:
         return False
     if n > _NARROW_N:
         return m >= 16
-    # Narrow N: cuBLAS wins back the 16..24 band, but loses on both sides.
-    return m < 16 or m >= 24
+    # Narrow N needs a higher M before the tile pays off; below it the GEMM is
+    # bound by streaming the weights, where cuBLAS is ahead.
+    return m >= 24
 
 
 @debug_kernel_api

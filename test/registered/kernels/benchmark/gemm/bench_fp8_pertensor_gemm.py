@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import functools
+import statistics
 import sys
 
 import torch
 import triton
 from flashinfer import bmm_fp8
+from flashinfer.testing.utils import bench_gpu_time_with_cupti
 
-from sglang.kernels.jit.benchmark.utils import (
-    get_benchmark_range,
-    run_benchmark_no_cudagraph,
-)
+from sglang.kernels.jit.benchmark.utils import get_benchmark_range
 from sglang.kernels.ops.gemm.fp8_pertensor_gemm import fp8_pertensor_scaled_mm
 from sglang.srt.utils import is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -21,6 +21,7 @@ register_cuda_ci(
 )
 
 
+@functools.lru_cache(maxsize=None)
 def _make_inputs(m: int, n: int, k: int, device: str = "cuda"):
     fp8_info = torch.finfo(torch.float8_e4m3fn)
     fp8_max, fp8_min = fp8_info.max, fp8_info.min
@@ -42,6 +43,16 @@ shape_range = get_benchmark_range(
     ],
     ci_range=[(16, 16384, 5120), (24, 5120, 6144)],
 )
+
+
+def _bench_us(fn):
+    times_ms = bench_gpu_time_with_cupti(
+        fn=fn,
+        use_cuda_graph=True,
+        cold_l2_cache=True,
+    )
+    times_us = sorted(1000.0 * t for t in times_ms)
+    return statistics.median(times_us), times_us[0], times_us[-1]
 
 
 @triton.testing.perf_report(
@@ -76,9 +87,7 @@ def benchmark(m, n, k, provider):
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    # Not run_benchmark: do_bench_cudagraph never clears L2, and these weights
-    # (up to 84MB) fit in an SM120 L2, which inverts the ranking against cuBLAS.
-    return run_benchmark_no_cudagraph(fn)
+    return _bench_us(fn)
 
 
 if __name__ == "__main__":
