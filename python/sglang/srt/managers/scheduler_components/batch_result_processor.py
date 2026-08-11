@@ -1214,6 +1214,7 @@ class SchedulerBatchResultProcessor:
             req.mamba_next_track_idx = planned_pos
         # else: in-place fallback, or promoted by an earlier confirmation —
         # keep holds the track_seqlen state either way.
+        req.mamba_last_track_idx = planned_pos
         req.mamba_last_track_seqlen = track_seqlen
 
     @staticmethod
