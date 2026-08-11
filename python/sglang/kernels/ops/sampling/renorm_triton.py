@@ -19,10 +19,15 @@ import triton.language as tl
 from sglang.kernels.ops.sampling.renorm import (
     per_row_threshold,
     top_k_pivots,
+    top_p_fast_prefix,
     top_p_pivots,
+)
+from sglang.kernels.ops.sampling.top_p_select_triton import (
+    top_p_select_hierarchical_triton,
 )
 
 _BLOCK_SIZE = 1024
+_HIERARCHICAL_TOP_P_MIN_ROWS = 24
 
 
 @triton.jit
@@ -105,24 +110,139 @@ def top_k_renorm_probs_triton(
     return apply_pivot_triton(probs, top_k_pivots(probs, top_ks))
 
 
-def top_p_renorm_probs_triton(
+def _prepare_top_p(
+    probs: torch.Tensor,
+    top_p: Union[torch.Tensor, float],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert probs.ndim == 2
+    probs = probs.float().contiguous()
+    top_ps = per_row_threshold(top_p, probs=probs, dtype=torch.float32).clamp(0.0, 1.0)
+    return probs, top_ps
+
+
+def top_p_renorm_probs_triton_baseline(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    """Keep the nucleus -- every entry at least as likely as its pivot -- and
-    renormalize."""
-    assert probs.ndim == 2
-    probs = probs.float().contiguous()
+    """Exact general top-p path with 4096-prefix selection and dense apply."""
+    probs, top_ps = _prepare_top_p(probs, top_p)
+    if probs.shape[0] == 0:
+        return probs.clone()
+    assert probs.shape[1] > 0
+    return apply_pivot_triton(probs, top_p_pivots(probs, top_ps))
+
+
+def top_p_renorm_probs_triton_scale_fast(
+    probs: torch.Tensor,
+    top_p: Union[torch.Tensor, float],
+) -> torch.Tensor:
+    """Topk32 fast selection with a pre-normalized dense scale/write pass."""
+    probs, top_ps = _prepare_top_p(probs, top_p)
     if probs.shape[0] == 0:
         return probs.clone()
     assert probs.shape[1] > 0
 
-    top_ps = per_row_threshold(top_p, probs=probs, dtype=torch.float32).clamp(0.0, 1.0)
-    return apply_pivot_triton(probs, top_p_pivots(probs, top_ps))
+    _, _, pivots, normalizers, fast_path = top_p_fast_prefix(probs, top_ps)
+    if not bool(fast_path.all()):
+        return top_p_renorm_probs_triton_baseline(probs, top_ps)
+
+    batch_size, vocab_size = probs.shape
+    grid = (batch_size, triton.cdiv(vocab_size, _BLOCK_SIZE))
+    out = torch.empty_like(probs)
+    _masked_scale_kernel[grid](
+        probs,
+        pivots,
+        normalizers,
+        out,
+        vocab_size,
+        BLOCK_SIZE=_BLOCK_SIZE,
+    )
+    return out
+
+
+def top_p_renorm_probs_triton_scatter_fast(
+    probs: torch.Tensor,
+    top_p: Union[torch.Tensor, float],
+) -> torch.Tensor:
+    """Topk32 fast selection with zero-fill and normalized prefix scatter."""
+    probs, top_ps = _prepare_top_p(probs, top_p)
+    if probs.shape[0] == 0:
+        return probs.clone()
+    assert probs.shape[1] > 0
+
+    values, indices, pivots, normalizers, fast_path = top_p_fast_prefix(probs, top_ps)
+    if not bool(fast_path.all()):
+        return top_p_renorm_probs_triton_baseline(probs, top_ps)
+
+    kept = values >= pivots.unsqueeze(1)
+    normalized = torch.where(
+        kept,
+        values / normalizers.unsqueeze(1),
+        torch.zeros_like(values),
+    )
+    return torch.zeros_like(probs).scatter_(1, indices, normalized)
+
+
+def top_p_renorm_probs_triton_hierarchical(
+    probs: torch.Tensor,
+    top_p: Union[torch.Tensor, float],
+    *,
+    chunk_size: int = 2048,
+    num_warps: int = 4,
+) -> torch.Tensor:
+    """Hierarchical fused row-sum/top32 selection with exact fallback."""
+    probs, top_ps = _prepare_top_p(probs, top_p)
+    if probs.shape[0] == 0:
+        return probs.clone()
+    assert probs.shape[1] > 0
+
+    values, _, _, _, _, _ = top_p_select_hierarchical_triton(
+        probs,
+        top_ps,
+        chunk_size=chunk_size,
+        num_warps=num_warps,
+    )
+    # Preserve the established topk32 path's reduction order exactly. A different
+    # row-sum or prefix-sum tree can move a near-boundary pivot by one token.
+    budget = probs.sum(dim=-1) - (1.0 - top_ps)
+    within = (values.cumsum(dim=-1) - values) <= budget.unsqueeze(1)
+    position = (within.sum(dim=-1) - 1).clamp(min=0)
+    pivots = values.gather(1, position.unsqueeze(1)).squeeze(1)
+    kept = values >= pivots.unsqueeze(1)
+    normalizers = torch.where(kept, values, torch.zeros_like(values)).sum(dim=-1)
+    fast_path = ~within[:, -1] & (values[:, -1] < pivots) & (normalizers > 0)
+    if not bool(fast_path.all()):
+        return top_p_renorm_probs_triton_baseline(probs, top_ps)
+
+    batch_size, vocab_size = probs.shape
+    grid = (batch_size, triton.cdiv(vocab_size, _BLOCK_SIZE))
+    out = torch.empty_like(probs)
+    _masked_scale_kernel[grid](
+        probs,
+        pivots,
+        normalizers,
+        out,
+        vocab_size,
+        BLOCK_SIZE=_BLOCK_SIZE,
+    )
+    return out
+
+
+def top_p_renorm_probs_triton(
+    probs: torch.Tensor,
+    top_p: Union[torch.Tensor, float],
+) -> torch.Tensor:
+    if torch.version.hip is not None and probs.shape[0] >= _HIERARCHICAL_TOP_P_MIN_ROWS:
+        return top_p_renorm_probs_triton_hierarchical(probs, top_p)
+    return top_p_renorm_probs_triton_scale_fast(probs, top_p)
 
 
 __all__ = [
     "apply_pivot_triton",
     "top_k_renorm_probs_triton",
     "top_p_renorm_probs_triton",
+    "top_p_renorm_probs_triton_baseline",
+    "top_p_renorm_probs_triton_hierarchical",
+    "top_p_renorm_probs_triton_scale_fast",
+    "top_p_renorm_probs_triton_scatter_fast",
 ]

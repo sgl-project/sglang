@@ -216,6 +216,247 @@ class TestPortableSpecRenorm(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "GPU is required for this test.")
+class TestTritonTopPFastPath(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.device = torch.device("cuda")
+
+    def _distribution_with_nucleus(self, nucleus_size: int, vocab_size: int = 128):
+        weights = torch.arange(
+            vocab_size,
+            0,
+            step=-1,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        probs = weights / weights.sum()
+        cumulative = probs.cumsum(dim=0)
+        lower = cumulative[nucleus_size - 2] if nucleus_size > 1 else 0.0
+        top_p = (lower + cumulative[nucleus_size - 1]) / 2
+        return probs.unsqueeze(0), top_p.unsqueeze(0)
+
+    def _assert_matches_baseline(self, probs, top_ps):
+        from sglang.kernels.ops.sampling import top_p_renorm_probs
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_p_renorm_probs_triton,
+            top_p_renorm_probs_triton_baseline,
+            top_p_renorm_probs_triton_hierarchical,
+            top_p_renorm_probs_triton_scale_fast,
+            top_p_renorm_probs_triton_scatter_fast,
+        )
+
+        expected = top_p_renorm_probs_triton_baseline(probs, top_ps)
+        functions = [
+            top_p_renorm_probs_triton_scale_fast,
+            top_p_renorm_probs_triton_scatter_fast,
+            top_p_renorm_probs_triton_hierarchical,
+            top_p_renorm_probs_triton,
+        ]
+        if torch.version.hip is not None:
+            functions.append(top_p_renorm_probs)
+        for fn in functions:
+            got = fn(probs, top_ps)
+            self.assertTrue(torch.equal(got > 0, expected > 0))
+            torch.testing.assert_close(got, expected, rtol=2e-5, atol=2e-6)
+            torch.testing.assert_close(
+                got.sum(dim=-1), expected.sum(dim=-1), rtol=1e-6, atol=1e-6
+            )
+
+    def test_fast_nucleus_sizes(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+
+        for nucleus_size in (1, 15, 31):
+            with self.subTest(nucleus_size=nucleus_size):
+                probs, top_ps = self._distribution_with_nucleus(nucleus_size)
+                *_, fast_path = top_p_fast_prefix(probs, top_ps)
+                self.assertTrue(bool(fast_path.all()))
+                self._assert_matches_baseline(probs, top_ps)
+
+    def test_boundary_and_cross_prefix_ties_fall_back(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+
+        boundary_probs, boundary_top_ps = self._distribution_with_nucleus(32)
+        tied_probs = torch.zeros((1, 128), dtype=torch.float32, device=self.device)
+        tied_probs[:, :70] = 1.0 / 70
+        tied_top_ps = torch.tensor([0.5], device=self.device)
+
+        for probs, top_ps in (
+            (boundary_probs, boundary_top_ps),
+            (tied_probs, tied_top_ps),
+        ):
+            *_, fast_path = top_p_fast_prefix(probs, top_ps)
+            self.assertFalse(bool(fast_path.any()))
+            self._assert_matches_baseline(probs, top_ps)
+
+    def test_ties_contained_inside_prefix_use_fast_path(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+
+        probs = torch.full((1, 128), 0.1 / 113, dtype=torch.float32, device=self.device)
+        probs[:, :15] = 0.9 / 15
+        top_ps = torch.tensor([0.5], device=self.device)
+        *_, fast_path = top_p_fast_prefix(probs, top_ps)
+        self.assertTrue(bool(fast_path.all()))
+        self._assert_matches_baseline(probs, top_ps)
+
+    def test_mixed_p_one_and_zero_rows_fall_back(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+
+        fast_probs = torch.full(
+            (1, 128), 0.04 / 127, dtype=torch.float32, device=self.device
+        )
+        fast_probs[:, 0] = 0.96
+        full_probs = torch.arange(
+            128, 0, -1, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+        full_probs /= full_probs.sum(dim=-1, keepdim=True)
+        zero_probs = torch.zeros_like(full_probs)
+        probs = torch.cat((fast_probs, full_probs, zero_probs))
+        top_ps = torch.tensor([0.95, 1.0, 0.95], device=self.device)
+
+        *_, fast_path = top_p_fast_prefix(probs, top_ps)
+        self.assertEqual(fast_path.tolist(), [True, False, False])
+        self._assert_matches_baseline(probs, top_ps)
+
+    def test_small_vocab_threshold_forms_and_non_contiguous_input(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_p_renorm_probs_triton,
+            top_p_renorm_probs_triton_baseline,
+        )
+
+        base = torch.rand((2, 64), dtype=torch.float32, device=self.device)
+        probs = base[:, ::2]
+        probs /= probs.sum(dim=-1, keepdim=True)
+        self.assertFalse(probs.is_contiguous())
+
+        for top_p in (
+            0.0,
+            0.9,
+            torch.tensor([0.9], device=self.device),
+            torch.tensor([0.5, 0.95], device=self.device),
+        ):
+            expected = top_p_renorm_probs_triton_baseline(probs, top_p)
+            got = top_p_renorm_probs_triton(probs, top_p)
+            self.assertTrue(torch.equal(got > 0, expected > 0))
+            torch.testing.assert_close(got, expected, rtol=2e-5, atol=2e-6)
+
+        top_ps = torch.tensor([1.0, 1.0], device=self.device)
+        *_, fast_path = top_p_fast_prefix(probs.contiguous(), top_ps)
+        self.assertTrue(bool(fast_path.all()))
+
+    def test_hierarchical_selector_values_sums_and_metadata(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+        from sglang.kernels.ops.sampling.top_p_select_triton import (
+            top_p_select_hierarchical_triton,
+        )
+
+        for rows, vocab_size, chunk_size in (
+            (1, 127, 512),
+            (6, 1549, 512),
+            (2, 154880, 1024),
+        ):
+            with self.subTest(rows=rows, vocab_size=vocab_size, chunk_size=chunk_size):
+                generator = torch.Generator(device=self.device).manual_seed(vocab_size)
+                probs = torch.softmax(
+                    torch.randn(
+                        (rows, vocab_size),
+                        dtype=torch.float32,
+                        device=self.device,
+                        generator=generator,
+                    )
+                    * 8,
+                    dim=-1,
+                )
+                top_ps = torch.full(
+                    (rows,), 0.95, dtype=torch.float32, device=self.device
+                )
+                (
+                    expected_values,
+                    _,
+                    expected_pivots,
+                    expected_normalizers,
+                    expected_fast,
+                ) = top_p_fast_prefix(probs, top_ps)
+                (
+                    values,
+                    row_sums,
+                    pivots,
+                    normalizers,
+                    fast_path,
+                    fallback,
+                ) = top_p_select_hierarchical_triton(
+                    probs, top_ps, chunk_size=chunk_size
+                )
+                torch.testing.assert_close(values, expected_values, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    row_sums, probs.sum(dim=-1), rtol=2e-5, atol=2e-6
+                )
+                torch.testing.assert_close(pivots, expected_pivots, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    normalizers, expected_normalizers, rtol=2e-5, atol=2e-6
+                )
+                self.assertTrue(torch.equal(fast_path, expected_fast))
+                self.assertEqual(bool(fallback.item()), not bool(expected_fast.all()))
+
+    def test_hierarchical_matches_topk_path_at_large_vocab_boundaries(self):
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_p_renorm_probs_triton_hierarchical,
+            top_p_renorm_probs_triton_scale_fast,
+        )
+
+        vocab_size = 154880
+        probs = torch.zeros((6, vocab_size), dtype=torch.float32, device=self.device)
+        indices = torch.tensor(
+            [3, 2051, 4099, 8197, 16391, 32771, 65537, 131071],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        masses = torch.tensor(
+            [0.50, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.01, 0.005625],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        row_indices = (
+            indices.unsqueeze(0)
+            + torch.arange(6, dtype=torch.int64, device=self.device).unsqueeze(1) * 17
+        ) % vocab_size
+        probs.scatter_(1, row_indices, masses.expand(6, -1))
+        top_ps = torch.tensor(
+            [0.5, 0.75, 0.875, 0.9375, 0.96875, 0.984375],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        expected = top_p_renorm_probs_triton_scale_fast(probs, top_ps)
+        got = top_p_renorm_probs_triton_hierarchical(probs, top_ps)
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+        self.assertTrue(torch.equal(got > 0, expected > 0))
+
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm-only dispatch test")
+    def test_hierarchical_selector_uses_measured_row_threshold(self):
+        from sglang.kernels.ops.sampling import renorm_triton
+
+        for rows, expected_calls in ((12, 0), (24, 1)):
+            with self.subTest(rows=rows):
+                probs = torch.softmax(
+                    torch.randn((rows, 1549), dtype=torch.float32, device=self.device)
+                    * 8,
+                    dim=-1,
+                )
+                top_ps = torch.full(
+                    (rows,), 0.95, dtype=torch.float32, device=self.device
+                )
+                with patch.object(
+                    renorm_triton,
+                    "top_p_renorm_probs_triton_hierarchical",
+                    wraps=renorm_triton.top_p_renorm_probs_triton_hierarchical,
+                ) as hierarchical:
+                    renorm_triton.top_p_renorm_probs_triton(probs, top_ps)
+                self.assertEqual(hierarchical.call_count, expected_calls)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "GPU is required for this test.")
 class TestSpecRenormFallbacks(CustomTestCase):
     """The torch renorm fallbacks must match the kernels they stand in for.
 

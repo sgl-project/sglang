@@ -27,6 +27,7 @@ import torch
 # only starts paying beyond that (2.78ms at 8192). Widening the prefix to the end
 # of that plateau is close to free and keeps rows off the 13.4ms sort.
 _TOP_P_PREFIX = 4096
+_TOP_P_FAST_PREFIX = 32
 
 
 def per_row_threshold(
@@ -74,6 +75,33 @@ def top_p_pivots(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
         rows = overflow.nonzero(as_tuple=True)[0]
         pivots[rows] = _top_p_pivots_sorted(probs[rows], top_ps[rows])
     return pivots
+
+
+def top_p_fast_prefix(
+    probs: torch.Tensor, top_ps: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return exact top-p metadata when a small descending prefix proves support.
+
+    The fast-path mask is conservative: for a partial-vocabulary prefix, the
+    nucleus must end before the final prefix entry and that entry must be
+    strictly below the pivot. This proves that no pivot tie exists outside the
+    selected prefix.
+    """
+    vocab_size = probs.shape[1]
+    prefix = min(_TOP_P_FAST_PREFIX, vocab_size)
+    values, indices = torch.topk(probs, prefix, dim=-1, sorted=True)
+    budget = probs.sum(dim=-1) - (1.0 - top_ps)
+    within = (values.cumsum(dim=-1) - values) <= budget.unsqueeze(1)
+    position = (within.sum(dim=-1) - 1).clamp(min=0)
+    pivots = values.gather(1, position.unsqueeze(1)).squeeze(1)
+    kept = values >= pivots.unsqueeze(1)
+    normalizers = torch.where(kept, values, torch.zeros_like(values)).sum(dim=-1)
+
+    if prefix == vocab_size:
+        fast_path = normalizers > 0
+    else:
+        fast_path = ~within[:, -1] & (values[:, -1] < pivots) & (normalizers > 0)
+    return values, indices, pivots, normalizers, fast_path
 
 
 def _top_p_pivots_sorted(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
