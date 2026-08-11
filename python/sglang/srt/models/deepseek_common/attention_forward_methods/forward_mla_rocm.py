@@ -514,7 +514,7 @@ class DeepseekMLARocmForwardMixin:
 
         # The fused rope+cache-write kernel writes at the virtual out_cache_loc,
         # which is wrong under DCP, so force the standalone rope there.
-        force_rope_for_dcp_decode = (
+        force_rope_for_aiter_dcp_decode = (
             get_parallel().dcp_enabled
             and (
                 forward_batch.forward_mode.is_decode()
@@ -526,7 +526,7 @@ class DeepseekMLARocmForwardMixin:
             not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         )
         if self.rotary_emb is not None and (
-            force_rope_for_dcp_decode
+            force_rope_for_aiter_dcp_decode
             or (
                 (not fuse_rope_for_trtllm_mla)
                 and (not self._skip_rope_for_dsa_tilelang_fused())
