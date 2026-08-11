@@ -347,6 +347,20 @@ class FusedMoE(torch.nn.Module):
                 self.intermediate_size_per_partition, 128
             )
 
+        if self._ep_load_for_tp:
+            # Layer-level target width for the TP view. Recomputed from the true
+            # per-rank width rather than derived from the EP-shaped value above:
+            # the padding just applied does not commute with the TP split, i.e.
+            # round_up(I // tp, a) != round_up(I, a) // tp in general.
+            _tp_isp = intermediate_size // self._orig_moe_tp_size
+            if self.use_flashinfer_trtllm_moe and _tp_isp % 128 != 0:
+                _tp_isp = round_up(_tp_isp, 128)
+            self._orig_intermediate_size_per_partition = _tp_isp
+            # Unpadded checkpoint width. A rank's stride can run past this (the
+            # last ranks then hold partial or no real data), exactly as
+            # get_actual_shard_size() clamps during a normal TP load.
+            self._ep_real_intermediate_size = intermediate_size
+
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
         # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
@@ -945,6 +959,7 @@ class FusedMoE(torch.nn.Module):
         tp_group = get_tp_group().device_group
         num_shared = self.num_fused_shared_experts
         num_routed_local = self.num_local_experts - num_shared
+        src_isp, dst_isp = self._ep_to_tp_isp_pair()
 
         for name, param in self.named_parameters():
             if not hasattr(param, "_ep_to_tp_buf"):
@@ -974,24 +989,61 @@ class FusedMoE(torch.nn.Module):
             is_w13 = "w13" in name
 
             if shard_dim is not None:
-                # For w13 params, the shard dim contains fused [gate | up].
-                # TP shards each half independently, so we must split into
-                # gate/up, chunk each by tp_size, then interleave:
-                #   rank i gets [gate_shard_i | up_shard_i]
-                if is_w13:
-                    half = routed.shape[shard_dim] // 2
-                    gate = routed.narrow(shard_dim, 0, half)
-                    up = routed.narrow(shard_dim, half, half)
-                    gate_chunks = gate.chunk(tp_size, dim=shard_dim)
-                    up_chunks = up.chunk(tp_size, dim=shard_dim)
-                    # chunks[i] = cat(gate_shard_i, up_shard_i) along shard_dim
-                    chunks = [
-                        torch.cat([g, u], dim=shard_dim)
-                        for g, u in zip(gate_chunks, up_chunks)
-                    ]
-                    del gate, up, gate_chunks, up_chunks
-                else:
-                    chunks = list(routed.chunk(tp_size, dim=shard_dim))
+                # The shard dim spans `halves` independently-sharded regions
+                # (w13 fuses gate and up), each `src_half` wide in the EP view
+                # and `dst_half` wide in the TP view. Those two are NOT related
+                # by tp_size: each is separately rounded up to the backend's
+                # alignment. Only the leading `real_*` elements of each region
+                # are checkpoint data; the remainder is alignment padding that
+                # must stay zero, so we move real content and let the
+                # zero-filled target buffer supply the padding.
+                halves = 2 if is_w13 else 1
+                src_half = routed.shape[shard_dim] // halves
+                # Buffer width comes from the *method's* padding; the shard
+                # stride comes from the *layer's* per-partition width. TP
+                # loading strides by the latter and zero-fills up to the
+                # former, so a rank's real region is `stride` wide inside a
+                # `dst_half`-wide slot. Conflating the two overruns or
+                # under-fills whenever the two paddings differ.
+                dst_half = src_half * dst_isp // src_isp
+                real_shard = self._ep_to_tp_real_width(
+                    self._orig_intermediate_size_per_partition, src_half, src_isp
+                )
+
+                src_real_half = self._ep_to_tp_real_width(
+                    self._ep_real_intermediate_size, src_half, src_isp
+                )
+
+                chunks = []
+                for i in range(tp_size):
+                    start = i * real_shard
+                    avail = max(0, min(real_shard, src_real_half - start))
+                    parts = []
+                    for h in range(halves):
+                        if avail == real_shard:
+                            # Fully covered: a view is enough, no copy.
+                            parts.append(
+                                routed.narrow(shard_dim, h * src_half + start, avail)
+                            )
+                            continue
+                        # Trailing rank whose stride runs past the real data:
+                        # take what exists and leave the rest zero.
+                        piece = torch.zeros(
+                            routed.shape[:shard_dim]
+                            + (real_shard,)
+                            + routed.shape[shard_dim + 1 :],
+                            dtype=routed.dtype,
+                            device=routed.device,
+                        )
+                        if avail > 0:
+                            piece.narrow(shard_dim, 0, avail).copy_(
+                                routed.narrow(shard_dim, h * src_half + start, avail)
+                            )
+                        parts.append(piece)
+                    chunks.append(
+                        parts[0] if halves == 1 else torch.cat(parts, dim=shard_dim)
+                    )
+                    del parts
 
                 stacked = torch.stack(chunks, dim=0)  # [P, R, ...]
                 del chunks
@@ -1003,33 +1055,36 @@ class FusedMoE(torch.nn.Module):
                 param.data = torch.empty(0, dtype=data.dtype, device=data.device)
                 del data, routed
 
-                recv_buf = param._ep_to_tp_buf[: num_routed_local * tp_size]
+                # Received payload is compact (real content only); scatter it
+                # into the padded target regions afterwards.
+                recv_buf = torch.empty(
+                    (num_routed_local * tp_size,) + send_buf.shape[1:],
+                    dtype=send_buf.dtype,
+                    device=send_buf.device,
+                )
                 dist.all_to_all_single(recv_buf, send_buf, group=tp_group)
                 del send_buf
 
+                routed_dst = param._ep_to_tp_buf[: num_routed_local * tp_size]
+                for h in range(halves):
+                    routed_dst.narrow(shard_dim, h * dst_half, real_shard).copy_(
+                        recv_buf.narrow(shard_dim, h * real_shard, real_shard)
+                    )
+                del recv_buf
+
                 if num_shared > 0:
-                    if is_w13:
-                        # Shared experts also have fused [gate | up] — shard each half
-                        shared_half = shared.shape[shard_dim] // 2
-                        shared_shard = shared_half // tp_size
-                        sg = shared.narrow(
-                            shard_dim, tp_rank * shared_shard, shared_shard
-                        )
-                        su = shared.narrow(
-                            shard_dim,
-                            shared_half + tp_rank * shared_shard,
-                            shared_shard,
-                        )
-                        shared_sliced = torch.cat([sg, su], dim=shard_dim).contiguous()
-                        del sg, su
-                    else:
-                        shard_size = shared.shape[shard_dim] // tp_size
-                        shared_sliced = shared.narrow(
-                            shard_dim, tp_rank * shard_size, shard_size
-                        ).contiguous()
+                    # Shared experts are already replicated, so each rank just
+                    # takes its own slice — same padded-target placement as the
+                    # routed path above.
+                    shared_dst = param._ep_to_tp_buf[num_routed_local * tp_size :]
+                    start = tp_rank * real_shard
+                    avail = max(0, min(real_shard, src_real_half - start))
+                    if avail > 0:
+                        for h in range(halves):
+                            shared_dst.narrow(shard_dim, h * dst_half, avail).copy_(
+                                shared.narrow(shard_dim, h * src_half + start, avail)
+                            )
                     del shared
-                    param._ep_to_tp_buf[num_routed_local * tp_size :] = shared_sliced
-                    del shared_sliced
             else:
                 # Expert-only dimension (scales with no intermediate dim to shard)
                 # Just all_gather along expert dim
@@ -1068,6 +1123,14 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition
         )
 
+        # Quant methods that cached per-partition dims during create_weights
+        # captured the EP-shaped view; re-point them at the TP one. No-op for
+        # methods that read dims off the layer.
+        self.quant_method.rebind_partition_dims(
+            num_experts=self.num_local_experts,
+            intermediate_size_per_partition=self.intermediate_size_per_partition,
+        )
+
         # Keep the dispatcher's view in sync (it snapshotted the EP-load counts
         # from moe_runner_config at construction), same as bind_full_expert_weights.
         self.dispatcher.moe_ep_size = 1
@@ -1079,6 +1142,49 @@ class FusedMoE(torch.nn.Module):
 
         # Mark transform as complete so forward() can verify
         self._ep_load_for_tp = False
+
+    def _ep_to_tp_isp_pair(self) -> Tuple[int, int]:
+        """(source, target) per-partition intermediate widths for the transform.
+
+        Source is what ``create_weights`` allocated for under the EP-shaped
+        view; target is what it *would* allocate for the TP view. They are not
+        related by ``// tp_size`` because each is independently rounded up, so
+        the target has to be asked for rather than derived.
+        """
+        pad = self.quant_method.padded_intermediate_size
+        return pad(self.intermediate_size_per_partition), pad(
+            self._orig_intermediate_size_per_partition
+        )
+
+    def ep_to_tp_target_shape(
+        self, param_name: str, param: torch.nn.Parameter
+    ) -> torch.Size:
+        """Shape this parameter must have once redistributed to the TP view.
+
+        The shard dim is *not* simply ``// tp_size``: source and target widths
+        are each independently rounded up to the backend's alignment, so the
+        target is scaled from the target intermediate width instead. Shared by
+        the buffer allocator and the transform so the two cannot disagree.
+        """
+        shape = list(param.data.shape)
+        shape[0] = self._num_global_routed + self.num_fused_shared_experts
+        shard_dim = self._get_ep_to_tp_shard_dim(param_name)
+        if shard_dim is not None:
+            halves = 2 if "w13" in param_name else 1
+            src_isp, dst_isp = self._ep_to_tp_isp_pair()
+            src_half = shape[shard_dim] // halves
+            shape[shard_dim] = halves * (src_half * dst_isp // src_isp)
+        return torch.Size(shape)
+
+    @staticmethod
+    def _ep_to_tp_real_width(isp_width: int, half_extent: int, isp: int) -> int:
+        """Convert an intermediate-denominated width into element units.
+
+        A block-scale parameter carries a fraction of an element per unit of
+        intermediate size (e.g. 1/32), so widths must be rescaled rather than
+        used directly.
+        """
+        return isp_width * half_extent // isp
 
     def _get_ep_to_tp_shard_dim(self, param_name: str) -> int | None:
         """Return the dimension holding intermediate_size for a given parameter,

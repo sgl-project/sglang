@@ -23,9 +23,14 @@ from sglang.srt.distributed.parallel_state import (
     destroy_model_parallel,
     initialize_model_parallel,
 )
+from sglang.srt.layers.moe.ep_to_tp_transform import (
+    EP_TO_TP_SUPPORTED_ARCHS,
+    maybe_ep_to_tp_transform_all_layers,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, initialize_moe_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.runtime_context import get_exec, get_flags
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
@@ -171,10 +176,69 @@ _MOCK_BLACKWELL = patch(
     return_value=True,
 )
 
-_MOCK_FLASHINFER_TRTLLM = patch(
-    "sglang.srt.layers.moe.utils.MOE_RUNNER_BACKEND",
-    MoeRunnerBackend.FLASHINFER_TRTLLM,
-)
+
+class _FakeMoEMlp(torch.nn.Module):
+    """Stand-in for KimiK3MoE / DeepseekV2MoE: holds experts under ``.experts``."""
+
+    def __init__(self, experts):
+        super().__init__()
+        self.experts = experts
+
+
+class _FakeDenseMlp(torch.nn.Module):
+    """Stand-in for KimiK3MLP: a dense layer with no ``.experts``."""
+
+
+class _FakeLayer(torch.nn.Module):
+    def __init__(self, mlp):
+        super().__init__()
+        self.mlp = mlp
+
+
+class _FakeDecoderStack(torch.nn.Module):
+    """Stand-in for KimiK3LinearModel: ``layers`` + PP ``start_layer``/``end_layer``."""
+
+    def __init__(self, layers, start_layer, end_layer):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(layers)
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+
+
+def _mock_flashinfer_trtllm():
+    """Force the flashinfer_trtllm MoE runner backend for the enclosed block.
+
+    The ACTIVE runner backend lives in the runtime-flags tier, so it is
+    injected through the flags group's transactional override rather than by
+    patching a module global.
+    """
+    return get_flags().moe.override(runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM)
+
+
+@contextlib.contextmanager
+def _force_shared_experts_fusion():
+    """Enable fused shared experts for the enclosed block.
+
+    Two independent gates have to be opened:
+
+    * ``DeepseekV2ForCausalLM.determine_num_fused_shared_experts`` only fuses
+      for an allow-list of ``n_routed_experts`` (256 / 384) that the tiny test
+      config is not in. On refusal it also *declares a load-time override*
+      forcing ``disable_shared_experts_fusion=True``, which would clobber the
+      bag override below — so it has to be patched out, not just overridden.
+    * ``DeepseekV2MoE.__init__`` reads ``disable_shared_experts_fusion`` from
+      the resolved ``exec.moe`` bag (not from the ServerArgs record), so that
+      leaf must independently say False for the extra expert slot to appear.
+    """
+    from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+
+    def _force_fuse(self_model, architecture="DeepseekV3ForCausalLM"):
+        self_model.num_fused_shared_experts = self_model.config.n_shared_experts
+
+    with patch.object(
+        DeepseekV3ForCausalLM, "determine_num_fused_shared_experts", _force_fuse
+    ), get_exec().moe.override(disable_shared_experts_fusion=False):
+        yield
 
 
 class _MoEOnlyNvFp4Config(ModelOptFp4Config):
@@ -683,41 +747,23 @@ class TestEpToTpTransform(unittest.TestCase):
 
     def test_ep_to_tp_nvfp4_scales_with_shared_experts(self):
         """EP-load + transform must match normal TP load for NVFP4 scales with fused shared experts."""
-        from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-        from sglang.srt.server_args import get_global_server_args
-
         config = _make_tiny_config(n_routed_experts=16)
         weights = _generate_nvfp4_checkpoint_weights(config, fuse_shared=True)
         qc = _make_nvfp4_config()
 
-        server_args = get_global_server_args()
-        old_flag = server_args.disable_shared_experts_fusion
-
-        def _force_fuse(self_model, architecture="DeepseekV3ForCausalLM"):
-            self_model.num_fused_shared_experts = self_model.config.n_shared_experts
-
-        try:
-            server_args.disable_shared_experts_fusion = False
-
-            with patch.object(
-                DeepseekV3ForCausalLM,
-                "determine_num_fused_shared_experts",
-                _force_fuse,
-            ), _MOCK_BLACKWELL:
-                tp_snapshot = _create_model_and_load(
-                    config,
-                    weights,
-                    ep_load=False,
-                    quant_config=qc,
-                )
-                ep_snapshot = _create_model_and_load(
-                    config,
-                    weights,
-                    ep_load=True,
-                    quant_config=qc,
-                )
-        finally:
-            server_args.disable_shared_experts_fusion = old_flag
+        with _force_shared_experts_fusion(), _MOCK_BLACKWELL:
+            tp_snapshot = _create_model_and_load(
+                config,
+                weights,
+                ep_load=False,
+                quant_config=qc,
+            )
+            ep_snapshot = _create_model_and_load(
+                config,
+                weights,
+                ep_load=True,
+                quant_config=qc,
+            )
 
         self.assertEqual(set(tp_snapshot.keys()), set(ep_snapshot.keys()))
 
@@ -743,64 +789,45 @@ class TestEpToTpTransform(unittest.TestCase):
         - is_w13 + shared: split fused [gate|up], shard each half, re-fuse
         - w2 + shared: simple shard slice
         """
-        from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-        from sglang.srt.server_args import get_global_server_args
-
         config = _make_tiny_config(n_routed_experts=16)
         weights = _generate_checkpoint_weights(config)
 
-        server_args = get_global_server_args()
-        old_flag = server_args.disable_shared_experts_fusion
+        with _force_shared_experts_fusion():
+            # Load normally (TP)
+            tp_snapshot = _create_model_and_load(config, weights, ep_load=False)
 
-        # Force-enable shared expert fusion, bypassing the n_routed_experts==256 check
-        def _force_fuse(self_model, architecture="DeepseekV3ForCausalLM"):
-            self_model.num_fused_shared_experts = self_model.config.n_shared_experts
+            # Load as EP, then transform to TP
+            ep_snapshot = _create_model_and_load(config, weights, ep_load=True)
 
-        try:
-            server_args.disable_shared_experts_fusion = False
-
-            with patch.object(
-                DeepseekV3ForCausalLM,
-                "determine_num_fused_shared_experts",
-                _force_fuse,
-            ):
-                # Load normally (TP)
-                tp_snapshot = _create_model_and_load(config, weights, ep_load=False)
-
-                # Load as EP, then transform to TP
-                ep_snapshot = _create_model_and_load(config, weights, ep_load=True)
-
-                # Verify shared experts are actually fused by checking weight dim 0
-                # With fusion: num_local_experts = n_routed + n_shared = 16 + 1 = 17
-                n_shared = config.n_shared_experts  # 1
-                found_fused = False
-                for key in tp_snapshot:
-                    if "w13_weight" in key and "scale" not in key and "bias" not in key:
-                        self.assertEqual(
-                            tp_snapshot[key].shape[0],
-                            config.n_routed_experts + n_shared,
-                            f"Shared experts not fused for {key}: "
-                            f"expected dim 0 = {config.n_routed_experts + n_shared}, "
-                            f"got {tp_snapshot[key].shape[0]}",
-                        )
-                        found_fused = True
-                        break
-                self.assertTrue(found_fused, "No w13_weight found in snapshot")
-
-                # Compare EP-loaded vs TP-loaded weights
-                self.assertEqual(
-                    set(tp_snapshot.keys()),
-                    set(ep_snapshot.keys()),
-                    "Mismatch in parameter names",
-                )
-                for key in sorted(tp_snapshot.keys()):
-                    torch.testing.assert_close(
-                        ep_snapshot[key],
-                        tp_snapshot[key],
-                        msg=f"Mismatch on rank {self.rank} for {key}",
+            # Verify shared experts are actually fused by checking weight dim 0
+            # With fusion: num_local_experts = n_routed + n_shared = 16 + 1 = 17
+            n_shared = config.n_shared_experts  # 1
+            found_fused = False
+            for key in tp_snapshot:
+                if "w13_weight" in key and "scale" not in key and "bias" not in key:
+                    self.assertEqual(
+                        tp_snapshot[key].shape[0],
+                        config.n_routed_experts + n_shared,
+                        f"Shared experts not fused for {key}: "
+                        f"expected dim 0 = {config.n_routed_experts + n_shared}, "
+                        f"got {tp_snapshot[key].shape[0]}",
                     )
-        finally:
-            server_args.disable_shared_experts_fusion = old_flag
+                    found_fused = True
+                    break
+            self.assertTrue(found_fused, "No w13_weight found in snapshot")
+
+            # Compare EP-loaded vs TP-loaded weights
+            self.assertEqual(
+                set(tp_snapshot.keys()),
+                set(ep_snapshot.keys()),
+                "Mismatch in parameter names",
+            )
+            for key in sorted(tp_snapshot.keys()):
+                torch.testing.assert_close(
+                    ep_snapshot[key],
+                    tp_snapshot[key],
+                    msg=f"Mismatch on rank {self.rank} for {key}",
+                )
 
     def test_ep_to_tp_flashinfer_trtllm(self):
         """EP→TP transform must work with flashinfer_trtllm backend layout.
@@ -816,7 +843,7 @@ class TestEpToTpTransform(unittest.TestCase):
         config.moe_intermediate_size = 192
         weights = _generate_checkpoint_weights(config)
 
-        with _MOCK_FLASHINFER_TRTLLM:
+        with _mock_flashinfer_trtllm():
             tp_snapshot = _create_model_and_load(config, weights, ep_load=False)
             ep_snapshot = _create_model_and_load(config, weights, ep_load=True)
 
@@ -845,7 +872,7 @@ class TestEpToTpTransform(unittest.TestCase):
         weights = _generate_nvfp4_checkpoint_weights(config)
         qc = _make_nvfp4_config()
 
-        with _MOCK_FLASHINFER_TRTLLM, _MOCK_BLACKWELL:
+        with _mock_flashinfer_trtllm(), _MOCK_BLACKWELL:
             tp_snapshot = _create_model_and_load(
                 config,
                 weights,
@@ -875,6 +902,163 @@ class TestEpToTpTransform(unittest.TestCase):
                 tp_snapshot[key],
                 msg=f"Mismatch on rank {self.rank} for {key}",
             )
+
+    # ------------------------------------------------------------------
+    # Kimi-K3 path coverage.
+    #
+    # K3 does not use DeepseekV2WeightLoaderMixin, so it reaches the transform
+    # through the module-level driver instead. These exercise that driver
+    # against K3's module shape; the redistribution math itself is covered by
+    # the DeepSeek cases above and is model-agnostic.
+    # ------------------------------------------------------------------
+
+    def _make_moe(self, num_experts=16, intermediate_size=256, hidden_size=512):
+        with torch.device("cuda"):
+            return FusedMoE(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                layer_id=0,
+                top_k=2,
+            )
+
+    def test_kimi_k3_arch_is_supported(self):
+        """The K3 entry arch must be accepted by the load_tp_by_experts gate."""
+        self.assertIn("KimiK3ForConditionalGeneration", EP_TO_TP_SUPPORTED_ARCHS)
+        # The DeepSeek path must not have been dropped by the extraction.
+        self.assertIn("DeepseekV3ForCausalLM", EP_TO_TP_SUPPORTED_ARCHS)
+
+    def test_kimi_k3_load_weights_wires_transform(self):
+        """KimiK3LinearForCausalLM.load_weights must drive the transform.
+
+        Source-level check: building a real K3 model needs a full multimodal
+        config, but the hook is a one-line call that is easy to drop in a
+        refactor, so guard it directly.
+        """
+        import inspect
+
+        from sglang.srt.models.kimi_k3 import KimiK3LinearForCausalLM
+
+        src = inspect.getsource(KimiK3LinearForCausalLM.load_weights)
+        self.assertIn("maybe_ep_to_tp_transform_all_layers", src)
+
+    def test_transform_is_noop_without_flag(self):
+        """Without load_tp_by_experts the driver must not touch any layer."""
+        with _load_tp_by_experts_config(False):
+            moe = self._make_moe()
+            self.assertFalse(moe._ep_load_for_tp)
+            stack = _FakeDecoderStack([_FakeLayer(_FakeMoEMlp(moe))], 0, 1)
+            maybe_ep_to_tp_transform_all_layers(stack)
+            # Still a plain TP layer, untouched.
+            self.assertEqual(moe.moe_tp_size, self.world_size)
+            self.assertEqual(moe.moe_ep_size, 1)
+        del moe, stack
+
+    def test_transform_walks_nested_experts_and_skips_dense(self):
+        """Driver must transform ``mlp.experts`` layers and skip dense ones.
+
+        This is K3's module shape: a mixed stack where only some layers carry a
+        FusedMoE, reached via ``mlp.experts`` rather than ``mlp`` itself.
+        """
+        n_routed = 16
+        intermediate = 256
+        with _load_tp_by_experts_config(True):
+            moe = self._make_moe(num_experts=n_routed, intermediate_size=intermediate)
+            # Under the flag the layer starts in the EP-load state.
+            self.assertTrue(moe._ep_load_for_tp)
+            self.assertEqual(moe.moe_tp_size, 1)
+            self.assertEqual(moe.moe_ep_size, self.world_size)
+
+            stack = _FakeDecoderStack(
+                [_FakeLayer(_FakeDenseMlp()), _FakeLayer(_FakeMoEMlp(moe))], 0, 2
+            )
+            # Dense layer must be skipped rather than raising.
+            maybe_ep_to_tp_transform_all_layers(stack)
+
+        # MoE layer is back to a normal TP view.
+        self.assertFalse(moe._ep_load_for_tp)
+        self.assertEqual(moe.moe_tp_size, self.world_size)
+        self.assertEqual(moe.moe_tp_rank, self.rank)
+        self.assertEqual(moe.moe_ep_size, 1)
+        self.assertEqual(moe.moe_ep_rank, 0)
+        self.assertEqual(moe.num_local_experts, n_routed)
+        self.assertEqual(
+            moe.intermediate_size_per_partition, intermediate // self.world_size
+        )
+        # The dispatcher's snapshot of the EP-load counts must be resynced.
+        self.assertEqual(moe.dispatcher.num_local_experts, moe.num_local_experts)
+        self.assertEqual(moe.dispatcher.moe_ep_size, 1)
+        del moe, stack
+
+    def test_transform_matches_tp_shape_when_padding_does_not_commute(self):
+        """EP-load + transform must produce the same shapes as a plain TP build.
+
+        Regression for the Kimi-K3 failure. Per-partition padding is applied
+        *after* the TP split on the normal path but *before* it under EP-load,
+        and ``round_up`` does not commute with division, so dividing an
+        already-padded whole gives the wrong width whenever
+
+            round_up(I // tp, align) != round_up(I, align) // tp
+
+        ``test_ep_to_tp_flashinfer_trtllm`` uses I=192/tp=2, where the two
+        happen to coincide (256//2 == round_up(96,128) == 128), so it passes
+        either way. I=384/tp=2 does not coincide:
+            normal TP : round_up(384//2, 128) = round_up(192,128) = 256
+            EP-load   : round_up(384,   128) = 384 -> 384//2      = 192
+        """
+        intermediate = 384
+        self.assertEqual(self.world_size, 2, "shape math below assumes TP=2")
+
+        with _mock_flashinfer_trtllm():
+            # Reference: how a plain TP build lays the experts out.
+            with _load_tp_by_experts_config(False):
+                ref = self._make_moe(intermediate_size=intermediate)
+            self.assertFalse(ref._ep_load_for_tp)
+
+            # EP-load + transform must land on exactly the same layout.
+            with _load_tp_by_experts_config(True):
+                moe = self._make_moe(intermediate_size=intermediate)
+                self.assertTrue(moe._ep_load_for_tp)
+                stack = _FakeDecoderStack([_FakeLayer(_FakeMoEMlp(moe))], 0, 1)
+                maybe_ep_to_tp_transform_all_layers(stack)
+
+        self.assertEqual(
+            moe.intermediate_size_per_partition,
+            ref.intermediate_size_per_partition,
+            "transformed layer's intermediate_size_per_partition diverges from plain TP",
+        )
+        self.assertEqual(
+            moe.w13_weight.shape,
+            ref.w13_weight.shape,
+            "transformed w13_weight shape diverges from plain TP",
+        )
+        self.assertEqual(
+            moe.w2_weight.shape,
+            ref.w2_weight.shape,
+            "transformed w2_weight shape diverges from plain TP",
+        )
+        del moe, ref, stack
+
+    def test_transform_respects_pp_layer_slice(self):
+        """Layers outside [start_layer, end_layer) must be left alone."""
+        with _load_tp_by_experts_config(True):
+            in_range = self._make_moe()
+            out_of_range = self._make_moe()
+            stack = _FakeDecoderStack(
+                [
+                    _FakeLayer(_FakeMoEMlp(in_range)),
+                    _FakeLayer(_FakeMoEMlp(out_of_range)),
+                ],
+                start_layer=0,
+                end_layer=1,
+            )
+            maybe_ep_to_tp_transform_all_layers(stack)
+
+        self.assertFalse(in_range._ep_load_for_tp, "in-range layer not transformed")
+        self.assertTrue(
+            out_of_range._ep_load_for_tp, "out-of-range layer must stay untouched"
+        )
+        del in_range, out_of_range, stack
 
 
 if __name__ == "__main__":
