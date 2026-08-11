@@ -105,7 +105,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
 from sglang.srt.models.glm_ocr import GlmOcrVisionModel
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -426,7 +425,7 @@ class Glm5NextDecoderLayer(nn.Module):
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
+            get_server_args().speculative_algorithm
         )
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
@@ -1083,7 +1082,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             getattr(text_config, "q_lora_rank", None), self.use_dsa, text_config.mhc
         )
 
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
         self.visual = GlmOcrVisionModel(
             config.vision_config,
             quant_config=quant_config,

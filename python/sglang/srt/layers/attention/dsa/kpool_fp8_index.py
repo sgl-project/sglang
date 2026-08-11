@@ -205,6 +205,65 @@ def _kpool_build_ragged_layout_kernel(
         tl.store(q_ke_ptr + q_start + q_offs, ke_val, mask=q_mask)
 
 
+def _prep_update_kpool_write_plan_launch(
+    write_start: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    real_page_table: torch.Tensor,
+    req_out: torch.Tensor,
+    write_start_out: torch.Tensor,
+    tail_logical_start_out: torch.Tensor,
+    write_loc_out: torch.Tensor,
+    pool_seqlens_per_q_out: Optional[torch.Tensor],
+    seqlens_per_q_out: Optional[torch.Tensor],
+    *,
+    pool_size: int,
+    num_draft_tokens: int,
+    slots_per_page: int,
+):
+    """Validate and build the (bs, args, constexpr kwargs) launch spec for the
+    write-plan kernel. Shared between the per-call wrapper below and the
+    prebound cuda-graph replay launcher. Mirrors the eager path exactly,
+    including pool_size < num_draft_tokens support (max_closed_pools)."""
+    max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool_size)
+    bs = write_start.shape[0]
+
+    assert write_loc_out.shape == (bs, max_closed_pools), write_loc_out.shape
+    assert write_loc_out.stride(1) == 1, write_loc_out.stride()
+
+    has_per_q_outputs = pool_seqlens_per_q_out is not None
+    assert has_per_q_outputs == (
+        seqlens_per_q_out is not None
+    ), "pool_seqlens_per_q_out and seqlens_per_q_out must be both set or both None"
+    per_q_dummy = (
+        pool_seqlens_per_q_out
+        if has_per_q_outputs
+        else torch.empty(1, dtype=torch.int32, device=write_start.device)
+    )
+
+    args = (
+        write_start,
+        req_pool_indices,
+        real_page_table,
+        req_out,
+        write_start_out,
+        tail_logical_start_out,
+        write_loc_out,
+        pool_seqlens_per_q_out if has_per_q_outputs else per_q_dummy,
+        seqlens_per_q_out if has_per_q_outputs else per_q_dummy,
+        real_page_table.stride(0),
+        real_page_table.shape[1],
+        write_loc_out.stride(0),
+    )
+    constexprs = dict(
+        POOL_SIZE=pool_size,
+        N=num_draft_tokens,
+        SLOTS_PER_PAGE=slots_per_page,
+        MAX_CLOSED_POOLS=max_closed_pools,
+        HAS_PER_Q=has_per_q_outputs,
+    )
+    return bs, args, constexprs
+
+
 def update_kpool_write_plan_cuda_graph(
     write_start: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -220,25 +279,9 @@ def update_kpool_write_plan_cuda_graph(
     num_draft_tokens: int,
     slots_per_page: int,
 ) -> None:
-    max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool_size)
-    bs = write_start.shape[0]
-    if bs == 0:
+    if write_start.shape[0] == 0:
         return
-
-    assert write_loc_out.shape == (bs, max_closed_pools), write_loc_out.shape
-    assert write_loc_out.stride(1) == 1, write_loc_out.stride()
-
-    has_per_q_outputs = pool_seqlens_per_q_out is not None
-    assert has_per_q_outputs == (
-        seqlens_per_q_out is not None
-    ), "pool_seqlens_per_q_out and seqlens_per_q_out must be both set or both None"
-    per_q_dummy = (
-        pool_seqlens_per_q_out
-        if has_per_q_outputs
-        else torch.empty(1, dtype=torch.int32, device=write_start.device)
-    )
-
-    _update_kpool_write_plan_kernel[(bs,)](
+    bs, args, constexprs = _prep_update_kpool_write_plan_launch(
         write_start,
         req_pool_indices,
         real_page_table,
@@ -246,17 +289,13 @@ def update_kpool_write_plan_cuda_graph(
         write_start_out,
         tail_logical_start_out,
         write_loc_out,
-        pool_seqlens_per_q_out if has_per_q_outputs else per_q_dummy,
-        seqlens_per_q_out if has_per_q_outputs else per_q_dummy,
-        real_page_table.stride(0),
-        real_page_table.shape[1],
-        write_loc_out.stride(0),
-        POOL_SIZE=pool_size,
-        N=num_draft_tokens,
-        SLOTS_PER_PAGE=slots_per_page,
-        MAX_CLOSED_POOLS=max_closed_pools,
-        HAS_PER_Q=has_per_q_outputs,
+        pool_seqlens_per_q_out,
+        seqlens_per_q_out,
+        pool_size=pool_size,
+        num_draft_tokens=num_draft_tokens,
+        slots_per_page=slots_per_page,
     )
+    _update_kpool_write_plan_kernel[(bs,)](*args, **constexprs)
 
 
 @triton.jit
@@ -301,8 +340,13 @@ def _update_kpool_write_plan_kernel(
         token_page_row = tl.minimum(
             tl.maximum(token_page_row, 0), real_page_table_cols - 1
         )
+        # Promote the row term to int64 before the pointer math (same as the
+        # fused metadata kernels): a row index times a context-scale stride
+        # wraps int32 well before the buffer does.
         packed_page = tl.load(
-            real_page_table_ptr + (b * N) * real_page_table_stride_0 + token_page_row
+            real_page_table_ptr
+            + (b * N).to(tl.int64) * real_page_table_stride_0
+            + token_page_row
         ).to(tl.int64)
         write_loc = packed_page * SLOTS_PER_PAGE + (pool_id % SLOTS_PER_PAGE)
         tl.store(
@@ -489,9 +533,12 @@ def _append_kpool_tail_to_topk_kernel(
     tail_value = tail_raw
     if HAS_PAGE_TABLE:
         safe_tail = tl.minimum(tl.maximum(tail_raw, 0), PAGE_TABLE_COLS - 1)
+        # int64 row term: the wide page table's row stride is context-scale
+        # (~2^20 on 1M-context models), so row * stride wraps int32 from
+        # row ~2048 — same promotion as the fused metadata kernels.
         tail_value = tl.load(
             page_table_ptr
-            + row * page_table_stride_0
+            + row.to(tl.int64) * page_table_stride_0
             + safe_tail * page_table_stride_1,
             mask=mask & is_tail,
             other=-1,

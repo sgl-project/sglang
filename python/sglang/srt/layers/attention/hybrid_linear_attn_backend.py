@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # Recurrent backends must explicitly opt in after their graph metadata
+    # loader is proven independent of live conv/SSM state.
+    supports_overlap_plan_stream_graph_load: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -75,6 +79,9 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+        # Constant (== 1) for mamba-like backends; hoisted so the replay path
+        # skips the per-cycle method dispatch.
+        self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
@@ -566,8 +573,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 num_padding = 0
             else:
                 num_padding = torch.count_nonzero(
-                    seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+                    seq_lens_cpu == self._graph_seq_len_fill_value
                 )
+        num_padding = int(num_padding)
         if self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
             # Single-launch fast path: mapping gather + padding sentinel + store
             # into the static buffer, plus zeroing padded req_pool_indices rows —
@@ -663,6 +671,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         )
                         new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
                         write_pos_buf[uniq_slots] = new_vals
+        is_target_verify = forward_mode.is_target_verify()
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
@@ -701,8 +710,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
+        qsl_buf = self.query_start_loc_list[bs - 1]
 
-        if forward_mode.is_target_verify() and self.topk > 1:
+        if is_target_verify and self.topk > 1:
             if (
                 spec_info is not None
                 and getattr(spec_info, "retrieve_next_token", None) is not None
@@ -715,7 +725,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     spec_info.retrieve_next_sibling
                 )
             return ForwardMetadata(
-                query_start_loc=self.query_start_loc_list[bs - 1],
+                query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
@@ -726,7 +736,7 @@ class MambaAttnBackendBase(AttentionBackend):
             )
         else:
             return ForwardMetadata(
-                query_start_loc=self.query_start_loc_list[bs - 1],
+                query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
@@ -954,6 +964,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
+    supports_overlap_plan_stream_graph_load: bool = False
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
@@ -974,6 +986,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+        self.supports_overlap_plan_stream_graph_load = bool(
+            linear_attn_backend.supports_overlap_plan_stream_graph_load
+        )
 
     @property
     def data_type(self):

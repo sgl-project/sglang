@@ -358,10 +358,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
 
-    # Read by decide_needs_cpu_seq_lens. Decode/verify metadata is GPU-only
-    # (graph replay already passes seq_lens_cpu=None), extend reads
-    # extend_seq_lens_cpu from schedule, mamba track indices rebuild from req
-    # objects, and the replayssm seq_lens_cpu force-flush is GDN-only.
+    # Target graph loading snapshots request-to-state indices and fixed replay
+    # metadata only.  Candidate conv/SSM states stay isolated until acceptance
+    # commits them on the main forward stream, so metadata loading is safe on
+    # the MTP plan stream after the draft/tree handoff event.
+    supports_overlap_plan_stream_graph_load: bool = True
+
+    # KDA graph replay receives padding explicitly and does not use the generic
+    # ReplaySSM host-seqlen force-flush path.  Keep the speculative length relay
+    # on device instead of synchronizing a D2H mirror every MTP cycle.
     needs_cpu_seq_lens: bool = False
 
     def __init__(self, model_runner: ModelRunner):
