@@ -5,7 +5,12 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 
 on:
   schedule:
-    - cron: '30 17 * * *' # Daily ROCm 7.0 rollback shadow
+    # ROCm 7.0 rollback shadow. pr-test-amd-rocm720.yml is the PR gate; this
+    # workflow now only proves ROCm 7.0 still works, so it fires once a day
+    # alongside nightly-test-amd.yml and chases coverage rather than latency:
+    # no matrix parallelism caps, no stage fast-fail (the `schedule` escape in
+    # each job's `if`), and continue-on-error via check-changes.
+    - cron: '30 17 * * *'
   workflow_dispatch:
     inputs:
       target_stage_select:
@@ -472,7 +477,6 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 4
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -588,7 +592,6 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         part: [0, 1, 2]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -629,7 +632,6 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         part: [0, 1]
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -670,7 +672,6 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         part: [0, 1, 2, 3]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -801,7 +802,6 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -1075,7 +1075,6 @@ jobs:
       RUNNER_LABELS: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi300') }}
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         part: [0, 1, 2, 3]
     runs-on: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi300') }}
