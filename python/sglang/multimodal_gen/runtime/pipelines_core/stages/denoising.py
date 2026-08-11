@@ -85,9 +85,6 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
-    TransformerLoader,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -125,6 +122,10 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
     RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.component_load import (
+    load_transformer_if_needed,
+    register_loaded_transformer,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -886,22 +887,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         else:
             cache_dit_num_inference_steps = num_inference_steps
 
-        transformer_was_loaded = server_args.model_loaded["transformer"]
-        if not transformer_was_loaded:
-            # FIXME: reuse more code
-            loader = TransformerLoader()
-            self.transformer = loader.load(
-                server_args.model_paths["transformer"], server_args, "transformer"
-            )
+        freshly_loaded = load_transformer_if_needed(self, server_args)
 
         self._maybe_enable_cache_dit_and_torch_compile(
             cache_dit_num_inference_steps, batch
         )
 
-        if not transformer_was_loaded:
-            if pipeline:
-                pipeline.add_module("transformer", self.transformer)
-            server_args.model_loaded["transformer"] = True
+        if freshly_loaded:
+            register_loaded_transformer(self, server_args, pipeline)
 
         if batch.rollout:
             self._maybe_prepare_rollout(batch)

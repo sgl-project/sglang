@@ -66,6 +66,7 @@ def _cosmos3_server_args(config=None):
     return types.SimpleNamespace(
         model_id=None,
         model_path="nvidia/Cosmos3-Nano",
+        served_model_name="cosmos3-production",
         backend=None,
         pipeline_class_name=None,
         output_path=None,
@@ -453,6 +454,7 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
     def test_metadata_describes_cosmos_action_contract(self):
         metadata = action_metadata(_cosmos3_server_args())
 
+        self.assertEqual(metadata["model"], "cosmos3-production")
         self.assertEqual(metadata["policy_family"], "cosmos3")
         self.assertEqual(metadata["input"]["modalities"], ["image", "video"])
         self.assertEqual(metadata["output"]["action_horizon"], 16)

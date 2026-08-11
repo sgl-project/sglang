@@ -21,11 +21,15 @@ import torch.distributed as dist
 from cuda.bindings import driver as drv
 
 from sglang.kernels.jit.utils import cache_once
-from sglang.srt.distributed.device_communicators.vmm_utils import (
+from sglang.srt import cuda_vmm_utils
+from sglang.srt.cuda_vmm_utils import (
     check_drv,
     exchange_posix_fds,
     export_shareable_handles,
+    get_allocation_granularity,
+    get_device_allocation_handle_type,
     import_and_map_alloc,
+    make_device_allocation_prop,
     make_rw_access_desc,
     map_chunk_into_span,
     release_mappings,
@@ -105,6 +109,67 @@ def _assert_region(va: int, expected: int, peer: int, chunk: int) -> None:
     ).all(), (
         f"read {host.tolist()} from peer {peer} chunk {chunk}, expected all {expected}"
     )
+
+
+@pytest.mark.parametrize(
+    ("rejected", "expected"),
+    [
+        ((_FABRIC,), _POSIX_FD),
+        ((_FABRIC, _POSIX_FD), 0),
+    ],
+)
+def test_default_handle_type_fallback(monkeypatch, rejected, expected) -> None:
+    device_id = torch.cuda.current_device()
+    create = drv.cuMemCreate
+
+    def reject_selected(size, prop, flags):
+        if prop.requestedHandleTypes in rejected:
+            return (drv.CUresult.CUDA_ERROR_NOT_SUPPORTED, None)
+        return create(size, prop, flags)
+
+    get_device_allocation_handle_type.cache_clear()
+    monkeypatch.setattr(cuda_vmm_utils, "is_gpu_fabric_ready", lambda _device: True)
+    monkeypatch.setattr(drv, "cuMemCreate", reject_selected)
+    try:
+        selected = get_device_allocation_handle_type(device_id)
+        prop = make_device_allocation_prop(device_id)
+        assert selected == expected
+        assert prop.requestedHandleTypes == expected
+        assert prop.allocFlags.gpuDirectRDMACapable == 0
+
+        explicit = make_device_allocation_prop(
+            device_id,
+            handle_types=_FABRIC,
+            gpu_direct_rdma=True,
+        )
+        assert explicit.requestedHandleTypes == _FABRIC
+        assert explicit.allocFlags.gpuDirectRDMACapable == 1
+
+        non_exportable = make_device_allocation_prop(device_id, handle_types=None)
+        assert non_exportable.requestedHandleTypes == 0
+
+        explicit_none = make_device_allocation_prop(device_id, handle_types=0)
+        assert explicit_none.requestedHandleTypes == 0
+
+        with pytest.raises(ValueError, match="handle_types must be"):
+            make_device_allocation_prop(device_id, handle_types="fabric")
+        with pytest.raises(ValueError, match="invalid CUDA handle-type value"):
+            make_device_allocation_prop(device_id, handle_types=42)
+    finally:
+        get_device_allocation_handle_type.cache_clear()
+
+
+def test_granularity_defaults_to_recommended(monkeypatch) -> None:
+    prop = make_device_allocation_prop(0, handle_types=None)
+    seen = []
+
+    def granularity(_prop, flag):
+        seen.append(flag)
+        return (drv.CUresult.CUDA_SUCCESS, _ALLOC_BYTES)
+
+    monkeypatch.setattr(drv, "cuMemGetAllocationGranularity", granularity)
+    assert get_allocation_granularity(prop) == _ALLOC_BYTES
+    assert seen == [_RECOMMENDED]
 
 
 @pytest.mark.parametrize("n_chunks", [1, 3])
