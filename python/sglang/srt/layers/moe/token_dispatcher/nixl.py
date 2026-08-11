@@ -271,9 +271,7 @@ class _NixlEPDispatcherImplBase:
 
 
 class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
-    def __init__(
-        self, return_recv_hook: bool, num_trailing_shared_slots: int, **kwargs
-    ):
+    def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
         """
@@ -281,7 +279,6 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         https://github.com/ai-dynamo/nixl
         """
         self.return_recv_hook = return_recv_hook
-        self.num_trailing_shared_slots = num_trailing_shared_slots
         self.device_module = torch.get_device_module()
 
     def dispatch_a(
@@ -330,8 +327,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            masked_m,
-            num_trailing_shared_slots=self.num_trailing_shared_slots,
+            masked_m
         )
 
         if isinstance(hidden_states, tuple):
@@ -452,8 +448,6 @@ class NixlEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.LOW_LATENCY,
         async_finish: bool = False,
         return_recv_hook: bool = False,
-        *,
-        num_trailing_shared_slots: int,
     ):
         self.deepep_mode = deepep_mode
 
@@ -471,7 +465,6 @@ class NixlEPDispatcher(BaseDispatcher):
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher = _NixlEPDispatcherImpl(
                 return_recv_hook=return_recv_hook,
-                num_trailing_shared_slots=num_trailing_shared_slots,
                 **common_kwargs,
             )
         if self.deepep_mode.enable_normal():
