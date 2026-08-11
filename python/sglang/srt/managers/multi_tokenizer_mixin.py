@@ -710,8 +710,7 @@ class TokenizerWorker(TokenizerManager):
 
     def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Called from handle_loop when a broadcast arrives from the router."""
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._apply_pause_continue_broadcast(obj))
+        self._create_background_task(self._apply_pause_continue_broadcast(obj))
 
     async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Apply pause/continue state under the condition lock."""

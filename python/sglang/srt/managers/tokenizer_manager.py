@@ -29,6 +29,7 @@ import threading
 import time
 from array import array
 from collections import deque
+from collections.abc import Coroutine
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
@@ -563,6 +564,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
         await async_sock_send(self.send_to_scheduler, obj)
+
+    def _create_background_task(
+        self, coroutine: Coroutine[Any, Any, Any]
+    ) -> asyncio.Task[Any]:
+        """Schedule a task and retain it until it finishes."""
+        task = asyncio.create_task(coroutine)
+        self.asyncio_tasks.add(task)
+        task.add_done_callback(self.asyncio_tasks.discard)
+        return task
 
     def init_running_status(self):
         # Request states
@@ -1757,7 +1767,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
-                    asyncio.create_task(
+                    self._create_background_task(
                         self.request_metrics_exporter_manager.write_record(obj, out)
                     )
 
@@ -2447,7 +2457,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Mark ongoing LoRA request as finished.
                 if self.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                    self._create_background_task(
+                        self.lora_registry.release(state.obj.lora_id)
+                    )
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -2963,7 +2975,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     to_dump_with_server_args["resolved_config"] = None
                     pickle.dump(to_dump_with_server_args, f)
 
-        asyncio.create_task(asyncio.to_thread(background_task))
+        self._create_background_task(asyncio.to_thread(background_task))
 
     def dump_requests_before_crash(
         self, hostname: str = os.getenv("HOSTNAME", socket.gethostname())
