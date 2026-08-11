@@ -16,7 +16,6 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     is_fsdp_managed_module,
 )
@@ -518,7 +517,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         ctx = _resolve_full_loop_context(batch)
 
         if current_platform.is_npu():
-            device = get_local_torch_device()
+            device = current_platform.get_local_torch_device()
             required_backend = "Ascend NPU"
         elif current_platform.is_cuda() or current_platform.is_rocm():
             device = torch.device(current_platform.device_type)
