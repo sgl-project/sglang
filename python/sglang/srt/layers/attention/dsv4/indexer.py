@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    plan_topk_v2,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -26,7 +27,11 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.dsa.utils import (
+    aiter_can_use_preshuffle_paged_mqa,
+    dsa_cp_round_robin_split_q_seqs_cpu,
+    is_dsa_prefill_cp_round_robin_split,
+)
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -495,7 +500,6 @@ class C4IndexerBackendMixin:
             forward_batch.forward_mode != ForwardMode.EXTEND
             or forward_batch._original_forward_mode is not None
             or forward_batch.tbo_parent_token_range is not None
-            or forward_batch.batch_size != 1
             or indexer_metadata.use_prefill_cuda_graph
         ):
             return False
@@ -506,9 +510,14 @@ class C4IndexerBackendMixin:
             or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         ):
             return False
+        cp_size = get_parallel().attn_cp_size
+        if cp_size > 1 and (
+            not is_dsa_prefill_cp_round_robin_split()
+            or forward_batch.attn_cp_metadata is None
+        ):
+            return False
         if (
-            get_parallel().attn_cp_size != 1
-            or self.hisparse_coordinator is not None
+            self.hisparse_coordinator is not None
             or is_in_tc_piecewise_cuda_graph()
             or is_in_breakable_cuda_graph()
         ):
@@ -558,44 +567,117 @@ class C4IndexerBackendMixin:
         if (
             extend_lens_cpu is None
             or seq_lens_cpu is None
-            or len(extend_lens_cpu) != 1
-            or len(seq_lens_cpu) != 1
-            or extend_lens_cpu[0] <= 0
+            or len(extend_lens_cpu) == 0
+            or len(extend_lens_cpu) != len(seq_lens_cpu)
+            or any(extend_len <= 0 for extend_len in extend_lens_cpu)
         ):
             return None
 
-        actual_queries = extend_lens_cpu[0]
+        cp_size = get_parallel().attn_cp_size
+        if cp_size > 1:
+            local_extend_lens_cpu, selected_request_indices = (
+                dsa_cp_round_robin_split_q_seqs_cpu(extend_lens_cpu)
+            )
+        else:
+            local_extend_lens_cpu = extend_lens_cpu
+            selected_request_indices = list(range(len(extend_lens_cpu)))
+
+        logical_query_rows = sum(local_extend_lens_cpu)
+        global_query_rows = sum(extend_lens_cpu)
         if (
-            actual_queries != query_rows
-            or int(forward_batch.extend_num_tokens) != query_rows
-            or forward_batch.seq_lens.numel() != 1
-            or forward_batch.extend_seq_lens.numel() != 1
-            or forward_batch.extend_start_loc.numel() != 1
+            logical_query_rows > query_rows
+            or int(forward_batch.extend_num_tokens) != global_query_rows
+            or (cp_size == 1 and logical_query_rows != query_rows)
+        ):
+            return None
+
+        batch_size = len(extend_lens_cpu)
+        if (
+            forward_batch.seq_lens.numel() != batch_size
+            or forward_batch.extend_seq_lens.numel() != batch_size
+            or forward_batch.extend_start_loc.numel() != batch_size
             or page_table.dim() != 2
             or page_table.shape[0] < query_rows
             or c4_seq_lens.numel() < query_rows
         ):
             return None
 
-        final_c4_len = seq_lens_cpu[0] // 4
-        if final_c4_len <= 0:
+        gather_c4_lens_cpu = [
+            seq_lens_cpu[request_idx] // 4 for request_idx in selected_request_indices
+        ]
+        if not gather_c4_lens_cpu or any(length <= 0 for length in gather_c4_lens_cpu):
             return None
 
-        request_page_table = page_table[:1].contiguous()
-        ke = c4_seq_lens[:query_rows].reshape(-1).to(torch.int32).contiguous()
-        gather_seq_lens = ke[-1:]
-        ks = torch.zeros_like(ke)
+        local_query_starts_cpu = []
+        local_query_offset = 0
+        for local_extend_len in local_extend_lens_cpu:
+            local_query_starts_cpu.append(local_query_offset)
+            local_query_offset += local_extend_len
+
+        local_query_starts = torch.tensor(
+            local_query_starts_cpu,
+            dtype=torch.int64,
+            device=page_table.device,
+        )
+        request_page_table = page_table.index_select(0, local_query_starts).contiguous()
+
+        selected_requests = torch.tensor(
+            selected_request_indices,
+            dtype=torch.int64,
+            device=forward_batch.seq_lens.device,
+        )
+        gather_seq_lens = (
+            torch.div(
+                forward_batch.seq_lens.index_select(0, selected_requests),
+                4,
+                rounding_mode="floor",
+            )
+            .to(torch.int32)
+            .contiguous()
+        )
+
+        request_k_offsets_cpu = []
+        request_k_offset = 0
+        for gather_c4_len in gather_c4_lens_cpu:
+            request_k_offsets_cpu.append(request_k_offset)
+            request_k_offset += gather_c4_len
+        request_k_offsets = torch.tensor(
+            request_k_offsets_cpu,
+            dtype=torch.int32,
+            device=c4_seq_lens.device,
+        )
+        local_extend_lens = torch.tensor(
+            local_extend_lens_cpu,
+            dtype=torch.int64,
+            device=c4_seq_lens.device,
+        )
+        ks = torch.repeat_interleave(
+            request_k_offsets,
+            local_extend_lens,
+            output_size=logical_query_rows,
+        )
+        ks = ks.to(torch.int32).contiguous()
+
+        local_c4_seq_lens = (
+            c4_seq_lens[:logical_query_rows].reshape(-1).to(torch.int32).contiguous()
+        )
+        ke = (ks + local_c4_seq_lens).contiguous()
+
+        seq_len_sum = sum(gather_c4_lens_cpu)
+        max_seq_len = max(gather_c4_lens_cpu)
         c4_page_size = indexer_metadata.c4_page_size
-        max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
+        max_seqlen_k = (
+            (max_seq_len + c4_page_size - 1) // c4_page_size * c4_page_size
+        )
         plan = NonPagedIndexerPlan(
             page_table=request_page_table,
             gather_seq_lens=gather_seq_lens,
             ks=ks,
             ke=ke,
-            seq_len_sum=final_c4_len,
-            max_seq_len=final_c4_len,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
             max_seqlen_k=max_seqlen_k,
-            query_rows=query_rows,
+            query_rows=logical_query_rows,
         )
         indexer_metadata.nonpaged_plan = plan
         return plan
@@ -723,7 +805,22 @@ class C4IndexerBackendMixin:
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
-        query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
+        physical_query_rows = (
+            q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
+        )
+        nonpaged_plan = self._get_nonpaged_indexer_plan(
+            c4_indexer=c4_indexer,
+            forward_batch=forward_batch,
+            indexer_metadata=indexer_metadata,
+            page_table=indexer_metadata.page_table,
+            c4_seq_lens=indexer_metadata.c4_seq_lens,
+            query_rows=physical_query_rows,
+        )
+        query_rows = (
+            nonpaged_plan.query_rows
+            if nonpaged_plan is not None
+            else physical_query_rows
+        )
 
         def match_num_queries(tensor: torch.Tensor, value: int) -> torch.Tensor:
             if tensor.shape[0] == query_rows:
@@ -745,14 +842,6 @@ class C4IndexerBackendMixin:
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
-        nonpaged_plan = self._get_nonpaged_indexer_plan(
-            c4_indexer=c4_indexer,
-            forward_batch=forward_batch,
-            indexer_metadata=indexer_metadata,
-            page_table=page_table,
-            c4_seq_lens=c4_seq_lens,
-            query_rows=query_rows,
-        )
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
@@ -802,7 +891,26 @@ class C4IndexerBackendMixin:
                 : c4_sparse_page_indices.size(0)
             ]
         elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
+            raw_indices = match_num_queries(
+                core_metadata.c4_sparse_raw_indices, value=-1
+            )
+
+        # The nonpaged CP path may trim padded query rows after metadata creation.
+        # Rebuild here because top-k v2 requires a plan built from the exact
+        # c4_seq_lens it sees.
+        # This can move after CP splitting during metadata initialization once
+        # nonpaged dispatch can be decided there.
+        if (
+            nonpaged_plan is not None
+            and query_rows != physical_query_rows
+            and indexer_metadata.topk_metadata.shape[0] != query_rows + 1
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and raw_indices is None
+            and not envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+            and not self.dsa_topk_backend.is_torch()
+            and not self.dsa_topk_backend.is_flashinfer()
+        ):
+            indexer_metadata.topk_metadata = plan_topk_v2(c4_seq_lens)
 
         if (
             envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
