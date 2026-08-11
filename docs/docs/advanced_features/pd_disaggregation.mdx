@@ -223,13 +223,17 @@ Please be aware that this setting will cause prefill instances to take a longer 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**`SGLANG_DISAGGREGATION_WAITING_TIMEOUT`**</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timeout (seconds) for receiving KV Cache after request initialization</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timeout (seconds) for receiving KV Cache after request initialization; also bounds pre-initialization prefill DP-rank discovery (`/query_dp_ranks`)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`300`</td>
     </tr>
   </tbody>
 </table>
 
 If a greater mean TTFT is acceptable, you can `export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600` (10 minutes) to relax the timeout condition.
+
+#### Prefill Replacement Detection
+
+Decode workers identify each prefill bootstrap server by a per-process instance id, returned in the `X-SGLang-Disaggregation-Instance-ID` response header. When a prefill is replaced behind a bootstrap address that stays reachable — for example a Kubernetes Service — a heartbeat that observes a changed id evicts the cached prefill connections and fails the affected in-flight requests; subsequent requests, including client retries, bootstrap against the new instance (NIXL, Mooncake, and Ascend backends — nothing is retried automatically). With the NIXL backend, a request that fails on cached connections inside the heartbeat window triggers the same recovery immediately. The bootstrap address must resolve to exactly one live prefill process at a time: replacement — old down, then new up — is the supported pattern, not load-balancing one address across several live prefills. Detection requires the prefill to send the id: rolling a prefill back to a version that predates it (the id disappearing) is not detected as a replacement, so avoid downgrades across that boundary while decodes hold cached connections.
 
 
 ## Heterogeneous TP with GPU Staging Buffer
