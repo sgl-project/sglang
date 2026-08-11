@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -59,7 +59,7 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
@@ -285,35 +285,41 @@ class MooncakeKVManager(CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
-    def register_buffer_to_engine(self):
-        # Batch register KV data buffers
-        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-            )
+    def _registerable_regions(self) -> List[Tuple[int, int]]:
+        """(ptr, len) regions to (de)register, exact duplicates removed.
 
-        # Batch register auxiliary data buffers
-        if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
-                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-            )
+        Deduped because the unified memory pool reports one raw buffer as both
+        its KV and its mamba state component, and double registration fails in
+        the engine.
+        """
+        regions: List[Tuple[int, int]] = []
+        seen: Set[Tuple[int, int]] = set()
 
+        def add(ptrs: List[int], lens: List[int]) -> None:
+            for ptr, length in zip(ptrs or [], lens or []):
+                if (ptr, length) not in seen:
+                    seen.add((ptr, length))
+                    regions.append((ptr, length))
+
+        add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        add(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
         for ptrs, lens in zip(
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
-            if ptrs and lens:
-                self.engine.batch_register(ptrs, lens)
+            add(ptrs, lens)
+        return regions
+
+    def register_buffer_to_engine(self):
+        regions = self._registerable_regions()
+        if regions:
+            ptrs, lens = zip(*regions)
+            self.engine.batch_register(list(ptrs), list(lens))
 
     def deregister_buffer_to_engine(self):
-        if self.kv_args.kv_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
-
-        if self.kv_args.aux_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
-
-        for ptrs in self.kv_args.state_data_ptrs or []:
-            if ptrs:
-                self.engine.batch_deregister(ptrs)
+        regions = self._registerable_regions()
+        if regions:
+            ptrs, _ = zip(*regions)
+            self.engine.batch_deregister(list(ptrs))
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -517,6 +523,7 @@ class MooncakeKVManager(CommonKVManager):
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            requester_pp_rank=self.pp_rank,
         )
 
     def send_kvcache_staged(
@@ -528,6 +535,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
+        dst_layer_ids: List[int],
         staging_buffer=None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
@@ -560,7 +568,19 @@ class MooncakeKVManager(CommonKVManager):
 
         num_tokens = len(prefill_kv_indices) * page_size
         per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
-        per_rank_bytes = per_layer_bytes * num_layers * 2
+        local_bytes = per_layer_bytes * num_layers * 2
+
+        if self.pp_size > 1:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                dst_layer_ids,
+                num_layers * 2,
+                len(dst_layer_ids),
+            )
+            dst_num_layers = len(dst_layer_ids) // 2
+        else:
+            pairs = None
+            dst_num_layers = num_layers
 
         num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
@@ -569,21 +589,20 @@ class MooncakeKVManager(CommonKVManager):
             total_kv_heads,
             num_tokens,
             head_dim * dtype_size,
-            num_layers,
+            dst_num_layers,
         )
         writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
         rank_offset = sum(writer_rank_bytes[:writer_idx])
 
-        if not staging_buffer.fits(per_rank_bytes):
+        if not staging_buffer.fits(local_bytes):
             logger.warning(
-                f"Prefill staging too small for {per_rank_bytes} bytes, falling back"
+                f"Prefill staging too small for {local_bytes} bytes, falling back"
             )
             return -1
         if dst_staging_size < total_staging_needed:
             logger.warning(
                 f"Decode staging too small: need {total_staging_needed} bytes "
-                f"({num_writers if self.attn_tp_size > dst_attn_tp_size else 1} writers "
-                f"x {per_rank_bytes} bytes/rank), have {dst_staging_size}, falling back"
+                f"for {dst_num_layers} layers, have {dst_staging_size}, falling back"
             )
             return -1
 
@@ -602,16 +621,29 @@ class MooncakeKVManager(CommonKVManager):
             self.kv_args.gpu_id,
         )
 
-        dst_write_ptr = dst_staging_ptr + rank_offset
-        ret = self._transfer_data(
-            mooncake_session_id,
-            [(staging_buffer.get_ptr(), dst_write_ptr, per_rank_bytes)],
-        )
+        if pairs is None:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr(),
+                    dst_staging_ptr + rank_offset,
+                    local_bytes,
+                )
+            ]
+        else:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr() + src_idx * per_layer_bytes,
+                    dst_staging_ptr + rank_offset + dst_idx * per_layer_bytes,
+                    per_layer_bytes,
+                )
+                for src_idx, dst_idx in pairs
+            ]
+        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
         if ret != 0:
             raise RuntimeError(
                 f"[Staging] Bulk RDMA transfer failed with ret={ret}. "
                 f"src_ptr=0x{staging_buffer.get_ptr():x}, "
-                f"dst_ptr=0x{dst_write_ptr:x}, size={per_rank_bytes}. "
+                f"dst_ptr=0x{dst_staging_ptr + rank_offset:x}, size={local_bytes}. "
                 f"The decode staging buffer may not be properly registered."
             )
         return ret
@@ -834,6 +866,52 @@ class MooncakeKVManager(CommonKVManager):
                     return ret
             return 0
 
+    def _validate_envelope_kv_layout(
+        self,
+        dst_kv_ptrs: list[int],
+        dst_kv_item_len: Optional[int],
+        dst_attn_tp_size: Optional[int] = None,
+    ) -> None:
+        """Reject a peer whose KV registration shape differs from ours.
+
+        The unified memory pool registers ONE whole-envelope region and
+        addresses the destination as ``dst_ptr + page_id * item_len`` using OUR
+        ``item_len``, so a peer on a different page size / spec, or without
+        unified memory, would take envelope-sized blocks at the wrong offsets.
+        Must run before the first RDMA write.
+
+        Scoped to unified memory by config, not by region count: a non-unified
+        PP stage owning a single full-attention layer also registers one region,
+        and `_send_kvcache_generic` pairs that with the peer by layer id.
+        """
+        if not get_memory().enable_unified_memory:
+            return
+        if dst_attn_tp_size is not None and self.attn_tp_size != dst_attn_tp_size:
+            # The unified mamba state ships as one whole-slot envelope with no
+            # per-tensor dims, so `_send_mamba_state_slice` cannot reslice it and
+            # silently falls back to an unsliced copy. Reject here, before any KV
+            # is written, rather than in `maybe_send_extra` afterwards.
+            raise RuntimeError(
+                "--enable-unified-memory does not support different prefill / "
+                f"decode attention TP sizes (prefill={self.attn_tp_size}, "
+                f"decode={dst_attn_tp_size}): the whole-envelope state cannot "
+                "be TP-resliced."
+            )
+        src_item_lens = self.kv_args.kv_item_lens
+        if (
+            len(src_item_lens) != 1
+            or len(dst_kv_ptrs) != 1
+            or dst_kv_item_len is None
+            or src_item_lens[0] != dst_kv_item_len
+        ):
+            raise RuntimeError(
+                "PD KV layout mismatch on the whole-envelope path: prefill has "
+                f"{len(src_item_lens)} KV region(s) with item_lens="
+                f"{src_item_lens}, decode has {len(dst_kv_ptrs)} with item_len="
+                f"{dst_kv_item_len}. With --enable-unified-memory both sides "
+                "must enable it and use the same page size and model spec."
+            )
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -843,7 +921,12 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_kv_item_len: Optional[int] = None,
+        dst_attn_tp_size: Optional[int] = None,
     ):
+        self._validate_envelope_kv_layout(
+            dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
+        )
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
@@ -1302,6 +1385,17 @@ class MooncakeKVManager(CommonKVManager):
             )
 
             if st == StateType.MAMBA:
+                if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
+                    src_item_lens
+                ) != list(dst_item_lens):
+                    raise RuntimeError(
+                        "Mamba state layouts differ between prefill and decode "
+                        f"(src item_lens={src_item_lens}, dst item_lens="
+                        f"{dst_item_lens}) and no per-tensor dim metadata is "
+                        "available to reslice. With --enable-unified-memory, "
+                        "prefill and decode must both enable it and use equal "
+                        "attention TP sizes."
+                    )
                 if (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
@@ -1752,6 +1846,8 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                                 dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
+                                dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
+                                dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                             )
                         elif (
                             self.enable_staging
