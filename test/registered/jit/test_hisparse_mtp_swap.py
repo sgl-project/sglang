@@ -5,6 +5,7 @@ from typing import NamedTuple
 import pytest
 import torch
 
+from sglang.kernels.ops.kvcache.hisparse import copy_cache_planned_mla
 from sglang.kernels.ops.kvcache.hisparse_mtp import (
     HiSparseMTPSwapState,
     load_cache_to_device_buffer_mtp_mla,
@@ -130,6 +131,9 @@ def _run_swap(
     out: torch.Tensor | None = None,
     req_pool_indices: torch.Tensor | None = None,
     num_real_reqs: torch.Tensor | None = None,
+    miss_src: torch.Tensor | None = None,
+    miss_dst: torch.Tensor | None = None,
+    miss_count: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if out is None:
         out = torch.full_like(top_k_tokens, -1)
@@ -152,6 +156,9 @@ def _run_swap(
         seq_lens=seq_lens,
         state=state.swap_state,
         num_real_reqs=num_real_reqs,
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
     )
     return out
 
@@ -239,6 +246,114 @@ class TestHiSparseMTPSwap(CustomTestCase):
         _assert_output_matches_tokens(state, out, top_k_tokens)
         self.assertEqual(int(state.swap_state.scratch_state[0, 0].item()), 782)
 
+    def test_records_union_plan_for_shared_layer_io(self) -> None:
+        hot_size, page_size = 4096, 64
+        num_steps, top_k, item_words = 4, 2048, 72
+        total_occurrences = num_steps * top_k
+        state = _make_state(
+            num_reqs=1,
+            hot_buffer_size=hot_size,
+            page_size=page_size,
+            scratch_size=hot_size,
+            seq_len=16384,
+            item_words=item_words,
+            metadata_occurrences=total_occurrences,
+        )
+
+        steps = []
+        next_miss = hot_size
+        for step_idx, step_miss_count in enumerate((196, 196, 195, 195)):
+            hits = torch.roll(
+                torch.arange(hot_size, dtype=torch.int32, device=DEVICE),
+                step_idx * 137,
+            )[: top_k - step_miss_count]
+            misses = torch.arange(
+                next_miss,
+                next_miss + step_miss_count,
+                dtype=torch.int32,
+                device=DEVICE,
+            )
+            next_miss += step_miss_count
+            steps.append(torch.cat((hits, misses)))
+        top_k_tokens = torch.stack(steps).unsqueeze(0).contiguous()
+        seq_lens = torch.full((num_steps,), 16384, dtype=torch.int32, device=DEVICE)
+        miss_src = torch.full(
+            (1, total_occurrences), -1, dtype=torch.int64, device=DEVICE
+        )
+        miss_dst = torch.full(
+            (1, total_occurrences), -1, dtype=torch.int32, device=DEVICE
+        )
+        miss_count = torch.full((1,), -1, dtype=torch.int32, device=DEVICE)
+
+        _run_swap(
+            top_k_tokens=top_k_tokens,
+            seq_lens=seq_lens,
+            state=state,
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+        )
+        shared_layer_buffer = torch.full_like(state.device_buffer, -1)
+        copy_cache_planned_mla(
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+            num_real_reqs=torch.ones(1, dtype=torch.int32, device=DEVICE),
+            host_cache=state.host_cache,
+            device_buffer=shared_layer_buffer,
+            item_size_bytes=state.host_cache.stride(0)
+            * state.host_cache.element_size(),
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(int(miss_count.item()), 782)
+        count = int(miss_count.item())
+        src = miss_src[0, :count].to(torch.long)
+        dst = miss_dst[0, :count].to(torch.long)
+        torch.testing.assert_close(
+            shared_layer_buffer[dst], state.host_cache[src.cpu()].to(DEVICE)
+        )
+        torch.testing.assert_close(shared_layer_buffer[dst], state.device_buffer[dst])
+
+    def test_padded_request_clears_stale_plan_count(self) -> None:
+        hot_size, page_size = 4096, 64
+        num_steps, top_k = 4, 2048
+        total_occurrences = num_steps * top_k
+        state = _make_state(
+            num_reqs=2,
+            hot_buffer_size=hot_size,
+            page_size=page_size,
+            scratch_size=hot_size,
+            seq_len=8192,
+            item_words=1,
+            metadata_occurrences=total_occurrences,
+        )
+        top_k_tokens = torch.arange(top_k, dtype=torch.int32, device=DEVICE).view(
+            1, 1, -1
+        )
+        top_k_tokens = top_k_tokens.repeat(2, num_steps, 1).contiguous()
+        seq_lens = torch.full((2 * num_steps,), 8192, dtype=torch.int32, device=DEVICE)
+        miss_src = torch.full(
+            (2, total_occurrences), -1, dtype=torch.int64, device=DEVICE
+        )
+        miss_dst = torch.full(
+            (2, total_occurrences), -1, dtype=torch.int32, device=DEVICE
+        )
+        miss_count = torch.full((2,), 123, dtype=torch.int32, device=DEVICE)
+
+        _run_swap(
+            top_k_tokens=top_k_tokens,
+            seq_lens=seq_lens,
+            state=state,
+            num_real_reqs=torch.ones(1, dtype=torch.int32, device=DEVICE),
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(int(miss_count[1].item()), 0)
+
     def test_resolves_all_speculative_extra_page_slots_without_host_io(self) -> None:
         hot_size, page_size = 4096, 64
         num_steps, top_k = 4, 2048
@@ -298,7 +413,21 @@ class TestHiSparseMTPSwap(CustomTestCase):
         ).view(1, num_steps, top_k)
         seq_lens = torch.full((num_steps,), 16384, dtype=torch.int32, device=DEVICE)
 
-        out = _run_swap(top_k_tokens=top_k_tokens, seq_lens=seq_lens, state=state)
+        miss_src = torch.full(
+            (1, total_occurrences), -1, dtype=torch.int64, device=DEVICE
+        )
+        miss_dst = torch.full(
+            (1, total_occurrences), -1, dtype=torch.int32, device=DEVICE
+        )
+        miss_count = torch.full((1,), -1, dtype=torch.int32, device=DEVICE)
+        out = _run_swap(
+            top_k_tokens=top_k_tokens,
+            seq_lens=seq_lens,
+            state=state,
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+        )
         torch.cuda.synchronize()
 
         _assert_output_matches_tokens(state, out, top_k_tokens)
@@ -306,6 +435,9 @@ class TestHiSparseMTPSwap(CustomTestCase):
         self.assertEqual(
             int(state.swap_state.scratch_state[0, 0].item()), total_occurrences
         )
+        self.assertEqual(int(miss_count.item()), total_occurrences)
+        self.assertTrue(miss_src.ge(0).all().item())
+        self.assertTrue(miss_dst.ge(0).all().item())
 
     def test_packed_ring_supports_glm52_native_context_length(self) -> None:
         hot_size, page_size = 4096, 64

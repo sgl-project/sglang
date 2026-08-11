@@ -412,7 +412,7 @@ __device__ __forceinline__ bool try_get_extra_page_device_loc(
 
 // Flatten all speculative steps. Each lane resolves one occurrence; the warp
 // cooperatively copies only lanes that won a unique-miss claim.
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan>
 __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -426,16 +426,25 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
     MtpCacheState cache_state,
     MtpMissWorkspace miss_workspace,
     const int32_t* __restrict__ num_real_reqs,
+    int64_t* __restrict__ miss_src_out,
+    int32_t* __restrict__ miss_dst_out,
+    int32_t* __restrict__ miss_count_out,
     int64_t buffer_stride_0,
     int64_t host_stride,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
+    int64_t plan_stride,
     int64_t page_size) {
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
   constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
   int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
   if (bid >= num_real_reqs[0]) {
+    if constexpr (RecordMissPlan) {
+      if (blockIdx.y == 0 && tid == 0) {
+        miss_count_out[bid] = 0;
+      }
+    }
     for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE)
       req_top_k_device_locs[i] = 0;
     return;
@@ -477,6 +486,7 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
   int32_t loc = -1;
   int32_t cache_slot = -1;
   bool copy_owner = false;
+  int32_t miss_idx = -1;
   int64_t src_loc = -1;
   bool needs_cache_lookup = false;
   if (occ < total_occurrences) {
@@ -527,6 +537,9 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
             const auto claimed = atomicCAS(req_scratch_table + hash_pos, old, packed);
             if (claimed == old) {
               const int32_t unique_idx = atomicAdd(req_work_count, 1);
+              if constexpr (RecordMissPlan) {
+                miss_idx = unique_idx;
+              }
               req_compact_hash_positions[unique_idx] = hash_pos;
               __threadfence();
               atomicExch(req_scratch_indices + hash_pos, epoch_bits | static_cast<uint32_t>(unique_idx));
@@ -577,6 +590,13 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
     const int32_t copy_loc = __shfl_sync(FULL_WARP_MASK, loc, owner_lane);
     const int64_t copy_src_loc = __shfl_sync(FULL_WARP_MASK, src_loc, owner_lane);
     if (copy_token >= 0 && copy_loc >= 0 && copy_src_loc >= 0) {
+      if constexpr (RecordMissPlan) {
+        const int32_t copy_miss_idx = __shfl_sync(FULL_WARP_MASK, miss_idx, owner_lane);
+        if (lane_id == owner_lane) {
+          miss_src_out[bid * plan_stride + copy_miss_idx] = copy_src_loc;
+          miss_dst_out[bid * plan_stride + copy_miss_idx] = copy_loc;
+        }
+      }
       const auto src_k = static_cast<const char*>(host_cache_k) + copy_src_loc * ITEM_SIZE_BYTES;
       auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
       transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
@@ -585,7 +605,7 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
   }
 }
 
-template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool USE_PDL>
+template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan, bool USE_PDL>
 __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ top_k_device_locs,
@@ -598,10 +618,14 @@ __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
     MtpCacheState cache_state,
     MtpMissWorkspace miss_workspace,
     const int32_t* __restrict__ num_real_reqs,
+    int64_t* __restrict__ miss_src_out,
+    int32_t* __restrict__ miss_dst_out,
+    int32_t* __restrict__ miss_count_out,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t buffer_stride_0,
-    int64_t host_stride) {
+    int64_t host_stride,
+    int64_t plan_stride) {
   device::PDLWaitPrimary<USE_PDL>();
   const int bid = blockIdx.x;
   if (bid >= num_real_reqs[0]) return;
@@ -840,6 +864,13 @@ __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
       const int64_t src_loc = __shfl_sync(FULL_WARP_MASK, copy_src_loc, owner_lane);
       const int32_t dst_loc = __shfl_sync(FULL_WARP_MASK, copy_dst_loc, owner_lane);
       if (src_loc >= 0 && dst_loc >= 0) {
+        if constexpr (RecordMissPlan) {
+          const int32_t miss_idx = __shfl_sync(FULL_WARP_MASK, unique_idx, owner_lane);
+          if (lane_id == owner_lane) {
+            miss_src_out[bid * plan_stride + miss_idx] = src_loc;
+            miss_dst_out[bid * plan_stride + miss_idx] = dst_loc;
+          }
+        }
         const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * ITEM_SIZE_BYTES;
         auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(dst_loc) * ITEM_SIZE_BYTES;
         transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
@@ -883,6 +914,9 @@ __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
   __syncthreads();
   if (threadIdx.x == 0) {
     miss_workspace.counters[rid] = miss_count;
+    if constexpr (RecordMissPlan) {
+      miss_count_out[bid] = miss_count;
+    }
     *req_work_count = 0;
     *req_union_hit_count = 0;
     *req_scratch_generation =
@@ -893,7 +927,14 @@ __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool USE_PDL>
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int ITEM_SIZE_BYTES,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    bool USE_PDL>
 void load_cache_to_device_buffer_mtp(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -909,7 +950,10 @@ void load_cache_to_device_buffer_mtp(
     tvm::ffi::TensorView scratch_locs,
     tvm::ffi::TensorView scratch_state,
     tvm::ffi::TensorView num_real_reqs,
-    int64_t page_size) {
+    int64_t page_size,
+    tvm::ffi::TensorView miss_src_out,
+    tvm::ffi::TensorView miss_dst_out,
+    tvm::ffi::TensorView miss_count_out) {
   using namespace host;
 
   static_assert(NUM_STEPS > 1 && NUM_STEPS <= 4, "HiSparse MTP swap requires 2-4 steps.");
@@ -959,6 +1003,21 @@ void load_cache_to_device_buffer_mtp(
   const int64_t cache_policy_stride_0 = cache_policy.strides()[0];
   const int64_t scratch_stride_0 = scratch_locs.strides()[0];
   const int64_t scratch_state_stride_0 = scratch_state.strides()[0];
+  int64_t* const miss_src_ptr = RecordMissPlan ? static_cast<int64_t*>(miss_src_out.data_ptr()) : nullptr;
+  int32_t* const miss_dst_ptr = RecordMissPlan ? static_cast<int32_t*>(miss_dst_out.data_ptr()) : nullptr;
+  int32_t* const miss_count_ptr = RecordMissPlan ? static_cast<int32_t*>(miss_count_out.data_ptr()) : nullptr;
+  const int64_t plan_stride = RecordMissPlan ? miss_src_out.strides()[0] : 0;
+  if constexpr (RecordMissPlan) {
+    RuntimeCheck(
+        miss_src_out.ndim() == 2 && miss_src_out.shape()[0] >= bs && miss_src_out.shape()[1] >= total_occurrences,
+        "MTP miss_src must have shape [batch, >= steps * top_k].");
+    RuntimeCheck(
+        miss_dst_out.ndim() == 2 && miss_dst_out.shape()[0] >= bs && miss_dst_out.shape()[1] >= total_occurrences,
+        "MTP miss_dst must have shape [batch, >= steps * top_k].");
+    RuntimeCheck(
+        miss_count_out.ndim() == 1 && miss_count_out.shape()[0] >= bs, "MTP miss_count must have shape [batch].");
+    RuntimeCheck(miss_dst_out.strides()[0] == plan_stride, "MTP miss_src/miss_dst row strides differ.");
+  }
 
   // Preserve the device kernels' independent restrict-qualified views while
   // exposing only four packed tensors through FFI. Row 0 is the control
@@ -989,7 +1048,13 @@ void load_cache_to_device_buffer_mtp(
 
   const uint32_t tiles = static_cast<uint32_t>((total_occurrences + BLOCK_SIZE - 1) / BLOCK_SIZE);
   LaunchKernel(dim3(static_cast<uint32_t>(bs), tiles), BLOCK_SIZE, device)(
-      load_cache_to_device_buffer_mtp_gather_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, ITEM_SIZE_BYTES, NUM_STEPS>,
+      load_cache_to_device_buffer_mtp_gather_kernel<
+          BLOCK_SIZE,
+          NUM_TOP_K,
+          HOT_BUFFER_SIZE,
+          ITEM_SIZE_BYTES,
+          NUM_STEPS,
+          RecordMissPlan>,
       static_cast<const int32_t*>(top_k_tokens.data_ptr()),
       static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
       static_cast<const int64_t*>(host_cache_locs.data_ptr()),
@@ -1002,10 +1067,14 @@ void load_cache_to_device_buffer_mtp(
       cache_state,
       miss_workspace,
       static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      miss_src_ptr,
+      miss_dst_ptr,
+      miss_count_ptr,
       buffer_stride_0,
       host_stride,
       top_k_tokens_stride,
       top_k_device_locs_stride,
+      plan_stride,
       page_size);
 
   LaunchKernel(dim3(static_cast<uint32_t>(bs)), 512, device)
@@ -1015,6 +1084,7 @@ void load_cache_to_device_buffer_mtp(
               HOT_BUFFER_SIZE,
               ITEM_SIZE_BYTES,
               NUM_STEPS,
+              RecordMissPlan,
               USE_PDL>,
           static_cast<const int32_t*>(top_k_tokens.data_ptr()),
           static_cast<int32_t*>(top_k_device_locs.data_ptr()),
@@ -1027,10 +1097,14 @@ void load_cache_to_device_buffer_mtp(
           cache_state,
           miss_workspace,
           static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+          miss_src_ptr,
+          miss_dst_ptr,
+          miss_count_ptr,
           top_k_tokens_stride,
           top_k_device_locs_stride,
           buffer_stride_0,
-          host_stride);
+          host_stride,
+          plan_stride);
 }
 
 }  // namespace sglang

@@ -5,7 +5,10 @@ from typing import NamedTuple
 import torch
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_mla
+from sglang.kernels.ops.kvcache.hisparse import (
+    copy_cache_planned_mla,
+    load_cache_to_device_buffer_mla,
+)
 from sglang.kernels.ops.kvcache.hisparse_mtp import (
     HiSparseMTPSwapState,
     load_cache_to_device_buffer_mtp_mla,
@@ -45,6 +48,10 @@ class _BenchmarkState(NamedTuple):
     lru_slots: torch.Tensor
     mtp_out: torch.Tensor
     lru_out: torch.Tensor
+    miss_src: torch.Tensor
+    miss_dst: torch.Tensor
+    miss_count: torch.Tensor
+    shared_layer_buffer: torch.Tensor
     swap_state: HiSparseMTPSwapState
 
 
@@ -162,6 +169,14 @@ def _build_state(batch_size: int) -> _BenchmarkState:
         .repeat(batch_size, 1),
         mtp_out=torch.full_like(top_k_tokens, -1),
         lru_out=torch.full_like(top_k_tokens, -1),
+        miss_src=torch.full(
+            (batch_size, total_occurrences), -1, dtype=torch.int64, device=DEVICE
+        ),
+        miss_dst=torch.full(
+            (batch_size, total_occurrences), -1, dtype=torch.int32, device=DEVICE
+        ),
+        miss_count=torch.zeros(batch_size, dtype=torch.int32, device=DEVICE),
+        shared_layer_buffer=torch.empty_like(device_buffer),
         swap_state=HiSparseMTPSwapState(
             cache_index=_make_cache_index(batch_size),
             cache_policy=torch.zeros(
@@ -175,7 +190,7 @@ def _build_state(batch_size: int) -> _BenchmarkState:
     )
 
 
-def _run_mtp(state: _BenchmarkState) -> None:
+def _run_mtp(state: _BenchmarkState, *, record_plan: bool = False) -> None:
     load_cache_to_device_buffer_mtp_mla(
         top_k_tokens=state.top_k_tokens,
         device_buffer_tokens=state.device_buffer_tokens,
@@ -188,6 +203,21 @@ def _run_mtp(state: _BenchmarkState) -> None:
         seq_lens=state.seq_lens,
         state=state.swap_state,
         num_real_reqs=state.num_real_reqs,
+        miss_src=state.miss_src if record_plan else None,
+        miss_dst=state.miss_dst if record_plan else None,
+        miss_count=state.miss_count if record_plan else None,
+    )
+
+
+def _run_planned_copy(state: _BenchmarkState) -> None:
+    copy_cache_planned_mla(
+        miss_src=state.miss_src,
+        miss_dst=state.miss_dst,
+        miss_count=state.miss_count,
+        num_real_reqs=state.num_real_reqs,
+        host_cache=state.host_cache,
+        device_buffer=state.shared_layer_buffer,
+        item_size_bytes=ITEM_SIZE_BYTES,
     )
 
 
@@ -216,7 +246,7 @@ def _run_lru_step(state: _BenchmarkState, step: int) -> None:
 
 
 def _assert_current_result(state: _BenchmarkState, impl: str) -> None:
-    if impl == "mtp_4step":
+    if impl.startswith("mtp_"):
         out = state.mtp_out
         tokens = state.top_k_tokens
     else:
@@ -225,11 +255,23 @@ def _assert_current_result(state: _BenchmarkState, impl: str) -> None:
     torch.cuda.synchronize()
     actual = state.device_buffer[:, 0][out.to(torch.long)]
     torch.testing.assert_close(actual, tokens.to(torch.int64) * TOKEN_SCALE)
+    if impl == "mtp_plan_plus_shared_io":
+        for bid in range(state.top_k_tokens.size(0)):
+            count = int(state.miss_count[bid].item())
+            src = state.miss_src[bid, :count].to(torch.long)
+            dst = state.miss_dst[bid, :count].to(torch.long)
+            torch.testing.assert_close(
+                state.shared_layer_buffer[:, 0][dst],
+                state.host_cache[src.cpu(), 0].to(DEVICE),
+            )
 
 
 def _check_initial_result(state: _BenchmarkState, impl: str) -> None:
-    if impl == "mtp_4step":
-        _run_mtp(state)
+    if impl.startswith("mtp_"):
+        record_plan = impl != "mtp_4step"
+        _run_mtp(state, record_plan=record_plan)
+        if impl == "mtp_plan_plus_shared_io":
+            _run_planned_copy(state)
     else:
         for step in range(NUM_STEPS):
             _run_lru_step(state, step)
@@ -237,16 +279,22 @@ def _check_initial_result(state: _BenchmarkState, impl: str) -> None:
 
 
 @marker.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64], [1])
-@marker.benchmark("impl", ["lru_4step", "mtp_4step"])
+@marker.benchmark(
+    "impl",
+    ["lru_4step", "mtp_4step", "mtp_plan", "mtp_plan_plus_shared_io"],
+)
 def benchmark(batch_size: int, impl: str):
     state = _build_state(batch_size)
     _check_initial_result(state, impl)
 
-    if impl == "mtp_4step":
+    if impl.startswith("mtp_"):
+        record_plan = impl != "mtp_4step"
 
         def run() -> None:
             state.top_k_tokens[..., -MISS_COUNT_PER_STEP:].add_(MISS_ADVANCE)
-            _run_mtp(state)
+            _run_mtp(state, record_plan=record_plan)
+            if impl == "mtp_plan_plus_shared_io":
+                _run_planned_copy(state)
 
     else:
 
