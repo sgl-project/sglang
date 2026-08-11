@@ -2,9 +2,7 @@ import logging
 from typing import Any
 
 import requests
-import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -60,14 +58,8 @@ class VisionLanguageEncoderLoader(ComponentLoader):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
-            target_device = (
-                torch.device("cpu")
-                if self._should_offload_component(
-                    server_args,
-                    transformers_or_diffusers,
-                    server_args.dit_cpu_offload,
-                )
-                else get_local_torch_device()
+            target_device = self.target_device(
+                server_args.should_cpu_offload_component("vision_language_encoder")
             )
             model = GlmImageForConditionalGeneration.from_pretrained(
                 component_model_path,

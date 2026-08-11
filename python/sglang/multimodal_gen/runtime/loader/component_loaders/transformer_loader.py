@@ -155,7 +155,7 @@ class TransformerLoader(ComponentLoader):
         if server_args.cpu_offload_components is not None:
             component_server_args = copy.copy(component_server_args)
             component_server_args.dit_cpu_offload = (
-                server_args.is_cpu_offload_component_selected(component_name)
+                server_args.should_cpu_offload_component(component_name)
             )
 
         # 1. hf config

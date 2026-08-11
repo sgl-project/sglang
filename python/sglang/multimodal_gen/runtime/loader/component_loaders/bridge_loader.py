@@ -74,9 +74,7 @@ class BridgeLoader(ComponentLoader):
             default_dtype,
         )
 
-        component_cpu_offload = self._should_offload_component(
-            server_args, component_name, server_args.dit_cpu_offload
-        )
+        component_cpu_offload = server_args.should_cpu_offload_component(component_name)
 
         # Use the FSDP loader when FSDP is requested or shard rules are declared.
         fsdp_shard_conditions = getattr(model_cls, "_fsdp_shard_conditions", None)
@@ -108,11 +106,7 @@ class BridgeLoader(ComponentLoader):
             model = model_cls.from_pretrained(
                 component_model_path, torch_dtype=default_dtype
             )
-            target_device = (
-                torch.device("cpu")
-                if component_cpu_offload
-                else get_local_torch_device()
-            )
+            target_device = self.target_device(component_cpu_offload)
             model = model.to(device=target_device, dtype=default_dtype)
 
         total_params = sum(p.numel() for p in model.parameters())

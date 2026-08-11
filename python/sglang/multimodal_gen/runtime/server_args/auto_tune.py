@@ -63,22 +63,6 @@ class ServerArgsAutoTuner:
             return IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB
         return DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
 
-    def _auto_keep_resident_components(
-        self, deployment_config: ModelDeploymentConfig
-    ) -> set[str]:
-        """Return components that auto mode may keep resident on this workload.
-
-        Image denoising repeatedly reuses one DiT and has a much smaller peak
-        activation footprint than video generation. On a sufficiently large
-        GPU, keeping the image DiT resident avoids a needless request-boundary
-        H2D/D2H cycle. Video DiTs remain model-configured because their peak
-        memory depends strongly on frame count and spatial resolution.
-        """
-        components = set(deployment_config.keep_resident_components)
-        if self.server_args.pipeline_config.task_type.is_image_gen():
-            components.add(LAYERWISE_OFFLOAD_DIT_GROUP)
-        return components
-
     def adjust_based_on_performance_mode(self) -> None:
         """Adjust the server args based on the performance mode"""
         args = self.server_args
@@ -156,7 +140,9 @@ class ServerArgsAutoTuner:
             and min_available_gb >= disable_threshold_gb
         ):
             changed = []
-            components = self._auto_keep_resident_components(deployment_config)
+            components = set(deployment_config.keep_resident_components)
+            if args.pipeline_config.task_type.is_image_gen():
+                components.add(LAYERWISE_OFFLOAD_DIT_GROUP)
             if (
                 args.layerwise_offload_components is not None
                 and not args.is_arg_explicitly_set("layerwise_offload_components")

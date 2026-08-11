@@ -37,6 +37,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     LAYERWISE_OFFLOAD_DIT_GROUP,
     cpu_offload_component_matches,
     cpu_offload_flags_for_layerwise_components,
+    is_dit_component_name,
+    is_image_encoder_component_name,
+    is_text_encoder_component_name,
+    is_vae_component_name,
     layerwise_component_matches_any_selection,
     normalize_cpu_offload_components,
     normalize_layerwise_offload_components,
@@ -773,16 +777,14 @@ class ServerArgs(DisaggServerArgsMixin):
             normalize_cpu_offload_components(self.cpu_offload_components) or []
         )
         self.cpu_offload_components = selected_components
-        self.dit_cpu_offload = cpu_offload_component_matches(
-            "transformer", selected_components
+        self.dit_cpu_offload = self.should_cpu_offload_component("transformer")
+        self.text_encoder_cpu_offload = self.should_cpu_offload_component(
+            "text_encoder"
         )
-        self.text_encoder_cpu_offload = cpu_offload_component_matches(
-            "text_encoder", selected_components
+        self.image_encoder_cpu_offload = self.should_cpu_offload_component(
+            "image_encoder"
         )
-        self.image_encoder_cpu_offload = cpu_offload_component_matches(
-            "image_encoder", selected_components
-        )
-        self.vae_cpu_offload = cpu_offload_component_matches("vae", selected_components)
+        self.vae_cpu_offload = self.should_cpu_offload_component("vae")
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
@@ -1285,10 +1287,24 @@ class ServerArgs(DisaggServerArgsMixin):
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
 
-    def is_cpu_offload_component_selected(self, component_name: str) -> bool:
-        return cpu_offload_component_matches(
-            component_name, self.cpu_offload_components
-        )
+    def should_cpu_offload_component(self, component_name: str) -> bool:
+        if self.cpu_offload_components is not None:
+            return cpu_offload_component_matches(
+                component_name, self.cpu_offload_components
+            )
+        if is_dit_component_name(component_name) or component_name in (
+            "connectors",
+            "unconditional_transformer",
+            "vision_language_encoder",
+        ):
+            return bool(self.dit_cpu_offload)
+        if is_text_encoder_component_name(component_name):
+            return bool(self.text_encoder_cpu_offload)
+        if is_image_encoder_component_name(component_name):
+            return bool(self.image_encoder_cpu_offload)
+        if is_vae_component_name(component_name) or component_name == "sound_tokenizer":
+            return bool(self.vae_cpu_offload)
+        return False
 
     def should_configure_layerwise_offload_for_lazy_component(
         self, component_name: str

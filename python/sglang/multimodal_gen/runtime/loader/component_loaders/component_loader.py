@@ -100,17 +100,9 @@ class ComponentLoader(ABC):
         model_config: ModelConfig | None = None,
         component_name: str | None = None,
     ):
-        return component_name is not None and self._should_offload_component(
-            server_args, component_name, False
+        return component_name is not None and server_args.should_cpu_offload_component(
+            component_name
         )
-
-    @staticmethod
-    def _should_offload_component(
-        server_args: ServerArgs, component_name: str, legacy_value: bool | None
-    ) -> bool:
-        if server_args.cpu_offload_components is not None:
-            return server_args.is_cpu_offload_component_selected(component_name)
-        return bool(legacy_value)
 
     def target_device(self, should_offload):
         if should_offload:
@@ -318,7 +310,7 @@ class ComponentLoader(ABC):
                 component = component.eval()
                 if (
                     server_args.cpu_offload_components is not None
-                    and server_args.is_cpu_offload_component_selected(component_name)
+                    and server_args.should_cpu_offload_component(component_name)
                     and not is_fsdp_managed_module(component)
                 ):
                     component = component.to("cpu")

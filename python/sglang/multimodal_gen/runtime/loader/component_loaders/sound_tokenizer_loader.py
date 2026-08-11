@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from safetensors.torch import load_file as safetensors_load_file
 
-from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -25,18 +24,6 @@ class SoundTokenizerLoader(ComponentLoader):
     component_names = ["sound_tokenizer"]
     expected_library = "diffusers"
 
-    def should_offload(
-        self,
-        server_args: ServerArgs,
-        model_config: ModelConfig | None = None,
-        component_name: str | None = None,
-    ) -> bool:
-        return self._should_offload_component(
-            server_args,
-            component_name or "sound_tokenizer",
-            server_args.vae_cpu_offload,
-        )
-
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
@@ -54,7 +41,7 @@ class SoundTokenizerLoader(ComponentLoader):
             precision = "bf16"
         dtype = PRECISION_TO_TYPE[precision]
         target_device = self.target_device(
-            self.should_offload(server_args, component_name=component_name)
+            server_args.should_cpu_offload_component(component_name)
         )
 
         with set_default_torch_dtype(dtype), skip_init_modules():

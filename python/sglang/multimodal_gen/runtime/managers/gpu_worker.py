@@ -44,12 +44,6 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
-    is_dit_component_name,
-    is_image_encoder_component_name,
-    is_text_encoder_component_name,
-    is_vae_component_name,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
@@ -323,9 +317,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
-        disable_offload_str = self._format_offload_disable_suggestions(
-            can_stay_resident
-        )
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
         pool_overhead_pct = (
@@ -334,30 +325,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         logger.debug(
             "GPU memory: peak=%.2f GB, allocated=%.2f GB, pool=%.2f GB (%.1f%%), "
-            "headroom=%.2f GB; resident_candidates=%s; disable_offload=%s",
+            "headroom=%.2f GB. Components that can remain on GPU: %s. "
+            "Adjust --cpu-offload-components or --layerwise-offload-components "
+            "to change residency.",
             peak_reserved_gb,
             peak_allocated_gb,
             pool_overhead_gb,
             pool_overhead_pct,
             remaining_gpu_mem_gb,
             can_stay_resident,
-            disable_offload_str,
         )
-
-    def _format_offload_disable_suggestions(self, components: List[str]) -> str:
-        if not components:
-            return "None"
-
-        suggestions = []
-        for component in components:
-            if self.server_args.should_configure_layerwise_offload_for_lazy_component(
-                component
-            ):
-                option = "--layerwise-offload-components"
-            else:
-                option = "--cpu-offload-components"
-            suggestions.append(f"{component} via {option}")
-        return ", ".join(suggestions)
 
     def execute_forward(
         self, batch: List[Req], return_req: bool = False
@@ -988,7 +965,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         for name in ordered_names:
             usage = memory_usages[name]
-            if not self._is_component_offloaded(name):
+            if not (
+                self.server_args.should_cpu_offload_component(name)
+                or self.server_args.should_configure_layerwise_offload_for_lazy_component(
+                    name
+                )
+            ):
                 continue
             if usage is None:
                 continue
@@ -997,23 +979,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 remaining_gpu_mem_gb -= usage
 
         return can_stay_resident
-
-    def _is_component_offloaded(self, component_name: str) -> bool:
-        if self.server_args.should_configure_layerwise_offload_for_lazy_component(
-            component_name
-        ):
-            return True
-        if self.server_args.cpu_offload_components is not None:
-            return self.server_args.is_cpu_offload_component_selected(component_name)
-        if is_dit_component_name(component_name):
-            return bool(self.server_args.dit_cpu_offload)
-        if is_text_encoder_component_name(component_name):
-            return bool(self.server_args.text_encoder_cpu_offload)
-        if is_image_encoder_component_name(component_name):
-            return bool(self.server_args.image_encoder_cpu_offload)
-        if is_vae_component_name(component_name):
-            return bool(self.server_args.vae_cpu_offload)
-        return False
 
     def set_lora(
         self,

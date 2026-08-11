@@ -18,12 +18,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
     is_resident_layerwise_module,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
-    is_dit_component_name,
-    is_image_encoder_component_name,
-    is_text_encoder_component_name,
-    is_vae_component_name,
-)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -93,26 +87,6 @@ class ComponentResidencyPipeline(Protocol):
     component_residency_strategies: MutableMapping[str, "ComponentResidencyStrategy"]
 
 
-def should_cpu_offload_component(
-    component_name: str, module: nn.Module, server_args: ServerArgs
-) -> bool:
-    if current_platform.is_mps():
-        return False
-    if server_args.use_fsdp_inference or is_fsdp_managed_module(module):
-        return False
-    if server_args.cpu_offload_components is not None:
-        return server_args.is_cpu_offload_component_selected(component_name)
-    if is_dit_component_name(component_name):
-        return bool(server_args.dit_cpu_offload)
-    if is_text_encoder_component_name(component_name):
-        return bool(server_args.text_encoder_cpu_offload)
-    if is_image_encoder_component_name(component_name):
-        return bool(server_args.image_encoder_cpu_offload)
-    if is_vae_component_name(component_name):
-        return bool(server_args.vae_cpu_offload)
-    return False
-
-
 def build_component_residency_strategy(
     component_name: str,
     module: nn.Module,
@@ -120,7 +94,12 @@ def build_component_residency_strategy(
 ) -> ComponentResidencyStrategy:
     if is_layerwise_offloaded_module(module):
         return LayerwiseOffloadStrategy()
-    if should_cpu_offload_component(component_name, module, server_args):
+    if (
+        not current_platform.is_mps()
+        and not server_args.use_fsdp_inference
+        and not is_fsdp_managed_module(module)
+        and server_args.should_cpu_offload_component(component_name)
+    ):
         return VanillaD2HStrategy()
     return ResidentStrategy()
 

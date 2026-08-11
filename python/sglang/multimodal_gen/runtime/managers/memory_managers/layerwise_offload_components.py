@@ -68,22 +68,18 @@ def normalize_cpu_offload_components(
     for raw_component in raw_components:
         if not isinstance(raw_component, str):
             raise ValueError(f"Invalid CPU offload component name: {raw_component}.")
-        for component_name in raw_component.split(","):
-            component_name = component_name.strip().replace("-", "_").lower()
-            if not component_name:
-                continue
-            if component_name == "none":
-                if len(raw_components) != 1 or normalized_components:
-                    raise ValueError("'none' cannot be combined with other components.")
-                return []
-            if component_name == CPU_OFFLOAD_ALL_COMPONENTS:
-                if CPU_OFFLOAD_ALL_COMPONENTS not in normalized_components:
-                    normalized_components.append(CPU_OFFLOAD_ALL_COMPONENTS)
-                continue
-            if component_name not in normalized_components:
-                normalized_components.append(component_name)
+        normalized_components.extend(
+            component_name
+            for value in raw_component.split(",")
+            if (component_name := value.strip().replace("-", "_").lower())
+        )
 
-    return normalized_components or None
+    unique_components = list(dict.fromkeys(normalized_components))
+    if "none" in unique_components:
+        if len(unique_components) != 1:
+            raise ValueError("'none' cannot be combined with other components.")
+        return []
+    return unique_components or None
 
 
 def cpu_offload_component_matches(

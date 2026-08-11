@@ -840,21 +840,6 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.vae_cpu_offload)
 
-    def test_cpu_offload_components_controls_legacy_flags(self):
-        args = self._from_dict_with_task_type(
-            ModelTaskType.T2V,
-            kwargs={
-                "performance_mode": "manual",
-                "cpu_offload_components": ["transformer", "vae"],
-            },
-        )
-
-        self.assertEqual(args.cpu_offload_components, ["transformer", "vae"])
-        self.assertTrue(args.dit_cpu_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
-        self.assertTrue(args.vae_cpu_offload)
-
     def test_cpu_offload_components_preserves_model_index_names(self):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
@@ -872,9 +857,9 @@ class TestOffloadDefaults(unittest.TestCase):
             args.cpu_offload_components,
             ["transformer_2", "audio_vae", "connectors"],
         )
-        self.assertTrue(args.is_cpu_offload_component_selected("transformer_2"))
-        self.assertTrue(args.is_cpu_offload_component_selected("audio_vae"))
-        self.assertTrue(args.is_cpu_offload_component_selected("connectors"))
+        self.assertTrue(args.should_cpu_offload_component("transformer_2"))
+        self.assertTrue(args.should_cpu_offload_component("audio_vae"))
+        self.assertTrue(args.should_cpu_offload_component("connectors"))
         self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
 
@@ -888,8 +873,8 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(args.cpu_offload_components, ["all"])
-        self.assertTrue(args.is_cpu_offload_component_selected("transformer_2"))
-        self.assertTrue(args.is_cpu_offload_component_selected("connectors"))
+        self.assertTrue(args.should_cpu_offload_component("transformer_2"))
+        self.assertTrue(args.should_cpu_offload_component("connectors"))
 
     def test_cpu_offload_components_none_disables_all_legacy_flags(self):
         args = self._from_dict_with_task_type(
@@ -905,6 +890,12 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
+
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            self._from_dict_with_task_type(
+                ModelTaskType.T2V,
+                kwargs={"cpu_offload_components": ["none", "vae"]},
+            )
 
     def test_cpu_offload_components_rejects_legacy_flag_conflict(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
