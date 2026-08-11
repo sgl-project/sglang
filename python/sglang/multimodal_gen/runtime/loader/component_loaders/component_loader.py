@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     component_name_to_loader_cls,
     get_memory_usage_of_component,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+    is_fsdp_managed_module,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
     is_layerwise_offloaded_module,
@@ -92,10 +95,22 @@ class ComponentLoader(ABC):
         self.component_architecture: str | None = None
 
     def should_offload(
-        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+        self,
+        server_args: ServerArgs,
+        model_config: ModelConfig | None = None,
+        component_name: str | None = None,
     ):
-        # not offload by default
-        return False
+        return component_name is not None and self._should_offload_component(
+            server_args, component_name, False
+        )
+
+    @staticmethod
+    def _should_offload_component(
+        server_args: ServerArgs, component_name: str, legacy_value: bool | None
+    ) -> bool:
+        if server_args.cpu_offload_components is not None:
+            return server_args.is_cpu_offload_component_selected(component_name)
+        return bool(legacy_value)
 
     def target_device(self, should_offload):
         if should_offload:
@@ -215,7 +230,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 component_name,
             )
-        should_offload = self.should_offload(server_args)
+        should_offload = self.should_offload(server_args, component_name=component_name)
         target_device = self.target_device(should_offload)
         return component.to(device=target_device)
 
@@ -301,6 +316,12 @@ class ComponentLoader(ABC):
         else:
             if isinstance(component, nn.Module):
                 component = component.eval()
+                if (
+                    server_args.cpu_offload_components is not None
+                    and server_args.is_cpu_offload_component_selected(component_name)
+                    and not is_fsdp_managed_module(component)
+                ):
+                    component = component.to("cpu")
             current_gpu_mem = current_platform.get_available_gpu_memory()
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem
