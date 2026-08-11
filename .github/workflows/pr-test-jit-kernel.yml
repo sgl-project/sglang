@@ -81,8 +81,12 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
+      # 45 like the b200 and benchmark jobs below: this suite is 110 files and
+      # every JIT module in it compiles from scratch on a host whose cache has
+      # not seen this commit's kernels yet. Two measured cold runs reached 76 of
+      # 110 in 27.5 minutes each, so 30 cannot fit one.
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 45
         run: |
           cd test/
           python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-large
