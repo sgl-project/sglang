@@ -16,6 +16,7 @@ import torch
 from setproctitle import setproctitle
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_tp_rank,
@@ -740,6 +741,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             def build_output_path(idx: int) -> str:
                 return req.output_file_path(num_outputs, idx)
 
+        # Skip save_outputs for text output (no image/video to save)
+        if req.data_type == DataType.TEXT:
+            return
+
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             req.data_type,
@@ -771,6 +776,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
 
         first_req = reqs[0]
+
+        # Skip save_outputs for text output (no image/video to save)
+        if first_req.data_type == DataType.TEXT:
+            return
+
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             first_req.data_type,

@@ -417,7 +417,11 @@ def create_app(server_args: ServerArgs):
     app.include_router(health_router)
     app.include_router(vertex_router)
 
-    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
+    from sglang.multimodal_gen.runtime.entrypoints.openai import (
+        common_api,
+        mesh_api,
+        text_api,
+    )
 
     app.include_router(common_api.router)
     app.include_router(image_api.router)
@@ -428,6 +432,7 @@ def create_app(server_args: ServerArgs):
     if server_args.pipeline_config.supports_openpi_endpoint():
         app.include_router(openpi.router)
     app.include_router(mesh_api.router)
+    app.include_router(text_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
 

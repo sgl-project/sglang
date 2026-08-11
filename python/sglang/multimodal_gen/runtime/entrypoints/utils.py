@@ -231,6 +231,7 @@ class GenerationResult:
     frames: Any = None
     audio: Any = None
     action: Any = None  # [T, raw_action_dim] predicted action (policy/inverse_dynamics)
+    text: str | None = None
     prompt: str | None = None
     size: tuple | None = None  # (height, width, num_frames)
     generation_time: float = 0.0

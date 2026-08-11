@@ -45,6 +45,9 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cola_dlm import (
+    ColaDLMPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
     ErnieImagePipelineConfig,
 )
@@ -105,6 +108,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.sample.cola_dlm import ColaDLMSamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
@@ -308,6 +312,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "cola-dlm": "ColaDLMPipeline",
 }
 
 
@@ -439,17 +444,31 @@ def _get_config_info(
             model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
             return _CONFIG_REGISTRY.get(model_id)
 
-    # 3. Use detectors
-    config = maybe_download_model_index(model_path)
-    pipeline_name = config.get("_class_name", "").lower()
-
+    # 3. Use detectors — check model path first (supports non-diffusers models
+    #    that have no model_index.json), then fall back to pipeline name from
+    #    model_index.json.
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
-        if detector(model_path.lower()) or detector(pipeline_name):
+        if detector(model_path.lower()):
             logger.debug(
-                f"Matched model name '{model_id}' using a registered detector."
+                f"Matched model name '{model_id}' using a registered detector (by path)."
             )
             matched_model_names += [model_id]
+
+    # If no path-based match, try downloading model_index.json and match by
+    # pipeline class name.
+    if not matched_model_names:
+        try:
+            config = maybe_download_model_index(model_path)
+            pipeline_name = config.get("_class_name", "").lower()
+            for model_id, detector in _MODEL_NAME_DETECTORS:
+                if detector(pipeline_name):
+                    logger.debug(
+                        f"Matched model name '{model_id}' using a registered detector (by pipeline name)."
+                    )
+                    matched_model_names += [model_id]
+        except Exception:
+            pass  # non-diffusers models won't have model_index.json
 
     if len(matched_model_names) >= 1:
         if len(matched_model_names) > 1:
@@ -1185,6 +1204,15 @@ def _register_configs():
         pipeline_config_cls=LingBotVideoMoEPipelineConfig,
         model_detectors=[
             lambda hf_id: "lingbot-video-moe" in hf_id.lower(),
+        ],
+    )
+
+    # Cola-DLM
+    register_configs(
+        sampling_param_cls=ColaDLMSamplingParams,
+        pipeline_config_cls=ColaDLMPipelineConfig,
+        model_detectors=[
+            lambda hf_id: "cola" in hf_id.lower() and "dlm" in hf_id.lower(),
         ],
     )
 
