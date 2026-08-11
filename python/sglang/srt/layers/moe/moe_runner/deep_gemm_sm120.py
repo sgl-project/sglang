@@ -45,6 +45,14 @@ def use_swizzle() -> bool:
     return not _is_sm120
 
 
+def allows_masked_standard_layout() -> bool:
+    """SM120 cannot serve the masked-standard layout for DSV4 shapes: its varlen
+    activation kernel requires ``D // 8 >= num_experts`` (512 // 8 = 64 < 256),
+    so keep upstream's memory-budget heuristic off this path.
+    """
+    return not _is_sm120
+
+
 def _eligible(hidden_states, quant_info, runner_config) -> bool:
     return (
         _is_sm120

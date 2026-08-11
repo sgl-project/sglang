@@ -870,7 +870,10 @@ def pre_permute_standard_to_deep_gemm(
 
     topk_weights, topk_ids = topk_weights, topk_ids
 
-    if _should_use_masked_standard_layout(runner_config, quant_info, hidden_states):
+    if (
+        deep_gemm_sm120.allows_masked_standard_layout()
+        and _should_use_masked_standard_layout(runner_config, quant_info, hidden_states)
+    ):
         output_dtype = (
             torch.bfloat16
             if quant_info.w13_weight.dtype == torch.bfloat16
