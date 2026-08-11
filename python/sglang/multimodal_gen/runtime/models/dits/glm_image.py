@@ -18,15 +18,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.bitexact_gate import (
+    BitExactFusionGate,
+    tensors_equal,
+)
 from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     can_fuse_linear_gelu,
+    fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
-from sglang.kernels.ops.diffusion.residual_gate_add import (
-    can_use_residual_gate_add_cuda,
-    residual_gate_add_cuda,
-)
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
     can_use_fused_layernorm_modulate,
     can_use_fused_qk_head_layernorm,
@@ -75,11 +77,8 @@ logger = init_logger(__name__)
 
 _is_cuda = current_platform.is_cuda()
 
-_GLM_FUSED_LN_MOD_DISABLED = False
-_GLM_FUSED_LN_MOD_VERIFIED = False
-_GLM_FUSED_QK_LN_DISABLED = False
-_GLM_FUSED_QK_LN_VERIFIED = False
-_GLM_RESIDUAL_GATE_CUDA_DISABLED = False
+_GLM_LN_MOD = BitExactFusionGate("GLM fused LN+modulate")
+_GLM_QK_LN = BitExactFusionGate("GLM fused qk-LayerNorm")
 
 
 def _eager_ln_modulate(
@@ -105,36 +104,31 @@ def _glm_ln_modulate(
     the first call verifies ``torch.equal`` against the eager chain and
     disables the fast path permanently on any mismatch.
     """
-    global _GLM_FUSED_LN_MOD_DISABLED, _GLM_FUSED_LN_MOD_VERIFIED
-
+    verified = _GLM_LN_MOD.verified
     if (
-        not _GLM_FUSED_LN_MOD_DISABLED
+        not _GLM_LN_MOD.disabled
         and _is_cuda
         and dtype is x.dtype
         and is_plain_layer_norm(norm, x.shape[-1])
         and can_use_fused_layernorm_modulate(x, scale, shift)
-        and (_GLM_FUSED_LN_MOD_VERIFIED or not torch.compiler.is_compiling())
+        and (verified or _GLM_LN_MOD.can_attempt_once())
     ):
         try:
             out = fused_layernorm_modulate(x, scale, shift, norm.eps)
         except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling GLM fused LN+modulate fast path: {exc}")
-            _GLM_FUSED_LN_MOD_DISABLED = True
+            _GLM_LN_MOD.on_exception(exc, logger=logger)
         else:
-            if _GLM_FUSED_LN_MOD_VERIFIED:
+            if verified:
                 return out
-            ref = _eager_ln_modulate(norm, x, scale, shift, dtype)
-            if torch.equal(out, ref):
-                _GLM_FUSED_LN_MOD_VERIFIED = True
-                return out
-            logger.warning_once(
-                "GLM fused LN+modulate fast path is not bit-exact against "
-                "this platform's LayerNorm dispatch; falling back to eager"
+            return _GLM_LN_MOD.accept_or_fallback(
+                out,
+                _eager_ln_modulate(norm, x, scale, shift, dtype),
+                logger=logger,
+                mismatch_msg=(
+                    "GLM fused LN+modulate fast path is not bit-exact against "
+                    "this platform's LayerNorm dispatch; falling back to eager"
+                ),
             )
-            _GLM_FUSED_LN_MOD_DISABLED = True
-            return ref
 
     return _eager_ln_modulate(norm, x, scale, shift, dtype)
 
@@ -151,10 +145,9 @@ def _glm_qk_layernorm(
     First call verifies ``torch.equal`` against the eager pair and falls
     back permanently on any mismatch.
     """
-    global _GLM_FUSED_QK_LN_DISABLED, _GLM_FUSED_QK_LN_VERIFIED
-
+    verified = _GLM_QK_LN.verified
     if (
-        not _GLM_FUSED_QK_LN_DISABLED
+        not _GLM_QK_LN.disabled
         and _is_cuda
         and dtype is query.dtype
         and dtype is key.dtype
@@ -162,59 +155,31 @@ def _glm_qk_layernorm(
         and is_plain_layer_norm(norm_k, key.shape[-1])
         and norm_q.eps == norm_k.eps
         and can_use_fused_qk_head_layernorm(query, key)
-        and (_GLM_FUSED_QK_LN_VERIFIED or not torch.compiler.is_compiling())
+        and (verified or _GLM_QK_LN.can_attempt_once())
     ):
         try:
-            q_out, k_out = fused_qk_head_layernorm(query, key, norm_q.eps)
+            out = fused_qk_head_layernorm(query, key, norm_q.eps)
         except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling GLM fused qk-LayerNorm fast path: {exc}")
-            _GLM_FUSED_QK_LN_DISABLED = True
+            _GLM_QK_LN.on_exception(exc, logger=logger)
         else:
-            if _GLM_FUSED_QK_LN_VERIFIED:
-                return q_out, k_out
-            q_ref = norm_q(query).to(dtype=dtype)
-            k_ref = norm_k(key).to(dtype=dtype)
-            if torch.equal(q_out, q_ref) and torch.equal(k_out, k_ref):
-                _GLM_FUSED_QK_LN_VERIFIED = True
-                return q_out, k_out
-            logger.warning_once(
-                "GLM fused qk-LayerNorm fast path is not bit-exact against "
-                "this platform's LayerNorm dispatch; falling back to eager"
+            if verified:
+                return out
+            ref = (
+                norm_q(query).to(dtype=dtype),
+                norm_k(key).to(dtype=dtype),
             )
-            _GLM_FUSED_QK_LN_DISABLED = True
-            return q_ref, k_ref
+            return _GLM_QK_LN.accept_or_fallback(
+                out,
+                ref,
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "GLM fused qk-LayerNorm fast path is not bit-exact against "
+                    "this platform's LayerNorm dispatch; falling back to eager"
+                ),
+            )
 
     return norm_q(query).to(dtype=dtype), norm_k(key).to(dtype=dtype)
-
-
-def _glm_residual_gate_add(
-    residual: torch.Tensor,
-    update: torch.Tensor,
-    gate: torch.Tensor,
-) -> torch.Tensor:
-    """Single-kernel ``residual + gate * update``, bit-exact vs the eager pair.
-
-    Half dtypes only: for fp32 the kernel would contract to an fma (one
-    rounding) and stop being bit-exact.
-    """
-    global _GLM_RESIDUAL_GATE_CUDA_DISABLED
-
-    if (
-        not _GLM_RESIDUAL_GATE_CUDA_DISABLED
-        and residual.dtype in (torch.float16, torch.bfloat16)
-        and can_use_residual_gate_add_cuda(residual, update, gate)
-    ):
-        try:
-            return residual_gate_add_cuda(residual, update, gate)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling GLM residual-gate CUDA fast path: {exc}")
-            _GLM_RESIDUAL_GATE_CUDA_DISABLED = True
-
-    return residual + gate * update
 
 
 class GlmImageLayerKVCache:
@@ -491,9 +456,7 @@ class GlmImageGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
-            self.proj, hidden_states
-        ):
+        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -837,10 +800,10 @@ class GlmImageTransformerBlock(nn.Module):
 
         ff_output = self.ff(norm_hidden_states)
         ff_output_context = self.ff(norm_encoder_hidden_states)
-        hidden_states = _glm_residual_gate_add(
+        hidden_states = residual_gate_add(
             hidden_states, ff_output, gate_mlp.unsqueeze(1)
         )
-        encoder_hidden_states = _glm_residual_gate_add(
+        encoder_hidden_states = residual_gate_add(
             encoder_hidden_states, ff_output_context, c_gate_mlp.unsqueeze(1)
         )
 
@@ -978,8 +941,7 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ):
         super().__init__(config=config, hf_config=hf_config)
 
-        self.config_data = config  # Store config
-        arch_config = config.arch_config
+        arch_config = self.config
 
         self.in_channels = arch_config.in_channels
         self.out_channels = arch_config.out_channels
