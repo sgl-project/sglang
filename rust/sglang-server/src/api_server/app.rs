@@ -51,7 +51,7 @@ pub async fn serve(
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
         .merge(common::routes())
-        .merge(native_api::routes())
+        .merge(native_api::routes(server_args.enable_pd_bootstrap()))
         .merge(openai::routes());
 
     // TODO(auth): no API-key boundary yet. Python gates every route (except
@@ -71,6 +71,24 @@ pub async fn serve(
         let (routes, sweeper) = pd_bootstrap::router_and_sweeper();
         tokio::spawn(sweeper); // cancelled with the runtime on shutdown
         app = app.merge(routes);
+        // Stamped on the whole listener, not per handler: the decode reads it
+        // from `/health` (native_api) and `/route` (pd_bootstrap), which live
+        // in different routers with different state types. Keep this layer
+        // below every `.merge()` -- a router merged after it would not be
+        // stamped, and the listener-wide test probes the router fallback, so
+        // it would stay green.
+        let instance_id = pd_bootstrap::new_instance_id();
+        app = app.layer(axum::middleware::map_response(
+            move |mut response: axum::response::Response| {
+                let instance_id = instance_id.clone();
+                async move {
+                    response
+                        .headers_mut()
+                        .insert(pd_bootstrap::INSTANCE_ID_HEADER, instance_id);
+                    response
+                }
+            },
+        ));
         tracing::info!("PD KV bootstrap registry mounted on the api listener");
     }
 
