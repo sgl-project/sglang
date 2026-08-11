@@ -135,6 +135,7 @@ def test_default_handle_type_fallback(monkeypatch, rejected, expected) -> None:
         prop = make_device_allocation_prop(device_id)
         assert selected == expected
         assert prop.requestedHandleTypes == expected
+        assert isinstance(prop.requestedHandleTypes, drv.CUmemAllocationHandleType)
         assert prop.allocFlags.gpuDirectRDMACapable == 0
 
         explicit = make_device_allocation_prop(
@@ -143,13 +144,20 @@ def test_default_handle_type_fallback(monkeypatch, rejected, expected) -> None:
             gpu_direct_rdma=True,
         )
         assert explicit.requestedHandleTypes == _FABRIC
+        assert isinstance(explicit.requestedHandleTypes, drv.CUmemAllocationHandleType)
         assert explicit.allocFlags.gpuDirectRDMACapable == 1
 
         non_exportable = make_device_allocation_prop(device_id, handle_types=None)
         assert non_exportable.requestedHandleTypes == 0
+        assert isinstance(
+            non_exportable.requestedHandleTypes, drv.CUmemAllocationHandleType
+        )
 
         explicit_none = make_device_allocation_prop(device_id, handle_types=0)
         assert explicit_none.requestedHandleTypes == 0
+        assert isinstance(
+            explicit_none.requestedHandleTypes, drv.CUmemAllocationHandleType
+        )
 
         with pytest.raises(ValueError, match="handle_types must be"):
             make_device_allocation_prop(device_id, handle_types="fabric")
