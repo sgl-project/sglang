@@ -309,6 +309,13 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
+# GB10 (DGX Spark and OEM equivalents). Not expressible via
+# _check_cuda_device_version, which only matches on the major.
+@lru_cache(maxsize=1)
+def is_sm121() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
+
+
 try:
     import sgl_kernel  # noqa: F401
 
@@ -1016,21 +1023,11 @@ def set_cuda_arch():
         )
 
 
-def mxfp_supported():
-    """
-    Returns whether the current platform supports MX types.
-    """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
-
-
 @lru_cache(maxsize=1)
 def is_gfx95_supported():
-    """
-    Returns whether the current platform supports MX types.
+    """Whether the device is an AMD gfx95 GPU (the MX-capable ROCm arch).
+
+    False on every non-HIP build, so callers do not need their own is_hip().
     """
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
@@ -1646,9 +1643,12 @@ class VideoData:
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
 
 
-def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+def is_jpeg_with_cuda(
+    image_bytes: bytes = b"", gpu_image_decode: GPUImageDecodeMode = True
+) -> bool:
     """
     Check three conditions:
     1. whether CUDA is available.
@@ -1662,10 +1662,19 @@ def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -
     return False
 
 
+@lru_cache(maxsize=16)
+def _warn_fancy_jpeg_fallback(error: str) -> None:
+    logger.warning(
+        "High-fidelity GPU JPEG decode is unavailable; falling back to PIL. "
+        "Install the Kimi-K3 serving image or NVIDIA nvImageCodec. Error: %s",
+        error,
+    )
+
+
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
-    gpu_image_decode: bool = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
     Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
@@ -1676,19 +1685,29 @@ def _load_image(
         image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
+            if gpu_image_decode == "nvjpeg_fancy":
+                from sglang.srt.utils.nvjpeg_decoder import (
+                    decode_jpeg_with_fancy_upsampling,
+                )
+
+                return decode_jpeg_with_fancy_upsampling(image_bytes)
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
         except Exception as e:
-            logger.warning(
-                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
-            )
+            if gpu_image_decode == "nvjpeg_fancy":
+                _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")
+            else:
+                logger.warning(
+                    "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
+                    e,
+                )
     return Image.open(BytesIO(image_bytes))
 
 
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
-    gpu_image_decode: bool = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
@@ -3508,14 +3527,17 @@ def dispose_tensor(x: torch.Tensor):
     interfering with torch.compile's memory tracking and graph recording.
     """
 
-    # Skip disposal during piecewise CUDA graph capture/replay: freeing the
-    # backing storage would invalidate addresses recorded in the graph.
-    # Local import avoids a circular dependency.
+    # Skip disposal under a captured prefill graph (piecewise or breakable):
+    # freeing the backing storage would invalidate addresses recorded in the
+    # graph. Local imports avoid a circular dependency.
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         is_in_tc_piecewise_cuda_graph,
     )
 
-    if is_in_tc_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return
 
     from sglang.srt.runtime_context import get_flags
@@ -4262,15 +4284,7 @@ class ConcurrentCounter:
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
-    if importlib.util.find_spec("triton_kernels") is None:
-        return False
-    try:
-        ragged_metadata_spec = importlib.util.find_spec(
-            "triton_kernels.tensor_details.ragged_tensor"
-        )
-    except ModuleNotFoundError:
-        return False
-    return ragged_metadata_spec is not None
+    return importlib.util.find_spec("triton_kernels") is not None
 
 
 def json_list_type(value):
