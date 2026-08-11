@@ -1,0 +1,317 @@
+name: Close Stale PRs
+
+# Paced deliberately. As of 2026-08-11 the candidate pool is ~1400 PRs (331 from
+# the WIP rule, ~1072 from the 90-day rule) and roughly 12-13 PRs go quiet per
+# day. At 32 per run that is ~19 net per day, so the backlog drains in ~2.5
+# months while staying well ahead of new inflow - and a bad rule shows up in the
+# reopen rate long before it can close a thousand PRs.
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report only, do not close anything'
+        type: boolean
+        default: true
+      rules:
+        description: 'Comma-separated subset of: wip,quota,stale'
+        default: 'wip,quota,stale'
+      max_actions:
+        description: 'Hard cap on PRs closed in one run'
+        default: '32'
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  close-stale-prs:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sweep stale PRs
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Thresholds.
+            const WIP_DAYS = 21;      // rule 1: WIP / do-not-merge / draft title marker
+            const DRAFT_DAYS = 21;    // rule 1: GitHub draft flag
+            const QUOTA = 5;          // rule 2: max open PRs for a non-write author
+            const QUOTA_IDLE = 7;     // rule 2: every one of their PRs must be idle this long
+            const STALE_DAYS = 90;    // rule 3: no updates at all
+
+            // Keep true. PRs with an approving review are almost always blocked on
+            // us, not on the author: of the 43 approved-and-stale PRs as of
+            // 2026-08-11, a manual triage pass had independently marked at least 8
+            // as worth keeping (#22441, #21194, #21153, #20427, #19777, #19857,
+            // #19530, #22178), and every one of those approvals came from a
+            // maintainer with write access. Flipping this to false closes PRs that
+            // our own reviewers signed off on.
+            const SKIP_APPROVED = true;
+
+            // Candidates are enumerated with paginated pulls.list, NOT the search API.
+            // Search caps out at 1000 results, which silently truncates a 4000+ PR
+            // backlog; REST pagination has no such cap. Both agree on the actual
+            // counts, so this is about completeness, not correctness.
+            //
+            // Caveat on updated_at: it is refreshed by some non-substantive events, so
+            // a PR can report a recent updated_at with no commit or comment behind it
+            // (#6722 on 2026-08-11: updated_at yesterday, last commit 14 months old,
+            // last human comment 8 months old). That direction is safe here - such a
+            // PR is skipped, never wrongly closed. If we ever want to catch them too,
+            // the fix is to age off max(last commit, last human comment) instead, at
+            // the cost of two extra API calls per candidate.
+
+            const KEEP_LABELS = new Set([
+              'high priority',
+              'keep-open',
+              'good first issue',
+            ]);
+
+            const WIP_MARKER = /^\s*\[?\s*(wip|do[ _-]?not[ _-]?merge|dnm|draft)\s*\]?/i;
+
+            const DRY = context.eventName !== 'schedule'
+              && String(process.env.DRY_RUN) !== 'false';
+            const RULES = new Set(
+              (process.env.RULES || 'wip,quota,stale').split(',').map(s => s.trim()));
+            const MAX = parseInt(process.env.MAX_ACTIONS || '32', 10);
+
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const now = Date.now();
+            const idleDays = ts => (now - new Date(ts).getTime()) / 86400000;
+
+            core.info(`dry_run=${DRY} rules=${[...RULES]} max_actions=${MAX}`);
+
+            // One permission lookup per author, not per PR.
+            const permCache = new Map();
+            async function hasWrite(login) {
+              if (permCache.has(login)) return permCache.get(login);
+              let ok = false;
+              try {
+                const r = await github.rest.repos.getCollaboratorPermissionLevel(
+                  { owner, repo, username: login });
+                ok = ['admin', 'maintain', 'write'].includes(r.data.permission);
+              } catch (e) {
+                ok = false;  // not a collaborator
+              }
+              permCache.set(login, ok);
+              return ok;
+            }
+
+            async function isApproved(number) {
+              try {
+                const revs = await github.paginate(
+                  github.rest.pulls.listReviews,
+                  { owner, repo, pull_number: number, per_page: 100 });
+                return revs.some(r => r.state === 'APPROVED');
+              } catch (e) {
+                return false;
+              }
+            }
+
+            const prs = await github.paginate(
+              github.rest.pulls.list,
+              { owner, repo, state: 'open', sort: 'updated',
+                direction: 'asc', per_page: 100 });
+            core.info(`fetched ${prs.length} open PRs`);
+
+            // Rule 2 operates on the whole author, so pre-compute per-author state:
+            // how many PRs they have open, and how long ALL of them have been idle.
+            const authors = new Map();
+            for (const pr of prs) {
+              const a = authors.get(pr.user.login) || { count: 0, minIdle: Infinity };
+              a.count += 1;
+              a.minIdle = Math.min(a.minIdle, idleDays(pr.updated_at));
+              authors.set(pr.user.login, a);
+            }
+            const overQuota = new Set();
+            for (const [login, a] of authors) {
+              if (a.count <= QUOTA) continue;
+              if (a.minIdle < QUOTA_IDLE) continue;   // any recent activity spares them all
+              if (await hasWrite(login)) continue;
+              overQuota.add(login);
+            }
+            if (overQuota.size) {
+              core.info(`over-quota authors: ${[...overQuota].join(', ')}`);
+            }
+
+            function classify(pr) {
+              const idle = Math.floor(idleDays(pr.updated_at));
+              if (RULES.has('quota') && overQuota.has(pr.user.login)) {
+                const n = authors.get(pr.user.login).count;
+                return { rule: 'quota',
+                  short: `quota: ${n} open PRs, all idle ${idle}d`,
+                  reason: `the author has ${n} open PRs (limit ${QUOTA} for non-collaborators) `
+                        + `and none of them has been updated in ${QUOTA_IDLE} days` };
+              }
+              if (RULES.has('wip') && (WIP_MARKER.test(pr.title) || pr.draft)
+                  && idle > (pr.draft ? DRAFT_DAYS : WIP_DAYS)) {
+                const marked = WIP_MARKER.test(pr.title);
+                const what = marked ? 'marked WIP / do-not-merge' : 'still a draft';
+                return { rule: 'wip',
+                  short: `${marked ? 'WIP' : 'draft'}, idle ${idle}d`,
+                  reason: `it is ${what} and has not been updated in ${idle} days` };
+              }
+              if (RULES.has('stale') && idle > STALE_DAYS) {
+                return { rule: 'stale',
+                  short: `stale, idle ${idle}d`,
+                  reason: `it has had no updates in ${idle} days` };
+              }
+              return null;
+            }
+
+            // Rebasing hint - an old branch is very likely pointing at paths that
+            // have since moved, so save the author the archaeology.
+            const RELOCATIONS = [
+              'If you do come back to it, these directory moves landed recently and are',
+              'the most common reason an older branch no longer applies:',
+              '',
+              '- `sgl-kernel/` -> `python/sglang/kernels/aot/`',
+              '- `python/sglang/jit_kernel/` -> `python/sglang/kernels/jit/` and `kernels/ops/`',
+              '- Sphinx `docs/` -> Mintlify `docs/docs/` (`.md` -> `.mdx`)',
+              '- `python/sglang/bench_serving.py` -> `python/sglang/benchmark/serving.py`',
+              '- `test/srt/` retired; tests now live under `test/registered/`',
+            ];
+
+            function commentBody(pr, verdict) {
+              const who = `@${pr.user.login}`;
+              const idle = Math.floor(idleDays(pr.updated_at));
+              let lead;
+
+              if (verdict.rule === 'wip') {
+                const what = WIP_MARKER.test(pr.title)
+                  ? 'is still marked a work in progress'
+                  : 'is still a draft';
+                lead = [
+                  `Thanks for working on this, ${who}.`,
+                  '',
+                  `This PR ${what} and has not been updated in ${idle} days, so we are`
+                    + ' closing it to keep the review queue current. Reopen it or push to the'
+                    + ' branch whenever you want to pick it back up.',
+                ];
+              } else if (verdict.rule === 'quota') {
+                const n = authors.get(pr.user.login).count;
+                lead = [
+                  `Thanks for the contributions, ${who}.`,
+                  '',
+                  `You have ${n} PRs open and none has been updated in the last`
+                    + ` ${QUOTA_IDLE} days. We cap idle open PRs at ${QUOTA} per contributor`
+                    + ' so review attention stays spread out, so this batch is being closed.',
+                  '',
+                  'Reopen the two or three you most want reviewed - a short active set moves'
+                    + ' faster than a long idle one.',
+                ];
+              } else {
+                lead = [
+                  `This PR has had no updates in ${idle} days, so it is being closed in a`
+                    + ' backlog sweep. That is a queue-hygiene call, not a judgement on the'
+                    + ' change.',
+                  '',
+                  'If it is still relevant, rebase onto current `main` and reopen.',
+                ];
+              }
+
+              return [...lead, '', ...RELOCATIONS].join('\n');
+            }
+
+            const closed = [];
+            const skipped = [];
+
+            for (const pr of prs) {
+              if (closed.length >= MAX) {
+                core.info(`hit max_actions=${MAX}, stopping`);
+                break;
+              }
+
+              const labels = pr.labels.map(l => l.name);
+              if (labels.some(l => KEEP_LABELS.has(l))) continue;
+              if (await hasWrite(pr.user.login)) continue;
+
+              const verdict = classify(pr);
+              if (!verdict) continue;
+
+              if (SKIP_APPROVED && await isApproved(pr.number)) {
+                skipped.push({ pr, why: 'has an approving review' });
+                continue;
+              }
+
+              if (!DRY) {
+                try {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: pr.number,
+                    body: commentBody(pr, verdict),
+                  });
+                  await github.rest.pulls.update({
+                    owner, repo, pull_number: pr.number, state: 'closed',
+                  });
+                } catch (e) {
+                  core.warning(`failed on #${pr.number}: ${e.message}`);
+                  continue;
+                }
+              }
+              closed.push({ pr, ...verdict });
+              core.info(`${DRY ? 'WOULD CLOSE' : 'closed'} #${pr.number} [${verdict.rule}]`);
+            }
+
+            core.summary.addHeading(
+              DRY ? 'Stale PR sweep - DRY RUN' : 'Stale PR sweep', 2);
+            core.summary.addRaw(
+              `Scanned ${prs.length} open PRs. `
+              + `${DRY ? 'Would close' : 'Closed'} ${closed.length}`
+              + (closed.length >= MAX ? ` (capped at ${MAX})` : '')
+              + `. Left open despite matching: ${skipped.length} (approved).\n\n`);
+
+            const tally = {};
+            for (const c of closed) tally[c.rule] = (tally[c.rule] || 0) + 1;
+            core.summary.addRaw(
+              'By rule: '
+              + (Object.entries(tally).map(([k, v]) => `${k}=${v}`).join(', ') || 'none')
+              + '\n\n');
+
+            if (closed.length) {
+              core.summary.addTable([
+                [{ data: 'reason', header: true }, { data: 'author', header: true },
+                 { data: 'title', header: true }, { data: 'link', header: true }],
+                ...closed.map(c => [
+                  c.short,
+                  `@${c.pr.user.login}`,
+                  c.pr.title.length > 80 ? c.pr.title.slice(0, 77) + '...' : c.pr.title,
+                  `<a href="${c.pr.html_url}">#${c.pr.number}</a>`,
+                ]),
+              ]);
+            }
+            // Rollback line. If a run turns out to have closed the wrong things,
+            // this is the one command that undoes exactly that run.
+            if (closed.length && !DRY) {
+              const nums = closed.map(c => c.pr.number).join(' ');
+              core.summary.addRaw('\n**Undo this run**\n\n');
+              core.summary.addCodeBlock(
+                `for n in ${nums}; do gh pr reopen $n --repo ${owner}/${repo}; done`,
+                'bash');
+              core.summary.addRaw(
+                '\nNote: nothing is labelled, so this table is the only record of the '
+                + 'run. Job summaries are retained for 90 days by default - if you want a '
+                + 'history that outlives that, raise the retention setting or archive the '
+                + 'summaries.\n');
+            }
+
+            if (skipped.length) {
+              core.summary.addRaw(
+                '\n**Matched a rule but not closed - has an approving review**\n\n');
+              for (const s of skipped) {
+                core.summary.addRaw(`- #${s.pr.number} @${s.pr.user.login}\n`);
+              }
+            }
+            await core.summary.write();
+        env:
+          # Precedence: manual input > repository variable > built-in default.
+          # The repository variables let the scheduled run be retuned from
+          # Settings -> Actions -> Variables without touching this file:
+          #   STALE_MAX_ACTIONS=64  speed up once the reopen rate looks healthy
+          #   STALE_MAX_ACTIONS=0   kill switch - MAX=0 breaks the loop immediately
+          #   STALE_RULES=wip       temporarily narrow to one rule
+          DRY_RUN: ${{ inputs.dry_run }}
+          RULES: ${{ inputs.rules || vars.STALE_RULES || 'wip,quota,stale' }}
+          MAX_ACTIONS: ${{ inputs.max_actions || vars.STALE_MAX_ACTIONS || '32' }}
