@@ -195,8 +195,17 @@ class UpsamplerLoader(ComponentLoader):
     component_names = ["spatial_upsampler"]
     expected_library = "diffusers"
 
-    def should_offload(self, server_args: ServerArgs, model_config=None):
-        return server_args.vae_cpu_offload
+    def should_offload(
+        self,
+        server_args: ServerArgs,
+        model_config=None,
+        component_name: str | None = None,
+    ):
+        return self._should_offload_component(
+            server_args,
+            component_name or "spatial_upsampler",
+            server_args.vae_cpu_offload,
+        )
 
     def load_customized(
         self,
@@ -210,7 +219,7 @@ class UpsamplerLoader(ComponentLoader):
 
         logger.info("Loading LatentUpsampler with config: %s", config)
 
-        should_offload = self.should_offload(server_args)
+        should_offload = self.should_offload(server_args, component_name=component_name)
         target_device = self.target_device(should_offload)
 
         with torch.device("meta"):

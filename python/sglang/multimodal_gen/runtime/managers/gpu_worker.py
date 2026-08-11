@@ -333,29 +333,25 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def _format_offload_disable_suggestions(self, components: List[str]) -> str:
         component_set = set(components)
-        suggestions = []
-        seen_args = set()
+        component_names = []
+        layerwise_suggestions = []
 
         for component in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
             if component not in component_set:
                 continue
 
-            arg = None
-            if component == "vae":
-                arg = "--cpu-offload-components"
-            elif component == "image_encoder":
-                arg = "--cpu-offload-components"
-            elif component in ("text_encoder", "text_encoder_2"):
-                arg = "--cpu-offload-components"
+            if component in ("vae", "image_encoder", "text_encoder", "text_encoder_2"):
+                component_names.append(component)
             elif component == "transformer":
                 if self.server_args.is_dit_layerwise_offload_selected:
-                    arg = "--dit-layerwise-offload"
+                    layerwise_suggestions.append("--dit-layerwise-offload")
                 elif self.server_args.dit_cpu_offload:
-                    arg = "--cpu-offload-components"
+                    component_names.append(component)
 
-            if arg is not None and arg not in seen_args:
-                suggestions.append(arg)
-                seen_args.add(arg)
+        suggestions = []
+        if component_names:
+            suggestions.append("--cpu-offload-components " + " ".join(component_names))
+        suggestions.extend(layerwise_suggestions)
 
         return ", ".join(suggestions) if suggestions else "None"
 

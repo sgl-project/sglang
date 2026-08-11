@@ -100,6 +100,8 @@ def should_cpu_offload_component(
         return False
     if server_args.use_fsdp_inference or is_fsdp_managed_module(module):
         return False
+    if server_args.cpu_offload_components is not None:
+        return server_args.is_cpu_offload_component_selected(component_name)
     if is_dit_component_name(component_name):
         return bool(server_args.dit_cpu_offload)
     if is_text_encoder_component_name(component_name):

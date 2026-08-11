@@ -366,7 +366,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             ):
                 server_args = ServerArgs.from_cli_args(args, unknown_args)
 
-        self.assertEqual(server_args.cpu_offload_components, ["dit", "vae"])
+        self.assertEqual(server_args.cpu_offload_components, ["transformer", "vae"])
         self.assertTrue(server_args.dit_cpu_offload)
         self.assertTrue(server_args.vae_cpu_offload)
         self.assertFalse(server_args.text_encoder_cpu_offload)
@@ -801,11 +801,47 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertEqual(args.cpu_offload_components, ["dit", "vae"])
+        self.assertEqual(args.cpu_offload_components, ["transformer", "vae"])
         self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertTrue(args.vae_cpu_offload)
+
+    def test_cpu_offload_components_preserves_model_index_names(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "cpu_offload_components": [
+                    "transformer_2",
+                    "audio_vae",
+                    "connectors",
+                ],
+            },
+        )
+
+        self.assertEqual(
+            args.cpu_offload_components,
+            ["transformer_2", "audio_vae", "connectors"],
+        )
+        self.assertTrue(args.is_cpu_offload_component_selected("transformer_2"))
+        self.assertTrue(args.is_cpu_offload_component_selected("audio_vae"))
+        self.assertTrue(args.is_cpu_offload_component_selected("connectors"))
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_cpu_offload_components_all_matches_dynamic_components(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "cpu_offload_components": ["all"],
+            },
+        )
+
+        self.assertEqual(args.cpu_offload_components, ["all"])
+        self.assertTrue(args.is_cpu_offload_component_selected("transformer_2"))
+        self.assertTrue(args.is_cpu_offload_component_selected("connectors"))
 
     def test_cpu_offload_components_none_disables_all_legacy_flags(self):
         args = self._from_dict_with_task_type(
