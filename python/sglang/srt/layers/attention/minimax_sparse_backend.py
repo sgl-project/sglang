@@ -373,8 +373,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 build_page_table_snapshot,
             )
 
+            active_num_pages = max(
+                1, (self._max_seqlen_k + self.page_size - 1) // self.page_size
+            )
             build_page_table_snapshot(
-                self._active_page_table,
+                self._active_page_table[:, :active_num_pages],
                 self.req_to_token,
                 forward_batch.req_pool_indices[:bs],
                 seq_lens,
