@@ -15,6 +15,11 @@ from sglang.srt.configs.inkling import (
     InklingModelConfig,
     InklingVisionConfig,
 )
+from sglang.srt.configs.interns2_mobius import (
+    InternS2MobiusConfig,
+    InternS2MobiusTextConfig,
+    InternS2MobiusVisionConfig,
+)
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
@@ -81,6 +86,9 @@ __all__ = [
     "Qwen3_5TextConfig",
     "Qwen3_5MoeTextConfig",
     "InternS2PreviewConfig",
+    "InternS2MobiusConfig",
+    "InternS2MobiusTextConfig",
+    "InternS2MobiusVisionConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",
     "FalconH1Config",

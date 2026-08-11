@@ -327,6 +327,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.transfer_queue = transfer_queue
         self.tree_cache = tree_cache
         self.gloo_group = gloo_group
+        # Destinations visible to prefill but not yet on the transfer queue.
+        self._num_published_destinations = 0
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.dp_size = dp_size
@@ -656,9 +658,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
+        # HiSparse admits up to the host-backed logical capacity.
+        if self.scheduler.enable_hisparse:
+            capacity = self.scheduler.tp_worker.model_runner.max_token_pool_size
+        else:
+            capacity = self.max_total_num_tokens
         input_len = self._rebootstrap_prefill_len(req)
-        if input_len > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {self.max_total_num_tokens}"
+        if input_len > capacity:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {capacity}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
@@ -1146,14 +1153,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx
                 ][total_prefix_len:origin_input_len]
+                kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        kv_indices
+                    )
+                )
 
             seq_len = origin_input_len
 
             def _mamba_payload():
                 return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.req_pool_idx
-                    ]
+                    self.req_to_token_pool.translate_mamba_indices(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            decode_req.req.req_pool_idx
+                        ]
+                    )
                     .cpu()
                     .numpy()
                 ]
@@ -1301,6 +1315,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.kv_receiver,
                     decode_req.req.build_rebootstrap_payload(),
                 )
+            self._num_published_destinations += 1
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
@@ -1310,6 +1325,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
         return preallocated_reqs, failed_reqs
+
+    @property
+    def has_published_destinations(self) -> bool:
+        """Whether any destination address is visible to prefill but not yet
+        protected by the transfer queue."""
+        return self._num_published_destinations > 0
+
+    def note_destinations_queued(self, count: int) -> None:
+        """Hand `count` published destinations over to the transfer queue."""
+        self._num_published_destinations = max(
+            0, self._num_published_destinations - count
+        )
 
     @property
     def num_tokens_pre_allocated(self):
@@ -1793,6 +1820,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
+        # This queue now covers them.
+        prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
+        if prealloc_queue is not None:
+            prealloc_queue.note_destinations_queued(len(decode_reqs))
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index

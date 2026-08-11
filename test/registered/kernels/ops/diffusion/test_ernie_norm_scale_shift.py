@@ -47,10 +47,10 @@ def test_fused_norm_scale_shift_is_bit_exact(shape):
         assert torch.equal(out2, ref2)
 
     # the fast paths must actually be in use (not silently disabled)
-    assert ernie_image._ERNIE_FUSED_NORM_VERIFIED
-    assert ernie_image._ERNIE_FUSED_GATED_NORM_VERIFIED
-    assert not ernie_image._ERNIE_FUSED_NORM_DISABLED
-    assert not ernie_image._ERNIE_FUSED_GATED_NORM_DISABLED
+    assert ernie_image._ERNIE_NORM.verified
+    assert ernie_image._ERNIE_GATED_NORM.verified
+    assert not ernie_image._ERNIE_NORM.disabled
+    assert not ernie_image._ERNIE_GATED_NORM.disabled
 
 
 if __name__ == "__main__":
