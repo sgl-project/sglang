@@ -37,8 +37,8 @@ on:
           - multimodal-gen-test-2-gpu-amd-rocm720
           - multimodal-gen-unit-test-amd-rocm720
           - stage-c-test-4-gpu-amd-rocm720
-          - dsv4-flash-fp4-fp8-amd-mi35x-rocm720
-          - dsv4-pro-fp4-amd-mi35x-rocm720
+          - stage-c-dsv4-flash-fp4-fp8-amd-mi35x-rocm720
+          - stage-c-dsv4-pro-fp4-amd-mi35x-rocm720
           - stage-c-test-large-8-gpu-amd-rocm720
           - stage-c-test-large-8-gpu-amd-mi35x-rocm720
           - stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720
@@ -1160,12 +1160,12 @@ jobs:
   # =============================================== DeepSeek-V4 (MI35x, 8-GPU) ====================================================
   # GSM8K accuracy on the nightly dsv4 suites, ~20min each. Gated as stage-C so
   # every PR that touches the main package covers DeepSeek-V4.
-  dsv4-flash-fp4-fp8-amd-mi35x-rocm720:
+  stage-c-dsv4-flash-fp4-fp8-amd-mi35x-rocm720:
     needs: [check-changes, call-gate, wait-for-stage-b-amd-rocm720]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',dsv4-flash-fp4-fp8-amd-mi35x-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-dsv4-flash-fp4-fp8-amd-mi35x-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1214,12 +1214,12 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  dsv4-pro-fp4-amd-mi35x-rocm720:
+  stage-c-dsv4-pro-fp4-amd-mi35x-rocm720:
     needs: [check-changes, call-gate, wait-for-stage-b-amd-rocm720]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',dsv4-pro-fp4-amd-mi35x-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-dsv4-pro-fp4-amd-mi35x-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1429,8 +1429,8 @@ jobs:
         stage-c-test-large-8-gpu-amd-rocm720,
         stage-c-test-large-8-gpu-amd-mi35x-rocm720,
 
-        dsv4-flash-fp4-fp8-amd-mi35x-rocm720,
-        dsv4-pro-fp4-amd-mi35x-rocm720,
+        stage-c-dsv4-flash-fp4-fp8-amd-mi35x-rocm720,
+        stage-c-dsv4-pro-fp4-amd-mi35x-rocm720,
       ]
     if: always()
     runs-on: ubuntu-latest
