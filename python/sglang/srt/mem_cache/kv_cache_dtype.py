@@ -22,7 +22,7 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
 def configure_kv_cache_dtype(
     *,
     server_args_kv_cache_dtype: str,
-    model: nn.Module,
+    model: nn.Module | None,
     model_dtype: torch.dtype,
     is_draft_worker: bool,
     is_dflash: bool,
