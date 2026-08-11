@@ -742,7 +742,7 @@ Router flags map to these values:
 - `bounded_consistent_hashing`: an opt-in variant of consistent hashing. With an explicit `X-SMG-Routing-Key`, it spills only when both `preferred_load - min_healthy_load > min_load_gap` and `preferred_load > mean_healthy_load * max_load_skew`; `min_load_gap` is measured in active requests. It then walks the ring clockwise to the first healthy worker within the relative bound, retaining the preferred worker if no candidate qualifies.
   `X-SMG-Target-Worker` and implicit keys from `Authorization`, `X-Forwarded-For`, or `Cookie` remain strict. The active-load signal is best-effort and local to each gateway process, and this soft-affinity policy must not be used when worker-local session state requires strict affinity.
   Configure it with `--policy bounded_consistent_hashing --max-load-skew 1.5 --min-load-gap <active-requests>`.
-  This follow-up branch uses `min_load_gap=2` as a provisional validation candidate; the public default remains pending the two-worker HTTP A/B.
+  The default `min_load_gap` is 2 as a conservative middle setting for this opt-in policy, not as an empirically optimal value. Operators should tune it for their worker count, concurrent fan-out, request length, and cache-reuse trade-off. Existing `consistent_hashing` behavior is unchanged.
   Per-model overrides are available in PD mode (`--prefill-policy`, `--decode-policy`) and IGW mode via the worker registry.
 
 ## Observability

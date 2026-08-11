@@ -61,7 +61,7 @@ class RouterArgs:
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
     max_load_skew: float = 1.5
-    min_load_gap: int = 2  # Provisional candidate pending HTTP A/B validation
+    min_load_gap: int = 2  # Conservative configurable default for opt-in bounded routing
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     max_idle_secs: int = 4 * 3600

@@ -348,7 +348,7 @@ fn default_max_load_skew() -> f64 {
     1.5
 }
 
-// Provisional wiring candidate pending placement and HTTP A/B validation.
+// Conservative configurable default for this opt-in policy.
 fn default_min_load_gap() -> usize {
     2
 }
