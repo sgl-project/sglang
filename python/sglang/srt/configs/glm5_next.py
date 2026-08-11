@@ -324,19 +324,14 @@ class Glm5NextConfig(PretrainedConfig):
         else:
             self.text_config = text_config
 
-        text_swiglu_limit = getattr(self.text_config, "swiglu_limit", None)
-        if isinstance(vision_config, dict):
-            vision_config = dict(vision_config)
-        elif vision_config is None:
-            vision_config = {}
+        if vision_config is None:
+            self.vision_config = None
         else:
-            vision_config = vision_config.to_dict()
-
-        swiglu_limit = vision_config.get("swiglu_limit", text_swiglu_limit)
-        if swiglu_limit is None:
-            raise ValueError("GLM-5 Next vision_config requires swiglu_limit")
-        vision_config["swiglu_limit"] = swiglu_limit
-        self.vision_config = self.sub_configs["vision_config"](**vision_config)
+            if isinstance(vision_config, dict):
+                vision_config = dict(vision_config)
+            else:
+                vision_config = vision_config.to_dict()
+            self.vision_config = self.sub_configs["vision_config"](**vision_config)
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
