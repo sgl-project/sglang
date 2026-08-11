@@ -39,9 +39,10 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         and server_args.speculative_algorithm == "DSPARK"
         and server_args.disaggregation_transfer_backend == "nixl"
     ):
-        # The draft KV rides its own StateType.DSPARK_DRAFT_KV component; only
-        # the mooncake maybe_send_extra dispatches it. nixl would silently skip
-        # the draft rows and desync the draft pool at transfer time.
+        # The draft KV rides its own StateType.DSPARK_DRAFT_KV component and
+        # only mooncake's maybe_send_extra dispatches it. nixl's falls through
+        # to its unknown-state-type raise, failing every request at transfer
+        # time; reject it here instead, after the model is already loaded.
         raise ValueError(
             "PD with DSPARK requires --disaggregation-transfer-backend mooncake; "
             "the nixl backend has no transfer path for the DSPARK draft KV state."
