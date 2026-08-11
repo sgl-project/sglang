@@ -53,6 +53,7 @@ from sglang.benchmark.serving import (
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
     _finite_positive_float,
+    _get_ready_check_url,
     async_request_openai_embeddings,
     flush_server_cache,
 )
@@ -109,6 +110,31 @@ class TestEmbeddingBenchmarkBackends(CustomTestCase):
             ASYNC_REQUEST_FUNCS["vllm-embedding"], async_request_openai_embeddings
         )
         self.assertEqual(_BACKEND_API_PATHS["vllm-embedding"], "/v1/embeddings")
+
+
+class TestBenchmarkReadinessEndpoint(CustomTestCase):
+    def test_sglang_backends_wait_for_generation_readiness(self):
+        """A SGLang server exposes models before warmup finishes, so benchmarks
+        must wait for the generation probe instead of the model-list endpoint.
+        """
+        base_url = "http://127.0.0.1:30000"
+        model_url = f"{base_url}/v1/models"
+
+        for backend in ("sglang", "sglang-native", "sglang-oai", "sglang-oai-chat"):
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    _get_ready_check_url(base_url, model_url, backend),
+                    f"{base_url}/health_generate",
+                )
+
+    def test_other_backends_keep_their_existing_readiness_endpoint(self):
+        """Backends without SGLang's generation probe retain their current URL."""
+        base_url = "http://127.0.0.1:8000"
+        model_url = f"{base_url}/v1/models"
+
+        self.assertEqual(_get_ready_check_url(base_url, model_url, "vllm"), model_url)
+        self.assertEqual(_get_ready_check_url(base_url, model_url, "trt"), base_url)
+        self.assertEqual(_get_ready_check_url(base_url, model_url, "gserver"), base_url)
 
 
 class TestBenchmarkCacheFlush(CustomTestCase):

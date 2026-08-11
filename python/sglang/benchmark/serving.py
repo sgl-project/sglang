@@ -169,6 +169,13 @@ def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
         time.sleep(1)
 
 
+def _get_ready_check_url(base_url: str, model_url: str, backend: str) -> str:
+    """Return the endpoint used to decide when a benchmark server is ready."""
+    if backend in ("sglang", "sglang-native", "sglang-oai", "sglang-oai-chat"):
+        return f"{base_url}/health_generate"
+    return model_url if backend not in ("trt", "gserver") else base_url
+
+
 # trt llm does not support ignore_eos
 # https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
 async def async_request_trt_llm(
@@ -2028,7 +2035,7 @@ def run_benchmark(args_: argparse.Namespace):
 
     # Wait for server to be ready
     if args.ready_check_timeout_sec > 0:
-        health_url = model_url if args.backend not in ("trt", "gserver") else base_url
+        health_url = _get_ready_check_url(base_url, model_url, args.backend)
         if not wait_for_endpoint(health_url, args.ready_check_timeout_sec):
             print(f"Server at {health_url} is not ready. Exiting.")
             sys.exit(1)
