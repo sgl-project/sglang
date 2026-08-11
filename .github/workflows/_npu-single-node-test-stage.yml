@@ -61,7 +61,7 @@ on:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
         default: 'false'
-      nightly:
+      is_nightly_pipeline_job:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
         default: false
@@ -249,7 +249,7 @@ jobs:
           echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_date=${create_date} timestamp=${timestamp}"
           # Persist results to: .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{test_type}/{tc_name}-{timestamp}
           # Only nightly persists structured results; PR keeps the original per-run flow.
-          if [ "${{ inputs.nightly }}" = "true" ]; then
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             test_data_output_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}-${timestamp}
             mkdir -p ${test_data_output_path}
             export METRICS_DATA_FILE=${test_data_output_path}
@@ -257,6 +257,9 @@ jobs:
             export SGLANG_TEST_METRICS_OUTPUT=${test_data_output_path}/metrics
             echo "Metrics file path: ${METRICS_DATA_FILE}"
             echo "SGLANG_TEST_METRICS_OUTPUT=${SGLANG_TEST_METRICS_OUTPUT}"
+            # Persist to job env early so the "Upload metrics" step still has the
+            # path if the test fails or this step times out mid-run.
+            echo "METRICS_DATA_FILE=${METRICS_DATA_FILE}" >> $GITHUB_ENV
           fi
 
           export TRANSFORMERS_VERSION_FOR_SGLANG="${{ inputs.transformers_version }}"
@@ -304,7 +307,7 @@ jobs:
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
 
           # Set environment of cann
-          if [ "${{ inputs.nightly }}" = "true" ]; then
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             # Nightly: full per-suite log under the structured run prefix.
             # Per-case logs are grouped under the same directory scheme as
             # metrics.json:
@@ -331,12 +334,11 @@ jobs:
           cd test
           # nightly mode: collect nightly-registered tests (--nightly) and keep running
           # remaining cases even if one fails (--continue-on-error)
-          NIGHTLY_FLAG="$([ "${{ inputs.nightly }}" = "true" ] && echo "--nightly --continue-on-error")"
-          if [ "${{ inputs.nightly }}" = "true" ]; then
-            ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} --timeout-per-file 3600 2>&1 | tee /tmp/test_output.log "${log_path}/${tc_name}.log" || test_exit_code=$?
-          else
-            ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
-          fi
+          NIGHTLY_FLAG="$([ "${{ inputs.is_nightly_pipeline_job }}" = "true" ] && echo "--nightly --continue-on-error")"
+          # Nightly additionally persists the full suite log to ${log_path}/${tc_name}.log;
+          # PR runs only tee to /tmp/test_output.log (empty expansion adds no arg).
+          LOG_TEE_TARGET="$([ "${{ inputs.is_nightly_pipeline_job }}" = "true" ] && echo "${log_path}/${tc_name}.log")"
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log ${LOG_TEE_TARGET} || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
@@ -350,7 +352,6 @@ jobs:
 
           echo "test_status=${test_status}" >> $GITHUB_ENV
           echo "tc_name=${tc_name}" >> $GITHUB_ENV
-          echo "METRICS_DATA_FILE=${METRICS_DATA_FILE}" >> $GITHUB_ENV
           # Persist path prefix vars for later steps (e.g. plog backup)
           echo "branch_label=${branch_label}" >> $GITHUB_ENV
           echo "workflow_name=${workflow_name}" >> $GITHUB_ENV
@@ -388,7 +389,7 @@ jobs:
           exit ${test_exit_code}
 
       - name: Upload metrics
-        if: always() && inputs.nightly == true
+        if: always() && inputs.is_nightly_pipeline_job == true && env.METRICS_DATA_FILE != ''
         uses: actions/upload-artifact@v4
         with:
           name: metrics-${{ inputs.test_suite }}
