@@ -106,7 +106,7 @@ docker pull lmsysorg/sglang:latest
 docker pull lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi30x-20260715
 
 # Or use Docker (AMD MI355X)
-docker pull lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260715
+docker pull lmsysorg/sglang:v0.5.16-rocm720-mi35x
 ```
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
@@ -276,6 +276,89 @@ python3 -m sglang.launch_server \
   --port 30000
 ```
 > **Note:** To enable MTP (speculative decoding), append `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
+
+**AMD MI355X — Disaggregated Inference (MoRI, 1P1D):**
+
+Disaggregated inference separates prefill and decode into independent workers, eliminating interference between the two phases. This configuration uses MoRI KV transfer with TP4 prefill + TP8 decode (12 GPUs total), which delivers 24-31% better throughput/GPU compared to the TP8P+TP8D (16 GPU) configuration while maintaining identical decode interactivity.
+
+```shell Command
+# === Prefill worker (4 GPUs) ===
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --disaggregation-mode prefill \
+  --tp 4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-backend aiter \
+  --disaggregation-transfer-backend mori \
+  --moe-dense-tp-size 1 \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 128 \
+  --chunked-prefill-size 262144 \
+  --disable-radix-cache \
+  --host 0.0.0.0 \
+  --port 8000
+
+# === Decode worker (8 GPUs) ===
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --disaggregation-mode decode \
+  --tp 8 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-backend aiter \
+  --disaggregation-transfer-backend mori \
+  --moe-dense-tp-size 1 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 128 \
+  --prefill-round-robin-balance \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+**AMD MI355X — Disaggregated Inference with MTP (MoRI, 1P1D, EAGLE):**
+
+Adding EAGLE speculative decoding (MTP) to the disaggregated setup improves TPOT by 3-14% at concurrency ≤ 64. For concurrency = 128, switch the decode worker to TP4 (8 GPUs total) to avoid MTP throughput collapse at high batch sizes.
+
+```shell Command
+# === Prefill worker (4 GPUs, same as baseline) ===
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --disaggregation-mode prefill \
+  --tp 4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-backend aiter \
+  --disaggregation-transfer-backend mori \
+  --moe-dense-tp-size 1 \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 128 \
+  --chunked-prefill-size 262144 \
+  --disable-radix-cache \
+  --host 0.0.0.0 \
+  --port 8000
+
+# === Decode worker with MTP (8 GPUs; use TP4 for conc≥128) ===
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --disaggregation-mode decode \
+  --tp 8 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-backend aiter \
+  --disaggregation-transfer-backend mori \
+  --moe-dense-tp-size 1 \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-steps 3 \
+  --speculative-num-draft-tokens 4 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 128 \
+  --prefill-round-robin-balance \
+  --host 0.0.0.0 \
+  --port 8000
+```
+> **Tip:** At concurrency ≥ 128, set `--tp 4` on the decode worker (4 GPUs) instead of `--tp 8`. TP8 decode at high concurrency saturates during MTP draft verification, causing throughput collapse. TP4 decode resolves this with +83% throughput/GPU improvement.
 
 ### 4.1 Basic Usage
 
