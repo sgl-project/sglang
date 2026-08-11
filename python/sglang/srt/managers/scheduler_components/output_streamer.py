@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     List,
@@ -26,8 +27,13 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.rust_server import RustServer
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,10 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
+    # Rust egress ring via `rust_server.push_generation` instead of the zmq
+    # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
+    rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
 
     def _get_storage_backend_type(self) -> str:
@@ -132,17 +142,22 @@ class SchedulerOutputStreamer:
         return_indexer_topk = any(
             req.return_indexer_topk for req in reqs if req is not skip_req
         )
+        return_sampling_mask = any(
+            req.return_sampling_mask for req in reqs if req is not skip_req
+        )
 
         acc = _GenerationStreamAccumulator(
             return_logprob=return_logprob,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             return_indexer_topk=return_indexer_topk,
+            return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
-            default_stream_interval=self.server_args.stream_interval,
+            default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
+            rust_server_mode=self.rust_server is not None,
         )
         for req in reqs:
             if req is skip_req:
@@ -161,13 +176,16 @@ class SchedulerOutputStreamer:
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
-            self.send_to_detokenizer.send_output(payload)
+            if self.rust_server is not None:
+                self.rust_server.push_generation(payload)
+            else:
+                self.send_to_detokenizer.send_output(payload)
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
             req.finished()
             and self.ps.attn_tp_rank == 0
-            and self.server_args.enable_request_time_stats_logging
+            and get_observability().enable_request_time_stats_logging
         ):
             req.log_time_stats()
 
@@ -250,12 +268,12 @@ class _GenerationStreamAccumulator:
     return_hidden_states: bool
     return_routed_experts: bool
     return_indexer_topk: bool
+    return_sampling_mask: bool = False
     spec_algorithm: Any
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
-
     rids: list = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
     finished_reasons: list = field(default_factory=list)
@@ -278,7 +296,10 @@ class _GenerationStreamAccumulator:
     video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
+    spec_num_block_accept_tokens: list = field(default_factory=list)
+    spec_num_cap_tokens: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
+    spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
@@ -291,12 +312,24 @@ class _GenerationStreamAccumulator:
     output_token_logprobs_idx: Optional[list] = None
     input_top_logprobs_val: Optional[list] = None
     input_top_logprobs_idx: Optional[list] = None
+    # Per-request flat prompt top logprob arrays (return_flat_raw_top_logprobs);
+    # None entries for requests on the nested format.
+    input_top_logprobs_val_flat: Optional[list] = None
+    input_top_logprobs_idx_flat: Optional[list] = None
+    input_top_logprobs_flat_null_prefix: Optional[list] = None
+    has_input_top_logprobs_flat: bool = False
     output_top_logprobs_val: Optional[list] = None
     output_top_logprobs_idx: Optional[list] = None
     input_token_ids_logprobs_val: Optional[list] = None
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
+    output_token_sampling_mask: Optional[list] = None
+    output_token_sampling_logprobs: Optional[list] = None
+    # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
+    # output tokens itself and never consumes the scheduler's incremental-detok
+    # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
+    rust_server_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.return_hidden_states:
@@ -313,12 +346,18 @@ class _GenerationStreamAccumulator:
             self.output_token_logprobs_idx = []
             self.input_top_logprobs_val = []
             self.input_top_logprobs_idx = []
+            self.input_top_logprobs_val_flat = []
+            self.input_top_logprobs_idx_flat = []
+            self.input_top_logprobs_flat_null_prefix = []
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
             self.input_token_ids_logprobs_val = []
             self.input_token_ids_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
+        if self.return_sampling_mask:
+            self.output_token_sampling_mask = []
+            self.output_token_sampling_logprobs = []
 
     def accept(self, *, req: Req) -> None:
         if req.finished():
@@ -354,34 +393,40 @@ class _GenerationStreamAccumulator:
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
         self.rids.append(req.rid)
-        self.http_worker_ipcs.append(req.http_worker_ipc)
         self.finished_reasons.append(
             req.finished_reason.to_json() if req.finished_reason else None
         )
-        self.decoded_texts.append(req.decoded_text)
-        decode_ids, read_offset = req.init_incremental_detokenize()
-
-        self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
-
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
-
-        req.send_decode_id_offset = len(decode_ids)
-        self.read_offsets.append(read_offset)
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
-        self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
-        self.spaces_between_special_tokens.append(
-            req.sampling_params.spaces_between_special_tokens
-        )
-        self.no_stop_trim.append(req.sampling_params.no_stop_trim)
         self.prompt_tokens.append(len(req.origin_input_ids))
-        self.reasoning_tokens.append(req.reasoning_tokens)
-        self.completion_tokens.append(len(output_ids_))
-        self.cached_tokens.append(req.cached_tokens)
 
-        # Collect detailed cache breakdown if available
-        self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+        if not self.rust_server_mode:
+            # Everything below feeds the Python DetokenizerManager /
+            # TokenizerManager (incremental detok, meta_info, per-request metrics)
+            # or gets pickled into the payload (time_stats). The Rust server
+            # replaces those stages and builds its own metadata from the
+            # ChunkEvent, so `push_generation` never reads these — skip the whole
+            # block. The parallel lists stay empty; the payload goes straight to
+            # `push_generation`, which only indexes the fields appended above.
+            self.http_worker_ipcs.append(req.http_worker_ipc)
+            self.decoded_texts.append(req.decoded_text)
+            decode_ids, read_offset = req.init_incremental_detokenize()
+            self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+            req.send_decode_id_offset = len(decode_ids)
+            self.read_offsets.append(read_offset)
+            self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
+            self.spaces_between_special_tokens.append(
+                req.sampling_params.spaces_between_special_tokens
+            )
+            self.no_stop_trim.append(req.sampling_params.no_stop_trim)
+            self.reasoning_tokens.append(req.reasoning_tokens)
+            self.completion_tokens.append(len(output_ids_))
+            self.cached_tokens.append(req.cached_tokens)
+
+            # Collect detailed cache breakdown if available
+            self.cached_tokens_details.append(self.get_cached_tokens_details(req))
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer
@@ -406,7 +451,10 @@ class _GenerationStreamAccumulator:
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+            self.spec_num_block_accept_tokens.append(req.spec_num_block_accept_tokens)
+            self.spec_num_cap_tokens.append(req.spec_num_cap_tokens)
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
+            self.spec_cap_lens_histogram.append(req.spec_cap_lens_histogram)
 
         if self.return_logprob:
             if (
@@ -425,6 +473,17 @@ class _GenerationStreamAccumulator:
                 )
                 self.input_top_logprobs_val.append(req.logprob.input_top_logprobs_val)
                 self.input_top_logprobs_idx.append(req.logprob.input_top_logprobs_idx)
+                self.input_top_logprobs_val_flat.append(
+                    req.logprob.input_top_logprobs_val_flat
+                )
+                self.input_top_logprobs_idx_flat.append(
+                    req.logprob.input_top_logprobs_idx_flat
+                )
+                self.input_top_logprobs_flat_null_prefix.append(
+                    req.logprob.input_top_logprobs_flat_null_prefix
+                )
+                if req.logprob.input_top_logprobs_val_flat is not None:
+                    self.has_input_top_logprobs_flat = True
                 self.input_token_ids_logprobs_val.append(
                     req.logprob.input_token_ids_logprobs_val
                 )
@@ -437,6 +496,9 @@ class _GenerationStreamAccumulator:
                 self.input_token_logprobs_idx.append([])
                 self.input_top_logprobs_val.append([])
                 self.input_top_logprobs_idx.append([])
+                self.input_top_logprobs_val_flat.append(None)
+                self.input_top_logprobs_idx_flat.append(None)
+                self.input_top_logprobs_flat_null_prefix.append(None)
                 self.input_token_ids_logprobs_val.append([])
                 self.input_token_ids_logprobs_idx.append([])
 
@@ -481,13 +543,40 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
 
+        if self.return_sampling_mask:
+            if req.return_sampling_mask:
+                send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
+                sampling_mask_end = len(req.output_token_sampling_mask)
+                self.output_token_sampling_mask.append(
+                    req.output_token_sampling_mask[
+                        send_output_sampling_mask_offset:sampling_mask_end
+                    ]
+                )
+                self.output_token_sampling_logprobs.append(
+                    req.output_token_sampling_logprobs[
+                        send_output_sampling_mask_offset:sampling_mask_end
+                    ]
+                )
+                req.send_output_sampling_mask_offset = sampling_mask_end
+            else:
+                self.output_token_sampling_mask.append([])
+                self.output_token_sampling_logprobs.append([])
+
         if self.return_hidden_states:
             if req.return_hidden_states:
-                # Mirror output_ids_through_stop: spec verify steps can overshoot finished_len.
-                hs = req.hidden_states
-                if req.finished_len is not None:
-                    hs = hs[: req.finished_len]
-                self.output_hidden_states.append(hs)
+                if req.return_hidden_states == "last":
+                    # Collection keeps this list bounded to the final valid
+                    # accepted token, including speculative verify overshoot.
+                    self.output_hidden_states.append(
+                        req.hidden_states[-1] if req.hidden_states else None
+                    )
+                else:
+                    # Mirror output_ids_through_stop: spec verify steps can
+                    # overshoot finished_len.
+                    hs = req.hidden_states
+                    if req.finished_len is not None:
+                        hs = hs[: req.finished_len]
+                    self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)
         if self.return_routed_experts:
@@ -528,7 +617,10 @@ class _GenerationStreamAccumulator:
             http_worker_ipcs=self.http_worker_ipcs,
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
+            spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
+            spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
+            spec_cap_lens_histogram=self.spec_cap_lens_histogram,
             time_stats=wrap_as_pickle(self.time_stats),
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,
@@ -552,6 +644,23 @@ class _GenerationStreamAccumulator:
             output_token_logprobs_idx=self.output_token_logprobs_idx,
             input_top_logprobs_val=self.input_top_logprobs_val,
             input_top_logprobs_idx=self.input_top_logprobs_idx,
+            # None on the common path so the wire payload is unchanged when no
+            # request in the batch uses the flat format.
+            input_top_logprobs_val_flat=(
+                self.input_top_logprobs_val_flat
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
+            input_top_logprobs_idx_flat=(
+                self.input_top_logprobs_idx_flat
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
+            input_top_logprobs_flat_null_prefix=(
+                self.input_top_logprobs_flat_null_prefix
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
             output_top_logprobs_val=self.output_top_logprobs_val,
             output_top_logprobs_idx=self.output_top_logprobs_idx,
             input_token_ids_logprobs_val=self.input_token_ids_logprobs_val,
@@ -559,6 +668,8 @@ class _GenerationStreamAccumulator:
             output_token_ids_logprobs_val=self.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
             output_token_entropy_val=None,
+            output_token_sampling_mask=self.output_token_sampling_mask,
+            output_token_sampling_logprobs=self.output_token_sampling_logprobs,
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,

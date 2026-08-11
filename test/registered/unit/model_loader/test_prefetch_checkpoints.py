@@ -9,17 +9,22 @@ import os
 import tempfile
 import unittest
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import safetensors.torch
 import torch
 
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
+    fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -56,7 +61,7 @@ def _wait_all(fs, return_when):
     return set(fs), set()
 
 
-class TestPrefetchCheckpoints(unittest.TestCase):
+class TestPrefetchCheckpoints(CustomTestCase):
     """Verify coordinated checkpoint prefetch behavior."""
 
     def _create_safetensors_files(self, tmpdir, num_shards=3):
@@ -215,6 +220,305 @@ class TestPrefetchCheckpoints(unittest.TestCase):
             self.assertEqual(
                 [call.args[0] for call in drop_cache.call_args_list],
                 paths,
+            )
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_fastsafetensors_drops_only_the_rank_owned_file(self, _):
+        events = []
+        test_case = self
+
+        class FakeGroup:
+            def rank(self):
+                return 0
+
+            def size(self):
+                return 1
+
+        class FakeBuffer:
+            key_to_rank_lidx = {"weight": (0, 0)}
+
+            def get_tensor(self, name):
+                test_case.assertEqual(name, "weight")
+                return torch.tensor([1.0])
+
+        class FakeLoader:
+            def __init__(self, group, device, nogds):
+                test_case.assertIsInstance(group, FakeGroup)
+                test_case.assertEqual(device.type, "cuda")
+                test_case.assertFalse(nogds)
+
+            def add_filenames(self, rank_file_map):
+                test_case.assertEqual(
+                    rank_file_map,
+                    {0: ["model.safetensors"]},
+                )
+
+            def copy_files_to_device(self):
+                return FakeBuffer()
+
+            def close(self):
+                events.append("close")
+
+        with (
+            patch(
+                "sglang.srt.model_loader.weight_utils.SingleGroup",
+                FakeGroup,
+            ),
+            patch(
+                "sglang.srt.model_loader.weight_utils.SafeTensorsFileLoader",
+                FakeLoader,
+            ),
+            patch(
+                "sglang.srt.model_loader.weight_utils._drop_file_cache_after_load",
+                side_effect=lambda path: events.append(f"drop:{path}"),
+            ),
+        ):
+            loaded = list(
+                fastsafetensors_weights_iterator(
+                    ["model.safetensors"],
+                    drop_cache_after_load=True,
+                )
+            )
+
+        torch.testing.assert_close(loaded[0][1], torch.tensor([1.0]))
+        self.assertEqual(events, ["close", "drop:model.safetensors"])
+
+
+class TestPrefetchDispatch(CustomTestCase):
+    """Verify _get_weights_iterator dispatches to the right safetensors
+    iterator based on prefetch / multi-thread config.
+
+    Prefetch + default (multi-thread on) must fall back to the
+    single-threaded iterator; an explicit enable_multithread_load=true is
+    honored as an opt-out; FASTSAFETENSORS and disable_mmap bypass the
+    override.
+    """
+
+    def _make_loader(self, extra_config, load_format=LoadFormat.SAFETENSORS):
+        load_config = LoadConfig(
+            load_format=load_format,
+            model_loader_extra_config=extra_config,
+        )
+        return DefaultModelLoader(load_config)
+
+    def _make_source(self):
+        # model_config=None skips maybe_add_mtp_safetensors.
+        return SimpleNamespace(
+            model_or_path="/dummy",
+            revision=None,
+            fall_back_to_pt=False,
+            model_config=None,
+            prefix="",
+        )
+
+    def _server_args(self, prefetch, disable_mmap=False, drop_cache=False):
+        return SimpleNamespace(
+            weight_loader_disable_mmap=disable_mmap,
+            weight_loader_prefetch_checkpoints=prefetch,
+            weight_loader_prefetch_num_threads=4,
+            weight_loader_drop_cache_after_load=drop_cache,
+        )
+
+    def _run(self, loader):
+        # _get_weights_iterator returns a generator wrapping the chosen
+        # iterator; consuming it forces the eager dispatch (the if/elif/else
+        # that calls the iterator factory) to execute.
+        list(loader._get_weights_iterator(self._make_source()))
+
+    def _patch_dispatch(self, prefetch, disable_mmap=False, drop_cache=False):
+        return (
+            patch.object(
+                DefaultModelLoader,
+                "_prepare_weights",
+                return_value=("/dummy", ["f.safetensors"], True),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader.get_server_args",
+                return_value=self._server_args(
+                    prefetch,
+                    disable_mmap,
+                    drop_cache,
+                ),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader.get_model",
+                return_value=self._server_args(prefetch, disable_mmap, drop_cache),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader."
+                "buffered_multi_thread_safetensors_weights_iterator",
+                return_value=iter([]),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader.safetensors_weights_iterator",
+                return_value=iter([]),
+            ),
+            patch("sglang.srt.model_loader.loader.logger.warning"),
+        )
+
+    def test_prefetch_uses_single_thread_for_default_config(self):
+        """Prefetch on + no explicit multithread config -> single-threaded,
+        and the opt-out warning fires once."""
+        loader = self._make_loader({})
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=True
+        )
+        with (
+            p_prep,
+            p_args,
+            p_model,
+            p_buffered as mock_buffered,
+            p_single as mock_single,
+            p_warn as mock_warning,
+        ):
+            self._run(loader)
+        mock_single.assert_called_once()
+        mock_buffered.assert_not_called()
+        mock_warning.assert_called_once()
+
+    def test_explicit_enable_multithread_keeps_buffered_with_prefetch(self):
+        """Explicit enable_multithread_load=true is the escape hatch; the
+        override and its warning must not fire."""
+        loader = self._make_loader({"enable_multithread_load": True})
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=True
+        )
+        with (
+            p_prep,
+            p_args,
+            p_model,
+            p_buffered as mock_buffered,
+            p_single as mock_single,
+            p_warn as mock_warning,
+        ):
+            self._run(loader)
+        mock_buffered.assert_called_once()
+        mock_single.assert_not_called()
+        mock_warning.assert_not_called()
+
+    def test_num_threads_only_keeps_buffered_with_prefetch(self):
+        """num_threads alone (relying on the enable_multithread_load=True
+        default) also signals multi-thread intent, so the override must not
+        fire and num_threads stays live."""
+        loader = self._make_loader({"num_threads": 64})
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=True
+        )
+        with (
+            p_prep,
+            p_args,
+            p_model,
+            p_buffered as mock_buffered,
+            p_single as mock_single,
+            p_warn as mock_warning,
+        ):
+            self._run(loader)
+        mock_buffered.assert_called_once()
+        # num_threads is forwarded as max_workers to the buffered iterator.
+        self.assertEqual(mock_buffered.call_args.kwargs["max_workers"], 64)
+        mock_single.assert_not_called()
+        mock_warning.assert_not_called()
+
+    def test_no_prefetch_uses_multithread(self):
+        """Prefetch off -> multi-threaded iterator is used (default), no
+        override warning."""
+        loader = self._make_loader({})
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=False
+        )
+        with (
+            p_prep,
+            p_args,
+            p_model,
+            p_buffered as mock_buffered,
+            p_single as mock_single,
+            p_warn as mock_warning,
+        ):
+            self._run(loader)
+        mock_buffered.assert_called_once()
+        mock_single.assert_not_called()
+        mock_warning.assert_not_called()
+
+    def test_prefetch_does_not_override_when_mmap_disabled(self):
+        """Prefetch is a no-op without mmap, so the override and its warning
+        must not fire."""
+        loader = self._make_loader({})
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=True, disable_mmap=True
+        )
+        with (
+            p_prep,
+            p_args,
+            p_model,
+            p_buffered as mock_buffered,
+            p_single as mock_single,
+            p_warn as mock_warning,
+        ):
+            self._run(loader)
+        mock_buffered.assert_called_once()
+        mock_single.assert_not_called()
+        mock_warning.assert_not_called()
+
+    def test_prefetch_does_not_override_for_fastsafetensors(self):
+        """FASTSAFETENSORS ignores both flags; override + warning must not
+        fire."""
+        loader = self._make_loader({}, load_format=LoadFormat.FASTSAFETENSORS)
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=True
+        )
+        with (
+            patch(
+                "sglang.srt.model_loader.loader.fastsafetensors_weights_iterator",
+                return_value=iter([]),
+            ) as mock_fast,
+            p_prep,
+            p_args,
+            p_model,
+            p_buffered as mock_buffered,
+            p_single as mock_single,
+            p_warn as mock_warning,
+        ):
+            self._run(loader)
+        mock_fast.assert_called_once_with(
+            ["f.safetensors"],
+            enable_gds=True,
+            drop_cache_after_load=False,
+        )
+        mock_buffered.assert_not_called()
+        mock_single.assert_not_called()
+        mock_warning.assert_not_called()
+
+    def test_fastsafetensors_gds_can_be_disabled(self):
+        loader = self._make_loader(
+            {"enable_gds": False}, load_format=LoadFormat.FASTSAFETENSORS
+        )
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=False,
+            drop_cache=True,
+        )
+        with (
+            patch(
+                "sglang.srt.model_loader.loader.fastsafetensors_weights_iterator",
+                return_value=iter([]),
+            ) as mock_fast,
+            p_prep,
+            p_args,
+            p_model,
+            p_buffered,
+            p_single,
+            p_warn,
+        ):
+            self._run(loader)
+        mock_fast.assert_called_once_with(
+            ["f.safetensors"],
+            enable_gds=False,
+            drop_cache_after_load=True,
+        )
+
+    def test_fastsafetensors_enable_gds_requires_boolean(self):
+        with self.assertRaisesRegex(ValueError, "enable_gds.*must be a boolean"):
+            self._make_loader(
+                {"enable_gds": "false"}, load_format=LoadFormat.FASTSAFETENSORS
             )
 
 

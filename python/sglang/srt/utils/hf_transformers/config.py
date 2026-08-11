@@ -16,6 +16,7 @@
 from pathlib import Path
 from typing import Optional
 
+from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs.model_config_parser_registry import (
@@ -51,6 +52,26 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+_LONGCAT_ARCHS = {
+    "LongcatCausalLM",
+    "LongcatFlashForCausalLM",
+    "LongcatFlashNgramForCausalLM",
+}
+
+
+def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    architectures = config_dict.get("architectures") or []
+    if not any(arch in _LONGCAT_ARCHS for arch in architectures):
+        return None
+
+    return _CONFIG_REGISTRY["longcat_flash"].from_pretrained(
+        model, revision=revision, **kwargs
+    )
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -60,12 +81,14 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = AutoConfig.from_pretrained(
-            model,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        config = _try_load_longcat_config(model, revision, **kwargs)
+        if config is None:
+            config = AutoConfig.from_pretrained(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
         if (
             config.architectures is not None
@@ -231,7 +254,15 @@ def get_config(
     )
 
     if model_override_args:
-        config.update(model_override_args)
+        # A plain update() setattrs a dict-valued override straight onto the
+        # config, so '{"text_config": {...}}' on a VLM would replace the whole
+        # sub-config with a dict and break attribute access downstream.
+        for key, value in model_override_args.items():
+            current = getattr(config, key, None)
+            if isinstance(value, dict) and isinstance(current, PretrainedConfig):
+                current.update(value)
+            else:
+                setattr(config, key, value)
 
     if is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:

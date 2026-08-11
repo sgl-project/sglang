@@ -1,6 +1,6 @@
 ---
 name: cookbook-review-pr
-description: Review a pull request against the SGLang Cookbook (docs_new/, Mintlify) contribution checklist — the config-driven format (per-model config + benchmarks JSX consumed by the shared _deployment.jsx / _playground.jsx engines). Run with /cookbook-review-pr <PR number>.
+description: Review a pull request against the SGLang Cookbook (docs/, Mintlify) contribution checklist — the config-driven format (per-model config + benchmarks JSX consumed by the shared _deployment.jsx / _playground.jsx engines). Run with /cookbook-review-pr <PR number>.
 ---
 
 # Cookbook Review PR
@@ -29,9 +29,9 @@ than restating.
 ## Checklist
 
 ### 1. File hygiene
-- A cookbook PR should only touch: `docs_new/src/snippets/configs/<vendor>/*.jsx`
-  (config + benchmarks), `docs_new/cookbook/**/*.mdx`, `docs_new/docs.json`,
-  `docs_new/cookbook/<category>/intro.mdx` (vendor card), `docs_new/cards/logos/<vendor>.png`
+- A cookbook PR should only touch: `docs/src/snippets/configs/<vendor>/*.jsx`
+  (config + benchmarks), `docs/cookbook/**/*.mdx`, `docs/docs.json`,
+  `docs/cookbook/<category>/intro.mdx` (vendor card), `docs/cards/logos/<vendor>.png`
   (new vendor only). Flag stray files (`settings.local.json`, lockfiles, IDE configs).
 - Pages must be `.mdx`, not `.md`. Files end with a trailing newline. Check commit history
   for unrelated commits accidentally included.
@@ -45,7 +45,10 @@ than restating.
 - No `!(x in y)` anywhere (Mintlify AST walker crashes) — use `obj.key === undefined`.
 - `supportedHardware` ⊆ `HARDWARE_CATALOG` (in `_deployment.jsx`) ∪ `config.hardware`. A
   model-specific GPU the shared catalog lacks must be declared in `config.hardware`
-  (`{id,label,vram,vendor}`), **not** added to the engine catalog.
+  (`{id,label,vram,vendor}`), **not** added to the engine catalog — unless the platform is
+  genuinely shared, which is an engine change the PR body has to argue (and the
+  `cookbook-add-model` hardware table moves with it). A new catalog entry is inert for
+  other pages: each filters the catalog by its own `supportedHardware`.
 - `placeholders` declares every `{{KEY}}` used in `curl` or any cell.
 - `modelNames` covers every cell (by `hw|variant|quant` triple or `variant|quant` pair).
 - `strategies` count matches the page's operating points — 1 recipe → a single `balanced`;
@@ -66,6 +69,9 @@ than restating.
   a different image (e.g. an FP4 dev build) — don't flag those.
 - `multiNodeHints` present ONLY for hw whose fabric needs manual NIC env (e.g. `gb200`
   NVL72) — NOT every `multi-N` hw (standard-IB DeepEP / Marlin multi-node don't need it).
+  Hints render above BOTH run modes, so flag one that reads as docker-only ("add these
+  docker run flags") — `docker run` flags belong in the hardware entry's
+  `multiNodeDockerFlags`, which the engine emits into the Docker command itself.
 - `github.cookbookModel` is set to the model's HF id (`<hf-org>/<model-slug>`). The issue
   template's `model` field is a free-form input prefilled from this value; if the config
   omits the `github` block, the engine falls back to `deepseek-ai/deepseek-v4` and the
@@ -115,9 +121,19 @@ than restating.
 - A benchmark's quantization must match a variant actually listed — `(BF16)` on a model
   that only released FP8/FP4 is a factual bug.
 - `benchmarkCommands.speed` is `python3 -m sglang.bench_serving` (the workload), separate
-  from the `sglang serve` deploy command.
+  from the `sglang serve` deploy command, and should carry `--flush-cache`: bench_serving's
+  `random` prompts are deterministic, so a warm rerun hits the radix cache and inflates
+  throughput — speed numbers are measured cache-cold.
 - `sglang_version` is a real build the author ran (a release, or `dev`/nightly) — not a
   guessed/placeholder value (no leftover `0.0.0`).
+- **Latency percentile**: `config.latencyPercentile` (default `"P50"`, or `"Mean"`) matches the
+  percentile the TTFT/TPOT values actually are — the card renders `TTFT (<pct>)`. A benchmarks
+  entry may carry its own `latencyPercentile` to override the page value per cell
+  (entry → config → `"P50"`): on a P50 page, kept legacy Mean cells must set it — a
+  `sglang_version` tag alone doesn't convey the percentile. (`"Mean"` is temporary — legacy
+  data is being re-measured to P50.)
+- **Throughput convention**: `tokens_per_sec_per_gpu` is stored as **total (in+out)/GPU**
+  = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. Flag output-only values.
 - **Consistent accuracy harness across entries**: every value under one `accuracyLabels`
   column must be produced by the SAME harness — flag a page that, say, measures one
   platform's GSM8K with `few_shot_gsm8k --num-questions 200` and another's with
@@ -146,20 +162,20 @@ than restating.
   other model page has. Leave `mode` unset (the Deploy/Playground panels self-cap at 900px, so
   the default column holds them fine). `mode: wide` belongs only on category `intro.mdx` grids.
 - `tag: NEW` only for genuine new launches; when one is added, stale `tag: NEW` on older
-  pages should be dropped in the same PR (`grep -RlE "^tag: NEW" docs_new/cookbook/`).
+  pages should be dropped in the same PR (`grep -RlE "^tag: NEW" docs/cookbook/`).
 - MDX imports BOTH `Deployment` and `Playground` from `/src/snippets/...` (absolute).
 - Deploy heading slugs to `deployment` (or `deploy`), Playground to `playground` — so
   "↑ Switch base" and "Open the Playground →" scroll. No numbered headings for these two.
 
 ### 8. Navigation & homepage
-- New page → `docs_new/docs.json` updated: under the right vendor group inside
+- New page → `docs/docs.json` updated: under the right vendor group inside
   `navigation` → Cookbook → Autoregressive Models, root-relative, **no `.mdx`**:
   `cookbook/<category>/<Vendor>/<Model>`.
-- Homepage `<Card href>` in `docs_new/cookbook/<category>/intro.mdx` points to the vendor's
-  flagship; new vendors get a new `<Card>` + a logo at `docs_new/cards/logos/<vendor>.png` —
+- Homepage `<Card href>` in `docs/cookbook/<category>/intro.mdx` points to the vendor's
+  flagship; new vendors get a new `<Card>` + a logo at `docs/cards/logos/<vendor>.png` —
   **940×525 RGBA transparent, icon-only (no wordmark)**, lowercase filename, tracked via
   `git add -f` (`*.png` is gitignored repo-wide). Card order matches the `docs.json` nav order.
-- Don't change `docs_new/cookbook/intro.mdx` for individual model adds (top-level only).
+- Don't change `docs/cookbook/intro.mdx` for individual model adds (top-level only).
 
 ### 9. Links & factual
 - HuggingFace URLs resolve to a real model. License section matches the actual HF license
@@ -216,7 +232,7 @@ than restating.
 
 ### 13. Build / validate
 ```bash
-cd docs_new
+cd docs
 mint validate
 mint broken-links
 ```

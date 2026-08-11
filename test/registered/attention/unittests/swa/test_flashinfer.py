@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
@@ -44,6 +45,21 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
     CASES = make_swa_no_prefix_input_config_cases(
         "flashinfer"
     ) + make_swa_prefix_input_config_cases("flashinfer")
+    # Paged-only prefill has no ragged pass / custom prefix mask, so the kernel
+    # must enforce the window; the long case puts tokens past the window.
+    PAGED_MODE_CASES = CASES + (
+        DenseAttentionCase(
+            name="swa_extend_no_prefix_above_window_long",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0, 0, 0),
+            extend_lens=(6, 8, 12),
+            sliding_window_size=4,
+        ),
+    )
     # Above-window decode case requires the `extend_window` reference rule
     # (window+1 keys), not the `min_seq_len_window` rule — FlashInfer's
     # decode metadata uses `clamp(seq_lens, max=window+1)` per
@@ -137,6 +153,17 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
+
+    def test_projected_swa_attention_cases_paged_mode(self):
+        for case in self.PAGED_MODE_CASES:
+            with self.subTest(case=case.name, backend=case.backend, mode="paged"):
+                with envs.SGLANG_FLASHINFER_USE_PAGED.override(True):
+                    run_dense_attention_case(
+                        self,
+                        case,
+                        head_dim=self.HEAD_DIM,
+                        hidden_size=self.HIDDEN_SIZE,
+                    )
 
     # Layout-robustness. See dense/test_triton.py for the full rationale.
     # The default `shuffled_pages` is already exercised by

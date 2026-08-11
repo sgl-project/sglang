@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import time
-from typing import Dict, Iterable, NamedTuple, Optional, Set
+from typing import Any, Callable, Dict, Iterable, NamedTuple, Optional, Set
 
 import torch
 import torch.distributed as dist
@@ -56,6 +56,7 @@ _NON_PERSISTENT_BUFFER_PATTERNS = (
     "inv_freq",
     "freqs_cis",
     "_weight_fp32",
+    "expert_mask_gpu",
 )
 
 
@@ -64,8 +65,9 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
 
 
 class WeightChecker:
-    def __init__(self, model_runner):
-        self._model_runner = model_runner
+    def __init__(self, *, get_model: Callable[[], Any], ps: Any):
+        self._get_model = get_model
+        self._ps = ps
         self._snapshot_tensors = None
 
     def handle(self, action: str, allow_quant_error: bool = False) -> Optional[Dict]:
@@ -101,7 +103,7 @@ class WeightChecker:
     def _compare(self, allow_quant_error: bool = False):
         assert self._snapshot_tensors is not None
 
-        quantized_set = _build_quantized_set(self._model_runner.model)
+        quantized_set = _build_quantized_set(self._get_model())
         skip_compare_names = {
             name
             for name, param in self._model_state()
@@ -121,7 +123,7 @@ class WeightChecker:
         torch.cuda.synchronize()
         start = time.perf_counter()
 
-        quantized_set = _build_quantized_set(self._model_runner.model)
+        quantized_set = _build_quantized_set(self._get_model())
         skip_compare_names = {
             name
             for name, param in self._model_state()
@@ -157,21 +159,22 @@ class WeightChecker:
         return info.model_dump()
 
     def _parallelism_info(self) -> ParallelismInfo:
-        mr = self._model_runner
+        ps = self._ps
         return ParallelismInfo(
-            tp_rank=mr.tp_rank,
-            tp_size=mr.tp_size,
-            dp_rank=mr.dp_rank if mr.dp_rank is not None else 0,
-            dp_size=mr.dp_size,
-            pp_rank=mr.pp_rank,
-            pp_size=mr.pp_size,
+            tp_rank=ps.tp_rank,
+            tp_size=ps.tp_size,
+            dp_rank=ps.dp_rank if ps.dp_rank is not None else 0,
+            dp_size=ps.attn_dp_size,
+            pp_rank=ps.pp_rank,
+            pp_size=ps.pp_size,
             rank=dist.get_rank() if dist.is_initialized() else 0,
             size=dist.get_world_size() if dist.is_initialized() else 1,
         )
 
     def _model_state(self):
-        yield from self._model_runner.model.named_parameters()
-        yield from self._model_runner.model.named_buffers()
+        model = self._get_model()
+        yield from model.named_parameters()
+        yield from model.named_buffers()
 
 
 def _hash_tensor(t: torch.Tensor) -> str:
@@ -192,6 +195,9 @@ def _check_tensors(
         actual_should_compare,
         actual_comparable,
     ) in zip(expect_tensors, actual_tensors, strict=True):
+        if ".cos_sin_cache" in expect_name:
+            # skip cos/sin cache which is deterministic from shape and dtype and may have different shapes due to different implementations.
+            continue
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
         assert (
             should_compare == actual_should_compare

@@ -16,6 +16,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
@@ -34,10 +35,9 @@ _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
 
-# Force redirect deep_gemm cache_dir
-os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm")
-)
+# Force redirect deep_gemm cache_dir. Defaults under SGLANG_CACHE_DIR so it
+# sits with the other compiled-kernel caches; SGLANG_DG_CACHE_DIR still wins.
+os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
 
 # Refer to https://github.com/deepseek-ai/DeepGEMM/commit/d75b218b7b8f4a5dd5406ac87905039ead3ae42f
 # NVRTC may have performance loss with some cases.
@@ -435,15 +435,14 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
-    from sglang.srt.layers.dp_attention import get_attention_tp_size
-    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
     from sglang.srt.utils.common import require_mlp_sync
 
     n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
     block_m = 64
     cp = max(get_cp_padding_align_size(), 1)
 
-    attn_tp_size = get_attention_tp_size()
+    attn_tp_size = get_parallel().attn_tp_size
     mlp_sync = require_mlp_sync(model_runner.server_args)
 
     def _align(bs: int) -> int:
@@ -476,8 +475,8 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     logger.info(
         "PP-parallel DeepGEMM warmup start "
         "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, disagg=%s).",
-        model_runner.pp_rank,
-        model_runner.tp_rank,
+        model_runner.ps.pp_rank,
+        model_runner.ps.tp_rank,
         batch_sizes,
         disagg_mode,
     )
@@ -505,5 +504,5 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     logger.info(
         "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
         time.perf_counter() - t0,
-        model_runner.pp_rank,
+        model_runner.ps.pp_rank,
     )

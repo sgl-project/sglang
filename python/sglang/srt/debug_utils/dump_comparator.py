@@ -15,6 +15,7 @@ from typing import Callable, List, Optional
 import torch
 
 from sglang.srt.debug_utils.dumper import get_truncated_value
+from sglang.srt.utils import get_device
 
 
 def main(args):
@@ -259,7 +260,7 @@ def _load_object(path):
     if not isinstance(x, torch.Tensor):
         print(f"Skip load {path} since {type(x)=} is not a Tensor ({x=})")
         return None
-    return x.cuda()
+    return x.to(get_device())
 
 
 def _comparison_preprocessor(x_baseline, x_target, name):

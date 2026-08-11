@@ -121,25 +121,36 @@ class ParallelExecutor(PipelineExecutor):
                         use_nvtx,
                     )
                 elif paradigm == StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS:
+                    obj_list = []
                     if rank == 0:
                         # Only main rank executes, others just wait
-                        batch = self._run_stage_with_executor_hooks(
-                            stage,
-                            stage_index,
-                            batch,
-                            server_args,
-                            run_stage,
-                            use_nvtx,
-                        )
-                    torch.distributed.barrier()
+                        try:
+                            batch = self._run_stage_with_executor_hooks(
+                                stage,
+                                stage_index,
+                                batch,
+                                server_args,
+                                run_stage,
+                                use_nvtx,
+                            )
+                            obj_list = [True, batch]
+                        except Exception as e:
+                            obj_list = [False, e]
 
                     # Send batch to other ranks
-                    obj_list = [batch] if rank == 0 else []
                     broadcasted_list = broadcast_pyobj(
                         obj_list, rank=rank, dist_group=group.cpu_group, src=0
                     )
+                    success, broadcasted_batch = broadcasted_list
+
+                    if not success:
+                        if isinstance(broadcasted_batch, BaseException):
+                            raise RuntimeError("Error on rank 0") from broadcasted_batch
+                        raise RuntimeError(f"Error on rank 0: {broadcasted_batch}")
+
                     if rank != 0:
-                        batch = broadcasted_list[0]
+                        batch = broadcasted_batch
+
                     torch.distributed.barrier()
         return batch
 

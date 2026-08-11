@@ -1,7 +1,9 @@
+from sglang.srt.runtime_context import get_context, get_observability
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import math
 import types
 import unittest
 from unittest.mock import patch
@@ -17,26 +19,11 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 def _make_ps(**overrides) -> ParallelState:
     """Build a ParallelState with reasonable defaults for tests; override fields via kwargs."""
     defaults = dict(
-        tp_rank=0,
-        tp_size=1,
-        pp_rank=0,
-        pp_size=1,
         dp_rank=None,
-        dp_size=1,
-        attn_tp_rank=0,
-        attn_tp_size=1,
-        attn_cp_rank=0,
-        attn_cp_size=1,
-        attn_dp_rank=0,
-        attn_dp_size=1,
-        moe_ep_rank=0,
-        moe_ep_size=1,
         moe_dp_rank=None,
-        moe_dp_size=1,
-        gpu_id=0,
     )
     defaults.update(overrides)
-    return ParallelState(**defaults)
+    return ParallelState.trivial(**defaults)
 
 
 class _FakeReq:
@@ -85,9 +72,19 @@ class _DummyPublisherThread:
         pass
 
 
-def _make_reporter(scheduler) -> SchedulerMetricsReporter:
+def _publish_server_args(test, **fields):
+    """Publish a config for the reporter under test and return the instance."""
+    fields.setdefault("decode_log_interval", 40)
+    override = get_context().override_server_args(**fields)
+    server_args = override.install()
+    test.addCleanup(override.restore)
+    return server_args
+
+
+def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "server_args"):
-        scheduler.server_args = types.SimpleNamespace(
+        scheduler.server_args = _publish_server_args(
+            test,
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             kv_events_config=None,
@@ -95,7 +92,7 @@ def _make_reporter(scheduler) -> SchedulerMetricsReporter:
             enable_forward_pass_metrics=False,
         )
     if not hasattr(scheduler, "ps"):
-        scheduler.ps = types.SimpleNamespace(attn_tp_rank=0, attn_cp_rank=0)
+        scheduler.ps = ParallelState.trivial()
     if not hasattr(scheduler, "kv_events_publisher"):
         scheduler.kv_events_publisher = types.SimpleNamespace(
             init_kv_events=lambda *a, **kw: None,
@@ -135,7 +132,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.scheduler._fpm_gpu_time_acc = 0.0
         self.scheduler.waiting_queue = []
         self.scheduler.disaggregation_mode = DisaggregationMode.NULL
-        self.reporter = _make_reporter(self.scheduler)
+        self.reporter = _make_reporter(self, self.scheduler)
         self.scheduler.enable_fpm = True
 
     def _make_batch(self, **overrides):
@@ -234,11 +231,12 @@ class TestForwardPassMetrics(unittest.TestCase):
             self.scheduler._fpm_publisher.metrics[0].wall_time, 0.035, places=4
         )
 
-    def test_disagg_prefill_queued_metrics(self):
+    def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         self.scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
-            queue=[_FakeReq(100), _FakeReq(200), _FakeReq(50)],
+            queue=[_FakeReq(100)],
         )
+        self.scheduler.waiting_queue = [_FakeReq(200), _FakeReq(50)]
         batch = self._make_batch()
 
         with patch(
@@ -275,7 +273,8 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_metrics_uses_server_worker_id(self):
         scheduler = types.SimpleNamespace()
-        scheduler.server_args = types.SimpleNamespace(
+        scheduler.server_args = _publish_server_args(
+            self,
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             extra_metric_labels=None,
@@ -291,7 +290,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
             _DummyPublisherThread,
         ):
-            reporter = _make_reporter(scheduler)
+            reporter = _make_reporter(self, scheduler)
 
         self.assertTrue(scheduler.enable_fpm)
         self.assertEqual(scheduler._fpm_worker_id, "endpoint-42")
@@ -299,11 +298,20 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(scheduler._fpm_publisher.worker_id, "endpoint-42")
         self.assertEqual(scheduler._fpm_publisher.dp_rank, 2)
         self.assertTrue(scheduler._fpm_publisher.endpoint.startswith("ipc://"))
-        self.assertIsNotNone(scheduler.server_args.forward_pass_metrics_ipc_name)
+        # The bag is what makes the write a bag write: an instance mutation
+        # would still show up in the resolved dict through its ServerArgs base.
+        endpoint = get_observability().forward_pass_metrics_ipc_name
+        self.assertTrue(endpoint.startswith("ipc://"))
+        self.assertEqual(
+            get_context().resolved_server_args_dict()["forward_pass_metrics_ipc_name"],
+            endpoint,
+        )
+        self.assertIsNone(scheduler.server_args.forward_pass_metrics_ipc_name)
 
     def test_init_fpm_disabled_on_non_last_pp_rank(self):
         scheduler = types.SimpleNamespace()
-        scheduler.server_args = types.SimpleNamespace(
+        scheduler.server_args = _publish_server_args(
+            self,
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             extra_metric_labels=None,
@@ -319,9 +327,76 @@ class TestForwardPassMetrics(unittest.TestCase):
             "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
             _DummyPublisherThread,
         ):
-            reporter = _make_reporter(scheduler)
+            reporter = _make_reporter(self, scheduler)
 
         self.assertFalse(scheduler.enable_fpm)
+
+
+class TestIdleMetrics(unittest.TestCase):
+    def setUp(self):
+        self.scheduler = types.SimpleNamespace(
+            running_batch=types.SimpleNamespace(reqs=[]),
+            waiting_queue=[],
+            grammar_manager=[],
+            enable_priority_scheduling=False,
+            disaggregation_mode=DisaggregationMode.NULL,
+            pool_stats_observer=types.SimpleNamespace(
+                get_pool_stats=lambda: types.SimpleNamespace(
+                    update_scheduler_stats=lambda _: None
+                ),
+                streaming_session_count=lambda: 0,
+                session_held_tokens=lambda: 0,
+            ),
+        )
+        self.reporter = _make_reporter(self, self.scheduler)
+        self.published_occupancies = []
+        self.reporter.metrics_collector = types.SimpleNamespace(
+            last_log_time=100.0,
+            log_stats=lambda stats: self.published_occupancies.append(
+                stats.fwd_occupancy
+            ),
+        )
+
+    def test_idle_clears_cached_forward_occupancy_immediately(self):
+        self.reporter.current_scheduler_metrics_enabled = True
+        self.reporter.fwd_occupancy = 72.0
+        self.reporter.stats.fwd_occupancy = 72.0
+        self.reporter._device_timer_window_batch_count = 7
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                True,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                return_value=101.0,
+            ),
+        ):
+            self.reporter._maybe_log_idle_metrics()
+            self.reporter._maybe_log_idle_metrics()
+
+        self.assertEqual(len(self.published_occupancies), 1)
+        self.assertTrue(math.isnan(self.published_occupancies[0]))
+        self.assertTrue(math.isnan(self.reporter.fwd_occupancy))
+        self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
+        self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
+
+    def test_idle_resets_forward_timing_when_metrics_are_disabled(self):
+        self.reporter.fwd_occupancy = 72.0
+        self.reporter.stats.fwd_occupancy = 72.0
+        self.reporter._device_timer_window_batch_count = 7
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+            True,
+        ):
+            self.reporter._maybe_log_idle_metrics()
+
+        self.assertTrue(math.isnan(self.reporter.fwd_occupancy))
+        self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
+        self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
+        self.assertEqual(self.published_occupancies, [])
 
 
 if __name__ == "__main__":

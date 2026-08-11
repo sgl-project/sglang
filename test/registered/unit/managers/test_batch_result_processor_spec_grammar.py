@@ -43,9 +43,19 @@ class _FakeSpecAlgorithm:
         return False
 
 
+class _FakeForwardMode:
+    def is_decode(self) -> bool:
+        return True
+
+    def is_extend(self) -> bool:
+        return False
+
+
 class _FakeBatch:
     def __init__(self, reqs):
         self.reqs = reqs
+        self.has_grammar = any(req.grammar is not None for req in reqs)
+        self.forward_mode = _FakeForwardMode()
         self.spec_algorithm = _FakeSpecAlgorithm()
 
 
@@ -56,7 +66,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         enable_overlap=False,
         enable_overlap_mlx=False,
         server_args=SimpleNamespace(enable_metrics=False),
-        model_config=SimpleNamespace(think_end_id=None),
+        model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=None,
         tree_cache=None,
         hisparse_coordinator=None,
@@ -93,6 +103,10 @@ def _make_result(num_draft_tokens, accept_lens, flat_tokens):
         speculative_num_draft_tokens=num_draft_tokens,
         num_correct_drafts=None,
         num_correct_drafts_per_req_cpu=None,
+        block_accept_lens=None,
+        cap_lens=None,
+        copy_done=None,
+        grammar_advanced=False,
     )
 
 
@@ -118,6 +132,20 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
         self.assertEqual(predict_tokens, [[201, 202, 203]])
         self.assertEqual(req.kv_committed_len, 3)
+
+
+class TestReasoningTokenAccounting(CustomTestCase):
+    def test_multi_token_end_can_span_decode_steps(self):
+        req = _make_req(terminate_after=99)
+        req.require_reasoning = True
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [7, 8]
+
+        processor._maybe_update_reasoning_tokens(req, [10, 7])
+        processor._maybe_update_reasoning_tokens(req, [8, 11])
+
+        self.assertEqual(req.reasoning_tokens, 3)
+        self.assertTrue(req._is_reasoning_over)
 
 
 if __name__ == "__main__":

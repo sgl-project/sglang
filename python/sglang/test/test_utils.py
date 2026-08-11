@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import copy
 import doctest
+import importlib.util
 import inspect
 import json
 import logging
@@ -146,7 +147,9 @@ DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = (
+    "meta-llama/Llama-3.1-8B-Instruct,Qwen/Qwen3-8B,Qwen/Qwen3-4B"
+)
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,zai-org/GLM-4.5-Air-FP8"
@@ -176,6 +179,22 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
+def build_vlm_image_prompt(processor, question: str) -> str:
+    # Take the image placeholder from the model's own HF chat template: a
+    # hand-written one silently degrades to a text-only prompt on any model
+    # whose placeholder differs.
+    return processor.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": question}],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -194,6 +213,23 @@ def is_blackwell_system():
 def is_h200_system():
     """Return whether it is running on an H200 system."""
     return envs.IS_H200.get()
+
+
+def is_rust_server_built():
+    """Return whether the embedded Rust server extension (``SGLANG_RUST_SERVER``)
+    is importable.
+
+    ``sglang/srt/server/`` is not in the source tree — it is produced by
+    ``setup.py build_rust --inplace``, so on a build without it ``find_spec``
+    raises ``ModuleNotFoundError`` for the missing *parent* package rather than
+    returning ``None`` for the missing leaf. Suites gate a rust-server subclass on
+    this at class-definition time, so letting that escape would fail the whole
+    module import instead of skipping the one class.
+    """
+    try:
+        return importlib.util.find_spec("sglang.srt.server._core") is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def _use_cached_default_models(model_repo: str):
@@ -223,6 +259,9 @@ if is_blackwell_system():
 
 if is_h200_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
+
+if is_in_ci() and is_xpu():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1800
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -762,6 +801,11 @@ def _subprocess_popen_with_outputs(
     env: Optional[dict],
     return_stdout_stderr: Optional[tuple],
 ) -> subprocess.Popen:
+    # Release allocator-cached GPU memory to the driver before spawning a
+    # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
     if not return_stdout_stderr:
         return subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
@@ -916,6 +960,11 @@ def popen_launch_server(
         merged.update(env)
         env = merged
 
+    # A dying predecessor can hold the derived port plan past
+    # kill_process_tree() while GPU teardown completes; give CI launches
+    # teardown-sized patience (see wait_port_available).
+    env.setdefault("SGLANG_WAIT_PORT_TIMEOUT", "120")
+
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
     try:
@@ -1028,6 +1077,27 @@ def popen_launch_server(
     if "exited" in error_msg:
         raise Exception(error_msg + ". Check server logs for errors.")
     raise TimeoutError(error_msg)
+
+
+def terminate_and_kill_process_tree(
+    process,
+    terminate_timeout: float = 60,
+    **kill_kwargs,
+) -> None:
+    """Shut a launched server down gracefully, then SIGKILL whatever is left.
+
+    A bare ``kill_process_tree`` leaves the kernel to unwind the CUDA context
+    and unpin the host memory during process reclaim, which can hold GPU memory
+    for minutes on a busy host -- long enough to trip the per-class GPU-idle
+    gate in the next ``setUpClass``. SIGTERM first so the server releases those
+    resources in userspace.
+    """
+    process.terminate()
+    try:
+        process.wait(timeout=terminate_timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    kill_process_tree(process.pid, **kill_kwargs)
 
 
 def popen_launch_pd_server(
@@ -2171,6 +2241,132 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
+_GPU_IDLE_TIMEOUT_SECS = 30.0
+_GPU_IDLE_POLL_INTERVAL_SECS = 2.0
+_GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
+
+
+def _format_gib(num_bytes: Optional[int]) -> str:
+    if num_bytes is None:
+        return "N/A"
+    return f"{num_bytes / (1 << 30):.2f} GiB"
+
+
+def _visible_gpu_indices(pynvml) -> List[int]:
+    num_gpus = pynvml.nvmlDeviceGetCount()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return list(range(num_gpus))
+    entries = [entry.strip() for entry in visible.split(",") if entry.strip()]
+    if not all(entry.isdigit() for entry in entries):
+        # UUID-style entries; fall back to checking all GPUs.
+        return list(range(num_gpus))
+    return [int(entry) for entry in entries if int(entry) < num_gpus]
+
+
+def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
+    self_pid = os.getpid()
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        used_bytes = pynvml.nvmlDeviceGetMemoryInfo(handle).used
+        if used_bytes < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+            continue
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            procs = None
+        if procs is not None:
+            # Discount our own usage: the caching allocator retains memory
+            # across test classes, and waiting on ourselves never succeeds.
+            self_used = sum(
+                proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
+            )
+            if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+                continue
+            proc_info = ", ".join(
+                f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+                for proc in procs
+                if proc.pid != self_pid
+            ) or (
+                f"no other compute processes;"
+                f" self pid={self_pid} holds {_format_gib(self_used)}"
+            )
+        else:
+            proc_info = ""
+        reports.append(
+            f"GPU {index} uses {_format_gib(used_bytes)}"
+            f" ({proc_info or 'no compute processes found'})"
+        )
+    return reports
+
+
+def _wait_for_gpu_idle_in_ci(
+    timeout: float = _GPU_IDLE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_IDLE_POLL_INTERVAL_SECS,
+) -> None:
+    """Wait until visible GPUs release residual memory from earlier tests.
+
+    Killed server processes return GPU memory asynchronously; launching the
+    next server too early makes memory profiling over-commit the KV cache and
+    OOM. Abort with the offending processes if the memory is never returned.
+    """
+    if not is_in_ci():
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        deadline = time.monotonic() + timeout
+        while True:
+            busy_reports = _collect_busy_gpu_reports(pynvml, gpu_indices)
+            if not busy_reports:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"GPU(s) still not idle after waiting {timeout:.0f}s "
+                    f"before setUpClass: {'; '.join(busy_reports)}"
+                )
+            print(
+                f"[CI GPU Idle] Waiting for GPU to become idle: "
+                f"{'; '.join(busy_reports)}",
+                flush=True,
+            )
+            time.sleep(poll_interval)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def server_args_variant(server_args, **fields):
+    """A modified deep copy of a config, for a test double whose fixture
+    differs from the (possibly published, read-only) config it starts from.
+    The receiver is untouched; the copy keeps its read-only guard.
+
+    A name may also shadow a method with a fixture value (the runner kits set
+    ``use_mla_backend``, a method ModelRunner itself overwrites at init);
+    names that exist nowhere on the class fail loudly."""
+    variant = copy.deepcopy(server_args)
+    cls = type(variant)
+    unknown = {
+        name
+        for name in fields
+        if name not in cls.__dataclass_fields__ and not hasattr(cls, name)
+    }
+    if unknown:
+        raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    for name, value in fields.items():
+        object.__setattr__(variant, name, value)
+    return variant
+
+
 class CustomTestCase(unittest.TestCase):
 
     def __init_subclass__(cls, **kwargs):
@@ -2187,6 +2383,7 @@ class CustomTestCase(unittest.TestCase):
 
         def safe_setUpClass(klass):
             try:
+                _wait_for_gpu_idle_in_ci()
                 orig_func(klass)
             except Exception:
                 # Best-effort cleanup; suppress teardown errors so the

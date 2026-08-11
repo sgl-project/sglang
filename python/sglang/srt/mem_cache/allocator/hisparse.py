@@ -262,7 +262,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.free(free_index)
             self.free_hisparse(free_index)
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
         assert (
             self.logical_attn_allocator.available_size()
             <= self.logical_attn_allocator.size
@@ -400,6 +400,26 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
+        )
+
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+    ):
+        return self.logical_attn_allocator.alloc_extend_swa_tail(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=extend_num_tokens,
+            swa_tail_len=swa_tail_len,
         )
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
@@ -565,4 +585,4 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.is_not_in_free_group:
             self.logical_attn_allocator.free(free_index)
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))

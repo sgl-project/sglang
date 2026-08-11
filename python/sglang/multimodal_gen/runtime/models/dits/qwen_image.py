@@ -14,7 +14,14 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
+from sglang.kernels.ops.diffusion.fused_linear_gelu import (
+    can_fuse_linear_gelu,
+    fused_gelu_active,
+    fused_linear_gelu_tanh,
+    mark_fused_gelu_site,
+)
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_world_size,
@@ -31,8 +38,10 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
+    DynamicVarlenMaskMeta,
     USPAttention,
     build_varlen_mask_meta,
+    build_varlen_mask_meta_from_ranges,
 )
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.fused_scale_shift_gate import (
@@ -65,10 +74,21 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _attn_mask_meta_local_pad(attn_mask_meta) -> int:
+    if attn_mask_meta is None or isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
+        return 0
+    return attn_mask_meta.get("local_pad", 0)
+
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -86,32 +106,7 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
     return padded_len // sp_world_size
 
 
-def _get_qkv_projections(
-    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
-):
-    if attn.use_fused_qkv:
-        img_qkv, _ = attn.to_qkv(hidden_states)
-        img_query, img_key, img_value = [
-            x.contiguous() for x in img_qkv.chunk(3, dim=-1)
-        ]
-    else:
-        img_query, _ = attn.to_q(hidden_states)
-        img_key, _ = attn.to_k(hidden_states)
-        img_value, _ = attn.to_v(hidden_states)
-
-    txt_query = txt_key = txt_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if attn.use_fused_added_qkv:
-            txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            txt_query, txt_key, txt_value = [
-                x.contiguous() for x in txt_qkv.chunk(3, dim=-1)
-            ]
-        else:
-            txt_query, _ = attn.add_q_proj(encoder_hidden_states)
-            txt_key, _ = attn.add_k_proj(encoder_hidden_states)
-            txt_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return img_query, img_key, img_value, txt_query, txt_key, txt_value
+_get_qkv_projections = get_qkv_projections
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -690,7 +685,7 @@ class QwenImageCrossAttention(nn.Module):
         # fully sequence-parallel, so no leading tokens are replicated.
         sp_text_sharded = cross_attention_kwargs.get("sp_text_sharded", False)
         # Rows of tail padding inside THIS rank's text chunk (sp_shard meta).
-        sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
+        sp_txt_pad = _attn_mask_meta_local_pad(attn_mask_meta)
 
         (
             img_query,
@@ -726,7 +721,7 @@ class QwenImageCrossAttention(nn.Module):
                 k=img_key,
                 q_norm=self.norm_q,
                 k_norm=self.norm_k,
-                head_dim=img_query.shape[-1],
+                head_dim=self.head_dim,
                 cos_sin_cache=img_cache,
                 is_neox=False,
                 allow_inplace=True,
@@ -736,7 +731,7 @@ class QwenImageCrossAttention(nn.Module):
                 k=txt_key,
                 q_norm=self.norm_added_q,
                 k_norm=self.norm_added_k,
-                head_dim=txt_query.shape[-1],
+                head_dim=self.head_dim,
                 cos_sin_cache=txt_cache,
                 is_neox=False,
                 allow_inplace=True,
@@ -751,9 +746,29 @@ class QwenImageCrossAttention(nn.Module):
 
         # Joint order [text, image]; join_seqs relocates any SP text tail-pad
         # behind the image (see sp_shard.join_seqs for why).
-        joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
-        joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
-        joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
+        seg_qkv = None
+        # The segmented pre-all-to-all emits Ulysses layout; K/V-gather takes
+        # the join_seqs path and exchanges inside the attention instead.
+        if sp_text_sharded and self.attn.sp_attention_mode == "ulysses":
+            from sglang.multimodal_gen.runtime.layers.usp import (
+                _ipc_input_a2a_qkv_segmented,
+            )
+
+            seg_qkv = _ipc_input_a2a_qkv_segmented(
+                txt_query,
+                img_query,
+                txt_key,
+                img_key,
+                txt_value,
+                img_value,
+                sp_txt_pad,
+            )
+        if seg_qkv is not None:
+            joint_query, joint_key, joint_value = seg_qkv
+        else:
+            joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
+            joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
+            joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
         if attn_mask is None and encoder_hidden_states_mask is not None:
             image_mask = torch.ones(
                 (hidden_states.shape[0], img_query.shape[1]),
@@ -773,6 +788,7 @@ class QwenImageCrossAttention(nn.Module):
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
             num_replicated_prefix=0 if sp_text_sharded else seq_len_txt,
+            qkv_pre_all_to_all=seg_qkv is not None,
         )
 
         # Reshape back
@@ -821,8 +837,15 @@ class QwenImageGELU(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.proj",
             )
+        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # epilogue. Off by default; mounted per batch by the denoising stage.
+        mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+            return fused_linear_gelu_tanh(
+                hidden_states, self.proj.weight, self.proj.bias
+            )
         hidden_states, _ = self.proj(hidden_states)
         return F.gelu(hidden_states, approximate="tanh")
 
@@ -1002,6 +1025,38 @@ class QwenImageTransformerBlock(nn.Module):
             self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
             self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
 
+    def _norm_scale_shift(
+        self,
+        norm_module: LayerNormScaleShift,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return norm_module(x=x, shift=shift, scale=scale)
+
+    def _scale_residual_norm_scale_shift(
+        self,
+        norm_module: ScaleResidualLayerNormScaleShift,
+        *,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return norm_module(
+            residual=residual,
+            x=x,
+            gate=gate,
+            shift=shift,
+            scale=scale,
+        )
+
+    def _mul_add(
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
+    ) -> torch.Tensor:
+        return self.fuse_mul_add(a, b, c, k)
+
     def _modulate(
         self,
         x: torch.Tensor,
@@ -1010,6 +1065,7 @@ class QwenImageTransformerBlock(nn.Module):
         index: Optional[torch.Tensor] = None,
         gate_x: Optional[torch.Tensor] = None,
         residual_x: Optional[torch.Tensor] = None,
+        use_bcg_helpers: bool = False,
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor],
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1071,16 +1127,31 @@ class QwenImageTransformerBlock(nn.Module):
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
         if is_scale_residual:
-            modulated, residual_out = norm_module(
-                residual=residual_x,
-                x=x,
-                gate=gate_x,
-                shift=shift_result,
-                scale=scale_result,
-            )
+            if use_bcg_helpers:
+                modulated, residual_out = self._scale_residual_norm_scale_shift(
+                    norm_module,
+                    residual=residual_x,
+                    x=x,
+                    gate=gate_x,
+                    shift=shift_result,
+                    scale=scale_result,
+                )
+            else:
+                modulated, residual_out = norm_module(
+                    residual=residual_x,
+                    x=x,
+                    gate=gate_x,
+                    shift=shift_result,
+                    scale=scale_result,
+                )
             return modulated, residual_out, gate_result
         else:
-            modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
+            if use_bcg_helpers:
+                modulated = self._norm_scale_shift(
+                    norm_module, x=x, shift=shift_result, scale=scale_result
+                )
+            else:
+                modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
             return modulated, gate_result
 
     def forward(
@@ -1119,16 +1190,29 @@ class QwenImageTransformerBlock(nn.Module):
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
+        use_bcg_helpers = is_in_breakable_cuda_graph()
 
         # Process image stream - norm1 + modulation
         img_modulated, img_gate1 = self._modulate(
-            hidden_states, img_mod1, self.img_norm1, modulate_index
+            hidden_states,
+            img_mod1,
+            self.img_norm1,
+            modulate_index,
+            use_bcg_helpers=use_bcg_helpers,
         )
         # Process text stream - norm1 + modulation
         txt_shift1, txt_scale1, txt_gate1_raw = txt_mod1.chunk(3, dim=-1)
-        txt_modulated = self.txt_norm1(
-            encoder_hidden_states, shift=txt_shift1, scale=txt_scale1
-        )
+        if use_bcg_helpers:
+            txt_modulated = self._norm_scale_shift(
+                self.txt_norm1,
+                encoder_hidden_states,
+                shift=txt_shift1,
+                scale=txt_scale1,
+            )
+        else:
+            txt_modulated = self.txt_norm1(
+                encoder_hidden_states, shift=txt_shift1, scale=txt_scale1
+            )
         txt_gate1 = txt_gate1_raw.unsqueeze(1)
 
         # Use QwenAttnProcessor2_0 for joint attention computation
@@ -1158,30 +1242,52 @@ class QwenImageTransformerBlock(nn.Module):
             modulate_index,
             gate_x=img_gate1,
             residual_x=hidden_states,
+            use_bcg_helpers=use_bcg_helpers,
         )
         img_mlp_output = self.img_mlp(img_modulated2)
 
         if img_mlp_output.dim() == 2:
             img_mlp_output = img_mlp_output.unsqueeze(0)
-        hidden_states = self.fuse_mul_add(img_mlp_output, img_gate2, hidden_states)
+        if use_bcg_helpers:
+            hidden_states = self._mul_add(img_mlp_output, img_gate2, hidden_states)
+        else:
+            hidden_states = self.fuse_mul_add(img_mlp_output, img_gate2, hidden_states)
 
         # Process text stream - norm2 + MLP
         txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
-        txt_modulated2, encoder_hidden_states = self.txt_norm2(
-            residual=encoder_hidden_states,
-            x=txt_attn_output,
-            gate=txt_gate1,
-            shift=txt_shift2,
-            scale=txt_scale2,
-        )
+        if use_bcg_helpers:
+            (
+                txt_modulated2,
+                encoder_hidden_states,
+            ) = self._scale_residual_norm_scale_shift(
+                self.txt_norm2,
+                residual=encoder_hidden_states,
+                x=txt_attn_output,
+                gate=txt_gate1,
+                shift=txt_shift2,
+                scale=txt_scale2,
+            )
+        else:
+            txt_modulated2, encoder_hidden_states = self.txt_norm2(
+                residual=encoder_hidden_states,
+                x=txt_attn_output,
+                gate=txt_gate1,
+                shift=txt_shift2,
+                scale=txt_scale2,
+            )
         txt_gate2 = txt_gate2_raw.unsqueeze(1)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
 
         if txt_mlp_output.dim() == 2:
             txt_mlp_output = txt_mlp_output.unsqueeze(0)
-        encoder_hidden_states = self.fuse_mul_add(
-            txt_mlp_output, txt_gate2, encoder_hidden_states
-        )
+        if use_bcg_helpers:
+            encoder_hidden_states = self._mul_add(
+                txt_mlp_output, txt_gate2, encoder_hidden_states
+            )
+        else:
+            encoder_hidden_states = self.fuse_mul_add(
+                txt_mlp_output, txt_gate2, encoder_hidden_states
+            )
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -1210,7 +1316,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
-    _fsdp_shard_conditions = QwenImageDitConfig().arch_config._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_transformer_block]
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
@@ -1242,23 +1348,24 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
-        patch_size = config.arch_config.patch_size
-        in_channels = config.arch_config.in_channels
-        out_channels = config.arch_config.out_channels
-        num_layers = config.arch_config.num_layers
-        attention_head_dim = config.arch_config.attention_head_dim
-        num_attention_heads = config.arch_config.num_attention_heads
-        joint_attention_dim = config.arch_config.joint_attention_dim
-        axes_dims_rope = config.arch_config.axes_dims_rope
-        self.zero_cond_t = getattr(config.arch_config, "zero_cond_t", False)
+        arch = self.config
+        patch_size = arch.patch_size
+        in_channels = arch.in_channels
+        out_channels = arch.out_channels
+        num_layers = arch.num_layers
+        attention_head_dim = arch.attention_head_dim
+        num_attention_heads = arch.num_attention_heads
+        joint_attention_dim = arch.joint_attention_dim
+        axes_dims_rope = arch.axes_dims_rope
+        self.zero_cond_t = getattr(arch, "zero_cond_t", False)
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
 
         self.use_additional_t_cond: bool = getattr(
-            config.arch_config, "use_additional_t_cond", False
+            arch, "use_additional_t_cond", False
         )  # For qwen-image-layered now
         self.use_layer3d_rope: bool = getattr(
-            config.arch_config, "use_layer3d_rope", False
+            arch, "use_layer3d_rope", False
         )  # For qwen-image-layered now
 
         if not self.use_layer3d_rope:
@@ -1430,11 +1537,38 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
             joint_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
             block_attention_kwargs["attn_mask"] = joint_mask
-            # Precompute varlen metadata once per request so every block reuses
-            # the same cu_seqlens / indices instead of rebuilding.
-            block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
-                joint_mask
-            )
+            if is_in_breakable_cuda_graph():
+                # Qwen/FireRed BCG buckets text inputs so different prompt
+                # lengths can share a graph. Attention break kwargs are captured
+                # once, so build varlen metadata replay-locally from the current
+                # static mask instead of closing over stale cu_seqlens/indices.
+                block_attention_kwargs["attn_mask_meta"] = DynamicVarlenMaskMeta()
+            elif (
+                txt_seq_lens is not None
+                and len(txt_seq_lens) == batch_size
+                and all(0 <= n <= encoder_hidden_states.shape[1] for n in txt_seq_lens)
+            ):
+                # txt_seq_lens already carries each row's valid text prefix
+                # (the mask is built from it), so the varlen metadata can be
+                # assembled host-side; the mask-based builder costs a GPU
+                # nonzero plus a device sync on every denoising step.
+                txt_len = encoder_hidden_states.shape[1]
+                block_attention_kwargs["attn_mask_meta"] = (
+                    build_varlen_mask_meta_from_ranges(
+                        [
+                            [(0, int(n)), (txt_len, txt_len + image_seq_len)]
+                            for n in txt_seq_lens
+                        ],
+                        max_seqlen=txt_len + image_seq_len,
+                        device=hidden_states.device,
+                    )
+                )
+            else:
+                # Precompute varlen metadata once per request so every block
+                # reuses the same cu_seqlens / indices instead of rebuilding.
+                block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
+                    joint_mask
+                )
         elif should_shard_text(encoder_hidden_states.shape[1]):
             # Shard the replicated text stream across SP ranks; non-divisible
             # lengths tail-pad the last rank and attention skips the pad via the

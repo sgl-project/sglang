@@ -45,10 +45,10 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
     def test_cli_name_differs_from_field_name(self):
         """cli_name maps a different CLI flag to the dataclass field via dest."""
         sa = self._parse(
-            ["--fp8-gemm-backend", "triton", "--fp4-gemm-backend", "cutlass"]
+            ["--fp8-gemm-backend", "triton", "--fp4-gemm-backend", "marlin"]
         )
         self.assertEqual(sa.fp8_gemm_runner_backend, "triton")
-        self.assertEqual(sa.fp4_gemm_runner_backend, "cutlass")
+        self.assertEqual(sa.fp4_gemm_runner_backend, "marlin")
 
     def test_nargs_question_with_const(self):
         """nargs='?' + const='' for --model-checksum."""

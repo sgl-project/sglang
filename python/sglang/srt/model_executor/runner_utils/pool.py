@@ -20,22 +20,21 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-_global_graph_memory_pool: Optional[Any] = None
+from sglang.srt.runtime_context import get_resources
 
 
 def get_global_graph_memory_pool() -> Optional[Any]:
-    return _global_graph_memory_pool
+    return get_resources().graph_memory_pool
 
 
 def set_global_graph_memory_pool(val: Any) -> None:
-    global _global_graph_memory_pool
-    _global_graph_memory_pool = val
+    get_resources().graph_memory_pool = val
 
 
 def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
     """Return the shared graph memory pool, creating it on first use so
     later backends reuse the same handle."""
-    global _global_graph_memory_pool
-    if _global_graph_memory_pool is None:
-        _global_graph_memory_pool = device_module.graph_pool_handle()
-    return _global_graph_memory_pool
+    resources = get_resources()
+    if resources.graph_memory_pool is None:
+        resources.graph_memory_pool = device_module.graph_pool_handle()
+    return resources.graph_memory_pool

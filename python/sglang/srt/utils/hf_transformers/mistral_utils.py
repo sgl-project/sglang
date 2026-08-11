@@ -11,7 +11,12 @@ from transformers import AutoConfig, PretrainedConfig, WhisperConfig
 
 from sglang.srt.utils import logger
 
-from .common import _ensure_sub_configs, download_from_hf
+from .common import (
+    _cached_file_exists,
+    _ensure_sub_configs,
+    _remote_file_exists,
+    download_from_hf,
+)
 
 
 def adapt_config_dict(
@@ -428,6 +433,34 @@ _MISTRAL_TOKENIZER_REDIRECTS = {
     # TODO(Xinyuan): Remove this once we have a proper tokenizer for Devstral
     "mistralai/Devstral-Small-2505": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
 }
+
+
+def is_bare_tekken_checkpoint(tokenizer_name, revision=None) -> bool:
+    """True iff the checkpoint ships tekken.json but no tokenizer.json.
+
+    AutoTokenizer converts tekken.json on the fly, but the converter assigns
+    BPE ids from rank 0, dropping the 1000 special-token slots that precede
+    the BPE vocab in tekken's id space — every encoded id is shifted and
+    generation produces garbage. Such checkpoints must load through the
+    mistral-common backed tokenizer instead.
+    """
+
+    local_dir = Path(tokenizer_name)
+    if local_dir.is_dir():
+        return (local_dir / "tekken.json").is_file() and not (
+            local_dir / "tokenizer.json"
+        ).is_file()
+
+    if _cached_file_exists(tokenizer_name, "tokenizer.json", revision):
+        return False
+    if _cached_file_exists(tokenizer_name, "tekken.json", revision):
+        return True
+
+    # Cold cache: the tokenizer loads before weights, so tekken.json isn't
+    # cached yet on a first launch — HEAD-probe the hub to still detect it.
+    if not _remote_file_exists(tokenizer_name, "tekken.json", revision):
+        return False
+    return not _remote_file_exists(tokenizer_name, "tokenizer.json", revision)
 
 
 def retry_without_mistral_common_kwargs(tokenizer_name, *args, **common_kwargs):

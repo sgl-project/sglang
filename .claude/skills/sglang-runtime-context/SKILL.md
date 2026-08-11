@@ -1,0 +1,464 @@
+---
+name: sglang-runtime-context
+description: How SGLang's runtime configuration and process-global state are organized (RuntimeContext tiers, publish + namespace config bags, the pristine ServerArgs seed, override entry points, resource/stream/buffer leases, per-forward flags), the CI guardrails that enforce the design, and the idioms for developing and testing against it. Load this before touching server_args, model overrides, module-level state, or per-forward state in sglang.
+---
+
+# SGLang runtime-context architecture
+
+One container owns process-static runtime state: `sglang.srt.runtime_context.RuntimeContext`
+(a process singleton reached via `get_context()`). Everything below is a tier on it.
+
+| Tier | Accessor | Holds | Lifecycle |
+|------|----------|-------|-----------|
+| raw config seed | `get_server_args()` | the published `ServerArgs` — the startup record, for debugging, dumps and provenance. **Business code does not read fields off it**: the read ratchet pins that at zero, and "Reading config: the seed is off limits" below says what to read instead, which forms the ratchet sees, and what is outside it by construction (a runtime-computed name; a whole-object hand-off) | published at process entry; re-publish is **last-publish-wins** (in-process tokenizer build, multi-Engine) and re-projects the bags; read-only |
+| resolved config | `get_exec()` `get_memory()` `get_schedule()` `get_model()` `get_spec()` `get_serving()` `get_observability()` `get_disagg()` `get_lora()` `get_mm()` `get_device()` | namespace **config bags** — the single source of truth for resolved config; leaves are real attributes (dynamo-traceable) | projected from `server_args` at `publish`; mutated only via `get_context().override` |
+| runtime flags | `get_flags()` | state that is *not* a pure function of config: `capture` (cuda-graph lifecycle), `moe` (ACTIVE backends, swappable), `dp` (DP-attention runtime flags) | materialized at subsystem init; groups offer `override()` for tests |
+| resources | `get_resources()`, `get_stream(name)`, `get_buffer(name, factory)` | process-level handles: graph pools, EPLB state, EP dispatcher state, named side streams, workspace buffers | lazy; cleared by `reset_context()` |
+| per-forward | `get_forward()` | forward-scoped flags (multi-stream switch, MoE output buffer, attn-TP inputs, extend-in-batch) | contextvar-backed; `scoped(**kw)` restores on exit; new threads see defaults |
+| parallel | `get_parallel()` | **dual**: live topology (tp/pp/moe/attn sizes, ranks, groups — `@property`, read-through) *plus* parallel config-bag leaves via `__getattr__` | live: after dist init; config leaves: after publish |
+
+`reset_context()` (unit-test teardown) drops the published config and installs fresh
+flags/resources/forward tiers.
+
+## Config: publish + namespace bags
+
+**`ServerArgs` is a pristine seed. Business code never reads it for decisions —
+resolved configuration lives in the namespace bags.**
+
+- Every publishing process entry calls `publish(server_args, role=...)`
+  (`run_scheduler_process`, the Ray `SchedulerActor`, the DP controller, tokenizer,
+  encoder, weight-cache daemon, launcher, ...). The one deliberate exception is the
+  detokenizer: its processes never publish and read only the raw config handed to
+  their constructors — code that can run detokenizer-side must not use the
+  namespace accessors. `publish` snapshots the resolved field
+  values into the config bags; the accessors (`get_exec()` etc.) fail closed before it
+  runs. `role` records which process type published, and keys per-role namespace
+  enforcement: `SGLANG_ROLE_NAMESPACES=record` audits which namespaces each role's
+  process actually reads (per-pair persisted via `SGLANG_ROLE_NAMESPACES_OUT`;
+  reads inside torch.compile-traced code are NOT observed — audit with
+  compilation disabled before restricting a role), and
+  `=enforce` fails closed on bag reads outside the role's `ROLE_NAMESPACE_SETS` entry
+  (`None` = full tree; only audited roles are restricted).
+- Bag membership is metadata on the dataclass: every `ServerArgs` field carries
+  `NS("path")` (e.g. `NS("exec.moe")`); coverage is linted two-way
+  (`test_server_args_namespaces.py`, `test_runtime_context_config_bags.py`).
+- **Reading config**: `get_<ns>()[.sub].field` — e.g.
+  `get_exec().moe.moe_a2a_backend`, `get_schedule().max_running_requests`. Bag leaves
+  are plain instance attributes, safe inside `torch.compile`-traced code.
+- **Mutating config after publish**: the ONLY entry point is
+  `get_context().override(source, **fields)`. It writes the bag leaves in place
+  (namespace readers see the new value) and records provenance in the overrides log.
+  There is **no write-through** to the `ServerArgs` instance — it stays pristine.
+  There is no in-place mutation entry on the instance at all: it is read-only after
+  resolution.
+- **Late launcher-stage resolution (pre-publish)**: a few rules cannot run inside
+  `__post_init__` — LoRA normalization, and the auto-parser detection that needs a
+  tokenizer/chat-template load. They are resolution, not mutation, and they write
+  **in place** via `arg_groups.overrides.declare_late_resolution(server_args,
+  source, **fields)`, which refuses the published instance. In place is the point:
+  every holder of that object must see the resolved value — the HTTP server, the
+  multi-tokenizer workers it is serialized for, the schedulers it forks. Returning a
+  variant here is a bug: the launcher rebinds its local and everyone else keeps the
+  unresolved object.
+- **A value another runner / worker owns is a constructor argument, not a config
+  copy.** The draft worker's `context_length`, load format and attention backend
+  travel as arguments to `TpModelWorker` / `ModelRunner` and live on the runner
+  (`ModelRunner.draft_attention_backend`, `kv_cache_dtype_str`, …); the encoder
+  DP worker's device is `MMEncoder(gpu_id=...)`. There is no `ServerArgs.derive`
+  any more — a config object is never copied-and-edited; test doubles that need a
+  modified copy use `sglang.test.test_utils.server_args_variant`.
+
+**Why a bag override cannot stand in for late resolution or per-runner
+construction.** The bags are projected at
+publish *from the instance's fields*, so anything the runtime must read has to be on
+the instance before publish — an override afterwards puts instance and bags back out
+of agreement, and whole-object readers (`ModelConfig.from_server_args`,
+`build_load_config`, `MMEncoder`'s own `self.server_args.X`) never see it. And bags do
+not cross a process boundary: a child publishes from the object it receives and
+re-projects its own bags, so a parent-side override is lost. Values that feed
+construction before any bag exists (group init reads `server_args.tp_size`) have no
+bag to override at all.
+
+- **Nested publishes**: `get_context().preserve_config()` snapshots the enclosing
+  lifecycle (including its post-publish overrides) and reinstates it on exit. No
+  production caller is left — the draft build was the last one, and per-runner
+  values are constructor arguments now — so it survives for tests and for a future
+  construction step that genuinely has to publish a private copy.
+
+### Reads that legitimately stay on a `ServerArgs` instance
+
+- **Per-runner values** — there is no per-runner `ServerArgs` any more. The
+  draft-worker config copy is gone: every worker (`TpModelWorker`, the draft
+  workers in `speculative/`) is handed the *same* instance the process published,
+  so `self.server_args.X` and the bag leaf agree **at publish** — a
+  post-publish `override` moves only the bag, which is exactly why a field that
+  is process-wide config (`attention_backend`, `skip_tokenizer_init`,
+  `kv_cache_dtype`) reads from the bags like any other, and why a residual
+  instance read on this path is stale the moment someone overrides that leaf.
+  What is genuinely per-runner travels two ways, neither of them a config
+  instance: **constructor arguments** (`ModelRunner(draft_attention_backend=...)`,
+  `MMEncoder(gpu_id=...)`) and **runner attributes holding the resolved value**
+  (`model_runner.kv_cache_dtype_str`, `prefill_attention_backend_str`,
+  `num_fused_shared_experts`) — threaded to consumers as arguments, never
+  backfilled onto a shared object. The one sanctioned bend in that rule is
+  *scoped*: `ModelRunner._load_format_scope` exposes the draft's
+  `--speculative-draft-load-format` through `get_model().override(load_format=...)`
+  for exactly the duration of the draft build, because model construction
+  reads that bag leaf — the override restores on exit, so nothing outlives
+  the scope. When there is a runner in hand, read its
+  stamp; that is a different rule from "read the instance".
+- **Per-instance boundaries** — the tokenizer-manager family, everything under
+  `entrypoints/`, and the tokenizer-process multimodal processors read
+  `self.server_args`: several `Engine`s can share one process, and the process-global
+  bags are last-publish-wins across engines. `base_gpu_id` also differs per engine,
+  so no process-global value can stand in for it —
+  `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy. (The
+  encode-server DP workers used to specialize a config copy for the same reason;
+  their device now travels as `MMEncoder(gpu_id=...)`.)
+- **Whole-object passes** (`f(server_args)` handing the instance along) keep the
+  supplied-instance contract; don't rewrite the parameter reads to bag reads unless the
+  field is runtime-mutated (see the elastic-EP `ep_size` case in
+  `eplb/expert_location.py`).
+
+### `get_parallel()`: config leaves vs live topology
+
+Config leaves (`nccl_port`, `enable_dp_attention`, `dp_size`, `ep_size`,
+`dwdp_size`, ...) resolve through the parallel bag; live topology (`tp_size`,
+`attn_tp_group`, ranks) are `@property` and **win on name collisions**. Five topology
+sizes are live-shadowed (`tp/pp/dcp/attn_cp/moe_dp_size`): the live property always
+wins on the accessor, so a config-intent read of those goes through
+`configured_tp_size()` / `configured_pp_size()` / `configured_moe_dp_size()` /
+`configured_attn_cp_size()` (DCP: the live `get_parallel().attn_dcp_size` /
+`.dcp_enabled`, which are safe with no group installed — they answer `1` /
+`False` — but report the *effective* topology, never the requested size;
+a config-intent read would need its own accessor, which no call site
+requires today). A process-global seed field-read of one of these
+sizes (`get_server_args().tp_size`, or an alias of it) is a read-ratchet failure; the
+sites that legitimately go around the live property are the `configured_*_size()`
+readers, and those are what the ratchet registers, each with its reason
+(`_CONFIGURED_SIZE_CALL_SITES` in `test_global_config_read_ratchet.py`). A
+`server_args` the object was *handed* is a different thing and not a ratchet
+matter — see "Reads that legitimately stay on a ServerArgs instance".
+Fail-loud is narrower: before dist init, a live size/group read raises — except
+the DCP pair, which degrades instead (`dcp_enabled` → `False`,
+`attn_dcp_size` → `1` when no group is installed;
+`test_attn_dcp_defaults_when_group_is_uninitialized` pins this). After init,
+only the DCP group is optional (`_DCP` exists only when `dcp_size > 1`; attn-CP and
+moe-DP always install, as size-1 aliases if unused). `ParallelContext.__getattr__` is deliberately dynamo-traceable (no
+`object.__getattribute__`); gate helpers like `enable_moe_dense_fully_dp()` run inside
+compiled model forwards (`test_parallel_config_leaves_trace_under_torch_compile` pins
+this).
+
+### Reading config: the seed is off limits
+
+`get_server_args().field` in business code is a ratchet failure. Read:
+
+- **a resolved leaf** → its namespace bag (`get_exec().moe.moe_runner_backend`,
+  `get_schedule().chunked_prefill_size`, …). Bag-backed reads — a leaf directly, or
+  a bag-derived accessor below, including `configured_*_size()` which reads the
+  parallel bag's own leaf — are what see post-publish overrides. Only the
+  instance-derived accessors (the ones with no leaf to read) answer from the
+  startup record and therefore do not.
+- **the live topology** → `get_parallel()`.
+- **a value derived from published leaves** → an accessor in `runtime_context` that
+  derives it *from the bags*: `mamba_extra_buffer_enabled()` /
+  `mamba_extra_buffer_lazy_enabled()` read `get_memory()` and `get_exec()`, so
+  they see post-publish overrides. Prefer this shape whenever the inputs are
+  leaves; the same-named `ServerArgs` members are the pre-publish equivalents the
+  resolution pipeline uses, and wrapping one of those instead would quietly cost
+  you override visibility. `is_ep_joiner()` / `is_ep_scale_joiner()` are the same
+  shape over `exec.moe.ep_join_mode`, `attention_backends()` derives the
+  `(prefill, decode)` pair from the three `exec.kernel` leaves, and
+  `max_speculative_num_draft_tokens()` / `cutedsl_moe_max_num_tokens()` derive
+  theirs from `spec` / `schedule` / `exec.graph`.
+- **a value only the instance can compute** → the named accessor in
+  `runtime_context`, which is the one module allowed to read the slot:
+  `mamba_cache_chunk_size()`, `uses_mla_backend()`, `process_model_config()`.
+  These have no leaf to read — they combine several fields, the HF config, or a
+  property with no bag of its own. A new derived member gets an accessor here
+  rather than call sites reaching for the record, and only when the bag-derived
+  shape above cannot express it.
+- **what was *configured*, where `get_parallel()` shadows it with the live value**
+  → `configured_{tp,pp,moe_dp,attn_cp}_size()` — the full names are
+  `configured_tp_size`, `configured_pp_size`, `configured_moe_dp_size`,
+  `configured_attn_cp_size`. They read the parallel bag's own leaf (going
+  around the live property that shadows those four names), so they answer with
+  the resolved configuration and follow a post-publish override. DCP has no configured accessor because no
+  config-intent DCP call site exists today — the live reads go through
+  `get_parallel().attn_dcp_size` / `.dcp_enabled`, which answer the effective
+  topology (`1` / `False` when no group is installed). A site
+  that must know the *requested* DCP size before dist init needs its own
+  `configured_dcp_size()` (and an entry in `_CONFIGURED_SIZE_CALL_SITES`, which lives
+  in the ratchet test, not in this skill); note the live pair does not *need*
+  dist init — with no group it answers `1` / `False` — it just cannot answer
+  with the requested size. Every (file, accessor) pair is registered
+  with its reason in `test_global_config_read_ratchet.py`
+  (`_CONFIGURED_SIZE_CALL_SITES`), and that test fails if the code and the list
+  disagree — a new file, or a new accessor in a listed file, has to be added — so a new site needs both an answer the live property cannot give and
+  an entry saying what it is.
+- **this runner's resolved value** → the runner
+  (`prefill_attention_backend_str`, `kv_cache_dtype_str`,
+  `draft_attention_backend`, `num_fused_shared_experts` on the model).
+
+`self.server_args.field` is still right for handed per-instance config (see
+"Reads that legitimately stay on a ServerArgs instance" above for the full set —
+per-instance boundaries and whole-object passes; there are no per-runner config
+copies to read any more). The allow-list is the
+tokenizer-manager family, `entrypoints/`, the tokenizer-process multimodal
+processors, `GrammarManager`, `MMEncoder` — but not for one single reason:
+
+- the tokenizer-manager family and `entrypoints/` are the multi-Engine case
+  proper: several of them can live in one process, so a bag read would answer
+  from whichever Engine published last;
+- `GrammarManager` is a handed instance — it is constructed with the config its
+  owner hands it and never assumes a published namespace;
+- `MMEncoder` publishes the very instance it is handed (`publish(server_args,
+  role="encoder")`) and takes its per-worker device as a separate `gpu_id`
+  argument, so its `self.server_args` reads and the bag agree today. They are on
+  this list as a construction-path convention rather than a semantic exception —
+  and the residual is real: a post-publish `override` would not reach them.
+
+Their tests tell you the same thing: they construct the object standalone, so a
+bag read turns into "config namespace not published".
+
+**Test doubles publish, they do not inject.** A stand-in that carries
+`server_args=SimpleNamespace(field=...)` stops working the moment production reads
+the bag; seed the value with `override_server_args`, which publishes only once it is
+entered or installed — the bare call just builds the override:
+
+```python
+override = get_context().override_server_args(field=...)
+override.install()
+self.addCleanup(override.restore)      # or: with get_context().override_server_args(...):
+```
+
+Five separate test files learned this the hard way during the sweep.
+
+The rule is about a double standing in for **config**: a `SimpleNamespace` that
+pretends to be `server_args`. Prefer the context override even where a
+single-accessor stub would work — `override_server_args(...)` composed with the
+scoped bag / `get_parallel()` overrides expresses the *cause* (the configuration)
+rather than pinning one helper's answer, and it keeps working when a reader
+migrates between the accessor and the leaf. The sweep converted the last two
+accessor stubs to exactly that shape (`test_attention_patching.py` publishes the
+non-lazy strategy; `test_kimi_k3_vision.py` publishes `tp_size` and forces the
+live topology through `get_parallel().override`), so no test stubs an accessor
+today. Stubbing one *named accessor* remains a last resort for a case that
+isolates one branch of one helper where no published config can reach it —
+if you do it, say so in the test.
+
+### Mid-resolution reads (inside the pipeline only)
+
+Resolution itself still runs in `__post_init__`: handlers and hooks read the
+in-flight state through `resolved_view(server_args)` / `self._resolved()`, fields are
+read-only during resolution, and declarations materialize once at the very end of
+`__post_init__` (gate order, last writer wins) — *then* `publish` snapshots the
+resolved values into the bags. `resolved_view` is pipeline-internal
+(`server_args.py` / `arg_groups/`, plus helpers the pipeline itself invokes
+mid-resolution, e.g. `adaptive_spec_params`); do not introduce new
+out-of-pipeline call sites.
+
+### Adding a model-specific config adjustment
+
+Never assign `server_args` fields from model code. Declare instead
+(`sglang/srt/arg_groups/overrides.py`):
+
+- Constant per-arch values → `MODEL_OVERRIDES["MyArchForCausalLM"] = {...}`.
+- Derived values → `@register_model_override("MyArchForCausalLM")` returning a dict; the
+  callable receives *pristine* `server_args` + `hf_config` and must not write.
+- Normalization that must see earlier declarations → a post-process pass invoked via
+  `run_post_process_pass` at its slot (reads a view, returns a declaration dict).
+- Values only knowable at load time are **per-runner state**, not declarations:
+  there is no `declare_load_time_override` any more. A model-family decision that
+  its checkpoint drives (shared-experts fusion) is a question the *loader* asks
+  the model class — `shared_experts_fusion_disable_reason(hf_config,
+  quant_config)`, a classmethod answering without an instance — at the single
+  model-instantiation point, and
+  `install_shared_experts_fusion_decision` writes the answer to the ACTIVE moe
+  flag before that model's layers build and read it
+  (`is_shared_experts_fusion_disabled`, config-intent fallback).
+  `draft_model_build_scope` brackets every draft build and routes the draft's
+  answer to the speculative leaf, so a draft's decision never overwrites the
+  target's. A process-level load-time fact (the sm80 dtype fallback —
+  device-driven, identical for every runner) records directly via
+  `get_context().override`.
+
+Declarable fields form a whitelist: `Arg(..., resolvable=True)` in the `ServerArgs`
+dataclass. A declaration against a non-whitelisted field fails at its slot.
+
+### Load-time vs resolution-time (critical)
+
+`__post_init__` runs in the launcher process before any model/platform import. Logic that
+consults an **extensible registry** (e.g. out-of-tree platforms registering attention
+backends in `init_backend()`, which runs at `model_runner` import) must stay at load time
+(ModelRunner init), writing through `get_context().override()`. Before moving any
+load-time logic into resolution, verify everything it reads is already complete at
+construction time.
+
+## Runtime flags (`get_flags()`)
+
+For state that init-time code *derives* and runtime code reads — parsed enums, platform
+probes, swappable ACTIVE values. Not for config mirrors (read the bag leaf instead).
+
+- Groups are typed dataclasses on `Flags` (`capture` / `moe` / `dp`): typo-safe writes,
+  transactional test-only `override(**kw)` context manager.
+- `flags.moe` is materialized by `initialize_moe_config(server_args)` at scheduler init;
+  accessors (`get_moe_a2a_backend` etc.) are thin shims with lazy defaults. The speculative
+  contexts (`speculative_moe_backend_context`) swap the ACTIVE leaves around draft forwards.
+- `flags.dp` is materialized by `initialize_dp_attention`; `is_dp_attention_enabled()` is a
+  shim over `flags.dp.enabled`.
+- Adding a leaf: declare the dataclass field with a default equal to the pre-init behavior,
+  materialize it at the owning subsystem's init, keep any public accessor as a shim.
+
+## Resources (`get_resources()`)
+
+Named slots + two keyed-lazy registries:
+
+- `get_stream(name)` — get-or-create a named CUDA side stream; `set_stream(name, stream)`
+  installs explicitly. **Name leases by subsystem ROLE**: all model alternate streams share
+  `"alt"`; the offloader's copy stream is `"offload"`; DP-TBO comm is `"dp_tbo_comm"`; LoRA
+  side stream is `"lora_side"`. Two call sites may share a name only if their work belongs
+  on one stream — sharing across roles serializes intended overlap.
+- `get_buffer(name, factory)` — get-or-create a named persistent buffer. Grow-only or
+  per-device semantics manage their `resources.buffers` entries directly (see tokenspeed /
+  SM120 split / Marlin workspace). Buffer names are per-backend today; do not silently
+  share.
+- Singletons with manager semantics (EP dispatcher buffers, EPLB recorder/metadata, graph
+  memory pool) keep their owning accessors/classes as facades; only the *state* lives in a
+  resources entry. Preserve exact semantics in the shim: lazy defaults (the EPLB recorder
+  defaults to a Noop instance, not None), publish-once asserts, event-reuse contracts.
+- Stream/buffer creation is a driver call — it must happen outside cuda-graph capture;
+  keep lease points at init/warmup time.
+
+## Per-forward flags (`get_forward()`)
+
+Contextvar-backed; a new thread sees the defaults; `scoped(**kw)` is the regular write path
+(transactional, restores on exit and on exception); `set(name, value)` exists for legacy
+sticky setters (`is_extend_in_batch` is intentionally sticky within a thread). Use this
+tier for anything set-per-forward and read-within-forward. Before adding cross-thread
+state here, prove the readers' thread affinity: contextvars do NOT propagate to already-
+running or newly spawned threads. Note TBO ("two-batch overlap") interleaves ubatches on
+ONE thread — do not design for TBO threads that don't exist.
+
+## Testing idioms
+
+- **Force a code path by overriding causes, not effects**: compose
+  `get_context().override_server_args(**fields)` (publishes a fresh dummy-boundary
+  `ServerArgs` carrying the overrides AND projects the bags — `with`-scoped, or
+  `install()`/`restore()` + `addCleanup` for fixture-lifetime use) +
+  `get_<ns>().override(...)` (scoped override of one bag's own leaves) +
+  `get_parallel().override(...)` (live topology) + `get_flags().<group>.override(...)` +
+  `get_forward().scoped(...)`. All are scoped and transactional. Tests control execution
+  through the context — do not hand-build and publish config objects.
+- **Never monkeypatch import bindings** (`module.get_x = lambda: ...`) and never fake a
+  config source with a `SimpleNamespace` stand-in: production reads the published bags,
+  so a faked accessor silently stops intercepting after any reader migration. Publish
+  for real (`override_server_args(...)`), then adjust bag leaves with the scoped bag
+  `override` where the constructed `ServerArgs` cannot carry the value (e.g.
+  `get_device().override(device="meta")`). The one carve-out is the deliberate
+  single-accessor stub for isolating one predicate — the terms and the two
+  sanctioned examples live under "Test doubles publish, they do not inject"
+  above; anything wider than one named accessor is this rule.
+- Mocked runners/managers still need the **per-runner instance attributes** the code
+  under test reads (`kv_cache_dtype_str`, `server_args` for whole-object passes) — set
+  them explicitly on the mock; `MagicMock(spec=...)` raises on attributes that only
+  exist post-`__init__`, which is the fastest way to find a missed stub.
+- `reset_context()` in teardown when a test publishes outside a scoped override.
+- `ServerArgs(model_path="dummy")` early-returns `__post_init__` (no materialization, no
+  strict guard) — fine for lightweight fixtures.
+- **Run changed test files per-file** (own process), the way CI does: a monolithic local
+  pytest run lets a context published by an earlier file mask a missing-publish bug in a
+  later one.
+
+## Guardrails (these fail CI; what to do when they fire)
+
+1. **Strict mutation guard** (always on): bare `server_args.x = ...` after resolution
+   raises unconditionally in `ServerArgs.__setattr__` — this *is* the guarantee that
+   no writer can desync the bags, so there is no writer ratchet any more. Change
+   resolved config with `get_context().override`; hand a per-runner value to its
+   runner as a constructor argument. Projected bags are sealed the same way (leaf
+   assignment raises).
+2. **Mutation ratchet** (`test_server_args_mutation_ratchet.py`, exact pin 0 over the whole
+   package minus the pipeline / multimodal_gen): textual scan for assignment forms. Never
+   raise the baseline.
+3. **No-copy contract** (`test_server_args_no_instance_mutation_entry.py`): neither
+   `ServerArgs.override` nor `ServerArgs.derive` exists, and nothing in the package
+   calls either form. Rerouting a writer to the bags means flipping **all its readers
+   in the same commit** (no transitional dual-write).
+4. **Legacy-accessor ratchet** (`test_legacy_global_ratchet.py`): `get_global_server_args`
+   call sites must not grow. The replacement for a *decision* is a bag leaf, a named
+   accessor, or the owning runner's stamp — not `get_server_args().field`, which the
+   read ratchet below pins at zero. `runtime_context.get_server_args()` is only for the
+   whole-object shapes (dumps, provenance, a hand-off to a callee that takes a config).
+5. **Global config read ratchet** (`test_global_config_read_ratchet.py`): baselines are
+   **0** for both the direct `get_server_args().field` and the alias form (function-local
+   — including local copies of an alias, `cfg = sa` — module-level, or parked on an
+   instance attribute, plus the `getattr(..., "field")` spelling of each; a name
+   computed at runtime or indirection deeper than a local name copy is census-tool
+   territory, per the test's docstring). The scanners match `get_server_args` and
+   `configured_*_size` by their literal names, and the same file *bans*
+   `import ... as` renames of them so that matching stays sound. Exempt by owner
+   module only (`runtime_context.py`, `server_args.py`, `arg_groups/`). The same file
+   carries `_CONFIGURED_SIZE_CALL_SITES`, the (file, accessor) map of every
+   `configured_*_size()` reader with the reason the live property cannot serve it — a new
+   file or a new accessor in a listed file must be added there.
+6. **Module-state ratchet** (`test_module_state_ratchet.py`): `global` statements in the
+   flag-owning layers are pinned by name. A new module-level runtime global belongs on a
+   flags group / resources slot instead; migrating a pinned survivor must shrink the pin.
+7. **Namespace coverage** (`test_server_args_namespaces.py`,
+   `test_runtime_context_config_bags.py`): every `ServerArgs` field carries `NS(...)`
+   metadata and the projected bags must cover the fields exactly (two-way).
+
+Never module-skip a test "until the migration settles" — seed the context instead
+(the deferral ratchet that once pinned this is retired; the rule stands).
+
+## Hard-won pitfalls (check these before/while refactoring)
+
+- **Moving code drops first-line guards**: early returns (`if self.is_draft_worker: return`)
+  are the easiest thing to lose when relocating a method body. A draft is built from
+  the target's published config — there is no draft config copy and no nested publish
+  any more — so a body moved out of a draft-aware call site keeps reading the target's
+  bags, and only that guard tells the two apart. What the draft build *does* scope is
+  narrower and named: `draft_model_build_scope()` for the MoE fusion gates,
+  `speculative_moe_backend_context()` for the runner backends.
+- **Registry-completeness timing**: a gate that consults an extensible list is only correct
+  after the registrars ran (platform `init_backend()` at module import). See "load-time vs
+  resolution-time".
+- **Late function-scope imports shadow module names** for the WHOLE function
+  (UnboundLocalError at earlier lines). Audit moves with AST, not grep.
+- **Lease names are per-role**, not per-API-shape (the offloader-vs-"alt" lesson).
+- **Storage matrix for state read inside torch.compile-traced model code**
+  (piecewise cuda graph compiles the whole model forward): contextvars are
+  untraceable (hard error); dict-slot values are guarded per value — for a
+  per-forward int that is one recompile per distinct size, straight into the
+  recompile limit; **class/instance attributes are the only compile-friendly
+  form** (attribute-source ints get automatic-dynamic after the first size
+  change). Bools (≤2 values) are tolerable in any form — see
+  `ForwardFlags._GRAPH_VISIBLE`. Config-bag leaves are real instance attributes for
+  exactly this reason, and `ParallelContext.__getattr__` must stay free of
+  `object.__getattribute__` (dynamo graph-breaks on it). Before moving such state,
+  prove its readers sit outside compile coverage; a piecewise-prefill boot of a small
+  model is the fast check (recompile storms show as `torch._dynamo hit
+  config.recompile_limit` during the compile pass).
+- **Engine-booting e2e tests are the only coverage for launcher-path code**; a child crash
+  kills the process tree and pytest dies silently — run with `PYTHONUNBUFFERED=1` and read
+  child logs.
+- CI arms `SGLANG_ENABLE_ASYNC_ASSERT=1` (device-side `torch._assert_async` probes, e.g.
+  KV-cache OOB): a fired device assert kills the tree with no Python traceback, and the
+  same bug is *silent corruption* locally with the flag off. Arm it when reproducing CI
+  crashes.
+- CI startup logs print the full `server_args=ServerArgs(...)`; diffing that dump between
+  runs is the fastest config-divergence check.
+
+## Where to read the code
+
+Key source files: `python/sglang/srt/runtime_context.py` (the container, every tier,
+`publish`, `_ConfigBag`, `preserve_config`, `override_server_args`),
+`python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
+`declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
+`Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
+`test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
+`test_global_config_read_ratchet.py`, `test_legacy_global_ratchet.py`,
+`test_module_state_ratchet.py`, `test_server_args_namespaces.py`,
+`test_runtime_context.py` — the last one doubles
+as executable documentation of every tier's semantics).
