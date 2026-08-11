@@ -1,7 +1,13 @@
+import array
+import ctypes
 import logging
 import os
+import socket
 import struct
+import tempfile
+import threading
 import time
+from functools import cache
 from typing import Any, List, Optional
 
 import torch
@@ -12,18 +18,43 @@ from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
-_drv = None
 _FD_HEADER_BYTES = 24
 _FD_SEND_TIMEOUT_S = 120.0
 
+try:
+    from cuda.bindings import driver as _drv
+except ImportError:
+    _drv = None
+
+if _drv is None:
+    _RECOMMENDED_GRANULARITY = 1
+else:
+    _RECOMMENDED_GRANULARITY = (
+        _drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
+    )
+
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
+
+_NVML_GPU_FABRIC_INFO_V3_TYPE = None
+_NVML_GPU_FABRIC_INFO_V3_VERSION = None
+if pynvml is not None:
+    try:
+        _NVML_GPU_FABRIC_INFO_V3_TYPE = pynvml.c_nvmlGpuFabricInfo_v3_t
+        _NVML_GPU_FABRIC_INFO_V3_VERSION = pynvml.nvmlGpuFabricInfo_v3
+    except AttributeError:
+        pass
+
+# NVML_GPU_FABRIC_STATE_COMPLETED: the GPU has joined its NVLink fabric clique.
+_NVML_GPU_FABRIC_STATE_COMPLETED = 3
+
 
 def _get_cuda_driver():
-    """Lazily import cuda.bindings.driver (cached after first call)."""
-    global _drv
+    """Return the imported CUDA driver bindings."""
     if _drv is None:
-        from cuda.bindings import driver
-
-        _drv = driver
+        raise ImportError("cuda.bindings.driver is required for CUDA VMM operations")
     return _drv
 
 
@@ -36,6 +67,22 @@ def check_drv(result_tuple, label):
     if err != drv.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"{label}: {err}")
     return result_tuple[1] if len(result_tuple) > 1 else None
+
+
+def tensor_from_pointer(
+    pointer: int,
+    nbytes: int,
+    *,
+    shape=None,
+    dtype: torch.dtype = torch.uint8,
+    device_id: int,
+) -> torch.Tensor:
+    """Use non-owning storage; the caller controls the underlying pages' lifetime."""
+    device = torch.device("cuda", device_id)
+    storage = torch._C._construct_storage_from_data_pointer(pointer, device, nbytes)
+    if shape is None:
+        shape = (nbytes,)
+    return torch.empty(0, dtype=dtype, device=device).set_(storage, 0, shape)
 
 
 def is_vmm_pointer(ptr: int) -> bool:
@@ -112,6 +159,329 @@ def make_rw_access_desc(device_id: int):
     return desc
 
 
+def _gpu_fabric_clique(device: torch.device):
+    """Return this GPU's NVLink fabric clique, or ``None`` if not joined."""
+    if pynvml is None:
+        return None
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if cuda_visible_devices:
+        device_ids = list(map(int, cuda_visible_devices.split(",")))
+    else:
+        device_ids = list(range(torch.cuda.device_count()))
+    handle = pynvml.nvmlDeviceGetHandleByIndex(device_ids[device.index])
+    if (
+        _NVML_GPU_FABRIC_INFO_V3_TYPE is not None
+        and _NVML_GPU_FABRIC_INFO_V3_VERSION is not None
+    ):
+        fabric = _NVML_GPU_FABRIC_INFO_V3_TYPE()
+        fabric.version = _NVML_GPU_FABRIC_INFO_V3_VERSION
+        pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric))
+        clique_id = fabric.cliqueId
+    else:
+        fabric = pynvml.c_nvmlGpuFabricInfo_t()
+        pynvml.nvmlDeviceGetGpuFabricInfo(handle, ctypes.byref(fabric))
+        clique_id = fabric.partitionId
+    if fabric.state != _NVML_GPU_FABRIC_STATE_COMPLETED:
+        return None
+    return (bytes(fabric.clusterUuid), int(clique_id))
+
+
+def is_gpu_fabric_ready(device: torch.device) -> bool:
+    """Whether one CUDA GPU has completed NVLink fabric initialization."""
+    if pynvml is None:
+        return False
+    try:
+        pynvml.nvmlInit()
+        try:
+            return _gpu_fabric_clique(device) is not None
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as error:
+        logger.warning("GPU fabric readiness query failed: %r", error)
+        return False
+
+
+def allocation_handle_type_name(handle_type: int) -> str:
+    """Return a stable display name for a CUDA allocation handle type."""
+    drv = _get_cuda_driver()
+    fabric = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    posix_fd = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+    if handle_type == fabric:
+        return "FABRIC"
+    if handle_type == posix_fd:
+        return "POSIX_FD"
+    if handle_type == 0:
+        return "NONE"
+    return str(handle_type)
+
+
+@cache
+def get_device_allocation_handle_type(device_id: int) -> int:
+    """Probe and cache the best supported VMM handle type for one device."""
+    device_id = int(device_id)
+    drv = _get_cuda_driver()
+    if not is_gpu_fabric_ready(torch.device("cuda", device_id)):
+        logger.info(
+            "GPU %d has not joined an NVLink fabric clique; probing local "
+            "FABRIC allocation support",
+            device_id,
+        )
+
+    fabric = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    posix_fd = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+    candidates = (fabric, posix_fd, 0)
+    last_error = None
+    for handle_type in candidates:
+        name = allocation_handle_type_name(handle_type)
+        prop = make_device_allocation_prop(
+            device_id,
+            handle_types=handle_type,
+            gpu_direct_rdma=False,
+        )
+        try:
+            granularity = get_allocation_granularity(prop)
+            probe_handle = check_drv(
+                drv.cuMemCreate(granularity, prop, 0),
+                f"cuMemCreate({name} probe)",
+            )
+            check_drv(
+                drv.cuMemRelease(probe_handle),
+                f"cuMemRelease({name} probe)",
+            )
+        except RuntimeError as error:
+            last_error = error
+            logger.warning(
+                "CUDA VMM %s backing unavailable on device %d; trying fallback: %s",
+                name,
+                device_id,
+                error,
+            )
+            continue
+        logger.info(
+            "CUDA VMM selected %s backing for device %d",
+            name,
+            device_id,
+        )
+        return handle_type
+    raise RuntimeError("no supported CUDA VMM allocation handle type") from last_error
+
+
+def make_device_allocation_prop(
+    device_id: int,
+    *,
+    handle_types: int | str | None = "auto",
+    gpu_direct_rdma: bool = False,
+):
+    """Build a device allocation prop with automatic or explicit exportability."""
+    drv = _get_cuda_driver()
+    if handle_types == "auto":
+        handle_types = get_device_allocation_handle_type(device_id)
+    elif handle_types is None:
+        handle_types = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
+    elif not isinstance(handle_types, int):
+        raise ValueError("handle_types must be 'auto', an integer, or None")
+
+    handle_types = int(handle_types)
+    valid_handle_types = {
+        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE),
+        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
+        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC),
+    }
+    if handle_types not in valid_handle_types:
+        raise ValueError(f"invalid CUDA handle-type value: {handle_types}")
+
+    prop = drv.CUmemAllocationProp()
+    prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = int(device_id)
+    prop.requestedHandleTypes = handle_types
+    prop.allocFlags.gpuDirectRDMACapable = int(gpu_direct_rdma)
+    return prop
+
+
+def get_allocation_granularity(prop, flag=_RECOMMENDED_GRANULARITY) -> int:
+    """Return allocation granularity for a CUDA policy flag."""
+    drv = _get_cuda_driver()
+    return int(
+        check_drv(
+            drv.cuMemGetAllocationGranularity(prop, flag),
+            "cuMemGetAllocationGranularity",
+        )
+    )
+
+
+@cache
+def get_device_granularity(device_id: int) -> int:
+    """Granularity for this device's default allocations. Cached: it is a device
+    constant, and callers that size a reservation must agree with the one that
+    maps into it."""
+    device_id = int(device_id)
+    return get_allocation_granularity(make_device_allocation_prop(device_id))
+
+
+def align_up(value: int, alignment: int) -> int:
+    """Round ``value`` up to a positive byte ``alignment``."""
+    return (int(value) + alignment - 1) // alignment * alignment
+
+
+def align_down(value: int, alignment: int) -> int:
+    """Round ``value`` down to a positive byte ``alignment``."""
+    return int(value) // alignment * alignment
+
+
+class VmmReservation:
+    """Own a VA reservation, its mappings, and their teardown order."""
+
+    def __init__(
+        self,
+        size: int,
+        prop,
+        device_id: int,
+        *,
+        alignment: int = 0,
+        requested_address: int = 0,
+    ) -> None:
+        drv = _get_cuda_driver()
+        self.size = int(size)
+        self._prop = prop
+        self._access_descs = [make_rw_access_desc(int(device_id))]
+        self.base = int(
+            check_drv(
+                drv.cuMemAddressReserve(
+                    self.size,
+                    int(alignment),
+                    int(requested_address),
+                    0,
+                ),
+                "cuMemAddressReserve(local)",
+            )
+        )
+        self._mappings = []
+        self._closed = False
+
+    def map(
+        self,
+        offset: int,
+        size: int,
+        *,
+        retain_handle: bool,
+    ):
+        """Create and map local memory at ``base + offset``."""
+        if self._closed:
+            raise RuntimeError("VmmReservation.map after close")
+        offset, size = int(offset), int(size)
+        if offset < 0 or size <= 0 or offset + size > self.size:
+            raise ValueError(
+                f"mapping [{offset}, {offset + size}) is outside reservation "
+                f"[0, {self.size})"
+            )
+
+        drv = _get_cuda_driver()
+        address = self.base + offset
+        handle = check_drv(drv.cuMemCreate(size, self._prop, 0), "cuMemCreate(local)")
+        mapped = False
+        try:
+            check_drv(
+                drv.cuMemMap(address, size, 0, handle, 0),
+                "cuMemMap(local)",
+            )
+            mapped = True
+            check_drv(
+                drv.cuMemSetAccess(
+                    address,
+                    size,
+                    self._access_descs,
+                    len(self._access_descs),
+                ),
+                "cuMemSetAccess(local)",
+            )
+            if not retain_handle:
+                check_drv(drv.cuMemRelease(handle), "cuMemRelease(local)")
+                handle = None
+        except BaseException as error:
+            cleanup_errors = []
+            if mapped:
+                try:
+                    check_drv(
+                        drv.cuMemUnmap(address, size), "cuMemUnmap(local rollback)"
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if handle is not None:
+                try:
+                    check_drv(drv.cuMemRelease(handle), "cuMemRelease(local rollback)")
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                error.add_note(
+                    f"{len(cleanup_errors)} CUDA VMM rollback operation(s) also failed"
+                )
+                raise error from cleanup_errors[0]
+            raise
+
+        self._mappings.append((address, size, handle))
+        return handle
+
+    def map_existing(self, offset: int, size: int, handle) -> None:
+        """Map a caller-owned physical allocation into this reservation."""
+        if self._closed:
+            raise RuntimeError("VmmReservation.map_existing after close")
+        offset, size = int(offset), int(size)
+        drv = _get_cuda_driver()
+        address = self.base + offset
+        mapped = False
+        try:
+            check_drv(
+                drv.cuMemMap(address, size, 0, handle, 0),
+                "cuMemMap(existing)",
+            )
+            mapped = True
+            check_drv(
+                drv.cuMemSetAccess(
+                    address,
+                    size,
+                    self._access_descs,
+                    len(self._access_descs),
+                ),
+                "cuMemSetAccess(existing)",
+            )
+        except BaseException as error:
+            if mapped:
+                try:
+                    check_drv(
+                        drv.cuMemUnmap(address, size),
+                        "cuMemUnmap(existing rollback)",
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note("CUDA VMM alias rollback also failed")
+                    raise error from cleanup_error
+            raise
+
+        self._mappings.append((address, size, None))
+
+    def close(self, *, release_handles: bool = True) -> None:
+        """Unmap allocations, optionally release retained handles, and free VA."""
+        if self._closed:
+            return
+        self._closed = True
+        drv = _get_cuda_driver()
+        while self._mappings:
+            address, size, handle = self._mappings.pop()
+            err = drv.cuMemUnmap(address, size)
+            err = err[0] if isinstance(err, tuple) else err
+            if err != drv.CUresult.CUDA_SUCCESS:
+                logger.warning("cuMemUnmap(local) -> %s", err)
+            if release_handles and handle is not None:
+                err = drv.cuMemRelease(handle)
+                err = err[0] if isinstance(err, tuple) else err
+                if err != drv.CUresult.CUDA_SUCCESS:
+                    logger.warning("cuMemRelease(local) -> %s", err)
+        err = drv.cuMemAddressFree(self.base, self.size)
+        err = err[0] if isinstance(err, tuple) else err
+        if err != drv.CUresult.CUDA_SUCCESS:
+            logger.warning("cuMemAddressFree(local) -> %s", err)
+
+
 def all_ranks_ok(group: ProcessGroup, ok: bool) -> bool:
     """True iff ``ok`` holds on every rank in ``group`` (BAND all-reduce)."""
     flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
@@ -133,9 +503,6 @@ def release_mappings(mappings) -> None:
 
 
 def _send_fd(sock, fd: int, src_rank: int, base_idx: int) -> None:
-    import array
-    import socket
-
     fds = array.array("i", [int(fd)])
     header = struct.pack("<QQQ", int(src_rank), int(base_idx), 1)
     sent = sock.sendmsg(
@@ -147,9 +514,6 @@ def _send_fd(sock, fd: int, src_rank: int, base_idx: int) -> None:
 
 
 def _recv_fd(sock):
-    import array
-    import socket
-
     fd_item_size = array.array("i").itemsize
     data, ancdata, _, _ = sock.recvmsg(
         _FD_HEADER_BYTES, socket.CMSG_SPACE(fd_item_size)
@@ -253,11 +617,7 @@ def exchange_posix_fds(
     socket. Returns ``{(src_rank, base_idx): fd}`` for every peer. The caller
     owns the received fds and must close them.
     """
-    import socket
-    import tempfile
-    import threading
-
-    sock_kind = getattr(socket, "SOCK_SEQPACKET", socket.SOCK_STREAM)
+    sock_kind = socket.SOCK_SEQPACKET
     sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
     sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
     server = socket.socket(socket.AF_UNIX, sock_kind)
@@ -382,13 +742,7 @@ def import_and_map_alloc(
         drv.cuMemGetAllocationPropertiesFromHandle(imp_h),
         "cuMemGetAllocationPropertiesFromHandle",
     )
-    gran = check_drv(
-        drv.cuMemGetAllocationGranularity(
-            prop,
-            drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
-        ),
-        "cuMemGetAllocationGranularity",
-    )
+    gran = get_allocation_granularity(prop)
     va = check_drv(
         drv.cuMemAddressReserve(alloc_size, int(gran), 0, 0), "cuMemAddressReserve"
     )
@@ -447,8 +801,8 @@ class VmmGraphInputManager:
         VMM-compatible path for expandable_segments. The C++ side deduplicates
         graph capture pointers into unique base allocations via cuMemGetAddressRange.
         Python exports handles for each unique base, imports + cuMemMaps peer
-        allocations, then registers the peer VAs. FABRIC handles are preferred;
-        POSIX file descriptors are used when FABRIC is unavailable.
+        allocations, then registers the peer virtual addresses. FABRIC handles are
+        preferred; POSIX file descriptors are used when FABRIC is unavailable.
         """
         FABRIC_HANDLE_BYTES = 64
         MAX_VMM_BASES = 4096

@@ -38,9 +38,11 @@ from sglang.multimodal_gen.runtime.models.vlas.pi05_core import Pi05CoreModel
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.vla.denoise_cuda_graph import (
+from sglang.multimodal_gen.runtime.vla.cuda_graph import (
     VLADenoiseGraphRunner,
     VLADenoiseGraphSignature,
+    VLAPrefixGraphRunner,
+    VLAPrefixGraphSignature,
 )
 from sglang.multimodal_gen.runtime.vla.observation import (
     VLAObservationBatch,
@@ -161,6 +163,10 @@ class Pi05PolicyModel(nn.Module):
         if self.runtime_role != "all":
             logger.info("Pi05 split runtime role on rank: %s", self.runtime_role)
         self.action_expert = Pi05ActionExpert(config, self.core_model)
+        self.prefix_graph_runner = VLAPrefixGraphRunner(
+            enabled=self._prefix_cuda_graph_enabled(),
+            max_entries=config.prefix_cuda_graph_max_entries,
+        )
         self.graph_runner = VLADenoiseGraphRunner(
             enabled=config.enable_action_cuda_graph
         )
@@ -175,6 +181,25 @@ class Pi05PolicyModel(nn.Module):
         if not model_parallel_is_initialized():
             return False
         return get_tp_world_size() > 1
+
+    def _prefix_cuda_graph_enabled(self) -> bool:
+        if (
+            not self.config.enable_prefix_cuda_graph
+            or self.device.type != "cuda"
+            or self.runtime_role not in ("all", "prefix")
+            or self._prefix_tensor_parallel_enabled()
+        ):
+            return False
+        return not any(
+            (
+                self.config.offload_prefix_image_encoder,
+                self.config.offload_prefix_image_encoder_after_embed,
+                self.config.offload_prefix_token_embedding,
+                self.config.offload_prefix_language_layers,
+                self.config.offload_prefix_language_layers_after_prefix,
+                self.config.empty_cache_after_prefix,
+            )
+        )
 
     @staticmethod
     def _to_empty_preserve_buffers(module: nn.Module, *, device: torch.device) -> None:
@@ -796,6 +821,10 @@ class Pi05PolicyModel(nn.Module):
             return None
         return paligemma.model.language_model
 
+    def _prefix_tensor_parallel_enabled(self) -> bool:
+        language_model = self._prefix_language_model()
+        return language_model is not None and language_model.tensor_parallel
+
     def _prefix_kv_requires_tp_gather(self) -> bool:
         language_model = self._prefix_language_model()
         if language_model is None or not language_model.tensor_parallel:
@@ -822,7 +851,12 @@ class Pi05PolicyModel(nn.Module):
             )
         )
 
-    def encode_prefix(self, observation: VLAObservationBatch) -> PrefixContext:
+    def encode_prefix(
+        self,
+        observation: VLAObservationBatch,
+        *,
+        use_cuda_graph: bool = True,
+    ) -> PrefixContext:
         camera_order = tuple(observation.metadata.get("camera_order", ()))
         images = [
             observation.images[name].to(self.device, dtype=torch.float32)
@@ -844,22 +878,57 @@ class Pi05PolicyModel(nn.Module):
         prefix_full_attention_hint = all(
             bool(observation.image_masks[name].all().item()) for name in camera_order
         ) and bool(token_masks_cpu.all().item())
-        past_key_values, prefix_pad_masks, full_attention = (
-            self.core_model.encode_prefix(
-                images,
-                image_masks,
-                tokens,
-                token_masks,
-                prefix_full_attention_hint=prefix_full_attention_hint,
-                tokens_trimmed=tokens_trimmed,
+
+        image_count = len(images)
+        graph_inputs = tuple([*images, *image_masks, tokens, token_masks])
+
+        def encode(current_inputs: tuple[torch.Tensor, ...]) -> PrefixContext:
+            current_images = list(current_inputs[:image_count])
+            current_image_masks = list(current_inputs[image_count : 2 * image_count])
+            current_tokens = current_inputs[-2]
+            current_token_masks = current_inputs[-1]
+            past_key_values, prefix_pad_masks, full_attention = (
+                self.core_model.encode_prefix(
+                    current_images,
+                    current_image_masks,
+                    current_tokens,
+                    current_token_masks,
+                    prefix_full_attention_hint=prefix_full_attention_hint,
+                    tokens_trimmed=tokens_trimmed,
+                )
             )
+            past_key_values = self._materialize_prefix_kv_for_action(past_key_values)
+            return PrefixContext(
+                past_key_values=past_key_values,
+                prefix_pad_masks=prefix_pad_masks,
+                prefix_len=prefix_pad_masks.shape[1],
+                layout={"full_attention": full_attention},
+            )
+
+        if (
+            not use_cuda_graph
+            or not self.prefix_graph_runner.enabled
+            or observation.batch_size != 1
+        ):
+            return encode(graph_inputs)
+
+        signature = VLAPrefixGraphSignature(
+            batch_size=observation.batch_size,
+            input_shapes=tuple(tuple(tensor.shape) for tensor in graph_inputs),
+            input_dtypes=tuple(
+                str(tensor.dtype).replace("torch.", "") for tensor in graph_inputs
+            ),
+            static_layout=(
+                image_count,
+                prefix_full_attention_hint,
+                tokens_trimmed,
+            ),
+            parallel_layout=self.config.parallel_layout_version,
         )
-        past_key_values = self._materialize_prefix_kv_for_action(past_key_values)
-        return PrefixContext(
-            past_key_values=past_key_values,
-            prefix_pad_masks=prefix_pad_masks,
-            prefix_len=prefix_pad_masks.shape[1],
-            layout={"full_attention": full_attention},
+        return self.prefix_graph_runner.capture_or_run(
+            signature,
+            encode,
+            graph_inputs,
         )
 
     def sample_noise(

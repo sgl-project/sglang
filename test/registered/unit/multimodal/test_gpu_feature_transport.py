@@ -18,48 +18,27 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool.memory_pool = object()
         pool.use_fabric = True
         pool.shareable_handle = b"handle"
-        pool._pool_pointer = 123
-        pool._allocation_handle = 456
-        pool._allocation_mapped = True
-        pool.allocation_size = 4096
+        allocation = MagicMock()
+        allocation.close.side_effect = [
+            RuntimeError("forced allocation close failure"),
+            None,
+        ]
+        pool._allocation = allocation
         pool.device_index = 0
-        driver = MagicMock()
-        driver.cuMemUnmap.return_value = "unmap"
-        driver.cuMemAddressFree.return_value = "address_free"
-        driver.cuMemRelease.return_value = "release"
-        failed_once = False
-
-        def check_driver(result, _operation):
-            nonlocal failed_once
-            if result == "address_free" and not failed_once:
-                failed_once = True
-                raise RuntimeError("forced address-free failure")
-            return result
 
         with (
-            patch.object(vmm, "_get_cuda_driver", return_value=driver),
             patch.object(vmm.torch.cuda, "device", return_value=nullcontext()),
-            patch.object(vmm, "check_drv", side_effect=check_driver),
-            self.assertRaisesRegex(RuntimeError, "forced address-free failure"),
+            self.assertRaisesRegex(RuntimeError, "forced allocation close failure"),
         ):
             pool._release_allocation()
 
-        self.assertFalse(pool._allocation_mapped)
-        self.assertEqual(pool._pool_pointer, 123)
-        self.assertEqual(pool._allocation_handle, 456)
+        self.assertIs(pool._allocation, allocation)
 
-        with (
-            patch.object(vmm, "_get_cuda_driver", return_value=driver),
-            patch.object(vmm.torch.cuda, "device", return_value=nullcontext()),
-            patch.object(vmm, "check_drv", side_effect=lambda result, _: result),
-        ):
+        with patch.object(vmm.torch.cuda, "device", return_value=nullcontext()):
             pool._release_allocation()
 
-        self.assertIsNone(pool._pool_pointer)
-        self.assertIsNone(pool._allocation_handle)
-        self.assertEqual(driver.cuMemUnmap.call_count, 1)
-        self.assertEqual(driver.cuMemAddressFree.call_count, 2)
-        self.assertEqual(driver.cuMemRelease.call_count, 1)
+        self.assertIsNone(pool._allocation)
+        self.assertEqual(allocation.close.call_count, 2)
 
     def test_model_class_controls_cuda_vmm_opt_in(self):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager

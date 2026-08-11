@@ -199,6 +199,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # explicit model ID override (e.g. "Qwen-Image")
     model_id: str | None = None
 
+    # served model name exposed via /v1/models and generation responses
+    served_model_name: str | None = None
+
     # Model backend (sglang native or diffusers)
     backend: Backend = Backend.AUTO
 
@@ -299,6 +302,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
+    # trade checkpoint-loading peak memory for faster ordinary DiT startup
+    direct_gpu_weight_loading: bool = False
     # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
@@ -490,6 +495,8 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
+        if self.served_model_name is None:
+            self.served_model_name = self.model_id or self.model_path
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
@@ -508,6 +515,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_scheduler_rpc_timeout()
         self._validate_pipeline()
         self._validate_offload()
+        self._validate_direct_gpu_weight_loading()
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
@@ -1426,6 +1434,15 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=ServerArgs.served_model_name,
+            help=(
+                "Override the model name exposed by /v1/models and used in generation "
+                "responses. Defaults to --model-id if set, otherwise --model-path."
+            ),
+        )
+        parser.add_argument(
             "--pipeline",
             "--pipeline-class-name",
             dest="pipeline_class_name",
@@ -1770,6 +1787,15 @@ class ServerArgs(DisaggServerArgsMixin):
             "--dit-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
+        )
+        parser.add_argument(
+            "--direct-gpu-weight-loading",
+            action=StoreBoolean,
+            default=ServerArgs.direct_gpu_weight_loading,
+            help="Load the full unquantized DiT checkpoint state dict directly "
+            "onto GPU before assigning model parameters. This may reduce startup "
+            "time depending on the model, but temporarily requires checkpoint "
+            "weights and model weights to coexist on GPU. Disabled by default.",
         )
         parser.add_argument(
             "--dit-layerwise-offload",
@@ -2633,6 +2659,23 @@ class ServerArgs(DisaggServerArgsMixin):
                     "This reduces peak GPU memory and can increase latency; use "
                     "--performance-mode speed for GPU-resident defaults when memory allows."
                 )
+
+    def _validate_direct_gpu_weight_loading(self) -> None:
+        if not self.direct_gpu_weight_loading:
+            return
+        if not current_platform.is_cuda():
+            raise ValueError("--direct-gpu-weight-loading requires CUDA")
+        if self.dit_cpu_offload or self.is_dit_layerwise_offload_selected:
+            raise ValueError(
+                "--direct-gpu-weight-loading requires a GPU-resident DiT; disable "
+                "DiT CPU and layerwise offload"
+            )
+        if self.use_fsdp_inference:
+            raise ValueError(
+                "--direct-gpu-weight-loading does not support FSDP inference"
+            )
+        if self.tp_size != 1:
+            raise ValueError("--direct-gpu-weight-loading requires --tp-size 1")
 
     def _validate_parallelism(self):
         if self.kv_gather_degree < 1:
