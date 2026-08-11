@@ -1,3 +1,5 @@
+import torch
+
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -59,7 +61,10 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
         if not isinstance(stage, GlmImageAR):
             raise RuntimeError("GLM-Image AR stage is not available for prefetch")
         return stage.prepare_external_ar_group(
-            batches, server_args, require_single_output=True
+            batches,
+            server_args,
+            require_single_output=True,
+            device=torch.device("cpu"),
         )
 
 

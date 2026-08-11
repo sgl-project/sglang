@@ -591,6 +591,7 @@ class GlmImageAR(PipelineStage):
         server_args: ServerArgs,
         *,
         require_single_output: bool = False,
+        device: Optional[torch.device] = None,
     ) -> list[Req]:
         if not self.can_prepare_external_ar_group(
             batches, server_args, require_single_output=require_single_output
@@ -619,7 +620,7 @@ class GlmImageAR(PipelineStage):
             height=height,
             width=width,
             server_args=server_args,
-            device=torch.device("cpu"),
+            device=device,
         )
         duration = time.time() - start_time
         logger.info(

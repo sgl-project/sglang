@@ -479,9 +479,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 else "sequential_prefetch"
             )
         self._record_batch_dispatch_metrics(
-            batch_size=batch_len,
+            request_count=batch_len,
+            output_count=sum(
+                max(1, int(req.num_outputs_per_prompt or 1)) for req in compatible_reqs
+            ),
             queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
-            effective_max_batch_size=self._batch_admission.max_admissible_batch_size(
+            effective_max_output_count=self._batch_admission.max_admissible_batch_size(
                 compatible_reqs[0]
             ),
             reject_reasons=reject_reasons,
@@ -507,6 +510,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self.waiting_queue.extend((identity, req, now) for identity, req in new_reqs)
 
     def _maybe_start_sequential_prefetch(self) -> None:
+        if not self._sequential_prefetch_enabled():
+            return
         if self._sequential_prefetch is not None:
             return
         if self.worker.is_sleeping():
