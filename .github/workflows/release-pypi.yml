@@ -87,8 +87,79 @@ jobs:
           name: wheel-py${{ matrix.python-version }}-${{ matrix.arch }}
           path: python/dist/*.whl
 
+  build-windows-arm64:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      fail-fast: false
+      matrix:
+        # CPython 3.10 does not publish a native Windows ARM64 distribution.
+        python-version: ["3.11.8", "3.12.10", "3.13"]
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: "recursive"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: arm64
+
+      - name: Verify native toolchain
+        shell: pwsh
+        run: |
+          python -c "import platform, sysconfig; assert platform.machine().lower() == 'arm64'; assert sysconfig.get_platform() == 'win-arm64'"
+          rustc -vV
+          cargo --version
+          clang --version
+
+      - name: Set release version
+        if: inputs.version != ''
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $version = $env:RELEASE_VERSION -replace '^v', ''
+          "SETUPTOOLS_SCM_PRETEND_VERSION=$version" >> $env:GITHUB_ENV
+          Write-Output "Pinning wheel version to $version"
+
+      - name: Install Python build frontend
+        run: python -m pip install build
+
+      - name: Build Windows ARM64 wheel
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath`) do set "VS_PATH=%%i"
+          if not defined VS_PATH (
+            echo Visual Studio ARM64 build tools were not found.
+            exit /b 1
+          )
+          set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvarsall.bat" arm64
+          copy /Y README.md python\README.md
+          copy /Y LICENSE python\LICENSE
+          python -m build --wheel --outdir dist python
+
+      - name: Verify wheel
+        shell: pwsh
+        run: |
+          python scripts/ci/utils/verify_windows_arm64_wheel.py dist
+          python -m pip install twine
+          $wheel = Get-ChildItem dist\*.whl | Select-Object -First 1
+          python -m twine check $wheel.FullName
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python-version }}-windows-arm64
+          path: dist/*.whl
+
   publish:
-    needs: build
+    needs: [build, build-windows-arm64]
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     environment: "prod"

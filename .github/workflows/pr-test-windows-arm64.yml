@@ -8,6 +8,8 @@ on:
       - "rust/Cargo.lock"
       - "rust/Cargo.toml"
       - "rust/sglang-mm/**"
+      - "scripts/ci/utils/verify_windows_arm64_wheel.py"
+      - ".github/workflows/release-pypi.yml"
       - ".github/workflows/pr-test-windows-arm64.yml"
   pull_request:
     branches: [main]
@@ -17,6 +19,8 @@ on:
       - "rust/Cargo.lock"
       - "rust/Cargo.toml"
       - "rust/sglang-mm/**"
+      - "scripts/ci/utils/verify_windows_arm64_wheel.py"
+      - ".github/workflows/release-pypi.yml"
       - ".github/workflows/pr-test-windows-arm64.yml"
   workflow_dispatch:
 
@@ -32,16 +36,21 @@ jobs:
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: windows-11-arm
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # CPython 3.10 does not publish a native Windows ARM64 distribution.
+        python-version: ["3.11.8", "3.12.10", "3.13"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
           architecture: arm64
 
       - name: Verify native toolchain
@@ -70,63 +79,10 @@ jobs:
           python -m build --wheel --outdir dist python
 
       - name: Verify wheel contents
-        shell: pwsh
-        run: |
-          $wheels = @(Get-ChildItem dist\*.whl)
-          if ($wheels.Count -ne 1) {
-            throw "Expected one wheel, found $($wheels.Count)."
-          }
-          if ($wheels[0].Name -notmatch "-cp313-cp313-win_arm64\.whl$") {
-            throw "Unexpected Windows ARM64 wheel tag: $($wheels[0].Name)"
-          }
-          $env:SGLANG_WHEEL = $wheels[0].FullName
-          @'
-          import os
-          import zipfile
-          from email.parser import Parser
-
-          with zipfile.ZipFile(os.environ["SGLANG_WHEEL"]) as wheel:
-              names = wheel.namelist()
-              metadata_name = next(
-                  name for name in names if name.endswith(".dist-info/METADATA")
-              )
-              metadata = Parser().parsestr(
-                  wheel.read(metadata_name).decode("utf-8")
-              )
-
-          multimodal = [
-              name
-              for name in names
-              if name.startswith("sglang/srt/multimodal/_core")
-              and name.endswith(".pyd")
-          ]
-          unexpected = [
-              name
-              for name in names
-              if (
-                  name.startswith("sglang/srt/grpc/_core")
-                  or name.startswith("sglang/srt/server/_core")
-              )
-              and name.endswith(".pyd")
-          ]
-          if len(multimodal) != 1:
-              raise SystemExit(
-                  f"expected one multimodal extension, found {multimodal}"
-              )
-          if unexpected:
-              raise SystemExit(
-                  f"found unsupported Windows extension modules: {unexpected}"
-              )
-          version = metadata["Version"]
-          if version.startswith("0.0.0"):
-              raise SystemExit(
-                  f"setuptools-scm fell back to an invalid version: {version}"
-              )
-          print(f"verified {os.environ['SGLANG_WHEEL']} ({version})")
-          '@ | python -
+        run: python scripts/ci/utils/verify_windows_arm64_wheel.py dist
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: sglang-wheel-python3.13-windows-arm64
+          name: sglang-wheel-python${{ matrix.python-version }}-windows-arm64
           path: dist/*.whl
