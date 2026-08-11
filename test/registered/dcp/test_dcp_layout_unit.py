@@ -113,6 +113,9 @@ class TestGetDcpLens(CustomTestCase):
 
         group = FakeDcpGroup()
         backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        # GQA, not MLA: the K/V heads reaching the kernel are the DCP-replicated
+        # set, so this rank has to pick the slice its Q shard maps to.
+        backend.use_mla = False
         backend.forward_metadata = SimpleNamespace(
             custom_mask=None,
             kv_indptr=torch.zeros(2, dtype=torch.int32),

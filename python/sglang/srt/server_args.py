@@ -3886,27 +3886,17 @@ class ServerArgs:
         if self.dcp_size > 1 and is_hip():
             from sglang.srt.arg_groups.overrides import attention_backends_of
 
-            prefill_backend, decode_backend = attention_backends_of(self)
+            _, decode_backend = attention_backends_of(self)
             if decode_backend == "aiter":
-                self._validate_aiter_mla_dcp(prefill_backend=prefill_backend)
+                self._validate_aiter_mla_dcp()
 
-    def _validate_aiter_mla_dcp(self, *, prefill_backend: Optional[str] = None):
+    def _validate_aiter_mla_dcp(self):
         """Validate aiter MLA decode-context-parallel (--dcp-size > 1)."""
         from sglang.srt.configs.model_config import AttentionArch
 
         model_config = self.get_model_config()
         if model_config.attention_arch != AttentionArch.MLA:
             return
-
-        # TEMPORARY, lifted by the triton-MLA-DCP fix later in this series:
-        # that path double-filters its MLA KV writes under DCP, silently.
-        if prefill_backend == "triton":
-            raise ValueError(
-                "--prefill-attention-backend triton is not yet supported "
-                "together with the aiter MLA DCP decode path (--dcp-size > 1): "
-                "the triton extend path corrupts its MLA KV writes under DCP. "
-                "Use the default aiter prefill backend."
-            )
 
         if "fp8" in (self.kv_cache_dtype or "") and not (
             envs.SGLANG_EXPERIMENTAL_AITER_DCP_FP8.get()
