@@ -3586,7 +3586,6 @@ class Scheduler(
 
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
-
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
