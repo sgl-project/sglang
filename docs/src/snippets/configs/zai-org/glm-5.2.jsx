@@ -998,9 +998,8 @@ sgl-eval run aime25 \\
       ],
     },
     // ====================================================================
-    // AMD MI355X + MXFP4 — amd/GLM-5.2-MXFP4 (Quark, gfx950-only; MXFP4 is not
-    // supported on MI300X/MI325X/gfx942). TP4: the 4-bit MoE weights fit a
-    // 4-GPU slice, mirroring the amd/GLM-5.1-MXFP4 MI355X recipe (same DSA
+    // AMD MI355X + MXFP4 — amd/GLM-5.2-MXFP4 (Quark). TP4: the 4-bit MoE
+    // weights fit a 4-GPU slice, mirroring the amd/GLM-5.1-MXFP4 MI355X recipe (same DSA
     // architecture family) — --trust-remote-code (Quark custom quant config)
     // and --kv-cache-dtype fp8_e4m3 both come from that precedent. Pinned to a
     // newer image (v0.5.16, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
