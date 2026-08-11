@@ -38,46 +38,6 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 
 
-@triton.jit
-def _dcp_ragged_to_block_table_kernel(
-    kv_indices_ptr,  # [total_local_kv] flat, this-rank round-robin shard
-    kv_indptr_ptr,  # [bs + 1] per-request offsets into kv_indices
-    dest_ptr,  # [bs, MAX_COLS] block table (physical slot per (req, pos))
-    dest_stride0: tl.int64,
-    MAX_COLS: tl.constexpr,
-):
-    req = tl.program_id(0)
-    start = tl.load(kv_indptr_ptr + req)
-    n = tl.load(kv_indptr_ptr + req + 1) - start
-    cols = tl.arange(0, MAX_COLS)
-    mask = cols < n
-    vals = tl.load(kv_indices_ptr + start + cols, mask=mask, other=0)
-    tl.store(dest_ptr + req * dest_stride0 + cols, vals, mask=mask)
-
-
-def build_dcp_block_table(
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    bs: int,
-    max_cols: int,
-):
-    """Scatter a ragged (kv_indptr, kv_indices) shard into a 2D block table
-    ``[bs, max_cols]`` for aiter's ``mla_decode_fwd`` (block_size == 1,
-    so each entry is a physical KV slot). Unused tail columns stay 0 and are
-    never read (bounded by ``seqused_k``)."""
-    block_tables = torch.zeros(
-        bs, max_cols, dtype=torch.int32, device=kv_indices.device
-    )
-    _dcp_ragged_to_block_table_kernel[(bs,)](
-        kv_indices,
-        kv_indptr,
-        block_tables,
-        block_tables.stride(0),
-        MAX_COLS=triton.next_power_of_2(max_cols),
-    )
-    return block_tables
-
-
 def build_dcp_page_table(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -229,6 +189,29 @@ def _dcp_mla_reduce_kernel(
     head = tl.program_id(1)
 
     seq_len = tl.load(seq_lens_ptr + tok)
+
+    # A rank owns no committed KV for a request whose prefix is shorter than the
+    # rank index, so an all-zero shard length is a normal input here (the planner
+    # clamps local_kv_lens to min 0, not min 1). Emit the identity element of the
+    # LSE merge -- out = 0 with lse = -inf, which lse_combine_base2 and
+    # cp_lse_ag_out_rs_mla both weight to zero.
+    #
+    # This has to be an early return, not a mask on the result: with seq_len 0
+    # tiles_per_segment below is 0, so act_num_segments divides by zero, and the
+    # NaNs that follow cannot be cleaned up downstream -- the merge zeroes the
+    # WEIGHT via nan_to_num, but NaN * 0 is still NaN, so a single empty shard
+    # poisons the merged output of an otherwise healthy batch.
+    if seq_len == 0:
+        tl.store(
+            out_ptr
+            + tok * out_stride0
+            + head * out_stride1
+            + tl.arange(0, KV_LORA_RANK),
+            tl.zeros([KV_LORA_RANK], dtype=out_ptr.type.element_ty),
+        )
+        tl.store(lse_ptr + tok * lse_stride0 + head, float("-inf"))
+        return
+
     # aiter picks the same segment count regardless of seq_len; only the first
     # act_num_segments hold valid data (the rest of the empty() buffer is garbage).
     tiles_per_segment = tl.cdiv(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
