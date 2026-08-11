@@ -145,6 +145,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
+    resolve_image_processor_backend,
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
@@ -3561,34 +3562,15 @@ async def print_exception_wrapper(func):
 
 
 def get_processor_wrapper(server_args):
-    try:
-        processor = get_processor(
-            server_args.tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            use_fast=not server_args.disable_fast_image_processor,
-            tokenizer_backend=server_args.tokenizer_backend,
-            model_name=server_args.model_path,
-        )
-    except ValueError as e:
-        error_message = str(e)
-        if "does not have a slow version" in error_message:
-            logger.info(
-                f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
-            )
-            processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=True,
-                tokenizer_backend=server_args.tokenizer_backend,
-                model_name=server_args.model_path,
-            )
-        else:
-            raise e
-    return processor
+    return get_processor(
+        server_args.tokenizer_path,
+        tokenizer_mode=server_args.tokenizer_mode,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        image_processor_backend=resolve_image_processor_backend(server_args),
+        tokenizer_backend=server_args.tokenizer_backend,
+        model_name=server_args.model_path,
+    )
 
 
 def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:

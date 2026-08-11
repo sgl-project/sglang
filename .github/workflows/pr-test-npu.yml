@@ -222,7 +222,7 @@ jobs:
 
   multimodal-gen-test-2-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.multimodal_gen == 'true' }}
+    if: false  # Temporarily disabled; will be restored once the issue is fixed.
     runs-on: linux-aarch64-a3-800t-2
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}

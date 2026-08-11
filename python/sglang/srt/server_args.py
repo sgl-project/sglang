@@ -2781,6 +2781,12 @@ class ServerArgs:
         "Enable global multimodal embedding cache to skip redundant ViT inference.",
         NS("mm"),
     ] = False
+    image_processor_backend: A[
+        Literal["auto", "torchvision", "pil"],
+        "Image processor backend. 'auto' lets Transformers select the best "
+        "available backend.",
+        NS("mm"),
+    ] = "auto"
     mm_global_cache_backend: A[
         str,
         Arg(
@@ -2791,7 +2797,9 @@ class ServerArgs:
         NS("mm"),
     ] = "mooncake"
     disable_fast_image_processor: A[
-        bool, "Adopt base image processor instead of fast image processor.", NS("mm")
+        bool,
+        "Deprecated. Use --image-processor-backend=pil instead.",
+        NS("mm"),
     ] = False
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
@@ -4016,6 +4024,18 @@ class ServerArgs:
                     )
 
     def _handle_deprecated_args(self):
+        if self.disable_fast_image_processor:
+            if self.image_processor_backend not in {"auto", "pil"}:
+                raise ValueError(
+                    "--disable-fast-image-processor conflicts with "
+                    f"--image-processor-backend={self.image_processor_backend}."
+                )
+            logger.warning(
+                "--disable-fast-image-processor is deprecated; use "
+                "--image-processor-backend=pil instead."
+            )
+            self.image_processor_backend = "pil"
+
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
         if self.tool_call_parser in deprecated_tool_call_parsers:
