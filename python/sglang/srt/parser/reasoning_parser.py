@@ -144,24 +144,14 @@ class BaseReasoningFormatDetector:
             # Assume reasoning was truncated before end token
             return StreamingParseResult(reasoning_text=processed_text)
 
-        # Extract reasoning content. Alternate rather than split once, or a later
-        # reasoning block and its tokens would be left sitting in normal_text.
+        # Extract reasoning content
         if self.think_end_token in processed_text:
-            reasoning_parts = []
-            normal_parts = []
-            rest = processed_text
-            while self.think_end_token in rest:
-                block, rest = rest.split(self.think_end_token, 1)
-                reasoning_parts.append(block)
-                if think_start_text not in rest:
-                    break
-                before, rest = rest.split(think_start_text, 1)
-                normal_parts.append(before)
-            normal_parts.append(rest)
+            splits = processed_text.split(self.think_end_token, maxsplit=1)
+            reasoning_text = splits[0]
+            normal_text = splits[1]
 
             return StreamingParseResult(
-                normal_text="".join(normal_parts),
-                reasoning_text="".join(reasoning_parts),
+                normal_text=normal_text, reasoning_text=reasoning_text
             )
         else:
             # think_end_token is in self.previous_content for continue_final_message=True case
@@ -203,18 +193,7 @@ class BaseReasoningFormatDetector:
 
         # Strip `<think>` token if present
         if not self.stripped_think_start and think_start_text in current_text:
-            start_idx = current_text.find(think_start_text)
-            if start_idx > 0:
-                # Emit what precedes the token and re-enter with it at the front,
-                # so a `replace` can never pull that text into reasoning.
-                leading = current_text[:start_idx]
-                self._buffer = current_text[start_idx:]
-                nested = self._parse_streaming_increment_impl("")
-                return StreamingParseResult(
-                    normal_text=leading + nested.normal_text,
-                    reasoning_text=nested.reasoning_text,
-                )
-            current_text = current_text[len(think_start_text) :]
+            current_text = current_text.replace(think_start_text, "", 1)
             # Write back, or stream_reasoning=False carries the token into finish().
             self._buffer = current_text
             self.stripped_think_start = True
@@ -225,20 +204,14 @@ class BaseReasoningFormatDetector:
             end_idx = current_text.find(self.think_end_token)
 
             reasoning_text = current_text[:end_idx]
-            remainder = current_text[end_idx + len(self.think_end_token) :]
 
-            self._buffer = remainder
+            self._buffer = ""
             self._in_reasoning = False
-            # Re-armed so a further reasoning block in the remainder is still seen.
-            self.stripped_think_start = False
-            if remainder:
-                nested = self._parse_streaming_increment_impl("")
-                return StreamingParseResult(
-                    normal_text=nested.normal_text,
-                    reasoning_text=reasoning_text + nested.reasoning_text,
-                )
+            normal_text = current_text[end_idx + len(self.think_end_token) :]
 
-            return StreamingParseResult(reasoning_text=reasoning_text)
+            return StreamingParseResult(
+                normal_text=normal_text, reasoning_text=reasoning_text
+            )
 
         # Continue with reasoning content
         if self._in_reasoning:
@@ -267,6 +240,13 @@ class BaseReasoningFormatDetector:
                             current_text, self.tool_start_token
                         ),
                     )
+                if not self.stripped_think_start:
+                    # force_reasoning starts inside the block without having seen
+                    # the opening token, which can still arrive split.
+                    holdback = max(
+                        holdback,
+                        self._ends_with_partial_token(current_text, think_start_text),
+                    )
                 self._buffer = current_text[len(current_text) - holdback :]
                 return StreamingParseResult(
                     reasoning_text=current_text[: len(current_text) - holdback]
@@ -274,18 +254,10 @@ class BaseReasoningFormatDetector:
             else:
                 return StreamingParseResult()
 
-        # If we're not in a reasoning block return as normal text, holding back a
-        # trailing partial think_start so a later reasoning block is still seen.
+        # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
-            holdback = (
-                0
-                if self.stripped_think_start
-                else self._ends_with_partial_token(current_text, think_start_text)
-            )
-            self._buffer = current_text[len(current_text) - holdback :]
-            return StreamingParseResult(
-                normal_text=current_text[: len(current_text) - holdback]
-            )
+            self._buffer = ""
+            return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
 
@@ -308,10 +280,7 @@ class BaseReasoningFormatDetector:
         before the end token (e.g. max_tokens cut it short), instead of dropping it.
         force_nonempty_content emits it as normal_text, else as reasoning_text."""
         if not self._in_reasoning:
-            # A held-back partial think_start that never completed is normal text.
-            leftover = self._buffer
-            self._buffer = ""
-            return StreamingParseResult(normal_text=leftover)
+            return StreamingParseResult()
 
         # Defensive: subclasses that fill _buffer themselves may not have stripped
         # the opening think token that _parse_streaming_increment_impl removes.

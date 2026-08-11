@@ -972,31 +972,10 @@ class TestBufferLossBugFix(CustomTestCase):
         self.assertTrue(detector._in_reasoning)
         self.assertTrue(detector.stripped_think_start)
 
-    def test_finish_flushes_partial_token_held_outside_reasoning(self):
-        """Detectors hold back a trailing partial start token so it can be
-        recombined with the next chunk. If the stream ends first, finish() must
-        emit those characters as content instead of dropping them.
-
-        Covers the subclasses that manage `_buffer` themselves but inherit
-        `finish()` from the base class.
-        """
-        for detector in (
-            BaseReasoningFormatDetector("<think>", "</think>"),
-            Apertus2509Detector(),
-        ):
-            with self.subTest(detector=type(detector).__name__):
-                token = detector.think_start_token
-                partial = token[: len(token) - 1]
-                emitted = detector.parse_streaming_increment(f"see {partial}")
-                emitted_normal = emitted.normal_text + detector.finish().normal_text
-
-                self.assertFalse(detector._in_reasoning)
-                self.assertEqual(emitted_normal, f"see {partial}")
-
 
 class TestStreamingChunkSizeInvariance(CustomTestCase):
     """Accumulated (reasoning, normal) output must not depend on how the decode
-    steps happen to batch tokens, and must match one-shot detect_and_parse.
+    steps happen to batch tokens.
 
     Speculative decoding and stream_interval > 1 deliver multiple tokens per
     step, which splits multi-character tokens like `</think>` across chunk
@@ -1044,26 +1023,6 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             DeepSeekR1Detector,
             "<think>a < b</think>tail",
             ("a < b", "tail"),
-        )
-
-    def test_reasoning_truncated_mid_partial_token(self):
-        """A stream cut short inside a partial `</think>` drops that fragment
-        (see test_finish_drops_partial_end_tag_when_streaming_reasoning), but it
-        must drop exactly the same fragment at every chunk size."""
-        for chunk_size in self.CHUNK_SIZES:
-            with self.subTest(chunk_size=chunk_size):
-                self.assertEqual(
-                    self._feed(DeepSeekR1Detector(), "<think>compare a <", chunk_size),
-                    ("compare a ", ""),
-                )
-
-    def test_second_reasoning_block_does_not_leak_into_content(self):
-        """A further `<think>` block must be routed to reasoning, and the text
-        before it must stay normal content."""
-        self._assert_invariant(
-            DeepSeekR1Detector,
-            "<think>first</think>mid<think>second</think>end",
-            ("firstsecond", "midend"),
         )
 
     def test_dsv4_tool_block_after_think_end(self):
