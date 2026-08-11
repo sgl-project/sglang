@@ -357,8 +357,11 @@ def create_grammar_backend(
                 ) from e
             logger.warning(
                 f"Grammar backend disabled because tokenizer is not supported by XGrammar: {e}. "
-                "Falling back to grammar_backend='none'. "
-                "Structured outputs (JSON schema, regex, EBNF) will not be available."
+                "Falling back to grammar_backend='none'. Requests using json_schema, "
+                "regex, ebnf or structural_tag will be rejected with HTTP 400, and tool "
+                "calls that need a constraint (tool_choice='required'/named, or 'auto' "
+                "with strict tools) will fail the same way. Try --grammar-backend "
+                "llguidance or --grammar-backend outlines."
             )
             get_context().override("grammar.import_fallback", grammar_backend="none")
             return None

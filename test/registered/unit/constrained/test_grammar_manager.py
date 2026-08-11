@@ -233,19 +233,53 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("bad schema", req.set_finish_with_abort.call_args[0][0])
 
-    def test_no_backend_aborts(self):
-        """No grammar backend should abort request."""
-        scheduler = _make_scheduler()
-        scheduler.server_args.skip_tokenizer_init = True
-        mgr = GrammarManager(scheduler)
+    def _make_no_backend_mgr(self):
+        """Manager with no grammar backend, built with skip-tokenizer-init so that
+        backend creation is bypassed; callers then set the field under test."""
+        mgr = GrammarManager(_make_scheduler(skip_tokenizer=True))
         mgr.grammar_backend = None
+        return mgr
 
+    def _abort_message(self, mgr, overrides=()):
+        """Run a json_schema request through mgr and return the abort message."""
         req = _make_req(json_schema='{"type": "object"}')
-        result = mgr.process_req_with_grammar(req)
+        with patch("sglang.srt.constrained.grammar_manager.get_context") as get_context:
+            get_context.return_value.overrides_log.return_value = list(overrides)
+            result = mgr.process_req_with_grammar(req)
 
         self.assertFalse(result)
         req.set_finish_with_abort.assert_called_once()
-        self.assertIn("not supported", req.set_finish_with_abort.call_args[0][0])
+        return req.set_finish_with_abort.call_args[0][0]
+
+    def test_no_backend_aborts_on_skip_tokenizer_init(self):
+        """No grammar backend should abort, naming skip-tokenizer-init."""
+        self.assertIn(
+            "--skip-tokenizer-init", self._abort_message(self._make_no_backend_mgr())
+        )
+
+    def test_no_backend_aborts_on_explicit_none(self):
+        """An operator-specified grammar_backend='none' keeps the original message."""
+        mgr = self._make_no_backend_mgr()
+        mgr.server_args.skip_tokenizer_init = False
+        mgr.server_args.grammar_backend = "none"
+
+        msg = self._abort_message(mgr)
+
+        self.assertIn("not supported", msg)
+        self.assertIn("--grammar-backend none", msg)
+
+    def test_no_backend_aborts_on_import_fallback(self):
+        """A backend disabled at startup must not be reported as a launch flag."""
+        mgr = self._make_no_backend_mgr()
+        mgr.server_args.skip_tokenizer_init = False
+        mgr.server_args.grammar_backend = "xgrammar"
+
+        msg = self._abort_message(
+            mgr, overrides=[("grammar.import_fallback", {"grammar_backend": "none"})]
+        )
+
+        self.assertIn("failed to initialize", msg)
+        self.assertNotIn("--grammar-backend none", msg)
 
     def test_json_takes_priority_over_other_constraints(self):
         """When json_schema is set, it should be used regardless of other fields."""
