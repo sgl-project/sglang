@@ -44,8 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_dflash_attention_type(config) -> AttentionType:
-    """DFLASH drafts attend over the whole draft block, so they are
-    bidirectional unless the checkpoint declares itself causal."""
+    """Bidirectional over the draft block unless the checkpoint says causal."""
     text_config = getattr(config, "text_config", None) or config
     return (
         AttentionType.DECODER
@@ -70,8 +69,7 @@ def _get_dflash_layer_attention_params(
     if layer_type == "full_attention":
         return -1, _get_dflash_attention_type(config)
     if layer_type == "sliding_attention":
-        # Windowing is orthogonal to causality: the layer masks only
-        # p1 - p0 >= sliding_window.
+        # Windowing is orthogonal to causality (mask is p1 - p0 >= window).
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
         return sliding_window_size, _get_dflash_attention_type(config)

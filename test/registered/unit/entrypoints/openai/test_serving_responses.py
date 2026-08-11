@@ -380,9 +380,8 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
     def test_default_parser_keeps_skip_special_tokens(self):
         serving = make_serving()
         params = self._create_responses_sampling_params(serving)
-        # ResponsesRequest has no skip_special_tokens of its own, so the chat
-        # request's True is a synthesized default, not user intent -- leave the
-        # key unset instead of overriding --preferred-sampling-params with it.
+        # The chat request's True is a synthesized default (ResponsesRequest has
+        # no such field), so leave it unset for --preferred-sampling-params.
         self.assertNotIn("skip_special_tokens", params)
 
 

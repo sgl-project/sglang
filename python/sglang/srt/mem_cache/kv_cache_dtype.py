@@ -95,8 +95,7 @@ def configure_kv_cache_dtype(
             model_dtype,
         )
         kv_cache_dtype = model_dtype
-        # Unquantized pool now, and "auto" is the tag for that; attention
-        # backends gate their descale paths on it (kv_cache_dtype_str).
+        # "auto" is the tag for an unquantized pool; backends gate descale on it.
         resolved_kv_cache_dtype = "auto"
 
     return resolved_kv_cache_dtype, kv_cache_dtype
