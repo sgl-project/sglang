@@ -175,10 +175,10 @@ class PrefillBootstrapQueue:
                     f"chunked_prefill_size that is a multiple of page_size "
                     f"({page_size}); got {chunked_prefill_size}."
                 )
-            if self.pp_size > 1:
-                # Staging writer accounting has no pp dimension.
+            if self.pp_size > 1 and self.transfer_backend != TransferBackend.MOONCAKE:
                 raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
+                    "SGLANG_DISAGG_STAGING_BUFFER with pp_size > 1 is only "
+                    "supported by Mooncake."
                 )
             if get_parallel().enable_prefill_context_parallel:
                 # CP rewrites index_slice per rank, breaking the chunk grid.
