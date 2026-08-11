@@ -236,6 +236,18 @@ class TestDeepSeekV4Detector(CustomTestCase):
         self.assertEqual(detector.reasoning_default, "explicit_thinking")
         self.assertTrue(detector.thinks_internally)
 
+    def test_dsml_block_is_routed_out_of_reasoning(self):
+        """Without tool_start_token the DSML block stays in reasoning_content and
+        the tool call detector never sees it."""
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertEqual(detector.tool_start_token, "<｜DSML｜")
+
+        result = detector.parse_streaming_increment(
+            '<think>pick a tool<｜DSML｜tool_calls><｜DSML｜invoke name="s">'
+        )
+        self.assertEqual(result.reasoning_text, "pick a tool")
+        self.assertTrue(result.normal_text.startswith("<｜DSML｜tool_calls>"))
+
 
 class TestInklingDetector(CustomTestCase):
     def test_streaming_routes_blocks_across_all_string_boundaries(self):
@@ -959,6 +971,109 @@ class TestBufferLossBugFix(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertTrue(detector._in_reasoning)
         self.assertTrue(detector.stripped_think_start)
+
+
+class TestStreamingChunkSizeInvariance(CustomTestCase):
+    """Accumulated (reasoning, normal) output must not depend on how the decode
+    steps happen to batch tokens, and must match one-shot detect_and_parse.
+
+    Speculative decoding and stream_interval > 1 deliver multiple tokens per
+    step, which splits multi-character tokens like `</think>` across chunk
+    boundaries.
+    """
+
+    CHUNK_SIZES = [1, 2, 3, 5, 7, 11, 23, 1000]
+    DSML = "｜DSML｜"
+
+    def _feed(self, detector, text, chunk_size):
+        reasoning = normal = ""
+        for i in range(0, len(text), chunk_size):
+            result = detector.parse_streaming_increment(text[i : i + chunk_size])
+            reasoning += result.reasoning_text
+            normal += result.normal_text
+        result = detector.finish()
+        return reasoning + result.reasoning_text, normal + result.normal_text
+
+    def _assert_invariant(self, make_detector, text, expected):
+        for chunk_size in self.CHUNK_SIZES:
+            with self.subTest(chunk_size=chunk_size):
+                self.assertEqual(
+                    self._feed(make_detector(), text, chunk_size), expected
+                )
+        one_shot = make_detector().detect_and_parse(text)
+        self.assertEqual((one_shot.reasoning_text, one_shot.normal_text), expected)
+
+    def test_think_end_split_across_chunks(self):
+        """`</think>` straddling a chunk boundary must still end the block."""
+        self._assert_invariant(
+            DeepSeekR1Detector,
+            "<think>abc reasoning</think>normal text",
+            ("abc reasoning", "normal text"),
+        )
+
+    def test_think_end_split_buffered_mode(self):
+        self._assert_invariant(
+            lambda: DeepSeekR1Detector(stream_reasoning=False),
+            "<think>abc reasoning</think>normal text",
+            ("abc reasoning", "normal text"),
+        )
+
+    def test_literal_angle_bracket_in_reasoning_is_not_swallowed(self):
+        self._assert_invariant(
+            DeepSeekR1Detector,
+            "<think>a < b</think>tail",
+            ("a < b", "tail"),
+        )
+
+    def test_reasoning_truncated_mid_partial_token(self):
+        """A stream cut short inside a partial `</think>` must not drop the
+        held-back characters."""
+        for chunk_size in self.CHUNK_SIZES:
+            with self.subTest(chunk_size=chunk_size):
+                self.assertEqual(
+                    self._feed(DeepSeekR1Detector(), "<think>compare a <", chunk_size),
+                    ("compare a <", ""),
+                )
+
+    def test_second_reasoning_block_does_not_leak_into_content(self):
+        """A further `<think>` block must be routed to reasoning, and the text
+        before it must stay normal content."""
+        self._assert_invariant(
+            DeepSeekR1Detector,
+            "<think>first</think>mid<think>second</think>end",
+            ("firstsecond", "midend"),
+        )
+
+    def test_dsv4_tool_block_after_think_end(self):
+        tool_call = (
+            f"<{self.DSML}tool_calls>"
+            f'<{self.DSML}invoke name="s"></{self.DSML}invoke>'
+            f"</{self.DSML}tool_calls>"
+        )
+        self._assert_invariant(
+            DeepSeekV4Detector,
+            f"<think>my reasoning</think>{tool_call}",
+            ("my reasoning", tool_call),
+        )
+
+    def test_dsv4_tool_block_without_think_end(self):
+        """DSML directly after reasoning must still be routed to normal_text so
+        the tool call detector can see it."""
+        tool_call = (
+            f"<{self.DSML}tool_calls>"
+            f'<{self.DSML}invoke name="s"></{self.DSML}invoke>'
+            f"</{self.DSML}tool_calls>"
+        )
+        for chunk_size in self.CHUNK_SIZES:
+            with self.subTest(chunk_size=chunk_size):
+                self.assertEqual(
+                    self._feed(
+                        DeepSeekV4Detector(),
+                        f"<think>my reasoning{tool_call}",
+                        chunk_size,
+                    ),
+                    ("my reasoning", tool_call),
+                )
 
 
 class TestGptOssDetector(CustomTestCase):

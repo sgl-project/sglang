@@ -2,6 +2,7 @@ import json
 import logging
 import re
 
+from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -179,7 +180,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         parameters[param_name] = _partial_json_loads(
                             param_value, Allow.ALL
                         )[0]
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, MalformedJSON):
                         parameters[param_name] = param_value.strip()
 
         return json.dumps(parameters, ensure_ascii=False)
@@ -199,26 +200,27 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         calls = []
         try:
-            # Extract content between function_calls tags
-            function_calls_match = re.search(
-                self.function_calls_regex,
-                text,
-                re.DOTALL,
-            )
-            if not function_calls_match:
+            # Every tool_calls section, not just the first: a turn can contain
+            # several, and the streaming path already parses all of them.
+            sections = re.findall(self.function_calls_regex, text, re.DOTALL)
+            if not sections:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
-            function_calls_content = function_calls_match.group(1)
-
             # Find all invoke blocks
-            for invoke_match in re.finditer(
-                self.invoke_regex, function_calls_content, re.DOTALL
-            ):
-                func_name, invoke_content, _ = self._unpack_invoke_match(invoke_match)
-                func_args = self._parse_parameters_from_xml(invoke_content)
-                # construct match_result for parse_base_json
-                match_result = {"name": func_name, "parameters": json.loads(func_args)}
-                calls.extend(self.parse_base_json(match_result, tools))
+            for function_calls_content in sections:
+                for invoke_match in re.finditer(
+                    self.invoke_regex, function_calls_content, re.DOTALL
+                ):
+                    func_name, invoke_content, _ = self._unpack_invoke_match(
+                        invoke_match
+                    )
+                    func_args = self._parse_parameters_from_xml(invoke_content)
+                    # construct match_result for parse_base_json
+                    match_result = {
+                        "name": func_name,
+                        "parameters": json.loads(func_args),
+                    }
+                    calls.extend(self.parse_base_json(match_result, tools))
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
@@ -259,6 +261,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
         all_calls: list[ToolCallItem] = []
+        # Prose the model emitted before the first tool call. Only recovered for the
+        # first call; prose between or after tool calls stays buffered because the
+        # DSML guard above never releases a buffer that still holds a marker.
+        preamble = ""
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -280,6 +286,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
+                    call_start = invoke_match.start()
+                    bot_pos = current_text.rfind(self.bot_token, 0, call_start)
+                    if bot_pos != -1:
+                        call_start = bot_pos
+                    # Same trailing-newline handling as detect_and_parse, so the
+                    # two paths agree on normal_text.
+                    preamble = current_text[:call_start].removesuffix("\n\n")
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -355,11 +368,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text=preamble, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            # Drop the buffer so the same bad content is not re-parsed, and
+            # re-emit it verbatim rather than swallowing the turn. The preamble is
+            # still inside current_text unless a completed call advanced past it.
+            self._buffer = ""
+            if not current_text.startswith(preamble):
+                current_text = preamble + current_text
+            return StreamingParseResult(normal_text=current_text, calls=all_calls)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
