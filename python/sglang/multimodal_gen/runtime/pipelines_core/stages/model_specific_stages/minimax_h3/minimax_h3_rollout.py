@@ -54,7 +54,7 @@ def minimax_h3_rollout_update_video_target(
         )
 
         out = video_target.clone()
-        sigma_t = out.new_tensor(1.0 - sigma_curr)
+        sigma_t = out.new_tensor(sigma_curr)
         ratio = out.new_tensor(sigma_next / sigma_curr if sigma_curr != 0.0 else 1.0)
         one_minus_ratio = 1.0 - ratio
         scratch = torch.empty_like(out)
