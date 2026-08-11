@@ -24,6 +24,8 @@ dependencies = [
   "build",
   "compressed-tensors",
   "cuda-python>=13.0",
+  # Transitive dep of flashinfer-python, pinned because 1.6.0rc6 shipped no cp310 linux x86_64 wheel.
+  "cuda-tile==1.6.0rc5",
   "datasets",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "distro",
@@ -33,7 +35,6 @@ dependencies = [
   "flash-attn-4>=4.0.0b18",
   "flashinfer_python[cu13]==0.6.15.post1", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
-  "helion==1.4",
   "humming-kernels[cu13]==0.1.10",
   "interegular",
   "IPython",
