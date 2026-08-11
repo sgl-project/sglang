@@ -12,7 +12,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from typing import Annotated, Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -59,6 +59,8 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 )
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.cache import (
+    CacheLookup,
+    CacheReservation,
     EncoderMediaLookup,
     EncoderPreprocessArtifact,
     MultimodalPreprocessCache,
@@ -433,6 +435,12 @@ class MMEncoder:
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
         self.mm_cache_lock = asyncio.Lock()
+        # Metadata and embedding caches have different eviction policies. This
+        # short-lived map coalesces the work that fills both without retaining
+        # another copy of either result.
+        self.k3_encoder_inflight: dict[str, asyncio.Future] = {}
+        self.k3_encoder_inflight_lock = asyncio.Lock()
+        self.k3_encoder_cache_generation = 0
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
@@ -533,6 +541,13 @@ class MMEncoder:
         logger.info(f"rank {rank} init finish ")
 
     def clear_mm_caches(self) -> None:
+        self.k3_encoder_cache_generation += 1
+        error = InternalError("K3 encoder cache was flushed during preprocessing")
+        for future in self.k3_encoder_inflight.values():
+            if not future.done():
+                future.set_exception(error)
+                future.exception()
+        self.k3_encoder_inflight.clear()
         self.mm_preprocess_cache.clear()
         self.mm_cache.clear()
 
@@ -1281,33 +1296,78 @@ class MMEncoder:
             prepared_mm_feature = None
             prepared_index_map = None
             if metadata_miss_indices:
-                processor_media = await self._materialize_k3_encoder_media(
-                    lookups, metadata_miss_indices
-                )
-                (
-                    prepared_mm_inputs,
-                    prepared_get_feature_fn,
-                ) = await self._process_mm_items(processor_media, modality)
-                prepared_grid_thw = _get_mm_grid_dim(
-                    prepared_mm_inputs, modality, self.model_type
-                )
-                prepared_mm_feature = _convert(
-                    _get_mm_feature(prepared_mm_inputs, modality)
-                )
-                prepared_artifacts = self._store_k3_encoder_artifacts(
-                    [lookups[index] for index in metadata_miss_indices],
-                    prepared_mm_inputs,
-                    prepared_mm_feature,
-                    prepared_grid_thw,
-                )
-                for index, artifact in zip(metadata_miss_indices, prepared_artifacts):
-                    cached_artifacts[index] = artifact
-                prepared_index_map = {
-                    request_index: prepared_index
-                    for prepared_index, request_index in enumerate(
-                        metadata_miss_indices
+                first_index_by_key = {}
+                for index in metadata_miss_indices:
+                    first_index_by_key.setdefault(lookups[index].artifact_key, index)
+                reservations = dict(
+                    zip(
+                        first_index_by_key,
+                        self.mm_preprocess_cache.reserve_many(list(first_index_by_key)),
                     )
-                }
+                )
+                owner_indices = [
+                    first_index_by_key[key]
+                    for key, reservation in reservations.items()
+                    if isinstance(reservation, CacheReservation) and reservation.owner
+                ]
+                try:
+                    if owner_indices:
+                        processor_media = await self._materialize_k3_encoder_media(
+                            lookups, owner_indices
+                        )
+                        (
+                            prepared_mm_inputs,
+                            prepared_get_feature_fn,
+                        ) = await self._process_mm_items(processor_media, modality)
+                        prepared_grid_thw = _get_mm_grid_dim(
+                            prepared_mm_inputs, modality, self.model_type
+                        )
+                        prepared_mm_feature = _convert(
+                            _get_mm_feature(prepared_mm_inputs, modality)
+                        )
+                        prepared_artifacts = self._store_k3_encoder_artifacts(
+                            [lookups[index] for index in owner_indices],
+                            prepared_mm_inputs,
+                            prepared_mm_feature,
+                            prepared_grid_thw,
+                            store=False,
+                        )
+                        for index, artifact in zip(owner_indices, prepared_artifacts):
+                            reservation = reservations[artifact.artifact_key]
+                            self.mm_preprocess_cache.fulfill(reservation, artifact)
+                            cached_artifacts[index] = artifact
+                        prepared_index_map = {
+                            request_index: prepared_index
+                            for prepared_index, request_index in enumerate(
+                                owner_indices
+                            )
+                        }
+
+                    resolved_by_key = {}
+                    for key, reservation in reservations.items():
+                        if isinstance(reservation, CacheLookup):
+                            resolved_by_key[key] = reservation.value
+                        elif reservation.owner:
+                            resolved_by_key[key] = cached_artifacts[
+                                first_index_by_key[key]
+                            ]
+                        else:
+                            resolved_by_key[key] = await self.mm_preprocess_cache.wait(
+                                reservation
+                            )
+                    for index in metadata_miss_indices:
+                        artifact = resolved_by_key[lookups[index].artifact_key]
+                        cached_artifacts[index] = artifact
+                        lookups[index] = replace(lookups[index], artifact=artifact)
+                except BaseException as error:
+                    for reservation in reservations.values():
+                        if (
+                            isinstance(reservation, CacheReservation)
+                            and reservation.owner
+                            and not reservation.future.done()
+                        ):
+                            self.mm_preprocess_cache.fail(reservation, error)
+                    raise
 
             if any(artifact is None for artifact in cached_artifacts):
                 raise InternalError("K3 global-cache metadata assembly is incomplete")
@@ -1394,7 +1454,7 @@ class MMEncoder:
         )
 
     def _store_k3_encoder_artifacts(
-        self, lookups, mm_inputs, mm_feature, grid_thw
+        self, lookups, mm_inputs, mm_feature, grid_thw, *, store: bool = True
     ) -> list[EncoderPreprocessArtifact]:
         model_items = self._build_mm_data_items(
             mm_feature,
@@ -1424,7 +1484,8 @@ class MMEncoder:
                 grid_thw=tuple(int(value) for value in grid_thw[index]),
                 original_size=tuple(int(value) for value in original_sizes[index]),
             )
-            self.mm_preprocess_cache.put(lookup.artifact_key, artifact)
+            if store:
+                self.mm_preprocess_cache.put(lookup.artifact_key, artifact)
             artifacts.append(artifact)
         return artifacts
 
@@ -2321,83 +2382,60 @@ class MMEncoder:
             index for index, embedding in enumerate(embeddings) if embedding is None
         ]
         first_index_by_key = {}
-        process_indices = []
         for index in missing_indices:
             key = lookups[index].artifact_key
             if key not in first_index_by_key:
                 first_index_by_key[key] = index
-                process_indices.append(index)
 
-        if process_indices:
-            processor_media = await self._materialize_k3_encoder_media(
-                lookups, process_indices
-            )
-            try:
-                mm_inputs, get_feature_fn = await self._process_mm_items(
-                    processor_media, Modality.IMAGE, log_metrics=log_metrics
+        futures_by_key = {}
+        owner_indices = []
+        loop = asyncio.get_running_loop()
+        async with self.k3_encoder_inflight_lock:
+            cache_generation = self.k3_encoder_cache_generation
+            for key, index in first_index_by_key.items():
+                future = self.k3_encoder_inflight.get(key)
+                if future is None:
+                    future = loop.create_future()
+                    self.k3_encoder_inflight[key] = future
+                    owner_indices.append(index)
+                else:
+                    self.mm_preprocess_cache.record_singleflight_joins(1)
+                futures_by_key[key] = future
+
+        try:
+            if owner_indices:
+                owner_results = await self._encode_k3_singleflight_owners(
+                    lookups,
+                    artifacts,
+                    embeddings,
+                    owner_indices,
+                    cache_generation,
+                    log_metrics,
                 )
-            except NotImplementedError as error:
-                raise InternalError(f"Not implemented error: {error}") from error
-            except Exception as error:
-                raise BadRequestError(f"Failed to process mm items: {error}") from error
-
-            grid_thw = _get_mm_grid_dim(mm_inputs, Modality.IMAGE, self.model_type)
-            mm_feature = _convert(_get_mm_feature(mm_inputs, Modality.IMAGE))
-            model_items = self._build_mm_data_items(
-                mm_feature,
-                mm_inputs,
-                list(range(len(process_indices))),
-                Modality.IMAGE,
-                grid_thw,
-            )
-            for item in model_items:
-                item.set_pad_value()
-
-            forward_start = time.perf_counter()
-            with torch.inference_mode():
-                encoded = get_feature_fn(model_items).cpu()
-            if encoded.ndim != 2:
-                encoded = encoded.reshape(-1, encoded.shape[-1])
-            if encoder_metrics_collector is not None and log_metrics:
-                encoder_metrics_collector.observe_model_forward(
-                    time.perf_counter() - forward_start, modality="image"
-                )
-            encoded_slices = self.slice_embedding(encoded, grid_thw, Modality.IMAGE)
-            original_sizes = mm_inputs["original_image_sizes"]
-
-            for position, request_index in enumerate(process_indices):
-                item = model_items[position]
-                lookup = lookups[request_index]
-                prior = artifacts[request_index]
-                if prior is not None and prior.feature_hash != item.hash:
-                    self.mm_preprocess_cache.pop(lookup.artifact_key)
-                    raise InternalError(
-                        "K3 encoder feature hash changed for identical artifact "
-                        f"{lookup.artifact_key}: "
-                        f"{prior.feature_hash} != {item.hash}"
-                    )
-                artifact = EncoderPreprocessArtifact(
-                    content_digest=lookup.content_digest,
-                    artifact_key=lookup.artifact_key,
-                    feature_hash=item.hash,
-                    grid_thw=tuple(int(value) for value in grid_thw[position]),
-                    original_size=tuple(
-                        int(value) for value in original_sizes[position]
-                    ),
-                )
-                self.mm_preprocess_cache.put(lookup.artifact_key, artifact)
-                artifacts[request_index] = artifact
-                embeddings[request_index] = encoded_slices[position]
-                async with self.mm_cache_lock:
-                    self.mm_cache.set(
-                        artifact.feature_hash,
-                        EmbeddingResult(embedding=encoded_slices[position]),
-                    )
+                async with self.k3_encoder_inflight_lock:
+                    for key, result in owner_results.items():
+                        future = futures_by_key[key]
+                        if not future.done():
+                            future.set_result(result)
+                        if self.k3_encoder_inflight.get(key) is future:
+                            self.k3_encoder_inflight.pop(key)
 
             for request_index in missing_indices:
-                owner_index = first_index_by_key[lookups[request_index].artifact_key]
-                artifacts[request_index] = artifacts[owner_index]
-                embeddings[request_index] = embeddings[owner_index]
+                key = lookups[request_index].artifact_key
+                artifact, embedding = await asyncio.shield(futures_by_key[key])
+                artifacts[request_index] = artifact
+                embeddings[request_index] = embedding
+        except BaseException as error:
+            async with self.k3_encoder_inflight_lock:
+                for request_index in owner_indices:
+                    key = lookups[request_index].artifact_key
+                    future = futures_by_key[key]
+                    if not future.done():
+                        future.set_exception(error)
+                        future.exception()
+                    if self.k3_encoder_inflight.get(key) is future:
+                        self.k3_encoder_inflight.pop(key)
+            raise
 
         if any(artifact is None for artifact in artifacts) or any(
             embedding is None for embedding in embeddings
@@ -2418,7 +2456,7 @@ class MMEncoder:
         }
 
         if encoder_metrics_collector is not None and log_metrics:
-            hit_indices = set(range(len(lookups))) - set(missing_indices)
+            hit_indices = set(range(len(lookups))) - set(owner_indices)
             hit_tokens = sum(
                 resolved_embeddings[index].shape[0] for index in hit_indices
             )
@@ -2436,6 +2474,95 @@ class MMEncoder:
         if self.profiler is not None:
             self.profiler.step()
         return grid_thw, output, aux_data
+
+    async def _encode_k3_singleflight_owners(
+        self,
+        lookups: list[EncoderMediaLookup],
+        artifacts: list[Optional[EncoderPreprocessArtifact]],
+        embeddings: list[Optional[torch.Tensor]],
+        owner_indices: list[int],
+        cache_generation: int,
+        log_metrics: bool,
+    ) -> dict[str, tuple[EncoderPreprocessArtifact, torch.Tensor]]:
+        """Fill metadata and embedding caches before waking concurrent waiters."""
+        if owner_indices:
+            processor_media = await self._materialize_k3_encoder_media(
+                lookups, owner_indices
+            )
+            try:
+                mm_inputs, get_feature_fn = await self._process_mm_items(
+                    processor_media, Modality.IMAGE, log_metrics=log_metrics
+                )
+            except NotImplementedError as error:
+                raise InternalError(f"Not implemented error: {error}") from error
+            except Exception as error:
+                raise BadRequestError(f"Failed to process mm items: {error}") from error
+
+            grid_thw = _get_mm_grid_dim(mm_inputs, Modality.IMAGE, self.model_type)
+            mm_feature = _convert(_get_mm_feature(mm_inputs, Modality.IMAGE))
+            model_items = self._build_mm_data_items(
+                mm_feature,
+                mm_inputs,
+                list(range(len(owner_indices))),
+                Modality.IMAGE,
+                grid_thw,
+            )
+            for item in model_items:
+                item.set_pad_value()
+
+            forward_start = time.perf_counter()
+            with torch.inference_mode():
+                encoded = get_feature_fn(model_items).cpu()
+            if encoded.ndim != 2:
+                encoded = encoded.reshape(-1, encoded.shape[-1])
+            if encoder_metrics_collector is not None and log_metrics:
+                encoder_metrics_collector.observe_model_forward(
+                    time.perf_counter() - forward_start, modality="image"
+                )
+            encoded_slices = self.slice_embedding(encoded, grid_thw, Modality.IMAGE)
+            original_sizes = mm_inputs["original_image_sizes"]
+
+            owner_results = {}
+            for position, request_index in enumerate(owner_indices):
+                item = model_items[position]
+                lookup = lookups[request_index]
+                prior = artifacts[request_index]
+                if prior is not None and prior.feature_hash != item.hash:
+                    self.mm_preprocess_cache.pop(lookup.artifact_key)
+                    raise InternalError(
+                        "K3 encoder feature hash changed for identical artifact "
+                        f"{lookup.artifact_key}: "
+                        f"{prior.feature_hash} != {item.hash}"
+                    )
+                artifact = EncoderPreprocessArtifact(
+                    content_digest=lookup.content_digest,
+                    artifact_key=lookup.artifact_key,
+                    feature_hash=item.hash,
+                    grid_thw=tuple(int(value) for value in grid_thw[position]),
+                    original_size=tuple(
+                        int(value) for value in original_sizes[position]
+                    ),
+                )
+                artifacts[request_index] = artifact
+                embeddings[request_index] = encoded_slices[position]
+                owner_results[lookup.artifact_key] = (
+                    artifact,
+                    encoded_slices[position],
+                )
+
+            async with self.mm_cache_lock:
+                if cache_generation != self.k3_encoder_cache_generation:
+                    raise InternalError(
+                        "K3 encoder cache was flushed during preprocessing"
+                    )
+                for key, (artifact, embedding) in owner_results.items():
+                    self.mm_preprocess_cache.put(key, artifact)
+                    self.mm_cache.set(
+                        artifact.feature_hash,
+                        EmbeddingResult(embedding=embedding),
+                    )
+            return owner_results
+        return {}
 
     async def _encode(
         self, mm_items, modality: Modality, log_metrics: bool = True

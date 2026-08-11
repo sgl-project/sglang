@@ -21,7 +21,11 @@ from sglang.srt.disaggregation.encode_receiver import (
     MultiModalEmbeddingData,
     _select_mm_processor_prompt,
 )
-from sglang.srt.disaggregation.encode_server import MMEncoder, _get_mm_grid_dim
+from sglang.srt.disaggregation.encode_server import (
+    InternalError,
+    MMEncoder,
+    _get_mm_grid_dim,
+)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
@@ -407,6 +411,9 @@ def _cache_enabled_encoder(*, trust_content_hashes=False):
     encoder.mm_preprocess_cache = MultimodalPreprocessCache(max_size_bytes=1024 * 1024)
     encoder.mm_cache = MultiModalStaticCache(max_size=1024 * 1024)
     encoder.mm_cache_lock = asyncio.Lock()
+    encoder.k3_encoder_inflight = {}
+    encoder.k3_encoder_inflight_lock = asyncio.Lock()
+    encoder.k3_encoder_cache_generation = 0
     encoder.io_executor = ThreadPoolExecutor(max_workers=2)
     encoder.trust_mm_content_hashes = trust_content_hashes
     encoder.profiler = None
@@ -476,6 +483,101 @@ def test_kimi_k3_epd_embedding_hit_skips_decode_processor_and_vit():
         encoder.io_executor.shutdown()
 
 
+def test_kimi_k3_epd_coalesces_concurrent_encoder_misses():
+    async def run():
+        encoder = _cache_enabled_encoder()
+        digest = "sha256:" + "12" * 32
+        artifact = EncoderPreprocessArtifact(
+            content_digest=digest,
+            artifact_key="shared-key",
+            feature_hash=29,
+            grid_thw=(1, 2, 2),
+            original_size=(8, 6),
+        )
+        lookup = EncoderMediaLookup(
+            "image", None, digest, artifact.artifact_key, None, None
+        )
+        embedding = torch.arange(4, dtype=torch.float32).reshape(1, 4)
+        owner_started = asyncio.Event()
+        release_owner = asyncio.Event()
+        owner_calls = 0
+
+        encoder._lookup_k3_encoder_artifacts = AsyncMock(return_value=[lookup])
+
+        async def encode_owner(*args):
+            nonlocal owner_calls
+            owner_calls += 1
+            owner_started.set()
+            await release_owner.wait()
+            return {artifact.artifact_key: (artifact, embedding)}
+
+        encoder._encode_k3_singleflight_owners = encode_owner
+        try:
+            first = asyncio.create_task(
+                encoder._encode_k3_with_preprocess_cache(["image"], log_metrics=False)
+            )
+            await owner_started.wait()
+            second = asyncio.create_task(
+                encoder._encode_k3_with_preprocess_cache(["image"], log_metrics=False)
+            )
+            await asyncio.sleep(0)
+            release_owner.set()
+            outputs = await asyncio.gather(first, second)
+
+            assert owner_calls == 1
+            assert encoder.mm_preprocess_cache.stats()["singleflight_joins"] == 1
+            for grid, output, aux in outputs:
+                torch.testing.assert_close(grid, torch.tensor([[1, 2, 2]]))
+                torch.testing.assert_close(output, embedding)
+                assert aux == {"original_image_sizes": [[8, 6]]}
+        finally:
+            encoder.io_executor.shutdown()
+
+    asyncio.run(run())
+
+
+def test_kimi_k3_epd_flush_invalidates_inflight_encoder_work():
+    async def run():
+        encoder = _cache_enabled_encoder()
+        digest = "sha256:" + "34" * 32
+        artifact = EncoderPreprocessArtifact(
+            content_digest=digest,
+            artifact_key="inflight-key",
+            feature_hash=31,
+            grid_thw=(1, 2, 2),
+            original_size=(8, 6),
+        )
+        lookup = EncoderMediaLookup(
+            "image", None, digest, artifact.artifact_key, None, None
+        )
+        embedding = torch.ones((1, 4))
+        owner_started = asyncio.Event()
+        release_owner = asyncio.Event()
+        encoder._lookup_k3_encoder_artifacts = AsyncMock(return_value=[lookup])
+
+        async def encode_owner(*args):
+            owner_started.set()
+            await release_owner.wait()
+            return {artifact.artifact_key: (artifact, embedding)}
+
+        encoder._encode_k3_singleflight_owners = encode_owner
+        try:
+            task = asyncio.create_task(
+                encoder._encode_k3_with_preprocess_cache(["image"], log_metrics=False)
+            )
+            await owner_started.wait()
+            encoder.clear_mm_caches()
+            release_owner.set()
+            with pytest.raises(InternalError, match="flushed during preprocessing"):
+                await task
+            assert not encoder.k3_encoder_inflight
+            assert len(encoder.mm_cache) == 0
+        finally:
+            encoder.io_executor.shutdown()
+
+    asyncio.run(run())
+
+
 def test_kimi_k3_epd_global_cache_preprocesses_only_metadata_misses():
     encoder = _cache_enabled_encoder()
     encoder.rank = 0
@@ -506,7 +608,7 @@ def test_kimi_k3_epd_global_cache_preprocesses_only_metadata_misses():
     encoder._lookup_k3_encoder_artifacts = AsyncMock(return_value=lookups)
     encoder._materialize_k3_encoder_media = AsyncMock(return_value=["miss-media"])
     encoder._process_mm_items = AsyncMock(return_value=(mm_inputs, feature_fn))
-    encoder._store_k3_encoder_artifacts = lambda *args: [miss]
+    encoder._store_k3_encoder_artifacts = lambda *args, **kwargs: [miss]
     try:
         ctx = asyncio.run(
             encoder._prepare_global_cache_context(
@@ -522,6 +624,70 @@ def test_kimi_k3_epd_global_cache_preprocesses_only_metadata_misses():
     assert ctx.str_mm_hashes == ["11", "22"]
     assert ctx.grid_thw.tolist() == [[1, 2, 2], [1, 4, 4]]
     assert ctx.aux_data == {"original_image_sizes": [[8, 6], [16, 12]]}
+
+
+def test_kimi_k3_epd_global_cache_coalesces_concurrent_metadata_misses():
+    async def run():
+        encoder = _cache_enabled_encoder()
+        encoder.rank = 0
+        digest = "sha256:" + "56" * 32
+        artifact = EncoderPreprocessArtifact(
+            content_digest=digest,
+            artifact_key="global-key",
+            feature_hash=41,
+            grid_thw=(1, 2, 2),
+            original_size=(8, 6),
+        )
+        lookup = EncoderMediaLookup(
+            "image", None, digest, artifact.artifact_key, None, None
+        )
+        mm_inputs = {
+            "pixel_values": torch.ones(4, 3),
+            "grid_thws": torch.tensor([[1, 2, 2]]),
+            "original_image_sizes": [[8, 6]],
+        }
+        owner_started = asyncio.Event()
+        release_owner = asyncio.Event()
+        process_calls = 0
+        encoder._lookup_k3_encoder_artifacts = AsyncMock(
+            side_effect=lambda items: [lookup]
+        )
+        encoder._materialize_k3_encoder_media = AsyncMock(return_value=["image"])
+
+        async def process(*args, **kwargs):
+            nonlocal process_calls
+            process_calls += 1
+            owner_started.set()
+            await release_owner.wait()
+            return mm_inputs, object()
+
+        encoder._process_mm_items = process
+        encoder._store_k3_encoder_artifacts = lambda *args, **kwargs: [artifact]
+        try:
+            first = asyncio.create_task(
+                encoder._prepare_global_cache_context(
+                    ["image"], Modality.IMAGE, "first"
+                )
+            )
+            await owner_started.wait()
+            second = asyncio.create_task(
+                encoder._prepare_global_cache_context(
+                    ["image"], Modality.IMAGE, "second"
+                )
+            )
+            await asyncio.sleep(0)
+            release_owner.set()
+            first_ctx, second_ctx = await asyncio.gather(first, second)
+
+            assert process_calls == 1
+            assert first_ctx.str_mm_hashes == second_ctx.str_mm_hashes == ["41"]
+            assert first_ctx.prepared_index_map == {0: 0}
+            assert second_ctx.prepared_index_map is None
+            assert encoder.mm_preprocess_cache.stats()["singleflight_joins"] == 1
+        finally:
+            encoder.io_executor.shutdown()
+
+    asyncio.run(run())
 
 
 def test_epd_receiver_keeps_content_hash_aligned_with_image():

@@ -315,6 +315,13 @@ class MultimodalPreprocessCache(Generic[K, V]):
     async def wait(self, reservation: CacheReservation[K, V]) -> V:
         return await asyncio.wrap_future(reservation.future)
 
+    def record_singleflight_joins(self, count: int) -> None:
+        """Include external work coalesced around this cache in its metrics."""
+        if count < 0:
+            raise ValueError("single-flight join count must be non-negative")
+        with self._lock:
+            self.singleflight_joins += count
+
     def stats(self) -> dict[str, int]:
         with self._lock:
             return {
