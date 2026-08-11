@@ -32,6 +32,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
 )
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
@@ -527,6 +528,7 @@ class MiniMaxH3Attention(nn.Module):
         self.inner_dim = self.total_num_heads * self.head_dim
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
+        self.prefix = prefix
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
@@ -576,6 +578,7 @@ class MiniMaxH3Attention(nn.Module):
             causal=False,
             softmax_scale=self.softmax_scale,
             num_kv_heads=self.num_heads,
+            prefix=self.prefix,
         )
         # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
         # the resolved enum alongside the impl instance instead of a second
@@ -585,6 +588,14 @@ class MiniMaxH3Attention(nn.Module):
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         weight = self.qkv_proj.weight
         base_loader = weight.weight_loader
+
+        def _reorder_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
+            return _reorder_grouped_qkv_to_qkv(
+                loaded_weight,
+                num_query_groups=arch.num_attention_heads,
+                heads_per_group=1,
+                head_dim=arch.attention_head_dim,
+            )
 
         def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
             # The grouped checkpoint layout is
@@ -600,18 +611,14 @@ class MiniMaxH3Attention(nn.Module):
                 tp_size=self.tp_size,
             ):
                 return
-            reordered = _reorder_grouped_qkv_to_qkv(
-                loaded_weight,
-                num_query_groups=arch.num_attention_heads,
-                heads_per_group=1,
-                head_dim=arch.attention_head_dim,
-            )
-            base_loader(param, reordered)
+            base_loader(param, _reorder_checkpoint_weight(loaded_weight))
 
         if hasattr(weight, "_weight_loader"):
             weight._weight_loader = _weight_loader
         else:
             weight.weight_loader = _weight_loader
+        # rank-local FSDP must reorder grouped QKV before selecting each shard
+        weight.rank_local_weight_transform = _reorder_checkpoint_weight
 
     def forward(
         self,
@@ -1018,11 +1025,11 @@ class MiniMaxH3FinalLayer(nn.Module):
 
 
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = _ARCH_DEFAULTS._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_block]
     # parameters mix fp32 (patch projections, timestep embedder, and output
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
-    _compile_conditions = _ARCH_DEFAULTS._compile_conditions
+    _compile_conditions = [is_block]
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
@@ -1107,7 +1114,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        arch = config.arch_config
+        arch = self.config
         self.arch = arch
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
