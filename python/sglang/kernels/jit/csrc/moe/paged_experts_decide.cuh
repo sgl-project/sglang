@@ -375,7 +375,7 @@ void decide(
     tvm::ffi::TensorView dst,
     tvm::ffi::TensorView n_out,
     tvm::ffi::TensorView idx) {
-  using namespace host;
+  using namespace sglang::host;
 
   // All operands are int32 CUDA tensors on the same device. Bind E to expert_slot and K to slot_expert,
   // then verify the rest against those symbolic sizes so a shape mismatch is caught here.
@@ -432,7 +432,7 @@ void decide_bounded(
     int64_t doorbell,
     tvm::ffi::TensorView idx,
     tvm::ffi::TensorView needed) {
-  using namespace host;
+  using namespace sglang::host;
 
   // E bound to expert_slot, K to slot_expert; the per-expert maps (freq/idx/log2hot) are [E], the
   // per-slot ones (slot_lastuse/needed) and page-in plans (src/dst/cold_log) are [K], topk is [T].
@@ -495,7 +495,7 @@ void decide_wave(
     tvm::ffi::TensorView dst,
     tvm::ffi::TensorView n_out,
     tvm::ffi::TensorView idx) {
-  using namespace host;
+  using namespace sglang::host;
 
   SymbolicSize K = {"num_slots"}, T = {"topk_n"}, Eidx = {"num_experts"};
   SymbolicDevice device_;
@@ -526,7 +526,7 @@ void decide_wave(
 int64_t host_devptr(tvm::ffi::TensorView pinned) {
   void* d = nullptr;
   cudaError_t e = cudaHostGetDevicePointer(&d, pinned.data_ptr(), 0);
-  host::RuntimeCheck(e == cudaSuccess, "cudaHostGetDevicePointer failed: ", cudaGetErrorString(e));
+  sglang::host::RuntimeCheck(e == cudaSuccess, "cudaHostGetDevicePointer failed: ", cudaGetErrorString(e));
   return reinterpret_cast<int64_t>(d);
 }
 
@@ -537,7 +537,7 @@ void gather(
     tvm::ffi::TensorView dst,
     tvm::ffi::TensorView n_out,
     int64_t item_bytes) {
-  using namespace host;
+  using namespace sglang::host;
 
   SymbolicSize Nsrc = {"n_src"}, One = {"one"};
   SymbolicDevice device_;
@@ -565,7 +565,7 @@ void gather_multi(
     tvm::ffi::TensorView src,
     tvm::ffi::TensorView dst,
     tvm::ffi::TensorView n_out) {
-  using namespace host;
+  using namespace sglang::host;
 
   SymbolicSize Nt = {"n_tensors"}, Nsrc = {"n_src"}, One = {"one"};
   SymbolicDevice device_;
@@ -595,7 +595,7 @@ void scatter_multi(
     tvm::ffi::TensorView e16s,    // [ntens] int64 CUDA: per-tensor per-expert bytes / 16
     tvm::ffi::TensorView dst,     // [>=n] int32 CUDA: destination slots
     int64_t n) {
-  using namespace host;
+  using namespace sglang::host;
 
   SymbolicSize Nt = {"n_tensors"}, Nd = {"n_dst"};
   SymbolicDevice device_;
@@ -656,7 +656,7 @@ void scratch_split(
     tvm::ffi::TensorView h2d_src,
     tvm::ffi::TensorView h2d_dst,
     tvm::ffi::TensorView h2d_n) {
-  using namespace host;
+  using namespace sglang::host;
 
   SymbolicSize E = {"num_experts"}, One = {"one"};
   SymbolicDevice device_;
@@ -691,7 +691,7 @@ void remap_mask(
     tvm::ffi::TensorView tw,
     tvm::ffi::TensorView safe_ids,
     tvm::ffi::TensorView masked_tw) {
-  using namespace host;
+  using namespace sglang::host;
 
   SymbolicSize E = {"num_experts"}, T = {"topk_n"};
   SymbolicDevice device_;
