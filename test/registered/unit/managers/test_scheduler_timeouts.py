@@ -50,8 +50,8 @@ def _scheduler(waiting_queue):
     s.waiting_queue = waiting_queue
     s.enable_hicache_storage = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
-    # The waiting-timeout path reports dropped requests to the rejection counter.
-    # Accounting itself is asserted in test_scheduler_queue_rejection_metrics.py.
+    # The waiting-timeout path reports dropped requests to the rejection counter,
+    # so the reporter has to exist even though this file asserts nothing about it.
     s.metrics_reporter = SimpleNamespace(
         current_scheduler_metrics_enabled=True, metrics_collector=MagicMock()
     )
@@ -70,6 +70,24 @@ class TestWaitingTimeout(CustomTestCase):
 
         self.assertEqual([r.rid for r in s.waiting_queue], ["fresh"])
         self.assertEqual(s.ipc_channels.send_to_tokenizer.send_output.call_count, 1)
+        collector = s.metrics_reporter.metrics_collector
+        collector.increment_queue_rejected_reqs.assert_called_once_with(
+            "waiting_timeout", 1
+        )
+
+    def test_non_reporting_rank_does_not_count_the_drop(self):
+        # Requests are broadcast to every TP rank, so each rank runs this path for
+        # the same logical request. Ranks without current_scheduler_metrics_enabled
+        # must stay quiet or `sum by (reason)` counts one rejection tp_size times.
+        s = _scheduler([_req("stale", wait_entry=time.perf_counter() - 10)])
+        s.metrics_reporter.current_scheduler_metrics_enabled = False
+
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
+            s._abort_on_waiting_timeout()
+
+        self.assertEqual(s.waiting_queue, [], "the req must still be dropped")
+        collector = s.metrics_reporter.metrics_collector
+        collector.increment_queue_rejected_reqs.assert_not_called()
 
     def test_unset_entry_time_is_never_dropped(self):
         # 0 is the "not yet stamped" sentinel; the guard is `0 < entry_time`.

@@ -78,32 +78,18 @@ class TestMaxQueuedRequests(CustomTestCase):
         # expected_status_codes = [200, 200, 503, 503, 503, 503, 503, 503, 503, 503]
         # self.assertEqual(status_codes, expected_status_codes)
 
-    def _queue_full_rejections(self) -> float:
-        """Sum sglang:num_queue_rejected_requests_total{reason="queue_full"} over all label sets."""
+    def _rejections_by_reason(self) -> dict:
+        """sglang:num_queue_rejected_requests_total summed per reason label."""
         response = requests.get(f"{self.base_url}/metrics")
         self.assertEqual(response.status_code, 200)
 
-        total = 0.0
+        totals = {}
         for family in text_string_to_metric_families(response.text):
             for sample in family.samples:
-                if (
-                    sample.name == "sglang:num_queue_rejected_requests_total"
-                    and sample.labels.get("reason") == "queue_full"
-                ):
-                    total += sample.value
-        return total
-
-    def _exported_rejection_reasons(self) -> set:
-        """Reason labels present on sglang:num_queue_rejected_requests_total."""
-        response = requests.get(f"{self.base_url}/metrics")
-        self.assertEqual(response.status_code, 200)
-
-        return {
-            sample.labels["reason"]
-            for family in text_string_to_metric_families(response.text)
-            for sample in family.samples
-            if sample.name == "sglang:num_queue_rejected_requests_total"
-        }
+                if sample.name == "sglang:num_queue_rejected_requests_total":
+                    reason = sample.labels["reason"]
+                    totals[reason] = totals.get(reason, 0.0) + sample.value
+        return totals
 
     def test_queue_rejection_reasons_are_pre_seeded(self):
         """Every reason is exported before it first fires.
@@ -113,7 +99,7 @@ class TestMaxQueuedRequests(CustomTestCase):
         queries return no data precisely when the server is healthy.
         """
         self.assertEqual(
-            self._exported_rejection_reasons(),
+            set(self._rejections_by_reason()),
             {"queue_full", "priority_preempted", "waiting_timeout"},
         )
 
@@ -124,7 +110,7 @@ class TestMaxQueuedRequests(CustomTestCase):
         before the scheduler rejects, so this counter is the only server-side
         signal that the queue cap shed load.
         """
-        before = self._queue_full_rejections()
+        before = self._rejections_by_reason().get("queue_full", 0.0)
 
         status_codes = asyncio.run(
             send_concurrent_generate_requests(self.base_url, num_requests=10)
@@ -132,7 +118,8 @@ class TestMaxQueuedRequests(CustomTestCase):
         num_rejected = status_codes.count(503)
         self.assertGreater(num_rejected, 0, "expected the queue cap to reject requests")
 
-        self.assertEqual(self._queue_full_rejections() - before, num_rejected)
+        after = self._rejections_by_reason().get("queue_full", 0.0)
+        self.assertEqual(after - before, num_rejected)
 
     def test_max_running_requests_and_max_queued_request_validation(self):
         """Verify running request and queued request numbers based on server logs."""
