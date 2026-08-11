@@ -6,7 +6,7 @@ from typing import Dict, List, Literal, Optional
 
 import requests
 
-from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.srt.utils import is_hip, is_xpu, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
 
 _base_url = DEFAULT_URL_FOR_TEST
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 
 class BaseTestGptOss(CustomTestCase):
@@ -39,7 +40,7 @@ class BaseTestGptOss(CustomTestCase):
             ("120b", "mxfp4"): "openai/gpt-oss-120b",
         }[(model_variant, quantization)]
 
-        if model_variant == "20b":
+        if model_variant == "20b" and not _is_xpu:
             other_args += ["--cuda-graph-max-bs-decode", "600"]
         # Respect SGLANG_USE_AITER if already set, otherwise default to "0" for HIP
         if _is_hip and "SGLANG_USE_AITER" not in os.environ:
