@@ -7,6 +7,12 @@ name: Nightly Test (AMD MI355X 2N 1P1D Disagg)
 on:
   schedule:
     - cron: '17 3 * * *'  # 03:17 UTC
+  # TEST BRANCH ONLY (do not merge): this branch carries PR #33919 and exists
+  # solely to run the nightly harness against the new Qwen3.5 recipes. Pushing
+  # is the only trigger available here, so it stands in for workflow_dispatch.
+  push:
+    branches:
+      - cursor/test-qwen35-mi355x-recipes-7487
   workflow_dispatch:
     inputs:
       image:
@@ -68,7 +74,10 @@ jobs:
       - name: Generate benchmark matrix
         id: generate
         env:
-          CONFIGS_FILTER: ${{ inputs.configs }}
+          # TEST BRANCH ONLY (do not merge): a push-triggered run has no inputs,
+          # so restrict it to the four Qwen3.5 legs under test instead of the
+          # whole nightly matrix.
+          CONFIGS_FILTER: ${{ inputs.configs != '' && inputs.configs || (github.event_name == 'push' && 'qwen35-fp4-1k1k-1p1d,qwen35-fp4-1k1k-1p1d-mtp,qwen35-fp4-1k1k-1p1d-dp8ep8,qwen35-fp4-1k1k-1p1d-dp8ep8-mtp' || '') }}
         run: |
           pip install pyyaml -q
 
