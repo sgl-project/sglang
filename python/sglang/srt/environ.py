@@ -849,6 +849,14 @@ class Envs:
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
+    # HiSparse
+    # Kill-switch for the shared-index (IndexShare) swap-in prefetch
+    # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
+    SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Timing probe: run the swap-in fully but skip the host->device KV bytes,
+    # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
+    SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+
     # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to an unpacked SiTU
     # cubin pool (cubins + flat ABI headers + overlay/; distributed as a
     # single downloadable archive). Needs the public flashinfer package
