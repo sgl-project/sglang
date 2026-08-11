@@ -340,7 +340,7 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
+            dit_layerwise_offload_modes=("memory",),
             keep_resident_min_available_gb=70,
             keep_resident_components=("dit",),
         )
