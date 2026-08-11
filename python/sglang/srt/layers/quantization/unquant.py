@@ -85,17 +85,18 @@ _use_cutedsl_bf16_gemm = None
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
 
-    from sglang.srt.utils import is_sm100_supported
+    from sglang.srt.utils import get_device_sm, is_sm100_supported
 
     backend_str = server_args.bf16_gemm_backend
-    if backend_str == "auto" and is_sm100_supported():
-        backend_str = "cutedsl"
+    cutedsl_supported = is_sm100_supported() and get_device_sm() == 100
+    if backend_str == "auto":
+        backend_str = "cutedsl" if cutedsl_supported else "torch"
 
     backend = Bf16GemmBackend(backend_str)
 
     if backend.is_cutedsl():
-        if not is_sm100_supported():
-            raise ValueError("--bf16-gemm-backend cutedsl requires an SM10x GPU")
+        if not cutedsl_supported:
+            raise ValueError("--bf16-gemm-backend cutedsl requires an SM100 GPU")
 
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
             cutedsl_bf16_gemm,

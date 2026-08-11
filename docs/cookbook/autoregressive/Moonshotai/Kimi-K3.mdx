@@ -127,7 +127,7 @@ Capacity levers, all in the Playground. Each trades precision or cache behavior 
 
 Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request — the calculator folds this in — and an unset `--max-running-requests` resets to 48 under spec (the command panel reminds you; set it explicitly to raise).
 
-**MoE runner.** Leave `--moe-runner-backend` unset on Blackwell and it resolves to FlashInfer MXFP4 (W4A8, prebuilt trtllm-gen SiTU kernels) when the cubin pool is installed, Marlin (W4A16) otherwise; H100/H200 pin Marlin. The B200 Balanced and High-Throughput cells pin `flashinfer_mxfp4` explicitly because that is the shape they were brought up on — on an install without the pool, drop the flag to fall back to Marlin. The published Docker images already provision the **SiTU cubin pool**; to install it independently, run the same flow as the Dockerfile:
+**MoE runner.** On SM100 (B200/GB200), leaving `--moe-runner-backend` unset selects FlashInfer MXFP4 (W4A8, prebuilt trtllm-gen SiTU kernels) and requires the cubin pool. On SM103 (B300/GB300), auto selects Marlin (W4A16) because the trtllm-gen finalize kernel can hang on B300 ([#34340](https://github.com/sgl-project/sglang/issues/34340)); H100/H200 also pin Marlin. The B200 Balanced and High-Throughput cells pin `flashinfer_mxfp4` explicitly because that is the shape they were brought up on — on an install without the pool, replace that flag with `--moe-runner-backend marlin`. The published Docker images already provision the **SiTU cubin pool**; to install it independently, run the same flow as the Dockerfile:
 
 ```bash
 wget https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip

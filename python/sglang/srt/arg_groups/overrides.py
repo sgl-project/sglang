@@ -544,17 +544,26 @@ def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
-    # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
-    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103;
-    # it hard-requires the SiTU cubin pool on the box (K3's SiTU activation has
-    # no public cubins). Do not silently trade W4A8 for Marlin W4A16 when the
-    # default cannot start; explicit non-FlashInfer runner choices still win.
+    # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on SM100, but its
+    # SM103 cubin coverage is incomplete and the finalize kernel can hang on
+    # B300 (#34340). Keep explicit runner choices authoritative, while routing
+    # auto to the safe Marlin fallback on SM103.
     if server_args.moe_runner_backend not in ("auto", "flashinfer_mxfp4"):
         return {}
-    if not (is_sm100_supported() and get_device_sm() in (100, 103)):
+    sm = get_device_sm()
+    if not (is_sm100_supported() and sm in (100, 103)):
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):
         return {}
+    if sm == 103:
+        if server_args.moe_runner_backend == "auto":
+            logger.warning(
+                "Kimi-K3 on SM103: moe_runner_backend=marlin because the "
+                "trtllm-gen MoE finalize kernel can hang on B300 (#34340)."
+            )
+            return {"moe_runner_backend": "marlin"}
+        return {}
+
     from sglang.kernels.ops.moe.trtllm_gen_moe import available as _trtllm_gen_moe_ok
 
     if not _trtllm_gen_moe_ok():
@@ -578,7 +587,7 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
 
     if server_args.moe_runner_backend == "auto":
         logger.info(
-            "Kimi-K3 on SM100/SM103: moe_runner_backend=flashinfer_mxfp4 "
+            "Kimi-K3 on SM100: moe_runner_backend=flashinfer_mxfp4 "
             "(trtllm-gen SiTU cubin pool found)."
         )
         return {"moe_runner_backend": "flashinfer_mxfp4"}

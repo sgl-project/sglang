@@ -9,9 +9,10 @@ import dataclasses
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
 
@@ -1030,6 +1031,30 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_deepseek_v4_sm120_moe(_view(arch="LlamaForCausalLM")), {})
         with patch.object(overrides_module, "is_sm120_supported", return_value=False):
             self.assertEqual(_deepseek_v4_sm120_moe(_view()), {})
+
+    def test_kimi_k3_sm103_auto_moe_uses_marlin(self):
+        """SM103 auto selection must not launch the hanging trtllm-gen finalize kernel."""
+        from sglang.srt.arg_groups.overrides import _kimi_k3_moe_runner_overrides
+
+        server_args = SimpleNamespace(moe_runner_backend="auto")
+        hf_config = SimpleNamespace(
+            quantization_config={"config_groups": {"experts": {"format": "mxfp4"}}}
+        )
+        trtllm_gen_moe = ModuleType("sglang.kernels.ops.moe.trtllm_gen_moe")
+        trtllm_gen_moe.available = lambda: True
+
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            patch.object(overrides_module, "get_device_sm", return_value=103),
+            patch.dict(
+                sys.modules,
+                {"sglang.kernels.ops.moe.trtllm_gen_moe": trtllm_gen_moe},
+            ),
+        ):
+            self.assertEqual(
+                _kimi_k3_moe_runner_overrides(server_args, hf_config),
+                {"moe_runner_backend": "marlin"},
+            )
 
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _nemotron_h_overrides

@@ -458,11 +458,12 @@ export const config = {
           // Blackwell-only kernel-fusion path; selecting it reveals the Quantization sub-select.
           { id: "megamoe",          label: "MegaMoE",           flags: ["--moe-a2a-backend megamoe"],
             requiresHw: ["b200", "b300", "gb200", "gb300"] },
-          // Blackwell-only: runs the prebuilt trtllm-gen SiTU cubins; needs the
+          // SM100-only: runs the prebuilt trtllm-gen SiTU cubins; needs the
           // downloadable SiTU cubin pool unpacked and pointed to by the env var.
+          // SM103 uses Marlin because the trtllm-gen finalize kernel can hang.
           { id: "flashinfer_mxfp4", label: "FlashInfer (MXFP4)", flags: ["--moe-runner-backend flashinfer_mxfp4"],
             env: ["SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/path/to/trtllm_gen_moe_cubin_pool"],
-            requiresHw: ["b200", "b300", "gb200", "gb300"] },
+            requiresHw: ["b200", "gb200"] },
           { id: "marlin",           label: "Marlin (W4A16)",    flags: ["--moe-runner-backend marlin"] },
         ],
       },
