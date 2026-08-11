@@ -2315,24 +2315,43 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+                if layer.sliding_window_size is not None and (
+                    layer.sliding_window_size > -1
+                ):
+                    # ``extend_attention_fwd`` positions its SWA mask relative to
+                    # ``window_kv_offsets``, which AiterAttnBackend never builds
+                    # (it carries ``swa_page_table`` instead). Silently running
+                    # full attention over the whole prefix would be wrong, so
+                    # refuse instead.
+                    raise NotImplementedError(
+                        "aiter target-verify fallback does not support "
+                        "sliding-window layers. Use speculative_eagle_topk == 1 "
+                        "so the unified-attention verify path is taken, or run "
+                        "with --attention-backend triton."
+                    )
+
+                # Keyword arguments only: this callee's signature has grown
+                # trailing options (sliding_window_size, sinks, page_size, ...)
+                # and a positional call silently drops the new ones.
                 self.extend_attention_fwd(
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k.contiguous(),
-                    v.contiguous(),
-                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                    self.forward_metadata.qo_indptr,
-                    self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
-                    self.forward_metadata.custom_mask,
-                    True,  # causal
-                    self.forward_metadata.mask_indptr,
-                    self.forward_metadata.max_extend_len,
-                    1.0,  # k_scale
-                    1.0,  # v_scale
-                    layer.scaling,
+                    q_extend=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_extend=k.contiguous(),
+                    v_extend=v.contiguous(),
+                    o_extend=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    k_buffer=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                    v_buffer=self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    qo_indptr=self.forward_metadata.qo_indptr,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_indices=self.forward_metadata.kv_indices,
+                    custom_mask=self.forward_metadata.custom_mask,
+                    is_causal=True,
+                    mask_indptr=self.forward_metadata.mask_indptr,
+                    max_len_extend=self.forward_metadata.max_extend_len,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    sm_scale=layer.scaling,
                     logit_cap=layer.logit_cap,
+                    sinks=sinks,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -2635,26 +2654,45 @@ class AiterAttnBackend(AttentionBackend):
                 # ``fp8_dtype``; aiter has no ``fp8_e5m2`` string.)
                 aiter_kv_str = self._get_aiter_paged_ragged_kv_cache_dtype()
 
+                if sinks is not None:
+                    # aiter's paged_attention_ragged has no sink argument, so the
+                    # per-head sink logit cannot enter its softmax denominator.
+                    # Running anyway would return silently wrong probabilities.
+                    raise NotImplementedError(
+                        "aiter paged_attention_ragged decode does not support "
+                        "attention sinks. Sink models need the unified-attention "
+                        "decode path (SGLANG_USE_AITER_UNIFIED_ATTN=1) or "
+                        "--attention-backend triton."
+                    )
+
+                # Keyword arguments only: paged_attention_ragged takes 19
+                # same-typed positionals and grows optional trailing ones
+                # (fp8_out_scale, partition_size, mtp), so a positional call is
+                # both unreadable and silently truncatable.
                 paged_attention_ragged(
-                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    self.workspace_buffer,
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                    v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                    self.scale,
-                    self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
-                    self.kv_last_page_len,
-                    1,
-                    self.max_num_partitions,
-                    None,
-                    aiter_kv_str,
-                    "NHD",
-                    self.logits_soft_cap,
-                    self.k_scale,
-                    self.v_scale,
-                    None,
-                    _AITER_PARTITION_SIZE_ROCM,
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    workspace_buffer=self.workspace_buffer,
+                    query=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    key_cache=k_cache.view(
+                        -1, 1, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    value_cache=v_cache.view(
+                        -1, 1, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    scale=self.scale,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_page_indices=self.forward_metadata.kv_indices,
+                    kv_last_page_lens=self.kv_last_page_len,
+                    block_size=1,
+                    max_num_partitions=self.max_num_partitions,
+                    alibi_slopes=None,
+                    kv_cache_dtype=aiter_kv_str,
+                    kv_cache_layout="NHD",
+                    logits_soft_cap=self.logits_soft_cap,
+                    k_scale=self.k_scale,
+                    v_scale=self.v_scale,
+                    fp8_out_scale=None,
+                    partition_size=_AITER_PARTITION_SIZE_ROCM,
                 )
 
         return o
