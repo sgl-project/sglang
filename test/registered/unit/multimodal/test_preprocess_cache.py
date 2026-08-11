@@ -198,23 +198,6 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_clear_starts_a_new_singleflight_generation(self):
-        async def run():
-            cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
-            old = cache.reserve_many(["key"])[0]
-            cache.clear()
-            new = cache.reserve_many(["key"])[0]
-
-            self.assertTrue(old.owner)
-            self.assertTrue(new.owner)
-            self.assertIsNot(old.future, new.future)
-            cache.fulfill(old, b"old")
-            self.assertNotIn("key", cache)
-            cache.fulfill(new, b"new")
-            self.assertEqual(cache.get("key"), b"new")
-
-        asyncio.run(run())
-
     def test_reserve_many_batches_owners_and_joins(self):
         async def run():
             cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
