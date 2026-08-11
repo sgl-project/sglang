@@ -1275,7 +1275,7 @@ export const Deployment = ({ config, benchmarks }) => {
   const runModes = configuredRunModes || ["python", "docker"];
   const [runMode, setRunMode] = useState(runModes[0]); // "python" | "docker"
   const [builderScope, setBuilderScope] = useState("base");
-  const [builderSetting, setBuilderSetting] = useState({ serve: null, request: null });
+  const [builderServerSetting, setBuilderServerSetting] = useState(null);
   const [builderAdvanced, setBuilderAdvanced] = useState(false);
   const [serveExpanded, setServeExpanded] = useState(false);
   const [requestExpanded, setRequestExpanded] = useState(false);
@@ -1571,7 +1571,7 @@ export const Deployment = ({ config, benchmarks }) => {
   const maxHwCols = Math.max(...hwGroups.map((x) => x.items.length));
 
   if (commandBuilder) {
-    const scopeLabel = { base: "Base recipe", serve: "Server options", request: "Request options" };
+    const scopeLabel = { base: "Setup", serve: "Server", request: "Request" };
     const scopedDims = (scope) => overlayDimSpecs.filter((dim) => {
       if ((dim.scope || "base") !== scope) return false;
       if (dim.kind === "number") {
@@ -1605,17 +1605,43 @@ export const Deployment = ({ config, benchmarks }) => {
       "in-progress": "Verification in progress",
       error: "Invalid configuration",
     }[status] || "Unverified");
-    const activeDims = builderScope === "serve" ? serveDims : requestDims;
-    const activeSettingId = builderScope === "base"
-      ? null
-      : (builderSetting[builderScope] || activeDims[0]?.id);
-    const activeSetting = activeDims.find((dim) => dim.id === activeSettingId) || activeDims[0];
+    const activeServerSetting = serveDims.find((dim) => dim.id === builderServerSetting) || serveDims[0];
     const selectedOption = (dim) => (dim.options || []).find((option) => option.id === sel[dim.id]);
     const effectiveSetting = (dim) =>
       builderMeta.resolvedSettings?.[dim.id]
       || selectedOption(dim)?.label
       || sel[dim.id]
       || "—";
+    const verifiedRecipes = commandBuilder.resource?.verifiedRecipes || [];
+    const recommendedRecipe = verifiedRecipes.find((recipe) => recipe.hw === sel.hw && recipe.default)
+      || verifiedRecipes.find((recipe) => recipe.hw === sel.hw);
+    const recommendedInUse = !!recommendedRecipe
+      && Number(sel.nodes) === recommendedRecipe.nodes
+      && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
+      && sel.topology_mode === "auto"
+      && ["auto", recommendedRecipe.placement].includes(sel.placement)
+      && sel.attention === "platform"
+      && sel.precision === "native"
+      && ["auto", recommendedRecipe.encoder].includes(sel.encoder)
+      && sel.execution === "eager";
+
+    const restoreRecommendedRecipe = () => {
+      if (!recommendedRecipe) return;
+      setSel((prev) => reseatHiddenPicks(normalizeBuilderSelection({
+        ...prev,
+        nodes: recommendedRecipe.nodes,
+        gpus_per_node: recommendedRecipe.gpus_per_node,
+        topology_mode: "auto",
+        tp_size: recommendedRecipe.tp_size,
+        ulysses_degree: recommendedRecipe.ulysses_degree,
+        ring_degree: recommendedRecipe.ring_degree,
+        placement: recommendedRecipe.placement || "auto",
+        attention: "platform",
+        precision: "native",
+        encoder: recommendedRecipe.encoder || "auto",
+        execution: "eager",
+      })));
+    };
 
     const renderBuilderChoice = (item, dim) => {
       const checked = sel[dim.id] === item.id;
@@ -1679,6 +1705,28 @@ export const Deployment = ({ config, benchmarks }) => {
 
     const renderBaseScope = () => (
       <div className="sgd-builder-scope-panel" data-scope="base">
+        {recommendedRecipe && (
+          <section className="sgd-builder-recipe">
+            <div>
+              <span>Recommended for {sel.hw.toUpperCase()}</span>
+              <strong>
+                {[
+                  `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
+                  recommendedRecipe.tp_size > 1 && `TP ${recommendedRecipe.tp_size}`,
+                  `Ulysses ${recommendedRecipe.ulysses_degree}`,
+                  recommendedRecipe.ring_degree > 1 && `Ring ${recommendedRecipe.ring_degree}`,
+                  { resident: "Resident", fsdp: "FSDP", offload: "Layerwise offload" }[recommendedRecipe.placement],
+                ].filter(Boolean).join(" · ")}
+              </strong>
+            </div>
+            <div>
+              {renderStatus("verified")}
+              {recommendedInUse
+                ? <small>In use</small>
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>Use recommended</button>}
+            </div>
+          </section>
+        )}
         <section className="sgd-builder-section">
           <div className="sgd-builder-section-heading"><span>Hardware</span></div>
           <div className="sgd-builder-hardware-grid">
@@ -1771,75 +1819,99 @@ export const Deployment = ({ config, benchmarks }) => {
       </div>
     );
 
-    const renderSettingScope = (scope) => {
-      const dims = scope === "serve" ? serveDims : requestDims;
-      const current = dims.find((dim) => dim.id === activeSetting?.id) || dims[0];
-      if (!current) return null;
-      const options = visibleOptions(current, sel);
-      const currentOption = selectedOption(current);
+    const renderSettingEditor = (dim, className = "", direct = false) => {
+      if (!dim) return null;
+      const options = visibleOptions(dim, sel);
+      const currentOption = selectedOption(dim);
       return (
-        <div className="sgd-builder-scope-panel" data-scope={scope}>
+        <section className={`sgd-builder-context ${className}`} aria-live={direct ? undefined : "polite"}>
+          <div className="sgd-builder-context-heading">
+            <div>
+              <span>{direct ? dim.title : `${dim.title} options`}</span>
+              {dim.description && <p>{dim.description}</p>}
+            </div>
+            {dim.quality && <small>{dim.quality}</small>}
+          </div>
+          {dim.kind === "number" ? (
+            <div className="sgd-builder-request-stepper">
+              <button
+                type="button"
+                aria-label={`Decrease ${dim.title}`}
+                disabled={Number(sel[dim.id]) <= dim.min}
+                onClick={() => setSel((prev) => ({ ...prev, [dim.id]: Math.max(dim.min, Number(prev[dim.id]) - 1) }))}
+              >−</button>
+              <output aria-live="polite">{sel[dim.id]}</output>
+              <button
+                type="button"
+                aria-label={`Increase ${dim.title}`}
+                disabled={Number(sel[dim.id]) >= dim.max}
+                onClick={() => setSel((prev) => ({ ...prev, [dim.id]: Math.min(dim.max, Number(prev[dim.id]) + 1) }))}
+              >+</button>
+              <span>{dim.unit || "outputs"}</span>
+            </div>
+          ) : (
+            <div className="sgd-builder-context-options">
+              {options.map((option) => renderBuilderChoice(option, dim))}
+            </div>
+          )}
+          {(currentOption?.description || dim.learnMore) && (
+            <div className="sgd-builder-context-note">
+              {currentOption?.description && <p>{currentOption.description}</p>}
+              {dim.learnMore && <a href={dim.learnMore}>Learn more →</a>}
+            </div>
+          )}
+        </section>
+      );
+    };
+
+    const renderServerScope = () => (
+      <div className="sgd-builder-scope-panel" data-scope="serve">
+        <div className="sgd-builder-setting-layout">
           <div className="sgd-builder-setting-list">
-            {dims.map((dim) => {
-              const isActive = dim.id === current.id;
+            {serveDims.map((dim) => {
+              const isActive = dim.id === activeServerSetting?.id;
               const option = selectedOption(dim);
               const recommended = typeof option?.recommendedWhen === "function"
                 ? option.recommendedWhen(sel)
                 : !!option?.recommended;
               return (
-                <button
-                  type="button"
-                  className="sgd-builder-setting-row"
-                  data-active={isActive ? "true" : "false"}
-                  key={dim.id}
-                  onClick={() => setBuilderSetting((state) => ({ ...state, [scope]: dim.id }))}
-                >
-                  <span>{dim.title}</span>
-                  <strong>{effectiveSetting(dim)}</strong>
-                  {recommended && <small>Recommended</small>}
-                  <span aria-hidden="true">›</span>
-                </button>
+                <div className="sgd-builder-setting-item" key={dim.id}>
+                  <button
+                    type="button"
+                    className="sgd-builder-setting-row"
+                    data-active={isActive ? "true" : "false"}
+                    aria-expanded={isActive}
+                    onClick={() => setBuilderServerSetting(dim.id)}
+                  >
+                    <span>{dim.title}</span>
+                    <strong>{effectiveSetting(dim)}</strong>
+                    {recommended && <small>Recommended</small>}
+                    <span aria-hidden="true">{isActive ? "⌄" : "›"}</span>
+                  </button>
+                  {isActive && renderSettingEditor(dim, "sgd-builder-context--inline")}
+                </div>
               );
             })}
           </div>
-
-          <section className="sgd-builder-context" aria-live="polite">
-            <div className="sgd-builder-context-heading">
-              <div>
-                <span>{current.title}</span>
-                {current.description && <p>{current.description}</p>}
-              </div>
-              {current.quality && <small>{current.quality}</small>}
-            </div>
-            {current.kind === "number" ? (
-              <div className="sgd-builder-request-stepper">
-                <button
-                  type="button"
-                  disabled={Number(sel[current.id]) <= current.min}
-                  onClick={() => setSel((prev) => ({ ...prev, [current.id]: Math.max(current.min, Number(prev[current.id]) - 1) }))}
-                >−</button>
-                <output>{sel[current.id]}</output>
-                <button
-                  type="button"
-                  disabled={Number(sel[current.id]) >= current.max}
-                  onClick={() => setSel((prev) => ({ ...prev, [current.id]: Math.min(current.max, Number(prev[current.id]) + 1) }))}
-                >+</button>
-                <span>{current.unit || "outputs"}</span>
-              </div>
-            ) : (
-              <div className="sgd-builder-context-options">
-                {options.map((option) => renderBuilderChoice(option, current))}
-              </div>
-            )}
-            {(currentOption?.description || current.learnMore) && (
-              <div className="sgd-builder-context-note">
-                {currentOption?.description && <p>{currentOption.description}</p>}
-                {current.learnMore && <a href={current.learnMore}>Learn more →</a>}
-              </div>
-            )}
-          </section>
+          {renderSettingEditor(activeServerSetting, "sgd-builder-context--rail")}
         </div>
-      );
+      </div>
+    );
+
+    const renderRequestScope = () => (
+      <div className="sgd-builder-scope-panel sgd-builder-request-direct" data-scope="request">
+        {requestDims.map((dim) => (
+          <div className="sgd-builder-request-setting" key={dim.id}>
+            {renderSettingEditor(dim, "", true)}
+          </div>
+        ))}
+      </div>
+    );
+
+    const renderScopeControls = () => {
+      if (builderScope === "base") return renderBaseScope();
+      if (builderScope === "serve") return renderServerScope();
+      return renderRequestScope();
     };
 
     const renderStatus = (status) => (
@@ -1930,27 +2002,31 @@ export const Deployment = ({ config, benchmarks }) => {
         style={{ scrollMarginTop: "104px" }}
         aria-label={`${config.modelName} command builder`}
       >
-        <nav className="sgd-builder-scope-tabs" aria-label="Command builder scope">
+        <nav className="sgd-builder-scope-tabs" role="tablist" aria-label="Command builder scope">
           {["base", "serve", "request"].map((scope) => (
             <button
               type="button"
+              role="tab"
               key={scope}
               aria-label={scopeLabel[scope]}
-              aria-current={builderScope === scope ? "page" : undefined}
+              aria-selected={builderScope === scope}
+              aria-controls={`${DEPLOYMENT_COMPONENT_ID}-controls`}
               data-active={builderScope === scope ? "true" : "false"}
               onClick={() => setBuilderScope(scope)}
             >
-              <span className="sgd-builder-scope-label--full">{scopeLabel[scope]}</span>
-              <span className="sgd-builder-scope-label--compact" aria-hidden="true">
-                {scope === "base" ? "Base" : scope === "serve" ? "Server" : "Request"}
-              </span>
+              {scopeLabel[scope]}
             </button>
           ))}
         </nav>
 
         <div className="sgd-builder-main">
-          <div className="sgd-builder-controls">
-            {builderScope === "base" ? renderBaseScope() : renderSettingScope(builderScope)}
+          <div
+            id={`${DEPLOYMENT_COMPONENT_ID}-controls`}
+            className="sgd-builder-controls"
+            role="tabpanel"
+            aria-label={`${scopeLabel[builderScope]} settings`}
+          >
+            {renderScopeControls()}
           </div>
           <div className="sgd-builder-output-rail">
             {renderOutputCard("serve")}

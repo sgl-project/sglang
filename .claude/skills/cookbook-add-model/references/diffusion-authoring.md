@@ -37,13 +37,14 @@ model,” but should not have to read the architecture section to choose the rig
 ## Scoped command builder
 
 New diffusion pages use `templates/diffusion-config.jsx.tmpl` and opt into the shared
-`commandBuilder` renderer. Base, Server, and Request choices share one semantic selection and
+`commandBuilder` renderer. Setup, Server, and Request choices share one semantic selection and
 one command composer; do not create a second command engine or assemble fragments in MDX.
 
 Classify every dimension by lifecycle:
 
-- `scope: "base"`: hardware-independent required decisions such as checkpoint weights and
-  request mode. Hardware and Nodes × GPUs/node are supplied by the shared builder.
+- `scope: "base"`: the visible Setup tab—hardware-independent required decisions such as
+  checkpoint weights and request mode. Hardware, Nodes × GPUs/node, and the recommended
+  verified deployment are supplied by the shared builder.
 - `scope: "serve"`: startup flags such as placement, attention, precision, encoder scheduling,
   and graph execution. They modify only the complete Serve command.
 - `scope: "request"`: sampling fields such as quality and outputs. They modify only the complete
@@ -77,7 +78,7 @@ model-by-model migrations.
 - tags render before section 1 and describe the model rather than the runtime;
 - the first screen explains capability, strength, and boundary without marketing filler;
 - checkpoint variants and request modes are unambiguous;
-- the builder separates Base, Server, and Request inputs while keeping both output commands visible;
+- the builder separates Setup, Server, and Request inputs while keeping both output commands visible;
 - topology-dependent recommended defaults are explicit in the setting summary and generated command;
 - legal custom topologies are Unverified and copyable; statically illegal combinations block Copy;
 - attention, quantization, caching, compile, and similar orthogonal features have explicit
