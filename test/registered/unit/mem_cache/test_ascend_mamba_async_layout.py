@@ -1,30 +1,45 @@
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
+import sglang.srt.mem_cache.memory_pool_host as memory_pool_host
+from sglang.srt.mem_cache.memory_pool_host import (
+    MambaPoolHost,
+    _ascend_hicache_mamba_io_mode,
+)
 
 
-class TestAscendMambaAsyncLayout(unittest.TestCase):
-    def test_accepts_contiguous_slot_payload(self):
-        state = torch.empty(3, 5, 2, 4)
-        self.assertIsNone(
-            MambaPoolHost._dense_device_slot_payload_unavailable_reason(state, 0)
-        )
+class TestAscendMambaAsyncConfig(unittest.TestCase):
+    def test_accepts_explicit_sync_and_async_modes(self):
+        for mode in ("sync", "async"):
+            with self.subTest(mode=mode), patch.dict(
+                os.environ, {"SGLANG_ASCEND_HICACHE_MAMBA_IO": mode}
+            ):
+                self.assertEqual(_ascend_hicache_mamba_io_mode(), mode)
 
-    def test_accepts_nextn_dense_permutation(self):
-        state = torch.empty(3, 5, 2, 4).transpose(-1, -2)
-        self.assertFalse(state.is_contiguous())
-        self.assertIsNone(
-            MambaPoolHost._dense_device_slot_payload_unavailable_reason(state, 0)
-        )
+    def test_rejects_auto_mode(self):
+        with patch.dict(
+            os.environ, {"SGLANG_ASCEND_HICACHE_MAMBA_IO": "auto"}
+        ), self.assertRaisesRegex(ValueError, "must be one of"):
+            _ascend_hicache_mamba_io_mode()
 
-    def test_rejects_slot_payload_with_holes(self):
-        state = torch.empty(3, 5, 2, 4)[..., ::2]
-        reason = MambaPoolHost._dense_device_slot_payload_unavailable_reason(state, 0)
-        self.assertIsNotNone(reason)
-        self.assertIn("not physically dense", reason)
+    @patch.object(memory_pool_host, "_is_npu", True)
+    @patch.object(
+        memory_pool_host,
+        "_ascend_hicache_mamba_io_mode",
+        return_value="async",
+    )
+    @patch.object(memory_pool_host, "transfer_state_dim_exchange", None)
+    def test_async_requires_native_operator(self, _mock_mode):
+        pool = MambaPoolHost.__new__(MambaPoolHost)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "transfer_state_dim_exchange from sgl-kernel-npu"
+        ):
+            pool._configure_ascend_mamba_io()
 
     def test_conv_only_components_skip_empty_temporal_state(self):
         pool = MambaPoolHost.__new__(MambaPoolHost)
