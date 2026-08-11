@@ -704,7 +704,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
             # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
-            draft_layers = 1
+            draft_layers = (
+                kvc.spec_aux_config.dflash_draft_num_layers
+                or kvc.spec_aux_config.eagle_draft_num_layers
+                or 1
+            )
             target_layers = self.num_layers_total
             self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
 
