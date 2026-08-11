@@ -124,11 +124,13 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
             get_algorithm(config)
 
     @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
-    def test_llada_config_provides_edit_token_ids(self, mock_model_config):
-        mock_model_config.return_value.hf_config.architectures = ["LLaDA2MoeModelLM"]
+    def test_official_llada22_config_provides_edit_token_ids(self, mock_model_config):
+        mock_model_config.return_value.hf_config = SimpleNamespace(
+            architectures=["LLaDA2MoeModelLM"]
+        )
         server_args = SimpleNamespace(
             dllm_algorithm="JointThresholdInDel",
-            model_path="model",
+            model_path="inclusionAI/LLaDA2.2-flash",
             revision=None,
             max_running_requests=None,
             dllm_algorithm_config=None,
@@ -143,11 +145,75 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
         self.assertTrue(config.first_done_first_out_mode)
 
     @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
-    def test_non_indel_model_has_no_edit_token_ids(self, mock_model_config):
-        mock_model_config.return_value.hf_config.architectures = ["SDARForCausalLM"]
+    def test_explicit_checkpoint_edit_token_ids_enable_indel(self, mock_model_config):
+        mock_model_config.return_value.hf_config = SimpleNamespace(
+            architectures=["LLaDA2MoeModelLM"],
+            delete_token_id=9,
+            split_token_id=10,
+        )
+        server_args = SimpleNamespace(
+            dllm_algorithm="JointThresholdInDel",
+            model_path="local/indel-checkpoint",
+            revision=None,
+            max_running_requests=4,
+            dllm_algorithm_config=None,
+            dllm_fdfo=False,
+        )
+
+        config = DllmConfig.from_server_args(server_args)
+
+        self.assertEqual(config.delete_token_id, 9)
+        self.assertEqual(config.split_token_id, 10)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_unsupported_checkpoint_rejects_indel_at_startup(self, mock_model_config):
+        mock_model_config.return_value.hf_config = SimpleNamespace(
+            architectures=["LLaDA2MoeModelLM"]
+        )
+        server_args = SimpleNamespace(
+            dllm_algorithm="JointThresholdInDel",
+            model_path="inclusionAI/LLaDA2.0-mini",
+            revision=None,
+            max_running_requests=4,
+            dllm_algorithm_config=None,
+            dllm_fdfo=False,
+        )
+
+        with self.assertRaises(RuntimeError) as context:
+            DllmConfig.from_server_args(server_args)
+
+        message = str(context.exception)
+        self.assertIn("inclusionAI/LLaDA2.0-mini", message)
+        self.assertIn("delete_token_id and split_token_id", message)
+        self.assertIn("--json-model-override-args", message)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_partial_checkpoint_edit_token_ids_are_rejected(self, mock_model_config):
+        mock_model_config.return_value.hf_config = SimpleNamespace(
+            architectures=["LLaDA2MoeModelLM"], delete_token_id=9
+        )
+        server_args = SimpleNamespace(
+            dllm_algorithm="JointThresholdInDel",
+            model_path="local/incomplete-indel-checkpoint",
+            revision=None,
+            max_running_requests=4,
+            dllm_algorithm_config=None,
+            dllm_fdfo=False,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "delete_token_id and split_token_id"):
+            DllmConfig.from_server_args(server_args)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_non_indel_algorithm_does_not_require_edit_token_ids(
+        self, mock_model_config
+    ):
+        mock_model_config.return_value.hf_config = SimpleNamespace(
+            architectures=["LLaDA2MoeModelLM"]
+        )
         server_args = SimpleNamespace(
             dllm_algorithm="JointThreshold",
-            model_path="model",
+            model_path="inclusionAI/LLaDA2.0-mini",
             revision=None,
             max_running_requests=4,
             dllm_algorithm_config=None,
@@ -346,22 +412,13 @@ class TestJointThresholdInDelSelection(CustomTestCase):
 
 
 class TestJointThresholdInDelTermination(CustomTestCase):
-    def test_post_edit_boundary_then_final_cleanup_scrubs_all_reserved_tokens(self):
+    def test_budget_one_final_cleanup_scrubs_all_reserved_tokens(self):
         algorithm = JointThresholdInDel(
             make_config(block_size=4, max_post_edit_steps=1)
         )
         batch = make_batch([[3, MASK, MASK, 4]])
         state = algorithm.init_step_state(batch)[0]
         state["is_orig_mask"] = torch.zeros(4, dtype=torch.bool)
-        ordinary_logits = make_logits([[3], [MASK, 5], [MASK, 6], [4]])
-
-        done = algorithm.step(batch, ordinary_logits, [state])
-
-        self.assertEqual(done, [False])
-        self.assertEqual(state["post_edit_steps"], 1)
-        self.assertFalse(state["finished"])
-        self.assertEqual(batch.input_ids.tolist(), [3, MASK, MASK, 4])
-
         logits = make_logits(
             [
                 [DELETE, 8],
@@ -452,7 +509,7 @@ class TestJointThresholdInDelTermination(CustomTestCase):
 
 
 class TestJointThresholdInDelFdfo(CustomTestCase):
-    def test_fdfo_run_preserves_state_across_request_retirement(self):
+    def test_fdfo_budget_zero_cleans_up_while_resolving_last_original_mask(self):
         algorithm = JointThresholdInDel(
             make_config(block_size=3, max_post_edit_steps=0, fdfo=True)
         )
@@ -465,13 +522,12 @@ class TestJointThresholdInDelFdfo(CustomTestCase):
                         [4],
                         [5],
                         [3],
-                        [6],
-                        [4],
+                        [SPLIT, 6],
+                        [DELETE, 7],
                     ]
                 )
             ),
-            make_model_output(make_logits([[3], [7], [4]])),
-            make_model_output(make_logits([[3], [7], [4]])),
+            make_model_output(make_logits([[3], [6], [7]])),
         ]
 
         batch = make_batch([[3, 4, 5], [3, MASK, 4]])
@@ -481,19 +537,54 @@ class TestJointThresholdInDelFdfo(CustomTestCase):
 
         self.assertEqual(accept_lengths, [3, 0])
         self.assertIsNone(algo_states[0])
-        self.assertEqual(next_token_ids[1], [3, 6, 4])
+        self.assertEqual(next_token_ids[1], [3, 6, 7])
         surviving_state = algo_states[1]
         self.assertEqual(surviving_state["num_update_steps"], 1)
+        self.assertEqual(surviving_state["post_edit_steps"], 0)
+        self.assertTrue(surviving_state["finished"])
 
         batch = make_batch([next_token_ids[1]])
         _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
             model_runner, batch, [surviving_state]
         )
 
+        self.assertEqual(accept_lengths, [3])
+        self.assertEqual(next_token_ids, [[3, 6, 7]])
+        self.assertEqual(algo_states, [None])
+        self.assertEqual(model_runner.forward.call_count, 2)
+
+    def test_fdfo_budget_one_uses_first_post_edit_round_for_cleanup(self):
+        algorithm = JointThresholdInDel(
+            make_config(block_size=3, max_post_edit_steps=1, fdfo=True)
+        )
+        model_runner = Mock()
+        model_runner.forward.side_effect = [
+            make_model_output(make_logits([[3], [6], [4]])),
+            make_model_output(make_logits([[3], [DELETE, 7], [SPLIT, 8]])),
+            make_model_output(make_logits([[3], [7], [8]])),
+        ]
+
+        batch = make_batch([[3, MASK, 4]])
+        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
+            model_runner, batch
+        )
+
         self.assertEqual(accept_lengths, [0])
-        self.assertEqual(next_token_ids, [[3, 7, 4]])
-        self.assertIs(algo_states[0], surviving_state)
-        self.assertTrue(surviving_state["finished"])
+        self.assertEqual(next_token_ids, [[3, 6, 4]])
+        state = algo_states[0]
+        self.assertEqual(state["post_edit_steps"], 0)
+        self.assertFalse(state["finished"])
+
+        batch = make_batch(next_token_ids)
+        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
+            model_runner, batch, algo_states
+        )
+
+        self.assertEqual(accept_lengths, [0])
+        self.assertEqual(next_token_ids, [[3, 7, 8]])
+        self.assertIs(algo_states[0], state)
+        self.assertEqual(state["post_edit_steps"], 1)
+        self.assertTrue(state["finished"])
 
         batch = make_batch(next_token_ids)
         _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
@@ -501,7 +592,7 @@ class TestJointThresholdInDelFdfo(CustomTestCase):
         )
 
         self.assertEqual(accept_lengths, [3])
-        self.assertEqual(next_token_ids, [[3, 7, 4]])
+        self.assertEqual(next_token_ids, [[3, 7, 8]])
         self.assertEqual(algo_states, [None])
         self.assertEqual(model_runner.forward.call_count, 3)
 

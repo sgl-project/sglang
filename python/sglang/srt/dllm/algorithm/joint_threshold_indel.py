@@ -148,8 +148,13 @@ class JointThresholdInDel(DllmAlgorithm):
             if original_mask_count == 0:
                 state["post_edit_steps"] += 1
 
+            post_edit_limit_reached = (
+                self.max_post_edit_steps > 0
+                and state["post_edit_steps"] >= self.max_post_edit_steps
+            )
             is_final_cleanup = (
-                state["post_edit_steps"] > self.max_post_edit_steps
+                post_edit_limit_reached
+                or (self.max_post_edit_steps == 0 and original_mask_count == 0)
                 or state["num_update_steps"] > self.max_regular_update_steps
             )
 
@@ -194,6 +199,16 @@ class JointThresholdInDel(DllmAlgorithm):
                             mask_transfer_index[selected_positions] = True
                 else:
                     mask_transfer_index = mask_index
+
+            # With no post-edit rounds, the update that selects the last
+            # unresolved original masks also performs final cleanup.
+            if (
+                self.max_post_edit_steps == 0
+                and original_mask_count > 0
+                and not (original_mask_index & ~mask_transfer_index).any().item()
+            ):
+                is_final_cleanup = True
+                mask_transfer_index = mask_index & ~curr_prompt_index
 
             # T2T: edit non-mask, non-prompt positions where model disagrees
             edit_mask = ~mask_index & ~curr_prompt_index

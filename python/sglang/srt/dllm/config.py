@@ -3,6 +3,13 @@ from typing import Any
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
+INDEL_CHECKPOINT_PARAMS = {
+    "inclusionAI/LLaDA2.2-flash": {
+        "delete_token_id": 156930,
+        "split_token_id": 156931,
+    },
+}
+
 
 class DllmConfig:
     def __init__(
@@ -44,8 +51,6 @@ class DllmConfig:
             "LLaDA2MoeModelLM": {
                 "block_size": 32,
                 "mask_id": 156895,
-                "delete_token_id": 156930,
-                "split_token_id": 156931,
             },
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
@@ -56,10 +61,36 @@ class DllmConfig:
             params = DLLM_PARAMS[arch]
             block_size = params["block_size"]
             mask_id = params["mask_id"]
-            delete_token_id = params.get("delete_token_id")
-            split_token_id = params.get("split_token_id")
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+
+        delete_token_id = None
+        split_token_id = None
+        if server_args.dllm_algorithm == "JointThresholdInDel":
+            delete_token_id = getattr(model_config.hf_config, "delete_token_id", None)
+            split_token_id = getattr(model_config.hf_config, "split_token_id", None)
+
+            if delete_token_id is None and split_token_id is None:
+                checkpoint_params = INDEL_CHECKPOINT_PARAMS.get(server_args.model_path)
+                if checkpoint_params is not None:
+                    delete_token_id = checkpoint_params["delete_token_id"]
+                    split_token_id = checkpoint_params["split_token_id"]
+
+            if delete_token_id is None or split_token_id is None:
+                override_example = (
+                    '{"delete_token_id": 156930, "split_token_id": 156931}'
+                )
+                raise RuntimeError(
+                    "JointThresholdInDel is not supported for checkpoint "
+                    f"{server_args.model_path!r}: the checkpoint must declare both "
+                    "delete_token_id and split_token_id. Use a checkpoint with "
+                    "explicit Insert/Delete support. If you are certain this "
+                    "checkpoint was trained for Insert/Delete decoding, declare the "
+                    "correct token IDs in config.json or pass them with "
+                    "`--json-model-override-args "
+                    f"'{override_example}'`. "
+                    "Use the token IDs defined by your checkpoint."
+                )
 
         max_running_requests = (
             1 if cfg.max_running_requests is None else cfg.max_running_requests
