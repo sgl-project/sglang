@@ -76,7 +76,7 @@ struct FusedQNormRopeParams {
   float eps;
 };
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL, bool kBlockPerToken = true>
 Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams params) {
   using namespace device;
 
@@ -90,95 +90,220 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
   static_assert(kRopeSize <= kWarpThreads);
   static_assert(kRopeDim == kWarpThreads * 2, "1 (real, imag) pair per lane");
 
+  // fp8: 2 work-items/warp so their loads overlap (latency-bound); bf16: 1
+  // (bandwidth-bound, a 2nd item just adds register pressure). Per-item math is
+  // identical either way -> the output is bitwise-identical for both.
+  constexpr uint32_t kWorkPerWarp = (sizeof(DType) == 1) ? 2u : 1u;
+
   using Storage = AlignedVector<DType, kVecSize>;
+  using DType2 = packed_t<DType>;
+  constexpr bool kVecConvert = (sizeof(DType) == 1);  // fp8 only
+  // fp8 shares one freq row per token across its heads (block-per-token), but
+  // only when the grid fills the SMs; the host picks kBlockPerToken=false at
+  // small N (crossover total_works>=kBPTMinWorks). bf16 never uses it.
+  // Dispatch-only, so the per-work-item math is byte-identical.
+  constexpr bool kUseBPT = kVecConvert && kBlockPerToken;
 
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
-  const auto work_id = blockIdx.x * kFusedQNumWarps + warp_id;
-
   const uint32_t total_works = params.batch_size * params.num_q_heads;
-  if (work_id >= total_works) return;
 
-  const uint32_t batch_id = work_id / params.num_q_heads;
-  const uint32_t head_id = work_id % params.num_q_heads;
-  const auto input_ptr =
-      static_cast<const DType*>(params.q_input) + batch_id * params.q_input_stride_batch + head_id * kHeadDim;
-  const auto output_ptr =
-      static_cast<DType*>(params.q_output) + batch_id * params.q_output_stride_batch + head_id * kHeadDim;
-  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
-
+  // rope-tail staging. fp8's part-2 read is 32 lanes x fp8x2 (2B) -> 2 lanes
+  // share a 4B SMEM bank; pad each pair to its own 4B slot to avoid that. bf16
+  // pairs are already 4B, so bf16 keeps the packed layout.
   __shared__ Storage s_rope[kFusedQNumWarps][kRopeSize];
-
-  // Prefetch this lane's freq pair before the PDL gate so the wait happens
-  // outside the dependency chain on `position`.
-  const auto mem_freq = tile::Memory<fp32x2_t>{lane_id, kWarpThreads};
-
-  PDLWaitPrimary<kUsePDL>();
-
-  // part 1: rmsnorm-self (no weight).
+  __shared__ uint32_t s_rope_pad[kFusedQNumWarps][kVecConvert ? kWarpThreads : 1];
+  // fp8 block-per-token: one freq row shared by all heads of the block's token.
+  __shared__ fp32x2_t s_freq[kVecConvert ? kWarpThreads : 1];
   const auto gmem = tile::Memory<Storage>{lane_id, kWarpThreads};
-  Storage input_vec[kLocalSize];
-#pragma unroll
-  for (int i = 0; i < kLocalSize; ++i) {
-    input_vec[i] = gmem.load(input_ptr, i);
-  }
-
-  const auto freq = mem_freq.load(params.freqs_cis + position * kRopeDim);
-
-  float sum_of_squares = 0.0f;
-#pragma unroll
-  for (int i = 0; i < kLocalSize; ++i) {
-#pragma unroll
-    for (int j = 0; j < kVecSize; ++j) {
-      const auto x = cast<float>(input_vec[i][j]);
-      sum_of_squares += x * x;
-    }
-  }
-  sum_of_squares = warp::reduce_sum(sum_of_squares);
-  const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
-
-#pragma unroll
-  for (int i = 0; i < kLocalSize; ++i) {
-#pragma unroll
-    for (int j = 0; j < kVecSize; ++j) {
-      const auto x = cast<float>(input_vec[i][j]);
-      input_vec[i][j] = cast<DType>(x * norm_factor);
-    }
-  }
-
-  // Stash the rope tail (last kRopeSize lanes' last tile) into shared memory;
-  // write nope tiles to gmem directly.
+  const auto mem_freq = tile::Memory<fp32x2_t>{lane_id, kWarpThreads};
   const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
+
+  // Per-work-item context + a hoisted input load (all loads issued first).
+  Storage input_vec[kWorkPerWarp][kLocalSize];
+  const DType* out_ptr[kWorkPerWarp];
+  int32_t position[kWorkPerWarp];  // bf16 path only; fp8 uses shared s_freq
+  uint32_t n_work;
+
+  if constexpr (kUseBPT) {
+    // ---- fp8: block-per-token dispatch. A block is pinned to one token and
+    // covers up to kHeadsPerBlock consecutive heads; the token's freq row is
+    // loaded ONCE into s_freq (warp 0) and reused. freq is exact fp32 so the
+    // shared value is bit-neutral -> the output is unchanged. All warps reach
+    // __syncthreads (no divergent return); out-of-range warps just do zero
+    // work-items.
+    constexpr uint32_t kHeadsPerBlock = kFusedQNumWarps * kWorkPerWarp;
+    const uint32_t blocks_per_token = (params.num_q_heads + kHeadsPerBlock - 1) / kHeadsPerBlock;
+    const uint32_t token = blockIdx.x / blocks_per_token;
+    const uint32_t head_block = blockIdx.x % blocks_per_token;
+    const uint32_t head_base = head_block * kHeadsPerBlock + warp_id * kWorkPerWarp;
+    const int32_t tpos = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[token]);
+
+    PDLWaitPrimary<kUsePDL>();
+
+    if (warp_id == 0) {
+      s_freq[lane_id] = mem_freq.load(params.freqs_cis + tpos * kRopeDim);
+    }
+
+    n_work = (head_base >= params.num_q_heads)
+                 ? 0u
+                 : ((params.num_q_heads - head_base < kWorkPerWarp) ? (params.num_q_heads - head_base) : kWorkPerWarp);
+
 #pragma unroll
-  for (int i = 0; i < kLocalSize; ++i) {
-    if (i == kLocalSize - 1 && is_rope_lane) {
-      const auto rope_id = lane_id - (kWarpThreads - kRopeSize);
-      s_rope[warp_id][rope_id] = input_vec[i];
-    } else {
-      gmem.store(output_ptr, input_vec[i], i);
+    for (uint32_t w = 0; w < kWorkPerWarp; ++w) {
+      const uint32_t head_id = head_base + w;
+      const uint32_t chead = (head_id < params.num_q_heads) ? head_id : (params.num_q_heads - 1);
+      const auto in_ptr =
+          static_cast<const DType*>(params.q_input) + token * params.q_input_stride_batch + chead * kHeadDim;
+      out_ptr[w] = static_cast<DType*>(params.q_output) + token * params.q_output_stride_batch + chead * kHeadDim;
+#pragma unroll
+      for (int i = 0; i < kLocalSize; ++i) {
+        input_vec[w][i] = gmem.load(in_ptr, i);
+      }
+    }
+    __syncthreads();  // s_freq visible to all warps before part 2
+  } else {
+    // ---- warp-per-(token, head) dispatch (bf16 always; fp8 at small N). -----
+    const auto warp_slot = blockIdx.x * kFusedQNumWarps + warp_id;
+    const auto work_base = warp_slot * kWorkPerWarp;
+    if (work_base >= total_works) return;
+
+    PDLWaitPrimary<kUsePDL>();
+
+    n_work = (total_works - work_base < kWorkPerWarp) ? (total_works - work_base) : kWorkPerWarp;
+#pragma unroll
+    for (uint32_t w = 0; w < kWorkPerWarp; ++w) {
+      const uint32_t work_id = work_base + w;
+      const uint32_t clamped = (work_id < total_works) ? work_id : (total_works - 1);
+      const uint32_t batch_id = clamped / params.num_q_heads;
+      const uint32_t head_id = clamped % params.num_q_heads;
+      const auto in_ptr =
+          static_cast<const DType*>(params.q_input) + batch_id * params.q_input_stride_batch + head_id * kHeadDim;
+      out_ptr[w] = static_cast<DType*>(params.q_output) + batch_id * params.q_output_stride_batch + head_id * kHeadDim;
+      position[w] = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
+#pragma unroll
+      for (int i = 0; i < kLocalSize; ++i) {
+        input_vec[w][i] = gmem.load(in_ptr, i);
+      }
     }
   }
-  __syncwarp();
+
+  // Process each in-range work-item; math identical to the 1-item baseline.
+#pragma unroll
+  for (uint32_t w = 0; w < kWorkPerWarp; ++w) {
+    if (w >= n_work) break;
+    const auto output_ptr = const_cast<DType*>(out_ptr[w]);
+    fp32x2_t freq;
+    if constexpr (kUseBPT) {
+      freq = s_freq[lane_id];
+    } else {
+      freq = mem_freq.load(params.freqs_cis + position[w] * kRopeDim);
+    }
+
+    float sum_of_squares = 0.0f;
+    if constexpr (kVecConvert) {
+      // Vectorized fp8<->fp32: one hardware convert per pair instead of two
+      // scalar ones (fp8 is instruction-issue bound). device::cast<fp32x2_t> and
+      // device::cast<DType2> use the same round as scalar static_cast, and the
+      // accumulation order is preserved (pair p -> elem 2p then 2p+1), so the
+      // output stays bitwise-identical.
+      constexpr int kPairs = kVecSize / 2;
+#pragma unroll
+      for (int i = 0; i < kLocalSize; ++i) {
+        const auto* vp = reinterpret_cast<const DType2*>(input_vec[w][i].data());
+#pragma unroll
+        for (int p = 0; p < kPairs; ++p) {
+          const auto f = cast<fp32x2_t>(vp[p]);
+          sum_of_squares += f.x * f.x;
+          sum_of_squares += f.y * f.y;
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < kLocalSize; ++i) {
+#pragma unroll
+        for (int j = 0; j < kVecSize; ++j) {
+          const auto x = cast<float>(input_vec[w][i][j]);
+          sum_of_squares += x * x;
+        }
+      }
+    }
+    sum_of_squares = warp::reduce_sum(sum_of_squares);
+    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+    if constexpr (kVecConvert) {
+      constexpr int kPairs = kVecSize / 2;
+#pragma unroll
+      for (int i = 0; i < kLocalSize; ++i) {
+        auto* vp = reinterpret_cast<DType2*>(input_vec[w][i].data());
+#pragma unroll
+        for (int p = 0; p < kPairs; ++p) {
+          const auto f = cast<fp32x2_t>(vp[p]);
+          vp[p] = cast<DType2>(fp32x2_t{f.x * norm_factor, f.y * norm_factor});
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < kLocalSize; ++i) {
+#pragma unroll
+        for (int j = 0; j < kVecSize; ++j) {
+          const auto x = cast<float>(input_vec[w][i][j]);
+          input_vec[w][i][j] = cast<DType>(x * norm_factor);
+        }
+      }
+    }
+
+    // Streaming store (st.cs) of nope tiles; stash rope tile to shared.
+#pragma unroll
+    for (int i = 0; i < kLocalSize; ++i) {
+      if (i == kLocalSize - 1 && is_rope_lane) {
+        const auto rope_id = lane_id - (kWarpThreads - kRopeSize);
+        if constexpr (kVecConvert) {
+          // fp8: spread this lane's pairs into 4B slots (bank-conflict-free read).
+          const auto* pr = reinterpret_cast<const DType2*>(input_vec[w][i].data());
+#pragma unroll
+          for (int p = 0; p < kVecSize / 2; ++p) {
+            s_rope_pad[warp_id][rope_id * (kVecSize / 2) + p] =
+                static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&pr[p]));
+          }
+        } else {
+          s_rope[warp_id][rope_id] = input_vec[w][i];
+        }
+      } else {
+        static_assert(sizeof(Storage) == 16, "expect 128-bit nope tile");
+        __stcs(
+            reinterpret_cast<int4*>(output_ptr) + (lane_id + i * kWarpThreads),
+            *reinterpret_cast<const int4*>(&input_vec[w][i]));
+      }
+    }
+    __syncwarp();
+
+    // part 2: RoPE on all 32 lanes -- one (real, imag) pair per lane.
+    const auto mem_elem = tile::Memory<DType2>{lane_id, kWarpThreads};
+    DType2 elem;
+    if constexpr (kVecConvert) {
+      const uint16_t raw = static_cast<uint16_t>(s_rope_pad[warp_id][lane_id]);
+      elem = *reinterpret_cast<const DType2*>(&raw);
+    } else {
+      elem = mem_elem.load(s_rope[warp_id]);
+    }
+    const auto [x_real, x_imag] = cast<fp32x2_t>(elem);
+    const auto [freq_real, freq_imag] = freq;
+    const fp32x2_t rotated = {
+        x_real * freq_real - x_imag * freq_imag,
+        x_real * freq_imag + x_imag * freq_real,
+    };
+    mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
+    if (w + 1 < n_work) __syncwarp();  // fence only before next item reuses s_rope
+  }
 
   PDLTriggerSecondary<kUsePDL>();
-
-  // part 2: RoPE on all 32 lanes -- one (real, imag) bf16x2 pair per lane.
-  using DType2 = packed_t<DType>;
-  const auto mem_elem = tile::Memory<DType2>{lane_id, kWarpThreads};
-  const auto elem = mem_elem.load(s_rope[warp_id]);
-  const auto [x_real, x_imag] = cast<fp32x2_t>(elem);
-  const auto [freq_real, freq_imag] = freq;
-  const fp32x2_t rotated = {
-      x_real * freq_real - x_imag * freq_imag,
-      x_real * freq_imag + x_imag * freq_real,
-  };
-  mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
 }
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
 struct FusedQNormRopeKernel {
-  template <typename PosT>
-  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL>;
+  template <typename PosT, bool kBlockPerToken>
+  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, kBlockPerToken>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -229,10 +354,22 @@ struct FusedQNormRopeKernel {
         .eps = eps,
     };
     const auto total_works = batch_size * num_q_heads;
-    const auto num_blocks = div_ceil(total_works, kFusedQNumWarps);
-    const auto k_int32 = kernel<int32_t>;
-    const auto k_int64 = kernel<int64_t>;
-    const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
+    constexpr uint32_t kWorkPerWarp = (sizeof(DType) == 1) ? 2u : 1u;
+    constexpr bool kVecConvert = (sizeof(DType) == 1);
+    constexpr uint32_t kHeadsPerBlock = kFusedQNumWarps * kWorkPerWarp;
+    // Shape dispatch (fp8 only): block-per-token wins once the grid fills the
+    // SMs but loses to warp-per-work at small N (crossover total_works~4096).
+    constexpr uint32_t kBPTMinWorks = 4096;
+    const bool use_bpt = kVecConvert && (total_works >= kBPTMinWorks);
+
+    uint32_t num_blocks;
+    if (use_bpt) {
+      num_blocks = batch_size * div_ceil(num_q_heads, kHeadsPerBlock);
+    } else {
+      num_blocks = div_ceil(total_works, kFusedQNumWarps * kWorkPerWarp);
+    }
+    const auto k = pos_dtype.is_type<int32_t>() ? (use_bpt ? kernel<int32_t, true> : kernel<int32_t, false>)
+                                                : (use_bpt ? kernel<int64_t, true> : kernel<int64_t, false>);
     LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
   }
