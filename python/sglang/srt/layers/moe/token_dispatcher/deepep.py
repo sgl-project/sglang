@@ -356,6 +356,7 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        num_trailing_shared_slots: int,
     ):
         if not use_deepep:
             raise ImportError(
@@ -371,6 +372,7 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.num_trailing_shared_slots = num_trailing_shared_slots
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
@@ -597,6 +599,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             num_tokens_per_expert=num_tokens_per_expert,
+            num_trailing_shared_slots=self.num_trailing_shared_slots,
         )
 
         return (
@@ -658,9 +661,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     dispatch_mode = DeepEPMode.LOW_LATENCY
 
-    def __init__(
-        self, return_recv_hook: bool, num_trailing_shared_slots: int, **kwargs
-    ):
+    def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
         """
@@ -668,7 +669,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         """
         self.return_recv_hook = return_recv_hook
-        self.num_trailing_shared_slots = num_trailing_shared_slots
         self.device_module = torch.get_device_module()
         self.quant_config = {}
 
@@ -902,12 +902,12 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            num_trailing_shared_slots=num_trailing_shared_slots,
         )
 
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
                 return_recv_hook=return_recv_hook,
-                num_trailing_shared_slots=num_trailing_shared_slots,
                 **common_kwargs,
             )
         if self.deepep_mode.enable_normal():

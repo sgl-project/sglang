@@ -7,12 +7,14 @@ import torch
 
 from sglang.srt.eplb.expert_distribution import (
     _DeepepLowLatencySinglePassGatherer,
+    _DeepepNormalSinglePassGatherer,
     _ExpertDistributionRecorderReal,
 )
 from sglang.srt.layers.moe.fused_moe_triton import layer
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPDispatcher,
     _DeepEPDispatcherImplLowLatency,
+    _DeepEPDispatcherImplNormal,
 )
 from sglang.srt.layers.moe.token_dispatcher.moriep import (
     MoriEPDispatcher,
@@ -42,6 +44,13 @@ def _gatherer(width, *, elastic=False):
     return gatherer
 
 
+def _normal_gatherer():
+    gatherer = object.__new__(_DeepepNormalSinglePassGatherer)
+    gatherer._expert_location_metadata = SimpleNamespace(num_layers=1)
+    gatherer._objects_of_layer = {}
+    return gatherer
+
+
 def _runner_config(num_fused_shared_experts=2):
     return SimpleNamespace(
         top_k=8,
@@ -66,6 +75,20 @@ class TestDeepEPLowLatencySharedSlots(CustomTestCase):
         torch.testing.assert_close(
             gatherer._data, torch.tensor([[3, 5]], dtype=torch.int32)
         )
+
+    def test_normal_recorder_drops_trailing_shared_slots(self):
+        gatherer = _normal_gatherer()
+
+        gatherer.on_deepep_dispatch_normal(
+            0,
+            [3, 5, 101, 103],
+            num_tokens_per_rank=None,
+            num_tokens_per_rdma_rank=None,
+            num_tokens_per_expert=None,
+            num_trailing_shared_slots=2,
+        )
+
+        self.assertEqual(gatherer._objects_of_layer, {0: [3, 5]})
 
     def test_routed_length_is_derived_for_each_elastic_callback(self):
         gatherer = _gatherer(2, elastic=True)
@@ -108,7 +131,7 @@ class TestDeepEPLowLatencySharedSlots(CustomTestCase):
                     num_trailing_shared_slots=value,
                 )
 
-    def test_active_low_latency_recorders_require_the_layout_contract(self):
+    def test_active_dispatchers_require_the_layout_contract(self):
         for dispatcher_cls in (DeepEPDispatcher, MoriEPDispatcher):
             with self.subTest(dispatcher=dispatcher_cls.__name__):
                 param = inspect.signature(dispatcher_cls.__init__).parameters[
@@ -140,6 +163,22 @@ class TestDeepEPLowLatencySharedSlots(CustomTestCase):
             num_trailing_shared_slots=2,
         )
 
+        recorder.on_deepep_dispatch_normal(
+            [3, 5, 101, 103],
+            num_tokens_per_rank=None,
+            num_tokens_per_rdma_rank=None,
+            num_tokens_per_expert=None,
+            num_trailing_shared_slots=2,
+        )
+        gatherer.on_deepep_dispatch_normal.assert_called_once_with(
+            layer_idx=3,
+            local_physical_count_of_layer=[3, 5, 101, 103],
+            num_tokens_per_rank=None,
+            num_tokens_per_rdma_rank=None,
+            num_tokens_per_expert=None,
+            num_trailing_shared_slots=2,
+        )
+
     def test_deepep_dispatch_forwards_the_layout_contract(self):
         dispatcher = object.__new__(_DeepEPDispatcherImplLowLatency)
         dispatcher.return_recv_hook = True
@@ -164,6 +203,63 @@ class TestDeepEPLowLatencySharedSlots(CustomTestCase):
 
         recorder.on_deepep_dispatch_low_latency.assert_called_once_with(
             masked_m,
+            num_trailing_shared_slots=2,
+        )
+
+    def test_deepep_normal_dispatch_forwards_the_layout_contract(self):
+        dispatcher = object.__new__(_DeepEPDispatcherImplNormal)
+        dispatcher.async_finish = False
+        dispatcher.num_experts = 4
+        dispatcher.num_trailing_shared_slots = 2
+        local_count = [3, 5, 101, 103]
+        event = object()
+        buffer = Mock()
+        buffer.get_dispatch_layout.return_value = (
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        buffer.dispatch.return_value = (
+            torch.empty((0, 8)),
+            torch.empty((0, 1), dtype=torch.int64),
+            torch.empty((0, 1)),
+            local_count,
+            object(),
+            event,
+        )
+        dispatcher._get_buffer = Mock(return_value=buffer)
+        recorder = Mock()
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.deepep."
+                "_deepep_precompile_tp_barrier"
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.deepep."
+                "DeepEPConfig.get_instance",
+                return_value=SimpleNamespace(normal_dispatch_config=object()),
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.deepep."
+                "get_global_expert_distribution_recorder",
+                return_value=recorder,
+            ),
+        ):
+            dispatcher._dispatch_core(
+                x=torch.empty((0, 8)),
+                topk_ids=torch.empty((0, 1), dtype=torch.int64),
+                topk_weights=torch.empty((0, 1)),
+                previous_event=None,
+            )
+
+        recorder.on_deepep_dispatch_normal.assert_called_once_with(
+            local_count,
+            num_tokens_per_rank=None,
+            num_tokens_per_rdma_rank=None,
+            num_tokens_per_expert=None,
             num_trailing_shared_slots=2,
         )
 

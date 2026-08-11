@@ -386,7 +386,8 @@ class _MoriEPDispatcherImplBase:
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
         instance_id: int = 0,
-        num_trailing_shared_slots: int = 0,
+        *,
+        num_trailing_shared_slots: int,
     ):
         try:
             import mori  # noqa: F401

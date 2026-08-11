@@ -104,6 +104,8 @@ class ExpertDistributionRecorder(ABC):
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
+        *,
+        num_trailing_shared_slots: int = 0,
     ):
         pass
 
@@ -218,6 +220,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
+        *,
+        num_trailing_shared_slots: int = 0,
     ):
         self._on_hook(
             "on_deepep_dispatch_normal",
@@ -225,6 +229,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             num_tokens_per_expert=num_tokens_per_expert,
+            num_trailing_shared_slots=num_trailing_shared_slots,
         )
 
     def on_deepep_dispatch_low_latency(
@@ -366,6 +371,8 @@ class _SinglePassGatherer(ABC):
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
+        *,
+        num_trailing_shared_slots: int = 0,
     ):
         pass
 
@@ -436,6 +443,8 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
+        *,
+        num_trailing_shared_slots: int = 0,
     ):
         self._misc_objects.append(
             dict(
@@ -553,6 +562,27 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         )
 
 
+def _drop_trailing_shared_slots(
+    local_physical_count_of_layer: List[int] | torch.Tensor,
+    num_trailing_shared_slots: int,
+) -> List[int] | torch.Tensor:
+    if isinstance(num_trailing_shared_slots, bool) or not isinstance(
+        num_trailing_shared_slots, int
+    ):
+        raise TypeError("num_trailing_shared_slots must be an int")
+
+    num_reported_slots = len(local_physical_count_of_layer)
+    if not 0 <= num_trailing_shared_slots <= num_reported_slots:
+        raise ValueError(
+            "num_trailing_shared_slots must be between 0 and the number "
+            f"of reported slots ({num_reported_slots}), got "
+            f"{num_trailing_shared_slots}"
+        )
+    if num_trailing_shared_slots:
+        return local_physical_count_of_layer[:-num_trailing_shared_slots]
+    return local_physical_count_of_layer
+
+
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -569,8 +599,13 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
+        *,
+        num_trailing_shared_slots: int = 0,
     ):
         assert isinstance(local_physical_count_of_layer, list)
+        local_physical_count_of_layer = _drop_trailing_shared_slots(
+            local_physical_count_of_layer, num_trailing_shared_slots
+        )
         self._on_layer_data(layer_idx, local_physical_count_of_layer)
 
     def collect(self) -> Dict:
@@ -598,21 +633,9 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         *,
         num_trailing_shared_slots: int = 0,
     ):
-        if isinstance(num_trailing_shared_slots, bool) or not isinstance(
-            num_trailing_shared_slots, int
-        ):
-            raise TypeError("num_trailing_shared_slots must be an int")
-
-        num_slots = local_physical_count_of_layer.shape[0]
-        if not 0 <= num_trailing_shared_slots <= num_slots:
-            raise ValueError(
-                "num_trailing_shared_slots must be between 0 and the number "
-                f"of reported slots ({num_slots}), got {num_trailing_shared_slots}"
-            )
-        if num_trailing_shared_slots:
-            local_physical_count_of_layer = local_physical_count_of_layer[
-                :-num_trailing_shared_slots
-            ]
+        local_physical_count_of_layer = _drop_trailing_shared_slots(
+            local_physical_count_of_layer, num_trailing_shared_slots
+        )
 
         if local_physical_count_of_layer.shape[0] != self._data.shape[1]:
             if not self._elastic_ep_enabled:
