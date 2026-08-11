@@ -148,14 +148,9 @@ def plan_dcp_decode_metadata(
     local_kv_lens.clamp_(min=0)
 
     if static_local_len_bounds is not None:
-        # (max, total) UPPER BOUNDS supplied by the caller in place of the exact
-        # values, for callers that can afford neither a GPU->CPU sync nor a CPU
-        # length array (cuda-graph target-verify, whose CPU seq_lens carries the
-        # verify window while the device one does not). Over-estimating is safe:
-        # max_local_len only sizes the triton grid, whose kernel masks per row,
-        # and total_local_len only over-allocates local_kv_indices and copies a
-        # longer tail into kv_indices -- a tail that is rebuilt from
-        # req_to_token every step and that kv_indptr never exposes to a reader.
+        # (max, total) upper bounds for callers that can afford neither a
+        # GPU->CPU sync nor a CPU length array (cuda-graph target-verify).
+        # Over-estimating only sizes a grid and over-allocates a tail nobody reads.
         max_local_len, total_local_len = static_local_len_bounds
     elif not init_metadata_replay:
         max_local_len = (

@@ -512,9 +512,8 @@ class DeepseekMLARocmForwardMixin:
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
 
-        # Under DCP the fused rope+cache-write kernel writes at the *virtual*
-        # out_cache_loc (wrong under the DCP virtual allocator), so force the
-        # standalone rope for the aiter decode-context-parallel path.
+        # The fused rope+cache-write kernel writes at the virtual out_cache_loc,
+        # which is wrong under DCP, so force the standalone rope there.
         force_rope_for_dcp_decode = (
             get_parallel().dcp_enabled
             and (
@@ -577,11 +576,8 @@ class DeepseekMLARocmForwardMixin:
                         q_pe=q_pe,
                     )
             elif forward_batch.forward_mode.is_extend():
-                # Assemble the full-sequence KV into dcp_kv_buffer: gather the
-                # cached prefix across dcp ranks (skipped internally when there is
-                # no prefix) and copy the in-hand new tokens. Always run so the
-                # new-token copy happens even in the no-prefix case; the backend
-                # then attends over dcp_kv_buffer (not the sharded local cache).
+                # Assemble the full sequence into dcp_kv_buffer, which the
+                # backend attends over instead of the sharded local cache.
                 if (
                     forward_batch.attn_dcp_metadata is not None
                     and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
@@ -736,32 +732,22 @@ class DeepseekMLARocmForwardMixin:
             )
             and get_parallel().dcp_enabled
         ):
-            # aiter DCP decode over this rank's round-robin KV shard. Q is already
-            # gathered across the dcp group in forward_absorb_prepare; write this
-            # rank's KV shard, then run the per-rank partial attention returning
-            # (out, lse) so the cross-rank merge below can combine partials.
-            # NOTE this cannot reuse is_dcp_mla_decode_phase(): that helper covers
-            # decode and target-verify only, and the draft-extend-v2 step needs the
-            # same treatment.
+            # aiter DCP decode over this rank's KV shard, returning (out, lse)
+            # for the cross-rank merge below. Cannot use is_dcp_mla_decode_phase():
+            # that helper omits draft-extend-v2, which needs the same treatment.
             q = torch.cat([q_nope_out, q_pe], dim=-1)
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
-            # set_mla_kv_buffer's kernel takes the RAW virtual out_cache_loc and
-            # INTERNALLY owner-filters (loc % dcp_size == dcp_rank) and shards
-            # (loc // dcp_size), so pass the raw loc and the full k_nope/k_pe --
-            # pre-dividing or pre-masking here would double-apply the kernel's
-            # filter and corrupt the write.
+            # set_mla_kv_buffer owner-filters and shards internally, so pass the
+            # RAW loc: pre-dividing here would double-apply the filter.
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mqa,
                 forward_batch.out_cache_loc,
                 k_nope,
                 k_pe,
             )
-            # Decode reads everything it needs back from the KV shard, so it
-            # passes no k/v. TARGET_VERIFY cannot: the gamma+1 window it must
-            # attend densely is round-robin split across ranks the moment it
-            # lands in the cache, so hand the backend the in-hand window latent
-            # (v is its first kv_lora_rank columns, the MLA absorb form).
+            # Decode reads its KV back from the shard; target-verify cannot,
+            # since the window it must attend densely is split across ranks.
             if forward_batch.forward_mode.is_target_verify():
                 k_window = torch.cat([k_nope, k_pe], dim=-1)
                 v_window = k_nope

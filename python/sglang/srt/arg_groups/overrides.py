@@ -434,16 +434,9 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 
         prefill_backend, decode_backend = attention_backends_of(server_args)
         if decode_backend == "aiter":
-            # DCP decode runs aiter's MLA kernel over each rank's KV shard
-            # and merges the partials, by default with ag_rs
-            # (cp_lse_ag_out_rs_mla). --dcp-comm-backend a2a switches the merge to
-            # dcp_a2a_lse_reduce, which avoids the ag_rs reduce_scatter's grouped
-            # self-P2P RCCL path (sgl-project/sglang#32831).
-            #
-            # Prefill defaults to aiter's paged absorb-prefill;
-            # --prefill-attention-backend triton stays available and is
-            # KV-compatible, since both write the same latent KV the DCP
-            # decode reads.
+            # ag_rs merges the per-rank partials by default; --dcp-comm-backend
+            # a2a avoids its grouped self-P2P RCCL path (sgl-project/sglang#32831).
+            # Either prefill backend is KV-compatible: both write the same latent KV.
             prefill_ab = "triton" if prefill_backend == "triton" else "aiter"
             dcp_comm = (
                 server_args.dcp_comm_backend
@@ -460,17 +453,12 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="aiter",
                 dcp_comm_backend=dcp_comm,
             )
-            # ag_rs needs the head-dim Q all-gather, so replicated Q stays off;
-            # a2a/fi_a2a project the full-head Q locally instead.
+            # ag_rs needs the head-dim Q all-gather; a2a/fi_a2a project locally.
             if server_args.dcp_replicate_q_proj is None:
                 overrides["dcp_replicate_q_proj"] = dcp_comm in ("a2a", "fi_a2a")
             if server_args.page_size is None:
-                # The MLA decode takes its KV tile straight from the paged
-                # block size, and under DCP the allocator's page is
-                # page_size * dcp_size, so this gives each rank 32 contiguous
-                # physical slots per virtual page. 32 measured fastest across
-                # shapes; the extend path stages its own copy with its own page
-                # size (_DCP_PREFILL_PAGE_SIZE).
+                # The decode KV tile is the paged block size, and under DCP the
+                # allocator's page is page_size * dcp_size. 32 measured fastest.
                 overrides["page_size"] = 32
             return overrides
         if decode_backend == "cutedsl_mla" or decode_backend is None:

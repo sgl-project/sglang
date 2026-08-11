@@ -3881,14 +3881,8 @@ class ServerArgs:
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
                 )
 
-        # Only the aiter MLA decode backend runs this DCP path; the triton HIP
-        # DCP path has different constraints, so don't reject it here. Resolve
-        # the decode backend the same way the model overrides do
-        # (attention_backends_of: the split field falls back to the base one) --
-        # gating on self.attention_backend alone missed
-        # `--decode-attention-backend aiter` without `--attention-backend aiter`,
-        # which is exactly what the K3 PD recipe passes, so the fp8 rejection
-        # below never fired on it.
+        # Resolve the decode backend the way the model overrides do: gating on
+        # self.attention_backend alone misses --decode-attention-backend aiter.
         if self.dcp_size > 1 and is_hip():
             from sglang.srt.arg_groups.overrides import attention_backends_of
 
@@ -3910,14 +3904,8 @@ class ServerArgs:
         if model_config.attention_arch != AttentionArch.MLA:
             return
 
-        # TEMPORARY, removed by the triton-MLA-DCP fix later in this series.
-        # The triton extend path writes its MLA KV with a pre-divided location
-        # (`out_cache_loc // dcp_size`) while the pool owner-filters that same
-        # value with `loc % dcp_size == rank` and never divides, so the filter
-        # runs in the wrong coordinate space and only ~1/dcp_size of the tokens
-        # reach their owning rank. There is no error and no log line -- just
-        # degraded answers that get worse as dcp_size grows. Refuse the
-        # combination until the fix lands rather than serve it silently.
+        # TEMPORARY, lifted by the triton-MLA-DCP fix later in this series:
+        # that path double-filters its MLA KV writes under DCP, silently.
         if prefill_backend == "triton":
             raise ValueError(
                 "--prefill-attention-backend triton is not yet supported "
@@ -3929,8 +3917,6 @@ class ServerArgs:
         if "fp8" in (self.kv_cache_dtype or "") and not (
             envs.SGLANG_EXPERIMENTAL_AITER_DCP_FP8.get()
         ):
-            # Validated, but on one model/arch only, so it stays opt-in rather
-            # than becoming the default.
             raise ValueError(
                 "aiter MLA decode context parallel (--dcp-size > 1) defaults to "
                 "bf16 kv-cache. fp8 kv-cache has been validated for Kimi-K3 on "

@@ -138,18 +138,15 @@ class ForwardMetadata:
     # built once per forward instead of per layer. See build_dcp_page_table.
     dcp_block_table: Optional[torch.Tensor] = None
     dcp_local_kv_lens: Optional[torch.Tensor] = None
-    # DCP target-verify flattens the gamma+1 window into one single-token row
-    # per query token, so stage A needs its own [bs * q_len + 1] arange
-    # cu_seqlens_q (qo_indptr above stays the per-request window boundaries).
+    # Stage A flattens the window to one row per query token, so it needs its
+    # own arange cu_seqlens_q; qo_indptr stays the per-request boundaries.
     dcp_verify_qo_indptr: Optional[torch.Tensor] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
 
-# KV page size for the DCP extend path. mla_prefill_fwd sets TILE_SIZE == block_size
-# (the MLA kernel asserts NUM_BLOCKS_GATHER_PER_TILE == 1), and on gfx950 a
-# 16384x16384 chunk measured 5156 ms at 1, 55.8 ms at 16, 39.5 ms at 64. This is
-# a staging-buffer page size, independent of the KV pool's --page-size.
+# Staging page size for the DCP extend path, independent of --page-size. The KV
+# tile is the block size: a 16384^2 chunk measured 5156 ms at 1 vs 39.5 ms at 64.
 _DCP_PREFILL_PAGE_SIZE = 64
 
 
@@ -319,11 +316,8 @@ class AiterAttnBackend(AttentionBackend):
 
         if self.use_mla:
             self.dcp_world_size = get_attention_dcp_world_size()
-            # Under DCP the decode path runs an aiter MLA kernel
-            # (_mla_decode_fwd_dcp), which tiles the query heads and so
-            # serves any local head count. The {4,8,16k} constraint below
-            # applies to the non-DCP path only, so skip it under DCP
-            # (e.g. Kimi-K3 has 12 local heads at tp8).
+            # The DCP decode kernel tiles the query heads, so it serves any
+            # local head count; the check below is for the non-DCP path only.
             _valid_heads = self.num_head in (4, 8) or (
                 self.num_head % 16 == 0 and 16 <= self.num_head <= 128
             )
@@ -336,10 +330,8 @@ class AiterAttnBackend(AttentionBackend):
             self.num_head_padded = 16 if self.num_head < 16 else self.num_head
             self.head_repeat_factor = 16 // self.num_head if self.num_head < 16 else 1
 
-            # when DCP is on, it all-gathers Q across the dcp group, so the
-            # compute op as well as its persist metadata operates on the gathered
-            # head count num_head * dcp_world_size, not the local num_head.
-            # No op for non-dcp case
+            # Under DCP, Q is all-gathered, so this operates on the gathered
+            # head count num_head * dcp_world_size. No-op otherwise.
             _gathered_num_head = self.num_head * self.dcp_world_size
             self.mla_kernel_num_head_padded = (
                 16 if _gathered_num_head < 16 else _gathered_num_head
@@ -817,10 +809,8 @@ class AiterAttnBackend(AttentionBackend):
         per-(token, head) log-sum-exp so the caller can merge partial outputs
         across dcp ranks.
         """
-        # Head padding is driven by this call's ACTUAL query-head count
-        # (layer.tp_q_head_num), not the backend's static self.num_head: under DCP
-        # the dcp-group-gathered layer has num_local_heads * dcp_world_size heads,
-        # which is usually already >= 16 (no padding) even when num_local_heads < 16.
+        # Padding follows this call's actual head count, not self.num_head: under
+        # DCP the gathered layer usually already has >= 16 heads.
         n_heads = layer.tp_q_head_num
         repeat_factor = (16 // n_heads) if n_heads < 16 else 1
         if repeat_factor > 1:
@@ -829,9 +819,8 @@ class AiterAttnBackend(AttentionBackend):
                 (q.shape[0], n_heads * repeat_factor, layer.v_head_dim),
                 dtype=self.input_dtype,
             )
-            # Only opt into the (out, lse) tuple return under DCP; the non-DCP
-            # path keeps the legacy single-return contract so it stays agnostic
-            # to the installed aiter's mla_decode_fwd signature.
+            # Only ask for the (out, lse) tuple under DCP, so the non-DCP path
+            # stays agnostic to the installed aiter's signature.
             if return_lse:
                 _, lse = mla_decode_fwd(
                     q_in, k_buffer_flat, o, return_lse=True, **kwargs
@@ -895,9 +884,8 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         fm = self.forward_metadata
-        # kv_indptr was localized to this rank's round-robin shard by
-        # _plan_dcp_decode_metadata during init_forward_metadata, which also
-        # built the per-rank PAGE table (once per forward, not per layer).
+        # kv_indptr and the PAGE table were localized to this rank's shard by
+        # _plan_dcp_decode_metadata, once per forward rather than per layer.
         kv_indptr = fm.kv_indptr
         bs = kv_indptr.shape[0] - 1
         num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
@@ -906,12 +894,9 @@ class AiterAttnBackend(AttentionBackend):
 
         seqused_k = fm.dcp_local_kv_lens
         block_tables = fm.dcp_block_table
-        # Under cuda-graph capture/replay a GPU->CPU sync (.item()) is illegal, and
-        # a per-step max would make the kernel's NUM_SEGMENTS (and thus the segm-buffer
-        # shapes) vary between capture and replay. Pin max_local to a fixed
-        # per-graph upper bound (worst-case local shard = ceil(ctx_len / W)) so
-        # every shape is static; per-token correctness still comes from the exact
-        # per-request seqused_k masking inside the kernel and the reduce.
+        # .item() is illegal under capture, and a per-step max would vary
+        # NUM_SEGMENTS between capture and replay. Pin a static per-graph bound;
+        # per-token correctness still comes from seqused_k inside the kernel.
         if fm.run_graph:
             max_local = self._dcp_graph_max_local_kv_len()
         else:
@@ -999,9 +984,8 @@ class AiterAttnBackend(AttentionBackend):
         n_rows = seqused_k.shape[0]
         bs = n_rows // q_len
 
-        # Same reasoning as the decode path: a per-step max would make the kernel's
-        # NUM_SEGMENTS vary between capture and replay, and .item() is illegal
-        # under capture. Per-token correctness comes from seqused_k regardless.
+        # Static bound for the same reason as the decode path: NUM_SEGMENTS must
+        # not vary between capture and replay.
         if fm.run_graph:
             max_local = self._dcp_graph_max_local_kv_len()
         else:
@@ -1082,19 +1066,14 @@ class AiterAttnBackend(AttentionBackend):
         kv_lora_rank = layer.v_head_dim
         qk_rope_head_dim = layer.qk_head_dim - kv_lora_rank
 
-        # NOTE: the .item() below is a GPU->CPU sync, which would be illegal
-        # under cuda-graph capture -- but this path is uncapturable anyway
-        # (pack_dcp_kv_into_pages allocates per batch) and prefill cuda graphs
-        # are disabled for K3 DCP. Do NOT try to assert that via
-        # ForwardMetadata.run_graph: it defaults to True and is only set to
-        # False explicitly on the eager decode/verify paths, so on the prefill
-        # metadata it is always True and says nothing about capture state.
+        # The .item() below is a GPU->CPU sync, fine because this path is
+        # uncapturable anyway (pack_dcp_kv_into_pages allocates per batch). Do NOT
+        # guard it with ForwardMetadata.run_graph: that defaults True on prefill
+        # metadata and says nothing about capture state.
         seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
         max_kv = int(seqused_k.max().item())
-        # mla_prefill_fwd takes its KV tile straight from the paged block size, so feeding
-        # the assembled buffer as block_size 1 collapses each tile to a single
-        # token: a 16384x16384 chunk measured 5156 ms that way vs 39 ms at block
-        # size 64 on gfx950 (~131x). Repack into per-request page-aligned pages.
+        # The KV tile is the paged block size, so block_size 1 collapses each
+        # tile to one token (16384^2 chunk: 5156 ms vs 39 ms at 64). Repack.
         paged_kv, block_tables = pack_dcp_kv_into_pages(
             kv_buffer, kv_indptr, kv_indices, bs, _DCP_PREFILL_PAGE_SIZE
         )
@@ -1515,11 +1494,8 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
                 device = forward_batch.seq_lens.device
-                # Under DCP the committed prefix and the gamma+1 window are
-                # attended as two separate stages, so the shard plan must cover
-                # the COMMITTED length only: the window tokens this rank owns
-                # were already written to the cache by the model layer and would
-                # otherwise be counted twice (once in each stage).
+                # Prefix and window are attended as two stages, so plan the
+                # shard over the COMMITTED length only or the window is counted twice.
                 verify_dcp = self.use_mla and dcp_enabled()
                 if verify_dcp:
                     kv_lens = forward_batch.seq_lens.to(torch.int32).clone()
@@ -1556,10 +1532,8 @@ class AiterAttnBackend(AttentionBackend):
                     dcp_g_kv_indptr = kv_indptr.clone()
                     dcp_cp_world_size = get_attention_dcp_world_size()
                     dcp_cp_rank = get_attention_dcp_rank()
-                    # seq_lens_cpu is NOT usable here: the DSPARK verify path
-                    # pre-adds the window to it while the device seq_lens still
-                    # holds the committed length, so the CPU fast path would
-                    # plan a shard that is draft_num tokens too long.
+                    # seq_lens_cpu is NOT usable: the DSPARK verify path pre-adds
+                    # the window to it, so the shard would be draft_num too long.
                     self._plan_dcp_decode_metadata(
                         kv_indptr,
                         kv_indices,
@@ -1979,9 +1953,8 @@ class AiterAttnBackend(AttentionBackend):
             self.cuda_graph_dcp_g_kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=self.device
             )
-            # Page table for the Triton DCP decode: capture-stable shape, filled
-            # out-of-graph in _apply_cuda_graph_metadata. Width is the worst-case
-            # local shard (ceil(ctx_len / W)) in pages.
+            # Capture-stable page table, filled out-of-graph. Width is the
+            # worst-case local shard, ceil(ctx_len / W) pages.
             max_local_pages = (
                 self._dcp_graph_max_local_kv_len() + self.page_size - 1
             ) // self.page_size
@@ -1992,10 +1965,8 @@ class AiterAttnBackend(AttentionBackend):
                 (max_bs,), dtype=torch.int32, device=self.device
             )
             if self.num_draft_tokens:
-                # Target-verify flattens each request's gamma+1 window into that
-                # many single-token rows (see _build_dcp_verify_page_table), so
-                # it needs max_bs * num_draft_tokens rows rather than max_bs.
-                # cu_seqlens_q is a plain arange, so one buffer serves every bs.
+                # Target-verify flattens the window into single-token rows, so it
+                # needs max_bs * num_draft_tokens of them, not max_bs.
                 n_verify_rows = max_bs * self.num_draft_tokens
                 self.cuda_graph_dcp_verify_block_table = torch.zeros(
                     (n_verify_rows, max_local_pages),
@@ -2252,10 +2223,8 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
 
-                # DCP decode runs the aiter MLA kernel (builds its own block-table
-                # metadata in forward_decode), so the cprr persist metadata is
-                # unused on this path and is skipped. Mirrors the eager guard in
-                # init_forward_metadata.
+                # DCP decode builds its own block-table metadata in
+                # forward_decode, so the cprr persist metadata is unused here.
                 if _use_mla_ps_kernel and dcp_cp_world_size == 1:
                     num_kv_splits = self.max_split_per_batch
 
@@ -2322,10 +2291,8 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # Under DCP the committed prefix and the gamma+1 window are attended
-            # as two separate stages, so plan the shard over the COMMITTED length
-            # only -- the window tokens this rank owns are already in the cache
-            # and would otherwise be counted in both stages.
+            # Prefix and window are attended as two stages, so plan the shard
+            # over the COMMITTED length only or the window is counted twice.
             verify_dcp = self.use_mla and dcp_enabled()
             if self.use_mla and not verify_dcp:
                 kv_lens = seq_lens + self.num_draft_tokens
@@ -2362,14 +2329,9 @@ class AiterAttnBackend(AttentionBackend):
                 dcp_g_kv_indptr = self.cuda_graph_dcp_g_kv_indptr[: bs + 1]
                 dcp_cp_world_size = get_attention_dcp_world_size()
                 dcp_cp_rank = get_attention_dcp_rank()
-                # seq_lens_cpu is NOT usable here: the DSPARK verify path
-                # pre-adds the window to it while the device seq_lens still holds
-                # the committed length, so the CPU fast path would plan a shard
-                # draft_num tokens too long. The exact device sizing costs two
-                # GPU->CPU syncs on EVERY replay, so size the plan from the
-                # static per-graph bounds instead -- sync-free by construction.
-                # (Measured as a wash at bs=1 and bs~44: the overlap scheduler
-                # keeps the CPU ahead, so the sync waited on finished work.)
+                # seq_lens_cpu is NOT usable (the DSPARK verify path pre-adds the
+                # window), and exact device sizing costs two syncs per replay, so
+                # size from the static per-graph bounds instead.
                 self._plan_dcp_decode_metadata(
                     kv_indptr,
                     kv_indices,
@@ -2669,15 +2631,10 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 elif self.use_mla:
                     if dcp_enabled():
-                        # DCP: the KV pool is physically round-robin sharded. Use
-                        # set_mla_kv_buffer, whose kernel takes the RAW virtual
-                        # out_cache_loc and INTERNALLY owner-filters
-                        # (loc % dcp_size == dcp_rank) and shards (loc // dcp_size).
-                        # Pass the raw cache_loc and the FULL (unmasked, undivided) k
-                        # split into (k_nope, k_pe): pre-dividing/pre-masking here
-                        # double-applies the kernel's own filter and corrupts the
-                        # write. (set_kv_buffer's MLA DCP path owner-filters but does
-                        # NOT //dcp_size, so it is wrong for this sharded pool.)
+                        # set_mla_kv_buffer owner-filters AND shards internally,
+                        # so pass the RAW loc and the full k: pre-dividing would
+                        # double-apply the filter. (set_kv_buffer's MLA path
+                        # filters without dividing, so it is wrong here.)
                         kv_lora_rank = v.shape[-1]
                         self.token_to_kv_pool.set_mla_kv_buffer(
                             layer,
@@ -2730,10 +2687,8 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and self.forward_metadata.dcp_cp_world_size > 1
             ):
-                # Two-stage DCP verify. Dispatched before the dims below because
-                # under DCP the model layer writes the KV shard itself and hands
-                # us the window's k/v directly (v is k's first kv_lora_rank
-                # columns), not a full-sequence k to measure head dims from.
+                # Two-stage DCP verify, dispatched before the dims below: the
+                # model layer hands us the window's k/v, not a full-sequence k.
                 return self._mla_verify_fwd_dcp(q, k, layer, k_descale)
 
             qk_nope_head_dim = k.shape[-1] - qk_rope_head_dim
@@ -3264,10 +3219,8 @@ class AiterAttnBackend(AttentionBackend):
             k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
             if self.forward_metadata.dcp_cp_world_size > 1:
-                # DCP decode: run an aiter MLA decode over this rank's
-                # round-robin KV shard and return (out, lse2). The kernel
-                # tiles query heads, so any gathered head count works, and its
-                # base-2 lse feeds cp_lse_ag_out_rs_mla for the cross-rank merge.
+                # DCP decode over this rank's KV shard, returning (out, base-2
+                # lse) for the cross-rank merge.
                 return self._mla_decode_fwd_dcp(q, k_buffer, layer, k_descale)
 
             work_metadata = self.forward_metadata.work_metadata

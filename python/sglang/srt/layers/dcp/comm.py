@@ -274,12 +274,8 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    # Gather the cached prefix shard across dcp ranks into the front of
-    # dcp_kv_buffer. Skip the collective entirely when there is no cached prefix
-    # (dcp_extend_prefix_lens_sum == 0, batch-consistent across ranks): an empty
-    # all-gather launches a 0-sized kernel (HIP invalid configuration), and there
-    # is nothing to gather. The new-token copy below still runs so dcp_kv_buffer
-    # holds the full sequence even in the no-prefix case.
+    # Skip the all-gather when there is no cached prefix: an empty one launches
+    # a 0-sized kernel (HIP invalid configuration). The copy below still runs.
     if dcp_extend_prefix_lens_sum > 0:
         cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
             attn_mqa,
