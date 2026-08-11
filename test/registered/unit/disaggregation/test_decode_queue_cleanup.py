@@ -1,8 +1,10 @@
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -89,6 +91,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.pending_reqs = []
         queue.retracted_queue = []
+        queue._dp_rank_query_first_attempt = {}
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
@@ -136,6 +139,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.pending_reqs = [decode_req]  # same object, dual ownership
         queue.retracted_queue = []
+        queue._dp_rank_query_first_attempt = {}
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
@@ -177,6 +181,199 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertEqual(ready, {})
         self.assertEqual(remaining, [])
+
+    def _make_dp_rank_query_queue(self, decode_req, prefill_info):
+        addr = "10.0.0.1:8998"
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pending_reqs = [decode_req]
+        queue._ensure_retry_count = {}
+        queue._ensure_last_attempt_time = {}
+        queue._ensure_retry_interval = 0
+        queue._max_ensure_retries = 15
+        queue.kv_manager = SimpleNamespace(
+            try_ensure_parallel_info=lambda addr: True,
+            connection_lock=threading.Lock(),
+            prefill_info_table={addr: prefill_info},
+            handle_instance_replacement=MagicMock(),
+            record_failure=MagicMock(),
+        )
+        queue._dp_rank_query_first_attempt = {}
+        queue._dp_rank_query_timeout = 300.0
+        queue._dp_rank_query_fresh_retry_grace = 150.0
+        queue._dp_rank_query_last_fresh_retry = {}
+        return queue
+
+    def test_unresolvable_dp_rank_query_fails_request_after_timeout(self):
+        """Regression: a room the current prefill never registered resolved
+        to nothing on every cycle and re-entered pending_reqs with no
+        timeout armed (init() never ran) -- it cycled forever. The pass must
+        arm its own deadline and abort the receiver on expiry."""
+        prefill_info = SimpleNamespace(
+            instance_id="live", dp_size=2, follow_bootstrap_room=False
+        )
+        req = SimpleNamespace(
+            bootstrap_room=7,
+            disagg_prefill_dp_rank=None,
+            bootstrap_host="10.0.0.1",
+            bootstrap_port=8998,
+        )
+        decode_req = SimpleNamespace(req=req, kv_receiver=MagicMock())
+        queue = self._make_dp_rank_query_queue(decode_req, prefill_info)
+
+        with patch.object(
+            CommonKVReceiver, "query_prefill_dp_ranks", return_value={}
+        ) as query:
+            queue._resolve_pending_reqs()
+        query.assert_called_once_with("10.0.0.1:8998", [7], expected_instance_id="live")
+        self.assertEqual(queue.pending_reqs, [decode_req])
+        self.assertIn(7, queue._dp_rank_query_first_attempt)
+        decode_req.kv_receiver.abort.assert_not_called()
+
+        queue._dp_rank_query_first_attempt[7] -= 301.0
+        with patch.object(CommonKVReceiver, "query_prefill_dp_ranks", return_value={}):
+            queue._resolve_pending_reqs()
+        decode_req.kv_receiver.abort.assert_called_once_with()
+        # Regression: abort() records a generic AbortReq reason; the deadline
+        # path must overwrite it so the client sees why the request failed.
+        queue.kv_manager.record_failure.assert_called_once()
+        self.assertIn(
+            "Could not resolve prefill dp_rank",
+            queue.kv_manager.record_failure.call_args.args[1],
+        )
+        self.assertEqual(queue.pending_reqs, [])
+        self.assertEqual(queue._dp_rank_query_first_attempt, {})
+
+        resolved_req = SimpleNamespace(req=req, kv_receiver=MagicMock())
+        queue = self._make_dp_rank_query_queue(resolved_req, prefill_info)
+        with patch.object(
+            CommonKVReceiver, "query_prefill_dp_ranks", return_value={"7": 1}
+        ):
+            queue._resolve_pending_reqs()
+        resolved_req.kv_receiver.init.assert_called_once_with(1)
+        self.assertEqual(queue.pending_reqs, [])
+        self.assertEqual(queue._dp_rank_query_first_attempt, {})
+
+    def test_persistent_dp_rank_query_mismatch_evicts_stale_topology(self):
+        """Regression: on a persistent mismatch (None) the pass re-asked with
+        the same stale expectation until the deadline aborted the rooms --
+        and the abort exempts the receiver from the failure-path repair. The
+        pass must evict the snapshot (generation-gated) and retire the rooms
+        in flight against it instead."""
+        prefill_info = SimpleNamespace(
+            instance_id="stale", dp_size=2, follow_bootstrap_room=False
+        )
+        req = SimpleNamespace(
+            bootstrap_room=7,
+            disagg_prefill_dp_rank=None,
+            bootstrap_host="10.0.0.1",
+            bootstrap_port=8998,
+        )
+        decode_req = SimpleNamespace(req=req, kv_receiver=MagicMock())
+        queue = self._make_dp_rank_query_queue(decode_req, prefill_info)
+
+        with patch.object(
+            CommonKVReceiver, "query_prefill_dp_ranks", return_value=None
+        ):
+            queue._resolve_pending_reqs()
+
+        # Retirement, not cache-only invalidation: in-flight rooms against
+        # the evicted snapshot would otherwise wait out the full timeout
+        # (the heartbeat can no longer indict them once the replacement's
+        # topology is published).
+        queue.kv_manager.handle_instance_replacement.assert_called_once_with(
+            "10.0.0.1:8998",
+            expected_prefill_info=prefill_info,
+            detected_by="dp-rank resolution",
+        )
+        self.assertEqual(queue.pending_reqs, [decode_req])
+        decode_req.kv_receiver.abort.assert_not_called()
+
+    def test_externally_removed_rooms_leave_no_deadline_entry(self):
+        """Regression: the early return on an emptied queue skipped deadline
+        pruning, stranding removed rooms' entries; a reused room id
+        inherited the expired deadline and failed immediately."""
+        prefill_info = SimpleNamespace(
+            instance_id="live", dp_size=2, follow_bootstrap_room=False
+        )
+        req = SimpleNamespace(
+            bootstrap_room=7,
+            disagg_prefill_dp_rank=None,
+            bootstrap_host="10.0.0.1",
+            bootstrap_port=8998,
+        )
+        decode_req = SimpleNamespace(req=req, kv_receiver=MagicMock())
+        queue = self._make_dp_rank_query_queue(decode_req, prefill_info)
+        with patch.object(CommonKVReceiver, "query_prefill_dp_ranks", return_value={}):
+            queue._resolve_pending_reqs()
+        self.assertIn(7, queue._dp_rank_query_first_attempt)
+
+        # pop_preallocated's abort scan drops the request from pending_reqs
+        # without running the resolution pass again.
+        queue.pending_reqs = []
+        queue._resolve_pending_reqs()
+        self.assertEqual(queue._dp_rank_query_first_attempt, {})
+
+    def test_drop_failed_pending_reqs_prunes_deadlines_with_the_requests(self):
+        """Regression: pop_preallocated left removed requests' deadline
+        entries for the next pass to prune; a room reused before then
+        inherited the expired deadline via setdefault and aborted on its
+        first cycle."""
+        prefill_info = SimpleNamespace(
+            instance_id="live", dp_size=2, follow_bootstrap_room=False
+        )
+        failed_req = SimpleNamespace(
+            req=SimpleNamespace(bootstrap_room=7), kv_receiver=None
+        )
+        kept_req = SimpleNamespace(
+            req=SimpleNamespace(bootstrap_room=8), kv_receiver=MagicMock()
+        )
+        queue = self._make_dp_rank_query_queue(failed_req, prefill_info)
+        queue.pending_reqs = [failed_req, kept_req]
+        queue._dp_rank_query_first_attempt = {7: 100.0, 8: 200.0}
+
+        queue._drop_failed_pending_reqs([failed_req])
+
+        self.assertEqual(queue.pending_reqs, [kept_req])
+        self.assertEqual(queue._dp_rank_query_first_attempt, {8: 200.0})
+
+    def test_stale_missing_rooms_force_reconnect_through_address_resolution(self):
+        """Regression: a draining replaced instance presents the expected id
+        with the replacement's rooms simply absent, so neither the mismatch
+        machinery nor the heartbeat ever fired and every request burned its
+        deadline. Rooms missing past the grace period drop the pooled
+        session (rate-limited); a freshly missing room must not force churn."""
+        prefill_info = SimpleNamespace(
+            instance_id="live", dp_size=2, follow_bootstrap_room=False
+        )
+        req = SimpleNamespace(
+            bootstrap_room=7,
+            disagg_prefill_dp_rank=None,
+            bootstrap_host="10.0.0.1",
+            bootstrap_port=8998,
+        )
+        decode_req = SimpleNamespace(req=req, kv_receiver=MagicMock())
+        queue = self._make_dp_rank_query_queue(decode_req, prefill_info)
+
+        with patch.object(
+            CommonKVReceiver, "query_prefill_dp_ranks", return_value={}
+        ), patch(
+            "sglang.srt.disaggregation.decode._drop_bootstrap_session"
+        ) as drop_session:
+            # Freshly missing: within the grace period, no reconnect.
+            queue._resolve_pending_reqs()
+            drop_session.assert_not_called()
+
+            # Past the grace period: drop the pooled session once.
+            queue._dp_rank_query_first_attempt[7] -= 151.0
+            queue._resolve_pending_reqs()
+            drop_session.assert_called_once_with("10.0.0.1:8998")
+
+            # Immediately after: rate-limited, no second drop.
+            queue._resolve_pending_reqs()
+            drop_session.assert_called_once_with("10.0.0.1:8998")
+
+        self.assertEqual(queue.pending_reqs, [decode_req])
+        decode_req.kv_receiver.abort.assert_not_called()
 
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")

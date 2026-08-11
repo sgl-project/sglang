@@ -107,6 +107,9 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.pp_size = 1
         queue.queue = list(decode_reqs)
         queue.pending_reqs = []
+        # `pop_preallocated` prunes this map for failed requests; `__new__`
+        # skips the __init__ that seeds it.
+        queue._dp_rank_query_first_attempt = {}
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
         # `pop_preallocated` credits this counter; `__new__` skips the __init__
