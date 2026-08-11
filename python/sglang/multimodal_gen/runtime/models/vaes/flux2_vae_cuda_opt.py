@@ -1,36 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CUDA fast paths for the FLUX.2 VAE decoder (AutoencoderKLFlux2, diffusers
-``Decoder``) on image workloads.
+"""CUDA fast paths for KL VAE decoders built on the diffusers ``Decoder``.
+
+Covers the FLUX.2 VAE (``AutoencoderKLFlux2``) and the generic
+``AutoencoderKL`` (FLUX.1 / Z-Image / SD3); both share the exact same
+decoder module family (``ResnetBlock2D`` GroupNorm+SiLU chains,
+``Upsample2D``, single-head mid-block ``Attention``).
 
 All rewrites are mathematically exact re-associations of the original
-operators (weight folding is done lazily in fp32 on first fast-path use and
-written back to the model compute dtype). The wrappers are installed once at
-VAE load and stay in place; each forward dispatches on a shared
-request-scoped :class:`VaeFastPathGate`: requests with ``quality == "high"``
-run the fast paths, the ``"lossless"`` default runs the original module path
-bit-for-bit.
+operators. Wrappers are installed once at VAE load and dispatch on a
+decode-scoped :class:`VaeFastPathGate`: ``quality == "high"`` runs the fast
+paths, the ``"lossless"`` default runs the original module path bit-for-bit.
 
-- channels_last: run the decoder in channels_last so cuDNN convolutions run
-  natively in NHWC (removes the nchwToNhwc/nhwcToNchw transpose kernels
-  around every conv). The parameter layout is swapped at decode entry to
-  match the gate, so lossless decodes always run the NCHW baseline kernels
-  bit-for-bit. The mid-block attention needs a layout-safe forward because
-  diffusers' ``AttnProcessor2_0`` calls ``.view`` on the 4D activation,
-  which is illegal for channels_last tensors.
-- norm+SiLU: two-pass channels_last GroupNorm(+SiLU) Triton fusion (fp32
-  statistics) for the ResnetBlock2D norm1/norm2 + SiLU chains and the
-  decoder ``conv_norm_out``/``conv_act`` tail, which upcast to fp32 under
-  autocast and dominate the decode profile.
-- fused upsample: nearest-2x upsample + Conv2d(3x3, p1) ==
-  ConvTranspose2d(k4, s2, p1) with a lazily-summed kernel. Removes the 4x
-  upsampled intermediate materialization.
-- attention V/proj fold: fold the attention output projection into the V
-  projection of the single-head mid-block attention (softmax rows sum to 1,
-  so ``A @ (V W_v^T + b_v) W_o^T + b_o == A @ (V W_v'^T + b')``).
+- channels_last: run the decoder in NHWC so cuDNN convs skip the transpose
+  kernels; parameter layout is swapped at decode entry to match the gate.
+- norm+SiLU: two-pass channels_last GroupNorm(+SiLU) Triton fusion.
+- fused upsample: nearest-2x + Conv2d(3x3, p1) == ConvTranspose2d(k4, s2, p1).
+- attention V/proj fold: softmax rows sum to 1, so
+  ``A @ (V W_v^T + b_v) W_o^T + b_o == A @ (V W_v'^T + b')``.
 
-Install is all-or-nothing and fail-closed: without Triton, or with any
-attention block lacking the layout-safe rewrite, no wrapper is installed and
-every request runs the unmodified decoder.
+Install is all-or-nothing and fail-closed.
 """
 
 from types import MethodType
@@ -39,6 +27,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    VaeFastPathGate,
+    register_vae_fast_path_gate,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -54,36 +46,15 @@ except ImportError:  # pragma: no cover
     _HAS_TRITON = False
 
 
-class VaeFastPathGate:
-    """Mutable fast-path flag shared by every wrapper of one VAE.
-
-    Published on the VAE as ``_sgl_vae_fast_path_gate``; ``DecodingStage``
-    enables it for the duration of a decode when the request's ``quality``
-    sampling param is ``"high"``.
-    """
-
-    __slots__ = ("enabled",)
-
-    def __init__(self) -> None:
-        self.enabled = False
-
-
-GATE_ATTR = "_sgl_vae_fast_path_gate"
-
-
 # ---------------------------------------------------------------------------
 # Fuse A: two-pass GroupNorm(+SiLU) fusion (channels_last Triton kernel)
 # ---------------------------------------------------------------------------
 
 
 class FusedGroupNormSiLU(nn.Module):
-    """GroupNorm + SiLU fused with the two-pass channels_last Triton kernel.
-
-    fp32 statistics and affine/SiLU application, output in the input dtype.
-    Falls back to the original module chain (norm + F.silu, bit-identical to
-    the original norm + nn.SiLU pair) for unsupported inputs and whenever
-    the fast-path gate is disabled.
-    """
+    """GroupNorm + SiLU fused with the two-pass channels_last Triton kernel;
+    falls back to the original op chain (bit-identical to norm + ``nn.SiLU``)
+    for unsupported inputs and whenever the gate is off."""
 
     def __init__(self, norm: nn.GroupNorm, gate: VaeFastPathGate) -> None:
         super().__init__()
@@ -181,12 +152,8 @@ def _fold_upsample2x_conv2d_weight(conv: nn.Conv2d) -> torch.Tensor:
 
 class FusedUpsample2xConv2d(nn.Module):
     """ConvTranspose2d(k4, s2, p1) equivalent of diffusers Upsample2D
-    (nearest-2x interpolate + Conv2d(3x3, p1)).
-
-    nearest 2x upsampling is pure pixel replication (no arithmetic), so the
-    fusion only re-associates the conv taps; the kernel is summed lazily in
-    fp32 on first fast-path use and written back to the conv dtype. With the
-    fast-path gate disabled the original Upsample2D runs bit-for-bit.
+    (nearest-2x interpolate + Conv2d(3x3, p1)); the kernel is summed lazily
+    in fp32 on first use. Gate off runs the original Upsample2D bit-for-bit.
     """
 
     def __init__(self, upsample: nn.Module, gate: VaeFastPathGate) -> None:
@@ -353,8 +320,9 @@ def _decoder_layout_forward(self, *args, **kwargs):
             memory_format=(torch.channels_last if want_cl else torch.contiguous_format)
         )
         self._sgl_channels_last = want_cl
-        logger.info(
-            "FLUX.2 VAE: decoder switched to %s layout.",
+        logger.debug(
+            "%s: decoder switched to %s layout.",
+            self._sgl_label,
             "channels_last (NHWC)" if want_cl else "contiguous (NCHW)",
         )
     return type(self).forward(self, *args, **kwargs)
@@ -365,23 +333,16 @@ def _decoder_layout_forward(self, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def maybe_optimize_flux2_vae(vae: nn.Module) -> nn.Module:
-    """Install the quality-gated CUDA FLUX.2 VAE decoder fast paths."""
+def _install_decoder_fast_paths(vae: nn.Module, label: str) -> nn.Module:
+    """Install the quality-gated fast paths on a diffusers ``Decoder`` VAE."""
     from diffusers.models.attention_processor import Attention, AttnProcessor2_0
-    from diffusers.models.autoencoders.vae import Decoder
     from diffusers.models.resnet import ResnetBlock2D
     from diffusers.models.upsampling import Upsample2D
 
-    from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_flux2 import (
-        AutoencoderKLFlux2,
-    )
-
-    if not isinstance(vae, AutoencoderKLFlux2) or type(vae.decoder) is not Decoder:
-        return vae
     if getattr(vae, "_spatial_parallel_decode_enabled", False):
         logger.info(
-            "FLUX.2 VAE: spatial-parallel decode enabled; "
-            "skipping CUDA decoder fast paths."
+            "%s: spatial-parallel decode enabled; skipping CUDA decoder fast paths.",
+            label,
         )
         return vae
     if not _HAS_TRITON:
@@ -390,7 +351,7 @@ def maybe_optimize_flux2_vae(vae: nn.Module) -> nn.Module:
         # GroupNorm+SiLU fuse (measured: 97 -> 141 ms at 1024^2 with
         # channels_last alone vs 97 -> 29 ms with both).
         logger.warning(
-            "FLUX.2 VAE: Triton unavailable; skipping CUDA decoder fast paths."
+            "%s: Triton unavailable; skipping CUDA decoder fast paths.", label
         )
         return vae
 
@@ -406,8 +367,9 @@ def maybe_optimize_flux2_vae(vae: nn.Module) -> nn.Module:
         # channels_last tensors; without a layout-safe rewrite for every
         # attention block the layout switch cannot be applied (fail closed).
         logger.warning(
-            "FLUX.2 VAE: %d/%d attention blocks lack a layout-safe rewrite; "
+            "%s: %d/%d attention blocks lack a layout-safe rewrite; "
             "skipping CUDA decoder fast paths.",
+            label,
             n_attn_total - len(attn_modules),
             n_attn_total,
         )
@@ -415,6 +377,7 @@ def maybe_optimize_flux2_vae(vae: nn.Module) -> nn.Module:
 
     gate = VaeFastPathGate()
     decoder._sgl_gate = gate
+    decoder._sgl_label = label
     decoder._sgl_channels_last = False
     decoder.forward = MethodType(_decoder_layout_forward, decoder)
     n_up = _install_fused_upsample(decoder, Upsample2D, gate)
@@ -423,13 +386,39 @@ def maybe_optimize_flux2_vae(vae: nn.Module) -> nn.Module:
         m._sgl_folded_v = None
         m.forward = MethodType(_attn_fast_forward, m)
     n_norm = _install_norm_silu(decoder, ResnetBlock2D, gate)
-    setattr(vae, GATE_ATTR, gate)
+    register_vae_fast_path_gate(vae, gate)
     logger.info(
-        "FLUX.2 VAE: installed quality-gated decoder fast paths "
+        "%s: installed quality-gated decoder fast paths "
         "(channels_last dispatch, %d fused upsamplers, %d fast attention "
         "blocks, %d GroupNorm+SiLU fusions).",
+        label,
         n_up,
         len(attn_modules),
         n_norm,
     )
     return vae
+
+
+def maybe_optimize_flux2_vae(vae: nn.Module) -> nn.Module:
+    """Install the quality-gated CUDA FLUX.2 VAE decoder fast paths."""
+    from diffusers.models.autoencoders.vae import Decoder
+
+    from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_flux2 import (
+        AutoencoderKLFlux2,
+    )
+
+    if not isinstance(vae, AutoencoderKLFlux2) or type(vae.decoder) is not Decoder:
+        return vae
+    return _install_decoder_fast_paths(vae, "FLUX.2 VAE")
+
+
+def maybe_optimize_autoencoder_kl(vae: nn.Module) -> nn.Module:
+    """Install the quality-gated CUDA fast paths on the generic
+    ``AutoencoderKL`` decoder (FLUX.1 / Z-Image / SD3)."""
+    from diffusers.models.autoencoders.vae import Decoder
+
+    from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
+
+    if not isinstance(vae, AutoencoderKL) or type(vae.decoder) is not Decoder:
+        return vae
+    return _install_decoder_fast_paths(vae, "AutoencoderKL VAE")
