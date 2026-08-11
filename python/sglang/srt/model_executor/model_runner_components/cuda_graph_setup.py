@@ -414,6 +414,14 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         capture_time=0,
     )
 
+    # A PD prefill server never replays the target-verify graph, and its pool
+    # is built without the spec-verify scratch the capture would need.
+    if (
+        model_runner.spec_algorithm.is_speculative()
+        and not model_runner.is_draft_worker
+        and model_runner.server_args.disaggregation_mode == "prefill"
+    ):
+        return no_capture
     if not model_runner.is_generation:
         # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
         return no_capture

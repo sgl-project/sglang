@@ -207,27 +207,48 @@ sglang serve \
   --num-gpus 1
 ```
 
-The following request predicts a 16-step action chunk from one observation. The chunk length is `num_frames - 1`, and the completed job's `action` field contains the tensor data, shape, mode, and active action dimension.
+`policy` and `inverse_dynamics` return actions, so their canonical API is the synchronous `/v1/actions/generations` endpoint. The following request predicts a 16-step action chunk from one observation image. `action_horizon=16` maps to the model's `num_frames=17` convention.
 
-```bash Command
-job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
-  --form-string "prompt=Put the pot to the left of the purple item." \
-  --form "input_reference=@observation.png;type=image/png" \
-  --form-string "size=832x480" \
-  --form-string "num_frames=17" \
-  --form-string "fps=5" \
-  --form-string "num_inference_steps=30" \
-  --form-string "guidance_scale=1.0" \
-  --form-string "action_mode=policy" \
-  --form-string "domain_name=droid_lerobot" \
-  | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+```python Python
+import base64
+from pathlib import Path
 
-# After the job reaches "completed":
-curl -sS "http://127.0.0.1:30010/v1/videos/${job_id}" \
-  | python -c 'import json, sys; print(json.dumps(json.load(sys.stdin)["action"], indent=2))'
+import requests
+
+image_b64 = base64.b64encode(Path("observation.png").read_bytes()).decode()
+response = requests.post(
+    "http://127.0.0.1:30010/v1/actions/generations",
+    json={
+        "input": {
+            "task": "Put the pot to the left of the purple item.",
+            "observation": {
+                "image": {"b64_json": image_b64},
+            },
+        },
+        "parameters": {
+            "action_mode": "policy",
+            "action_horizon": 16,
+            "domain_name": "droid_lerobot",
+            "height": 480,
+            "width": 832,
+            "fps": 5,
+            "num_inference_steps": 30,
+            "guidance_scale": 1.0,
+            "seed": 42,
+        },
+    },
+    timeout=300,
+)
+response.raise_for_status()
+action = response.json()["data"][0]["action"]
+print(action["shape"], action["values"])
 ```
 
-The other action modes are `forward_dynamics` (condition on an observation and an `action` JSON array to generate video) and `inverse_dynamics` (condition on a full video to predict action). Select the embodiment head with `domain_name` or `domain_id`; set `raw_action_dim` explicitly when it cannot be inferred from the domain name.
+Use `GET /v1/actions/metadata` to inspect the action modes, default horizon, padded action dimension, and accepted observation modalities. Msgpack requests and the `/v1/actions/realtime` websocket use the same action envelope.
+
+`inverse_dynamics` also uses `/v1/actions/generations`; set `action_mode="inverse_dynamics"` and pass an observation video URL or server-local path as `input.observation.video`. Select the embodiment head with `domain_name` or `domain_id`; set `raw_action_dim` explicitly when it cannot be inferred from the domain name.
+
+`forward_dynamics` is intentionally different: it consumes an action array and predicts video, so it remains on `/v1/videos`. Action-producing modes submitted to `/v1/videos` return HTTP 400 with the canonical action endpoint in the error message.
 
 ## 5. Cosmos3 Parameters
 

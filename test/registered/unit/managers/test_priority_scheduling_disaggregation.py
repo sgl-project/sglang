@@ -109,6 +109,9 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
+        # `pop_preallocated` credits this counter; `__new__` skips the __init__
+        # that seeds it.
+        queue._num_published_destinations = 0
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._allocatable_tokens = MagicMock(return_value=1000)
