@@ -119,6 +119,11 @@ class Cosmos3Config(PipelineConfig):
     # names a server-side file. ``None`` disables normalization.
     action_stats_path: str | None = None
 
+    # Pre-computed once in update_config_from_dict from the resolved model_path.
+    # None until that point (e.g. in unit-test mocks that never call update_config_from_dict).
+    is_edge: bool | None = None
+    distilled_sigmas: list[float] | None = None
+
     def __post_init__(self):
         self.vae_config.arch_config.z_dim = 48
         # Encoder is needed for I2V; T2V/T2I never invoke it.
@@ -131,11 +136,14 @@ class Cosmos3Config(PipelineConfig):
 
     def update_config_from_dict(self, args, prefix: str = "") -> None:
         super().update_config_from_dict(args, prefix)
-        # model_path is only populated here, after construction. Distilled
-        # checkpoints ship their own fixed-step FlowMatchEuler scheduler;
-        # honor it instead of forcing FlowUniPC.
-        if self.model_path and is_distilled_checkpoint(self.model_path):
-            self.scheduler_class_override = None
+        # model_path is only populated here, after construction. Compute
+        # checkpoint variant flags once so per-request code reads them from the
+        # config rather than re-downloading the scheduler subfolder each time.
+        if self.model_path:
+            self.distilled_sigmas = get_distilled_sigmas(self.model_path)
+            self.is_edge = is_edge_checkpoint(self.model_path)
+            if self.distilled_sigmas is not None:
+                self.scheduler_class_override = None
 
     def adjust_num_frames(self, num_frames: int) -> int:
         """Round ``num_frames`` so ``(n - 1) % 4 == 0`` for the VAE.

@@ -104,17 +104,14 @@ class Cosmos3SamplingParams(SamplingParams):
     action_normalization: str = "quantile"
 
     def _adjust(self, server_args) -> None:
-        from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
-            get_distilled_sigmas,
-            is_edge_checkpoint,
-        )
-
-        # adjust distil and edge args
-        distilled_sigmas = get_distilled_sigmas(server_args.model_path)
+        # adjust distil and edge args — read from the pre-computed config fields
+        # so no checkpoint download happens at request time.
+        pipeline_config = server_args.pipeline_config
+        distilled_sigmas = pipeline_config.distilled_sigmas
         if distilled_sigmas is not None:
             self.num_inference_steps = len(distilled_sigmas)
         self._resolve_variant_defaults(
-            is_edge_checkpoint(server_args.model_path),
+            bool(pipeline_config.is_edge),
             is_distilled=distilled_sigmas is not None,
         )
 

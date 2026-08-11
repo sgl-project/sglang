@@ -18,10 +18,6 @@ import PIL.Image
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
-    get_distilled_sigmas,
-    is_edge_checkpoint,
-)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -740,7 +736,8 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         """Prepare scheduler timesteps."""
         device = get_local_torch_device()
 
-        distilled_sigmas = get_distilled_sigmas(server_args.model_path)
+        pipeline_config = server_args.pipeline_config
+        distilled_sigmas = pipeline_config.distilled_sigmas
         if distilled_sigmas is not None:
             # Distilled checkpoints carry an explicit fixed-step sigma schedule
             # with the shift already baked in; drive the scheduler from it
@@ -759,10 +756,10 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         num_inference_steps = batch.num_inference_steps
         flow_shift = getattr(batch, "flow_shift", None)
         if flow_shift is None:
-            flow_shift = server_args.pipeline_config.flow_shift
+            flow_shift = pipeline_config.flow_shift
         if flow_shift is None:
             flow_shift = self._default_flow_shift_for_mode(
-                batch, is_edge_checkpoint(server_args.model_path)
+                batch, bool(pipeline_config.is_edge)
             )
         if flow_shift is not None and hasattr(self.scheduler, "set_shift"):
             self.scheduler.set_shift(float(flow_shift))
