@@ -23,10 +23,25 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{post, put};
 use axum::{Json, Router};
+
+/// Response header carrying the serving process's instance id
+/// (`BOOTSTRAP_INSTANCE_ID_HEADER` in disaggregation/common/conn.py). The
+/// decode heartbeat compares it across `/health` polls to detect a prefill
+/// replaced behind a still-healthy bootstrap address, so `api_server::serve`
+/// stamps it on every response of the merged listener.
+pub(crate) const INSTANCE_ID_HEADER: HeaderName =
+    HeaderName::from_static("x-sglang-disaggregation-instance-id");
+
+/// Fresh per-server instance id (Python: `uuid.uuid4().hex` per bootstrap
+/// server); a replacement prefill presents a different value.
+pub(crate) fn new_instance_id() -> HeaderValue {
+    HeaderValue::from_str(&uuid::Uuid::new_v4().simple().to_string())
+        .expect("hex uuid is a valid header value")
+}
 
 /// Python default: `SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)`.
 const ENTRY_CLEANUP_INTERVAL_ENV: &str = "SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL";
@@ -361,13 +376,13 @@ mod tests {
     use std::net::SocketAddr;
 
     /// Minimal HTTP/1.1 client (same style as the `runtime` tests): returns
-    /// `(status, body)`.
-    fn request(
+    /// the raw response text.
+    fn request_raw(
         addr: SocketAddr,
         method: &str,
         path_query: &str,
         body: Option<&serde_json::Value>,
-    ) -> (u16, String) {
+    ) -> String {
         let body = body.map(|b| b.to_string()).unwrap_or_default();
         let mut conn = std::net::TcpStream::connect(addr).expect("connect");
         let req = format!(
@@ -378,6 +393,16 @@ mod tests {
         conn.write_all(req.as_bytes()).unwrap();
         let mut response = String::new();
         conn.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn request(
+        addr: SocketAddr,
+        method: &str,
+        path_query: &str,
+        body: Option<&serde_json::Value>,
+    ) -> (u16, String) {
+        let response = request_raw(addr, method, path_query, body);
         let status = response
             .split_whitespace()
             .nth(1)
@@ -389,6 +414,16 @@ mod tests {
             .map(|(_, b)| b.to_string())
             .unwrap_or_default();
         (status, body)
+    }
+
+    /// `INSTANCE_ID_HEADER` value from a raw response, if present.
+    fn instance_id_of(raw: &str) -> Option<String> {
+        let headers = raw.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or(raw);
+        headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(INSTANCE_ID_HEADER.as_str())
+                .then(|| value.trim().to_string())
+        })
     }
 
     fn put_route(overrides: serde_json::Value) -> serde_json::Value {
@@ -558,6 +593,54 @@ mod tests {
         assert_eq!(status, 200);
         let rank: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(rank["rank_ip"], "10.0.0.2");
+    }
+
+    /// Replacement detection: a pd-bootstrap-enabled listener stamps its
+    /// per-process instance id on every response, and a replacement server
+    /// presents a different one — that inequality is the decode heartbeat's
+    /// detection signal. The decode compares the id it saw on `/route` with
+    /// the one `/health` presents later, so the two must agree; that
+    /// coverage comes from one listener-wide layer, pinned here on `/health`
+    /// itself — mounting the bootstrap registry forces `/health` shallow
+    /// (the decode reads it with short timeouts; the deep generate probe
+    /// would wait out its scheduler deadline on this schedulerless runtime
+    /// and, in production, accumulate heartbeat misses against a
+    /// busy-but-healthy prefill), so the 200 asserted here also pins that
+    /// contract — plus the router fallback (a 404 outside every
+    /// sub-router), which pins the layer as listener-wide.
+    #[test]
+    fn instance_id_stable_per_server_fresh_per_replacement() {
+        let (_rt, addr) = start_on_free_port();
+
+        let unregistered = instance_id_of(&request_raw(addr, "GET", SENTINEL, None))
+            .expect("instance id on a 503 response");
+        let (status, _) = request(
+            addr,
+            "PUT",
+            "/route",
+            Some(&put_route(serde_json::json!({}))),
+        );
+        assert_eq!(status, 200);
+        let health = request_raw(addr, "GET", "/health", None);
+        assert!(
+            health.starts_with("HTTP/1.1 200"),
+            "PD bootstrap /health must answer shallow, got: {}",
+            health.lines().next().unwrap_or("")
+        );
+        let registered = instance_id_of(&health).expect("instance id on the /health response");
+        assert_eq!(unregistered, registered);
+
+        let fallback = request_raw(addr, "GET", "/no-such-route", None);
+        assert!(fallback.starts_with("HTTP/1.1 404"));
+        assert_eq!(
+            instance_id_of(&fallback).expect("instance id on a 404 response"),
+            registered
+        );
+
+        let (_rt2, replacement_addr) = start_on_free_port();
+        let replacement = instance_id_of(&request_raw(replacement_addr, "GET", SENTINEL, None))
+            .expect("instance id on the replacement server");
+        assert_ne!(registered, replacement);
     }
 
     /// The PD router's room→dp-rank side channel: register/query round-trip

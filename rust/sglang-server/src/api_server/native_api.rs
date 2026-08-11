@@ -34,10 +34,11 @@ use crate::ids::Rid;
 use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
 
 /// The routes this module owns, mounted by `api_server::serve`.
-pub(super) fn routes() -> Router<AppState> {
+/// `shallow_health` forces `/health` to a plain 200 (see `health_routes`).
+pub(super) fn routes(shallow_health: bool) -> Router<AppState> {
     Router::new()
         .route("/generate", post(generate))
-        .merge(health_routes())
+        .merge(health_routes(shallow_health))
 }
 
 /// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
@@ -47,11 +48,21 @@ pub(super) fn routes() -> Router<AppState> {
 /// always; `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (default true, mirroring
 /// Python) decides whether `/health` shares it or is a plain 200 (routing the
 /// request already proves the frontend is up).
-fn health_routes() -> Router<AppState> {
+///
+/// `shallow_health` (set when the PD bootstrap registry shares this listener)
+/// overrides the env knob and pins `/health` shallow: the decode side
+/// identity-probes bootstrap `/health` with short read timeouts expecting the
+/// bootstrap-server contract — Python's standalone bootstrap server answers a
+/// plain 200 plus the instance-id header — so the deep generate probe's
+/// default 20 s deadline would time those probes out, accumulate heartbeat
+/// misses, and retire a busy-but-healthy prefill as a node failure. The deep
+/// probe stays available on `/health_generate`.
+fn health_routes(shallow_health: bool) -> Router<AppState> {
     let timeout =
         std::time::Duration::from_secs(crate::environ::env_u64("SGLANG_HEALTH_CHECK_TIMEOUT", 20));
     let probe = get(move |state: State<AppState>| health_generate(state, timeout));
-    let health = if env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
+    let deep_health = !shallow_health && env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true);
+    let health = if deep_health {
         probe.clone()
     } else {
         get(|| async { StatusCode::OK.into_response() })
