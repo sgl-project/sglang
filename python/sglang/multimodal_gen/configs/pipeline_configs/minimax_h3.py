@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
-import shutil
 from dataclasses import dataclass, field
 
 import torch
@@ -177,19 +176,6 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             )
 
     def validate_server_args(self, server_args) -> None:
-        missing_media_tools = [
-            executable
-            for executable in ("ffmpeg", "ffprobe")
-            if shutil.which(executable) is None
-        ]
-        if missing_media_tools:
-            raise RuntimeError(
-                "MiniMax H3 requires ffmpeg and ffprobe for media processing "
-                "and validated output delivery; missing executables: "
-                f"{', '.join(missing_media_tools)}. Install the ffmpeg system "
-                "package before starting SGLang."
-            )
-
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
         component_backends = server_args.component_attention_backends or {}

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import shutil
+
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
@@ -45,6 +47,21 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         # scheduling_minimax_h3_euler_ancestral (stages accept scheduler=None).
         "transformer",
     ]
+
+    def __init__(self, *args, **kwargs):
+        missing_media_tools = [
+            executable
+            for executable in ("ffmpeg", "ffprobe")
+            if shutil.which(executable) is None
+        ]
+        if missing_media_tools:
+            raise RuntimeError(
+                "MiniMax H3 requires ffmpeg and ffprobe for media processing "
+                "and validated output delivery; missing executables: "
+                f"{', '.join(missing_media_tools)}. Install the ffmpeg system "
+                "package before starting SGLang."
+            )
+        super().__init__(*args, **kwargs)
 
     @staticmethod
     def model_subfolder_for_variant(variant: str) -> str:
