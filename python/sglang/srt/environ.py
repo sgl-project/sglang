@@ -1026,14 +1026,6 @@ class Envs:
     # reprefill, no SWA host pool) -- cheaper for short-prefix workloads.
     SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE = EnvBool(False)
 
-    # Restore the c4 overlap state for every layer in one fused H2D instead of one
-    # blocking copy per layer. OFF: under concurrent shared-prefix prefill the fused
-    # path lands bytes the per-layer path gets right, tripping the DBG=1 device
-    # landing check (host tile CRC still matches, so the tile is intact and only the
-    # device rows are wrong). Root cause still open; the per-layer path is the
-    # reference the byte-exact validation runs on.
-    SGLANG_SWA_STATE_FUSED_H2D = EnvBool(False)
-
     # CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.

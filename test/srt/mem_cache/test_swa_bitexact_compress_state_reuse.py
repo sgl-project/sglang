@@ -19,16 +19,17 @@ Run:
       test/srt/mem_cache/test_swa_bitexact_compress_state.py -q
 """
 
+import inspect
 import threading
 import types
 import unittest
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
 )
+from sglang.srt.layers.attention.dsv4 import compress_hip as CH
 from sglang.srt.layers.attention.dsv4.compress_hip import (
     capture_c4_state_windows_unified,
 )
@@ -314,175 +315,66 @@ class TestCaptureRestoreRoundTrip(unittest.TestCase):
         self.assertEqual(SC._state_rides(restorer), [])
 
 
-class TestFusedStateRideProbe(unittest.TestCase):
-    """The fused all-layer H2D computes state_locs once from the ride's first
-    layer, so the probe must reject any ride whose layers disagree on the window
-    width or the swa_loc -> state_loc geometry."""
+class TestC4StateAddressContract(unittest.TestCase):
+    """The restore has to hand back the very state rows the compressor will read.
+    The compressor addresses c4 state by SWA slot, so the restore does too; these
+    fail loudly if that base contract ever moves."""
 
-    def _ride(self, geoms):
-        layer_num = len(geoms)
-        bufs = [torch.zeros((8, 4), dtype=torch.bfloat16) for _ in range(layer_num)]
-        pools = [
-            types.SimpleNamespace(
-                ratio=g[0],
-                ring_size=g[1],
-                swa_page_size=g[2],
-                kv_score_buffer=types.SimpleNamespace(kv_score=bufs[i]),
-            )
-            for i, g in enumerate(geoms)
-        ]
-        hp = types.SimpleNamespace(
-            layout="layer_first",
-            gpu_device="cuda:0",
-            data_ptrs=object(),
-            device_ptrs=object(),
-            device_buffers=bufs,
-            layer_num=layer_num,
-            data_refs=[torch.zeros(64, dtype=torch.uint8) for _ in range(layer_num)],
+    def _sp(self, *, ring_size, swa_page_size):
+        sp = types.SimpleNamespace(ring_size=ring_size, swa_page_size=swa_page_size)
+        sp.translate_from_swa_loc_to_state_loc = lambda loc: _TRANSLATE(sp, loc)
+        return sp
+
+    def test_compressor_still_addresses_c4_by_swa_slot(self):
+        src = inspect.getsource(CH._c4_state_overlap_prefix)
+        self.assertIn(
+            "translate_from_swa_loc_to_state_loc",
+            src,
+            "compressor changed its c4 state addressing; _state_locs_for_window "
+            "must follow it or the restore writes rows nobody reads",
         )
-        layers = [(i, i) for i in range(layer_num)]
-        return hp, pools, layers
+        self.assertNotIn("translate_from_req_position_to_state_loc", src)
 
-    def test_uniform_geometry_is_fusable(self):
-        # The fused path ships disabled, so the probe's accept case only reports
-        # whether the geometry would qualify once it is turned back on.
-        hp, pools, layers = self._ride([(4, 16, 131), (4, 16, 131)])
-        with envs.SGLANG_SWA_STATE_FUSED_H2D.override(True):
-            self.assertTrue(SC._probe_state_ride_fusable(hp, pools, layers))
+    def test_the_two_contracts_actually_disagree(self):
+        # Guards against the above being vacuous: under a speculative ring the two
+        # addressing schemes do not even agree on the offset within the state ring.
+        sp = self._sp(ring_size=131, swa_page_size=256)
+        swa_ring, B, ratio = 256, 300, 4
+        swa_chunk = torch.arange(1024, 1024 + swa_ring, dtype=torch.int64)
+        pos = torch.arange(B - ratio, B, dtype=torch.int64)
+        by_slot = swa_chunk[pos % swa_ring] % sp.ring_size
+        by_position = pos % sp.ring_size
+        self.assertFalse(torch.equal(by_slot, by_position))
 
-    def test_disabled_by_default_even_on_uniform_geometry(self):
-        hp, pools, layers = self._ride([(4, 16, 131), (4, 16, 131)])
-        self.assertFalse(SC._probe_state_ride_fusable(hp, pools, layers))
-
-    def test_mixed_ring_size_falls_back(self):
-        hp, pools, layers = self._ride([(4, 16, 131), (4, 8, 131)])
-        self.assertFalse(SC._probe_state_ride_fusable(hp, pools, layers))
-
-    def test_mixed_ratio_falls_back(self):
-        hp, pools, layers = self._ride([(4, 16, 131), (2, 16, 131)])
-        self.assertFalse(SC._probe_state_ride_fusable(hp, pools, layers))
-
-    def test_cpu_pool_falls_back(self):
-        hp, pools, layers = self._ride([(4, 16, 131)])
-        hp.gpu_device = "cpu"
-        self.assertFalse(SC._probe_state_ride_fusable(hp, pools, layers))
-
-
-@unittest.skipUnless(
-    torch.cuda.is_available(), "fused state H2D only engages on a real device pool"
-)
-class TestFusedStateRideBytes(unittest.TestCase):
-    """The fused all-layer H2D ships disabled: it lands wrong device bytes under
-    concurrent shared-prefix prefill (see SGLANG_SWA_STATE_FUSED_H2D). This keeps
-    it honest at the geometry this test can build -- byte-identical to the
-    per-layer fallback -- which is exactly why the failure needs the real server
-    to reproduce and this test did not catch it."""
-
-    def setUp(self):
-        self._fused = envs.SGLANG_SWA_STATE_FUSED_H2D.override(True)
-        self._fused.__enter__()
-        self.addCleanup(self._fused.__exit__, None, None, None)
-
-    def _build_ride(self, layer_num=4, ring=16, ratio=4, head_dim=8, page=256):
-        try:
-            pools = [
-                CompressStatePool(
-                    size=1024,
-                    ring_size=ring,
-                    overlap=True,
-                    head_dim=head_dim,
-                    dtype=torch.bfloat16,
-                    device="cuda",
-                    enable_memory_saver=False,
-                    ratio=ratio,
-                    swa_page_size=page,
-                )
-                for _ in range(layer_num)
-            ]
-        except torch.OutOfMemoryError as e:  # a busy shared GPU, not a failure here
-            self.skipTest(f"no free device memory for the state pools: {e}")
-        bufs = [p.kv_score_buffer.kv_score for p in pools]
-        item_bytes = ring * bufs[0].shape[-1] * bufs[0].element_size()
-        hp = MPH.DeepSeekV4PagedHostPool(
-            pool_name="test_c4_state",
-            device_buffers=bufs,
-            item_bytes=item_bytes,
-            num_host_pages=8,
-            slot_page_size=ring,
-            layout="layer_first",
+    def test_restore_helper_uses_the_compressor_contract(self):
+        sp = self._sp(ring_size=131, swa_page_size=256)
+        swa_ring, B, ratio = 256, 300, 4
+        swa_chunk = torch.arange(1024, 1024 + swa_ring, dtype=torch.int64)
+        got = SC._state_locs_for_window(sp, swa_chunk, swa_ring, B, ratio)
+        want = sp.translate_from_swa_loc_to_state_loc(
+            swa_chunk[torch.arange(B - ratio, B, dtype=torch.int64) % swa_ring]
         )
-        hp._capture_staging = {}
-        hp._capture_state_crc = {}
-        # Distinct bytes per layer and per row, so a swapped layer or a misread
-        # tile row cannot pass by accident.
-        for li in range(layer_num):
-            torch.manual_seed(1000 + li)
-            hp.data_refs[li].copy_(
-                torch.randint(0, 256, hp.data_refs[li].shape, dtype=torch.uint8)
+        self.assertTrue(torch.equal(got, want))
+
+    def test_window_is_positional_not_the_block_tail(self):
+        sp = self._sp(ring_size=131, swa_page_size=256)
+        swa_ring, ratio = 256, 4
+        swa_chunk = torch.arange(1024, 1024 + swa_ring, dtype=torch.int64)
+        tail = sp.translate_from_swa_loc_to_state_loc(swa_chunk[-ratio:])
+        # B misaligned to the ring: the window sits mid-block, not at its tail.
+        self.assertFalse(
+            torch.equal(
+                SC._state_locs_for_window(sp, swa_chunk, swa_ring, 300, ratio), tail
             )
-        return hp, pools, bufs
-
-    def _restore(self, component, node, swa_chunk, hp, bufs, *, fused, io_backend):
-        for b in bufs:
-            b.zero_()
-        hp._state_fused_h2d_ok = fused
-        SC._restore_state_windows(component, node, swa_chunk, io_backend)
-        torch.cuda.synchronize()
-        return [b.clone() for b in bufs]
-
-    def test_fused_lands_same_bytes_as_per_layer(self):
-        layer_num, ring = 4, 16
-        hp, pools, bufs = self._build_ride(layer_num=layer_num, ring=ring)
-        layers = [(i, i) for i in range(layer_num)]
+        )
+        # Ring-aligned B is the case where the two coincide, which is exactly why
+        # taking the tail looked correct until speculative decode misaligned it.
         self.assertTrue(
-            SC._probe_state_ride_fusable(hp, pools, layers),
-            "a real device state pool must satisfy the probe, else this test is vacuous",
+            torch.equal(
+                SC._state_locs_for_window(sp, swa_chunk, swa_ring, 2 * swa_ring, ratio),
+                tail,
+            )
         )
-
-        page_row, swa_ring, req = 3, 131, 2
-        component = types.SimpleNamespace(
-            _c4_state_layer_index={i: i for i in range(layer_num)},
-            _c4_state_host_pool=hp,
-            _compress_state_pools=pools,
-            _c4_indexer_state_host_pool=None,
-            _indexer_compress_state_pools=None,
-        )
-        node = types.SimpleNamespace(
-            _c4_state_host_value=torch.tensor([page_row * ring], dtype=torch.int64),
-            # 512 % 131 != 0: the boundary group wraps inside the ring block, the
-            # case the positional addressing exists for.
-            _swa_state_B=512,
-        )
-        swa_chunk = (req * swa_ring + torch.arange(swa_ring)).cuda()
-
-        for io_backend in ("kernel", "direct"):
-            with self.subTest(io_backend=io_backend):
-                ref = self._restore(
-                    component, node, swa_chunk, hp, bufs, fused=False, io_backend="x"
-                )
-                got = self._restore(
-                    component,
-                    node,
-                    swa_chunk,
-                    hp,
-                    bufs,
-                    fused=True,
-                    io_backend=io_backend,
-                )
-                # Guard against a vacuous pass: the restore must have written.
-                self.assertTrue(
-                    any(bool(b.any()) for b in ref), "per-layer restore wrote nothing"
-                )
-                for li in range(layer_num):
-                    # Compare bit patterns, not values: the tiles are arbitrary
-                    # bytes, so some rows decode to NaN and float equality would
-                    # report a difference between two identical buffers.
-                    self.assertTrue(
-                        torch.equal(
-                            ref[li].view(torch.uint8), got[li].view(torch.uint8)
-                        ),
-                        f"fused {io_backend} differs from per-layer at layer {li}",
-                    )
 
 
 class TestDirtyReadWithoutRestore(unittest.TestCase):
