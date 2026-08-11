@@ -523,11 +523,26 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
-        # Since the outputs for both gate and up are identical, we use a random one.
-        shard_size = self.base_layer.output_partition_sizes[0]
-        start_idx = tp_rank * shard_size
-        end_idx = (tp_rank + 1) * shard_size
-        return B[:, start_idx:end_idx, :]
+        if B.dim() == 3:
+            # Stacked Q/K/V (or gate/up) LoRA weights from diffusers-style adapters.
+            shard_size = self.base_layer.output_partition_sizes[0]
+            start_idx = tp_rank * shard_size
+            end_idx = (tp_rank + 1) * shard_size
+            return B[:, start_idx:end_idx, :]
+
+        # Native fused checkpoints (MiniMax H3, etc.) store one concatenated 2D
+        # lora_B matrix per logical layer; shard each section independently.
+        shards: list[torch.Tensor] = []
+        row_offset = 0
+        for full_size, part_size in zip(
+            self.base_layer.output_sizes,
+            self.base_layer.output_partition_sizes,
+        ):
+            local_start = tp_rank * part_size
+            local_end = (tp_rank + 1) * part_size
+            shards.append(B[row_offset + local_start : row_offset + local_end, :])
+            row_offset += full_size
+        return torch.cat(shards, dim=0)
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):

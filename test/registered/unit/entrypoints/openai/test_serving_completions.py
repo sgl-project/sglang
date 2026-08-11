@@ -167,15 +167,20 @@ class ServingCompletionTestCase(unittest.TestCase):
         # (but might have json_schema from the legacy json_schema field)
         self.assertIsNone(sampling_params.get("structural_tag"))
 
-    def test_logprobs_false_non_streaming(self):
-        """Test that logprobs=False doesn't cause KeyError in non-streaming response."""
+    def test_non_streaming_response(self):
         req = CompletionRequest(
-            model="x", prompt="Hello", max_tokens=10, logprobs=False
+            model="x",
+            prompt="Hello",
+            max_tokens=10,
+            logprobs=False,
+            return_token_ids=True,
         )
 
         mock_ret = [
             {
                 "text": " world",
+                "output_ids": [3, 4],
+                "prompt_token_ids": [1, 2],
                 "meta_info": {
                     "id": "test-id",
                     "prompt_tokens": 1,
@@ -191,6 +196,8 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(len(response.choices), 1)
         self.assertEqual(response.choices[0].text, " world")
         self.assertEqual(len(response.choices[0].logprobs.top_logprobs), 0)
+        self.assertEqual(response.choices[0].token_ids, [3, 4])
+        self.assertEqual(response.choices[0].prompt_token_ids, [1, 2])
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
@@ -257,6 +264,76 @@ class ServingCompletionTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_streaming_token_ids_deltas_cover_output_exactly(self):
+        req = CompletionRequest(
+            model="x",
+            prompt="Hi",
+            max_tokens=10,
+            stream=True,
+            return_token_ids=True,
+        )
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+        self.sc.tokenizer_manager.server_args.stream_response_default_include_usage = (
+            False
+        )
+
+        for incremental in (False, True):
+            with self.subTest(incremental_streaming_output=incremental):
+                self.sc.tokenizer_manager.server_args.incremental_streaming_output = (
+                    incremental
+                )
+                texts = ("a", "b", "c") if incremental else ("a", "ab", "abc")
+                output_ids = (
+                    ([5], [6], [7]) if incremental else ([5], [5, 6], [5, 6, 7])
+                )
+                chunks = [
+                    {
+                        "text": text,
+                        "output_ids": ids,
+                        "prompt_token_ids": [1, 2],
+                        "meta_info": {
+                            "id": "cmpl-test",
+                            "prompt_tokens": 2,
+                            "completion_tokens": i + 1,
+                            "finish_reason": {"type": "stop"} if i == 2 else None,
+                        },
+                        "index": 0,
+                    }
+                    for i, (text, ids) in enumerate(zip(texts, output_ids))
+                ]
+
+                async def _mock_generate(*args, _chunks=chunks, **kwargs):
+                    for chunk in _chunks:
+                        yield chunk
+
+                self.sc.tokenizer_manager.generate_request = _mock_generate
+
+                async def run_stream():
+                    return [
+                        chunk
+                        async for chunk in self.sc._generate_completion_stream(
+                            adapted_request, req, self.fastapi_request
+                        )
+                    ]
+
+                loop = get_or_create_event_loop()
+                raw_chunks = loop.run_until_complete(run_stream())
+
+                choices = []
+                for raw in raw_chunks:
+                    if not raw.startswith("data: ") or raw.strip() == "data: [DONE]":
+                        continue
+                    data = json.loads(raw[len("data: ") :])
+                    choices.extend(data.get("choices", []))
+
+                token_ids = [tid for c in choices for tid in c.get("token_ids", [])]
+                text = "".join(c["text"] for c in choices)
+                self.assertEqual(text, "abc")
+                self.assertEqual(token_ids, [5, 6, 7])
+                self.assertEqual(choices[0]["prompt_token_ids"], [1, 2])
+                for choice in choices[1:]:
+                    self.assertNotIn("prompt_token_ids", choice)
 
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming completion responses emit cached token details in sglext."""

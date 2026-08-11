@@ -12,10 +12,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
+from sglang.kernels.ops.layernorm.norm import (
+    can_use_fused_inplace_qknorm as can_use_jit_qk_norm,
+)
 from sglang.srt.environ import envs
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -46,11 +48,11 @@ _is_xpu = is_xpu()
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
-    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
-            from sglang.jit_kernel.flash_attention_v4 import (
+            from sglang.kernels.ops.attention.flash_attention_v4 import (
                 flash_attn_varlen_func as flash_attn_varlen_func_fa4,
             )
 
@@ -85,7 +87,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
 from sglang.srt.utils import add_prefix
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -146,6 +148,7 @@ def prepare_vision_attention_metadata(
     cu_seqlens: torch.Tensor,
     device: torch.device,
     *,
+    max_seqlen: Optional[int] = None,
     packed_indptrs: Optional[torch.Tensor] = None,
     sequence_lengths: Optional[torch.Tensor] = None,
     flashinfer_max_seqlen: Optional[int] = None,
@@ -154,7 +157,8 @@ def prepare_vision_attention_metadata(
 
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen = int(seq_lens.max().item())
+    if max_seqlen is None:
+        max_seqlen = int(seq_lens.max().item())
     return VisionAttentionMetadata(
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
@@ -162,6 +166,43 @@ def prepare_vision_attention_metadata(
         packed_indptrs=packed_indptrs,
         sequence_lengths=sequence_lengths,
         flashinfer_max_seqlen=flashinfer_max_seqlen,
+    )
+
+
+def prepare_flashinfer_cudnn_vision_attention_metadata(
+    cu_seqlens: torch.Tensor,
+    device: torch.device,
+    *,
+    elem_per_token: int,
+) -> VisionAttentionMetadata:
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    batch_size = int(seq_lens.numel())
+    padded_batch_size = next(
+        (size for size in BATCH_BUCKETS if size >= batch_size),
+        math.ceil(batch_size / BATCH_BUCKETS[0]) * BATCH_BUCKETS[0],
+    )
+    if padded_batch_size != batch_size:
+        pad_size = padded_batch_size - batch_size
+        padded_indptrs = torch.cat([cu_seqlens, cu_seqlens[-1].expand(pad_size)])
+        padded_seq_lens = torch.cat([seq_lens, seq_lens.new_zeros(pad_size)])
+    else:
+        padded_indptrs = cu_seqlens
+        padded_seq_lens = seq_lens
+
+    elem_indptrs = padded_indptrs * elem_per_token
+    real_max_seqlen = int(seq_lens.max().item())
+    max_seqlen = next(
+        (size for size in FLASHINFER_MAX_SEQLEN_BUCKETS if size >= real_max_seqlen),
+        math.ceil(real_max_seqlen / FLASHINFER_MAX_SEQLEN_BUCKETS[-1])
+        * FLASHINFER_MAX_SEQLEN_BUCKETS[-1],
+    )
+    return prepare_vision_attention_metadata(
+        cu_seqlens,
+        device=device,
+        packed_indptrs=torch.cat([elem_indptrs] * 3),
+        sequence_lengths=padded_seq_lens.view(-1, 1, 1, 1),
+        flashinfer_max_seqlen=max_seqlen,
     )
 
 
@@ -203,11 +244,15 @@ def resolve_seqlens(
     return resolved_seqlens
 
 
-def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
-    """Return max segment length, caching it on a stable carrier so the
-    device->host sync (.item()) happens once per forward instead of once per layer.
+def resolve_max_seqlen(
+    source: torch.Tensor | SingletonCache | None, cu_seqlens: torch.Tensor
+) -> int:
+    """Return the maximum segment length, caching only on ``SingletonCache``.
+
+    Raw tensors have no mutable instance dictionary, so caching on them would
+    raise ``AttributeError``. They use the same calculation without a cache.
     """
-    if isinstance(source, SingletonCache) or isinstance(source, torch.Tensor):
+    if isinstance(source, SingletonCache):
         cached = getattr(source, "_max_seqlen", None)
         if cached is None:
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -778,6 +823,9 @@ class VisionAscendAttention(nn.Module):
         if not _is_npu:
             raise Exception("VisionAscendAttention is only available for ascend npu")
         super().__init__()
+        # Ascend fused attention does not support SGLang's additive masks, so
+        # masked inputs must stay on SDPA.
+        self.sdpa_fallback = VisionSdpaAttention(**kwargs)
 
     def forward(
         self,
@@ -789,6 +837,7 @@ class VisionAscendAttention(nn.Module):
         seq_len: int,
         softmax_scale: Optional[float] = None,
         forward_metadata: Optional[VisionAttentionMetadata] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -797,12 +846,25 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if attention_mask is not None:
+            return self.sdpa_fallback(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens=cu_seqlens,
+                bsz=bsz,
+                seq_len=seq_len,
+                attention_mask=attention_mask,
+                forward_metadata=forward_metadata,
+                **kwargs,
+            )
+
         if forward_metadata is not None:
-            seq_lens = forward_metadata.seq_lens
-            if seq_lens.is_npu:
-                seq_lens = seq_lens.to("cpu")
+            # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
+            # not per-sequence lengths in forward_metadata.seq_lens.
+            cu = forward_metadata.cu_seqlens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = seq_lens.to(torch.int32)
+            seq_len_arg = cu[1:].to(torch.int32)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")
@@ -1040,9 +1102,11 @@ class VisionAttention(nn.Module):
         # Select attention backend via a unified method
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
-        if get_server_args().mm_attention_backend is None and _passed_backend is None:
+        if get_mm().mm_attention_backend is None and _passed_backend is None:
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
+
+        self.qkv_backend_name: str = qkv_backend
 
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
@@ -1119,7 +1183,7 @@ class VisionAttention(nn.Module):
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
             )
-            if get_server_args().rl_on_policy_target is not None
+            if get_exec().deterministic.rl_on_policy_target is not None
             else {}
         )
         q_norm = RMSNorm(
@@ -1145,9 +1209,10 @@ class VisionAttention(nn.Module):
         - CUDA (Hopper SM90): "fa3"
         - CUDA (Blackwell SM100): "fa4"
         - CUDA (other): "triton_attn"
-        - Non-CUDA: "sdpa"
+        - Ascend NPU: "ascend_attn"
+        - Other platforms: device-specific optimized backend or "sdpa"
         """
-        override_backend = get_server_args().mm_attention_backend
+        override_backend = get_mm().mm_attention_backend
         if override_backend is not None:
             backend = override_backend
         elif passed_backend is not None:
@@ -1160,6 +1225,8 @@ class VisionAttention(nn.Module):
                 backend = "fa4"
             else:
                 backend = "triton_attn"
+        elif _is_npu:
+            backend = "ascend_attn"
         elif _is_musa:
             if get_device_capability() >= (3, 1):
                 backend = "fa3"
@@ -1252,7 +1319,7 @@ class VisionAttention(nn.Module):
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
         if (
-            get_server_args().rl_on_policy_target is not None
+            get_exec().deterministic.rl_on_policy_target is not None
             and position_embeddings is not None
         ):
             assert isinstance(position_embeddings, tuple), (
@@ -1331,7 +1398,18 @@ class VisionAttention(nn.Module):
                 cos = torch.cat([cos, cos], dim=-1)
                 sin = torch.cat([sin, sin], dim=-1)
 
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            # `apply_rotary_pos_emb` is torch.compile-decorated. Its first
+            # specialization may otherwise be compiled while a ViT CUDA graph
+            # is being captured, which makes Inductor attempt an illegal
+            # CPU-to-CUDA copy. The eager version is captured as part of the
+            # graph, so its pointwise work is still replayed without launch
+            # overhead.
+            rotary_fn = (
+                apply_rotary_pos_emb_native_eager
+                if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+                else apply_rotary_pos_emb
+            )
+            q, k = rotary_fn(q, k, cos, sin)
             q = q.view(original_q_shape)
             k = k.view(original_k_shape)
 

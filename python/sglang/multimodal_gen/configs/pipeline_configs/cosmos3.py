@@ -84,3 +84,9 @@ class Cosmos3Config(PipelineConfig):
                 (num_frames - 1) // vae_scale_factor_temporal
             ) * vae_scale_factor_temporal + 1
         return num_frames
+
+    def supports_action_endpoint(self) -> bool:
+        # The public Cosmos3 family shares one pipeline/config across visual-only
+        # and action-capable checkpoints. The loaded transformer validates that
+        # an action head is actually present when an action request is submitted.
+        return True

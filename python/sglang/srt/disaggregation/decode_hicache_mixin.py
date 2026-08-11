@@ -71,7 +71,7 @@ class DecodeHiCachePreallocMixin:
         l3_storage_hit_length = 0
         last_host_node = None
         if self.scheduler.enable_decode_hicache:
-            last_host_node = result.last_host_node
+            last_host_node = self.tree_cache.resolve_node_handle(result.last_host_node)
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 matched_len = l1_prefix_len + l2_host_hit_length
                 suffix_tokens = req.origin_input_ids[matched_len:]
@@ -82,7 +82,7 @@ class DecodeHiCachePreallocMixin:
                     else None
                 )
                 l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
-                    last_host_node,
+                    result.last_host_node,
                     suffix_tokens,
                     last_hash,
                     prefix_keys,
@@ -93,7 +93,9 @@ class DecodeHiCachePreallocMixin:
             l2_host_hit_length=l2_host_hit_length,
             l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
-            last_host_node=last_host_node if l3_storage_hit_length > 0 else None,
+            last_host_node=(
+                result.last_host_node if l3_storage_hit_length > 0 else None
+            ),
         )
 
     def _start_hicache_prefetch(
@@ -110,7 +112,7 @@ class DecodeHiCachePreallocMixin:
         ):
             return
         try:
-            node = prefix_match.last_host_node
+            node = self.tree_cache.resolve_node_handle(prefix_match.last_host_node)
             matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
             suffix = req.origin_input_ids[
                 matched_len : matched_len + prefix_match.l3_storage_hit_length
@@ -122,7 +124,7 @@ class DecodeHiCachePreallocMixin:
                 else None
             )
             self.tree_cache.prefetch_from_storage(
-                req.rid, node, suffix, last_hash, prefix_keys
+                req.rid, prefix_match.last_host_node, suffix, last_hash, prefix_keys
             )
             prefix_match.prefetch_registered = (
                 req.rid in self.tree_cache.ongoing_prefetch

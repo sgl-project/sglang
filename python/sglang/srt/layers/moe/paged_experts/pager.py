@@ -179,7 +179,7 @@ def _alloc_miss_slot(device) -> tuple:
     pinned host [1] doorbell view, doorbell device address)``."""
     global _MISS_VEC, _MISS_VEC_N, _MISS_VEC_HOST, _MISS_VEC_HOST_BASE
     if _MISS_VEC is None:
-        from sglang.jit_kernel.paged_experts_decide import paged_experts_host_devptr
+        from sglang.kernels.jit.paged_experts_decide import paged_experts_host_devptr
 
         _MISS_VEC = torch.zeros(_MISS_VEC_CAP, dtype=torch.int32, device=device)
         _MISS_VEC_HOST = torch.full(
@@ -425,7 +425,7 @@ class ExpertPager:
         """
         if not self.ondevice or self._gm_stores is None:
             return False
-        from sglang.jit_kernel.paged_experts_decide import (
+        from sglang.kernels.jit.paged_experts_decide import (
             paged_experts_gather_multi,
             paged_experts_scratch_split,
         )
@@ -538,7 +538,7 @@ class ExpertPager:
         store's UVA device pointer (once, outside any graph). Requires a pinned store with 16-byte-aligned
         per-expert blocks (the gather is float4). Slots 0..K-1 start holding experts 0..K-1, matching the
         eager seeding."""
-        from sglang.jit_kernel.paged_experts_decide import paged_experts_host_devptr
+        from sglang.kernels.jit.paged_experts_decide import paged_experts_host_devptr
 
         assert self.pin_host, "on-device gather needs a pinned store (UVA)"
         # Windowed store (>pin-ceiling fallback): only the hot window is pinned/UVA-gatherable — the gather
@@ -631,7 +631,7 @@ class ExpertPager:
         """Gather the experts the last decide chose (``_src_d`` -> ``_dst_d``, count ``_n_out_d``) from the
         pinned store into the GPU pool — ONE fused launch for all paged tensors (count read on-device ->
         capture-safe)."""
-        from sglang.jit_kernel.paged_experts_decide import paged_experts_gather_multi
+        from sglang.kernels.jit.paged_experts_decide import paged_experts_gather_multi
 
         paged_experts_gather_multi(
             self._gm_stores,
@@ -647,7 +647,7 @@ class ExpertPager:
         LIVE ``logical_to_gpu_index_cuda``, so on the BCG path it runs AFTER the staging break and sees
         just-staged experts. Returns ``(safe_ids, masked_tw)`` shaped like the inputs, or ``None`` when
         the weights layout is unsupported (caller falls back to the python chain)."""
-        from sglang.jit_kernel.paged_experts_decide import paged_experts_remap_mask
+        from sglang.kernels.jit.paged_experts_decide import paged_experts_remap_mask
 
         if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
             if not getattr(self, "_remap_fallback_warned", False):
@@ -680,7 +680,7 @@ class ExpertPager:
         Mutates the persistent state buffers and ``logical_to_gpu_index_cuda`` (the remap table) in place;
         gathers exactly the chosen experts. Requires distinct active experts <= K (the caller guarantees it
         via the shape guard ``num_tokens * top_k <= K``)."""
-        from sglang.jit_kernel.paged_experts_decide import paged_experts_decide
+        from sglang.kernels.jit.paged_experts_decide import paged_experts_decide
 
         self._prep_topk_ondevice(topk_ids)
         l2g = self.logical_to_gpu_index_cuda  # serves as both expert_slot and idx
@@ -706,7 +706,7 @@ class ExpertPager:
         (window-missing) experts are deferred — their logical ids land in ``_cold_log_d`` and they stay
         masked this replay — for the post-replay refill to stage and converge. Requires distinct active <= K.
         """
-        from sglang.jit_kernel.paged_experts_decide import paged_experts_decide_bounded
+        from sglang.kernels.jit.paged_experts_decide import paged_experts_decide_bounded
 
         self._prep_topk_ondevice(topk_ids)
         l2g = self.logical_to_gpu_index_cuda  # serves as both expert_slot and idx
@@ -863,7 +863,7 @@ class ExpertPager:
         # micro-copies (two of which move <1 KB fp8 scale rows). Falls back to per-row copies past the
         # staging cap or on non-windowed stores.
         if getattr(self, "_sc_stage", None) is not None and n <= self._sc_cap:
-            from sglang.jit_kernel.paged_experts_decide import (
+            from sglang.kernels.jit.paged_experts_decide import (
                 paged_experts_scatter_multi,
             )
 
@@ -936,7 +936,7 @@ class ExpertPager:
         (double-buffered) caller passes ``wave_k = K//2`` with alternating ``slot_base`` and a per-bank
         ``idx_out`` (so the next wave's decide cannot race this wave's remap); the captured caller uses
         the defaults (full-K waves into ``logical_to_gpu_index_cuda``)."""
-        from sglang.jit_kernel.paged_experts_decide import paged_experts_decide_wave
+        from sglang.kernels.jit.paged_experts_decide import paged_experts_decide_wave
 
         if wave == 0:
             self._prep_topk_ondevice(topk_ids)

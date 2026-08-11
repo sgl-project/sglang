@@ -57,7 +57,13 @@ def _get_dflash_layer_attention_params(
 
     layer_type = layer_types[layer_id]
     if layer_type == "full_attention":
-        return -1, AttentionType.ENCODER_ONLY
+        text_config = getattr(config, "text_config", None) or config
+        attention_type = (
+            AttentionType.DECODER
+            if getattr(text_config, "is_causal", False)
+            else AttentionType.ENCODER_ONLY
+        )
+        return -1, attention_type
     if layer_type == "sliding_attention":
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
@@ -143,6 +149,13 @@ class DFlashAttention(nn.Module):
         )
 
         self.scaling = head_dim**-0.5
+        rotary = self.rotary_emb
+        self.use_table_qk_norm_rope = (
+            not _is_npu
+            and hasattr(rotary, "cos_sin_cache")
+            and getattr(rotary, "rotary_dim", None) == head_dim
+            and getattr(rotary, "is_neox_style", False)
+        )
         self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
@@ -185,6 +198,21 @@ class DFlashAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
+        elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
+            from sglang.srt.speculative.dflash_utils import table_qk_norm_rope_
+
+            table_qk_norm_rope_(
+                qkv,
+                positions,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
@@ -404,9 +432,13 @@ class DFlashDraftModel(nn.Module):
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         if input_embeds is None:
-            raise ValueError(
-                "DFlashDraftModel requires `input_embeds` (use the target embedding)."
-            )
+            if hasattr(self, "forward_embed"):
+                input_embeds = self.forward_embed(input_ids)
+            else:
+                raise ValueError(
+                    "DFlashDraftModel requires `input_embeds` (use the target "
+                    "embedding)."
+                )
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 

@@ -22,7 +22,7 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
 def configure_kv_cache_dtype(
     *,
     server_args_kv_cache_dtype: str,
-    model: nn.Module,
+    model: nn.Module | None,
     model_dtype: torch.dtype,
     is_draft_worker: bool,
     is_dflash: bool,
@@ -50,6 +50,8 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = fp8_dtype
         else:
             kv_cache_dtype = torch.float8_e4m3fn
+    elif server_args_kv_cache_dtype == "mxfp8":
+        kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
     elif server_args_kv_cache_dtype == "fp4_e2m1":

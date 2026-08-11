@@ -52,6 +52,9 @@ class SessionSlot:
     last_node: Any = None
     cache_protected_len: int = 0
     swa_uuid_for_lock: Optional[str] = None
+    # components the first req skipped locking on last_node, so release dec
+    # releases only what it took (may share the node with another req).
+    skip_lock_node_ids: dict = field(default_factory=dict)
 
     # Mamba states
     mamba_pool_idx: Any = None
@@ -75,6 +78,7 @@ class SessionSlot:
             self.last_node = req.last_node
             self.cache_protected_len = req.cache_protected_len
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
+            self.skip_lock_node_ids = req.skip_lock_node_ids
 
         self.mamba_pool_idx = req.mamba_pool_idx
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
@@ -104,6 +108,7 @@ class SessionSlot:
         req.kv_committed_len = self.kv_committed_len
         req.kv = copy.copy(self.kv)
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
+        req.skip_lock_node_ids = self.skip_lock_node_ids
 
         req.mamba_pool_idx = self.mamba_pool_idx
         req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
@@ -306,6 +311,7 @@ class StreamingSession(BasePrefixCache):
                     last_node=req.last_node,
                     cache_protected_len=req.cache_protected_len,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
+                    skip_lock_node_ids=req.skip_lock_node_ids,
                     mamba_pool_idx=req.mamba_pool_idx,
                     mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
                 )
@@ -418,13 +424,13 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
-            if slot.swa_uuid_for_lock is not None:
-                self.inner.dec_lock_ref(
-                    lock_node,
-                    DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
-                )
-            else:
-                self.inner.dec_lock_ref(lock_node)
+            self.inner.dec_lock_ref(
+                lock_node,
+                DecLockRefParams(
+                    swa_uuid_for_lock=slot.swa_uuid_for_lock,
+                    skip_lock_node_ids=slot.skip_lock_node_ids,
+                ),
+            )
 
         if slot.is_holding_kv:
             start = protected_len
@@ -595,9 +601,6 @@ class StreamingSession(BasePrefixCache):
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()
-
-    def flush_write_through_acks(self) -> None:
-        return self.inner.flush_write_through_acks()
 
     def check_hicache_events(self):
         return self.inner.check_hicache_events()

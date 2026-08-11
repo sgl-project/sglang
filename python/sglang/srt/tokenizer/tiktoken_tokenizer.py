@@ -105,7 +105,22 @@ class TiktokenTokenizer:
         self.vocab_size = tokenizer.n_vocab
         self.chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}{{ 'Human: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'system' %}{{ 'System: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'assistant' %}{{ 'Assistant: '  + message['content'] + '<|separator|>\n\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
         self.chat_template_jinja = Template(self.chat_template)
-        self.additional_stop_token_ids = None
+        # Turn-final markers some checkpoints ship without EOS metadata -- e.g.
+        # Inkling's <|content_model_end_sampling|>, whose bundled tokenizer
+        # config leaves eos_token unset. get_tokenizer()'s tiktoken load path
+        # returns before attach_additional_stop_token_ids() runs, so register
+        # them here from the same shared list (resolved against the special
+        # tokens, as with EOS above); otherwise generation runs to max_tokens.
+        from sglang.srt.utils.hf_transformers.common import (
+            _ADDITIONAL_STOP_TOKEN_TEXTS,
+        )
+
+        stop_ids = {
+            tokenizer._special_tokens[text]
+            for text in _ADDITIONAL_STOP_TOKEN_TEXTS
+            if text in tokenizer._special_tokens
+        }
+        self.additional_stop_token_ids = stop_ids or None
 
     def encode(self, x, add_special_tokens=False):
         return self.tokenizer.encode(x)
