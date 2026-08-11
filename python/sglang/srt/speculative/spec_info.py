@@ -328,6 +328,10 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # Whether this input carries all state required for CUDA graph replay.
+    # Algorithm-specific dataclass subclasses can override this per input.
+    cuda_graph_compatible: bool = True
+
     # Per-request verify lengths for the ragged-verify graphs (see
     # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
     # supports_ragged_verify() override it per step. Must stay a class-level

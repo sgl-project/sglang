@@ -52,9 +52,8 @@ def _spec_input_cuda_graph_compatible(local_batch: Optional[ScheduleBatch]) -> b
         or local_batch.forward_mode.is_prebuilt()
     ):
         return True
-    return getattr(
-        getattr(local_batch, "spec_info", None), "cuda_graph_compatible", True
-    )
+    spec_info = local_batch.spec_info
+    return spec_info is None or spec_info.cuda_graph_compatible
 
 
 def _resolve_elastic_world_dp_size(
