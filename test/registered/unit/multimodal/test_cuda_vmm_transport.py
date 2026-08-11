@@ -442,7 +442,7 @@ class TestCudaVmmTransport(CustomTestCase):
     def test_posix_export_fd_closes_when_allocation_setup_fails(self):
         with (
             patch(
-                "sglang.srt.utils.cuda_vmm_transport_utils._tensor_from_pointer",
+                "sglang.srt.utils.cuda_vmm_transport_utils.tensor_from_pointer",
                 side_effect=RuntimeError("forced storage failure"),
             ),
             patch(

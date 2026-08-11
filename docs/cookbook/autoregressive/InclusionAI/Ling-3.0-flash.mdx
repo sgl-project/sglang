@@ -1,6 +1,6 @@
 ---
 title: Ling-3.0-flash
-description: "Deploy Ling-3.0-flash with SGLang — 124B total / 5.1B active hybrid KDA + MLA MoE in BF16 or FP8, with thinking mode, Ling3 parsers, and NEXTN speculative decoding."
+description: "Deploy Ling-3.0-flash with SGLang — a 124B hybrid KDA + MLA MoE in BF16, FP8, INT4, or MXFP4 on Hopper and Blackwell GPUs."
 tag: NEW
 ---
 
@@ -48,6 +48,8 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 
 - **BF16**: [inclusionAI/Ling-3.0-flash](https://huggingface.co/inclusionAI/Ling-3.0-flash) — 124B total / 5.1B active
 - **FP8** (blockwise E4M3): [inclusionAI/Ling-3.0-flash-fp8](https://huggingface.co/inclusionAI/Ling-3.0-flash-fp8)
+- **INT4** (compressed-tensors W4A16): [inclusionAI/Ling-3.0-flash-int4](https://huggingface.co/inclusionAI/Ling-3.0-flash-int4)
+- **MXFP4**: [inclusionAI/Ling-3.0-flash-fp4](https://huggingface.co/inclusionAI/Ling-3.0-flash-fp4)
 
 **License:** MIT
 
@@ -57,9 +59,11 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 
 - BF16 tensor parallelism follows the GPU: `--tp 4` on 141 GB-class cards (H20-3e, H200) and 4-GPU Blackwell nodes (B200, GB300); `--tp 8` on 80 GB cards (H100, H800).
 - The FP8 recipes pair `--tp` with a matching `--ep-size` (`--tp 4 --ep-size 4` on 4-GPU nodes, `--tp 8 --ep-size 8` on H100/H800). The checkpoint uses blockwise (128×128) E4M3 expert weights, so a pure tensor-parallel shard must satisfy `(768 / TP) % 128 == 0` — only TP2 qualifies; expert parallelism splits experts whole instead of by column, which lifts that restriction and uses the full node. SGLang detects the quantization format from the checkpoint's `quantization_config`, so no explicit quantization flag is needed.
+- INT4 uses compressed-tensors W4A16 experts. With the default MoE runner, SGLang selects Marlin on H200 and the graph-compatible Triton implementation on Blackwell; do not force a backend in the launch command.
+- MXFP4 uses the native FlashInfer runner on H200 and B200. The checkpoint mixes MXFP4 routed experts with block-FP8 dense and shared projections; on B200, `--fp8-gemm-backend triton` avoids an unsupported FlashInfer FP8 tactic while the routed experts remain native MXFP4.
 - `--reasoning-parser ling3` and `--tool-call-parser ling3` enable Ling-3.0-specific reasoning and structured tool-call parsing; toggle them in the **Parsers** card of the [Playground](#playground).
 - Both the chat template and the `ling3` reasoning parser default to thinking on. A single request can turn it off with `"chat_template_kwargs": {"enable_thinking": false}` (see §3.1).
-- `--mem-fraction-static 0.8` reserves headroom for CUDA graphs and concurrent decoding; with the default allocation the NEXTN recipes can OOM under concurrent requests (e.g. a 32-thread GSM8K run).
+- The BF16/FP8 recipes use `--mem-fraction-static 0.8`; INT4/MXFP4 use `0.85`. These values reserve the headroom used by the validated graph-enabled runs.
 - The checkpoint ships a built-in MTP layer (`num_nextn_predict_layers: 1`); enable it with `--speculative-algorithm NEXTN` — no separate draft model is needed. The Low-Latency recipes have it on; toggle it in the **Speculative Decoding** card of the [Playground](#playground).
 - Native context is 256K; SGLang reads it from the checkpoint's `max_position_embeddings`, so no `--context-length` flag is needed.
 - The **HiCache** card in the [Playground](#playground) exposes the validated Mooncake L3 path. It adds the hybrid-KDA scheduler and prefix-key settings together; see §3.3 for the required services.

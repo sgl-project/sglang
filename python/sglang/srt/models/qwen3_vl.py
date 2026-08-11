@@ -1351,42 +1351,52 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         _require_vision(self)
-        pixel_values = materialize_multimodal_features(
-            [item.feature for item in items],
-            device=self.visual.device,
-            dtype=self.visual.dtype,
-        )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-
-        if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
-                self.visual,
-                pixel_values,
-                image_grid_thw.tolist(),
-                rope_type="rope_3d",
-            )
-        else:
-            return self.visual(pixel_values, grid_thw=image_grid_thw)
+        return self._get_visual_feature(items, image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         _require_vision(self)
-        pixel_values = materialize_multimodal_features(
-            [item.feature for item in items],
-            device=self.visual.device,
-            dtype=self.visual.dtype,
-        )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        return self._get_visual_feature(items, video_grid_thw)
+
+    def _get_visual_feature(
+        self, items: List[MultimodalDataItem], grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        assert grid_thw.dim() == 2, grid_thw.dim()
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
+                self.visual,
+                None,
+                grid_thw.tolist(),
+                rope_type="rope_3d",
+                load_local_pixel_values=partial(self._materialize_visual_items, items),
+                pixel_values_device=self.visual.device,
+                pixel_values_dtype=self.visual.dtype,
             )
-        else:
-            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
-        return video_embeds
+        pixel_values = self._materialize_visual_items(items, range(len(items)))
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        return self.visual(pixel_values, grid_thw=grid_thw)
+
+    def _materialize_visual_items(
+        self, items: List[MultimodalDataItem], indices: Iterable[int]
+    ) -> torch.Tensor:
+        device = self.visual.device
+        device_index = device.index
+        if device.type == "cuda" and device_index is None:
+            device_index = torch.cuda.current_device()
+        if device.type == "cuda":
+            parallel = get_parallel()
+            consumer_count = max(parallel.tp_size, 1)
+
+        features = []
+        for index in indices:
+            item = items[index]
+            if device.type == "cuda":
+                item.reconstruct(device_index, ipc_consumer_count=consumer_count)
+            features.append(item.feature)
+        return materialize_multimodal_features(
+            features, device=device, dtype=self.visual.dtype
+        )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
