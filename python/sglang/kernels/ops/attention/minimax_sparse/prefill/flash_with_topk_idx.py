@@ -18,54 +18,16 @@ from ..common.utils import (
 from ..page_table import load_token_slots
 
 
+def _prefill_index_score_kernel_config() -> tuple[int, int, int, int]:
+    return 64, 128, 4, 2
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
         "BLOCK_SIZE_VD": lambda args: triton.next_power_of_2(args["v_head_dim"]),
         "HAS_SINK": lambda args: args["sink_ptr"] is not None,
     }
-)
-@triton.autotune(
-    configs=[
-        # Small block (64x64): low shared mem, can use higher num_stages
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4
-        ),
-        # Medium block (64x128, 128x64): moderate shared mem, ns=2,3
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3
-        ),
-        # Large block (128x128): high shared mem, ns=2,3 only, nw=8
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
-        ),
-    ],
-    key=[
-        "qk_head_dim",
-        "v_head_dim",
-        "block_size",
-        "use_gumbel_topk",
-        "SCORE_TYPE",
-        "DISABLE_INDEX_VALUE",
-    ],
 )
 @triton.jit
 def _flash_attn_fwd_with_block_score_kernel(
@@ -537,6 +499,10 @@ def flash_prefill_with_topk_index(
         device=q.device,
     )
 
+    BLOCK_SIZE_Q, BLOCK_SIZE_K, num_warps, num_stages = (
+        _prefill_index_score_kernel_config()
+    )
+
     # launch kernel
     def grid(META):
         return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
@@ -585,6 +551,10 @@ def flash_prefill_with_topk_index(
         IS_FP8=is_fp8,
         PAGE_SIZE=page_size,
         ONE_PAGE_PER_BLOCK=page_size == block_size_k,
+        BLOCK_SIZE_Q=BLOCK_SIZE_Q,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     # topk extraction kernel

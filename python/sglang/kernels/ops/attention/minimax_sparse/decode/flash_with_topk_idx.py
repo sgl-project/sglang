@@ -19,6 +19,10 @@ from ..common.utils import (
 from ..page_table import load_token_slots
 
 
+def _decode_score_one_page_kernel_config() -> tuple[int, int]:
+    return 2, 2
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_H": lambda args: max(
@@ -993,6 +997,7 @@ def flash_decode_with_topk_idx(
 
     grid = (batch_size * NUM_KV_CHUNKS, num_kv_heads)
     if disable_index_value and page_size == block_size:
+        num_warps, num_stages = _decode_score_one_page_kernel_config()
         _decode_score_one_page_per_block_kernel[grid](
             q,
             k_cache,
@@ -1022,8 +1027,8 @@ def flash_decode_with_topk_idx(
             SCORE_TYPE=score_type,
             SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
             IS_FP8=is_fp8,
-            num_warps=4,
-            num_stages=3,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     elif disable_index_value:
         _decode_score_kernel[grid](
