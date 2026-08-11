@@ -458,7 +458,19 @@ def _fwd_kernel(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
-    for start_n in range(0, prefix_end, BLOCK_N):
+    # The extend stage's floor, with q at its absolute position
+    # (cur_seq_len_prefix + cur_block_m * BLOCK_M) because kv is indexed within the
+    # prefix; tight for any BLOCK_M/BLOCK_N, and SKIP_TILE already made the skipped
+    # tiles no-ops. Past the first window's m-blocks no query reaches the prefix.
+    prefix_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        prefix_start = (
+            tl.maximum(
+                cur_seq_len_prefix + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
+            )
+            // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(prefix_start, prefix_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
 
