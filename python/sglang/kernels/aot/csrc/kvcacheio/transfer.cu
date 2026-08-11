@@ -30,7 +30,7 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");
   }
 }
-#else
+#elif defined(USE_ROCM)
 // ROCm: use 128-bit streaming load/store when 16B-aligned, so fewer CUs are
 // needed to saturate the host fabric; falls back to 64-bit otherwise.
 typedef uint32_t sgl_u32x4 __attribute__((ext_vector_type(4)));
@@ -66,6 +66,22 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
       uint64_t tmp = __builtin_nontemporal_load(src + j);
       __builtin_nontemporal_store(tmp, dst + j);
     }
+  }
+}
+#else
+// MUSA: keep the original scalar nontemporal load/store path; the 128-bit
+// ROCm path above relies on a HIP/clang ext_vector_type extension that isn't
+// guaranteed to be available/correct under the MUSA compiler.
+__device__ __forceinline__ void
+transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
+  const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
+  uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
+  const int total_chunks = item_size_bytes / sizeof(uint64_t);
+
+#pragma unroll
+  for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
+    uint64_t tmp = __builtin_nontemporal_load(src + j);
+    __builtin_nontemporal_store(tmp, dst + j);
   }
 }
 #endif
