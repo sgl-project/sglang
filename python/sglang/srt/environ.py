@@ -431,10 +431,6 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
-    # Per-zmq-context socket cap; libzmq's default is 1023. A prefill rank
-    # holds 2 sockets per decode endpoint (PUSH + PAIR monitor), so a large
-    # decode fleet (replicas x DP ranks) exhausts the default regardless of
-    # the OS nofile limit. Default is ~16x libzmq's.
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)

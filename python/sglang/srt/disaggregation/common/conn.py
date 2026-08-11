@@ -1252,8 +1252,6 @@ class CommonKVSender(BaseKVSender):
 
 class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
-    # One PUSH socket per prefill rank endpoint; raise the cap so a large
-    # prefill fleet cannot exhaust the default 1023 either.
     _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
     _socket_cache = {}
     _socket_locks = {}
