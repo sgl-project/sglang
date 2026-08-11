@@ -1135,6 +1135,10 @@ def calculate_metrics(
                 total_input += input_requests[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
                 total_input_vision += input_requests[i].vision_prompt_len
+            else:
+                # Multi-turn inputs are flattened after execution; use the
+                # prompt length recorded on each output.
+                total_input += outputs[i].prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:

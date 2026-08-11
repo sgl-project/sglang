@@ -318,13 +318,13 @@ class TestBenchServingReasoningNonStream(CustomTestCase):
             server.server_close()
 
     def test_reasoning_only_non_stream_metrics_retokenize_text(self):
-        out, request_bodies = self._run(
-            _make_response(
-                content=None,
-                reasoning_content="Let me think.",
-                completion_tokens=3,
-            )
+        response = _make_response(
+            content=None,
+            reasoning_content="Let me think.",
+            completion_tokens=3,
         )
+        response["usage"]["prompt_tokens"] = 19
+        out, request_bodies = self._run(response)
 
         self.assertTrue(out.success, msg=f"request failed: {out.error}")
         self.assertEqual(out.generated_text, "Let me think.")
@@ -339,6 +339,7 @@ class TestBenchServingReasoningNonStream(CustomTestCase):
             backend="sglang-oai-chat",
         )
         self.assertEqual(metrics.completed, 1)
+        self.assertEqual(metrics.total_input, 19)
         self.assertEqual(output_lens, [3])
         self.assertEqual(metrics.total_output_retokenized, 3)
 
