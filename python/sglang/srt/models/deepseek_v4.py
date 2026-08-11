@@ -2689,7 +2689,12 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        run_tbo = self._can_run_tbo(forward_batch)
+        capture_dspark = self.dspark_layers_to_capture is not None
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
+        # execution cannot expose per-layer completed hidden states), so skip
+        # TBO when capturing -- a perf-only downgrade, not a correctness one.
+        run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
         if use_prefill_cp and not run_tbo:
             if cp_v2_active:
                 input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
@@ -2706,12 +2711,7 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
-        capture_dspark = self.dspark_layers_to_capture is not None
-        dspark_aux_hidden_states: List[torch.Tensor] = []
-        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
-        # execution cannot expose per-layer completed hidden states), so skip
-        # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        if run_tbo and not capture_dspark:
+        if run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
@@ -2762,6 +2762,7 @@ class DeepseekV4Model(nn.Module):
             and not cp_v2_active
             and not run_tbo
         ):
+            stream = torch.cuda.current_stream()
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
