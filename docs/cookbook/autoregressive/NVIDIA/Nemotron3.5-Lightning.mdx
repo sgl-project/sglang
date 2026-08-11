@@ -19,7 +19,8 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
+# Nemotron 3.5 support is not in a release yet — install from PR #33554.
+uv pip install "git+https://github.com/sgl-project/sglang.git@refs/pull/33554/head#subdirectory=python"
 ```
 
 Then run the **Python** output of the command panel below in that environment.
