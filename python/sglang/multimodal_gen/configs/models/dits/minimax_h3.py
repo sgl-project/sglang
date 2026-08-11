@@ -2,7 +2,6 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_block
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
@@ -10,8 +9,6 @@ MINIMAX_H3_ADALN_MODALITY_NUM = 3
 
 @dataclass
 class MiniMaxH3DiTArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
-
     lora_param_names_mapping: dict = field(default_factory=dict)
 
     num_layers: int = 50

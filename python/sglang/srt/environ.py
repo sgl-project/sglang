@@ -334,6 +334,8 @@ class Envs:
     SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # NaN-fill the unified memory pool at boot (debug repro switch).
+    SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
@@ -364,6 +366,8 @@ class Envs:
     SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
+    SGLANG_TRACE_ASYNC = EnvBool(False)
+    SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     # Disable lazy compaction in the unified memory pool allocator and
     # fall back to the per-free eager compaction. Used for production
@@ -721,6 +725,12 @@ class Envs:
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
+    # Raise if Triton loads a kernel after the engine starts serving. This
+    # verifies that startup warmup covers every kernel specialization used at
+    # serving time.
+    SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
+    SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
+    SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
@@ -836,6 +846,14 @@ class Envs:
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
+    # HiSparse
+    # Kill-switch for the shared-index (IndexShare) swap-in prefetch
+    # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
+    SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Timing probe: run the swap-in fully but skip the host->device KV bytes,
+    # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
+    SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+
     # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to an unpacked SiTU
     # cubin pool (cubins + flat ABI headers + overlay/; distributed as a
     # single downloadable archive). Needs the public flashinfer package
@@ -900,6 +918,10 @@ class Envs:
     # Set to 1: force enable (even without --enable-deterministic-inference)
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
+    # NCCL channel count pinned on CUDA so the all-reduce reduces a token the
+    # same way whatever else shares its batch. Raise it to buy back bandwidth
+    # on links that can drive more channels.
+    SGLANG_DETERMINISTIC_NCCL_NCHANNELS = EnvInt(8)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
     # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
@@ -1028,6 +1050,10 @@ class Envs:
     SGLANG_LOGPROB_CHUNK_SIZE = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
     )
+    # Compute input logprobs from logits via per-row logsumexp instead of
+    # materializing the full-vocab log-softmax. Escape hatch only; the two
+    # paths are mathematically identical.
+    SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
@@ -1225,7 +1251,7 @@ class Envs:
 
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
 
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
@@ -1338,6 +1364,10 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    # Also autotune one EXTEND-shaped dummy at max_prefill_tokens during
+    # warmup. Opt-in: the extra forward needs transient activation headroom
+    # that small-VRAM or tightly-packed configs may not have.
+    SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
 
     # Plugin system
