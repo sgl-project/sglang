@@ -3145,7 +3145,7 @@ class ServerArgs:
     ] = 4
     weight_loader_drop_cache_after_load: A[
         bool,
-        "Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
+        "Call posix_fadvise(DONTNEED) on each safetensors shard after loading it, then repeat after all TP ranks finish loading.",
         NS("model"),
     ] = False
     remote_instance_weight_loader_seed_instance_ip: A[

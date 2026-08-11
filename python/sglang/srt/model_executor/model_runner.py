@@ -1184,6 +1184,16 @@ class ModelRunner:
             is_ep_joiner=is_ep_joiner(),
         )
 
+        if get_model().weight_loader_drop_cache_after_load:
+            self.loader.drop_loaded_weight_file_cache()
+            # Do not let one rank begin allocating large host cache pools while
+            # another rank is still evicting checkpoint pages.
+            dist_barrier_after_load(
+                elastic_ep_backend=get_exec().moe.elastic_ep_backend,
+                tp_rank=self.ps.tp_rank,
+                is_ep_joiner=is_ep_joiner(),
+            )
+
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 

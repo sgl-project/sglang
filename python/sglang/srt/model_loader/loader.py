@@ -103,6 +103,7 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
+    _drop_file_cache_after_load,
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -371,6 +372,10 @@ class BaseModelLoader(ABC):
         """Load a model with the given configurations."""
         raise NotImplementedError
 
+    def drop_loaded_weight_file_cache(self) -> int:
+        """Drop page cache for weight files loaded by this loader."""
+        return 0
+
 
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
@@ -414,6 +419,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
+        self._loaded_weight_files_for_cache_drop: set[str] = set()
         extra_config = load_config.model_loader_extra_config
         allowed_keys = {"enable_multithread_load", "num_threads"}
         if load_config.load_format == LoadFormat.FASTSAFETENSORS:
@@ -603,6 +609,8 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_drop_cache_after_load = (
                 get_model().weight_loader_drop_cache_after_load
             )
+            if weight_loader_drop_cache_after_load:
+                self._loaded_weight_files_for_cache_drop.update(hf_weights_files)
 
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
@@ -679,6 +687,23 @@ class DefaultModelLoader(BaseModelLoader):
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+    def drop_loaded_weight_file_cache(self) -> int:
+        """Repeat DONTNEED after all TP ranks have finished loading.
+
+        Per-shard eviction is intentionally retained to control the loading
+        peak. This final pass handles a later rank faulting a shard back into
+        page cache after an earlier rank already evicted it.
+        """
+        paths = sorted(self._loaded_weight_files_for_cache_drop)
+        for path in paths:
+            _drop_file_cache_after_load(path)
+        if paths:
+            logger.info(
+                "Final checkpoint page-cache eviction completed for %d files.",
+                len(paths),
+            )
+        return len(paths)
 
     @classmethod
     def _filter_mtp_weights(

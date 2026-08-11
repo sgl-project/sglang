@@ -521,6 +521,44 @@ class TestPrefetchDispatch(CustomTestCase):
                 {"enable_gds": "false"}, load_format=LoadFormat.FASTSAFETENSORS
             )
 
+    def test_final_cache_drop_replays_all_loaded_shards(self):
+        """The post-barrier pass evicts every shard even if ranks refaulted it."""
+        loader = self._make_loader({})
+        with (
+            patch.object(
+                DefaultModelLoader,
+                "_prepare_weights",
+                return_value=(
+                    "/dummy",
+                    ["b.safetensors", "a.safetensors", "a.safetensors"],
+                    True,
+                ),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader.get_model",
+                return_value=self._server_args(
+                    prefetch=False,
+                    drop_cache=True,
+                ),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader."
+                "buffered_multi_thread_safetensors_weights_iterator",
+                return_value=iter([]),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader._drop_file_cache_after_load"
+            ) as drop_cache,
+        ):
+            self._run(loader)
+            count = loader.drop_loaded_weight_file_cache()
+
+        self.assertEqual(count, 2)
+        self.assertEqual(
+            [call.args[0] for call in drop_cache.call_args_list],
+            ["a.safetensors", "b.safetensors"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
