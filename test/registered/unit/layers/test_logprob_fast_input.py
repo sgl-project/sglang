@@ -7,12 +7,17 @@ agree with the reference path to floating-point tolerance, with identical
 top-k indices, across chunk splits and heterogeneous per-sequence params.
 """
 
+import itertools
+import tempfile
 import unittest
 from types import SimpleNamespace
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.srt.layers.logprob_processor import (
+    DistributedLogprobContext,
     InputLogprobProcessor,
     compute_row_log_normalizer,
 )
@@ -32,6 +37,116 @@ TOKEN_IDS_CYCLE = [[0, 3], None, [1], []]
 SEQ_SPEC_MENU = ((1, 1), (3, 0), (4, 1), (5, 5), (6, 2))
 # 5 singletons + 5*5 ordered pairs + 4*5 wide cases at width 3.
 EXPECTED_CASES = 50
+
+
+class _TorchDistributedGroup:
+    def __init__(self):
+        self.device_group = dist.group.WORLD
+
+    def all_reduce(self, tensor):
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.device_group)
+        return tensor
+
+
+def _distributed_input_logprob_worker(rank, world_size, init_file):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(17)
+        rows, vocab, shard_width = 7, 11, 6
+        full_logits = torch.randn(rows, vocab, dtype=torch.float32) * 3
+        if rank == 0:
+            local_logits = full_logits[:, :shard_width].clone()
+            vocab_start, vocab_end = 0, 6
+        else:
+            # A deliberately dominant padding value catches accidental
+            # participation in the distributed normalizer.
+            padding = torch.full((rows, 1), 1e4)
+            local_logits = torch.cat((full_logits[:, 6:], padding), dim=1)
+            vocab_start, vocab_end = 6, vocab
+
+        group = _TorchDistributedGroup()
+
+        def get_local_logits_fn(states, lm_head, logits_metadata):
+            return states
+
+        def gather_sampled_logits_fn(local_sampled):
+            shards = [torch.empty_like(local_sampled) for _ in range(world_size)]
+            dist.all_gather(shards, local_sampled, group=group.device_group)
+            return torch.cat(shards, dim=-1)[:, :vocab]
+
+        context = DistributedLogprobContext(
+            tp_group=group,
+            vocab_start_index=vocab_start,
+            vocab_end_index=vocab_end,
+            vocab_size=vocab,
+            get_local_logits_fn=get_local_logits_fn,
+            gather_sampled_logits_fn=gather_sampled_logits_fn,
+        )
+        sample_indices = torch.tensor([2, 5, 6], dtype=torch.long)
+        input_indices = torch.arange(6, dtype=torch.long)
+        target_ids = torch.tensor([0, 6, 10, 1, 7, 9], dtype=torch.long)
+        metadata = SimpleNamespace(
+            extend_return_top_logprob=False,
+            extend_token_ids_logprob=True,
+            top_logprobs_nums=[0, 0, 0],
+            extend_logprob_pruned_lens_cpu=[3, 3, 0],
+            extend_input_logprob_token_ids_gpu=target_ids,
+            token_ids_logprobs=[[0, 6, 10], [2, 7], None],
+        )
+
+        proc = InputLogprobProcessor()
+        proc.enable_fast_input_logprobs = True
+        proc.enable_logprobs_chunk = True
+        proc.logprobs_chunk_size = 2
+
+        def unused_gathered_logits(*args, **kwargs):
+            raise AssertionError("distributed path unexpectedly gathered prompt rows")
+
+        result, sampled_logits = proc.forward(
+            pruned_states=local_logits,
+            sample_indices=sample_indices,
+            input_logprob_indices=input_indices,
+            token_to_seq_idx=[0, 0, 0, 1, 1, 1, 2],
+            lm_head=None,
+            get_logits_fn=unused_gathered_logits,
+            logits_metadata=metadata,
+            distributed_context=context,
+        )
+
+        reference = torch.log_softmax(full_logits, dim=-1)
+        expected_targets = reference[input_indices, target_ids]
+        torch.testing.assert_close(
+            result.token_logprobs, expected_targets, rtol=1e-5, atol=1e-5
+        )
+        torch.testing.assert_close(
+            sampled_logits, full_logits[sample_indices], rtol=0, atol=0
+        )
+
+        expected_explicit = [
+            reference[:3, [0, 6, 10]].tolist(),
+            reference[3:6, [2, 7]].tolist(),
+            [],
+        ]
+        _assert_nested_close(
+            unittest.TestCase(),
+            expected_explicit,
+            result.token_ids_logprobs_val,
+            "distributed explicit token IDs",
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        assert result.token_ids_logprobs_idx == [
+            [[0, 6, 10]] * 3,
+            [[2, 7]] * 3,
+            [],
+        ]
+    finally:
+        dist.destroy_process_group()
 
 
 def _build_batch(seq_specs, dtype, vocab=VOCAB):
@@ -123,6 +238,54 @@ def _shape_of(nested):
 
 
 class TestFastInputLogprobs(CustomTestCase):
+    def test_distributed_path_falls_back_for_prompt_topk(self):
+        batch = _build_batch([(4, 1), (3, 0)], torch.float32)
+        proc = InputLogprobProcessor()
+        reference, reference_sampled = _run(proc, batch, True, None)
+
+        def unexpected_distributed_call(*args, **kwargs):
+            raise AssertionError("prompt top-k must retain the gathered path")
+
+        context = DistributedLogprobContext(
+            tp_group=None,
+            vocab_start_index=0,
+            vocab_end_index=VOCAB,
+            vocab_size=VOCAB,
+            get_local_logits_fn=unexpected_distributed_call,
+            gather_sampled_logits_fn=unexpected_distributed_call,
+        )
+        pruned_states, sample_indices, input_indices, token_to_seq, metadata = batch
+
+        def get_logits_fn(states, lm_head, logits_metadata, **kwargs):
+            return states
+
+        got, got_sampled = proc.forward(
+            pruned_states=pruned_states,
+            sample_indices=sample_indices,
+            input_logprob_indices=input_indices,
+            token_to_seq_idx=token_to_seq,
+            lm_head=None,
+            get_logits_fn=get_logits_fn,
+            logits_metadata=metadata,
+            distributed_context=context,
+        )
+        self.assertEqual(reference.top_logprobs_idx, got.top_logprobs_idx)
+        self.assertEqual(reference.token_ids_logprobs_idx, got.token_ids_logprobs_idx)
+        torch.testing.assert_close(reference.token_logprobs, got.token_logprobs)
+        torch.testing.assert_close(reference_sampled, got_sampled)
+
+    def test_distributed_exact_input_logprobs_cpu(self):
+        # Real collectives, but Gloo/CPU only: validates TP=2 normalization,
+        # padding exclusion, local/remote token ownership, ragged explicit
+        # probes, chunk stitching, and sampled-row-only vocab gathering.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            mp.spawn(
+                _distributed_input_logprob_worker,
+                args=(2, f"{tmp_dir}/init"),
+                nprocs=2,
+                join=True,
+            )
+
     def _sweep(self, dtype, rtol, atol):
         torch.manual_seed(0)
         proc = InputLogprobProcessor()
