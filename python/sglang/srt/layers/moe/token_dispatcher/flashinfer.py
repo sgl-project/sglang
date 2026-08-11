@@ -35,8 +35,14 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.runtime_context import get_flags, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.common import is_xpu
 
 try:
+    # FlashInfer is CUDA-only and probes the CUDA driver at import time, which
+    # raises AssertionError (not ImportError) on an XPU host. See fp4_utils.py.
+    if is_xpu():
+        raise ImportError("flashinfer is CUDA-only and unavailable on XPU")
+
     from flashinfer import nvfp4_block_scale_interleave
     from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
     from flashinfer.comm.mapping import Mapping

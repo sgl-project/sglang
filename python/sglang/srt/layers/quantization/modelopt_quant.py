@@ -65,6 +65,7 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
+    is_xpu,
     round_up,
     set_weight_attrs,
 )
@@ -99,6 +100,11 @@ def _make_per_tensor_scale_parameter(
 
 
 try:
+    # FlashInfer is CUDA-only and probes the CUDA driver at import time, which
+    # raises AssertionError (not ImportError) on an XPU host. See fp4_utils.py.
+    if is_xpu():
+        raise ImportError("flashinfer is CUDA-only and unavailable on XPU")
+
     from flashinfer import mm_fp4 as flashinfer_fp4_gemm
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 

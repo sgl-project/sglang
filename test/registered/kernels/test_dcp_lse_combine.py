@@ -13,10 +13,29 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_xpu_ci(est_time=30, suite="stage-a-test-1-gpu-xpu")
+
+
+def _accel_device() -> str:
+    """Return the accelerator these Triton kernels can run on, or "" if none.
+
+    The DCP LSE-combine kernels are plain Triton and carry no CUDA-only
+    intrinsics, so they run on any Triton-backed accelerator. Resolve the
+    device instead of hardcoding "cuda" so Intel XPU hosts exercise the
+    kernels rather than skipping every case.
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    return ""
+
+
+_NO_ACCEL_SKIP_REASON = "A CUDA, ROCm, or XPU device is required for Triton kernel tests"
 
 
 class TestLSECombineTritonVsCPU(CustomTestCase):
@@ -24,9 +43,9 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA required for Triton kernel tests")
-        cls.device = "cuda"
+        cls.device = _accel_device()
+        if not cls.device:
+            raise unittest.SkipTest(_NO_ACCEL_SKIP_REASON)
 
     def _run_combine_test(
         self, N, B, H_local, D, is_base_e, dtype=torch.bfloat16, atol=1e-2
@@ -120,9 +139,9 @@ class TestLSECombineSingleShard(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA required")
-        cls.device = "cuda"
+        cls.device = _accel_device()
+        if not cls.device:
+            raise unittest.SkipTest(_NO_ACCEL_SKIP_REASON)
 
     def test_single_shard(self):
         from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
@@ -152,9 +171,9 @@ class TestLSECombineReturnLSE(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA required")
-        cls.device = "cuda"
+        cls.device = _accel_device()
+        if not cls.device:
+            raise unittest.SkipTest(_NO_ACCEL_SKIP_REASON)
 
     def test_return_lse(self):
         from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
@@ -181,9 +200,9 @@ class TestLSECombineEdgeCases(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA required")
-        cls.device = "cuda"
+        cls.device = _accel_device()
+        if not cls.device:
+            raise unittest.SkipTest(_NO_ACCEL_SKIP_REASON)
 
     def test_one_shard_dominant(self):
         """One shard has much larger LSE -- output should be close to that shard."""
@@ -303,9 +322,9 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA required")
-        cls.device = "cuda"
+        cls.device = _accel_device()
+        if not cls.device:
+            raise unittest.SkipTest(_NO_ACCEL_SKIP_REASON)
 
     def _make_mock_group(self, world_size):
         group = MagicMock()

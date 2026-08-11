@@ -13,6 +13,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
+    is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
@@ -20,7 +21,15 @@ logger = logging.getLogger(__name__)
 
 
 fp4_quantize = None
+# FlashInfer is a CUDA-only package and several of its submodules probe the CUDA
+# driver at import time (e.g. gdn_kernels reads
+# ``torch.cuda.get_device_properties(0).multi_processor_count`` at module
+# scope). On an XPU host that raises AssertionError rather than ImportError, so
+# skip the import outright instead of relying on the handler below.
 try:
+    if is_xpu():
+        raise ImportError("flashinfer is CUDA-only and unavailable on XPU")
+
     from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
 
     _flashinfer_fp4_quantize_backend = "cute-dsl" if get_platform().is_sm100 else "cuda"

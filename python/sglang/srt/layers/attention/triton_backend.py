@@ -1912,10 +1912,12 @@ class TritonAttnBackend(AttentionBackend):
                 skip_prefix=True,
             )
 
-        if kv_indices.numel() == 0:
-            return current_out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(
-                q.dtype
-            )
+        # NOTE: do not early-return when this rank's prefix shard is empty.
+        # kv_indices is per-rank (owner rule pos % dcp_size == dcp_rank), so a
+        # short prefix leaves some ranks with zero indices while others still
+        # have work. The reductions below are rank-collective, so returning here
+        # would block every other rank forever. All ranks participate instead;
+        # an empty shard just contributes lse = -inf (weight 0) to the merge.
 
         # Prefix KV is sharded across DCP ranks, so compute each rank's
         # partial attention with all gathered query heads and merge by LSE.

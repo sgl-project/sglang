@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
     should_report_expert_balancedness,
+    use_mla_backend,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -146,6 +147,96 @@ def handle_dcp_validation(server_args: Any):
                 "communication backend (it removes the head-dim Q all-gather); "
                 f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
             )
+    if cfg.dcp_size <= 1:
+        return
+
+    if get_platform().is_xpu:
+        _validate_dcp_on_xpu(server_args)
+
+    # The head-replication requirement comes from the Triton DCP decode path
+    # (it infers kv_group_num from the all-gathered Q head count), not the
+    # device, so it applies wherever DCP routes through Triton.
+    if (cfg.decode_attention_backend or cfg.attention_backend) == "triton":
+        _validate_dcp_kv_head_replication(server_args)
+
+
+# The xpu backend's decode kernels return no usable softmax LSE, so a DCP merge
+# over them would silently produce unnormalized output.
+_DCP_XPU_SUPPORTED_BACKENDS = ("triton",)
+
+
+def _validate_dcp_on_xpu(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "Decode context parallel (--dcp-size > 1) on XPU does not "
+            "support speculative decoding yet, but got "
+            f"speculative_algorithm={cfg.speculative_algorithm!r}."
+        )
+    if cfg.dcp_comm_backend != "ag_rs":
+        raise ValueError(
+            "Decode context parallel on XPU only supports "
+            "--dcp-comm-backend ag_rs (the a2a reduction is wired into the "
+            "CUDA/HIP MLA backends only), but got "
+            f"--dcp-comm-backend={cfg.dcp_comm_backend}."
+        )
+    for role, backend in (
+        ("--decode-attention-backend", cfg.decode_attention_backend),
+        ("--prefill-attention-backend", cfg.prefill_attention_backend),
+        ("--attention-backend", cfg.attention_backend),
+    ):
+        if backend is None:
+            continue
+        if backend not in _DCP_XPU_SUPPORTED_BACKENDS:
+            raise ValueError(
+                "Decode context parallel (--dcp-size > 1) on XPU requires "
+                f"the triton attention backend, but got {role}={backend!r}. "
+                "Pass --attention-backend triton."
+            )
+    if cfg.attention_backend is None and cfg.decode_attention_backend is None:
+        # Pin it before the model overrides run: several of them pick intel_xpu
+        # on XPU while the backend is still unset.
+        declare_resolution(
+            server_args,
+            "_handle_dcp_validation",
+            attention_backend="triton",
+        )
+        logger.info(
+            "DCP on XPU: defaulting --attention-backend to triton "
+            "(the xpu backend has no decode-context-parallel path)."
+        )
+
+
+def _validate_dcp_kv_head_replication(server_args: Any):
+    """Reject GQA configs whose DCP group spans distinct KV-head shards.
+
+    A DCP group must sit inside one KV-head replica run, i.e.
+    dcp_size <= tp_size // total_num_kv_heads. Violating it sums attention
+    over disjoint keys and returns wrong logits instead of raising.
+    """
+    cfg = resolving_view(server_args)
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        return
+    if use_mla_backend(server_args):
+        # MLA's single latent KV head is replicated on every rank.
+        return
+    total_num_kv_heads = model_config_of(server_args).get_total_num_kv_heads()
+    num_kv_head_replicas = max(1, cfg.tp_size // total_num_kv_heads)
+    if cfg.dcp_size <= num_kv_head_replicas:
+        return
+    raise ValueError(
+        "Decode context parallel (--dcp-size > 1) on the Triton attention "
+        "backend all-gathers Q across the DCP group and attends it against "
+        "each rank's local KV cache, which requires every rank in a DCP "
+        "group to hold the same KV heads. This model shards KV heads "
+        f"across the group: total_num_kv_heads={total_num_kv_heads}, "
+        f"tp_size={cfg.tp_size} gives num_kv_head_replicas="
+        f"{num_kv_head_replicas}, but --dcp-size={cfg.dcp_size} exceeds "
+        "it, so ranks in one DCP group own different KV heads and the "
+        "attention output would be silently wrong. Use "
+        f"--dcp-size <= {num_kv_head_replicas}, raise --tp-size to at "
+        f"least {total_num_kv_heads * cfg.dcp_size}, or pick an MLA model."
+    )
 
 
 def handle_data_parallelism(server_args: Any):
