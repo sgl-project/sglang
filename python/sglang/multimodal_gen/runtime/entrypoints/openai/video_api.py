@@ -425,14 +425,17 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
 
 # extract metadata which http_server needs to know
 def _video_job_from_sampling(
-    request_id: str, req: VideoGenerationsRequest, sampling: SamplingParams
+    request_id: str,
+    req: VideoGenerationsRequest,
+    sampling: SamplingParams,
+    served_model_name: str,
 ) -> Dict[str, Any]:
     size_str = f"{sampling.width}x{sampling.height}"
     seconds = int(round((sampling.num_frames or 0) / float(sampling.fps or 24)))
     return {
         "id": request_id,
         "object": "video",
-        "model": req.model or "sora-2",
+        "model": req.model or served_model_name,
         "status": "queued",
         "progress": 0,
         "created_at": int(time.time()),
@@ -841,7 +844,12 @@ async def create_video(
         scheduler_batches = sampling_params.expand_video_request_outputs_for_queue(
             batch
         )
-        job = _video_job_from_sampling(request_id, req, sampling_params)
+        job = _video_job_from_sampling(
+            request_id,
+            req,
+            sampling_params,
+            server_args.served_model_name,
+        )
         job.update(sampling_params.project_video_queued_job_fields(batch))
         await VIDEO_STORE.upsert(request_id, job)
     except Exception as e:
