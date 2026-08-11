@@ -13,9 +13,6 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
-    get_linear_attn_decode_backend,
-    get_linear_attn_prefill_backend,
-    get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -359,9 +356,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             .transpose(-1, -2)
             .shape
         )
-        decode_backend = get_linear_attn_decode_backend()
-        prefill_backend = get_linear_attn_prefill_backend()
-        verify_backend = get_linear_attn_verify_backend()
+        backends = model_runner.linear_attn_backends
+        decode_backend = backends.decode
+        prefill_backend = backends.prefill
+        verify_backend = backends.verify
         # KDA FlashInfer target_verify (recurrent_kda) is chain-only (no tree-ancestor
         # traversal). Reject EAGLE tree verify (topk > 1) early at setup, keyed on the
         # verify backend (not decode). The kernel keeps a per-call
