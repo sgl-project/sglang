@@ -3496,7 +3496,7 @@ class EncoderScheduler:
         # Video can't fuse (per-video preprocess kwargs vary).
         if (
             modality not in _BATCHABLE_MODALITIES
-            or self.encoder.mm_global_cache is not None
+            or getattr(self.encoder, "mm_global_cache", None) is not None
         ):
             await self._dispatch_per_request(group, modality)
             return

@@ -2733,7 +2733,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
-                mm_cache_context = self._mm_cache_retry_contexts.pop(rid, None)
+                mm_cache_context = getattr(self, "_mm_cache_retry_contexts", {}).pop(
+                    rid, None
+                )
                 if mm_cache_context is not None:
                     # Consumption normally removes the lease. This also covers
                     # validation failures that finish before MM scheduling.
