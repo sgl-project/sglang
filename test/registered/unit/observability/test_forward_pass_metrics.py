@@ -424,25 +424,15 @@ class TestEstimatedPrefillPerf(CustomTestCase):
         return flops
 
     def test_chunk_is_charged_for_its_cached_prefix(self):
-        """A chunk resumed on a cached prefix must be charged for reading it.
-
-        Every token of a new chunk attends to all tokens already in the KV
-        cache, so a 4-token chunk sitting at prefix 3 costs 4*3 pairs against
-        the prefix plus 4*5/2 pairs within the chunk. Scoring the chunk as a
-        fresh 4-token sequence drops the prefix term, and the shortfall grows
-        with the prefix length.
-        """
         self.assertEqual(self._pair_count([4], [3]), 4 * 3 + 4 * 5 / 2)
 
-    def test_requests_in_one_batch_do_not_attend_to_each_other(self):
-        """Requests batched together must be counted as separate sequences.
+    def test_chunk_is_charged_for_prefix_kv_reads(self):
+        self.reporter._kv_cache_bytes_per_token = 1.0
+        batch = types.SimpleNamespace(extend_lens=[4], prefix_lens=[3])
+        _, read_bytes, _ = self.reporter._estimate_prefill_perf(batch)
+        self.assertEqual(read_bytes, 4 * 3)
 
-        A token only attends within its own request, so two 100-token prefills
-        cost 2 * (100*101/2) pairs. Scoring the batch as one 200-token sequence
-        (200*201/2) charges pairs between requests that never attend to each
-        other. This holds with no prefix at all, so it is a defect distinct
-        from the missing prefix term above.
-        """
+    def test_requests_in_one_batch_do_not_attend_to_each_other(self):
         self.assertEqual(self._pair_count([100, 100], [0, 0]), 2 * (100 * 101 / 2))
 
 

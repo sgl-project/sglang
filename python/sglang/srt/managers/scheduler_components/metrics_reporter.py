@@ -453,6 +453,14 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
+    @staticmethod
+    def _prefill_attention_products(batch) -> Tuple[float, float]:
+        prefix_product = sum(
+            c * p for c, p in zip(batch.extend_lens, batch.prefix_lens)
+        )
+        within_chunk = sum(c * (c + 1) / 2.0 for c in batch.extend_lens)
+        return prefix_product + within_chunk, prefix_product
+
     def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
         if batch is None or batch.extend_lens is None:
             return 0.0, 0.0, 0.0
@@ -460,11 +468,7 @@ class SchedulerMetricsReporter:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        # Causal prefill token-context product.
-        context_product = sum(
-            c * p + c * (c + 1) / 2.0
-            for c, p in zip(batch.extend_lens, batch.prefix_lens)
-        )
+        context_product, prefix_product = self._prefill_attention_products(batch)
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * context_product
@@ -474,6 +478,7 @@ class SchedulerMetricsReporter:
             tokens * self._weight_read_bytes_per_token
             + tokens * self._qkv_act_bytes_per_token
             + tokens * self._prefill_attn_act_read_per_token
+            + prefix_product * self._kv_cache_bytes_per_token
         )
         write_bytes = (
             tokens * self._kv_cache_bytes_per_token
@@ -509,8 +514,8 @@ class SchedulerMetricsReporter:
 
     def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
         """Hook: model-specific speed-of-light % suffix for the prefill log line.
-        ``batch`` carries the per-request extend/prefix lengths a subclass needs
-        for an exact attention pair-count. No model arch here, so returns "";
+        Call ``_prefill_attention_products(batch)`` for the exact causal
+        attention pair-count. No model arch here, so returns "";
         a subclass may override it."""
         return ""
 
