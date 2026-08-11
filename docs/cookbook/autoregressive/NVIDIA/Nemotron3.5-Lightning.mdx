@@ -19,8 +19,7 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 ```bash Command
 pip install --upgrade pip
 pip install uv
-# Nemotron 3.5 support is not in a release yet — install from PR #33554.
-uv pip install "git+https://github.com/sgl-project/sglang.git@refs/pull/33554/head#subdirectory=python"
+SGLANG_BUILD_RUST_EXTS=none uv pip install 'git+https://github.com/sgl-project/sglang.git@refs/pull/33554/head#subdirectory=python'
 ```
 
 Then run the **Python** output of the command panel below in that environment.
@@ -81,12 +80,12 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px"}}>Full-precision reference</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/nemotron-3.5-dflash-w4a16-preview">nemotron-3.5-dflash-w4a16-preview</a></strong></td>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash">NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash</a></strong></td>
       <td style={{padding: "9px 12px"}}>W4A16</td>
       <td style={{padding: "9px 12px"}}>DFlash speculative draft model</td>
     </tr>
     <tr style={{background: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/nemotron-3.5-dspark-w4a16-preview">nemotron-3.5-dspark-w4a16-preview</a></strong></td>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark">NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark</a></strong></td>
       <td style={{padding: "9px 12px"}}>W4A16</td>
       <td style={{padding: "9px 12px"}}>DSpark speculative draft model</td>
     </tr>

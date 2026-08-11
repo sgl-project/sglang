@@ -5,7 +5,7 @@
 export const config = {
   modelName: "Nemotron 3.5 Lightning",
 
-  // Two validated single-GPU platforms, both at TP1/EP1.
+  // Three validated single-GPU platforms, all at TP1/EP1.
   supportedHardware: ["b200", "h100", "dgx-spark"],
 
   variants: [{ id: "default", label: "Default" }],
@@ -61,7 +61,7 @@ sgl-eval run gsm8k \\
   accuracyLabels: [["gsm8k_pct", "GSM8K", "%"]],
 
   dockerImages: {
-    // Multi-arch index (amd64 + arm64), so one tag covers H100 and GB10.
+    // Multi-arch index (amd64 + arm64), so one tag covers H100, B200, and GB10.
     // Equivalent to dev-cu13-nemotron3-5-lighting.
     b200:        "lmsysorg/sglang:dev-nemotron3-5-lighting",
     h100:        "lmsysorg/sglang:dev-nemotron3-5-lighting",
@@ -106,29 +106,23 @@ sgl-eval run gsm8k \\
                   "--speculative-draft-model-path {{MODEL_NAME}}",
                   "--speculative-num-steps 5",
                   "--speculative-eagle-topk 1",
-                  "--speculative-num-draft-tokens 6",
-                  "--speculative-moe-runner-backend marlin"] },
+                  "--speculative-num-draft-tokens 6"] },
         { id: "dflash",  label: "DFlash",
           flags: ["--speculative-algorithm DFLASH",
-                  "--speculative-draft-model-path nvidia/nemotron-3.5-dflash-w4a16-preview",
-                  "--speculative-dflash-block-size 6",
-                  "--speculative-moe-runner-backend marlin"] },
+                  "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash",
+                  "--speculative-dflash-block-size 4"] },
         { id: "dspark",  label: "DSpark",
           flags: ["--speculative-algorithm DSPARK",
-                  "--speculative-draft-model-path nvidia/nemotron-3.5-dspark-w4a16-preview",
-                  "--speculative-dspark-block-size 7",
-                  "--speculative-moe-runner-backend marlin"] },
+                  "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark",
+                  "--speculative-dspark-block-size 3"] },
       ],
     },
   },
 
   cells: [
-    // ==== NVIDIA Blackwell (SM100) + NVFP4, single GPU ====
-    // flashinfer Mamba with no_buffer radix caching, stochastic Mamba-cache
-    // rounding and overlap scheduling off. Marlin is pinned because auto
-    // selects flashinfer_trtllm on SM100. The speculative cells also pin
-    // flashinfer attention: left unset, the Nemotron-H override hook picks
-    // trtllm_mha on SM100, which is not what these recipes validated.
+    // ==== NVIDIA B200 (SM100) + NVFP4, single GPU ====
+    // The Nemotron-H resolver selects FlashInfer target attention without
+    // speculation and TRT-LLM MHA target/eligible-draft attention with it.
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       env: [],
@@ -136,12 +130,8 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--mamba-backend flashinfer",
         "--mamba-ssm-dtype float16",
-        "--mamba-radix-cache-strategy no_buffer",
         "--enable-mamba-cache-stochastic-rounding",
         "--mamba-cache-philox-rounds 5",
-        "--disable-overlap-schedule",
-        "--moe-runner-backend marlin",
-        "--max-running-requests 16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 16",
         "--reasoning-parser nemotron_3",
@@ -155,19 +145,12 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--attention-backend flashinfer",
         "--mamba-backend flashinfer",
         "--mamba-ssm-dtype float16",
-        "--mamba-radix-cache-strategy no_buffer",
         "--enable-mamba-cache-stochastic-rounding",
         "--mamba-cache-philox-rounds 5",
-        "--disable-overlap-schedule",
-        "--moe-runner-backend marlin",
-        "--max-running-requests 16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 16",
-        "--speculative-moe-runner-backend marlin",
-        "--speculative-draft-attention-backend flashinfer",
         "--speculative-algorithm EAGLE",
         "--speculative-draft-model-path {{MODEL_NAME}}",
         "--speculative-num-steps 5",
@@ -179,26 +162,21 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
+    // DFlash uses depth five on B200; its full-attention draft resolves to
+    // FlashInfer while target verification remains TRT-LLM MHA.
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dflash", nodes: "single" },
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--attention-backend flashinfer",
         "--mamba-backend flashinfer",
         "--mamba-ssm-dtype float16",
-        "--mamba-radix-cache-strategy no_buffer",
         "--enable-mamba-cache-stochastic-rounding",
         "--mamba-cache-philox-rounds 5",
-        "--disable-overlap-schedule",
-        "--moe-runner-backend marlin",
-        "--max-running-requests 16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 16",
-        "--speculative-moe-runner-backend marlin",
-        "--speculative-draft-attention-backend flashinfer",
         "--speculative-algorithm DFLASH",
-        "--speculative-draft-model-path nvidia/nemotron-3.5-dflash-w4a16-preview",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash",
         "--speculative-dflash-block-size 6",
         "--reasoning-parser nemotron_3",
         "--tool-call-parser qwen3_coder",
@@ -208,27 +186,18 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
-      env: [
-        "SGLANG_RAGGED_VERIFY_MODE=static",
-      ],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--attention-backend flashinfer",
         "--mamba-backend flashinfer",
         "--mamba-ssm-dtype float16",
-        "--mamba-radix-cache-strategy no_buffer",
         "--enable-mamba-cache-stochastic-rounding",
         "--mamba-cache-philox-rounds 5",
-        "--disable-overlap-schedule",
-        "--moe-runner-backend marlin",
-        "--max-running-requests 16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 16",
-        "--speculative-moe-runner-backend marlin",
-        "--speculative-draft-attention-backend flashinfer",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path nvidia/nemotron-3.5-dspark-w4a16-preview",
-        "--speculative-dspark-block-size 7",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark",
+        "--speculative-dspark-block-size 3",
         "--reasoning-parser nemotron_3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -236,17 +205,13 @@ sgl-eval run gsm8k \\
       ],
     },
     // ==== NVIDIA Hopper (SM90) + NVFP4, single GPU ====
-    // Everything SGLang already resolves for NemotronH on Hopper is left
-    // unset: fa3 attention (target and draft), Triton Mamba, the
-    // extra_buffer radix strategy, marlin MoE (modelopt_fp4 on SM80-SM90),
-    // an 8k chunked prefill and the context length from config.json.
+    // FA3 target attention is selected by default and inherited by the draft.
     {
       match: { hw: "h100", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--mamba-ssm-dtype float16",
-        "--max-running-requests 16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 16",
         "--reasoning-parser nemotron_3",
@@ -263,10 +228,8 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--mamba-ssm-dtype float16",
-        "--max-running-requests 16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 16",
-        "--speculative-moe-runner-backend marlin",
         "--speculative-algorithm EAGLE",
         "--speculative-draft-model-path {{MODEL_NAME}}",
         "--speculative-num-steps 5",
@@ -278,42 +241,36 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
-    // DFlash: separate draft model; depth five -> block/verify width six.
+    // DFlash: separate draft model; depth three -> block/verify width four.
     {
       match: { hw: "h100", variant: "default", quant: "nvfp4", strategy: "dflash", nodes: "single" },
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--mamba-ssm-dtype float16",
-        "--max-running-requests 16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 16",
-        "--speculative-moe-runner-backend marlin",
         "--speculative-algorithm DFLASH",
-        "--speculative-draft-model-path nvidia/nemotron-3.5-dflash-w4a16-preview",
-        "--speculative-dflash-block-size 6",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash",
+        "--speculative-dflash-block-size 4",
         "--reasoning-parser nemotron_3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
-    // DSpark: separate draft model; gamma seven -> verify width eight.
+    // DSpark: separate draft model; gamma three.
     {
       match: { hw: "h100", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
-      env: [
-        "SGLANG_RAGGED_VERIFY_MODE=static",
-      ],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--mamba-ssm-dtype float16",
-        "--max-running-requests 16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 16",
-        "--speculative-moe-runner-backend marlin",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path nvidia/nemotron-3.5-dspark-w4a16-preview",
-        "--speculative-dspark-block-size 7",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark",
+        "--speculative-dspark-block-size 3",
         "--reasoning-parser nemotron_3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -321,19 +278,15 @@ sgl-eval run gsm8k \\
       ],
     },
     // ==== NVIDIA DGX Spark (GB10 / SM121) + NVFP4, single GPU ====
-    // 128GB coherent unified memory. Same profile as H100 apart from the
-    // decode CUDA-graph batch cap of 4 and an explicit marlin MoE runner
-    // (SM121 would otherwise resolve to flashinfer_cutlass). Attention
-    // resolves to flashinfer on its own.
+    // The Nemotron-H resolver selects Triton target attention plus FlashInfer
+    // draft attention for speculative decoding on SM121.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--mamba-ssm-dtype float16",
-        "--moe-runner-backend marlin",
-        "--max-running-requests 16",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs-decode 4",
         "--reasoning-parser nemotron_3",
         "--tool-call-parser qwen3_coder",
@@ -349,11 +302,8 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--mamba-ssm-dtype float16",
-        "--moe-runner-backend marlin",
-        "--max-running-requests 16",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs-decode 4",
-        "--speculative-moe-runner-backend marlin",
         "--speculative-algorithm EAGLE",
         "--speculative-draft-model-path {{MODEL_NAME}}",
         "--speculative-num-steps 5",
@@ -365,44 +315,36 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
-    // DFlash: separate draft model; depth five -> block/verify width six.
+    // DFlash: separate draft model; depth three -> block/verify width four.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "dflash", nodes: "single" },
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--mamba-ssm-dtype float16",
-        "--moe-runner-backend marlin",
-        "--max-running-requests 16",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs-decode 4",
-        "--speculative-moe-runner-backend marlin",
         "--speculative-algorithm DFLASH",
-        "--speculative-draft-model-path nvidia/nemotron-3.5-dflash-w4a16-preview",
-        "--speculative-dflash-block-size 6",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash",
+        "--speculative-dflash-block-size 4",
         "--reasoning-parser nemotron_3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
-    // DSpark: separate draft model; gamma seven -> verify width eight.
+    // DSpark: separate draft model; gamma three.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
-      env: [
-        "SGLANG_RAGGED_VERIFY_MODE=static",
-      ],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--mamba-ssm-dtype float16",
-        "--moe-runner-backend marlin",
-        "--max-running-requests 16",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs-decode 4",
-        "--speculative-moe-runner-backend marlin",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path nvidia/nemotron-3.5-dspark-w4a16-preview",
-        "--speculative-dspark-block-size 7",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark",
+        "--speculative-dspark-block-size 3",
         "--reasoning-parser nemotron_3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
