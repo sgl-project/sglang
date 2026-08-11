@@ -1530,10 +1530,7 @@ class PauseGenerationReqInput(BaseReq, kw_only=True):
     def __post_init__(self):
         # The threshold decides who survives the pause, so it needs a mode that
         # keeps survivors at all. 'abort' keeps nothing.
-        if (
-            self.abort_below_start_weight_version is not None
-            and self.mode == "abort"
-        ):
+        if self.abort_below_start_weight_version is not None and self.mode == "abort":
             raise ValueError(
                 "abort_below_start_weight_version is meaningless with "
                 "mode='abort', which aborts every request already."

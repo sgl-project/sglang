@@ -63,9 +63,7 @@ class TestPauseAbortStaleStartVersion(CustomTestCase):
         body = {"mode": mode}
         if threshold is not None:
             body["abort_below_start_weight_version"] = threshold
-        return requests.post(
-            f"{self.base_url}/pause_generation", json=body, timeout=60
-        )
+        return requests.post(f"{self.base_url}/pause_generation", json=body, timeout=60)
 
     def _continue(self) -> requests.Response:
         return requests.post(
@@ -91,9 +89,7 @@ class TestPauseAbortStaleStartVersion(CustomTestCase):
         raise AssertionError(f"timed out waiting for running>={n}, saw {last}")
 
     def _assert_aborted(self, result, label):
-        self.assertEqual(
-            result["meta_info"]["finish_reason"]["type"], "abort", label
-        )
+        self.assertEqual(result["meta_info"]["finish_reason"]["type"], "abort", label)
 
     def _assert_completed(self, result, label):
         self.assertIn(
@@ -160,9 +156,7 @@ class TestPauseAbortStaleStartVersion(CustomTestCase):
 
     def test_echoes_declared_version_and_omits_it_otherwise(self):
         declared = self._generate(FRESH_VERSION)
-        self.assertEqual(
-            declared["meta_info"]["start_weight_version"], FRESH_VERSION
-        )
+        self.assertEqual(declared["meta_info"]["start_weight_version"], FRESH_VERSION)
         # Absent, not null: a response for a caller not using the feature is
         # unchanged.
         self.assertNotIn("start_weight_version", self._generate()["meta_info"])

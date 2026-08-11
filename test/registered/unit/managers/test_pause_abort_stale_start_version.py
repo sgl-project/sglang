@@ -53,7 +53,9 @@ class TestBatchChildrenInheritIt(CustomTestCase):
 
     def test_getitem_carries_start_weight_version(self):
         obj = GenerateReqInput(
-            text=["a", "b"], sampling_params={"max_new_tokens": 1}, start_weight_version=7
+            text=["a", "b"],
+            sampling_params={"max_new_tokens": 1},
+            start_weight_version=7,
         )
         obj.normalize_batch_and_arguments()
         self.assertEqual([obj[i].start_weight_version for i in range(2)], [7, 7])
@@ -67,9 +69,7 @@ class TestBatchChildrenInheritIt(CustomTestCase):
 class TestPauseThresholdValidation(CustomTestCase):
     def test_modes_that_keep_survivors_accept_threshold(self):
         for mode in ("retract", "in_place"):
-            req = PauseGenerationReqInput(
-                mode=mode, abort_below_start_weight_version=7
-            )
+            req = PauseGenerationReqInput(mode=mode, abort_below_start_weight_version=7)
             self.assertEqual(req.abort_below_start_weight_version, 7, mode)
 
     def test_abort_mode_rejects_threshold(self):
