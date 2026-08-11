@@ -115,22 +115,9 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertEqual(len(result.calls), 2)
 
-    def test_parse_error_reemits_buffer_instead_of_swallowing_it(self):
-        """On an unexpected parse error the turn must not come back empty."""
-        detector = DeepSeekV4Detector()
-
-        with patch.object(
-            DeepSeekV4Detector,
-            "_parse_parameters_from_xml",
-            side_effect=RuntimeError("boom"),
-        ):
-            result = detector.parse_streaming_increment(_weather_call(), self.tools)
-
-        self.assertIn("get_weather", result.normal_text)
-        self.assertEqual(detector._buffer, "")
-
-    def test_parse_error_does_not_duplicate_on_next_delta(self):
-        """The buffer is dropped on error, so the same text is not re-emitted."""
+    def test_parse_error_neither_swallows_nor_duplicates(self):
+        """An unexpected parse error must not empty the turn, and the dropped
+        buffer must not come back on the next delta."""
         detector = DeepSeekV4Detector()
 
         with patch.object(
@@ -139,6 +126,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             side_effect=RuntimeError("boom"),
         ):
             first = detector.parse_streaming_increment(_weather_call(), self.tools)
+            self.assertEqual(detector._buffer, "")
             second = detector.parse_streaming_increment(" tail", self.tools)
 
         self.assertIn("get_weather", first.normal_text)

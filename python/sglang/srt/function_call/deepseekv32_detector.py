@@ -200,8 +200,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         calls = []
         try:
-            # Every tool_calls section, not just the first: a turn can contain
-            # several, and the streaming path already parses all of them.
             sections = re.findall(self.function_calls_regex, text, re.DOTALL)
             if not sections:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
@@ -261,9 +259,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
         all_calls: list[ToolCallItem] = []
-        # Prose the model emitted before the first tool call. Only recovered for the
-        # first call; prose between or after tool calls stays buffered because the
-        # DSML guard above never releases a buffer that still holds a marker.
+        # Only recovered for the first call: the DSML guard above never releases a
+        # buffer that still holds a marker, so later prose stays buffered.
         preamble = ""
         try:
             # Loop to handle multiple consecutive invoke blocks
@@ -290,8 +287,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     bot_pos = current_text.rfind(self.bot_token, 0, call_start)
                     if bot_pos != -1:
                         call_start = bot_pos
-                    # Same trailing-newline handling as detect_and_parse, so the
-                    # two paths agree on normal_text.
+                    # Same trailing-newline trim as detect_and_parse, so both agree.
                     preamble = current_text[:call_start].removesuffix("\n\n")
 
                 # Ensure arrays are large enough for current tool
@@ -372,8 +368,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            # Drop the buffer so the same bad content is not re-parsed, and
-            # re-emit it verbatim rather than swallowing the turn. The preamble is
+            # Re-emit verbatim rather than swallowing the turn; the preamble is
             # still inside current_text unless a completed call advanced past it.
             self._buffer = ""
             if not current_text.startswith(preamble):

@@ -144,9 +144,8 @@ class BaseReasoningFormatDetector:
             # Assume reasoning was truncated before end token
             return StreamingParseResult(reasoning_text=processed_text)
 
-        # Extract reasoning content. A turn may hold several reasoning blocks, so
-        # keep alternating instead of splitting once, which would leave the later
-        # blocks (and their tokens) sitting in normal_text.
+        # Extract reasoning content. Alternate rather than split once, or a later
+        # reasoning block and its tokens would be left sitting in normal_text.
         if self.think_end_token in processed_text:
             reasoning_parts = []
             normal_parts = []
@@ -206,9 +205,8 @@ class BaseReasoningFormatDetector:
         if not self.stripped_think_start and think_start_text in current_text:
             start_idx = current_text.find(think_start_text)
             if start_idx > 0:
-                # Anything ahead of the token is normal content, not reasoning.
-                # Emit it and re-enter with the token at the front of the buffer,
-                # so a `replace` here can never pull that text into reasoning.
+                # Emit what precedes the token and re-enter with it at the front,
+                # so a `replace` can never pull that text into reasoning.
                 leading = current_text[:start_idx]
                 self._buffer = current_text[start_idx:]
                 nested = self._parse_streaming_increment_impl("")
@@ -217,8 +215,7 @@ class BaseReasoningFormatDetector:
                     reasoning_text=nested.reasoning_text,
                 )
             current_text = current_text[len(think_start_text) :]
-            # Write back so stream_reasoning=False, which keeps accumulating into
-            # _buffer, does not carry the token into reasoning_text or finish().
+            # Write back, or stream_reasoning=False carries the token into finish().
             self._buffer = current_text
             self.stripped_think_start = True
             self._in_reasoning = True
@@ -232,8 +229,7 @@ class BaseReasoningFormatDetector:
 
             self._buffer = remainder
             self._in_reasoning = False
-            # Arm the detector for a further reasoning block, and re-enter so the
-            # remainder is scanned for one instead of being emitted wholesale.
+            # Re-armed so a further reasoning block in the remainder is still seen.
             self.stripped_think_start = False
             if remainder:
                 nested = self._parse_streaming_increment_impl("")
@@ -258,8 +254,7 @@ class BaseReasoningFormatDetector:
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             if self.stream_reasoning:
-                # Stream the content immediately, minus any trailing slice that
-                # could be the start of think_end/tool_start split across chunks.
+                # Minus any trailing slice that could be a token split across chunks.
                 holdback = self._ends_with_partial_token(
                     current_text, self.think_end_token
                 )
@@ -1182,8 +1177,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             dsv4_thinking_start_token,
             dsv4_thinking_end_token,
             think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
-            # Route DSML blocks out of reasoning so the tool call detector, whose
-            # has_tool_call() matches on "<" + the DSML marker, can see them.
+            # Leading "<" included: has_tool_call() matches on it.
             tool_start_token=f"<{dsv4_dsml_token}",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
