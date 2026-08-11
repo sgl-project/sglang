@@ -3,10 +3,17 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+    LoRAPipeline,
+    _map_lora_param_name,
+    _validate_lora_pair_shapes,
+)
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
 _RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline.dist.get_rank"
 
@@ -120,3 +127,72 @@ def test_merged_lora_still_uses_weight_update_context():
     assert context_calls == 1
     assert layer.merged
     assert pipeline.is_lora_merged["transformer"]
+
+
+def test_lora_alpha_override_updates_cached_adapter_scale():
+    layer = _make_layer()
+    pipeline = _make_pipeline(layer)
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora(
+            "adapter",
+            None,
+            target="transformer",
+            strength=1.0,
+            merge_mode="dynamic",
+            lora_alpha=8,
+        )
+
+    assert pipeline.loaded_adapter_alphas["adapter"] == 8
+    assert layer.lora_rank == 1
+    assert layer.lora_alpha == 8
+
+
+def test_pinned_lora_weight_limits_snapshot_download(tmp_path):
+    weight_name = "adapter-v4.safetensors"
+    weight_path = tmp_path / weight_name
+    weight_path.touch()
+
+    download_target = (
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model"
+    )
+    with patch(download_target, return_value=str(tmp_path)) as download:
+        actual = maybe_download_lora("org/multi-adapter", weight_name=weight_name)
+
+    assert actual == str(weight_path)
+    assert download.call_args.kwargs["allow_patterns"] == [
+        "*.json",
+        weight_name,
+        f"**/{weight_name}",
+    ]
+
+
+def test_lora_shape_validation_rejects_pruned_model_adapter():
+    with pytest.raises(ValueError, match="expected input width 2"):
+        _validate_lora_pair_shapes(
+            "linear",
+            _make_layer(),
+            torch.ones(1, 1),
+            torch.ones(2, 1),
+        )
+
+
+def test_lora_mapping_keeps_split_projection_merge_metadata():
+    lora_mapping = get_param_names_mapping(
+        {
+            rf"^transformer_blocks\.(\d+)\.attn\.to_{projection}\.(lora_[AB])$": (
+                r"blocks.\1.attn.qkv_proj.\2",
+                index,
+                3,
+            )
+            for index, projection in enumerate(("q", "k", "v"))
+        }
+    )
+    target_mapping = get_param_names_mapping({})
+
+    for index, projection in enumerate(("q", "k", "v")):
+        assert _map_lora_param_name(
+            f"transformer_blocks.7.attn.to_{projection}.lora_A",
+            lora_mapping,
+            target_mapping,
+        ) == ("blocks.7.attn.qkv_proj.lora_A", index, 3)

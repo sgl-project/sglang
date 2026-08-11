@@ -1009,6 +1009,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
         merge_mode: str | None = None,
+        lora_alpha: int | None | list[int | None] = None,
     ) -> OutputBatch:
         """
         Set the LoRA adapter(s) for the pipeline.
@@ -1024,7 +1025,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.set_lora(
-            lora_nickname, lora_path, target, strength, merge_mode=merge_mode
+            lora_nickname,
+            lora_path,
+            target,
+            strength,
+            merge_mode=merge_mode,
+            lora_alpha=lora_alpha,
         )
         return OutputBatch()
 

@@ -127,6 +127,21 @@ def is_diffusers_style_keys(
     return ok
 
 
+def test_peft_adapter_namespace_is_canonicalized():
+    weight = torch.ones(2, 3)
+    normalized = normalize_lora_state_dict(
+        {
+            "transformer.block.proj.lora_A.default.weight": weight,
+            "transformer.block.proj.lora_B.cinematic.weight": weight,
+        },
+        logger=logger,
+    )
+    assert set(normalized) == {
+        "transformer.block.proj.lora_A.weight",
+        "transformer.block.proj.lora_B.weight",
+    }
+
+
 def run_single_test(
     name: str,
     repo_id: str,

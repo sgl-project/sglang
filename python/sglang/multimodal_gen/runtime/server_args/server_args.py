@@ -276,6 +276,7 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_alpha: int | None = None  # Override training alpha when metadata omits it
     lora_merge_mode: str = "auto"
     lora_weight_name: str | None = None
 
@@ -516,6 +517,8 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
+        if self.lora_alpha is not None and self.lora_alpha <= 0:
+            raise ValueError("lora_alpha must be a positive integer")
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
@@ -2090,6 +2093,15 @@ class ServerArgs(DisaggServerArgsMixin):
             type=float,
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
+        )
+        parser.add_argument(
+            "--lora-alpha",
+            type=int,
+            default=ServerArgs.lora_alpha,
+            help=(
+                "Override the LoRA training alpha when neither the checkpoint nor "
+                "adapter_config.json records it"
+            ),
         )
         parser.add_argument(
             "--lora-merge-mode",

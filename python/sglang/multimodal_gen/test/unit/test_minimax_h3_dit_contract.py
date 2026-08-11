@@ -54,6 +54,29 @@ def test_native_weight_names_and_grouped_qkv_reorder():
     ):
         assert mapping(key) == (key, None, None)
 
+    lora_mapping = get_param_names_mapping(arch.lora_param_names_mapping)
+    assert lora_mapping(
+        "base_model.model.transformer.transformer_blocks.7.attn.to_k.lora_A"
+    ) == ("blocks.7.attn.qkv_proj.lora_A", 1, 3)
+    assert lora_mapping("token_refiner.refiner_blocks.1.ff.net.0.proj.lora_B") == (
+        "token_refiner.blocks.1.mlp.fc1.lora_B",
+        None,
+        None,
+    )
+    assert lora_mapping(
+        "transformer.transformer_blocks.3.adaln_proj.linear.lora_A"
+    ) == ("blocks.3.adaln_proj.linear.lora_A", None, None)
+    assert lora_mapping("transformer.audio_proj_out.lora_B") == (
+        "final_layer.audio_out.lora_B",
+        None,
+        None,
+    )
+    assert lora_mapping("blocks.3.attn.out_proj.lora_A") == (
+        "blocks.3.attn.out_proj.lora_A",
+        None,
+        None,
+    )
+
     weight = torch.arange(12, dtype=torch.float32).reshape(12, 1)
     actual = _reorder_grouped_qkv_to_qkv(
         weight,
