@@ -38,6 +38,30 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
+# Keyed by group so a process holding several groups gets one region each; the
+# region must persist for the process lifetime (see symm_mem_gather).
+_SYMM_GATHERERS: dict = {}
+
+
+def _maybe_symm_gatherer(group, device, width: int):
+    """Symmetric-memory gatherer for this group, or None to use the collective."""
+    if not envs.SGLANG_USE_SYMM_MEM_DP_SYNC.get() or device == "cpu":
+        return None
+    key = id(group)
+    if key not in _SYMM_GATHERERS:
+        from sglang.srt.distributed.device_communicators.symm_mem_gather import (
+            maybe_create_symm_mem_gather,
+        )
+
+        _SYMM_GATHERERS[key] = maybe_create_symm_mem_gather(
+            world_size=torch.distributed.get_world_size(group),
+            width=width,
+            dtype=torch.int64,
+            device=device,
+            group_name=group.group_name,
+        )
+    return _SYMM_GATHERERS[key]
+
 
 def _resolve_elastic_world_dp_size(
     dp_size: int,
@@ -156,6 +180,10 @@ class MLPSyncBatchInfo:
             )
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
+        elif (gatherer := _maybe_symm_gatherer(group, device, info_width)) is not None:
+            global_info_tensor = gatherer.gather(local_info_tensor).view(
+                self.dp_size, self.tp_size * self.cp_size, info_width
+            )
         else:
             torch.distributed.all_gather_into_tensor(
                 global_info_tensor.flatten(),
