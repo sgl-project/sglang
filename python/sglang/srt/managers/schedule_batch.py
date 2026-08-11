@@ -70,6 +70,7 @@ from typing import (
 )
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
