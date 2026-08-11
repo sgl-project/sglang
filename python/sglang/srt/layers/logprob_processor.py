@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
@@ -62,6 +62,33 @@ class LogprobResult:
             )
 
 
+@dataclasses.dataclass(frozen=True)
+class DistributedLogprobContext:
+    """TP-sharded input-logprob callbacks and contiguous vocab ownership."""
+
+    tp_group: Any
+    vocab_start_index: int
+    vocab_end_index: int
+    vocab_size: int
+    get_local_logits_fn: Callable
+    gather_sampled_logits_fn: Callable
+
+
+@dataclasses.dataclass(frozen=True)
+class _TokenIdsChunkEntry:
+    token_ids: Optional[List[int]]
+    num_rows: int
+    continue_previous: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class _TokenIdsChunkPlan:
+    row_indices: torch.Tensor
+    token_ids: torch.Tensor
+    entries: List[_TokenIdsChunkEntry]
+    next_split_pruned_len: int
+
+
 def compute_row_log_normalizer(
     logits: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -80,6 +107,163 @@ def compute_row_log_normalizer(
     row_log_sum = torch.logsumexp(x - row_max[:, None], dim=-1)
     row_log_sum = torch.where(row_max.isinf(), 0.0, row_log_sum)
     return row_max, row_log_sum
+
+
+def compute_distributed_row_log_normalizer(
+    local_logits: torch.Tensor,
+    valid_vocab_size: int,
+    tp_group: Any,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute a global row normalizer without gathering vocab logits.
+
+    ``local_logits`` follows rank-local contiguous vocab order. Columns after
+    ``valid_vocab_size`` are padding and do not participate. The exchanged
+    tensors are one fp32 max and one fp32 exponential sum per row.
+    """
+    if not 0 <= valid_vocab_size <= local_logits.shape[1]:
+        raise ValueError(
+            f"valid_vocab_size={valid_vocab_size} is incompatible with "
+            f"local logits width {local_logits.shape[1]}"
+        )
+
+    if valid_vocab_size == 0:
+        local_max = torch.full(
+            (local_logits.shape[0],),
+            float("-inf"),
+            dtype=torch.float32,
+            device=local_logits.device,
+        )
+        local_log_sum = torch.zeros_like(local_max)
+    else:
+        valid_logits = local_logits[:, :valid_vocab_size]
+        local_max, local_log_sum = compute_row_log_normalizer(valid_logits)
+
+    global_max = local_max.clone()
+    torch.distributed.all_reduce(
+        global_max,
+        op=torch.distributed.ReduceOp.MAX,
+        group=tp_group.device_group,
+    )
+
+    if valid_vocab_size == 0:
+        local_exp_sum = torch.zeros_like(global_max)
+    else:
+        local_exp_sum = torch.exp((local_max - global_max) + local_log_sum)
+    global_exp_sum = tp_group.all_reduce(local_exp_sum)
+    return global_max, torch.log(global_exp_sum)
+
+
+def get_distributed_token_scores(
+    local_logits: torch.Tensor,
+    row_indices: torch.Tensor,
+    token_ids: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: Any,
+) -> torch.Tensor:
+    """Look up raw token scores from contiguous TP vocab shards.
+
+    Exactly one rank contributes each requested token score; all other ranks
+    contribute zero. A SUM reduction therefore returns the selected score on
+    every rank while exchanging only one fp32 value per request.
+    """
+    if row_indices.ndim != 1 or token_ids.ndim != 1:
+        raise ValueError("row_indices and token_ids must be one-dimensional")
+    if row_indices.shape != token_ids.shape:
+        raise ValueError("row_indices and token_ids must have the same shape")
+    if row_indices.numel() == 0:
+        return local_logits.new_empty(0, dtype=torch.float32)
+
+    owned = (token_ids >= vocab_start_index) & (token_ids < vocab_end_index)
+    local_width = local_logits.shape[1]
+    if local_width == 0:
+        local_scores = local_logits.new_zeros(token_ids.shape, dtype=torch.float32)
+    else:
+        local_indices = (token_ids - vocab_start_index).clamp(
+            min=0, max=local_width - 1
+        )
+        selected = local_logits[row_indices, local_indices].float()
+        local_scores = torch.where(owned, selected, torch.zeros_like(selected))
+    return tp_group.all_reduce(local_scores)
+
+
+def _build_token_ids_chunk_plan(
+    token_ids_logprobs: List[Optional[List[int]]],
+    pruned_lens: List[int],
+    split_pruned_len: int,
+    num_rows: int,
+    device: torch.device,
+) -> _TokenIdsChunkPlan:
+    """Flatten ragged explicit-token probes into one collective request."""
+    request_rows: List[int] = []
+    request_token_ids: List[int] = []
+    entries: List[_TokenIdsChunkEntry] = []
+    pt = 0
+    next_split_pruned_len = 0
+
+    for n, (token_ids, original_pruned_len) in enumerate(
+        zip(token_ids_logprobs, pruned_lens)
+    ):
+        current_split = split_pruned_len if n == 0 else 0
+        pruned_len = original_pruned_len - current_split
+        continue_previous = current_split > 0
+
+        if pruned_len <= 0:
+            entries.append(_TokenIdsChunkEntry(token_ids, 0, False))
+            continue
+
+        available_rows = min(pruned_len, max(num_rows - pt, 0))
+        if available_rows < pruned_len:
+            next_split_pruned_len = current_split + available_rows
+
+        if token_ids:
+            for row in range(pt, pt + available_rows):
+                request_rows.extend([row] * len(token_ids))
+                request_token_ids.extend(token_ids)
+
+        entries.append(
+            _TokenIdsChunkEntry(token_ids, available_rows, continue_previous)
+        )
+        pt += pruned_len
+
+    return _TokenIdsChunkPlan(
+        row_indices=torch.tensor(request_rows, dtype=torch.long, device=device),
+        token_ids=torch.tensor(request_token_ids, dtype=torch.long, device=device),
+        entries=entries,
+        next_split_pruned_len=next_split_pruned_len,
+    )
+
+
+def _append_token_ids_chunk_from_flat_scores(
+    plan: _TokenIdsChunkPlan,
+    flat_scores: torch.Tensor,
+    token_ids_logprobs_val: List,
+    token_ids_logprobs_idx: List,
+) -> None:
+    """Restore the existing per-sequence/per-row response shape."""
+    score_pt = 0
+    for entry in plan.entries:
+        token_ids = entry.token_ids
+        width = len(token_ids) if token_ids else 0
+        count = entry.num_rows * width
+        if width:
+            values = flat_scores[score_pt : score_pt + count].reshape(
+                entry.num_rows, width
+            )
+            val = values.tolist()
+            idx = [token_ids for _ in range(entry.num_rows)]
+        else:
+            val, idx = [], []
+        score_pt += count
+
+        if entry.continue_previous:
+            token_ids_logprobs_val[-1].extend(val)
+            token_ids_logprobs_idx[-1].extend(idx)
+        else:
+            token_ids_logprobs_val.append(val)
+            token_ids_logprobs_idx.append(idx)
+
+    assert score_pt == flat_scores.numel()
 
 
 def get_top_logprobs_raw(
@@ -447,6 +631,9 @@ class InputLogprobProcessor:
             envs.SGLANG_ENABLE_FAST_INPUT_LOGPROBS.get()
             and not _deterministic_inference_enabled()
         )
+        self.enable_distributed_input_logprobs = (
+            envs.SGLANG_ENABLE_DISTRIBUTED_INPUT_LOGPROBS.get()
+        )
 
     def forward(
         self,
@@ -458,6 +645,7 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         skip_chunking_for_dp_attn: bool = False,
+        distributed_context: Optional[DistributedLogprobContext] = None,
     ) -> Tuple[LogprobResult, torch.Tensor]:
         # Non-chunked = one chunk covering every row. DP-attention must stay
         # single-chunk: the collective schedule cannot depend on per-rank rows.
@@ -479,6 +667,7 @@ class InputLogprobProcessor:
             get_logits_fn,
             logits_metadata,
             chunk_size,
+            distributed_context,
         )
 
     def _forward_by_chunk(
@@ -491,6 +680,7 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         chunk_size: int,
+        distributed_context: Optional[DistributedLogprobContext] = None,
     ) -> Tuple[LogprobResult, torch.Tensor]:
         """Compute input logprobs chunk by chunk to cap peak memory."""
         total_size = pruned_states.shape[0]
@@ -524,6 +714,12 @@ class InputLogprobProcessor:
 
             fused_kernel, fused_max_k = row_logsumexp_topk, FUSED_TOPK_MAX_K
 
+        use_distributed_logprobs = (
+            distributed_context is not None
+            and self.enable_fast_input_logprobs
+            and not logits_metadata.extend_return_top_logprob
+        )
+
         for i in range(num_chunks):
             start_idx = i * chunk_size
             end_idx = min((i + 1) * chunk_size, total_size)
@@ -548,17 +744,27 @@ class InputLogprobProcessor:
             # writing through the shared graph logits buffer would alias
             # chunks whose shape happens to match the buffer.
             chunk_states = pruned_states[start_idx:end_idx]
-            chunk_logits = get_logits_fn(
-                chunk_states,
-                lm_head,
-                logits_metadata,
-                use_logits_buffer=num_chunks == 1,
-            )
+            if use_distributed_logprobs:
+                chunk_logits = distributed_context.get_local_logits_fn(
+                    chunk_states, lm_head, logits_metadata
+                )
+            else:
+                chunk_logits = get_logits_fn(
+                    chunk_states,
+                    lm_head,
+                    logits_metadata,
+                    use_logits_buffer=num_chunks == 1,
+                )
 
             # Initialize sampled_logits on first chunk
             if i == 0:
+                sampled_vocab_size = (
+                    distributed_context.vocab_size
+                    if use_distributed_logprobs
+                    else chunk_logits.shape[1]
+                )
                 sampled_logits = torch.empty(
-                    (sample_indices.shape[0], chunk_logits.shape[1]),
+                    (sample_indices.shape[0], sampled_vocab_size),
                     dtype=chunk_logits.dtype,
                     device=chunk_logits.device,
                 )
@@ -570,7 +776,12 @@ class InputLogprobProcessor:
             )
             if chunk_sample_mask.any():
                 chunk_sample_indices = sample_indices[chunk_sample_mask] - start_idx
-                sampled_logits[chunk_sample_mask] = chunk_logits[chunk_sample_indices]
+                chunk_sampled_logits = chunk_logits[chunk_sample_indices]
+                if use_distributed_logprobs:
+                    chunk_sampled_logits = distributed_context.gather_sampled_logits_fn(
+                        chunk_sampled_logits
+                    )
+                sampled_logits[chunk_sample_mask] = chunk_sampled_logits
 
             # Zero-logprob-row chunks still need the per-sequence bookkeeping below.
             chunk_logprobs = chunk_logits[chunk_indices]
@@ -581,6 +792,89 @@ class InputLogprobProcessor:
             chunk_slice = slice(
                 token_to_seq_idx[start_idx], token_to_seq_idx[end_idx - 1] + 1
             )
+
+            if use_distributed_logprobs:
+                valid_vocab_size = (
+                    distributed_context.vocab_end_index
+                    - distributed_context.vocab_start_index
+                )
+                if chunk_logprobs.shape[0] > 0:
+                    row_max, row_log_sum = compute_distributed_row_log_normalizer(
+                        chunk_logprobs,
+                        valid_vocab_size,
+                        distributed_context.tp_group,
+                    )
+
+                    target_token_ids = (
+                        logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices]
+                    ).long()
+                    target_rows = torch.arange(
+                        chunk_logprobs.shape[0],
+                        device=chunk_logprobs.device,
+                        dtype=torch.long,
+                    )
+
+                    explicit_plan = None
+                    lookup_rows = target_rows
+                    lookup_token_ids = target_token_ids
+                    if logits_metadata.extend_token_ids_logprob:
+                        explicit_plan = _build_token_ids_chunk_plan(
+                            logits_metadata.token_ids_logprobs[chunk_slice],
+                            logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice],
+                            split_len_token_ids,
+                            chunk_logprobs.shape[0],
+                            chunk_logprobs.device,
+                        )
+                        lookup_rows = torch.cat(
+                            (lookup_rows, explicit_plan.row_indices)
+                        )
+                        lookup_token_ids = torch.cat(
+                            (lookup_token_ids, explicit_plan.token_ids)
+                        )
+
+                    raw_scores = get_distributed_token_scores(
+                        chunk_logprobs,
+                        lookup_rows,
+                        lookup_token_ids,
+                        distributed_context.vocab_start_index,
+                        distributed_context.vocab_end_index,
+                        distributed_context.tp_group,
+                    )
+                    normalized_scores = (
+                        raw_scores - row_max[lookup_rows]
+                    ) - row_log_sum[lookup_rows]
+                    num_targets = target_rows.numel()
+                    token_logprobs.append(normalized_scores[:num_targets])
+
+                    if explicit_plan is not None:
+                        _append_token_ids_chunk_from_flat_scores(
+                            explicit_plan,
+                            normalized_scores[num_targets:],
+                            token_ids_logprobs_val,
+                            token_ids_logprobs_idx,
+                        )
+                        split_len_token_ids = explicit_plan.next_split_pruned_len
+                else:
+                    token_logprobs.append(
+                        chunk_logprobs.new_empty(0, dtype=torch.float32)
+                    )
+                    if logits_metadata.extend_token_ids_logprob:
+                        explicit_plan = _build_token_ids_chunk_plan(
+                            logits_metadata.token_ids_logprobs[chunk_slice],
+                            logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice],
+                            split_len_token_ids,
+                            0,
+                            chunk_logprobs.device,
+                        )
+                        _append_token_ids_chunk_from_flat_scores(
+                            explicit_plan,
+                            chunk_logprobs.new_empty(0, dtype=torch.float32),
+                            token_ids_logprobs_val,
+                            token_ids_logprobs_idx,
+                        )
+                        split_len_token_ids = explicit_plan.next_split_pruned_len
+                del chunk_logprobs
+                continue
 
             chunk_precomputed_topk = None
             if self.enable_fast_input_logprobs:

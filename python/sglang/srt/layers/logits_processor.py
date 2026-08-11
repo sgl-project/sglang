@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_hidden_size,
 )
 from sglang.srt.layers.logprob_processor import (
+    DistributedLogprobContext,
     InputLogprobProcessor,
     LogprobStage,
     get_token_ids_logprobs_raw,
@@ -414,6 +415,9 @@ class LogitsProcessor(nn.Module):
             get_logits_fn=self._get_logits,
             logits_metadata=logits_metadata,
             skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
+            distributed_context=self._get_distributed_logprob_context(
+                lm_head, logits_metadata
+            ),
         )
 
         logits_output = LogitsProcessorOutput(
@@ -688,6 +692,74 @@ class LogitsProcessor(nn.Module):
                     logits / self.final_logit_softcapping
                 )
 
+        return logits
+
+    def _get_distributed_logprob_context(
+        self,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> Optional[DistributedLogprobContext]:
+        """Return the narrow sharded prompt-logprob path when layout is safe."""
+        if (
+            not self.input_logprob_processor.enable_fast_input_logprobs
+            or not self.input_logprob_processor.enable_distributed_input_logprobs
+            or not self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+            or logits_metadata.extend_return_top_logprob
+            or not isinstance(lm_head, VocabParallelEmbedding)
+            or not lm_head.enable_tp
+            or lm_head.num_added_embeddings != 0
+            or lm_head.org_vocab_size != self.vocab_size
+        ):
+            return None
+
+        tp_group = (
+            get_parallel().attn_tp_group
+            if self.use_attn_tp_group
+            else get_parallel().tp_group
+        )
+        if lm_head.tp_size != tp_group.world_size:
+            return None
+
+        shard = lm_head.shard_indices
+        return DistributedLogprobContext(
+            tp_group=tp_group,
+            vocab_start_index=shard.org_vocab_start_index,
+            vocab_end_index=shard.org_vocab_end_index,
+            vocab_size=self.vocab_size,
+            get_local_logits_fn=self._get_local_logits_for_distributed_logprobs,
+            gather_sampled_logits_fn=self._gather_sampled_logits,
+        )
+
+    def _get_local_logits_for_distributed_logprobs(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> torch.Tensor:
+        """Compute transformed fp32 rank-local logits without vocab gather."""
+        assert not self.do_tensor_parallel_all_gather_dp_attn
+        logits = self._compute_lm_head(hidden_states, lm_head)
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        logits = logits.float()
+        if self.final_logit_softcapping:
+            if not (_is_npu or _is_cpu):
+                fused_softcap(logits, self.final_logit_softcapping)
+            else:
+                logits = self.final_logit_softcapping * torch.tanh(
+                    logits / self.final_logit_softcapping
+                )
+        return logits
+
+    def _gather_sampled_logits(self, local_logits: torch.Tensor) -> torch.Tensor:
+        """Preserve the sampler's full-vocab contract for sampled rows only."""
+        if self.use_attn_tp_group:
+            logits = self._gather_attn_tp_logits(local_logits)
+        else:
+            logits = self._logits_gatherer(local_logits)
+        if logits.shape[-1] > self.vocab_size:
+            logits = logits[:, : self.vocab_size]
         return logits
 
     def _compute_lm_head(
