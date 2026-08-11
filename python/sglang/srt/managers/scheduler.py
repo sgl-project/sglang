@@ -2820,27 +2820,19 @@ class Scheduler(
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
+        # Non-PD path only. PD prefill enforces the waiting timeout over its
+        # bootstrap + waiting queues in _abort_on_prefill_waiting_timeout; PD
+        # decode deliberately has no waiting abort (prefill already sheds load
+        # before any KV is computed or transferred).
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
             return
 
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
         for req in self.waiting_queue:
-            entry_time = req.time_stats.wait_queue_entry_time
-            if 0 < entry_time < deadline:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(req.rid)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(
-                        finished_reason={
-                            "type": "abort",
-                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "Request waiting timeout reached.",
-                        },
-                        rid=req.rid,
-                    ),
-                    req,
+            if 0 < req.time_stats.wait_queue_entry_time < deadline:
+                self._abort_waiting_request(
+                    req, message="Request waiting timeout reached."
                 )
                 deleted_reqs.add(req)
 
@@ -2848,6 +2840,41 @@ class Scheduler(
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
+
+    def _abort_waiting_request(self, req: Req, message: Optional[str] = None) -> None:
+        """Abort a queued (not yet running) request, releasing the
+        role-specific resources it already holds. The caller removes the
+        request from its queue."""
+        finished_reason = None
+        if message is not None:
+            finished_reason = {
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": message,
+            }
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(finished_reason=finished_reason, rid=req.rid), req
+        )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # The request already holds the KV received from prefill.
+            if self.enable_hisparse:
+                self.hisparse_coordinator.request_finished(req)
+            release_kv_cache(req, self.tree_cache)
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            maybe_release_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+            assert req.disagg_kv_sender is not None
+            # The decode peer stays blocked unless poll() observes this failure.
+            req.disagg_kv_sender.abort()
+
+        if (
+            req.mamba_pool_idx is not None
+            and self.disaggregation_mode != DisaggregationMode.DECODE
+        ):
+            release_kv_cache(req, self.tree_cache, is_insert=False)
 
     def handle_embedding_request(
         self,
@@ -4461,33 +4488,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
-                self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
-                maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-
-            # For mamba radix cache
-            if (
-                req.mamba_pool_idx is not None
-                and self.disaggregation_mode != DisaggregationMode.DECODE
-            ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+            self._abort_waiting_request(req)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:

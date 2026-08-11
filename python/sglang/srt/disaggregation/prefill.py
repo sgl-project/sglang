@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -43,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_min_attn_cp_tp_group,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -539,6 +541,50 @@ class SchedulerDisaggregationPrefillMixin:
             for req in self.waiting_queue
         )
 
+    def _abort_on_prefill_waiting_timeout(self: Scheduler) -> None:
+        """Abort requests whose pre-compute wait exceeded SGLANG_REQ_WAITING_TIMEOUT.
+
+        On the prefill side "waiting" spans the bootstrap queue and the waiting
+        queue, so staleness is measured from bootstrap-queue entry (arrival on
+        this worker). The per-rank clock verdicts are MIN-reduced across attn
+        ranks: both queues feed rank-aligned poll lists, so every rank must
+        drop the same requests in the same iteration.
+        """
+        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
+            return
+
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue.queue
+        candidates = bootstrap_queue + self.waiting_queue
+        if not candidates:
+            return
+
+        deadline = time.perf_counter() - timeout_s
+        stale_flags = all_reduce_min_attn_cp_tp_group(
+            [
+                int(0 < req.time_stats.prefill_bootstrap_queue_entry_time < deadline)
+                for req in candidates
+            ],
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+        )
+        stale_reqs = {
+            req for req, stale in zip(candidates, stale_flags, strict=True) if stale
+        }
+        if not stale_reqs:
+            return
+
+        for req in candidates:
+            if req in stale_reqs:
+                self._abort_waiting_request(
+                    req, message="Request waiting timeout reached."
+                )
+        self.disagg_prefill_bootstrap_queue.queue = [
+            req for req in bootstrap_queue if req not in stale_reqs
+        ]
+        self.waiting_queue = [
+            req for req in self.waiting_queue if req not in stale_reqs
+        ]
+
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
@@ -546,6 +592,7 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+        self._abort_on_prefill_waiting_timeout()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
