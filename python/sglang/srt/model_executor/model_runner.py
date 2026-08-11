@@ -861,7 +861,10 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.managers.hisparse_coordinator import (
+            HiSparseCoordinator,
+            resolve_shared_index_layers,
+        )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
@@ -881,6 +884,11 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            shared_index_layers=resolve_shared_index_layers(
+                hf_text_config=self.model_config.hf_text_config,
+                pp_size=self.ps.pp_size,
+                is_speculative=self.spec_algorithm.is_speculative(),
+            ),
         )
 
     def post_capture_resize_kv_pool(self):
