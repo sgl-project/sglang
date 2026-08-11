@@ -54,6 +54,9 @@ def generate(spec: BuildSpec) -> str:
     Paths of the generated translation units are relative, so the file is
     identical no matter which directory the build runs in.
     """
+    units = spec.translation_units()
+    with_device = any(unit.is_cuda for unit in units)
+
     host_cc, device_cc = toolchain.compilers()
     includes = toolchain.base_include_paths() + list(spec.include_paths)
     include_flags = [f"-I{_escape(path)}" for path in includes]
@@ -65,7 +68,7 @@ def generate(spec: BuildSpec) -> str:
         + list(spec.cuda_cflags)
         + include_flags
     )
-    ldflags = toolchain.base_link_flags() + list(spec.ldflags)
+    ldflags = toolchain.base_link_flags(with_device=with_device) + list(spec.ldflags)
 
     lines = [
         "ninja_required_version = 1.3",
@@ -89,7 +92,7 @@ def generate(spec: BuildSpec) -> str:
     ]
 
     objects: List[str] = []
-    for index, unit in enumerate(spec.translation_units()):
+    for index, unit in enumerate(units):
         obj = f"{unit.stem}_{index}.o"
         rule = "compile_cuda" if unit.is_cuda else "compile_cxx"
         lines.append(f"build {obj}: {rule} {_escape(unit.filename)}")

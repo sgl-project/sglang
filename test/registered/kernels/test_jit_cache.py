@@ -468,6 +468,31 @@ def test_generated_ninja_asks_both_compilers_for_dependencies():
     assert all("-MD -MF $out.d" in line for line in compile_commands)
 
 
+def test_pure_cpp_module_does_not_link_the_gpu_runtime():
+    """A module with no `.cu` sources must not ask the linker for libcudart.
+
+    `ngram_corpus` is five .cpp files and no device code, and it is built on
+    CPU-only CI runners that have no CUDA toolkit — linking it there fails with
+    `cannot find -lcudart`. tvm-ffi keyed the runtime flags off the presence of
+    `.cu` sources for exactly this reason.
+    """
+    cpu_only = _spec(cpp_files=("/tmp/a.cpp",), cpp_wrappers=(), header_only=False)
+    ldflags = next(
+        line
+        for line in ninja.generate(cpu_only).splitlines()
+        if line.startswith("ldflags = ")
+    )
+    assert "cudart" not in ldflags and "amdhip" not in ldflags
+
+    with_device = _spec(cuda_files=("/tmp/a.cu",), cpp_wrappers=(), header_only=False)
+    ldflags = next(
+        line
+        for line in ninja.generate(with_device).splitlines()
+        if line.startswith("ldflags = ")
+    )
+    assert "cudart" in ldflags or "amdhip" in ldflags
+
+
 def test_generated_ninja_is_deterministic():
     spec = _spec(cuda_wrappers=(("run", "K::run"),))
     assert ninja.generate(spec) == ninja.generate(spec)

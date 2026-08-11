@@ -147,9 +147,17 @@ def base_include_paths() -> List[str]:
     return list(includes)
 
 
-def base_link_flags() -> List[str]:
+def base_link_flags(*, with_device: bool) -> List[str]:
+    """Link flags for a module, with the GPU runtime only when it has device code.
+
+    A module built purely from ``.cpp`` sources must not drag in libcudart: CPU
+    runners have no CUDA toolkit to link it from, and the module never calls it.
+    tvm-ffi keyed this off the presence of ``.cu`` sources for the same reason.
+    """
     _, lib_dir, lib_name = tvm_ffi_paths()
     flags = ["-shared", f"-L{lib_dir}", f"-l{lib_name}"]
+    if not with_device:
+        return flags
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
     return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
