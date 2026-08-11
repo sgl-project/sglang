@@ -603,7 +603,28 @@ def _fwd_kernel(
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
-    for start_n in range(0, extend_end, BLOCK_N):
+    # Sliding window: start the loop at the first tile that can hold an unmasked
+    # element instead of walking (and masking away) every earlier tile.
+    #
+    # The window mask below keeps (q, kv) iff q <= kv + SLIDING_WINDOW_SIZE, with
+    # q = cur_block_m * BLOCK_M + i and kv = start_n + j. Row i = 0 always exists
+    # (the early return above guarantees cur_block_m * BLOCK_M <
+    # cur_seq_len_extend), and the largest kv in a tile is start_n + BLOCK_N - 1,
+    # so a tile can hold an unmasked element only if
+    #     cur_block_m * BLOCK_M <= start_n + BLOCK_N - 1 + SLIDING_WINDOW_SIZE.
+    # Writing A = cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, that is
+    # start_n >= A - BLOCK_N + 1, whose smallest BLOCK_N-aligned solution is
+    # exactly (A // BLOCK_N) * BLOCK_N. Every tile below that floor is entirely
+    # masked out, where SKIP_TILE already suppresses both the MMA and the
+    # online-softmax rescale, so skipping the iteration outright is
+    # bit-identical and drops the per-tile cross-wave tl.max reduction that
+    # currently dominates sliding-window layers.
+    extend_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        extend_start = (
+            tl.maximum(cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0) // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(extend_start, extend_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 
