@@ -15,6 +15,12 @@ from ..common.utils import (
 from ..page_table import load_token_slots
 
 
+def _decode_main_attention_kernel_config(batch_size: int) -> tuple[int, int]:
+    if 4 <= batch_size < 16:
+        return 8, 2
+    return 4, 2
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_H": lambda args: max(
@@ -25,14 +31,6 @@ from ..page_table import load_token_slots
         "HAS_SINK": lambda args: args["sink_ptr"] is not None,
         "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in [4, 8]
-        for ns in [2, 3, 4, 5]
-    ],
-    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "block_size", "HAS_SINK"],
 )
 @triton.jit
 def _gqa_share_sparse_decode_kernel(
@@ -381,6 +379,7 @@ def flash_decode_with_gqa_share_sparse(
     )
     # launch attention kernel
     grid = (batch_size * NUM_TOPK_CHUNKS, num_kv_heads)
+    num_warps, num_stages = _decode_main_attention_kernel_config(batch_size)
     _gqa_share_sparse_decode_kernel[grid](
         q,
         sink,
@@ -426,6 +425,8 @@ def flash_decode_with_gqa_share_sparse(
         IS_FP8=is_fp8,
         PAGE_SIZE=page_size,
         ONE_PAGE_PER_BLOCK=page_size == block_size,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)

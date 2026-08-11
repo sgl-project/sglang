@@ -16,6 +16,10 @@ from ..common.utils import (
 from ..page_table import load_token_slots
 
 
+def _prefill_main_attention_kernel_config() -> tuple[int, int]:
+    return 4, 3
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
@@ -30,22 +34,6 @@ from ..page_table import load_token_slots
         "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"] * args["BLOCK_SIZE_H"],
         "HAS_SINK": lambda args: args["sink_ptr"] is not None,
     }
-)
-@triton.autotune(
-    # Configs that fail to compile on the target arch are skipped, so widening
-    # the num_warps x num_stages grid only adds candidates, never a bad kernel.
-    configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in (2, 4, 8)
-        for ns in (2, 3, 4)
-    ],
-    key=[
-        "BLOCK_SIZE_Q",
-        "BLOCK_SIZE_K",
-        "qk_head_dim",
-        "v_head_dim",
-        "gqa_group_size",
-    ],
 )
 @triton.jit
 def _gqa_share_sparse_fwd_kernel(
@@ -340,6 +328,7 @@ def flash_prefill_with_gqa_share_sparse(
         num_k_heads,
         batch_size,
     )
+    num_warps, num_stages = _prefill_main_attention_kernel_config()
     _gqa_share_sparse_fwd_kernel[grid](
         q,
         k_cache,
@@ -385,5 +374,7 @@ def flash_prefill_with_gqa_share_sparse(
         IS_FP8=is_fp8,
         PAGE_SIZE=page_size,
         ONE_PAGE_PER_BLOCK=page_size == block_size_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return o
