@@ -75,12 +75,14 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 ### Model and runtime
 
 - `--model-path {MODEL}`: model path or Hugging Face model ID
+- `--served-model-name {NAME}`: stable model name exposed by serving APIs. Defaults to `--model-id` when set, otherwise `--model-path`.
 - `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`. This is a server/load-time choice, unlike a request's `task`.
 - `--model-subfolder {PATH}`: advanced direct override for a component subfolder inside the model repository. Prefer `--model-variant` when the pipeline exposes semantic routing. If both are supplied, they must resolve to the same weight partition.
 - `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
 - `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
 - `--num-gpus {N}`: number of GPUs to use
 - `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and keeps safe offload defaults, using FSDP only for validated DiT-offload replacement paths. `speed` keeps `torch.compile` disabled unless a model-specific deployment config opts in after validation; pass `--enable-torch-compile true` to enable it explicitly. Use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
+- `--direct-gpu-weight-loading {true|false}`: opt into direct GPU loading for an unquantized, GPU-resident, TP=1 DiT by materializing its complete checkpoint state dict on GPU. Startup impact is model-dependent, so benchmark the target model before deployment. Disabled by default because checkpoint and model weights coexist temporarily, substantially increasing peak GPU memory. It is incompatible with DiT CPU/layerwise offload and FSDP.
 - `--tp-size {N}`: tensor parallelism size. Depending on the pipeline, it can shard the DiT, one or more encoders, or both.
 - `--sp-degree {N}`: sequence parallelism size
 - `--dp-size {N}` (alias `--data-parallel-size`): number of data-parallel replicas. Each replica is a full copy of the engine on `num_gpus / N` GPUs with its own ingress; generation requests round-robin across replicas, realtime sessions stick to the replica holding their state, and control operations (weights, LoRA, memory occupation, shutdown) apply to every replica. Combines with the other parallelism axes (`num_gpus = dp × cfg × tp × sp`); monolithic serving only.

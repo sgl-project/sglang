@@ -1678,7 +1678,16 @@ class TritonAttnBackend(AttentionBackend):
             and isinstance(pool, SWAKVPool)
             and pool.layers_mapping[layer.layer_id][1]
         ):
+            # Consumes VIRTUAL ids, so it must see out_cache_loc untranslated.
             extend_kv_indices = pool.translate_loc_from_full_to_swa(extend_kv_indices)
+        elif self.forward_metadata.out_cache_loc_full_physical is not None:
+            # Unified pool: this kernel reads the extend half OUT OF THE POOL (the
+            # 2-stage path takes it from the k/v arguments), so it needs the same
+            # translated loc the KV write uses -- otherwise the prefix is read at
+            # physical ids and the extend tokens at virtual ones. Reuse the
+            # per-forward translation rather than re-translating: this runs once
+            # per layer.
+            extend_kv_indices = self.forward_metadata.out_cache_loc_full_physical
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
