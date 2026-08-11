@@ -314,14 +314,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
 
-        # Pinned host buffers for the fast prefill-path plan (target-verify and
-        # eager draft-extend). Passing host-resident indptr/len arrays into
-        # flashinfer's MLA plan() makes its .to("cpu") (mla/_core.py:839-841) a
-        # no-op, removing the 3 blocking DtoH that otherwise stall the host and
-        # break overlap scheduling. Pinned so the in-plan buffer copies stay
-        # async. Allocated here (not init_cuda_graph_state) because the eager
-        # draft-extend backend never calls init_cuda_graph_state. Only
-        # prefill-capable backends use these (draft multistep is skip_prefill).
+        # Pinned host buffers for the fast prefill path plan
         if not skip_prefill:
             self.fast_plan_qo_indptr_cpu = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device="cpu", pin_memory=True
@@ -398,6 +391,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
             )
+            if forward_mode.is_target_verify():
+                # use sync-free fast_mla_prefill_plan for replay
+                prefill_wrapper.plan = partial(fast_mla_prefill_plan, prefill_wrapper)
         else:
             self._apply_cuda_graph_metadata(
                 bs=bs,
@@ -443,22 +439,16 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 and not is_in_breakable_cuda_graph()
             )
 
-            # Fast plan for eager DRAFT_EXTEND_V2 (flashinfer-MLA has no draft-
-            # extend cuda graph, so this path runs every decode iteration): build
-            # host indptr/len arrays so the paged plan skips its 3 blocking DtoH
-            # (mla/_core.py:839-841). For V2 every req extends by num_tokens_per_req
-            # (= num_draft_tokens, fixed), so qo_indptr is that cumsum; kv from
-            # seq_lens_cpu, which matches the GPU seq_lens (both +num_draft_tokens,
-            # see eagle_info_v2.prepare_for_extend_to_fill_draft_kvcache). kv_indices
-            # stays on GPU. Only the paged path needs it; ragged uses begin_forward.
+            # build host indptr/len arrays for eager DRAFT_EXTEND_V2 fast plan path
             qo_indptr_cpu = kv_indptr_cpu = kv_len_arr_cpu = None
-            ndt = getattr(forward_batch.spec_info, "num_tokens_per_req", None)
+            spec_info = forward_batch.spec_info
             if (
                 not use_ragged
                 and forward_batch.forward_mode.is_draft_extend_v2()
                 and forward_batch.seq_lens_cpu is not None
-                and ndt is not None
+                and spec_info is not None
             ):
+                ndt = spec_info.num_tokens_per_req
                 bs = forward_batch.batch_size
                 self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
                     0, (bs + 1) * ndt, ndt, dtype=torch.int32
@@ -566,35 +556,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 **self.fast_decode_kwargs,
             )
         elif forward_mode.is_target_verify():
-            fast_verify_kwargs = {}
-            # Fast verify plan (target-verify cuda-graph replay): derive host-side
-            # indptr/len arrays from seq_lens_cpu (already resident) + the
-            # constant draft_token_num, so flashinfer's MLA plan() skips the 3
-            # blocking DtoH copies at mla/_core.py:839-841. qo_indptr is the
-            # fixed tree shape; kv_indptr/kv_len_arr come from seq_lens; both
-            # match what the GPU path produces. kv_indices stays on GPU (plan()
-            # never copies it to host). Eager DRAFT_EXTEND_V2 gets the same
-            # treatment in init_forward_metadata (flashinfer-MLA has no draft-
-            # extend cuda graph, so that path is eager).
-            if (
-                forward_mode.is_target_verify()
-                and seq_lens_cpu is not None
-                and spec_info is not None
-                and getattr(spec_info, "draft_token_num", None) is not None
-            ):
-                ndt = spec_info.draft_token_num
-                self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
-                    0, (bs + 1) * ndt, ndt, dtype=torch.int32
-                )
-                self.fast_plan_kv_len_arr_cpu[:bs] = seq_lens_cpu[:bs] + ndt
-                self.fast_plan_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
-                    self.fast_plan_kv_len_arr_cpu[:bs], dim=0
-                )
-                fast_verify_kwargs = {
-                    "qo_indptr_cpu": self.fast_plan_qo_indptr_cpu[: bs + 1],
-                    "kv_indptr_cpu": self.fast_plan_kv_indptr_cpu[: bs + 1],
-                    "kv_len_arr_cpu": self.fast_plan_kv_len_arr_cpu[:bs],
-                }
+            # build host indptr/len arrays for target-verify fast plan path
+            assert (
+                seq_lens_cpu is not None and spec_info is not None
+            ), "target-verify cuda-graph replay requires host-resident seq_lens_cpu"
+            ndt = spec_info.draft_token_num
+            self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
+                0, (bs + 1) * ndt, ndt, dtype=torch.int32
+            )
+            self.fast_plan_kv_len_arr_cpu[:bs] = seq_lens_cpu[:bs] + ndt
+            self.fast_plan_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                self.fast_plan_kv_len_arr_cpu[:bs], dim=0
+            )
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -605,7 +578,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 ],
                 use_ragged=False,
                 spec_info=spec_info,
-                **fast_verify_kwargs,
+                qo_indptr_cpu=self.fast_plan_qo_indptr_cpu[: bs + 1],
+                kv_indptr_cpu=self.fast_plan_kv_indptr_cpu[: bs + 1],
+                kv_len_arr_cpu=self.fast_plan_kv_len_arr_cpu[:bs],
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -1052,9 +1027,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 # DCP splits kv across CP ranks; the host-side fast-plan arrays are
                 # built from full seq_lens and don't match, so fall back to GPU.
                 qo_indptr_cpu = kv_indptr_cpu = kv_len_arr_cpu = None
-            # Fast plan: when host-side arrays are supplied (target-verify /
-            # DRAFT_EXTEND_V2), pass them so flashinfer's plan() skips the 3 blocking
-            # DtoH copies at mla/_core.py:839-841. kv_indices stays on GPU.
+
             plan_qo_indptr = qo_indptr if qo_indptr_cpu is None else qo_indptr_cpu
             plan_kv_indptr = kv_indptr if kv_indptr_cpu is None else kv_indptr_cpu
             plan_kv_len_arr = (
@@ -1062,6 +1035,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 if kv_len_arr_cpu is None
                 else kv_len_arr_cpu
             )
+
             wrapper_paged.plan(
                 plan_qo_indptr,
                 plan_kv_indptr,
@@ -1279,3 +1253,50 @@ def fast_mla_decode_plan(
         )
     except Exception as e:
         raise RuntimeError(f"Error in alternate MLA plan: {e}")
+
+
+def fast_mla_prefill_plan(
+    self,
+    qo_indptr_cpu: torch.Tensor,
+    kv_indptr_cpu: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_len_arr_cpu: torch.Tensor,
+    num_heads: int,
+    head_dim_ckv: int,
+    head_dim_kpe: int,
+    page_size: int,
+    causal: bool,
+    sm_scale: float,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+) -> None:
+    """Sync-free BatchMLAPagedAttentionWrapper.plan for the target-verify CUDA
+    graph replay. Like fast_mla_decode_plan it hands host-known qo/kv indptr +
+    lengths straight to _cached_module.plan (no per-replay device-to-host copy).
+    Decode's indices updater writes the cuda-graph buffers in place so its fast
+    plan can skip them; verify metadata is freshly built each step, so refresh
+    the bound buffers here exactly as stock plan()'s use_cuda_graph branch does
+    (host->device / device->device, non-blocking).
+    """
+    self._causal = causal
+    self._page_size = page_size
+    self._sm_scale = sm_scale
+    self._qo_indptr_buf.copy_(qo_indptr_cpu, non_blocking=True)
+    self._kv_indptr_buf.copy_(kv_indptr_cpu, non_blocking=True)
+    self._kv_indices_buf[: len(kv_indices)].copy_(kv_indices, non_blocking=True)
+    self._kv_len_arr_buf.copy_(kv_len_arr_cpu, non_blocking=True)
+
+    try:
+        self._cached_module.plan(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            kv_len_arr_cpu,
+            num_heads,
+            head_dim_ckv,
+            causal,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error in alternate MLA prefill plan: {e}")
