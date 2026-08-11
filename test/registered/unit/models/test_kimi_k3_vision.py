@@ -464,15 +464,17 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
     ]
     sharded_embeddings = torch.randn(2, 2)
 
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so publish it; the live topology the
+    # sharding helper reads is forced through the context's own override.
     with mock_patch(
         "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
         return_value=sharded_embeddings,
-    ) as run_dp, mock_patch(
-        "sglang.srt.models.kimi_k3.get_parallel",
-        return_value=SimpleNamespace(tp_size=1, attn_tp_size=1),
+    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, attn_tp_size=1
     ):
         output = model.get_image_feature(items)
-        # Exercise the loader while the runtime topology is patched.
+        # Exercise the loader while the runtime topology is forced.
         loader_in_scope = run_dp.call_args.kwargs["load_local_pixel_values"]
         local = loader_in_scope([1])
         both = loader_in_scope([0, 1])
@@ -516,6 +518,8 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     model.mm_projector = lambda image_embeds: image_embeds
 
     deferred_config = {
+        "backend": "gpu",
+        "feature_layout": "chw",
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
         "transparent_bg_config": None,
@@ -545,12 +549,13 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
         calls.append([int(image[0, 0, 0]) for image in images])
         return torch.tensor([[float(calls[-1][0]), 0.0]]), torch.tensor([[1, 1, 1]])
 
+    # Configured TP size (the IPC consumer count) comes from the published
+    # bags; the live topology is forced through the context's own override.
     with mock_patch(
         "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
         return_value=torch.zeros(1, 2),
-    ) as run_dp, mock_patch(
-        "sglang.srt.models.kimi_k3.get_parallel",
-        return_value=SimpleNamespace(tp_size=1, attn_tp_size=1),
+    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, attn_tp_size=1
     ), mock_patch(
         "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
         side_effect=fake_preprocess,

@@ -24,6 +24,7 @@
 FROM lmsysorg/sglang:v0.5.16-cu129 AS base
 
 ARG SGL_DEEP_GEMM_VERSION="0.1.5.post2"
+ARG NVIMGCODEC_VERSION="0.9.0.20"
 
 # Current Kimi-K3 source auto-discovers and builds its PyO3 extensions.
 ARG RUST_VERSION="1.90.0"
@@ -82,6 +83,12 @@ RUN TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
 # build, so CUDA 12.9 uses the matching official release asset.
 RUN python3 -m pip install --no-deps --force-reinstall \
     "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_x86_64.whl"
+
+# High-fidelity GPU JPEG decode. The K3 processor enables nvJPEG interpolated
+# chroma upsampling through nvImageCodec and zero-copy DLPack handoff to Torch.
+RUN python3 -m pip install \
+      "nvidia-nvimgcodec-cu12[all]==${NVIMGCODEC_VERSION}" && \
+    rm -rf /root/.cache/pip
 
 # Install the matching official FlashInfer package trio. A mixed
 # Python/cubin/JIT-cache installation fails at import time.
