@@ -264,7 +264,7 @@ class EagerRunner(BaseRunner):
             prepare_cp_forward(forward_batch)
 
         if forward_batch.needs_forward_metadata_init() or cp_v2_active:
-            if model_runner.dcp_size > 1 and hasattr(
+            if model_runner.ps.attn_dcp_size > 1 and hasattr(
                 model_runner.model, "prepare_context_parallel_metadata_for_dcp"
             ):
                 # prepare kv cache buffer for dcp to gather kv cache

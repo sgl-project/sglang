@@ -230,12 +230,15 @@ class ContextParallelStrategy(ABC):
 
 
 def _is_dsa_active() -> bool:
-    from sglang.srt.runtime_context import get_server_args
+    from sglang.srt.runtime_context import get_parallel, get_server_args
 
-    sa = get_server_args()
+    # `_is_dsa_model_arch` is set nowhere in the tree, so this predicate is
+    # inert today (the getattr default makes it False). Kept verbatim rather
+    # than "fixed" here, because deciding what it should name is the CP path's
+    # call; the ratchet exempts it with that reason.
     return bool(
-        getattr(sa, "enable_prefill_cp", False)
-        and getattr(sa, "_is_dsa_model_arch", False)
+        get_parallel().enable_prefill_cp
+        and getattr(get_server_args(), "_is_dsa_model_arch", False)
     )
 
 
@@ -288,7 +291,7 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
             server_args = get_server_args()
         except ValueError:
             return None
-        if server_args is not None and getattr(server_args, "enable_prefill_cp", False):
+        if server_args is not None and get_parallel().enable_prefill_cp:
             init_cp_strategy(server_args)
     return _STRATEGY
 
