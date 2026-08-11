@@ -148,8 +148,8 @@ def build_step_span_name(
     """Build the profile-trace span name for one forward step.
 
     Detailed annotations are folded into the label (via
-    :func:`build_detailed_annotation_suffix`) when enabled. ``detailed_annotations``
-    defaults to the process-wide toggle (:func:`detailed_annotations_enabled`, set
+    build_detailed_annotation_suffix) when enabled. detailed_annotations
+    defaults to the process-wide toggle (detailed_annotations_enabled, set
     by the profiler manager); pass an explicit bool to override (e.g. in tests).
     """
     if detailed_annotations is None:
