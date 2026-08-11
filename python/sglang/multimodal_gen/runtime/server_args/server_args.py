@@ -500,8 +500,8 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_adjust_auto_default_layerwise_offload()
         self._adjust_ltx2_two_stage_device_mode()
         if auto_tuner.could_override_server_args():
-            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
+            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
         if self.served_model_name is None:

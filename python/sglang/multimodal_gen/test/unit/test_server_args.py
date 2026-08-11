@@ -1553,9 +1553,9 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        # 80gb > image threshold (45gb): only vae resident, encoders offloaded;
-        # cfg/dit unchanged
-        self.assertTrue(args.dit_cpu_offload)
+        # 80gb > image threshold (45gb): vae and dit stay resident, while the
+        # large encoders use layerwise offload.
+        self.assertFalse(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder"],
@@ -1623,9 +1623,9 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        # 50gb still > image threshold (45gb): vae resident, encoders offloaded;
-        # fsdp skipped (qwen does not opt into auto fsdp)
-        self.assertTrue(args.dit_cpu_offload)
+        # 50gb still > image threshold (45gb): vae and dit stay resident, while
+        # the encoders remain offloaded; qwen does not opt into auto fsdp.
+        self.assertFalse(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder"],
@@ -1662,8 +1662,8 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
         # min available across selected gpus is 72gb > image threshold (45gb):
-        # vae resident, encoders offloaded
-        self.assertTrue(args.dit_cpu_offload)
+        # vae and dit stay resident, while the encoders remain offloaded.
+        self.assertFalse(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder"],
