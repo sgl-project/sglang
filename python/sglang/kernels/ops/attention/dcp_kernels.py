@@ -30,6 +30,15 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
 )
+from sglang.srt.utils import is_hip
+
+# tl.constexpr, not a plain float: a @triton.jit body cannot read a non-constexpr
+# global. Use _LOG2E.value where the host side needs the number.
+_LOG2E = tl.constexpr(1.4426950408889634)
+
+# waves_per_eu keeps more wavefronts resident on the tiny grids these DCP
+# kernels launch; matrix_instr_nonkdim matches the convention in verify_splitkv.
+_AMD_LAUNCH_KWARGS = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16} if is_hip() else {}
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +589,7 @@ def _lse_weighted_combine_cpu(
 # partials ``(segm_output, segm_max, segm_expsum)`` but its own reduce kernel
 # only writes the merged ``output`` -- no LSE. DCP needs the LSE of each rank's
 # KV shard to merge partial attention across ranks (``cp_lse_ag_out_rs_mla`` ->
-# ``correct_attn_out``, base-2), so ``dcp_mla_reduce`` below replicates aiter's
+# ``correct_attn_out``, base-2), so ``dcp_reduce_kv_segments`` below replicates aiter's
 # reduce math and additionally writes
 # ``lse = overall_max + log2(overall_expsum)``.
 #
@@ -722,7 +731,7 @@ def pack_dcp_kv_into_pages(
 
 
 @triton.jit
-def _dcp_mla_reduce_kernel(
+def _dcp_reduce_kv_segments_kernel(
     out_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
     lse_ptr,  # [num_tokens, num_query_heads] (base-2)
     segm_output_ptr,  # [num_tokens, num_query_heads, NUM_SEGMENTS, KV_LORA_RANK]
@@ -805,7 +814,7 @@ def _dcp_mla_reduce_kernel(
     tl.store(lse_ptr + tok * lse_stride0 + head, lse)
 
 
-def dcp_mla_reduce(
+def dcp_reduce_kv_segments(
     segm_output: torch.Tensor,
     segm_max: torch.Tensor,
     segm_expsum: torch.Tensor,
@@ -831,7 +840,7 @@ def dcp_mla_reduce(
     lse = torch.empty(
         num_tokens, num_heads, dtype=torch.float32, device=segm_output.device
     )
-    _dcp_mla_reduce_kernel[(num_tokens, num_heads)](
+    _dcp_reduce_kv_segments_kernel[(num_tokens, num_heads)](
         out,
         lse,
         segm_output,
@@ -845,5 +854,310 @@ def dcp_mla_reduce(
         TILE_SIZE=tile_size,
         KV_LORA_RANK=kv_lora_rank,
         NUM_SEGMENTS_PER_SEQ=num_segments,
+    )
+    return out, lse
+
+
+# ---------------------------------------------------------------------------
+# DCP target-verify stage B, and the two-partial merge that folds it into
+# stage A.
+#
+# Target-verify splits in two because aiter's mla_decode_fwd derives its causal
+# mask from the LOCAL shard index, which under round-robin DCP is not the
+# global position: stage A attends the committed shard with the window
+# flattened to single-token rows (mask degenerates), stage B attends the
+# in-hand window densely here, and the two are merged by LSE. Only rank 0 runs
+# stage B, so the window is counted exactly once across the group.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dense_causal_mla_window_kernel(
+    q_ptr,  # [bs * q_len, H, NOPE + PE]
+    k_ptr,  # [bs * q_len, 1, NOPE + PE] latent KV; v aliases its first NOPE cols
+    out_ptr,  # [bs * q_len, H, NOPE]
+    lse_ptr,  # [bs * q_len, H] fp32, base-2
+    scaling,
+    q_stride_t: tl.int64,
+    q_stride_h: tl.int64,
+    k_stride_t: tl.int64,
+    out_stride_t: tl.int64,
+    out_stride_h: tl.int64,
+    lse_stride_t: tl.int64,
+    lse_stride_h: tl.int64,
+    Q_LEN: tl.constexpr,
+    L_EXT: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    PE_DIM: tl.constexpr,
+    BLOCK_PE: tl.constexpr,
+):
+    """Dense causal attention over one request's in-hand window, one program
+    per (request, head).
+
+    The latent KV is read once as nope+rope: the rope half only feeds the QK
+    dot, and the nope half is BOTH the QK nope term and V (the MLA absorb
+    form), so there is no separate V load.
+    """
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+
+    offs_l = tl.arange(0, L_EXT)
+    mask_l = offs_l < Q_LEN
+    offs_n = tl.arange(0, BLOCK_NOPE)
+    mask_n = offs_n < NOPE_DIM
+    offs_p = tl.arange(0, BLOCK_PE)
+    mask_p = offs_p < PE_DIM
+
+    # Window position i of request b is row b * Q_LEN + i.
+    row = b * Q_LEN + offs_l
+
+    q_nope = tl.load(
+        q_ptr + row[:, None] * q_stride_t + h * q_stride_h + offs_n[None, :],
+        mask=mask_l[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+    q_rope = tl.load(
+        q_ptr + row[:, None] * q_stride_t + h * q_stride_h + NOPE_DIM + offs_p[None, :],
+        mask=mask_l[:, None] & mask_p[None, :],
+        other=0.0,
+    )
+    k_nope = tl.load(
+        k_ptr + row[:, None] * k_stride_t + offs_n[None, :],
+        mask=mask_l[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+    k_rope = tl.load(
+        k_ptr + row[:, None] * k_stride_t + NOPE_DIM + offs_p[None, :],
+        mask=mask_l[:, None] & mask_p[None, :],
+        other=0.0,
+    )
+
+    # scores[i, j] = q_i . k_j, split nope + rope so nothing is padded (both
+    # halves are powers of two for MLA).
+    #
+    # tl.dot, NOT an elementwise mul-reduce over [L_EXT, L_EXT, D]: that form
+    # reads better and verify_mla uses it for the same block, but its live set
+    # grows as L_EXT^2 * D and spills hard once L_EXT passes 8. Measured on
+    # gfx950 at bs 64: 78 us at q_len 8 but 1925 us at q_len 16, against 233 us
+    # for the torch version. tl.dot is flat across the same range.
+    qk = tl.dot(q_nope, tl.trans(k_nope), out_dtype=tl.float32)
+    qk += tl.dot(q_rope, tl.trans(k_rope), out_dtype=tl.float32)
+    qk *= scaling
+
+    # Causal within the window: query i sees key j iff j <= i.
+    causal = (offs_l[None, :] <= offs_l[:, None]) & mask_l[None, :] & mask_l[:, None]
+    qk = tl.where(causal, qk, float("-inf"))
+
+    m = tl.max(qk, 1)
+    p = tl.exp(qk - m[:, None])
+    denom = tl.sum(p, 1)
+    # PV in fp32. Casting p down to bf16 for an MFMA dot is the usual trick, but
+    # it costs real accuracy at short prefixes here (max_abs over the unit-test
+    # grid rises 1.95e-3 -> 2.91e-3 at prefix 0), eating most of the margin the
+    # tolerance tiers were calibrated with. The window is a handful of rows, so
+    # the slower fp32 path is affordable.
+    acc = tl.dot(p, k_nope.to(tl.float32), out_dtype=tl.float32) / denom[:, None]
+
+    tl.store(
+        out_ptr + row[:, None] * out_stride_t + h * out_stride_h + offs_n[None, :],
+        acc.to(out_ptr.dtype.element_ty),
+        mask=mask_l[:, None] & mask_n[None, :],
+    )
+    # Natural-log LSE rebased to base-2, which is what the DCP merges consume.
+    tl.store(
+        lse_ptr + row * lse_stride_t + h * lse_stride_h,
+        (m + tl.log(denom)) * _LOG2E,
+        mask=mask_l,
+    )
+
+
+def dense_causal_mla_attn_base2(
+    q: torch.Tensor,
+    k_window: torch.Tensor,
+    scaling: float,
+    bs: int,
+    q_len: int,
+    kv_lora_rank: int,
+):
+    """Dense causal MLA attention over one in-hand ``q_len``-token window.
+
+    Stage B of the DCP target-verify decomposition. The window is tiny
+    (``gamma + 1`` queries over the same ``gamma + 1`` keys), which is why this
+    is a purpose-built kernel rather than a paged one -- and it sidesteps two
+    kernel limitations that only bite inside the window: mla_decode_fwd derives
+    its causal mask from the LOCAL shard index (which under DCP is not the
+    global position), and its segmented reduce would need to mask the segments
+    the causal mask empties.
+
+    Args:
+        q: [bs * q_len, num_heads, kv_lora_rank + qk_rope_head_dim]
+        k_window: [bs * q_len, 1, kv_lora_rank + qk_rope_head_dim] latent KV of
+            the window tokens, in query order. ``v`` is its first
+            ``kv_lora_rank`` columns (MLA absorb form).
+
+    Returns (out [bs * q_len, num_heads, kv_lora_rank] fp32,
+    lse [bs * q_len, num_heads] fp32 base-2).
+    """
+    n_rows, num_heads, head_dim = q.shape
+    pe_dim = head_dim - kv_lora_rank
+    out = torch.empty(
+        (n_rows, num_heads, kv_lora_rank), dtype=torch.float32, device=q.device
+    )
+    lse = torch.empty((n_rows, num_heads), dtype=torch.float32, device=q.device)
+    if n_rows == 0:
+        return out, lse
+
+    k2 = k_window.view(n_rows, -1)
+    _dense_causal_mla_window_kernel[(bs, num_heads)](
+        q,
+        k2,
+        out,
+        lse,
+        scaling,
+        q.stride(0),
+        q.stride(1),
+        k2.stride(0),
+        out.stride(0),
+        out.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        Q_LEN=q_len,
+        # tl.dot needs at least 16 rows/cols; rows past q_len are masked off.
+        L_EXT=max(16, triton.next_power_of_2(q_len)),
+        NOPE_DIM=kv_lora_rank,
+        BLOCK_NOPE=triton.next_power_of_2(kv_lora_rank),
+        PE_DIM=pe_dim,
+        BLOCK_PE=triton.next_power_of_2(pe_dim),
+        **_AMD_LAUNCH_KWARGS,
+    )
+    return out, lse
+
+
+@triton.jit
+def _dcp_lse_combine_pair_kernel(
+    out_ptr,  # [tokens, heads, DIM]
+    out_lse_ptr,  # [tokens, heads] fp32, base-2
+    a_out_ptr,
+    a_lse_ptr,
+    b_out_ptr,
+    b_lse_ptr,
+    out_stride_t: tl.int64,
+    out_stride_h: tl.int64,
+    a_out_stride_t: tl.int64,
+    a_out_stride_h: tl.int64,
+    b_out_stride_t: tl.int64,
+    b_out_stride_h: tl.int64,
+    out_lse_stride_t: tl.int64,
+    out_lse_stride_h: tl.int64,
+    a_lse_stride_t: tl.int64,
+    a_lse_stride_h: tl.int64,
+    b_lse_stride_t: tl.int64,
+    b_lse_stride_h: tl.int64,
+    DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Merge two partial attentions over DISJOINT key sets, given base-2 LSEs.
+
+    Grid: (tokens, heads), one program per output row.
+    """
+    tok = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+
+    lse_a = tl.load(a_lse_ptr + tok * a_lse_stride_t + head * a_lse_stride_h).to(
+        tl.float32
+    )
+    lse_b = tl.load(b_lse_ptr + tok * b_lse_stride_t + head * b_lse_stride_h).to(
+        tl.float32
+    )
+    # A partial that saw no keys carries -inf. Fold NaN and +inf in with it
+    # rather than letting either reach the weights.
+    lse_a = tl.where((lse_a != lse_a) | (lse_a == float("inf")), float("-inf"), lse_a)
+    lse_b = tl.where((lse_b != lse_b) | (lse_b == float("inf")), float("-inf"), lse_b)
+
+    m = tl.maximum(lse_a, lse_b)
+    # Both partials empty: m is -inf and (-inf) - (-inf) would be NaN. Re-centre
+    # on 0 so both weights come out exp2(-inf) == 0, and let the guards below
+    # turn that into out 0 / lse -inf. The two comparable kernels in this repo
+    # (merge_state_kernel, _dcp_lse_combine_kernel) both return NaN here.
+    m_safe = tl.where(m == float("-inf"), 0.0, m)
+    w_a = tl.math.exp2(lse_a - m_safe)
+    w_b = tl.math.exp2(lse_b - m_safe)
+    denom = w_a + w_b
+
+    offs = tl.arange(0, BLOCK_DIM)
+    mask = offs < DIM
+    o_a = tl.load(
+        a_out_ptr + tok * a_out_stride_t + head * a_out_stride_h + offs,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    o_b = tl.load(
+        b_out_ptr + tok * b_out_stride_t + head * b_out_stride_h + offs,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    acc = o_a * w_a + o_b * w_b
+    # Guard the divisor as well as the result: both branches of a tl.where are
+    # evaluated, so dividing by a zero denominator would still produce NaN.
+    acc = tl.where(denom == 0.0, 0.0, acc / tl.where(denom == 0.0, 1.0, denom))
+
+    tl.store(
+        out_ptr + tok * out_stride_t + head * out_stride_h + offs,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    lse = tl.where(denom == 0.0, float("-inf"), m_safe + tl.log2(denom))
+    tl.store(out_lse_ptr + tok * out_lse_stride_t + head * out_lse_stride_h, lse)
+
+
+def lse_combine_base2(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    out_dtype: torch.dtype,
+):
+    """Merge two partial attentions over DISJOINT key sets, given base-2 LSEs.
+
+    ``out_*`` are [tokens, heads, dim] and ``lse_*`` are [tokens, heads]. A
+    partial that saw no keys carries ``lse = -inf`` (what dcp_reduce_kv_segments writes
+    for an empty shard); its weight is 0. If BOTH are empty the result is
+    ``out = 0, lse = -inf`` rather than NaN.
+
+    This is the two-input case of ``dcp_lse_combine_triton`` above. It is a
+    separate kernel because that one takes a stacked ``[N, B, H, D]`` tensor,
+    so reusing it here would mean a ``torch.stack`` copy of both partials on
+    every call.
+    """
+    n_tokens, n_heads, dim = out_a.shape
+    out = torch.empty((n_tokens, n_heads, dim), dtype=out_dtype, device=out_a.device)
+    lse = torch.empty((n_tokens, n_heads), dtype=torch.float32, device=out_a.device)
+    if n_tokens == 0:
+        return out, lse
+
+    _dcp_lse_combine_pair_kernel[(n_tokens, n_heads)](
+        out,
+        lse,
+        out_a,
+        lse_a,
+        out_b,
+        lse_b,
+        out.stride(0),
+        out.stride(1),
+        out_a.stride(0),
+        out_a.stride(1),
+        out_b.stride(0),
+        out_b.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        lse_a.stride(0),
+        lse_a.stride(1),
+        lse_b.stride(0),
+        lse_b.stride(1),
+        DIM=dim,
+        BLOCK_DIM=triton.next_power_of_2(dim),
+        **_AMD_LAUNCH_KWARGS,
     )
     return out, lse

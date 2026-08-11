@@ -152,76 +152,6 @@ _AITER_PARTITION_SIZE_ROCM = 256
 # a staging-buffer page size, independent of the KV pool's --page-size.
 _DCP_PREFILL_PAGE_SIZE = 64
 
-# The aiter MLA reduce and sglang's DCP merge (correct_attn_out) both work in
-# base-2, so any LSE produced here has to be rebased from natural log.
-_LOG2E = 1.4426950408889634
-
-
-def dense_causal_mla_attn_base2(
-    q: torch.Tensor,
-    k_window: torch.Tensor,
-    scaling: float,
-    bs: int,
-    q_len: int,
-    kv_lora_rank: int,
-):
-    """Dense causal MLA attention over one in-hand ``q_len``-token window.
-
-    Used as stage B of the DCP target-verify decomposition. The window is tiny
-    (``gamma + 1`` queries over the same ``gamma + 1`` keys), so a batched matmul
-    beats a paged kernel here -- and it sidesteps two kernel limitations that only
-    bite inside the window: mla_decode_fwd derives its causal mask from the LOCAL shard
-    index (which under DCP is not the global position), and its segmented reduce
-    would need to mask the segments the causal mask empties.
-
-    Args:
-        q: [bs * q_len, num_heads, kv_lora_rank + qk_rope_head_dim]
-        k_window: [bs * q_len, 1, kv_lora_rank + qk_rope_head_dim] latent KV of
-            the window tokens, in query order. ``v`` is its first
-            ``kv_lora_rank`` columns (MLA absorb form).
-
-    Returns (out [bs * q_len, num_heads, kv_lora_rank] float32,
-    lse [bs * q_len, num_heads] float32 base-2).
-    """
-    num_heads = q.shape[1]
-    qb = q.view(bs, q_len, num_heads, -1)
-    kb = k_window.view(bs, q_len, -1)
-    # Scores in the input dtype (matching the kernels), softmax/LSE in fp32.
-    scores = torch.einsum("bihd,bjd->bhij", qb, kb).float() * scaling
-    causal = torch.ones(q_len, q_len, dtype=torch.bool, device=q.device).tril()
-    scores = scores.masked_fill(~causal, float("-inf"))
-    lse_e = torch.logsumexp(scores, dim=-1)  # [bs, num_heads, q_len], natural log
-    probs = torch.exp(scores - lse_e.unsqueeze(-1))
-    vb = kb[..., :kv_lora_rank].float()
-    out = torch.einsum("bhij,bjd->bihd", probs, vb)  # [bs, q_len, H, kv_lora_rank]
-    return (
-        out.reshape(bs * q_len, num_heads, kv_lora_rank),
-        (lse_e * _LOG2E).permute(0, 2, 1).reshape(bs * q_len, num_heads),
-    )
-
-
-def lse_combine_base2(
-    out_a: torch.Tensor,
-    lse_a: torch.Tensor,
-    out_b: torch.Tensor,
-    lse_b: torch.Tensor,
-    out_dtype: torch.dtype,
-):
-    """Merge two partial attentions over DISJOINT key sets, given base-2 LSEs.
-
-    ``out_*`` are [tokens, heads, dim] and ``lse_*`` are [tokens, heads]. A
-    partial that saw no keys carries ``lse = -inf`` (what dcp_mla_reduce
-    writes for an empty shard); its weight is forced to 0 rather than NaN.
-    """
-    m = torch.maximum(lse_a, lse_b)
-    w_a = torch.nan_to_num(torch.exp2(lse_a - m), nan=0.0, posinf=0.0, neginf=0.0)
-    w_b = torch.nan_to_num(torch.exp2(lse_b - m), nan=0.0, posinf=0.0, neginf=0.0)
-    denom = w_a + w_b
-    out = out_a.float() * w_a.unsqueeze(-1) + out_b.float() * w_b.unsqueeze(-1)
-    out = out / denom.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1)
-    lse = torch.where(denom == 0.0, float("-inf"), m + torch.log2(denom))
-    return out.to(out_dtype), lse
-
 
 class AiterAttnBackend(AttentionBackend):
 
@@ -961,7 +891,7 @@ class AiterAttnBackend(AttentionBackend):
         from aiter.ops.triton.attention.mla import mla_decode_fwd
 
         from sglang.kernels.ops.attention.dcp_kernels import (
-            dcp_mla_reduce,
+            dcp_reduce_kv_segments,
         )
 
         fm = self.forward_metadata
@@ -1011,7 +941,7 @@ class AiterAttnBackend(AttentionBackend):
             skip_reduce=True,
         )
         # segment-reduce the shard partials to (out_local, lse2_local) [base-2].
-        return dcp_mla_reduce(
+        return dcp_reduce_kv_segments(
             segm_output,
             segm_max,
             segm_expsum,
@@ -1054,7 +984,7 @@ class AiterAttnBackend(AttentionBackend):
         from aiter.ops.triton.attention.mla import mla_decode_fwd
 
         from sglang.kernels.ops.attention.dcp_kernels import (
-            dcp_mla_reduce,
+            dcp_reduce_kv_segments,
         )
 
         fm = self.forward_metadata
@@ -1095,7 +1025,7 @@ class AiterAttnBackend(AttentionBackend):
             k_descale,
             skip_reduce=True,
         )
-        out_a, lse_a = dcp_mla_reduce(
+        out_a, lse_a = dcp_reduce_kv_segments(
             segm_output,
             segm_max,
             segm_expsum,
@@ -1106,6 +1036,11 @@ class AiterAttnBackend(AttentionBackend):
 
         if fm.dcp_cp_rank != 0:
             return out_a, lse_a
+
+        from sglang.kernels.ops.attention.dcp_kernels import (
+            dense_causal_mla_attn_base2,
+            lse_combine_base2,
+        )
 
         out_b, lse_b = dense_causal_mla_attn_base2(
             q, k_window, layer.scaling, bs, q_len, kv_lora_rank
