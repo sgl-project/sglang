@@ -7067,9 +7067,7 @@ class ServerArgs:
             if requested_load_format == "auto"
             else requested_load_format
         )
-        draft_server_args.override(
-            "draft_worker.load_format", load_format=resolved_load_format
-        )
+        draft_server_args.load_format = resolved_load_format
         logger.info("Using draft model load_format: %r", resolved_load_format)
         return draft_server_args
 
