@@ -15,6 +15,10 @@ from sglang.srt.utils import parse_connector_type
 
 logger = logging.getLogger(__name__)
 
+# Scheme of HttpRangeConnector, kept here so create_remote_connector can
+# dispatch on it without importing the module.
+HTTP_RANGE_SCHEME = "http-range"
+
 
 class ConnectorType(str, enum.Enum):
     FS = "filesystem"
@@ -41,6 +45,12 @@ def create_remote_connector(url, device=None, **kwargs) -> BaseConnector:
         return S3Connector(url)
     elif connector_type == "instance":
         return RemoteInstanceConnector(url, device)
+    elif connector_type == HTTP_RANGE_SCHEME:
+        # Imported lazily to keep the HTTP streaming machinery out of the
+        # import path of every other connector.
+        from sglang.srt.connector.http_range import HttpRangeConnector
+
+        return HttpRangeConnector(url)
     elif _is_azure_blob_url(url, connector_type):
         # Imported lazily so the optional ``blobfile`` dependency is only
         # required when an Azure URL is actually used.
@@ -70,6 +80,7 @@ __all__ = [
     "RemoteInstanceConnector",
     "S3Connector",
     "ConnectorType",
+    "HTTP_RANGE_SCHEME",
     "create_remote_connector",
     "get_connector_type",
 ]

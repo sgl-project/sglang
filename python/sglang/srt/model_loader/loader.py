@@ -3338,7 +3338,9 @@ class RemoteModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights from remote storage."""
         assert get_connector_type(client) == ConnectorType.FS
-        return client.weight_iterator()
+        # Connectors that shard the transfer per rank (e.g. one endpoint or NIC
+        # per rank) need the rank; the others ignore the argument.
+        return client.weight_iterator(get_parallel().tp_rank)
 
     def download_model(self, model_config: ModelConfig) -> None:
         pass
