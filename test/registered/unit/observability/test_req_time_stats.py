@@ -26,17 +26,12 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
         src = rts.SchedulerReqTimeStats()
         src.enable_metrics = True
         src.wait_queue_entry_time = 123.456
-        # A PD decode server never stamps prefill_finished_time locally.
         src.prefill_finished_time = 0.0
 
-        # Hop 1: scheduler -> detokenizer, clock anchors differ by 5s.
         with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0):
             blob = pickle.dumps(src)
         with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_005.0):
             hop1 = pickle.loads(blob)
-            # Hop 2: detokenizer -> tokenizer. has_timing_data (not
-            # enable_metrics, which __getstate__ pins to False) must keep the
-            # fields flowing.
             blob2 = pickle.dumps(hop1)
         with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_009.0):
             hop2 = pickle.loads(blob2)

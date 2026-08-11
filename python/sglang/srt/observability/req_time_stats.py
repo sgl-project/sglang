@@ -363,9 +363,6 @@ class ReqTimeStatsBase:
                 state["trace_ctx"] = TraceNullContext()
 
         for key in state.keys():
-            # 0.0 means "never stamped"; rebasing it fabricates an epsilon
-            # timestamp that defeats == 0.0 / > 0.0 sentinel checks downstream
-            # (e.g. a PD decode server's prefill_finished_time).
             if key.endswith("time") and state[key]:
                 state[key] = convert_time_cross_thread(
                     state[key],
