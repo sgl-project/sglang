@@ -4283,33 +4283,6 @@ class ServerArgs:
                     f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
                 )
 
-        # Resolve the decode backend the way the model overrides do: gating on
-        # attention_backend alone misses --decode-attention-backend aiter.
-        if cfg.dcp_size > 1 and is_hip():
-            from sglang.srt.arg_groups.overrides import attention_backends_of
-
-            prefill_backend, decode_backend = attention_backends_of(cfg)
-            if decode_backend == "aiter":
-                self._validate_aiter_mla_dcp(prefill_backend=prefill_backend)
-
-    def _validate_aiter_mla_dcp(self, *, prefill_backend: Optional[str] = None):
-        """Validate aiter MLA decode-context-parallel (--dcp-size > 1)."""
-        from sglang.srt.configs.model_config import AttentionArch
-
-        model_config = self.get_model_config()
-        if model_config.attention_arch != AttentionArch.MLA:
-            return
-
-        # TEMPORARY, lifted by the triton-MLA-DCP fix later in this series:
-        # that path double-filters its MLA KV writes under DCP, silently.
-        if prefill_backend == "triton":
-            raise ValueError(
-                "--prefill-attention-backend triton is not yet supported "
-                "together with the aiter MLA DCP decode path (--dcp-size > 1): "
-                "the triton extend path corrupts its MLA KV writes under DCP. "
-                "Use the default aiter prefill backend."
-            )
-
     def _handle_load_balance_method(self):
         cfg = resolving_view(self)
         if cfg.disaggregation_mode not in ("null", "prefill", "decode"):

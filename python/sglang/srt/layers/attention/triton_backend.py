@@ -221,8 +221,16 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
+        # dspark_kv_inject writes the draft KV at the raw cache_loc, so every rank
+        # holds a full copy instead of a shard.
+        spec_alg = model_runner.spec_algorithm
+        self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
+        if self.is_dspark_draft:
+            self.dcp_size = 1
+            self.dcp_rank = 0
+        else:
+            self.dcp_size = get_parallel().attn_dcp_size
+            self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -1285,6 +1293,17 @@ class TritonAttnBackend(AttentionBackend):
         # dcp_size) through the masked path so each rank only stores the tokens
         # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
         if self.dcp_size > 1:
+            if self.use_mla:
+                # set_mla_kv_buffer picks the owner and divides by dcp_size
+                # itself, so it takes the raw loc.
+                kv_lora_rank = v.shape[-1]
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k[..., :kv_lora_rank],
+                    k[..., kv_lora_rank:],
+                )
+                return
             loc = forward_batch.out_cache_loc // self.dcp_size
             if (
                 forward_batch.positions is not None
@@ -1553,8 +1572,9 @@ class TritonAttnBackend(AttentionBackend):
         )
 
         # Select the replicated K/V heads matching this rank's Q shard.
+        # An MLA model brings this rank's own K/V heads, not a replicated set.
         if k.numel() > 0:
-            if layer.tp_k_head_num > 1:
+            if layer.tp_k_head_num > 1 and not self.use_mla:
                 kv_head_start = (
                     group.rank_in_group * layer.tp_k_head_num // group.world_size
                 )
