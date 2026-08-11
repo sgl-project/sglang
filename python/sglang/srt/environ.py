@@ -1310,6 +1310,37 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
+    # MiniMax-M3 on ROCm: sparse-attention ports from alexsun07/sglang
+    # m3-atom-prefill-port. The two default-on toggles below measured
+    # MI350X TP8 bench_serving il8192/ol1024 cache-off: cc=1 120.7 -> 133.1
+    # tok/s (TPOT 8.00 -> 7.28 ms), cc=32 1385 -> 1697 (with
+    # SGLANG_M3_DECODE_TOPK_REUSE=1, its default).
+    # PORT (69cc50ccd4): compute the sparse index top-k on every Nth sparse
+    # layer ("source") and reuse it on the following N-1 ("skip") layers.
+    # 1 disables the sharing (every layer computes its own top-k).
+    SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(4)
+    # PORT (1d5282863c + 6f1821cfe0 + 1185d5ca88, adapted): ATOM-style Gluon
+    # sparse PREFILL. Replaces the Triton flash_prefill_with_gqa_share_sparse
+    # main-attention step with AITER's pa_decode_gluon (every prefill query
+    # token treated as a length-1 decode over a per-token sparse block table).
+    # The NHD main KV pool is kept; the needed context tokens are gathered per
+    # layer into a persistent SHUFFLE-5D scratch buffer. Unsupported cases
+    # (fp8 KV, sinks, non-128 head/block dims, missing aiter) fall back to the
+    # Triton kernel.
+    SGLANG_OPT_USE_ATOM_PREFILL = EnvBool(True)
+    # PORT (dfd35ad2a8, prefill half): index-topk skip layers drop the index
+    # arms of the fused rope+cache kernel in prefill (main-only norm+rope+KV
+    # write, no idx-K cache write). Only takes effect when the elision is safe:
+    # SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ > 1, decode top-k reuse active
+    # (SGLANG_M3_DECODE_TOPK_REUSE) and the dense-sparse decode path disabled;
+    # see MiniMaxSparseAttnBackend.prefill_skip_index_elision.
+    SGLANG_OPT_USE_PREFILL_SKIP_INDEX = EnvBool(False)
+    # PORT (c15159643d, adapted): use the aiter fused_qknorm_idxrqknorm C++/ASM
+    # builtin for the sparse-layer norm+rope+cache in extend/prefill (decode
+    # keeps the Triton path). Adapted to the NHD 3D KV pools via
+    # asm_layout=False 4D views instead of the source tree's 5D SHUFFLE cache.
+    SGLANG_OPT_USE_AITER_ROPE_CACHE = EnvBool(False)
+
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")

@@ -734,6 +734,13 @@ class MiniMaxM3Attention(nn.Module):
             and self.index_rotary_emb is self.rotary_emb
         )
 
+        # Opt-in prefill ports (both default off -> byte-identical behavior):
+        # PORT A (dfd35ad2a8, prefill half): skip-layer index elision in the
+        # fused rope+cache kernel. PORT B (c15159643d, adapted): aiter
+        # fused_qknorm_idxrqknorm builtin for extend-mode rope+cache.
+        self._prefill_skip_index_env = envs.SGLANG_OPT_USE_PREFILL_SKIP_INDEX.get()
+        self._aiter_rope_cache_env = envs.SGLANG_OPT_USE_AITER_ROPE_CACHE.get()
+
     def _can_use_rocm_qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> bool:
@@ -971,6 +978,13 @@ class MiniMaxM3Attention(nn.Module):
         sparse_backend = getattr(attn_backend, "sparse", None)
         return getattr(sparse_backend, "kv_pool", None)
 
+    @staticmethod
+    def _get_sparse_backend():
+        if not has_forward_context():
+            return None
+        attn_backend = get_forward_context().attn_backend
+        return getattr(attn_backend, "sparse", None)
+
     def _sparse_qk_index_norm_rope_cache(
         self,
         positions: torch.Tensor,
@@ -981,6 +995,7 @@ class MiniMaxM3Attention(nn.Module):
         idx_k: torch.Tensor,
         idx_v: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        fused_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_pool = self._get_sparse_kv_pool()
         # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
@@ -1001,6 +1016,48 @@ class MiniMaxM3Attention(nn.Module):
             layer_id = self.attn.layer_id
             k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
             idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
+            is_extend_mode = not forward_batch.forward_mode.is_decode_or_idle()
+            # PORT A (dfd35ad2a8, prefill half): an index-topk "skip" layer
+            # reuses the group source layer's top-k in prefill AND (via decode
+            # top-k reuse) in decode, so its idx_q/idx_k are never consumed and
+            # its idx-K cache is never read. Drop the index arms of the fused
+            # kernel entirely -> main-only q/k norm+rope + KV write. The safety
+            # conditions (decode reuse on, freq > 1, dense-sparse decode off)
+            # live in the backend's prefill_skip_index_elision(). Extend-only:
+            # decode keeps the full kernel so gate-off decode stays identical.
+            _skip_index = False
+            if self._prefill_skip_index_env and is_extend_mode:
+                _sb = self._get_sparse_backend()
+                if _sb is not None:
+                    _skip_index = _sb.prefill_skip_index_elision(
+                        layer_id, self.disable_index_value
+                    )
+            # PORT B (c15159643d, adapted): aiter fused_qknorm_idxrqknorm
+            # builtin for extend-mode rope+cache when the packed fused-GEMM row
+            # is available. Skip layers stay on the Triton kernel with
+            # skip_index=True (the builtin always does the index arms).
+            if (
+                self._aiter_rope_cache_env
+                and not _skip_index
+                and is_extend_mode
+                and fused_out is not None
+            ):
+                aiter_res = self._aiter_qknorm_idxr(
+                    fused_out,
+                    k_cache,
+                    v_cache,
+                    idx_k_cache,
+                    positions,
+                    forward_batch,
+                )
+                if aiter_res is not None:
+                    q_out, idx_q_out = aiter_res
+                    self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
+                    # k / idx_k are returned unchanged: attention reads them
+                    # from the caches the builtin just wrote (the fusion mark
+                    # makes the backend skip its own cache write), and the
+                    # loose k/idx_k tensors are not consumed downstream.
+                    return q_out, k, idx_q_out, idx_k
             q, k, idx_q, idx_k = sparse_qk_index_gemma_rmsnorm_rope_cache(
                 q,
                 k,
@@ -1021,10 +1078,136 @@ class MiniMaxM3Attention(nn.Module):
                 self.head_dim,
                 self.rotary_dim,
                 self.rotary_emb.is_neox_style,
+                skip_index=_skip_index,
             )
             self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
             return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
+
+    def _aiter_qknorm_idxr(
+        self,
+        fused_out: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """PORT B (c15159643d, adapted): rope+cache via aiter.fused_qknorm_idxrqknorm.
+
+        Consumes the packed [q|k|v|idx_q|idx_k] fused-GEMM output directly
+        (zero-copy view), does main+index Gemma-norm/rope, writes normed+roped
+        main K / raw V into the NHD KV pool and index-K into the flat index
+        cache, and returns (q_out, index_q_out). Returns None when any
+        precondition fails so the caller falls back to the Triton path.
+
+        Adaptation vs the source tree (which passes the 5D SHUFFLE cache with
+        asm_layout=True): our NHD pools [max_slots, num_kv_heads, head_dim] are
+        viewed as 4D [1, max_slots, num_kv_heads, head_dim] with
+        block_size=max_slots and asm_layout=False, so slot -> (block 0, offset
+        slot) degenerates to flat slot addressing; the builtin's idx-K write is
+        already flat slot*idx_head_dim.
+        """
+        try:
+            import aiter as _aiter
+        except ImportError:
+            return None
+        if not hasattr(_aiter, "fused_qknorm_idxrqknorm"):
+            return None
+
+        num_tokens = fused_out.shape[0]
+        if num_tokens == 0:
+            # The Triton path handles empty launches; don't assume the builtin does.
+            return None
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        idx_q_size = self.num_idx_heads * self.idx_head_dim
+        row = q_size + 2 * kv_size + idx_q_size + self.idx_head_dim
+        if not (
+            fused_out.is_contiguous()
+            and fused_out.dtype == torch.bfloat16
+            # == (not >=) so packed is the whole contiguous row; a wider row
+            # (e.g. idx_v present) would make packed a strided view.
+            and fused_out.shape[1] == row
+            # The builtin writes bf16 straight into the caches; require plain
+            # contiguous bf16 NHD pools (3D [max_slots, H, D]).
+            and k_cache.dim() == 3
+            and v_cache.dim() == 3
+            and k_cache.shape == v_cache.shape
+            and k_cache.shape[1] == self.num_kv_heads
+            and k_cache.shape[2] == self.head_dim
+            and k_cache.dtype == torch.bfloat16
+            and v_cache.dtype == torch.bfloat16
+            and k_cache.is_contiguous()
+            and v_cache.is_contiguous()
+            and idx_k_cache.dim() == 3
+            and idx_k_cache.shape[1] == 1
+            and idx_k_cache.shape[2] == self.idx_head_dim
+            and idx_k_cache.dtype == torch.bfloat16
+            and idx_k_cache.is_contiguous()
+            and positions.shape[0] == num_tokens
+            and forward_batch.out_cache_loc.shape[0] == num_tokens
+            and getattr(self.rotary_emb, "is_neox_style", False)
+        ):
+            return None
+        packed = fused_out[:, :row]
+
+        # cos_sin_cache must match the qkv dtype (bf16); sglang keeps it fp32
+        # until first use. Convert once and cache the bf16 buffer.
+        cos_sin = self.rotary_emb.cos_sin_cache
+        if cos_sin.dtype != packed.dtype:
+            cached = getattr(self, "_aiter_cos_sin", None)
+            if (
+                cached is None
+                or cached.dtype != packed.dtype
+                or cached.device != packed.device
+                or cached.shape != cos_sin.shape
+            ):
+                cached = cos_sin.to(device=packed.device, dtype=packed.dtype)
+                self._aiter_cos_sin = cached
+            cos_sin = cached
+
+        # 4D stride-based views (asm_layout=False):
+        # [num_blocks=1, block_size=max_slots, num_kv_heads, head_dim].
+        k_cache_4d = k_cache.view(1, *k_cache.shape)
+        v_cache_4d = v_cache.view(1, *v_cache.shape)
+        block_size = k_cache.shape[0]
+        idx_k_flat = idx_k_cache.reshape(-1, self.idx_head_dim)
+
+        q_out = torch.empty(
+            (num_tokens, q_size), dtype=packed.dtype, device=packed.device
+        )
+        index_q_out = torch.empty(
+            (num_tokens, idx_q_size), dtype=packed.dtype, device=packed.device
+        )
+
+        _aiter.fused_qknorm_idxrqknorm(
+            packed,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            cos_sin,
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_dim,
+            self.q_norm.variance_epsilon,
+            self.index_q_norm.weight.data,
+            self.index_k_norm.weight.data,
+            self.num_idx_heads,
+            forward_batch.out_cache_loc,
+            k_cache_4d,
+            v_cache_4d,
+            idx_k_flat,
+            block_size,
+            q_out,
+            index_q_out,
+            forward_batch.out_cache_loc,
+            kv_cache_dtype="auto",
+            k_scale=None,
+            v_scale=None,
+            asm_layout=False,
+        )
+        return q_out, index_q_out
 
     def forward_prepare(
         self,
@@ -1114,7 +1297,15 @@ class MiniMaxM3Attention(nn.Module):
             else:
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
                 q, k, idx_q, idx_k = self._sparse_qk_index_norm_rope_cache(
-                    positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
+                    positions,
+                    q,
+                    k,
+                    v,
+                    idx_q,
+                    idx_k,
+                    idx_v,
+                    forward_batch,
+                    fused_out=fused_out,
                 )
 
             inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)

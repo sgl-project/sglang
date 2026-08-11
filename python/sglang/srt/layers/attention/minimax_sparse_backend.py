@@ -12,6 +12,9 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_score_type,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
+    get_cu_seqblocks,
+)
 from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
     minimax_sparse_decode,
     minimax_sparse_prefill,
@@ -175,10 +178,43 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self.dense_backend: Optional[AttentionBackend] = None
 
+        # Index cache (ATOM #1354): share indexer top-k across groups of
+        # consecutive sparse layers. freq=N -> each group of N sparse layers
+        # computes top-k once (first layer) and the other N-1 reuse it. Prefill
+        # only for now (decode runs under cuda graph; the per-forward host dict
+        # would not be graph-safe). Only the group's source layer computes.
+        self.index_topk_freq = max(int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1)
+        self.index_cache_enabled = self.index_topk_freq > 1
+        # PORT (dfd35ad2a8, decode half): persistent per-bs device buffer for
+        # decode top-k reuse. CUDA-graph safe: alloc eager outside capture; the
+        # captured graph only copy_()s into / reads from a fixed address.
+        self._decode_topk_buf: dict = {}
+        import os as _os_dtr
+
+        self._decode_topk_reuse = _os_dtr.environ.get(
+            "SGLANG_M3_DECODE_TOPK_REUSE", "1"
+        ) not in ("0", "false", "False")
+        # PORT (dfd35ad2a8, prefill half): opt-in prefill skip-layer index
+        # elision (default off). Effective only when the elision is safe; see
+        # prefill_skip_index_elision().
+        self._prefill_skip_index = envs.SGLANG_OPT_USE_PREFILL_SKIP_INDEX.get()
+        # Map each sparse layer_id -> (group_key, is_source). Source layers compute
+        # and store; non-source layers in a group reuse the stored top-k. Groups run
+        # over the sparse-layer ordinal (position among sparse layers only).
+        self._topk_group_of_layer: dict[int, int] = {}
+        self._topk_is_source: dict[int, bool] = {}
+        for ordinal, lid in enumerate(self.sparse_layer_ids):
+            group = ordinal // self.index_topk_freq
+            self._topk_group_of_layer[lid] = group
+            self._topk_is_source[lid] = (ordinal % self.index_topk_freq) == 0
+        # Per-forward cache {group_key: reduced_topk_idx}; cleared each forward.
+        self._topk_cache: dict = {}
+
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"index_topk_freq={self.index_topk_freq}, "
             f"msa_decode={self._use_msa_decode}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
@@ -198,6 +234,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # cuda-graph replay views are a SimpleNamespace without extend_seq_lens_cpu,
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         self._msa_dec_meta = None
+        # New forward -> drop the per-forward index-cache top-k (prefill only).
+        if self.index_cache_enabled:
+            self._topk_cache = {}
+        # Decode top-k reuse: pre-allocate the per-bs persistent buffer so graph
+        # capture never allocates. num_kv_heads == 1 at TP>=4 for M3.
+        if (
+            self.index_cache_enabled
+            and self._decode_topk_reuse
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            bs = forward_batch.seq_lens.shape[0]
+            if bs > 0 and bs not in self._decode_topk_buf:
+                _nkv = self.kv_pool.main_pool.head_num
+                self._decode_topk_buf[bs] = torch.empty(
+                    (_nkv, bs, self.topk_blocks),
+                    dtype=torch.int32,
+                    device=forward_batch.seq_lens.device,
+                )
+        # PORT (alexsun07 210b08c002, extended): per-forward prefill meta cache.
+        self._prefill_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
@@ -269,6 +325,48 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         layer_ids = forward_batch.minimax_m3_precached_sparse_layers
         return layer_ids is not None and layer_id in layer_ids
 
+    def index_topk_skipped(self, layer_id: int, disable_value: bool) -> bool:
+        """Whether this sparse layer reuses another layer's top-k (index cache).
+
+        When True, the layer never runs the indexer (no flash-index attention,
+        no top-k), so its index Q/K norm+rope is dead work the model can skip.
+        Only valid for disable_value layers (idx_o is None there). Prefill-only:
+        decode always computes its own top-k, so callers must gate on is_extend.
+        """
+        return (
+            self.index_cache_enabled
+            and disable_value
+            and not self._topk_is_source.get(layer_id, True)
+        )
+
+    def prefill_skip_index_elision(self, layer_id: int, disable_value: bool) -> bool:
+        """PORT (dfd35ad2a8, prefill half): whether this layer's prefill may drop
+        the index arms of the fused rope+cache kernel (no idx_q/idx_k norm+rope
+        and, crucially, NO idx-K cache write).
+
+        Eliding the idx-K write is safe iff this layer's idx-K cache is never
+        read afterwards. That holds only when ALL of:
+          * SGLANG_OPT_USE_PREFILL_SKIP_INDEX is set (opt-in gate);
+          * the layer is an index-topk skip layer (freq > 1, disable_value,
+            non-source ordinal): in prefill -- including every later chunk of a
+            chunked prefill -- forward_extend feeds it the group source layer's
+            per-forward cached top-k, so the indexer (which is the only idx-K
+            reader) never runs on this layer; a cache miss raises instead of
+            recomputing (see forward_extend);
+          * decode top-k reuse is on (SGLANG_M3_DECODE_TOPK_REUSE): decode skip
+            layers reuse the source layer's top-k buffer instead of recomputing
+            from their own idx-K history;
+          * the dense-sparse decode path is off: it bypasses decode top-k reuse
+            (attn_fn is non-None in forward_decode), which would make decode
+            skip layers read their own (elided) idx-K.
+        """
+        return (
+            self._prefill_skip_index
+            and self._decode_topk_reuse
+            and not self.use_dense_sparse_decode
+            and self.index_topk_skipped(layer_id, disable_value)
+        )
+
     def forward(
         self,
         q,
@@ -332,19 +430,54 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(
-                    1, dtype=torch.int32, device=forward_batch.extend_seq_lens.device
-                ),
-                forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
-            ]
-        )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if forward_batch.extend_prefix_lens is not None:
-            prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
-        else:
-            prefix_lens = torch.zeros_like(seq_lens)
+        # PORT (alexsun07 210b08c002, extended): cu_seqlens/seq_lens/prefix_lens
+        # AND the cu_seqblocks trio are layer-invariant within a forward, but were
+        # rebuilt on every one of the 57 sparse layers (cat+cumsum glue kernels)
+        # and get_cu_seqblocks re-run per source layer (~8 more tiny kernels).
+        # Build once per forward; init_forward_metadata_out_graph resets the cache.
+        if getattr(self, "_prefill_meta", None) is None:
+            cu_seqlens = torch.cat(
+                [
+                    torch.zeros(
+                        1,
+                        dtype=torch.int32,
+                        device=forward_batch.extend_seq_lens.device,
+                    ),
+                    forward_batch.extend_seq_lens.to(torch.int32)
+                    .cumsum(0)
+                    .to(torch.int32),
+                ]
+            )
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            if forward_batch.extend_prefix_lens is not None:
+                prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
+            else:
+                prefix_lens = torch.zeros_like(seq_lens)
+            cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = (
+                get_cu_seqblocks(
+                    cu_seqlens,
+                    self._max_seqlen_q,
+                    self.block_size_q,
+                    self.block_size_k,
+                    forward_batch.extend_seq_lens_cpu,
+                )
+            )
+            self._prefill_meta = (
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+                cu_seqblocks_q,
+                max_seqblock_q,
+                all_seqblock_q,
+            )
+        (
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            cu_seqblocks_q,
+            max_seqblock_q,
+            all_seqblock_q,
+        ) = self._prefill_meta
 
         # DP attention pads q beyond the real token count for collective alignment;
         # trim to actual tokens so the sparse kernel sees consistent shapes.
@@ -363,7 +496,36 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             q = _quant_q_fp8(q, layer.q_scale_float)
             idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
-        idx_o, o = minimax_sparse_prefill(
+        # Index cache (ATOM #1354): only for disable_value layers (idx_o is None,
+        # so skipping the indexer has no output side effect). A group's source
+        # layer computes + stores the reduced top-k; the other layers reuse it.
+        use_index_cache = self.index_cache_enabled and disable_value
+        cached_topk_idx = None
+        want_topk = False
+        if use_index_cache:
+            group = self._topk_group_of_layer[layer.layer_id]
+            if self._topk_is_source[layer.layer_id]:
+                want_topk = True  # compute and store for this group
+            else:
+                cached_topk_idx = self._topk_cache.get(group)
+                # Miss (e.g. source layer chunked differently) -> recompute safely.
+                # PORT (dfd35ad2a8, prefill half): unless index elision is
+                # active for this layer -- then its idx_q was never computed and
+                # its idx-K cache never written, so recomputing the top-k here
+                # would silently use garbage. The group source layer runs
+                # earlier in the same forward and populates the cache, so this
+                # is normally unreachable; fail loudly instead of corrupting.
+                if cached_topk_idx is None and self.prefill_skip_index_elision(
+                    layer.layer_id, disable_value
+                ):
+                    raise RuntimeError(
+                        "MiniMaxSparse: prefill top-k cache miss for skip layer "
+                        f"{layer.layer_id} while SGLANG_OPT_USE_PREFILL_SKIP_INDEX "
+                        "index elision is active; cannot recompute top-k from "
+                        "an elided idx-K cache."
+                    )
+
+        result = minimax_sparse_prefill(
             q,
             k_cache,
             v_cache,
@@ -388,13 +550,27 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_value,
             use_msa=self.use_msa,
             seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            # K-side host lens (prefix + chunk) for the ATOM Gluon prefill path's
+            # scratch-page sizing; None simply disables that path.
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
             q_scale=layer.q_scale_float,
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
             idx_q_scale=layer.idx_q_scale_float,
             idx_k_scale=layer.idx_k_scale_float,
             idx_v_scale=layer.idx_v_scale_float,
+            cached_topk_idx=cached_topk_idx,
+            page_size=self.page_size,
+            return_topk_idx=want_topk,
         )
+        if want_topk:
+            idx_o, o, reduced_topk_idx = result
+            self._topk_cache[group] = reduced_topk_idx
+        else:
+            idx_o, o = result
 
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
@@ -517,7 +693,39 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             q = _quant_q_fp8(q, layer.q_scale_float)
             idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
-        idx_o, o = minimax_sparse_decode(
+        # Decode top-k reuse: group source layer computes+stores; skips reuse.
+        _use_reuse = (
+            self._decode_topk_reuse
+            and self.index_cache_enabled
+            and disable_value
+            and attn_fn is None
+        )
+        _topk_buf = self._decode_topk_buf.get(q.shape[0]) if _use_reuse else None
+        _cached_topk = None
+        _want_topk = False
+        if _use_reuse and _topk_buf is not None:
+            if self._topk_is_source.get(layer.layer_id, True):
+                _want_topk = True
+            else:
+                _cached_topk = _topk_buf
+        # PORT (dfd35ad2a8, prefill half): if prefill index elision was active
+        # for this layer, its idx-K history has holes, so decode must never
+        # recompute its own top-k. Guard the fallthrough (e.g. missing per-bs
+        # reuse buffer) loudly instead of silently reading garbage idx-K.
+        if (
+            _cached_topk is None
+            and not _want_topk
+            and q.shape[0] > 0
+            and self.prefill_skip_index_elision(layer.layer_id, disable_value)
+        ):
+            raise RuntimeError(
+                "MiniMaxSparse: decode would recompute top-k for skip layer "
+                f"{layer.layer_id} from its idx-K cache, but "
+                "SGLANG_OPT_USE_PREFILL_SKIP_INDEX elided its prefill idx-K writes "
+                f"(bs={q.shape[0]}, reuse_buf_ready={_topk_buf is not None})."
+            )
+
+        result = minimax_sparse_decode(
             q,
             None,
             k_cache,
@@ -548,7 +756,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q_scale=layer.idx_q_scale_float,
             idx_k_scale=layer.idx_k_scale_float,
             idx_v_scale=layer.idx_v_scale_float,
+            cached_topk_idx=_cached_topk,
+            return_topk_idx=_want_topk,
         )
+        if _want_topk:
+            idx_o, o, _reduced = result
+            _topk_buf.copy_(_reduced)
+        else:
+            idx_o, o = result
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
             o.reshape(q.shape[0], -1).contiguous(),

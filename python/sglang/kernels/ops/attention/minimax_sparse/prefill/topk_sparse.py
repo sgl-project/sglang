@@ -15,6 +15,34 @@ from ..common.utils import (
 )
 
 
+
+# PORT (vllm/models/minimax_m3/amd/ops/sparse_attn.py): CDNA sub-tiling params.
+# gfx950 -> SUB_K = BLOCK_SIZE_K//2, gfx942 -> //4. SGLANG_SPARSE_ATTN_SUBK=0
+# disables and restores the original dense path.
+_SPARSE_SUBK_CACHE = None
+
+
+def _sparse_subk(block_size_k):
+    global _SPARSE_SUBK_CACHE
+    if _SPARSE_SUBK_CACHE is None:
+        sub_k = 0
+        try:
+            import os
+
+            if torch.version.hip and os.environ.get(
+                "SGLANG_SPARSE_ATTN_SUBK", "1"
+            ) not in ("0", "false", "False"):
+                arch = torch.cuda.get_device_properties(0).gcnArchName
+                if "gfx950" in arch:
+                    sub_k = block_size_k // 2
+                elif "gfx942" in arch:
+                    sub_k = block_size_k // 4
+        except Exception:
+            sub_k = 0
+        _SPARSE_SUBK_CACHE = sub_k
+    return _SPARSE_SUBK_CACHE
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
@@ -34,9 +62,24 @@ from ..common.utils import (
     # Configs that fail to compile on the target arch are skipped, so widening
     # the num_warps x num_stages grid only adds candidates, never a bad kernel.
     configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in (2, 4, 8)
-        for ns in (2, 3, 4)
+        # PORT: vLLM's tuned CDNA config for the sub-tiled kernel --
+        # num_warps=1 keeps one wave resident on the small per-sub-tile GEMM,
+        # matrix_instr_nonkdim=16 / kpack=2 select the MFMA_16x16 path, and
+        # num_stages=1 fits LDS. Passed via the kwargs dict (Triton's AMD backend
+        # consumes them as compile options, same as waves_per_eu in the MoE
+        # configs). Configs that fail to compile are skipped by the autotuner, so
+        # this is safe on non-CDNA.
+        triton.Config(
+            {"matrix_instr_nonkdim": 16, "kpack": 2}, num_warps=1, num_stages=1
+        ),
+        triton.Config(
+            {"matrix_instr_nonkdim": 16, "kpack": 2}, num_warps=2, num_stages=1
+        ),
+        *[
+            triton.Config({}, num_warps=nw, num_stages=ns)
+            for nw in (2, 4, 8)
+            for ns in (2, 3, 4)
+        ],
     ],
     key=[
         "BLOCK_SIZE_Q",
@@ -102,6 +145,7 @@ def _gqa_share_sparse_fwd_kernel(
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_QH: tl.constexpr,
+    SUB_K: tl.constexpr,  # CDNA KV sub-tile width (0 = disabled)
     # has sink
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
@@ -187,7 +231,61 @@ def _gqa_share_sparse_fwd_kernel(
         acc_o = tl.full((BLOCK_SIZE_QH, BLOCK_SIZE_VD), 0, dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_KD)
         # sparse attention
-        for i in range(real_topk):
+        if SUB_K > 0:
+            # PORT of vLLM's gfx950 sparse-attn sub-tiling
+            # (vllm/models/minimax_m3/amd/ops/sparse_attn.py): split each
+            # BLOCK_SIZE_K-token KV block into SUB_K-token sub-tiles so each
+            # QK/PV MFMA is right-sized. vLLM: "5x+ kernel speedup over the dense
+            # path in an MI350 sweep". Measured here: their kernel 48.0ms vs this
+            # one 103.2ms for the same 57 prefill calls (2.2x).
+            # Numerically equivalent (flash-softmax reassociation).
+            NUM_SUB: tl.constexpr = BLOCK_SIZE_K // SUB_K
+            for i in range(real_topk):
+                c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
+                t_ptr_j = t_ptr_j + stride_tk
+                for sub_i in range(NUM_SUB):
+                    off_sub = tl.arange(0, SUB_K) + sub_i * SUB_K
+                    pos_s = c + off_sub
+                    pos_mask_s = pos_s < seq_len
+                    slots_s = tl.load(
+                        req_to_token_ptr + sid * stride_r2t_b + pos_s,
+                        mask=pos_mask_s, other=0,
+                    ).to(tl.int64)
+                    slots_s = (slots_s + max_slots) % max_slots
+                    k_s = tl.load(
+                        k_cache_ptr + slots_s[None, :] * stride_ks
+                        + pid_kh * stride_kh + off_kd[:, None] * stride_kd,
+                        mask=kd_mask[:, None] & pos_mask_s[None, :], other=0.0,
+                    )
+                    if IS_FP8:
+                        k_s = k_s.to(q.dtype)
+                    off_q_s = (
+                        tl.arange(0, BLOCK_SIZE_Q)[:, None]
+                        + pid_q_j * BLOCK_SIZE_Q + prefix_len
+                        - off_sub[None, :]
+                    )
+                    qk_s = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, SUB_K), dtype=tl.float32)
+                    qk_s += tl.where(off_q_s[:, None, :] >= c, 0, float("-inf"))
+                    qk_s = tl.reshape(qk_s, BLOCK_SIZE_QH, SUB_K)
+                    qk_s += tl.dot(q, k_s) * (sm_scale_log2e * k_scale)
+                    qk_s += tl.where(pos_mask_s[None, :], 0, float("-inf"))
+                    m_ij = tl.maximum(m_i, tl.max(qk_s, axis=1))
+                    p_s = tl.exp2(qk_s - m_ij[:, None])
+                    l_ij = tl.sum(p_s, axis=1)
+                    acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+                    v_s = tl.load(
+                        v_cache_ptr + slots_s[:, None] * stride_vs
+                        + pid_kh * stride_vh + off_vd[None, :] * stride_vd,
+                        mask=pos_mask_s[:, None] & vd_mask[None, :], other=0.0,
+                    )
+                    if IS_FP8:
+                        v_s = v_s.to(q.dtype)
+                    p_s = p_s.to(v_s.dtype)
+                    acc_o += tl.dot(p_s, v_s) * v_scale
+                    m_i = m_ij
+                    lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        elif True:
+          for i in range(real_topk):
             # get current block start index (absolute K position)
             c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
             t_ptr_j = t_ptr_j + stride_tk
@@ -374,6 +472,7 @@ def flash_prefill_with_gqa_share_sparse(
         o.stride(2),
         req_to_token.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
+        SUB_K=_sparse_subk(BLOCK_SIZE_K),
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
         IS_FP8=is_fp8,

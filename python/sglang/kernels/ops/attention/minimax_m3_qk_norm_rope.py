@@ -579,8 +579,20 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     head_dim: int,
     rotary_dim: int,
     is_neox_style: bool,
+    skip_index: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fuse sparse Q/K/index norm+RoPE with main KV and index-K cache stores."""
+    """Fuse sparse Q/K/index norm+RoPE with main KV and index-K cache stores.
+
+    PORT (dfd35ad2a8, prefill half): when ``skip_index`` is True (an index-topk
+    "skip" layer that reuses the group source layer's top-k, so its idx_q/idx_k
+    are never consumed and its idx_k cache is never read in prefill or decode),
+    the grid drops the idx_q/idx_k program rows: the kernel does ONLY main q/k
+    norm+rope + main KV cache write (ATOM's main-only
+    ``_fused_qkv_norm_rope_cache_kernel`` shape); no idx-K cache write happens.
+    The returned idx_q_out/idx_k_out are uninitialized (unused downstream for
+    skip layers). Callers must ensure the elision is safe (see
+    MiniMaxSparseAttnBackend.prefill_skip_index_elision).
+    """
     assert q.dim() == k.dim() == v.dim() == idx_q.dim() == idx_k.dim() == 2
     assert k_cache.dim() == v_cache.dim() == idx_k_cache.dim() == 3
     assert out_cache_loc.dim() == positions.dim() == 1
@@ -605,8 +617,14 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     idx_k_out = torch.empty(idx_k.shape, dtype=idx_k.dtype, device=idx_k.device)
     block_hd = triton.next_power_of_2(head_dim)
 
+    # skip_index: drop the idx_q (+idx_k) program rows so only the main q/k arms
+    # run. Every index op in the kernel is guarded by is_idx_q/is_idx_k, which are
+    # false for program rows < q_heads+k_heads, so a shorter grid = main-only.
+    _n_head_programs = (
+        q_heads + k_heads if skip_index else q_heads + k_heads + idx_q_heads + 1
+    )
     _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel[
-        (q.shape[0], q_heads + k_heads + idx_q_heads + 1)
+        (q.shape[0], _n_head_programs)
     ](
         q,
         k,
