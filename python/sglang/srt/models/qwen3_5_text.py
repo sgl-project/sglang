@@ -118,6 +118,20 @@ class Qwen3_5ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
+        # The body class implements the capture (flags _is_layer_to_capture on
+        # its layers and returns (hidden, aux) from forward, which our forward
+        # already unpacks); this wrapper only needs to delegate. Same guard and
+        # validation as LlamaForCausalLM.set_dflash_layers_to_capture.
+        if not self.pp_group.is_last_rank:
+            return
+        if layers_to_capture is None:
+            raise ValueError(
+                "DFLASH requires explicit layer ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture(layers_to_capture)
+
     @torch.no_grad()
     def forward(
         self,
