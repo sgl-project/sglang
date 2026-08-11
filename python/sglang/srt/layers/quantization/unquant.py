@@ -69,6 +69,7 @@ class Bf16GemmBackend(Enum):
     AUTO = "auto"
     CUTEDSL = "cutedsl"
     TORCH = "torch"
+    GEMV = "gemv"
 
     def is_auto(self) -> bool:
         return self == Bf16GemmBackend.AUTO
@@ -76,14 +77,20 @@ class Bf16GemmBackend(Enum):
     def is_cutedsl(self) -> bool:
         return self == Bf16GemmBackend.CUTEDSL
 
+    def is_gemv(self) -> bool:
+        return self == Bf16GemmBackend.GEMV
+
 
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
 _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
+_hopper_bf16_gemv = None
+_use_hopper_bf16_gemv = None
 
 
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+    global _hopper_bf16_gemv, _use_hopper_bf16_gemv
 
     from sglang.srt.utils import is_sm100_supported
 
@@ -92,6 +99,20 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
         backend_str = "cutedsl"
 
     backend = Bf16GemmBackend(backend_str)
+
+    if backend.is_gemv():
+        if not (
+            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+        ):
+            raise ValueError("--bf16-gemm-backend gemv requires an SM90 GPU")
+
+        from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
+            hopper_bf16_gemv,
+            use_hopper_bf16_gemv,
+        )
+
+        _hopper_bf16_gemv = hopper_bf16_gemv
+        _use_hopper_bf16_gemv = use_hopper_bf16_gemv
 
     if backend.is_cutedsl():
         if not is_sm100_supported():
@@ -247,6 +268,26 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 x_shapes = x.shape
                 output = _cutedsl_bf16_gemm(
                     x.view(-1, x_shapes[-1]), layer.weight, bias
+                )
+                return output.view(*x_shapes[:-1], -1)
+            return F.linear(x, layer.weight, bias)
+
+        elif (
+            get_bf16_gemm_backend().is_gemv()
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and bias is None
+            and not layer.weight.requires_grad
+        ):
+            if _use_hopper_bf16_gemv(
+                x.numel() // x.shape[-1],
+                layer.weight.shape[0],
+                layer.weight.shape[1],
+            ):
+                x_shapes = x.shape
+                output = _hopper_bf16_gemv(
+                    x.reshape(-1, x_shapes[-1]).contiguous(), layer.weight
                 )
                 return output.view(*x_shapes[:-1], -1)
             return F.linear(x, layer.weight, bias)
