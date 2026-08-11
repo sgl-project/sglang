@@ -1373,11 +1373,7 @@ class KVCacheConfigurator:
         swa_max_total_num_tokens: int,
         is_dsa_model: bool,
     ) -> KVCache:
-        """Build the asymmetric latent-KV pools used by dots.note.omni.
-
-        Full layers use DSA's latent/index cache while sliding layers use a
-        separate MLA latent geometry (the checkpoint has a larger SWA rank).
-        """
+        """Build separate DSA and SWA latent-KV pools for dots.note.omni."""
         full_pool_class = DSATokenToKVPool if is_dsa_model else MLATokenToKVPool
         common = {
             "page_size": self.server_args.page_size,

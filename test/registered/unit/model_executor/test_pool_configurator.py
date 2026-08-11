@@ -663,7 +663,7 @@ class TestEagleConfigurator(CustomTestCase):
         )
 
     def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
-        """A Dots-style SWA draft must not be charged as a full KV layer."""
+        """SWA draft layers use SWA KV geometry and capacity."""
         available = 10_000_000
         ratio = 0.25
         mr = _make_model_runner(

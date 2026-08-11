@@ -326,10 +326,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             DotsHybridAttnBackend,
         )
 
-        # Dots uses a 512-wide latent cache for full-attention layers but a
-        # 1024-wide one for SWA layers. Keep a separate SWA backend for its
-        # page table and prefill; decode consumes that cache through the
-        # large-kvlora latent fallback in DotsHybridAttnBackend.
+        # Full and SWA layers use different latent-cache geometries.
         from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
         swa_backend = (

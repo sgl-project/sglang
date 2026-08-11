@@ -82,8 +82,7 @@ class Dot3NoteModelNextN(nn.Module):
             enable_tp=not is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
-        # Keep a one-element ModuleList because the existing Dots3 NextN weight
-        # loader maps layer N to model.heads.0 and post-processes through it.
+        # The weight loader maps the shared MTP layer to heads.0.
         self.heads = nn.ModuleList(
             [Dots3MTPHead(config, quant_config, add_prefix("heads.0", prefix))]
         )
@@ -128,11 +127,8 @@ class Dot3NoteModelNextN(nn.Module):
         return hidden_states
 
     def _embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # VLM prefill input_ids contain hashed multimodal pad sentinels outside
-        # the vocabulary. The target hidden states carry the multimodal semantics
-        # into MTP, so the token embedding at a sentinel position is unused. Use a
-        # valid placeholder index here to avoid an OOB embedding lookup while
-        # retaining the checkpoint's separately trained MTP embedding elsewhere.
+        # Multimodal sentinels use target hidden states, so clamp their unused
+        # draft embedding indices to the vocabulary.
         return self.embed_tokens(input_ids.clamp(min=0, max=self.vocab_size - 1))
 
 
@@ -195,9 +191,7 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
         super().load_weights(weights, is_nextn=True)
 
     def set_embed_and_head(self, embed, head):
-        # Preserve a separately trained MTP embedding when present. The current
-        # checkpoint has no MTP-side lm_head, so logits always share the target
-        # head and remain in exactly the same vocabulary space.
+        # Preserve a checkpoint-provided MTP embedding; share the output head.
         if not self._mtp_loaded_embed:
             del self.model.embed_tokens.weight
             self.model.embed_tokens.weight = embed

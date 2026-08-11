@@ -620,9 +620,7 @@ class ModelConfig:
             "Dots3NoteForCausalLM": "Dots3NoteForCausalLMNextN",
         }.get(self.hf_config.architectures[0])
         if is_draft_model and dots3_draft_arch is not None:
-            # Dots3 uses one SWA-shaped MTP layer recursively for all NEXTN
-            # proposal steps (full sharing). Rewrite the draft config before
-            # model shapes and hybrid KV-cache geometry are derived.
+            # Configure the shared MTP layer with SWA geometry.
             self.hf_config.architectures[0] = dots3_draft_arch
             self.hf_text_config.num_nextn_predict_layers = 1
             self.hf_text_config.layer_types = ["sliding_attention"]

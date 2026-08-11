@@ -131,11 +131,9 @@ class DotsMoEVitConfig(PretrainedConfig):
         adapter_in_dim: int = 1536,
         adapter_out_dim: int = 2048,
         adapter_merge_size: int = 2,
-        # ``pixel_shuffle_mlp`` (legacy, e.g. dotsvlm2.lite.omni_fp8) reshapes 2x2 spatial neighbours via NHWC pixel-shuffle then runs LN+2-layer MLP.
-        # ``patch_merger`` (cybertron PatchMerger, e.g. fireall_iter02275) skips the pixel-shuffle permutation and instead views every 4 consecutive 2x2-grouped tokens as one row.
+        # Adapter used to merge each 2x2 patch group.
         adapter_type: str = "pixel_shuffle_mlp",
-        # If True the preprocessor already emits patches in 2x2-grouped order (qwen ``merge_size=2`` flatten path), so RoPE positions must also be regrouped
-        # to match the in-block layout. Old checkpoints (e.g. omni_fp8) were trained with ``pre_pixel_shuffle=False`` even though the data is grouped, so the legacy default keeps row-major RoPE.
+        # Whether input patches and RoPE positions are already 2x2-grouped.
         pre_pixel_shuffle: bool = False,
         # If True, use FP8 MoE implementation
         enable_fp8_moe: bool = True,
@@ -286,11 +284,7 @@ def _fp8_blockwise_linear(
 
 
 class DotsSwiGLUFFNFP8(nn.Module):
-    """SwiGLU FFN with FP8 weights (128×128 blocks) and per-token group-128 activation quant; bf16 output.
-
-    ``nn.Linear`` siblings keep standard ``fc{1,2,3}.weight`` keys for bf16 checkpoints; after each
-    ``load_state_dict`` the FP8 buffers are rebuilt from those weights.
-    """
+    """SwiGLU FFN with block-FP8 weights and per-token activations."""
 
     def __init__(
         self,
@@ -385,11 +379,7 @@ class MoESwiGLUFFN(nn.Module):
         nn.init.kaiming_uniform_(self.gate_weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Mirror cybertron's ``AIMv2MoEGEMMSwiGLUFFN.forward``: keep ``gating_prob`` /
-        # router-bias add in fp32 and run topk in fp32. The legacy ``.type_as(x_flat)``
-        # path on bf16 made expert routing diverge whenever two routed-expert scores
-        # tied within bf16 precision, which is the dominant source of numerical drift
-        # observed against latest cybertron checkpoints.
+        # Keep routing and top-k selection in FP32 to avoid BF16 ties.
         epsilon = 1e-9
         x_flat = x.contiguous()
         num_tokens = x_flat.shape[0]
@@ -436,17 +426,7 @@ class MoESwiGLUFFN(nn.Module):
 
 
 class MoESwiGLUFFNFP8(MoESwiGLUFFN):
-    """Same routing and checkpoint layout as :class:`MoESwiGLUFFN` (bf16 ``experts.*.fc13``).
-
-    Expert compute uses SGLang's fused MoE Triton path (same stack as
-    :class:`sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE` + block FP8), so
-    there is no per-expert Python dispatch loop. Stacked gate/up and down weights
-    are repacked from the linears after each ``load_state_dict`` (same hook pattern
-    as :class:`DotsSwiGLUFFNFP8`).
-
-    Requires CUDA, ``sglang`` (with ``torch.ops.sglang`` fused MoE), and
-    ``deep_gemm`` for 128×128 block FP8 quantization of expert weights.
-    """
+    """FP8 variant of :class:`MoESwiGLUFFN` using fused expert kernels."""
 
     def __init__(self, config: DotsMoEVitConfig, layer_number: int):
         super().__init__(config, layer_number)
@@ -504,8 +484,7 @@ class MoESwiGLUFFNFP8(MoESwiGLUFFN):
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
         from sglang.srt.layers.moe.topk import StandardTopKOutput
 
-        # Mirror cybertron's ``AIMv2MoEGEMMSwiGLUFFN.forward``: routing decisions stay in fp32 to
-        # avoid topk ties under bf16 precision (see :class:`MoESwiGLUFFN`).
+        # Keep routing decisions in FP32 to avoid BF16 top-k ties.
         epsilon = 1e-9
         x_flat = x.contiguous()
 

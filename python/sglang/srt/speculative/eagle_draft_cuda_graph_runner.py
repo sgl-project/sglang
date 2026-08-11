@@ -580,12 +580,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
-        # CUDA-graph metadata and the captured draft forwards must read the
-        # static, bucket-padded cache-location buffer.  Keeping the live raw
-        # tensor here makes batch_size refer to the padded graph bucket while
-        # out_cache_loc still has raw_bs * topk * num_steps entries.  Hybrid
-        # SWA then cannot select one draft step and may overflow its per-step
-        # metadata buffer.
+        # Replay metadata must use the bucket-padded cache-location buffer.
         forward_batch.out_cache_loc = buffers.out_cache_loc[
             : num_tokens * self.speculative_num_steps
         ]

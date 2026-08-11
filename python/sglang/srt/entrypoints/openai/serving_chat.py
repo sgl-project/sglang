@@ -207,13 +207,7 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
         }
     return value
 def _extract_video_question(request: ChatCompletionRequest) -> Optional[str]:
-    """Return the text paired with a native video in the last user turn.
-
-    dots.note.omni's train-consistent video adapter needs the unrendered
-    question both for its deterministic sampling seed and its preheat-cache
-    key.  The rendered chat prompt is not sufficient because it also contains
-    role and system tokens.
-    """
+    """Return text paired with a video in the last user turn."""
     for message in reversed(request.messages or []):
         if not isinstance(message, ChatCompletionMessageUserParam):
             continue

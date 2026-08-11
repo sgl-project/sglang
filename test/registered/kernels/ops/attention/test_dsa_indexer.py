@@ -963,7 +963,7 @@ class TestDSAIndexer(CustomTestCase):
             rotate_activation(x)
 
     def test_k_only_rotary_inputs_do_not_alias(self):
-        """The K-only prefill path must not pass one view as both Q and K."""
+        """K-only rotary inputs must not alias."""
         indexer = Indexer.__new__(Indexer)
         torch.nn.Module.__init__(indexer)
         indexer.head_dim = 4

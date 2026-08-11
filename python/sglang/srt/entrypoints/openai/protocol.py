@@ -867,9 +867,7 @@ class ChatCompletionRequest(BaseModel):
     min_dynamic_patch: Optional[int] = None
     use_audio_in_video: bool = False
 
-    # dots.note.omni train-consistent video preprocessing controls.  These are
-    # intentionally request-scoped because different evaluation jobs can share
-    # one server while using different context budgets.
+    # Per-request dots.note.omni video preprocessing controls.
     seq: int = Field(default=131072, gt=0)
     output_reserve: Optional[int] = Field(default=None, ge=0)
     audio_cap: float = Field(default=1.0, ge=0)

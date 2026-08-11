@@ -23,7 +23,7 @@ def forward_dense_kvlora_swa_torch_fallback(
     head_dim_v: int,
     window_size: int,
 ) -> torch.Tensor:
-    """Conservative page64 SWA fallback for dense kvlora decode."""
+    """Page-64 SWA fallback for dense KV-LoRA decode."""
     if layer.tp_k_head_num != 1:
         raise RuntimeError(
             "SWA MLA torch fallback currently supports MLA with one "
@@ -42,9 +42,7 @@ def forward_dense_kvlora_swa_torch_fallback(
             f"or s_q=4, got s_q={s_q}."
         )
 
-    # For s_q > 1, the union of all causal SWA windows is wider than one
-    # final-token window by s_q - 1. Pad the materialized length to keep
-    # the following bmm on the tensor-core friendly N % 8 == 0 path.
+    # Include the full union of causal windows and align it for BMM.
     kv_latent, kv_valid = gather_page64_kv_latent(
         k_cache,
         block_table,
@@ -55,8 +53,7 @@ def forward_dense_kvlora_swa_torch_fallback(
     )
     gather_len = kv_latent.shape[1]
 
-    # Keep scores/output in (s_q, num_heads) order so the final bmm result is
-    # already the [bs, s_q, num_heads, head_dim_v] layout the caller wants.
+    # Keep the output in [bs, s_q, num_heads, head_dim_v] order.
     q_for_scores = reshape_q.reshape(bs, s_q * num_heads, qk_dim)
     scores = torch.bmm(q_for_scores, kv_latent.transpose(1, 2)).view(
         bs, s_q, num_heads, gather_len

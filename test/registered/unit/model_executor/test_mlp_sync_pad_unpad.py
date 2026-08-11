@@ -217,8 +217,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             seq_lens_cpu=torch.tensor([1]),
             spec_info=spec_info,
         )
-        # Overlap may retain a scheduler dummy position while the previous
-        # batch's draft state is empty/stale.
+        # Simulate an idle rank with a retained scheduler dummy row.
         fb._original_batch_size = 1
         fb._original_num_tokens = 1
         fb.hidden_states_backup = torch.empty((0, 8))

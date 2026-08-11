@@ -131,7 +131,7 @@ class FlashAttentionMetadata:
         max_seq_len_q: int = 0
         max_seq_len_k: int = 0
 
-    # Dots.note.omni expands latent SWA cache into MHA K/V for FA3 prefill.
+    # Metadata for expanding the latent SWA cache during prefill.
     swa_mla_prefill_metadata: Optional[SWAMLAPrefillMetadata] = None
 
     # For sliding window attention topk>1 spec decoding
@@ -2726,13 +2726,7 @@ class FlashAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ) -> torch.Tensor:
-        """Select this draft step's SWA write locations.
-
-        The EAGLE draft runner stores all speculative steps in request-major
-        order, while each FlashAttention backend represents exactly one step.
-        Normal draft forwards already pass a per-step view; CUDA graph capture
-        and replay pass the combined buffer and need the selection here.
-        """
+        """Select this draft step from a combined SWA write-location buffer."""
         expected_numel = bs * self.topk * self.speculative_num_steps
         if (
             forward_mode.is_decode_or_idle()
@@ -3181,14 +3175,7 @@ class FlashAttentionBackend(AttentionBackend):
     def normalize_forward_metadata_for_dp_padding(
         self, forward_batch: ForwardBatch
     ) -> None:
-        """Re-plan eager FA metadata when DP sync appended dummy requests.
-
-        EAGLE pre-plans every draft step before the model runner performs DP
-        padding.  On an empty overlap rank that produces a zero-row page table,
-        while the actual forward contains one dummy request.  Rebuilding just
-        this active dense backend preserves pre-planned sparse/DSA schedules
-        and gives every row-dependent FA tensor the same request dimension.
-        """
+        """Rebuild eager metadata when DP padding changes the batch size."""
         metadata = self.forward_metadata
         page_table = metadata.page_table if metadata is not None else None
         original_bs = forward_batch._original_batch_size
@@ -3269,10 +3256,7 @@ class FlashAttentionBackend(AttentionBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype)
         v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype)
 
-        # FA3 supports unequal QK/V widths only up to QK=192. dots.note.omni
-        # uses QK=256 and V=128 in its SWA layers. Zero-padding V to 256 makes
-        # the kernel see equal head dimensions without changing the attention
-        # values in the original 128 channels.
+        # FA3 requires equal QK/V widths when QK exceeds 192.
         pad_v_to_qk = layer.head_dim > 192 and layer.v_head_dim != layer.head_dim
         if pad_v_to_qk:
             v = torch.nn.functional.pad(v, (0, layer.head_dim - layer.v_head_dim))
@@ -3307,9 +3291,7 @@ class FlashAttentionBackend(AttentionBackend):
         block_table = normalize_page_table_rows(metadata.swa_page_table, bs)
         cache_seqlens = metadata.cache_seqlens_int32
         if cache_seqlens.shape[0] != bs:
-            # DP may synthesize an idle row after per-step metadata planning.
-            # It has no semantic KV state, but the fallback still requires all
-            # row-shaped inputs to agree so the rank can join collectives.
+            # DP padding may append a row after per-step metadata is planned.
             cache_seqlens = forward_batch.seq_lens[:bs].to(torch.int32)
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -3317,10 +3299,7 @@ class FlashAttentionBackend(AttentionBackend):
             reshape_q=reshape_q,
             k_cache=k_cache,
             block_table=block_table,
-            # Metadata carries the phase-adjusted KV length.  In particular,
-            # target verify includes all proposed tokens and each draft
-            # backend includes the tokens produced up to its step.  The raw
-            # ForwardBatch length is only the pre-speculation prefix.
+            # Use phase-adjusted lengths for verify and draft steps.
             cache_seqlens=cache_seqlens,
             layer=layer,
             kv_cache_dim=layer.head_dim,

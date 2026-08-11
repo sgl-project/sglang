@@ -514,8 +514,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-    # True when an idle speculative batch was normalized during init_new so
-    # the worker observes its DP dummy rows before allocating draft buffers.
+    # Whether speculative DP padding was applied during initialization.
     mlp_sync_prepared: bool = False
 
     # For padding
@@ -858,15 +857,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 from sglang.srt.speculative.spec_info import SpecInputType
 
                 ret.prepare_mlp_sync_batch(model_runner)
-                # This normalized idle shape is the worker-visible baseline
-                # for every draft step.  Do not let post-forward restore the
-                # pre-normalization zero sizes between steps.
+                # Preserve the normalized idle shape across draft steps.
                 ret._original_batch_size = ret.batch_size
                 ret._original_num_tokens = ret.positions.shape[0]
-                # Real draft batches reserve every step's write location in
-                # prepare_for_draft.  The idle path skips that allocator, so
-                # synthesize the same flattened [N, topk, steps] layout with
-                # dummy slot 0 after DP normalization determines N.
+                # Idle batches need the same [N, topk, steps] layout as drafts.
                 if ret.spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT:
                     draft_cache_rows = (
                         ret.batch_size
@@ -1566,10 +1560,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=1,
             )
 
-        # A speculative draft-extend row represents a fixed-width request, not
-        # a zero-token request.  DP overlap can append such rows after the
-        # worker has already built the real-request metadata; keep both the GPU
-        # tensors and their CPU mirrors aligned with the padded request count.
+        # Draft-extend padding uses the fixed per-request token width.
         dummy_extend_len = 0
         if (
             self.spec_info is not None
@@ -1672,12 +1663,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
-                # An overlap idle rank may enter with zero/stale draft state
-                # while the scheduler already carries a dummy position, or DP
-                # sync may fabricate the execution row itself.  Keep enough
-                # output rows to match either source of the dummy.  Non-empty
-                # ranks still discard ordinary DP padding and retain only their
-                # original position/hidden-state rows.
+                # Retain scheduler- or DP-created dummy rows on idle ranks.
                 num_tokens = max(
                     self.hidden_states_backup.shape[0],
                     self._original_num_tokens or 0,
@@ -1711,10 +1697,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_idle() and self.spec_info.is_draft_input():
-                # IDLE ranks still execute normalized draft rows for DP
-                # collectives.  Their scheduler positions/top-k tensors carry
-                # those rows, so do not collapse the model output back to the
-                # zero real-request batch size before the draft worker uses it.
+                # Draft workers consume normalized idle rows after DP sync.
                 num_tokens = max(
                     self._original_num_tokens or 0,
                     execution_num_tokens if self._original_batch_size == 0 else 0,

@@ -456,9 +456,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._page_size = kvc.page_size
 
         if model_config.attention_arch == AttentionArch.MLA:
-            # MLA stores one latent vector (compressed KV + RoPE) per token.
-            # Dots.note.omni uses different latent ranks for full and SWA
-            # layers, so the generic MHA head geometry is not applicable.
+            # MLA pool sizing uses latent dimensions rather than MHA heads.
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
             )
@@ -509,10 +507,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
-        # EAGLE/STANDALONE draft layers share the target allocator but own their
-        # KV tensors. Full-attention layers use full capacity, ordinary SWA
-        # layers use the target SWA capacity, and an Inkling banded MTP depth
-        # uses SWA geometry at full capacity.
+        # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
         self._draft_full_layers_num = 0
         self._draft_swa_layers_num = 0
         self._draft_swa_full_layers_num = 0

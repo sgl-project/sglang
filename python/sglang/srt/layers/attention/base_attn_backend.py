@@ -125,16 +125,9 @@ class AttentionBackend(ABC):
     def normalize_forward_metadata_for_dp_padding(
         self, forward_batch: ForwardBatch
     ) -> None:
-        """Refresh pre-planned metadata after DP attention pads an eager batch.
+        """Refresh metadata when speculative DP padding adds request rows.
 
-        Speculative workers may plan attention metadata before entering the
-        model runner.  DP/MLP synchronization can subsequently append dummy
-        request rows on an otherwise empty rank.  Backends whose metadata is
-        safe to rebuild should override this hook and refresh it when its
-        request dimension no longer matches ``forward_batch.batch_size``.
-
-        The default deliberately does nothing: some sparse backends keep
-        schedules that cannot be rebuilt from a padded speculative batch.
+        Sparse backends retain their pre-planned schedules by default.
         """
         return None
 

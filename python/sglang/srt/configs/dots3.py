@@ -50,17 +50,9 @@ class Dots3Config(PretrainedConfig):
         num_attention_heads=64,
         num_key_value_heads=64,
         v_head_dim=128,
-        # Multi-Token Prediction (MTP / NextN) — number of extra speculative
-        # prediction layers appended after num_hidden_layers. Default 1 matches
-        # the load path which asserts == 1; lets checkpoints whose config.json
-        # predates this field load without raising.
+        # Dots3 uses one shared MTP layer for NEXTN decoding.
         num_nextn_predict_layers=1,
-        # Per-MTP-head attention type ("full_attention" | "sliding_attention").
-        # Length must equal the MTP KV-pool layer count (= num_nextn_predict_layers
-        # when mtp_head_sharing="none", else 1). None ⇒ default to
-        # "sliding_attention" because today's dots3 MTP weights are SWA-shaped
-        # (32 heads, matching swa_num_attention_heads). Set explicitly when a
-        # future checkpoint trains the MTP head differently.
+        # Defaults to the SWA geometry used by the shared MTP layer.
         mtp_layer_types=None,
         # Sliding Window Attention (SWA) parameters
         layer_types=None,
@@ -90,9 +82,7 @@ class Dots3Config(PretrainedConfig):
         # RoPE parameters
         rope_theta=50000.0,
         rope_scaling=None,
-        # NSA (Native Sparse Attention) parameters - optional.
-        # When all three are provided, the model attaches an NSA Indexer to
-        # each attention layer, mirroring DeepseekV3.2-style sparse attention.
+        # Optional DSA indexer parameters.
         index_n_heads=None,
         index_head_dim=None,
         index_topk=None,

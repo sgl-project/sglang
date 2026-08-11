@@ -31,10 +31,7 @@ def _map_muse_target_layer_ids(*, target_hf_config, draft_hf_config, layer_ids):
 class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     eagle_use_aux_hidden_state: bool = False
     eagle_draft_num_layers: Optional[int] = None
-    # Number of ordinary sliding-attention draft layers whose KV cache uses
-    # the target SWA pool capacity. The remaining draft layers use full
-    # capacity. Full-capacity SWA heads (currently Inkling) are handled
-    # separately by the hybrid pool configurator.
+    # Draft layers whose KV cache uses the target SWA pool capacity.
     eagle_draft_swa_num_layers: Optional[int] = None
     eagle_aux_hidden_state_layer_ids: Any = None
     dflash_use_aux_hidden_state: bool = False

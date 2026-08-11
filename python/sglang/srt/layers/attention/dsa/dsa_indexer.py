@@ -575,9 +575,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        # The CUDA rotary implementation may update both inputs in place.  Do
-        # not alias its query and key inputs: doing so can rotate/corrupt the
-        # index K twice in the K-only path used by early chunked prefill.
+        # Rotary may update both inputs in place, so the K-only path must not
+        # alias its dummy query with the key.
         dummy_q_rope = torch.empty_like(k_rope)
         _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)

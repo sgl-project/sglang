@@ -12,9 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
-# Adapted from:
+# Adapted from vLLM's DeepSeek V2 implementation:
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
-"""Inference-only DeepseekV2 model."""
+"""Inference implementation for dots.note.omni."""
 
 import concurrent.futures
 import logging
@@ -250,7 +250,7 @@ class Dots3MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        # NOTE: For some unknown reason, router_gemm seems degrade accept length.
+        # Use the fused router only for its tuned shapes.
         if (
             hidden_states.shape[0] <= 16
             and hidden_states.shape[1] == 7168
@@ -924,14 +924,9 @@ class Dots3AttentionMLA(nn.Module):
             )
         self.current_attention_backend = attention_backend
 
-        # NOTE(xiaozhi): Currently only fa3, nsa, triton and flashmla are supported.
         if attention_backend == "fa3":
             if self.use_swa:
-                # Target verification already has a paged SWA view prepared by
-                # the speculative attention backend. It must use the absorbed
-                # MLA path; the expanded SWA-MHA path is a prefill-only path
-                # and its logical-tail metadata is intentionally not built for
-                # target-verify CUDA graphs.
+                # Expanded SWA-MHA is prefill-only; other modes use paged MLA.
                 return (
                     Dots3AttnForwardMethod.MLA
                     if forward_batch.forward_mode.is_decode_or_idle()
@@ -950,11 +945,6 @@ class Dots3AttentionMLA(nn.Module):
                 f"Dots3 only supports CUDA attention backends (fa3, triton, flashmla, nsa), got: {attention_backend}"
             )
 
-    # Inputs:
-    # - attn_output: (num_tokens, num_local_heads, v_head_dim) or (num_tokens, num_local_heads * v_head_dim)
-    # - g: (num_tokens, num_local_heads) if attention_gate_type == "headwise", (num_tokens, num_local_heads * v_head_dim) otherwise
-    # Outputs:
-    # - attn_output: (num_tokens, num_local_heads, v_head_dim)
     def _apply_attention_gate(self, attn_output: torch.Tensor, g: torch.Tensor):
         if attn_output.ndim != 3:
             attn_output = attn_output.reshape(-1, self.num_local_heads, self.v_head_dim)
@@ -1154,7 +1144,6 @@ class Dots3AttentionMLA(nn.Module):
             get_is_capture_mode,
         )
 
-        # NOTE(xiaozhi): Ban dsv3_fused_a_gemm at this point. Maybe revisit this later.
         q, latent_cache, g = self._split_fused_qkv_a_g_proj_out(
             self.fused_qkv_a_g_proj_with_mqa(hidden_states)[0]
         )
@@ -1364,13 +1353,7 @@ class Dots3AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        # In normal mha, the k and v tensors will become overly large when the prefix length is long.
-        # To avoid this, we split the kv cache into chunks and process them one after another.
-        # Since mha is compute friendly, the for loop induced here will not introduce significant overhead.
-        # The top comments in https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
-        # will be helpful for understanding the purpose of this function.
-
-        # First do normal mha forward to get output for extended part
+        # Materialize long prefixes in chunks to limit expanded K/V memory.
         return self.forward_normal_prepare(
             positions, hidden_states, forward_batch, zero_allocator
         )
@@ -1393,9 +1376,7 @@ class Dots3AttentionMLA(nn.Module):
             ):
                 backend.init_mha_chunk_metadata(forward_batch)
 
-        # Fix FA3 bug: V with NaN at padding positions (beyond cu_seqlens_q[-1])
-        # corrupts real output positions due to FA3 kernel tiling reading out-of-bounds V.
-        # Zero out padding to prevent corruption.
+        # Zero padded V rows because FA3 tiles may read past cu_seqlens_q[-1].
         real_num_tokens = forward_batch.extend_num_tokens
         if real_num_tokens is not None and v.shape[0] > real_num_tokens:
             v[real_num_tokens:] = 0
@@ -1593,8 +1574,7 @@ class Dots3DecoderLayer(nn.Module):
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        # Dots3 MTP block uses a DENSE MLP (Dots3MLP), not Dots3MoE.
-        # Verified from checkpoint at model.layers.30.mlp.{gate,up,down}_proj.weight.
+        # The MTP block uses a dense MLP.
         if is_nextn:
             return False
         return (
@@ -1901,11 +1881,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
-        """Why this checkpoint cannot fuse its shared expert, or ``None``.
-
-        The loader evaluates this once per target or draft runner before any
-        model layer is constructed.
-        """
+        """Return why shared-expert fusion is unavailable, or ``None``."""
         if (
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
@@ -1914,11 +1890,11 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             or hf_config.n_routed_experts != 256
             or hf_config.n_shared_experts != 1
         ):
-            return "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
+            return "Shared-expert fusion is unsupported for this Dots3 configuration."
         if get_moe_expert_parallel_world_size() > 1:
-            return "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
+            return "Dots3 shared-expert fusion is unsupported with expert parallelism."
         if quant_config is not None and quant_config.get_name() == "w4afp8":
-            return "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
+            return "Dots3 W4AFP8 shared and routed experts use incompatible quantization."
         return None
 
     def determine_num_fused_shared_experts(self):
@@ -2215,9 +2191,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
-        # Params for special naming rules in mixed-precision models, for example:
-        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
-        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
+        # Map per-expert input scales used by mixed-precision checkpoints.
         if self.quant_config and self.quant_config.get_name() == "w4afp8":
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
@@ -2369,39 +2343,21 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                             and int(name_list[2]) >= self.config.num_hidden_layers
                         ):
                             continue
-                    # Dots3-specific MTP input embedding lives at model.mtp.*.
-                    # Owned by the NextN draft model, not the main model.
+                    # The NextN draft model owns model.mtp.* weights.
                     if num_nextn_layers > 0 and name.startswith("model.mtp."):
                         continue
                 else:
-                    # Dots3 has a SEPARATE MTP input embedding at model.mtp.embed_tokens
-                    # (Eagle-flavor; not shared with main model.embed_tokens). In
-                    # Dot3NoteModelNextN this is exposed as model.embed_tokens, so we
-                    # remap the source key. Main model.embed_tokens is skipped.
+                    # Remap the MTP-specific embedding into the draft model.
                     if name == "model.mtp.embed_tokens.weight":
                         name = "model.embed_tokens.weight"
                     elif name == "model.embed_tokens.weight":
-                        # main embed (not the MTP one) — skip; main model owns it
+                        # The target model owns the main embedding.
                         continue
                     else:
                         head_idx, matched_prefix = _match_nextn_prefix(name)
                         if matched_prefix is None:
                             continue
-                        # MTP-side lm_head (model.layers.{lid}.shared_head.head.*):
-                        # remap to the NextN's single self.lm_head slot at
-                        # model.shared_head.head.* and let it load. Today's dots3
-                        # checkpoints don't ship this key (the MTP head is tied to
-                        # the target's lm_head and shared via set_embed_and_head),
-                        # so this branch is dormant. When a future checkpoint
-                        # diverges (independent fine-tune / different quantization /
-                        # vocab compression), the override of set_embed_and_head in
-                        # Dots3NoteForCausalLMNextN keeps this loaded value instead
-                        # of overwriting it with the target's. K-heads note: this
-                        # routes every per-head head into the same lm_head slot —
-                        # the last write wins. The current architecture has one
-                        # shared lm_head across all K MTP heads; per-head distinct
-                        # heads would need self.lm_heads: ModuleList and a
-                        # forward() that selects per draft_step_idx.
+                        # Remap an MTP head into the draft model's shared head.
                         if "shared_head.head" in name:
                             name = name.replace(
                                 matched_prefix, "model.shared_head.head"
@@ -2597,17 +2553,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        # Destructive share-from-target for the main model. eagle_worker calls
-        # this on the *draft* model right after both target and draft have
-        # loaded. For the main `Dots3NoteForCausalLM` (used as the draft only in
-        # the unusual case of a 1-layer target), the loaded weights are
-        # discarded and replaced by the target's tensors — saves ~2× embed/head
-        # memory and guarantees the draft scores in the same vocab space.
-        #
-        # IMPORTANT: `Dots3NoteForCausalLMNextN` overrides this method (see
-        # dots3_nextn.py) to make the share decision *per side* based on
-        # whether the checkpoint actually wrote MTP-side embed / head weights.
-        # If you change the behaviour here, update the override there too.
+        # Share target embeddings and output head with the draft model.
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
@@ -2652,11 +2598,7 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-        # Multimodal features are embedded only on the first pipeline rank.
-        # Honor the standard language-only mode so an encoder/LLM deployment
-        # can keep the vision and audio towers out of the LLM process.  This is
-        # also useful for text-only long-context evaluation, where the towers'
-        # weights would otherwise unnecessarily reduce the KV-cache capacity.
+        # Load multimodal towers only where embeddings are produced.
         if self.pp_group.is_first_rank and not config.language_only:
             self.audio_tower = DotsNoteOmniAudioEncoder(str(model_dir))
             self.visual = DotsNoteOmniVisionEncoder(str(model_dir))
@@ -2767,16 +2709,7 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
 
 
 class DotsNoteOmniForConditionalGeneration(nn.Module):
-    """Native dots.note.omni conditional-generation model.
-
-    Its runtime hierarchy mirrors Qwen3 Omni:
-
-    DotsNoteOmniForConditionalGeneration
-      └── thinker
-          ├── audio_tower
-          ├── visual
-          └── language_model
-    """
+    """Native dots.note.omni conditional-generation model."""
 
     packed_modules_mapping = Dots3LanguageModelForCausalLM.packed_modules_mapping
     fall_back_to_pt_during_load = False
@@ -2838,9 +2771,7 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         return self.thinker.get_input_embeddings()
 
     def load_weights(self, weights, *args, **kwargs):
-        # Flat dots.note.omni publishes include all three components in one
-        # index. Tower weights are loaded below by their native modules, so do
-        # not pass their names through the language-model loader.
+        # Tower modules load their own weights from the flat checkpoint.
         language_weights = (
             (name, weight)
             for name, weight in weights

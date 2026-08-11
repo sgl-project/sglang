@@ -1689,10 +1689,7 @@ class ModelRunner:
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
 
-            # A speculative worker can pre-plan metadata before DP/MLP sync.
-            # Let the active per-step backend repair row-dependent metadata if
-            # padding changed the eager batch shape.  The base hook is a no-op
-            # for sparse backends whose pre-planned schedules must be kept.
+            # Refresh rebuildable metadata after speculative DP padding.
             get_attn_backend().normalize_forward_metadata_for_dp_padding(
                 forward_batch
             )

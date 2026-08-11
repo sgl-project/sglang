@@ -1,8 +1,4 @@
-"""Layer-wise attention dispatch for dots.note.omni.
-
-Full-attention layers use the DSA backend while sliding-window layers use the
-dense FA3 MLA backend for both prefill and decode.
-"""
+"""Layer-wise DSA/SWA attention dispatch for dots.note.omni."""
 
 from __future__ import annotations
 
@@ -28,14 +24,12 @@ class DotsHybridAttnBackend(AttentionBackend):
         swa_backend: AttentionBackend,
     ):
         self.dsa_backend = dsa_backend
-        # Dots does not implement DeepSeek's prefix-expanding MHA one-shot
-        # prepare path. Keep DSA on its radix-aware MLA implementation.
+        # Keep DSA on its radix-aware MLA path.
         self.dsa_backend.supports_mha_one_shot = False
         self.swa_backend = swa_backend
         self.token_to_kv_pool = swa_backend.token_to_kv_pool
         self.req_to_token_pool = swa_backend.req_to_token_pool
-        # SWA latent expansion builds a compact logical-tail index from the
-        # host mirrors during prefill.
+        # SWA latent expansion uses host sequence-length mirrors.
         self.needs_cpu_seq_lens = True
 
     @staticmethod
@@ -145,8 +139,7 @@ class DotsHybridAttnBackend(AttentionBackend):
         block_table = normalize_page_table_rows(block_table, bs)
         cache_seqlens = metadata.cache_seqlens_int32
         if cache_seqlens.shape[0] != bs:
-            # A DP-idle row can be appended after draft metadata is planned.
-            # Use its normalized dummy length solely to keep row shapes equal.
+            # DP padding may append a row after draft metadata is planned.
             cache_seqlens = forward_batch.seq_lens[:bs].to(torch.int32)
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -154,10 +147,7 @@ class DotsHybridAttnBackend(AttentionBackend):
             reshape_q=reshape_q,
             k_cache=k_cache,
             block_table=block_table,
-            # Use the backend's phase-adjusted length: target verify includes
-            # every proposed token, while draft step i includes its prefix of
-            # speculative tokens.  forward_batch.seq_lens is the unadjusted
-            # prefix and shifts both the gather and causal mask backwards.
+            # Use phase-adjusted lengths for verify and draft steps.
             cache_seqlens=cache_seqlens,
             layer=layer,
             kv_cache_dim=layer.head_dim,
