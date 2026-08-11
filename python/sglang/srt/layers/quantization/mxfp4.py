@@ -536,7 +536,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
-        elif _is_xpu:
+        elif _is_xpu and not self.use_triton_kernels:
+            # triton_kernels on XPU falls through: its swizzle needs 64 alignment.
+            #
             # The XPU grouped GEMM recovers K/N from the packed weight shapes and
             # the group size from the scale shape, so it takes the checkpoint
             # dims. Keep this ahead of the triton_kernels branch so an installed
@@ -1075,6 +1077,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex), **mx_block
             )
 
+            MXFP4_BLOCK_SIZE = 32
+
+            def check_block_size(weight, scale):
+                assert len(weight.shape) == len(scale.shape)
+                mxfp4_block_size = 0
+                for i in range(len(weight.shape)):
+                    if weight.shape[i] != scale.shape[i]:
+                        assert mxfp4_block_size == 0
+                        mxfp4_block_size = weight.shape[i] // scale.shape[i]
+                assert mxfp4_block_size == MXFP4_BLOCK_SIZE
+
+            if (
+                hasattr(self.w13_precision_config, "b_microblock_size")
+                and self.w13_precision_config.b_microblock_size is None
+            ):
+                check_block_size(w13_weight, w13_scale)
+                self.w13_precision_config.b_microblock_size = MXFP4_BLOCK_SIZE
+            if (
+                hasattr(self.w2_precision_config, "b_microblock_size")
+                and self.w2_precision_config.b_microblock_size is None
+            ):
+                check_block_size(w2_weight, w2_scale)
+                self.w2_precision_config.b_microblock_size = MXFP4_BLOCK_SIZE
+
             self.w13_weight_triton_tensor = w13_weight
             self.w2_weight_triton_tensor = w2_weight
             del layer.w13_weight
@@ -1103,7 +1129,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
             return
-        elif _is_xpu:
+        elif _is_xpu and not (
+            get_moe_runner_backend().is_triton()
+            or get_moe_runner_backend().is_triton_kernels()
+        ):
             # sgl-kernel-xpu's W4A16 grouped GEMM consumes the checkpoint MXFP4
             # layout as-is: packed e2m1 [E, N, K/2] uint8 plus N-outer ue8m0
             # scales [E, N, K/32] uint8, with GPT-OSS's interleaved
@@ -1139,7 +1168,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w2_weight_scale
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
-        torch.cuda.empty_cache()
+        torch.get_device_module().empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
@@ -1476,6 +1505,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "trtllm_sm100",
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif moe_runner_backend.is_intel_xpu():
+            self.runner = None
         else:
             raise NotImplementedError(
                 f"Mxfp4MoEMethod has no MoeRunner for backend={moe_runner_backend} "
@@ -1670,7 +1701,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
             return StandardCombineInput(hidden_states=output)
 
-        if _is_xpu:
+        if _is_xpu and not (
+            get_moe_runner_backend().is_triton()
+            or get_moe_runner_backend().is_triton_kernels()
+        ):
             # sgl-kernel-xpu path: moe_grouped_mm_nt_xe20_w4a16 consumes the
             # packed MXFP4 weights directly, so no dequantization happens.
             from sgl_kernel import fused_experts as sgl_fused_experts
