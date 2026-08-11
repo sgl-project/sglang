@@ -1057,14 +1057,8 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
                     )
 
     def test_text_before_think_token_is_chunk_dependent(self):
-        """Accepted divergence inherited from main, pinned so a future fix has to
-        update this test rather than silently change behaviour.
-
-        When reasoning is not forced and the model emits text before `<think>`,
-        `replace(think_start, "", 1)` pulls that text into the reasoning branch,
-        while the prefix check may instead flush it as content first. Which one
-        happens depends on where the chunk boundary lands.
-        """
+        """Accepted divergence, inherited from main: text before `<think>` lands
+        in reasoning or content depending on where the chunk boundary falls."""
         text = "lead<think>r</think>tail"
         variants = {
             self._feed(Qwen3Detector(), text, chunk_size)
@@ -1082,14 +1076,9 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
         )
 
     def test_dsv4_reasoning_quoting_dsml_is_chunk_dependent(self):
-        """Accepted divergence, pinned so it is not mistaken for a regression.
-
-        `tool_start_token` ends the reasoning block as soon as the DSML marker
-        appears, but the non-streaming path only does so when no `</think>`
-        follows. Streaming cannot see whether one is still coming, so a model
-        quoting the tool format inside its reasoning splits by chunk size. The
-        DSV4 system prompt shows that marker to the model, so this is reachable.
-        """
+        """Accepted divergence: streaming ends the block at the DSML marker, while
+        one-shot waits to see whether a `</think>` follows. Reachable because the
+        DSV4 system prompt shows that marker to the model."""
         text = f"<think>format is <{self.DSML}tool_calls></think>answer"
         by_output = {}
         for chunk_size in self.CHUNK_SIZES:

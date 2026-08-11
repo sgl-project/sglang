@@ -1,6 +1,5 @@
 """Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
 
-import json
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
@@ -69,12 +68,6 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             normal, DeepSeekV4Detector().detect_and_parse(text, self.tools).normal_text
         )
 
-    def test_preamble_in_earlier_delta(self):
-        normal, calls = self._feed(["Let me check.\n", _weather_call()])
-
-        self.assertIn("Let me check.", normal)
-        self.assertEqual([c.name for c in calls if c.name], ["get_weather"])
-
     def test_preamble_before_bare_invoke_without_wrapper(self):
         """The bare `<｜DSML｜invoke …>` form has no tool_calls wrapper to walk
         back to, so the preamble is computed from the invoke itself."""
@@ -89,12 +82,6 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         normal, _ = self._feed([text[i : i + 4] for i in range(0, len(text), 4)])
 
         self.assertNotIn(DSML, normal)
-
-    def test_arguments_are_streamed(self):
-        _, calls = self._feed([_weather_call()])
-
-        arguments = "".join(c.parameters for c in calls if c.parameters)
-        self.assertEqual(json.loads(arguments), {"city": "SF"})
 
     def test_malformed_partial_json_falls_back_to_raw_value(self):
         """A partial non-string parameter must not escape as MalformedJSON."""

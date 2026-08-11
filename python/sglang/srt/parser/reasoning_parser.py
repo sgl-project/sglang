@@ -215,9 +215,8 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
-            # Check for tool_start_token interruption. Unlike detect_and_parse we
-            # cannot see whether a think_end_token follows, so a model that quotes
-            # the tool token inside its reasoning ends the block early here.
+            # Check for tool_start_token interruption. Streaming cannot see a
+            # think_end_token that has not arrived yet; see the chunk_dependent test.
             if self.tool_start_token and self.tool_start_token in current_text:
                 tool_idx = current_text.find(self.tool_start_token)
                 reasoning_text = current_text[:tool_idx]
@@ -241,8 +240,7 @@ class BaseReasoningFormatDetector:
                         ),
                     )
                 if not self.stripped_think_start:
-                    # force_reasoning starts inside the block without having seen
-                    # the opening token, which can still arrive split.
+                    # force_reasoning never saw the opening token; it can still split.
                     holdback = max(
                         holdback,
                         self._ends_with_partial_token(current_text, think_start_text),
@@ -283,9 +281,8 @@ class BaseReasoningFormatDetector:
         stream_reasoning=False, the held-back token suffix under stream_reasoning=True.
         force_nonempty_content emits it as normal_text, else as reasoning_text."""
         if not self._in_reasoning:
-            # Same reasoning as the reasoning-side flush below: what is left is a
-            # trailing slice held back only because it could still have grown into
-            # a token. The stream ended, so it never did, and it is content.
+            # Same as the reasoning-side flush below: a held-back slice that never
+            # became a token is content.
             leftover = self._buffer
             self._buffer = ""
             return StreamingParseResult(normal_text=leftover)

@@ -370,9 +370,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             logger.error(f"Error in parse_streaming_increment: {e}")
             # Re-emit verbatim rather than swallowing the turn; the preamble is
             # still inside current_text unless a completed call advanced past it.
-            # Calls collected in this pass are dropped on purpose: the failure can
-            # land between a tool's name and its arguments, and a named call with
-            # no arguments is worse for the client than none at all.
+            # Calls are dropped on purpose: the failure can land between a tool's
+            # name and its arguments, and a half-formed call is worse than none.
             self._buffer = ""
             if not current_text.startswith(preamble):
                 current_text = preamble + current_text
