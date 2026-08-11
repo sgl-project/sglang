@@ -771,6 +771,7 @@ class GenerateReqInput:
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
+            start_weight_version=self.start_weight_version,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,

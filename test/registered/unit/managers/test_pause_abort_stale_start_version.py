@@ -15,7 +15,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import PauseGenerationReqInput
+from sglang.srt.managers.io_struct import GenerateReqInput, PauseGenerationReqInput
 from sglang.srt.managers.scheduler import _is_stale_start_version
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -42,6 +42,26 @@ class TestStaleStartVersionPredicate(CustomTestCase):
 
     def test_no_threshold_means_nothing_is_stale(self):
         self.assertFalse(_is_stale_start_version(_req(1), None))
+
+
+class TestBatchChildrenInheritIt(CustomTestCase):
+    """A batched request is split by `__getitem__` before it reaches the scheduler.
+
+    A field the split forgets to carry is not an error: the child simply starts
+    with None, the sweep can never match it, and the echo goes missing -- so a
+    batched caller silently loses the feature the single-request path has."""
+
+    def test_getitem_carries_start_weight_version(self):
+        obj = GenerateReqInput(
+            text=["a", "b"], sampling_params={"max_new_tokens": 1}, start_weight_version=7
+        )
+        obj.normalize_batch_and_arguments()
+        self.assertEqual([obj[i].start_weight_version for i in range(2)], [7, 7])
+
+    def test_getitem_leaves_it_undeclared_when_absent(self):
+        obj = GenerateReqInput(text=["a", "b"], sampling_params={"max_new_tokens": 1})
+        obj.normalize_batch_and_arguments()
+        self.assertEqual([obj[i].start_weight_version for i in range(2)], [None, None])
 
 
 class TestPauseThresholdValidation(CustomTestCase):
