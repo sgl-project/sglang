@@ -49,6 +49,49 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 # Class name used by transformers v5 when no tokenizer mapping exists for a model_type.
 _TOKENIZERS_BACKEND = "TokenizersBackend"
 
+# Declared tokenizer_class values that are generic bases/aliases, not model-specific
+# classes. In transformers v5, PreTrainedTokenizerFast is an alias of TokenizersBackend
+# and PreTrainedTokenizer is an alias of PythonBackend, so a model declaring one of
+# these (e.g. gpt-oss) has no model-specific tokenizer class to recover.
+_GENERIC_TOKENIZER_CLASS_NAMES = frozenset(
+    {
+        "TokenizersBackend",
+        "PreTrainedTokenizerFast",
+        "PreTrainedTokenizer",
+        "PreTrainedTokenizerBase",
+        "PythonBackend",
+    }
+)
+
+
+def _read_tokenizer_config(tokenizer_name, revision=None):
+    """Return the parsed tokenizer_config.json, or None if unavailable."""
+    try:
+        config_file = _resolve_local_or_cached_file(
+            tokenizer_name, "tokenizer_config.json", revision
+        )
+        with open(config_file) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        # ValueError also covers json.JSONDecodeError and huggingface_hub's
+        # HFValidationError (raised for local paths with no such file).
+        logger.debug(
+            "Failed to read tokenizer_config.json for %s: %s", tokenizer_name, e
+        )
+        return None
+
+
+def _has_generic_declared_tokenizer_class(tokenizer_name, revision=None):
+    """Whether tokenizer_config.json declares a generic base/alias class.
+
+    Those models have no model-specific class to recover, so re-resolving a
+    ``TokenizersBackend`` instance for them is pointless (#31271).
+    """
+    tok_config = _read_tokenizer_config(tokenizer_name, revision) or {}
+    return tok_config.get("tokenizer_class") in _GENERIC_TOKENIZER_CLASS_NAMES
+
 
 def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     """Load tokenizer by the class declared in tokenizer_config.json.
@@ -60,27 +103,17 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     """
     import transformers
 
-    try:
-        revision = kwargs.get("revision") or kwargs.get("tokenizer_revision")
-        config_file = _resolve_local_or_cached_file(
-            tokenizer_name, "tokenizer_config.json", revision
-        )
-        with open(config_file) as f:
-            tok_config = json.load(f)
-        tok_class_name = tok_config.get("tokenizer_class")
-    except FileNotFoundError:
-        return None
-    except (OSError, json.JSONDecodeError) as e:
-        logger.debug(
-            "Failed to read tokenizer_config.json for %s: %s", tokenizer_name, e
-        )
+    revision = kwargs.get("revision") or kwargs.get("tokenizer_revision")
+    tok_config = _read_tokenizer_config(tokenizer_name, revision)
+    if tok_config is None:
         return None
 
+    tok_class_name = tok_config.get("tokenizer_class")
     if not tok_class_name:
         return None
 
-    # Skip base classes that don't implement required methods (e.g. get_vocab)
-    if tok_class_name in ("PreTrainedTokenizer", "PreTrainedTokenizerBase"):
+    # Skip generic bases/aliases (no model-specific class to recover).
+    if tok_class_name in _GENERIC_TOKENIZER_CLASS_NAMES:
         return None
 
     tok_cls = getattr(transformers, tok_class_name, None)
@@ -521,9 +554,15 @@ def get_tokenizer(
             # With fastokens, the patched TokenizersBackend.from_pretrained already
             # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
             # the declared class (e.g. Qwen2Tokenizer) would discard that work.
+            # Models that declare a generic class (gpt-oss declares
+            # PreTrainedTokenizerFast, which *is* TokenizersBackend in transformers v5)
+            # have nothing to re-resolve to, so skip the retry for them (#31271).
             if (
                 type(tokenizer).__name__ == _TOKENIZERS_BACKEND
                 and tokenizer_backend != "fastokens"
+                and not _has_generic_declared_tokenizer_class(
+                    tokenizer_name, kwargs.get("revision") or tokenizer_revision
+                )
             ):
                 tokenizer = _resolve_tokenizers_backend(
                     tokenizer_name, *args, **common_kwargs
