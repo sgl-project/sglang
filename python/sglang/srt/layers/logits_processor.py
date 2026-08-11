@@ -70,33 +70,27 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
     "PackWeightMethod",
 }
 
-# True for the duration of a FlashInfer autotune pass. A statement of fact, not
-# a policy: the pass runs synthetic inputs and discards the model output, so any
-# consumer may take a cheaper or safer path. Read by attention backends that
-# must avoid a real cross-node exchange during the dummy forward.
-_in_autotune_dummy_run = False
-
-# Whether the current autotune pass still runs the LM head. Skipping it also
-# skips its [batch * dp_size, vocab] all-gather, which OOMs under DP attention
-# with a tight mem_fraction_static; it is worth running only when the head is a
-# quantized GEMM that autotune can profile.
-_autotune_run_lm_head = True
+# None outside a FlashInfer autotune pass; inside one, whether that pass runs the
+# LM head. Not-None is the fact that this forward's output is discarded, so a
+# consumer may take a cheaper or safer path -- attention backends read it through
+# get_in_autotune_dummy_run() to skip a real cross-node exchange. Skipping the LM
+# head also skips its [batch * dp_size, vocab] all-gather, which OOMs under DP
+# attention with a tight mem_fraction_static.
+_autotune_run_lm_head: Optional[bool] = None
 
 
 def get_in_autotune_dummy_run() -> bool:
-    return _in_autotune_dummy_run
+    return _autotune_run_lm_head is not None
 
 
 @contextmanager
 def autotune_dummy_run_mode(*, run_lm_head: bool):
-    global _in_autotune_dummy_run, _autotune_run_lm_head
-    _in_autotune_dummy_run = True
+    global _autotune_run_lm_head
     _autotune_run_lm_head = run_lm_head
     try:
         yield
     finally:
-        _in_autotune_dummy_run = False
-        _autotune_run_lm_head = True
+        _autotune_run_lm_head = None
 
 
 @dataclasses.dataclass
@@ -351,10 +345,11 @@ class LogitsProcessor(nn.Module):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
-        # Autotune dummy run discards this output; see _autotune_run_lm_head.
-        # Placed before the MIS / DLLM / common dispatch so all three LM-head
-        # paths are skipped.
-        if _in_autotune_dummy_run and not _autotune_run_lm_head:
+        # Autotune dummy run discards this output. `is False` and not `not`: None
+        # means no autotune pass is running, which must not skip anything. Placed
+        # before the MIS / DLLM / common dispatch so all three LM-head paths are
+        # skipped.
+        if _autotune_run_lm_head is False:
             return LogitsProcessorOutput(next_token_logits=None)
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
