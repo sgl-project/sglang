@@ -394,11 +394,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
-                    if processed_messages is not None:
-                        sampling_params["skip_special_tokens"] = (
-                            processed_messages.skip_special_tokens
-                        )
-
                     # _process_messages set skip_special_tokens on a chat_request
                     # we then discard, so re-apply it to the engine sampling dict.
                     if processed_messages is not None and (
