@@ -44,12 +44,6 @@ export const config = {
     "h100": "lmsysorg/sglang:dev-Ling-3.0-tiny",
     "b200": "lmsysorg/sglang:dev-Ling-3.0-tiny",
     "gb300": "lmsysorg/sglang:dev-Ling-3.0-tiny",
-    "h20-3e|int4": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "h200|int4": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "h800|int4": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "h100|int4": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "b200|int4": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "gb300|int4": "lmsysorg/sglang:dev-Ling-3.0-flash",
   },
 
   benchmarkCommands: {
