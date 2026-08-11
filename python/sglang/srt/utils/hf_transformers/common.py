@@ -32,16 +32,25 @@ from sglang.srt.configs import (
     ExaoneConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InklingAudioConfig,
+    InklingMMConfig,
+    InklingModelConfig,
+    InklingVisionConfig,
+    InternS2MobiusConfig,
+    InternS2MobiusTextConfig,
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK3Config,
     KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
     LagunaConfig,
+    LocateAnythingConfig,
     LongcatFlashConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
+    MiniMaxM3VLConfig,
     MultiModalityConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
@@ -50,6 +59,8 @@ from sglang.srt.configs import (
     Olmo3Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
     Qwen3NextConfig,
     Step3p5Config,
     Step3p7Config,
@@ -84,11 +95,13 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVL2Config,
         MultiModalityConfig,
         KimiVLConfig,
+        LocateAnythingConfig,
         InternVLChatConfig,
         LagunaConfig,
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
+        KimiK3Config,
         KimiLinearConfig,
         Qwen3NextConfig,
         FalconH1Config,
@@ -102,7 +115,11 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
+        Qwen3_5TextConfig,
+        Qwen3_5MoeTextConfig,
         InternS2PreviewConfig,
+        InternS2MobiusConfig,
+        InternS2MobiusTextConfig,
         JetNemotronConfig,
         JetVLMConfig,
         KimiK25Config,
@@ -110,6 +127,11 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3p7Config,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
+        InklingModelConfig,
+        InklingAudioConfig,
+        InklingVisionConfig,
+        InklingMMConfig,
+        MiniMaxM3VLConfig,
     ]
 }
 
@@ -135,6 +157,46 @@ try:
         model_type = "kimi_k2"
 
     _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
+except ImportError:
+    pass
+
+# Newer transformers versions (>=5.10.2) expose MellumConfig directly,
+# but fallback to Qwen3MoeConfig for older versions.
+try:
+    import transformers as _hf_transformers
+
+    _HFMellumConfig = getattr(_hf_transformers, "MellumConfig", None)
+
+    if _HFMellumConfig is not None:
+        _CONFIG_REGISTRY["mellum"] = _HFMellumConfig
+    else:
+        from transformers import Qwen3MoeConfig as _HFQwen3MoeConfig
+
+        class _MellumConfigAlias(_HFQwen3MoeConfig):
+            model_type = "mellum"
+
+            def __post_init__(self, **kwargs):
+                # Qwen3MoeConfig.__post_init__ wipes sliding_window unless
+                # use_sliding_window=True. Mellum gates sliding attention
+                # per-layer via layer_types, so preserve sliding_window
+                # regardless of the legacy use_sliding_window flag.
+                sliding_window = getattr(self, "sliding_window", None)
+                super().__post_init__(**kwargs)
+                self.sliding_window = sliding_window
+
+        _CONFIG_REGISTRY["mellum"] = _MellumConfigAlias
+
+except ImportError:
+    pass
+
+
+try:
+    from transformers import Gemma4Config as _HFGemma4Config
+
+    class _Gemma4UnifiedConfigAlias(_HFGemma4Config):
+        model_type = "gemma4_unified"
+
+    _CONFIG_REGISTRY["gemma4_unified"] = _Gemma4UnifiedConfigAlias
 except ImportError:
     pass
 
@@ -181,6 +243,33 @@ def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
     return hf_hub_download(
         model_name_or_path, filename, revision=revision, local_files_only=True
     )
+
+
+def _cached_file_exists(model_name_or_path, filename, revision=None) -> bool:
+    """Whether *filename* is available locally or in the HF cache (no network)."""
+    try:
+        _resolve_local_or_cached_file(model_name_or_path, filename, revision)
+        return True
+    except Exception:
+        return False
+
+
+def _remote_file_exists(repo_id, filename, revision=None) -> bool:
+    """Whether *filename* exists on the HF hub (HEAD request only, no download).
+
+    Returns False on any error (offline, gated, network, invalid id) so callers
+    fall back to their default path instead of crashing.
+    """
+    from huggingface_hub.constants import HF_HUB_OFFLINE
+
+    if HF_HUB_OFFLINE:
+        return False
+    try:
+        from huggingface_hub import HfApi
+
+        return HfApi().file_exists(repo_id, filename, revision=revision)
+    except Exception:
+        return False
 
 
 def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
@@ -406,12 +495,13 @@ def get_generation_config(
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    except FileNotFoundError:
-        return None
-    except OSError as e:
-        logger.warning(
-            "Failed to load generation config for %s: %s. "
-            "Proceeding without generation config.",
+    except (FileNotFoundError, OSError) as e:
+        # A missing generation_config.json is normal for many checkpoints and
+        # is surfaced by HF as a generic OSError (not FileNotFoundError). Treat
+        # it as benign — proceed without a generation config, at DEBUG level so
+        # normal startup logs stay quiet.
+        logger.debug(
+            "No generation config for %s: %s. Proceeding without it.",
             model,
             e,
         )
@@ -450,9 +540,13 @@ def get_tokenizer_from_processor(processor):
     return processor.tokenizer
 
 
+# Turn-final markers that some checkpoints ship without EOS metadata:
+# <|eom_id|> (Llama-3 tool use) and <|content_model_end_sampling|> (Inkling,
+# whose bundled tokenizer config leaves eos_token unset).
+_ADDITIONAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|content_model_end_sampling|>")
+
+
 def attach_additional_stop_token_ids(tokenizer):
     added = tokenizer.get_added_vocab()
-    if "<|eom_id|>" in added:
-        tokenizer.additional_stop_token_ids = {added["<|eom_id|>"]}
-    else:
-        tokenizer.additional_stop_token_ids = None
+    stop_ids = {added[text] for text in _ADDITIONAL_STOP_TOKEN_TEXTS if text in added}
+    tokenizer.additional_stop_token_ids = stop_ids or None

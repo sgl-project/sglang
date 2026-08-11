@@ -2,20 +2,25 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
+import msgspec
 import torch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers import io_struct
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
@@ -39,9 +44,16 @@ def _async_d2h(t: torch.Tensor) -> torch.Tensor:
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
-    next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
+    next_token_ids: Optional[
+        Union[torch.Tensor, List[torch.Tensor], List[List[int]]]
+    ] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
+    num_block_accept_tokens: int = 0
+    num_cap_tokens: int = 0
+    # FDFO dLLM batching: per-request accepted block length and carried algo state.
+    accept_length_per_req_cpu: Optional[List[int]] = None
+    dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and
@@ -59,9 +71,20 @@ class GenerationBatchResult:
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
+    # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
+    # these once — eagerly via the scheduler's grammar barrier inside verify(), or
+    # lazily in _resolve_spec_v2_tokens — and the latter consumes
+    # grammar_retained_tokens instead of re-advancing the FSM.
+    grammar_advanced: bool = False
+    grammar_retained_tokens: Optional[list] = None
+
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+
+    block_accept_lens: Optional[torch.Tensor] = None
+
+    cap_lens: Optional[torch.Tensor] = None
 
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
@@ -129,6 +152,12 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
+
+        if self.block_accept_lens is not None:
+            self.block_accept_lens = _async_d2h(self.block_accept_lens)
+
+        if self.cap_lens is not None:
+            self.cap_lens = _async_d2h(self.cap_lens)
 
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
@@ -207,6 +236,8 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
         "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
         "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
+        "next_token_sampling_mask_idx": result.logits_output.next_token_sampling_mask_idx,
+        "next_token_sampling_logprobs": result.logits_output.next_token_sampling_logprobs,
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
@@ -231,6 +262,8 @@ def get_logprob_from_pp_outputs(
         next_token_token_ids_logprobs_idx=next_pp_outputs[
             "next_token_token_ids_logprobs_idx"
         ],
+        next_token_sampling_mask_idx=next_pp_outputs["next_token_sampling_mask_idx"],
+        next_token_sampling_logprobs=next_pp_outputs["next_token_sampling_logprobs"],
         input_token_logprobs=next_pp_outputs["input_token_logprobs"],
         input_top_logprobs_val=next_pp_outputs["input_top_logprobs_val"],
         input_top_logprobs_idx=next_pp_outputs["input_top_logprobs_idx"],
@@ -260,10 +293,7 @@ class EmbeddingBatchResult:
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[torch.cuda.Event] = None
-
-    @property
-    def can_run_cuda_graph(self) -> bool:
-        return False
+    can_run_cuda_graph: bool = False
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
@@ -293,3 +323,73 @@ class EmbeddingBatchResult:
 def is_health_check_generate_req(recv_req):
     rid = getattr(recv_req, "rid", None)
     return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+
+
+class MsgpackDecodeError(ValueError):
+    """A msgpack frame the typed decoder rejected, with the failure explained:
+    ``rid`` (when recoverable from the raw tagged array) and a human-readable
+    ``reason`` whose leading ``$[<n>]`` array index is resolved to the struct
+    field name.
+    """
+
+    def __init__(self, rid: Optional[str], reason: str):
+        super().__init__(reason)
+        self.rid = rid
+        self.reason = reason
+
+
+def msgpack_decode_explained(data: bytes) -> Any:
+    """`io_struct.msgpack_decode`, but a rejected frame raises
+    `MsgpackDecodeError` carrying the rid (recovered via an untyped re-decode of
+    the tagged array) and a reason with the failing field named — for callers
+    that must report the failure back to a client (e.g. the rust ingress)
+    instead of just crashing."""
+    # TODO: the hook_custom_types() currently only apply for unit tests, once it
+    # esclate to the main code, we can provide a function to access the _all_types
+
+    try:
+        return io_struct.msgpack_decode(data)
+    except Exception as e:
+        msg = str(e)
+        try:
+            arr = msgspec.msgpack.decode(data)
+        except Exception:
+            arr = None
+        if not (isinstance(arr, (list, tuple)) and arr):
+            raise MsgpackDecodeError(None, msg) from e
+        # Tagged array_like layout is [tag, *fields]; rid is the first field of
+        # every BaseReq struct.
+        rid = str(arr[1]) if len(arr) > 1 and arr[1] is not None else None
+        tag_to_fields = {
+            cls.__struct_config__.tag: cls.__struct_fields__
+            for cls in io_struct._all_types
+            if isinstance(cls, type) and issubclass(cls, msgspec.Struct)
+        }
+        fields = tag_to_fields.get(arr[0])
+        if fields is not None:
+            # Leading ``$[<n>]`` in a msgspec ValidationError path, e.g.
+            # ``$[12][0]``.
+            m = re.search(r"\$\[(\d+)\]", msg)
+            if m is not None:
+                idx = int(m.group(1))
+                if 1 <= idx <= len(fields):
+                    msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
+        raise MsgpackDecodeError(rid, msg) from e
+
+
+def compute_num_reserved_tokens(server_args: ServerArgs) -> int:
+    """Output token slots reserved per request, on top of its input.
+
+    The current eagle implementation stores draft tokens in the output token
+    slots, so the context budget has to account for them; every other algorithm
+    reserves nothing. Shared by `TokenizerManager` and the rust server's
+    `server_args` blob (`RustServer._build_server_args`), which needs the same
+    number to run the total-token check in Rust.
+    """
+    algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if not algorithm.is_eagle():
+        return 0
+    return max(
+        server_args.speculative_eagle_topk * server_args.speculative_num_steps,
+        server_args.max_speculative_num_draft_tokens,
+    )

@@ -95,6 +95,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.swa_free_group = []
 
         self._kvcache = kvcache
         self.clear()
@@ -111,6 +112,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def swa_available_size(self):
         return self.swa_attn_allocator.available_size()
+
+    # Slot-conservation views for the leak invariant. On the non-shared allocator
+    # the static budget IS physical (conserve == physical); the shared composite
+    # overrides these with the static-cap view.
+    def _conserve_full_available_size(self):
+        return self.full_available_size()
+
+    def _conserve_swa_available_size(self):
+        return self.swa_available_size()
 
     @property
     def size(self):
@@ -315,7 +325,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
@@ -331,15 +341,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if full_indices.numel() == 0:
             return
         assert full_indices.numel() == swa_indices.numel()
-        if _is_npu:
-            self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = (
-                swa_indices.to(torch.int64)
-            )
-        else:
-            self.full_to_swa_index_mapping[full_indices] = swa_indices
+        full_indices = full_indices.to(torch.int64)
+        swa_indices = swa_indices.to(self.full_to_swa_index_mapping.dtype)
+        self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
+            return
+
+        if not self.is_not_in_free_group:
+            self.swa_free_group.append(self._copy_for_free_group(free_index))
             return
 
         if self.page_size == 1:
@@ -352,6 +363,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
+    def free_group_begin(self):
+        super().free_group_begin()
+        self.swa_free_group = []
+
+    def free_group_end(self):
+        super().free_group_end()
+        if self.swa_free_group:
+            swa_free_group = self.swa_free_group
+            self.swa_free_group = []
+            self.free_swa(torch.cat(swa_free_group))
+
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
         page_offsets = torch.arange(
@@ -359,16 +381,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return (pages[:, None] * self.page_size + page_offsets[None, :]).reshape(-1)
 
-    def backup_state(self):
-        return [
-            self.full_attn_allocator.backup_state(),
-            self.swa_attn_allocator.backup_state(),
-        ]
-
-    def restore_state(self, state):
-        assert len(state) == 2
-        self.full_attn_allocator.restore_state(state[0])
-        self.swa_attn_allocator.restore_state(state[1])
+    def resize(self, config) -> None:
+        size_full = int(config.full_max_total_num_tokens)
+        size_swa = int(config.swa_max_total_num_tokens)
+        self._size_full = size_full
+        self._size_swa = size_swa
+        for alloc, sz in (
+            (self.full_attn_allocator, size_full),
+            (self.swa_attn_allocator, size_swa),
+        ):
+            alloc.size = int(sz)
+            if self.page_size > 1:
+                alloc.num_pages = int(sz) // self.page_size
+        self.clear()
 
     def clear(self):
         self.swa_attn_allocator.clear()
@@ -377,6 +402,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
+        self.swa_free_group = []
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
@@ -474,13 +500,16 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if self.is_not_in_free_group:
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        self.swa_attn_allocator.free(free_index[free_index > 0])
+        if self.is_not_in_free_group:
+            self.swa_attn_allocator.free(free_index[free_index > 0])
+        else:
+            self.free_group.append(self._copy_for_free_group(free_index))
 
     def free_group_begin(self):
         self.is_not_in_free_group = False
@@ -491,12 +520,6 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if self.free_group:
             self.free(torch.cat(self.free_group))
         self.free_group = []
-
-    def backup_state(self):
-        return self.swa_attn_allocator.backup_state()
-
-    def restore_state(self, state):
-        self.swa_attn_allocator.restore_state(state)
 
     def clear(self):
         self.swa_attn_allocator.clear()

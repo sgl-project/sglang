@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.runner import swa_divergence as swa_div_module

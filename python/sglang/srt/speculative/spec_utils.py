@@ -1,49 +1,67 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.kernels.ops.speculative.cache_locs import (
+    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs as assign_extend_cache_locs,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
+    get_target_cache_loc as get_target_cache_loc,
+)
+from sglang.kernels.ops.speculative.eagle import (
+    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+)
+from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
+from sglang.srt.managers.utils import _async_d2h
+from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
+from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_spec,
+    mamba_extra_buffer_enabled,
+    mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+    next_power_of_2,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    get_target_cache_loc as get_target_cache_loc,
-)
-from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
-)
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
 
@@ -51,14 +69,16 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
 if _is_cuda:
@@ -68,12 +88,59 @@ elif _is_hip:
 else:
     from sglang.srt.utils.common import fast_topk
 
+if _is_cpu:
+    from sgl_kernel import assign_extend_cache_locs_cpu
+
 
 logger = logging.getLogger(__name__)
 
 
+def resolve_num_tokens_per_req(
+    *,
+    phase: Literal["draft_decode", "draft_extend", "target_verify"],
+    server_args: ServerArgs,
+    spec_algorithm=None,
+    is_draft_worker: bool = False,
+    num_draft_tokens: Optional[int] = None,
+) -> int:
+    """Single static derivation point for a spec phase's per-request token
+    width (sizes capture shapes / buffers); the per-forward dynamic width
+    lives on ``SpecInput.num_tokens_per_req``. Draft phases are
+    EAGLE-family-only; "target_verify" is algorithm-generic via the hook.
+    """
+    if phase == "draft_decode":
+        return server_args.speculative_eagle_topk
+    if phase == "draft_extend":
+        return server_args.speculative_num_draft_tokens
+    if phase == "target_verify":
+        if num_draft_tokens is None:
+            num_draft_tokens = server_args.speculative_num_draft_tokens
+        return spec_algorithm.get_num_tokens_per_req_for_target_verify(
+            num_draft_tokens, is_draft_worker
+        )
+    raise ValueError(f"Unknown speculative phase: {phase}")
+
+
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    """Draw from `probs` via the Gumbel-max trick: argmax(probs / Exp(1)).
+
+    Distributionally equivalent to torch.multinomial, but avoids multinomial's
+    device-side distribution-validity assert, which the draft CUDA graph would
+    otherwise capture and replay every step. q is clamped off zero so a zero
+    draw can't yield inf/NaN scores that argmax would wrongly select; fp32
+    avoids bf16 argmax ties biasing the draw. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0
+    to fall back to torch.multinomial.
+    """
+    if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
+        sample_index = torch.multinomial(probs, num_samples=num_samples)
+        return probs.gather(1, sample_index), sample_index
+    q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+    q.clamp_min_(torch.finfo(torch.float32).tiny)
+    scores = probs.float() / q
+    if num_samples == 1:
+        sample_index = scores.argmax(dim=-1, keepdim=True)
+    else:
+        sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
     return sample_p, sample_index
 
@@ -94,9 +161,22 @@ def renorm_draft_probs(
     return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
 
 
+def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+    """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
+
+    Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
+    only if q is exactly the distribution X was drawn from, so callers must hand
+    the returned q (not a recomputed one) to the verify.
+    """
+    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    topk_p, topk_index = fast_sample(probs, num_samples=1)
+    return probs, topk_p, topk_index
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
+SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -176,19 +256,17 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
     record_stream_each(candidates, fwd_stream)
 
 
-def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
-    if server_args is None:
-        server_args = get_global_server_args()
-
+def spec_need_hidden_states() -> bool:
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
-    # multi_layer_eagle and DFLASH don't relay hidden_states through FutureMap.
+    # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH"):
+    spec = get_spec()
+    if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
-    return not server_args.enable_multi_layer_eagle
+    return not spec.enable_multi_layer_eagle
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
 def create_num_accept_tokens_filter(
     num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -222,7 +300,7 @@ def _select_top_k_tokens_first(
     return input_ids, hidden_states, topk_p, tree_info
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
 def _select_top_k_tokens_later(
     i: int,
     topk_p: torch.Tensor,
@@ -274,7 +352,7 @@ def select_top_k_tokens(
     )
 
 
-def _sample_simulated_acc_len(
+def sample_simulated_acc_len(
     simulate_acc_len: float,
     simulate_acc_method: str,
     max_len: int,
@@ -316,25 +394,44 @@ def generate_simulated_accept_index(
     accept_index,
     predict,
     num_correct_drafts,
+    candidates,
+    target_predict,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
 ):
+    use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
+
     assert simulate_acc_len > 0.0
-    simulate_acc_len = _sample_simulated_acc_len(
+    simulate_acc_len = sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
     )
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device=accept_index.device
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
     )
     num_correct_drafts.fill_(simulate_acc_len - 1)
-    predict.fill_(100)  # some legit token id
+
+    if not use_real_draft_tokens:
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+
+    # Use the topk=1 draft chain for forced acceptance, then a target-derived bonus.
+    if simulate_acc_len > 1:
+        draft_node_indices = sim_accept_index[:, : simulate_acc_len - 1].long()
+        predict[draft_node_indices] = candidates[:, 1:simulate_acc_len].to(
+            dtype=predict.dtype
+        )
+    bonus_node_indices = sim_accept_index[:, simulate_acc_len - 1].long()
+    predict[bonus_node_indices] = target_predict[:, simulate_acc_len - 1].to(
+        dtype=predict.dtype
+    )
     return sim_accept_index
 
 
@@ -408,12 +505,11 @@ def traverse_tree(
 
 def generate_token_bitmask(
     reqs: List[Req],
-    verify_input: EagleVerifyInput,
     retrieve_next_token_cpu: torch.Tensor,
     retrieve_next_sibling_cpu: torch.Tensor,
     draft_tokens_cpu: torch.Tensor,
     vocab_size: int,
-):
+) -> Tuple[Optional[torch.Tensor], Optional[BaseGrammarObject]]:
     """
     Generate the logit mask for structured output.
     Draft model's token can be either valid or invalid with respect to the grammar.
@@ -454,8 +550,97 @@ def generate_token_bitmask(
                     f"grammar: {req.grammar}"
                 )
 
-    verify_input.grammar = grammar
-    return allocate_token_bitmask
+    return allocate_token_bitmask, grammar
+
+
+class GrammarTree:
+    """The verify tree the grammar bitmask is built over, on the host.
+
+    ``from_device`` starts an async copy, so build it before the target verify
+    launch; ``from_host`` is for algorithms that build the tree there (NGRAM).
+    """
+
+    def __init__(self, host: Tuple[torch.Tensor, ...], done_event):
+        self._host = host
+        self._done = done_event
+
+    @classmethod
+    def from_device(
+        cls,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        draft_token: torch.Tensor,
+    ) -> GrammarTree:
+        tensors = (retrieve_next_token, retrieve_next_sibling, draft_token)
+        host = tuple(_async_d2h(t) for t in tensors)
+        # Sources may be mixed -- an algorithm can synthesize part of the tree on
+        # the host -- so the event has to key off whichever one is on device.
+        device = next((t.device for t in tensors if t.device.type != "cpu"), None)
+        if device is None:
+            return cls(host, None)
+        done = torch.get_device_module(device).Event()
+        done.record()
+        return cls(host, done)
+
+    @classmethod
+    def from_host(
+        cls,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        draft_token: torch.Tensor,
+    ) -> GrammarTree:
+        return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
+
+    @classmethod
+    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> GrammarTree:
+        """Degenerate tree for chain-verify algorithms: node i's only child is i + 1.
+
+        ``verify_ids_2d`` is (bs, chain_len) with column 0 the already-committed
+        token, so mask rows line up with the target's logits rows one-for-one.
+        Only the ids need a copy; the links are fixed by the shape.
+        """
+        bs, chain_len = verify_ids_2d.shape
+        next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
+        next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        return cls.from_device(next_token, next_sibling, verify_ids_2d)
+
+    def resolve(self) -> Tuple[torch.Tensor, ...]:
+        if self._done is not None:
+            self._done.synchronize()
+        return self._host
+
+
+def build_grammar_vocab_mask(
+    *,
+    reqs: List[Req],
+    tree: GrammarTree,
+    sampling_info: SamplingBatchInfo,
+    device,
+    barrier: Optional[Callable[[], None]],
+) -> Optional[GrammarMask]:
+    """Build the constrained-decoding bitmask over a verify tree and stage it on device.
+
+    Call it after the target verify launch -- every step here is host work, so it all
+    overlaps that forward. ``barrier`` advances the previous batch's FSM over its
+    committed tokens, which the traversal then reads, so it has to run first.
+    """
+    if barrier is not None:
+        barrier()
+    vocab_mask, grammar = generate_token_bitmask(
+        reqs,
+        *tree.resolve(),
+        sampling_info.vocab_size,
+    )
+    if vocab_mask is None:
+        return None
+
+    # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
+    # order keeps the copy ahead of the sampler's apply_vocab_mask.
+    vocab_mask = vocab_mask.to(device, non_blocking=True)
+    # Otherwise the extend stage's leftover mask is applied instead.
+    sampling_info.grammar_mask = None
+    return GrammarMask(grammar, vocab_mask)
 
 
 def load_token_map(token_map_path: str) -> List[int]:
@@ -538,20 +723,30 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    assign_extend_cache_locs[(bs,)](
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        batch.seq_lens,
-        batch.seq_lens + num_correct_drafts + 1,
-        tgt_cache_loc,
-        batch.req_to_token_pool.req_to_token.shape[1],
-        next_power_of_2(bs),
-    )
-    fill_accept_out_cache_loc[(size,)](
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+        )
+    else:
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_correct_drafts + 1,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+    fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
         accept_out_cache_loc,
-        next_power_of_2(size),
+        size,
     )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
@@ -566,12 +761,69 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     the mask also keeps a stale extend-time mask from triggering in-forward
     tracking during TARGET_VERIFY; tracking is done in
     commit_mamba_states_after_verify instead.
+
+    Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
+    inside forward isolation, so it must not mutate req/pool state.
     """
-    if not get_global_server_args().enable_mamba_extra_buffer():
+    if not mamba_extra_buffer_enabled():
         return
-    set_mamba_track_indices_from_reqs(batch)
+    track_positions = None
+    if mamba_extra_buffer_lazy_enabled():
+        track_positions = batch.mamba_lazy_spec_track_positions_cpu
+        assert track_positions is not None and len(track_positions) == len(
+            batch.reqs
+        ), (
+            "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
+            "must run in prepare_for_decode for every spec decode iteration"
+        )
+    set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
+
+
+def _verify_commit_step_indices(
+    *,
+    batch: ScheduleBatch,
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    draft_token_num: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Step indices for a post-verify state commit: per req, the tree step of
+    the last accepted node (reduces to accept_lens - 1 for topk == 1), and the
+    mamba-track interval-crossing step (-1 = no crossing; None when tracking
+    is off)."""
+    bs = accept_lens.shape[0]
+    accept_indices_offset = torch.arange(
+        0,
+        bs * draft_token_num,
+        step=draft_token_num,
+        dtype=accept_lens.dtype,
+        device=accept_lens.device,
+    )
+    req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+    last_correct_step_indices = (
+        accept_index[req_idx, (accept_lens - 1).to(torch.int64)] - accept_indices_offset
+    )
+    if batch.mamba_track_indices is None:
+        return last_correct_step_indices, None
+    seq_lens_pre_verify = batch.seq_lens
+    seq_lens_post_verify = batch.seq_lens + accept_lens
+    mamba_track_interval = get_exec().mamba.mamba_track_interval
+    to_track_mask = (
+        seq_lens_pre_verify // mamba_track_interval
+        != seq_lens_post_verify // mamba_track_interval
+    )
+    tracking_point = seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+    to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0).to(
+        torch.int64
+    )
+    candidate_track_steps = accept_index[req_idx, to_track_ith] - accept_indices_offset
+    mamba_steps_to_track = torch.where(
+        to_track_mask,
+        candidate_track_steps,
+        torch.full_like(candidate_track_steps, -1),
+    )
+    return last_correct_step_indices, mamba_steps_to_track
 
 
 def commit_mamba_states_after_verify(
@@ -593,15 +845,123 @@ def commit_mamba_states_after_verify(
     commit hook.
     """
     model_runner = target_worker.model_runner
-    if model_runner.mambaish_config is None:
-        return
-    attn_backend = model_runner.attn_backend
-    if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+    if mambaish_config(model_runner.model_config) is None:
         return
 
-    bs = accept_lens.shape[0]
-    # `accept_lens` already includes the bonus token (drafts + 1 per req).
-    if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
+    # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
+    # live in the per-slot circular ring (written during verify). Instead of
+    # scattering an intermediate full SSM state into `temporal`, advance the
+    # block-keyed cursors by the accepted count (the ring owns the SSM state; the
+    # verify/flush kernel folds it into `temporal` periodically). The CONV state
+    # still needs its usual accept-rollback, so we keep the conv-window scatter and
+    # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
+    # ring is allocated only then; KDA never allocates the cursors.
+    req_pool = model_runner.req_to_token_pool
+    mamba_pool = getattr(req_pool, "mamba_pool", None)
+
+    # Fold-every-commit: replay the accepted prefix from the ring into
+    # `temporal`; the same fold stores the interval-crossing state to the
+    # track slot, so no SSM scatter or force-flush is needed here.
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "replayssm_spec_fold", False)
+        and not getattr(mamba_pool, "replayssm_is_kda", False)
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+            commit_gdn_replayssm_fold_after_verify,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
+        )
+        commit_gdn_replayssm_fold_after_verify(
+            spec_state=spec_state,
+            state_batch_indices=state_batch_indices,
+            accept_lens=accept_lens,
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=-1,
+        )
+        return
+
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+        and not getattr(mamba_pool, "replayssm_is_kda", False)
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_spec,
+        )
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_conv_window_scatter_with_mask,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        bs = accept_lens.shape[0]
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        # Advance the per-slot circular cursors by the accepted count (incl. the
+        # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
+        commit_gdn_replayssm_spec(
+            write_pos=mamba_pool.replayssm_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            num_accepted=accept_lens,  # [bs], includes the bonus token
+            state_batch_indices=state_batch_indices,
+            max_cache_len=spec_state.replayssm_d.shape[-2],
+            max_spec_len=draft_token_num,
+            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+        )
+        # Roll back / commit the conv state to the last accepted draft step
+        # (same logic as the recurrent commit, but conv-only).
+        last_correct_step_indices, _ = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
+        )
+        fused_conv_window_scatter_with_mask(
+            spec_state.conv[0],
+            spec_state.intermediate_conv_window[0],
+            state_batch_indices,
+            last_correct_step_indices,
+        )
+        # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
+        # a device-side force-flush so `temporal` reflects the ring before a
+        # snapshot; not wired for Part B (server_args forbids extra_buffer with
+        # --enable-linear-replayssm-spec), so the per-track scatters are intentionally
+        # skipped here.
+        return
+
+    # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
+    # for the OUTPUT, so we replay the accepted window into the fp32 checkpoint
+    # (`temporal`) here on commit -- `temporal` is always the current committed
+    # state. The draft window's raw inputs were written to the ring during verify
+    # by the KDA backend. Gate on the fold flag + is_kda (the cursor tensors are
+    # never allocated under fold, so they cannot serve as the signal).
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "replayssm_spec_fold", False)
+        and getattr(mamba_pool, "replayssm_is_kda", False)
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+            commit_kda_replayssm_after_verify,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        bs = accept_lens.shape[0]
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         accept_indices_offset = torch.arange(
             0,
             bs * draft_token_num,
@@ -610,55 +970,86 @@ def commit_mamba_states_after_verify(
             device=accept_lens.device,
         )
         req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-        # Per-req tree step of the last accepted node, i.e. the step whose
-        # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
         last_correct_step_indices = (
             accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
             - accept_indices_offset
         )
-
-        if batch.mamba_track_indices is not None:
-            # If after verify, the request's seq_lens has crossed a mamba track interval,
-            # we need to update the mamba state for the request at the crossing point.
-            seq_lens_pre_verify = batch.seq_lens
-            seq_lens_post_verify = batch.seq_lens + accept_lens
-            mamba_track_interval = get_global_server_args().mamba_track_interval
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != seq_lens_post_verify // mamba_track_interval
+        # extra_buffer: the interval-crossing step whose state must snapshot into
+        # the track ping-pong slot (mirrors the regular commit's
+        # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
+        # `temporal` stays current and no device-side force-flush is needed.
+        mamba_track_indices = batch.mamba_track_indices
+        mamba_steps_to_track = None
+        if mamba_track_indices is not None:
+            ti = get_exec().mamba.mamba_track_interval
+            seq_pre = batch.seq_lens
+            seq_post = batch.seq_lens + accept_lens
+            to_track_mask = seq_pre // ti != seq_post // ti
+            tracking_point = seq_post // ti * ti
+            to_track_ith = torch.clamp(tracking_point - seq_pre - 1, min=0).to(
+                torch.int64
             )
-            tracking_point = (
-                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-            )
-            to_track_ith = torch.clamp(
-                tracking_point - seq_lens_pre_verify - 1, min=0
-            ).to(torch.int64)
-            candidate_track_steps = (
-                accept_index[req_idx, to_track_ith] - accept_indices_offset
-            )
+            candidate = accept_index[req_idx, to_track_ith] - accept_indices_offset
             mamba_steps_to_track = torch.where(
-                to_track_mask,
-                candidate_track_steps,
-                torch.full_like(candidate_track_steps, -1),
+                to_track_mask, candidate, torch.full_like(candidate, -1)
             )
-        else:
-            mamba_steps_to_track = None
-
-        attn_backend.update_mamba_state_after_mtp_verify(
+        commit_kda_replayssm_after_verify(
+            spec_state=spec_state,
+            state_batch_indices=state_batch_indices,
+            accept_lens=accept_lens,  # incl. bonus token
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
-            model=model_runner.model,
+            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
         )
+        return
+
+    attn_backend = model_runner.attn_backend
+
+    bs = accept_lens.shape[0]
+    # `accept_lens` already includes the bonus token (drafts + 1 per req).
+    if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
+        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
+        )
+
+        if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            attn_backend.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=model_runner.model,
+                req_pool_indices=batch.req_pool_indices[:bs],
+            )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if batch.spec_algorithm.is_dflash():
+    if mamba_extra_buffer_lazy_enabled():
+        # Scheduler phase (outside forward isolation).
+        batch.mamba_lazy_spec_prepare(
+            get_exec().mamba.mamba_track_interval,
+            max_speculative_num_draft_tokens(),
+        )
+    if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 
         eagle_prepare_for_decode(batch)
+
+
+def get_plan_stream(
+    device: str,
+) -> Tuple[Any, contextlib.AbstractContextManager]:
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+        plan_stream = torch.get_device_module(device).Stream()
+        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
+        return plan_stream, plan_stream_ctx
+    else:
+        return None, contextlib.nullcontext()

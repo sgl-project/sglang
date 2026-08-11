@@ -28,11 +28,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     configure_layerwise_offload_modules,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
-from sglang.multimodal_gen.runtime.models.vision_utils import (
-    normalize,
-    numpy_to_pt,
-    pil_to_numpy,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -41,14 +36,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
+    autocast_context,
     autocast_enabled,
     resolve_precision,
     temporary_module_dtype,
+)
+from sglang.multimodal_gen.runtime.utils.vision import (
+    normalize,
+    numpy_to_pt,
+    pil_to_numpy,
 )
 
 logger = init_logger(__name__)
@@ -609,11 +609,7 @@ class LTX2ImageEncodingStage(PipelineStage):
         )
         vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
+        with autocast_context(vae_dtype, server_args.disable_autocast):
             try:
                 if server_args.pipeline_config.vae_tiling:
                     self.vae.enable_tiling()
@@ -650,13 +646,8 @@ class LTX2ImageEncodingStage(PipelineStage):
         vae_dtype = resolve_precision(
             server_args, "vae", precision_attr="vae_precision"
         )
-        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
+        with autocast_context(vae_dtype, server_args.disable_autocast):
             return self._condition_image_encoder(video_condition)
 
     @staticmethod
@@ -710,7 +701,7 @@ class LTX2ImageEncodingStage(PipelineStage):
         if self.vae is None:
             raise ValueError("VAE must be provided for LTX-2 TI2V.")
 
-        from sglang.multimodal_gen.runtime.models.vision_utils import load_image
+        from sglang.multimodal_gen.runtime.utils.vision import load_image
 
         # 1. Load images, apply codec compression, resize for condition_image
         conditioned_imgs = []
@@ -932,11 +923,7 @@ class ImageVAEEncodingStage(PipelineStage):
                 )
 
                 # Encode Image
-                with torch.autocast(
-                    device_type=current_platform.device_type,
-                    dtype=vae_dtype,
-                    enabled=vae_autocast_enabled,
-                ):
+                with autocast_context(vae_dtype, server_args.disable_autocast):
                     if server_args.pipeline_config.vae_tiling:
                         self.vae.enable_tiling()
                     # if server_args.vae_sp:

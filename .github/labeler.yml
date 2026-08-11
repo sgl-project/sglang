@@ -9,12 +9,14 @@ model-gateway:
 # Kernel specific
 sgl-kernel:
   - changed-files:
-    - any-glob-to-any-file: 'sgl-kernel/**/*'
+    - any-glob-to-any-file: 'python/sglang/kernels/aot/**/*'
 
 # JIT kernel specific
 jit-kernel:
   - changed-files:
-    - any-glob-to-any-file: 'python/sglang/jit_kernel/**/*'
+    - any-glob-to-any-file:
+      - 'python/sglang/kernels/!(*.md)'
+      - 'python/sglang/kernels/!(aot)/**/*'
 
 # Documentation
 documentation:
@@ -24,7 +26,7 @@ documentation:
       - '**/*.mdx'
       - 'docs/**/*'
       - 'README*'
-      - 'docs_new/**/*'
+      - 'docs/**/*'
 
 # Dependencies
 dependencies:
@@ -90,7 +92,7 @@ blackwell:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*nvfp4*'
-      - 'sgl-kernel/csrc/attention/cutlass_sm100_mla/**/*'
+      - 'python/sglang/kernels/aot/csrc/attention/cutlass_sm100_mla/**/*'
       - 'python/sglang/srt/layers/attention/trtllm_mla_backend.py'
       - 'python/sglang/srt/layers/attention/trtllm_mha_backend.py'
 
@@ -122,3 +124,13 @@ mthreads:
     - any-glob-to-any-file:
       - '**/*mthreads*'
       - '**/*musa*'
+      - '**/musa/**'
+
+# Apple Silicon specific
+apple-silicon:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*metal*'
+      - '**/*mlx*'
+      - '**/mlx/**'
+      - '**/*mps*'

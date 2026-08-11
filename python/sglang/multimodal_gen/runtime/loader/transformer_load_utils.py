@@ -122,6 +122,7 @@ class TransformerQuantLoadSpec:
     quant_config: Optional[QuantizationConfig]
     nunchaku_config: Optional[NunchakuConfig]
     param_dtype: Optional[torch.dtype]
+    needs_device_weight_postprocess: bool = False
     post_load_hooks: list[PostLoadHook] = field(default_factory=list)
 
     @property
@@ -129,6 +130,10 @@ class TransformerQuantLoadSpec:
         if self.quant_config is not None:
             return self.quant_config
         return self.nunchaku_config
+
+    @property
+    def is_modelopt_fp4(self) -> bool:
+        return _get_quant_config_name(self.quant_config) == "modelopt_fp4"
 
 
 class _TransformerQuantAdapter:
@@ -255,6 +260,7 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
 
         quant_name_getter = getattr(type(quant_config), "get_name", None)
         quant_name = quant_name_getter() if callable(quant_name_getter) else None
+
         if quant_name != "modelopt_fp8":
             return
 
@@ -480,8 +486,26 @@ def resolve_transformer_quant_load_spec(
         quant_config=quant_config,
         nunchaku_config=nunchaku_config,
         param_dtype=param_dtype,
+        needs_device_weight_postprocess=_needs_device_weight_postprocess(quant_config),
         post_load_hooks=post_load_hooks,
     )
+
+
+def _needs_device_weight_postprocess(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Return whether post-load weight processing needs CUDA/NPU tensors."""
+    quant_name = _get_quant_config_name(quant_config)
+    serialized_flag_by_quant_name = {
+        "fp8": "is_checkpoint_fp8_serialized",
+        "mxfp8": "is_checkpoint_fp8_serialized",
+        "mxfp4": "is_checkpoint_mxfp4_serialized",
+        "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
+    }
+    serialized_flag = serialized_flag_by_quant_name.get(quant_name)
+    if serialized_flag is None:
+        return False
+    return not getattr(quant_config, serialized_flag, False)
 
 
 def _build_transformer_quant_adapters(
@@ -581,7 +605,12 @@ def _resolve_quant_config(
         # in source dtype and are quantized in
         # process_weights_after_loading.
         quant_cls = get_quantization_config(server_args.quantization)
-        return quant_cls()
+        quant_kwargs = {}
+        if server_args.quantization in {"fp8", "mxfp4"}:
+            quant_kwargs["ignored_layers"] = getattr(
+                server_args, "quantization_ignored_layers", None
+            )
+        return quant_cls(**quant_kwargs)
 
     quant_config = get_quant_config(hf_config, component_model_path)
     if quant_config is None and server_args.transformer_weights_path:
@@ -595,10 +624,12 @@ def _resolve_quant_config(
     reverse_param_names_mapping_dict = getattr(
         arch_config, "reverse_param_names_mapping", None
     )
+    quant_ignore_remap_dict = getattr(arch_config, "quant_ignore_remap", None)
     quant_config = get_quant_config(
         hf_config,
         component_model_path,
         reverse_param_names_mapping=reverse_param_names_mapping_dict,
+        quant_ignore_remap=quant_ignore_remap_dict,
     )
     quant_config_name = _get_quant_config_name(quant_config)
     inferred_nvfp4_config = None

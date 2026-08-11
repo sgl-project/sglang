@@ -13,8 +13,7 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
@@ -395,6 +394,24 @@ class FlashInferWorkspaceManager:
         self._max_token_num_seen: Optional[int] = None
         self._max_hidden_dim_seen: Optional[int] = None
         self._logged_init = False
+        self._workspace_size_check_kwarg = None
+        self._workspace_size_check_strategy_type = None
+
+    def _configure_workspace_size_check(self):
+        """Cache the backend-specific size-check API for this workspace."""
+        size_check_params = inspect.signature(
+            self.workspace.is_buffer_size_sufficient
+        ).parameters
+        if "use_oneshot" in size_check_params:
+            self._workspace_size_check_kwarg = "use_oneshot"
+            self._workspace_size_check_strategy_type = None
+        elif "strategy" in size_check_params:
+            strategy_default = size_check_params["strategy"].default
+            self._workspace_size_check_kwarg = "strategy"
+            self._workspace_size_check_strategy_type = type(strategy_default)
+        else:
+            self._workspace_size_check_kwarg = None
+            self._workspace_size_check_strategy_type = None
 
     def initialize(
         self,
@@ -499,6 +516,7 @@ class FlashInferWorkspaceManager:
             if use_fp32_lamport:
                 create_kw["use_fp32_lamport"] = True
             self.workspace = _create_allreduce_fusion_workspace(**create_kw)
+            self._configure_workspace_size_check()
             self.world_size = world_size
             self.rank = rank
             self.group = (device_group, cpu_group)
@@ -527,6 +545,8 @@ class FlashInferWorkspaceManager:
                 "Disabling flashinfer allreduce fusion permanently."
             )
             self.workspace = None
+            self._workspace_size_check_kwarg = None
+            self._workspace_size_check_strategy_type = None
             self.initialized = False
             return
 
@@ -540,13 +560,25 @@ class FlashInferWorkspaceManager:
         if not self.initialized or self.workspace is None:
             return False
         try:
-            return self.workspace.is_buffer_size_sufficient(
+            check_kw = dict(
                 tp_size=self.world_size,
                 num_tokens=token_num,
                 hidden_dim=hidden_dim,
                 dtype=dtype,
-                use_oneshot=use_oneshot,
             )
+            if self._workspace_size_check_kwarg == "use_oneshot":
+                check_kw["use_oneshot"] = use_oneshot
+            elif (
+                self._workspace_size_check_kwarg == "strategy"
+                and use_oneshot is not None
+            ):
+                # FlashInfer's MNNVL workspace expresses the same choice with
+                # an enum-valued `strategy` argument rather than `use_oneshot`.
+                check_kw["strategy"] = getattr(
+                    self._workspace_size_check_strategy_type,
+                    "ONESHOT" if use_oneshot else "TWOSHOT",
+                )
+            return self.workspace.is_buffer_size_sufficient(**check_kw)
         except Exception as e:
             logger.debug(f"FlashInfer workspace size check failed: {e}")
             # Fallback: some backends may not implement is_buffer_size_sufficient;
@@ -570,6 +602,8 @@ class FlashInferWorkspaceManager:
                 logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
             finally:
                 self.workspace = None
+                self._workspace_size_check_kwarg = None
+                self._workspace_size_check_strategy_type = None
                 self.initialized = False
                 self.world_size = None
                 self.rank = None
@@ -580,14 +614,22 @@ class FlashInferWorkspaceManager:
                 self._logged_init = False
 
 
-_attn_tp_workspace_manager = FlashInferWorkspaceManager()
-_moe_tp_workspace_manager = FlashInferWorkspaceManager()
-
-
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
-    return (
-        _attn_tp_workspace_manager if use_attn_tp_group else _moe_tp_workspace_manager
+    """The per-group fusion workspace manager; the instances live on
+    ``ctx.resources`` (one per comm group, created lazily)."""
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    name = (
+        "flashinfer_fusion_attn_tp_workspace"
+        if use_attn_tp_group
+        else "flashinfer_fusion_moe_tp_workspace"
     )
+    manager = buffers.get(name)
+    if manager is None:
+        manager = FlashInferWorkspaceManager()
+        buffers[name] = manager
+    return manager
 
 
 def _sync_allreduce_unavailable_across_tp():
@@ -665,7 +707,7 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
     if backend is None:
         return False
@@ -853,11 +895,13 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    global _attn_tp_workspace_manager, _moe_tp_workspace_manager
-    if _attn_tp_workspace_manager is not None:
-        _attn_tp_workspace_manager.cleanup()
-    if (
-        _moe_tp_workspace_manager is not None
-        and _moe_tp_workspace_manager is not _attn_tp_workspace_manager
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    for name in (
+        "flashinfer_fusion_attn_tp_workspace",
+        "flashinfer_fusion_moe_tp_workspace",
     ):
-        _moe_tp_workspace_manager.cleanup()
+        manager = buffers.get(name)
+        if manager is not None:
+            manager.cleanup()

@@ -153,6 +153,8 @@ def get_processor(
 
     revision = kwargs.pop("revision", tokenizer_revision)
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
+    if model_name is not None:
+        model_name = resolve_runai_obj_uri(model_name)
 
     if is_mistral_model(tokenizer_name):
         config = load_mistral_config(
@@ -180,6 +182,18 @@ def get_processor(
         config.update({"architectures": ["DeepseekOCRForCausalLM"]})
         if is_ocr2:
             _override_v_head_dim_if_zero(config)
+
+    # Checkpoints with language_model_only=True are text-only despite their
+    # multimodal-family config; route to tokenizer instead of the mm processor.
+    if getattr(config, "language_model_only", False):
+        kwargs.pop("use_fast", None)
+        return AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
 
     if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
         if "size" not in kwargs:

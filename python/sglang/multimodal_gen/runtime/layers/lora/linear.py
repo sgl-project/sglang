@@ -134,10 +134,28 @@ class LoRAAdapter(Adapter):
         base_layer,
     ) -> "LoRAAdapter":
         if layout == ParallelLayout.ColwiseParallelLayout:
-            shard_size = base_layer.output_partition_sizes[0]
-            start_idx = distributed_rank * shard_size
-            end_idx = (distributed_rank + 1) * shard_size
-            B = self.lora_B[start_idx:end_idx, :]
+
+            B = self.lora_B
+            if self.lora_B.dim() == 3:
+                # Stacked Q/K/V (or gate/up) LoRA weights from diffusers-style adapters.
+                shard_size = base_layer.output_partition_sizes[0]
+                start_idx = distributed_rank * shard_size
+                end_idx = (distributed_rank + 1) * shard_size
+                B = self.lora_B[:, start_idx:end_idx, :]
+            else:
+                # Native fused checkpoints (MiniMax H3, etc.) store one concatenated 2D
+                # lora_B matrix per logical layer; shard each section independently.
+                shards: list[torch.Tensor] = []
+                row_offset = 0
+                for full_size, part_size in zip(
+                    base_layer.output_sizes,
+                    base_layer.output_partition_sizes,
+                ):
+                    local_start = distributed_rank * part_size
+                    local_end = (distributed_rank + 1) * part_size
+                    shards.append(B[row_offset + local_start : row_offset + local_end, :])
+                    row_offset += full_size
+                B = torch.cat(shards, dim=0)
             return LoRAAdapter(
                 self.lora_A,
                 B,

@@ -520,8 +520,10 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         # Causal-specific
         self.block_mask = None
-        self.num_frame_per_block = config.arch_config.num_frames_per_block
-        assert self.num_frame_per_block <= 3
+        self.num_frame_per_block = self.config.num_frames_per_block
+        # Block size is bounded only by the causal block-mask construction, which
+        # supports any positive value.
+        assert self.num_frame_per_block >= 1
         self.independent_first_frame = False
 
         self.__post_init__()

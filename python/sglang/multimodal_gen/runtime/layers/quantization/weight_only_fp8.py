@@ -15,7 +15,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 FP8_WEIGHT_DTYPE = torch.float8_e4m3fn
 W8A8_FP8_GEMM_ENV = "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"

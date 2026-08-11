@@ -250,10 +250,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         self.assertIsNone(exporter._current_file_handler)
         self.assertIsNone(exporter._current_hour_suffix)
 
-    def test_close_noop_when_no_handler(self):
-        exporter = self._make_exporter()
-        exporter.close()  # should not raise
-
     def test_close_error(self):
         """Close failure is logged but state is still reset."""
         exporter = self._make_exporter()

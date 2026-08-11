@@ -200,8 +200,8 @@ class LTX2PipelineConfig(PipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_disable_component_offload_min_available_memory_gb=70,
-            auto_disable_component_offload_components=("dit",),
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("dit",),
             auto_cfg_parallel_degree_by_num_gpus=((4, 1), (8, 1)),
         )
 
@@ -716,8 +716,3 @@ class LTX2PipelineConfig(PipelineConfig):
 @dataclasses.dataclass
 class LTX23PipelineConfig(LTX2PipelineConfig):
     """Configuration overrides for LTX-2.3."""
-
-
-@dataclasses.dataclass
-class LTX2I2VPipelineConfig(LTX2PipelineConfig):
-    task_type: ModelTaskType = ModelTaskType.TI2V

@@ -1,3 +1,6 @@
+import ast
+import threading
+import warnings
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -209,6 +212,15 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
             obj, end = JSONDecoder().raw_decode(input_str, start)
             return obj, end
         raise
+    except AssertionError as e:
+        # partial_json_parser.fix_fast() asserts on some partial/ambiguous inputs
+        # (e.g. trailing non-whitespace after an otherwise-fixable prefix) instead
+        # of signaling "incomplete". Convert to JSONDecodeError so streaming
+        # callers treat it as not-yet-complete (wait for more tokens) rather than
+        # raising and failing the request.
+        raise JSONDecodeError(
+            "partial_json_parser assertion (treat as incomplete)", input_str, 0
+        ) from e
 
 
 def _is_complete_json(input_str: str) -> bool:
@@ -217,6 +229,35 @@ def _is_complete_json(input_str: str) -> bool:
         return True
     except JSONDecodeError:
         return False
+
+
+# ``warnings.catch_warnings`` mutates the *process-global* warning filters and
+# is therefore not thread-safe (CPython docs). Tool-call parsing runs on the
+# request path and may execute concurrently, so the enter/eval/restore window
+# is serialized. These helpers are microsecond-cheap; the lock has no perf impact.
+_safe_ast_lock = threading.Lock()
+
+
+def _run_ast_quiet(fn, *args):
+    """Run an ``ast`` function with invalid-escape warnings suppressed.
+
+    CPython parses invalid escapes (e.g. ``"\\d+"``) with the backslash kept
+    and only emits a warning, so the parsed value is already correct —
+    promoting the warning to an error would drop otherwise-valid tool calls.
+
+    Holds ``_safe_ast_lock`` because ``catch_warnings`` touches global state."""
+    with _safe_ast_lock, warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=SyntaxWarning)
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        return fn(*args)
+
+
+def safe_literal_eval(value: str) -> Any:
+    return _run_ast_quiet(ast.literal_eval, value)
+
+
+def safe_ast_parse(source: str) -> ast.Module:
+    return _run_ast_quiet(ast.parse, source)
 
 
 def _get_tool_schema_defs(tools: List[Tool]) -> dict:
@@ -311,6 +352,9 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
                 # If all types are the same, return unified type
                 if len(set(types)) == 1:
                     return types[0]
+                # If it's an optional type, return original type.
+                if len(set(types)) == 2 and "null" in types:
+                    return [t for t in types if t != "null"][0]
                 # When types differ, prioritize string (safest)
                 if "string" in types:
                     return "string"
