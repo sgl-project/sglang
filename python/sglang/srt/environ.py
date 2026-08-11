@@ -334,6 +334,8 @@ class Envs:
     SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # NaN-fill the unified memory pool at boot (debug repro switch).
+    SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
@@ -1251,7 +1253,7 @@ class Envs:
 
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
 
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.

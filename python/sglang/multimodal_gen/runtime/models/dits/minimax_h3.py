@@ -588,6 +588,14 @@ class MiniMaxH3Attention(nn.Module):
         weight = self.qkv_proj.weight
         base_loader = weight.weight_loader
 
+        def _reorder_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
+            return _reorder_grouped_qkv_to_qkv(
+                loaded_weight,
+                num_query_groups=arch.num_attention_heads,
+                heads_per_group=1,
+                head_dim=arch.attention_head_dim,
+            )
+
         def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
             # The grouped checkpoint layout is
             # [num_query_groups, q_per_group + k + v] before splitting.
@@ -602,18 +610,14 @@ class MiniMaxH3Attention(nn.Module):
                 tp_size=self.tp_size,
             ):
                 return
-            reordered = _reorder_grouped_qkv_to_qkv(
-                loaded_weight,
-                num_query_groups=arch.num_attention_heads,
-                heads_per_group=1,
-                head_dim=arch.attention_head_dim,
-            )
-            base_loader(param, reordered)
+            base_loader(param, _reorder_checkpoint_weight(loaded_weight))
 
         if hasattr(weight, "_weight_loader"):
             weight._weight_loader = _weight_loader
         else:
             weight.weight_loader = _weight_loader
+        # rank-local FSDP must reorder grouped QKV before selecting each shard
+        weight.rank_local_weight_transform = _reorder_checkpoint_weight
 
     def forward(
         self,
@@ -1109,7 +1113,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        arch = config.arch_config
+        arch = self.config
         self.arch = arch
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads

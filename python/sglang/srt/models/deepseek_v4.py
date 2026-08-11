@@ -1942,7 +1942,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            # self_attn has already reduced across attention TP, so these hidden
+            # states are replicated and must not be summed by a partial gather.
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
@@ -2465,7 +2467,10 @@ class DeepseekV4Model(nn.Module):
             )
             # Token ids are replicated within an attention-TP group. Use replicate
             # gather here to avoid summing duplicated ids when attention_tp_size > 1.
-            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
+            # Clone because the MAX_LEN gather may zero its local input in place.
+            dp_gather_replicate(
+                input_ids_global, input_ids[:, None].clone(), forward_batch
+            )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
@@ -2487,12 +2492,6 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
         capture_dspark = self.dspark_layers_to_capture is not None
-        if capture_dspark and use_prefill_cp:
-            raise NotImplementedError(
-                "DSpark aux hidden-state capture is not supported together with "
-                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
-                "of them: DSpark static-verify is CP-off for v1."
-            )
         dspark_aux_hidden_states: List[torch.Tensor] = []
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
@@ -2543,12 +2542,21 @@ class DeepseekV4Model(nn.Module):
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and use_prefill_cp and not cp_v2_active:
+            stream = torch.cuda.current_stream()
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                stream,
             )
+            # Gather DSpark aux tensors on the same CP token split.
+            if capture_dspark:
+                dspark_aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        aux, self.cp_size, forward_batch, stream
+                    )
+                    for aux in dspark_aux_hidden_states
+                ]
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.

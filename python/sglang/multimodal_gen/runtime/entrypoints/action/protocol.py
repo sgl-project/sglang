@@ -151,7 +151,7 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
         defaults = Cosmos3SamplingParams()
         return {
             "object": "action.metadata",
-            "model": server_args.model_id or server_args.model_path,
+            "model": server_args.served_model_name,
             "model_path": server_args.model_path,
             "policy_family": "cosmos3",
             "input": {
@@ -201,7 +201,7 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
     )
     return {
         "object": "action.metadata",
-        "model": server_args.model_id or server_args.model_path,
+        "model": server_args.served_model_name,
         "model_path": server_args.model_path,
         "policy_family": policy_family,
         "input": {
@@ -622,7 +622,7 @@ def action_generation_response(
         "id": output.get("request_id") or f"act_{uuid.uuid4().hex}",
         "object": "action.generation",
         "created": int(time.time()),
-        "model": server_args.model_id or server_args.model_path,
+        "model": server_args.served_model_name,
         "data": [
             {
                 "index": 0,
