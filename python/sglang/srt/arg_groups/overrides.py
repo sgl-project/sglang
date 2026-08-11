@@ -935,11 +935,9 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
         elif is_hip():
             overrides["attention_backend"] = "aiter"
         elif not (is_mps() and use_mlx()):
-            # No triton on macOS, but only the MLX runner can actually serve
-            # gpt-oss there -- it owns attention, so it keeps the platform
-            # default. macOS *without* MLX must still fall through to triton
-            # and fail fast below: torch_native has neither sliding-window nor
-            # attention-sink support, so accepting it would silently mis-serve.
+            # Exempt MLX only -- it owns attention in its own runner.  macOS
+            # without MLX still falls through to triton and fails fast below,
+            # rather than landing on torch_native (no sliding window, no sinks).
             overrides["attention_backend"] = "triton"
     if is_xpu():
         # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,
