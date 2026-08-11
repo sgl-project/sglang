@@ -452,6 +452,53 @@ class TestFusedExperts:
             f"max |out| = {out.abs().max().item()}"
         )
 
+    # Moderate exponents only: 6.0 * 2**(255-127) is not representable in bf16
+    # and the comparison would be inf against inf.
+    @pytest.mark.parametrize("e8m0", [120, 127, 134])
+    def test_mxfp4_moe_zero_codes_mixed_with_nonzero(self, e8m0):
+        """Zeros and non-zeros inside the same 32-element scale block.
+
+        test_mxfp4_moe_zero_codes_stay_zero sets every weight to a zero code, so
+        it passes even if the zero check is done once per block. This one mixes
+        both kinds inside every block, so the check has to be per lane. A single
+        shared exponent keeps the reference a plain power of two.
+        """
+        M, N, K, E = 4, 64, 64, 2
+
+        a = torch.randn(M, K, dtype=dtype) / 10
+        # Alternate a zero byte and a non-zero one along K, so every scale block
+        # holds both kinds.
+        pattern = torch.tensor([0x88, 0x21], dtype=torch.uint8).repeat(K // 4)
+        w1q = pattern.view(1, 1, -1).expand(E, 2 * N, K // 2).contiguous()
+        w1s = torch.full((E, 2 * N, K // 32), e8m0, dtype=torch.uint8)
+        w1dq = MXFP4QuantizeUtil.dequantize(w1q, dtype, w1s)
+        w1_packed = kernel.convert_weight_packed(w1q)
+        w1s_packed = kernel.convert_scale_packed(w1s)
+
+        w2dq, w2_packed, w2s_packed = make_mxfp4_weights(E, K, N, dtype=dtype)
+
+        topk_weight = torch.ones((M, 1), dtype=torch.float32)
+        topk_ids = torch.zeros((M, 1), dtype=torch.int32)
+
+        ref_out = native_fp8_fused_moe(
+            a, w1dq.float(), w2dq.float(), topk_weight, topk_ids, 1
+        )
+        out = run_fused_experts(
+            a,
+            w1_packed,
+            w2_packed,
+            topk_weight,
+            topk_ids,
+            quant=CPUQuantMethod.MXFP4,
+            w1_scale=w1s_packed,
+            w2_scale=w2s_packed,
+            is_vnni=True,
+            inplace=False,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
+
     @pytest.mark.parametrize("m", [1, 32])
     @pytest.mark.parametrize("n", [128, 64])
     @pytest.mark.parametrize("k", [128, 64])
