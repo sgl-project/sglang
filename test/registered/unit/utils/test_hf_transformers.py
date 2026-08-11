@@ -39,51 +39,71 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestGetProcessor(unittest.TestCase):
-    def test_maps_image_processor_backend(self):
-        config = SimpleNamespace(model_type="test_vlm", auto_map={})
-
-        for use_fast, expected_backend in ((True, "torchvision"), (False, "pil")):
-            with self.subTest(use_fast=use_fast):
-                loaded_processor = MagicMock()
-                loaded_processor.tokenizer.chat_template = "template"
-                auto_config = MagicMock()
-                auto_config.from_pretrained.return_value = config
-                auto_processor = MagicMock()
-                auto_processor.from_pretrained.return_value = loaded_processor
-
-                with patch.multiple(
-                    processor_utils,
-                    AutoConfig=auto_config,
-                    AutoProcessor=auto_processor,
-                ):
-                    processor_utils.get_processor("test-model", use_fast=use_fast)
-
-                call_kwargs = auto_processor.from_pretrained.call_args.kwargs
-                self.assertEqual(call_kwargs["backend"], expected_backend)
-                self.assertNotIn("use_fast", call_kwargs)
-
-    def test_retries_with_torchvision_when_pil_is_unavailable(self):
+    def test_does_not_forward_backend_to_auto_processor(self):
         config = SimpleNamespace(model_type="test_vlm", auto_map={})
         loaded_processor = MagicMock()
+        loaded_processor.image_processor.backend = "torchvision"
         loaded_processor.tokenizer.chat_template = "template"
         auto_config = MagicMock()
         auto_config.from_pretrained.return_value = config
         auto_processor = MagicMock()
-        auto_processor.from_pretrained.side_effect = [
-            ValueError("does not have a slow version"),
-            loaded_processor,
-        ]
+        auto_processor.from_pretrained.return_value = loaded_processor
+        auto_image_processor = MagicMock()
 
         with patch.multiple(
             processor_utils,
             AutoConfig=auto_config,
             AutoProcessor=auto_processor,
+            AutoImageProcessor=auto_image_processor,
         ):
-            processor_utils.get_processor("test-model", use_fast=False)
+            processor_utils.get_processor(
+                "test-model", image_processor_backend="torchvision"
+            )
 
-        retry_kwargs = auto_processor.from_pretrained.call_args_list[1].kwargs
-        self.assertEqual(retry_kwargs["backend"], "torchvision")
-        self.assertNotIn("use_fast", retry_kwargs)
+        call_kwargs = auto_processor.from_pretrained.call_args.kwargs
+        self.assertNotIn("backend", call_kwargs)
+        self.assertNotIn("use_fast", call_kwargs)
+        auto_image_processor.from_pretrained.assert_not_called()
+
+    def test_applies_pil_backend_only_to_image_processor(self):
+        config = SimpleNamespace(model_type="test_vlm", auto_map={})
+
+        for processor_kwargs in (
+            {"image_processor_backend": "pil"},
+            {"use_fast": False},
+        ):
+            with self.subTest(processor_kwargs=processor_kwargs):
+                loaded_processor = MagicMock()
+                loaded_processor.image_processor.backend = "torchvision"
+                loaded_processor.tokenizer.chat_template = "template"
+                pil_processor = MagicMock(backend="pil")
+                auto_config = MagicMock()
+                auto_config.from_pretrained.return_value = config
+                auto_processor = MagicMock()
+                auto_processor.from_pretrained.return_value = loaded_processor
+                auto_image_processor = MagicMock()
+                auto_image_processor.from_pretrained.return_value = pil_processor
+
+                with patch.multiple(
+                    processor_utils,
+                    AutoConfig=auto_config,
+                    AutoProcessor=auto_processor,
+                    AutoImageProcessor=auto_image_processor,
+                ):
+                    processor = processor_utils.get_processor(
+                        "test-model", **processor_kwargs
+                    )
+
+                call_kwargs = auto_processor.from_pretrained.call_args.kwargs
+                self.assertNotIn("backend", call_kwargs)
+                self.assertNotIn("use_fast", call_kwargs)
+                auto_image_processor.from_pretrained.assert_called_once_with(
+                    "test-model",
+                    trust_remote_code=False,
+                    revision=None,
+                    backend="pil",
+                )
+                self.assertIs(processor.image_processor, pil_processor)
 
     def test_resolves_model_name_before_loading_config(self):
         remote_model = "s3://bucket/model"

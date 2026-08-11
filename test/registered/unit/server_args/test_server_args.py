@@ -142,6 +142,41 @@ class TestMmEncoderDataParallelLogging(CustomTestCase):
         self.assertIn("high-resolution or multi-image", logs.output[0])
 
 
+class TestImageProcessorBackend(CustomTestCase):
+    def test_new_backend_does_not_set_legacy_flag(self):
+        server_args = ServerArgs(model_path="dummy", image_processor_backend="pil")
+
+        server_args._handle_deprecated_args()
+
+        self.assertEqual(server_args.image_processor_backend, "pil")
+        self.assertFalse(server_args.disable_fast_image_processor)
+
+    def test_legacy_flag_maps_to_pil_with_one_warning(self):
+        server_args = ServerArgs(model_path="dummy", disable_fast_image_processor=True)
+
+        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+            server_args._handle_deprecated_args()
+
+        self.assertEqual(server_args.image_processor_backend, "pil")
+        self.assertTrue(server_args.disable_fast_image_processor)
+        self.assertEqual(
+            sum(
+                "--disable-fast-image-processor is deprecated" in x for x in logs.output
+            ),
+            1,
+        )
+
+    def test_legacy_flag_rejects_torchvision_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            image_processor_backend="torchvision",
+            disable_fast_image_processor=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "conflicts.*torchvision"):
+            server_args._handle_deprecated_args()
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @staticmethod
     def _set_model_type(server_args, *, is_multimodal):
