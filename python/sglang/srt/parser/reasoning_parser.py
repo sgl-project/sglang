@@ -30,6 +30,7 @@ from sglang.srt.function_call.muse_glimmer_format import (
     MESSAGE,
     RECIPIENT_RE,
     START,
+    could_start_header,
     has_atem_markers,
     partial_marker_len,
 )
@@ -1682,6 +1683,7 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
         )
         self._recipient: Optional[str] = None
         self._in_body = False
+        self._at_stream_start = True
         self._pending_reasoning = ""
         self._tool_call_parser_active = tool_call_parser_active
         self._saw_reasoning_block = False
@@ -1705,12 +1707,31 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
 
         while self._buffer:
             if not self._in_body:
+                # Decide whether a header is still coming before buffering for
+                # one; otherwise unframed prose never streams (the <|message|>
+                # it waits for never arrives). Mirrors the function-call
+                # detector's own header resolution.
+                if not (self._at_stream_start and could_start_header(self._buffer)):
+                    ws = len(self._buffer) - len(self._buffer.lstrip())
+                    head = self._buffer[ws : ws + len(START)]
+                    if not START.startswith(head):
+                        self._in_body = True
+                        self._recipient = None
+                        self._at_stream_start = False
+                        continue
+                    if ws:
+                        normal_parts.append(self._buffer[:ws])
+                        self._buffer = self._buffer[ws:]
+                    if len(head) < len(START):
+                        break
+
                 idx = self._buffer.find(MESSAGE)
                 if idx == -1:
                     if flush:
                         normal_parts.append(self._buffer)
                         self._buffer = ""
                     break
+                self._at_stream_start = False
                 header = self._buffer[:idx]
                 m = RECIPIENT_RE.search(header)
                 self._recipient = m.group(1) if m else "user"
@@ -1772,6 +1793,7 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
             self._buffer = raw
             self._recipient = None
             self._in_body = False
+            self._at_stream_start = True
             self._saw_reasoning_block = False
             reasoning, normal = self._consume(flush=True, preserve_channels=True)
         return self._maybe_apply_force_nonempty_content(
@@ -1788,6 +1810,14 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
             reasoning = ""
             if not self._in_body and self._pending_reasoning:
                 reasoning, self._pending_reasoning = self._pending_reasoning, ""
+        if self._force_nonempty_content:
+            # Base contract: keep a copy of the reasoning so finish() can promote
+            # it to content if the turn produces none. Drop it when real content
+            # arrives, NOT when the reasoning channel closes -- <|eom|> lands in
+            # the same chunk as the last reasoning text.
+            self._accumulated_reasoning += reasoning
+            if normal:
+                self._accumulated_reasoning = ""
         return StreamingParseResult(normal_text=normal, reasoning_text=reasoning)
 
     def finish(self) -> StreamingParseResult:
@@ -1797,6 +1827,11 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
         if self._pending_reasoning:
             reasoning = self._pending_reasoning + reasoning
             self._pending_reasoning = ""
+        if self._force_nonempty_content:
+            promoted = self._accumulated_reasoning + reasoning
+            self._accumulated_reasoning = ""
+            if not normal and promoted:
+                return StreamingParseResult(normal_text=promoted)
         return StreamingParseResult(normal_text=normal, reasoning_text=reasoning)
 
 

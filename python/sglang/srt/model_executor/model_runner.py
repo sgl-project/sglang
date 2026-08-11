@@ -722,6 +722,12 @@ class ModelRunner:
             ElasticEPStateManager.init(self.server_args)
 
     def init_token_oracle(self):
+        # The oracle sampler is installed process-wide, so only the target
+        # publishes it; a draft would overwrite it with its own vocab (and a
+        # DFlash draft has none of its own until the worker borrows one).
+        if self.is_draft_worker:
+            self._token_oracle_manager = None
+            return
         self._token_oracle_manager = install_token_oracle_from_env(
             server_args=self.server_args,
             vocab_size=self.model_config.vocab_size,

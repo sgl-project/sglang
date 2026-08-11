@@ -22,6 +22,21 @@ MAX_CHANNEL_MARKER = max(len(m) for m in (MESSAGE, EOM, EOT, START))
 MAX_MARKER = max(MAX_CHANNEL_MARKER, len(FUNCTION_CALLS_OPEN))
 
 
+def could_start_header(text: str) -> bool:
+    """Whether the tail could still grow into a header."""
+    stripped = text.lstrip()
+    if not stripped:
+        return True
+    if not (stripped.startswith("to=") or "to=".startswith(stripped[:3])):
+        return False
+    if MESSAGE in stripped:
+        return True
+    recipient, angle, marker = stripped[3:].partition("<")
+    if any(c.isspace() for c in recipient):
+        return False
+    return not angle or MESSAGE.startswith("<" + marker)
+
+
 def has_atem_markers(text: str) -> bool:
     return INVOKE_OPEN in text or FUNCTION_CALLS_OPEN in text
 

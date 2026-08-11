@@ -23,6 +23,7 @@ from sglang.srt.function_call.muse_glimmer_format import (
     MESSAGE,
     RECIPIENT_RE,
     START,
+    could_start_header,
     has_atem_markers,
     partial_marker_len,
 )
@@ -66,21 +67,6 @@ def _normalize_name(emitted: str, registered: Set[str]) -> str:
     if len(matches) == 1:
         return matches[0]
     return emitted
-
-
-def _could_start_header(text: str) -> bool:
-    """Whether the tail could still grow into a header."""
-    stripped = text.lstrip()
-    if not stripped:
-        return True
-    if not (stripped.startswith("to=") or "to=".startswith(stripped[:3])):
-        return False
-    if MESSAGE in stripped:
-        return True
-    recipient, angle, marker = stripped[3:].partition("<")
-    if any(c.isspace() for c in recipient):
-        return False
-    return not angle or MESSAGE.startswith("<" + marker)
 
 
 class MuseGlimmerDetector(BaseFormatDetector):
@@ -162,7 +148,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
         while self._buffer:
             if not self._in_body:
                 # Resolve the channel header before anything can be emitted.
-                if self._at_stream_start and _could_start_header(self._buffer):
+                if self._at_stream_start and could_start_header(self._buffer):
                     pass
                 else:
                     ws = len(self._buffer) - len(self._buffer.lstrip())
