@@ -20,6 +20,18 @@ from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 _MODULE_NAME_PREFIX = "sgl_kernel_jit_"
 
 
+def jit_module_name(*args: str) -> str:
+    """The library basename (without ``.so``) that ``load_jit(*args)`` builds.
+
+    A caller that pins ``build_directory`` needs to find its own library there
+    afterwards, and that directory is shared: it is keyed by what the caller
+    names it, not by this convention, so libraries built by other versions of
+    this code can sit alongside. Addressing the artifact by name is the only way
+    to be sure of picking the one that was just loaded.
+    """
+    return _MODULE_NAME_PREFIX + "_".join(args)
+
+
 class TranslationUnit(msgspec.Struct, frozen=True):
     """One file handed to the compiler.
 
@@ -54,7 +66,7 @@ class BuildSpec(msgspec.Struct, frozen=True):
     @property
     def module_name(self) -> str:
         """Derived: the args are the module's identity, the name just spells it."""
-        return _MODULE_NAME_PREFIX + "_".join(self.module_args)
+        return jit_module_name(*self.module_args)
 
     @property
     def sources(self) -> Tuple[str, ...]:

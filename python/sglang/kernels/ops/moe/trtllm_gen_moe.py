@@ -48,6 +48,7 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
+    jit_module_name,
     load_jit,
 )
 from sglang.srt.environ import envs
@@ -261,6 +262,7 @@ def _jit_trtllm_gen_moe_module() -> Module:
     # reach plain C symbols that tvm-ffi does not expose.
     path_tag = hashlib.sha256(cubin_path.encode()).hexdigest()[:8]
     build_dir = cache / f"sgl_trtllm_gen_moe_{meta_tag}_{path_tag}"
+    module_args = ("trtllm_gen_moe", meta_tag, path_tag)
 
     cpp_files = [_resolve_source(s) for s in _SOURCES if s.endswith(".cpp")]
     cuda_files = [_resolve_source(s) for s in _SOURCES if s.endswith(".cu")]
@@ -269,9 +271,7 @@ def _jit_trtllm_gen_moe_module() -> Module:
     # The trtllm-gen cubins themselves are prebuilt (sm100f) and loaded at
     # runtime, unaffected by this flag.
     module = load_jit(
-        "trtllm_gen_moe",
-        meta_tag,
-        path_tag,
+        *module_args,
         cpp_files=cpp_files,
         cuda_files=cuda_files,
         header_only=False,  # the launcher exports its own tvm-ffi functions
@@ -327,10 +327,15 @@ def _jit_trtllm_gen_moe_module() -> Module:
         ],
         build_directory=str(build_dir),
     )
-    so_files = sorted(build_dir.glob("*.so"))
-    if not so_files:
-        raise RuntimeError(f"no built .so under {build_dir}")
-    _setup_cubin_loader(str(so_files[-1]), pool / "local")
+    # Addressed by name, not globbed: the pinned directory is keyed by the pool
+    # identity alone, so libraries built by other versions of the JIT layer --
+    # whose module names carry extra suffixes -- outlive them there. Picking the
+    # last one alphabetically hands ctypes a stale library, and the callback
+    # then lands on an image nobody calls: `FlashInferSetCubinCallback not set`.
+    library = build_dir / f"{jit_module_name(*module_args)}.so"
+    if not library.is_file():
+        raise RuntimeError(f"no built {library.name} under {build_dir}")
+    _setup_cubin_loader(str(library), pool / "local")
     return module
 
 

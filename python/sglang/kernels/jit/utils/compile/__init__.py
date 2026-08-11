@@ -28,7 +28,7 @@ from sglang.kernels.jit.utils.compile.paths import (
     DEFAULT_LDFLAGS,
     KERNEL_PATH,
 )
-from sglang.kernels.jit.utils.compile.spec import BuildSpec
+from sglang.kernels.jit.utils.compile.spec import BuildSpec, jit_module_name
 
 __all__ = [
     "BuildSpec",
@@ -39,6 +39,7 @@ __all__ = [
     "DEFAULT_INCLUDE",
     "DEFAULT_LDFLAGS",
     "KERNEL_PATH",
+    "jit_module_name",
     "load_jit",
     "make_cpp_args",
 ]

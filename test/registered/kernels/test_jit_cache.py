@@ -563,6 +563,22 @@ def test_module_name_is_derived_from_the_args():
     assert _spec().module_name == "sgl_kernel_jit_activation_bf16_t"
 
 
+def test_the_published_name_is_the_library_the_build_produces():
+    """`jit_module_name` must name the file the build actually writes.
+
+    A caller that pins `build_directory` finds its library there by this name --
+    trtllm-gen MoE reopens it with ctypes to reach C symbols tvm-ffi does not
+    export. That directory is keyed by the caller, not by this convention, so a
+    library built by another version of the JIT layer can sit beside it and a
+    name that drifts silently selects the wrong one.
+    """
+    from sglang.kernels.jit.utils.compile.spec import jit_module_name
+
+    spec = _spec()
+    expected = f"{jit_module_name(*spec.module_args)}.so"
+    assert f"default {expected}" in ninja.generate(spec).splitlines()
+
+
 def test_relative_sources_resolve_against_csrc():
     from sglang.kernels.jit.utils.compile.spec import resolve_sources
 

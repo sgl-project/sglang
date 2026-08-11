@@ -14,7 +14,12 @@ from sglang.kernels.jit.utils.common import (
     lazy_register_class,
     should_run_full_tests,
 )
-from sglang.kernels.jit.utils.compile import KERNEL_PATH, load_jit, make_cpp_args
+from sglang.kernels.jit.utils.compile import (
+    KERNEL_PATH,
+    jit_module_name,
+    load_jit,
+    make_cpp_args,
+)
 
 __all__ = [
     "empty_sentinel",
@@ -25,6 +30,7 @@ __all__ = [
     "is_hip_runtime",
     "is_musa_runtime",
     "make_cpp_args",
+    "jit_module_name",
     "load_jit",
     "override_jit_cuda_arch",
     "get_jit_cuda_arch",
