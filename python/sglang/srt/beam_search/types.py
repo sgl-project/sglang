@@ -33,6 +33,3 @@ class BeamSearchSequence:
     finish_reason: Optional[object] = None
     text: Optional[str] = None
     beam_score: Optional[float] = None  # length-normalized; the sort key
-
-    def finished(self):
-        return self.finish_reason is not None

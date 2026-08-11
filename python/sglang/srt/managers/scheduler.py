@@ -2086,7 +2086,6 @@ class Scheduler(
             server_args=self.server_args,
             model_config=self.model_config,
             spec_algorithm=self.spec_algorithm,
-            enable_overlap=self.enable_overlap,
             dllm_enabled=self.dllm_config is not None,
             max_req_len=self.max_req_len,
             req_to_token_pool=self.req_to_token_pool,

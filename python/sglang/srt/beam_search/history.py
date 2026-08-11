@@ -29,15 +29,3 @@ def materialize_tokens(leaf: Optional[BeamNode]) -> List[int]:
         node = node.parent
     tokens.reverse()
     return tokens
-
-
-def tail_tokens(leaf: Optional[BeamNode], num_tokens: int) -> List[int]:
-    """Up to the last num_tokens tokens ending at leaf, in order. Currently
-    exercised only by tests; for a future bounded stop-string check."""
-    tokens: List[int] = []
-    node = leaf
-    while node is not None and len(tokens) < num_tokens:
-        tokens.append(node.token)
-        node = node.parent
-    tokens.reverse()
-    return tokens

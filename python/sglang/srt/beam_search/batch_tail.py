@@ -21,7 +21,6 @@ class BeamTail:
     tail-relative start, tail-relative end)."""
 
     num_base_rows: int
-    num_tail_rows: int
     entries: List[Tuple[Any, int, int, int]]
 
 
@@ -78,9 +77,7 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
         ]
     )
     batch.seq_lens_sum = None
-    batch.beam_tail = BeamTail(
-        num_base_rows=len(batch.reqs), num_tail_rows=t, entries=entries
-    )
+    batch.beam_tail = BeamTail(num_base_rows=len(batch.reqs), entries=entries)
 
 
 def strip_beam_tail(batch: ScheduleBatch) -> None:

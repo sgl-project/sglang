@@ -181,7 +181,6 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
             server_args=None,
             model_config=None,
             spec_algorithm=None,
-            enable_overlap=True,
             dllm_enabled=False,
             max_req_len=0,
             req_to_token_pool=None,

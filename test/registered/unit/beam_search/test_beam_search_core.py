@@ -19,7 +19,6 @@ from sglang.srt.beam_search import (
     joint_select,
     materialize_tokens,
     select_final_topk,
-    tail_tokens,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -175,15 +174,13 @@ class TestJointSelectDifferential(CustomTestCase):
 
 
 class TestHistory(CustomTestCase):
-    def test_materialize_and_tail(self):
+    def test_materialize(self):
         a = BeamNode(1)
         b = BeamNode(2, a)
         c = BeamNode(3, a)  # reparent: sibling branch off the same prefix
         self.assertEqual(materialize_tokens(b), [1, 2])
         self.assertEqual(materialize_tokens(c), [1, 3])
         self.assertEqual(materialize_tokens(None), [])
-        self.assertEqual(tail_tokens(c, 1), [3])
-        self.assertEqual(tail_tokens(b, 5), [1, 2])
 
 
 class TestBeamGroup(CustomTestCase):

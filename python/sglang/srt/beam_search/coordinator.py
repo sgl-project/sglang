@@ -78,7 +78,6 @@ class BeamCoordinator:
     server_args: ServerArgs
     model_config: ModelConfig
     spec_algorithm: SpeculativeAlgorithm
-    enable_overlap: bool
     dllm_enabled: bool
     max_req_len: int
     req_to_token_pool: ReqToTokenPool
@@ -86,7 +85,6 @@ class BeamCoordinator:
     tree_cache: BasePrefixCache
     future_map: FutureMap
 
-    _kv_buffers: Optional[List[torch.Tensor]] = None
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
 
@@ -568,16 +566,3 @@ class BeamCoordinator:
         if not torch.is_tensor(tokens):
             tokens = torch.tensor(tokens, dtype=torch.int64, device=device)
         self.future_map.stash(rows, RelayPayload(bonus_tokens=tokens))
-
-    def _kv_data_buffers(self) -> List[torch.Tensor]:
-        if self._kv_buffers is None:
-            pool = self.token_to_kv_pool_allocator.get_kvcache()
-            if hasattr(pool, "k_buffer") and hasattr(pool, "v_buffer"):
-                self._kv_buffers = list(pool.k_buffer) + list(pool.v_buffer)
-            elif hasattr(pool, "kv_buffer"):
-                self._kv_buffers = list(pool.kv_buffer)
-            else:
-                raise NotImplementedError(
-                    f"beam search reparent does not support KV pool {type(pool)}"
-                )
-        return self._kv_buffers
