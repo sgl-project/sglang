@@ -720,12 +720,9 @@ void load_cache_to_device_buffer(
   const int64_t bs = top_k_tokens.shape()[0];
   const int64_t host_stride = host_cache_locs.shape()[1];
   // Miss-plan side outputs; 0-dim sentinels when RecordMissPlan is false.
-  int64_t* const miss_src_ptr =
-      RecordMissPlan ? static_cast<int64_t*>(miss_src_out.data_ptr()) : nullptr;
-  int32_t* const miss_dst_ptr =
-      RecordMissPlan ? static_cast<int32_t*>(miss_dst_out.data_ptr()) : nullptr;
-  int32_t* const miss_count_ptr =
-      RecordMissPlan ? static_cast<int32_t*>(miss_count_out.data_ptr()) : nullptr;
+  int64_t* const miss_src_ptr = RecordMissPlan ? static_cast<int64_t*>(miss_src_out.data_ptr()) : nullptr;
+  int32_t* const miss_dst_ptr = RecordMissPlan ? static_cast<int32_t*>(miss_dst_out.data_ptr()) : nullptr;
+  int32_t* const miss_count_ptr = RecordMissPlan ? static_cast<int32_t*>(miss_count_out.data_ptr()) : nullptr;
   const int64_t plan_stride = RecordMissPlan ? miss_src_out.strides()[0] : 0;
   if (RecordMissPlan && miss_dst_out.strides()[0] != plan_stride) {
     throw std::runtime_error("load_cache_to_device_buffer: miss_src/miss_dst row strides differ");
