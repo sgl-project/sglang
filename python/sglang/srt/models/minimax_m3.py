@@ -83,7 +83,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
@@ -182,6 +182,7 @@ class _FusedQKVIndexProj(nn.Module):
         input_size_per_partition: int,
         logical_widths: List[int],
         orig_dtype: torch.dtype,
+        convert_mxfp8_to_block: bool = False,
     ) -> None:
         super().__init__()
         # Named ``_qm`` (not ``quant_method``) so the loader's post-process loop
@@ -198,9 +199,15 @@ class _FusedQKVIndexProj(nn.Module):
                 "weight_scale_inv", nn.Parameter(weight_scale_inv, requires_grad=False)
             )
             self.weight_scale_inv.format_ue8m0 = True
-            # Must derive the backend scale layout here: the loader skips this
-            # module (see ``_qm``), so it won't run process_weights_after_loading.
-            quant_method._process_mxfp8_linear_weight_scale(self)
+            # The loader skips this module (see ``_qm``), so it won't run
+            # process_weights_after_loading: derive the backend state here.
+            if convert_mxfp8_to_block:
+                # Same conversion the loader pass applies to unfused layers
+                # (block-fp8 requant + flag flips + bpreshuffle + optional
+                # cached-BF16 decode copy).
+                quant_method.process_weights_after_loading_block_quant(self)
+            else:
+                quant_method._process_mxfp8_linear_weight_scale(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._qm.apply(self, x, None)
@@ -285,8 +292,10 @@ class MiniMaxM3MoE(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
+        self.alt_stream = alt_stream
         self.tp_size = get_parallel().tp_size
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
         self.num_fused_shared_experts = (
@@ -396,8 +405,17 @@ class MiniMaxM3MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        shared_event = None
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
+            if self.alt_stream is not None:
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(hidden_states)
+                    if shared_output is not None:
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
         else:
@@ -407,6 +425,8 @@ class MiniMaxM3MoE(nn.Module):
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:
+            if shared_event is not None:
+                torch.cuda.current_stream().wait_event(shared_event)
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -822,11 +842,7 @@ class MiniMaxM3Attention(nn.Module):
         if type(ip.quant_method) is not type(qm):
             return
 
-        # gfx942 converts MXFP8->block-fp8 in process_weights_after_loading; the
-        # fused module skips that pass, so keep two separate (converted) GEMMs.
-        if getattr(qm, "convert_mxfp8_to_block", False):
-            return
-
+        convert_mxfp8_to_block = getattr(qm, "convert_mxfp8_to_block", False)
         is_unquant = isinstance(qm, UnquantizedLinearMethod)
         use_mxfp8 = getattr(qm, "use_mxfp8", False) and hasattr(qp, "weight_scale_inv")
         if not (is_unquant or use_mxfp8):
@@ -847,6 +863,7 @@ class MiniMaxM3Attention(nn.Module):
             getattr(qp, "input_size_per_partition", qp.input_size),
             [qp.output_size_per_partition, ip.output_size_per_partition],
             getattr(qp, "orig_dtype", qp.params_dtype),
+            convert_mxfp8_to_block=convert_mxfp8_to_block,
         )
         self.add_module("fused_qkv_index_proj", holder)
         self._fused_qkv_index = holder
@@ -1143,6 +1160,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1182,6 +1200,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                alt_stream=alt_stream,
             )
         else:
             if enable_moe_dense_fully_dp():
@@ -1324,12 +1343,19 @@ class MiniMaxM3Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        alt_stream = (
+            get_stream("alt")
+            if (_is_cuda or _is_hip) and is_shared_experts_fusion_disabled()
+            else None
+        )
+
         def layer_fn(idx, prefix: str) -> nn.Module:
             return MiniMaxM3DecoderLayer(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=alt_stream,
             )
 
         self.layers, self.start_layer, self.end_layer = make_layers(

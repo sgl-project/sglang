@@ -683,6 +683,17 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
+    # Convert MXFP8 *dense linear* weights to block-fp8 [128,128] at load (aiter
+    # block-scale GEMMs) while keeping the fused MoE on the native MX per-1x32
+    # path. Use when the model's MoE activation (e.g. SwiGLU-OAI) is unsupported
+    # by the CK block-scale MoE kernel, which the full
+    # SGLANG_FORCE_MXFP8_BLOCK_CONVERT would require.
+    SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
+    # With the dense block-convert above: batches of at most this many tokens run
+    # the dense linear as cached-BF16 F.linear (fast skinny-M hipblaslt) instead of
+    # the aiter block-fp8 GEMM (fast at large M). 0 disables the hybrid. Costs one
+    # BF16 weight copy per dense linear.
+    SGLANG_OPT_MXFP8_DENSE_BF16_DECODE_M = EnvInt(0)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 

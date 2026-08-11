@@ -465,7 +465,10 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        self.convert_mxfp8_to_block = self.use_mxfp8 and (
+            _mxfp8_to_block_fp8_required
+            or envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get()
+        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
@@ -658,10 +661,23 @@ class Fp8LinearMethod(LinearMethodBase):
                 convert_mxfp8_weight_to_block_fp8,
             )
 
+            bf16_decode_m = envs.SGLANG_OPT_MXFP8_DENSE_BF16_DECODE_M.get()
+            if bf16_decode_m > 0:
+                from sglang.srt.layers.quantization.mxfp8_block_convert import (
+                    dequant_mxfp8_2d_to_bf16,
+                )
+
+                bf16_weight = dequant_mxfp8_2d_to_bf16(
+                    layer.weight.data, layer.weight_scale_inv.data
+                )
             qweight, scale = convert_mxfp8_weight_to_block_fp8(
                 layer.weight.data, layer.weight_scale_inv.data, block=128
             )
             layer.weight = Parameter(qweight, requires_grad=False)
+            if bf16_decode_m > 0:
+                # Consumed by aiter_w8a8_block_fp8_linear's small-M fast path;
+                # survives the later in-place bpreshuffle (copy_ keeps the object).
+                layer.weight._bf16_dense_decode = bf16_weight
             layer.weight_scale_inv = Parameter(scale, requires_grad=False)
             self.use_mxfp8 = False
             self.convert_mxfp8_to_block = False

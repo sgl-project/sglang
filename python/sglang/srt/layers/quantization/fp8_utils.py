@@ -6,11 +6,13 @@ from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -65,6 +67,7 @@ _is_musa = is_musa()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+_MXFP8_DENSE_BF16_DECODE_M = envs.SGLANG_OPT_MXFP8_DENSE_BF16_DECODE_M.get()
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 # gfx95 + ROCm < 7.2: bpreshuffle CK is disabled (above), and the non-bpreshuffle
@@ -1114,6 +1117,18 @@ def aiter_w8a8_block_fp8_linear(
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    # Skinny-M fast path: dense linears converted from MXFP8 may carry a cached
+    # BF16 copy (see Fp8LinearMethod / SGLANG_OPT_MXFP8_DENSE_BF16_DECODE_M);
+    # hipblaslt BF16 beats the block-fp8 GEMMs at decode-sized M.
+    bf16_weight = getattr(weight, "_bf16_dense_decode", None)
+    if (
+        bf16_weight is not None
+        and input_scale is None
+        and input_2d.shape[0] <= _MXFP8_DENSE_BF16_DECODE_M
+    ):
+        out = F.linear(input_2d.to(bf16_weight.dtype), bf16_weight, bias)
+        return out.to(input.dtype).view(*output_shape)
 
     n, k = weight.shape
 
