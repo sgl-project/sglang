@@ -480,9 +480,11 @@ async def async_request_openai_chat_completions(
                         output.ttft = (
                             output.latency
                         )  # For non-streaming, TTFT = total latency
-                        output.output_len = response_json.get("usage", {}).get(
-                            "completion_tokens", output_len
+                        usage = response_json.get("usage") or {}
+                        output.prompt_len = usage.get(
+                            "prompt_tokens", output.prompt_len
                         )
+                        output.output_len = usage.get("completion_tokens", output_len)
                         _meta_info = response_json["choices"][0].get("meta_info") or {}
                         output.spec_accept_length = (
                             _meta_info.get("spec_accept_length", 0.0) or 0.0
@@ -513,9 +515,11 @@ async def async_request_openai_chat_completions(
                                 data = json.loads(chunk)
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
+                                usage = data.get("usage") or {}
+                                output.prompt_len = usage.get(
+                                    "prompt_tokens", output.prompt_len
                                 )
+                                output_len = usage.get("completion_tokens", output_len)
 
                                 if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
