@@ -23,6 +23,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.gemm.router_gemv import (
+    router_gemv,
+    router_gemv_supported,
+)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
@@ -462,6 +466,10 @@ class MiniMaxM3MoE(nn.Module):
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.bf16_router_gemm:
+            if envs.SGLANG_OPT_USE_TRITON_ROUTER_GEMV.get() and router_gemv_supported(
+                hidden_states, self.gate.weight
+            ):
+                return router_gemv(hidden_states, self.gate.weight)
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
             )

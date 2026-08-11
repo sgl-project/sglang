@@ -1288,6 +1288,9 @@ class Envs:
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
+    # Router-logits GEMV via Triton split-K for skinny M (hipblaslt runs the
+    # M<=8, N=128 router mm at ~0.1 TB/s on gfx950). bf16 router mode only.
+    SGLANG_OPT_USE_TRITON_ROUTER_GEMV = EnvBool(False)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
