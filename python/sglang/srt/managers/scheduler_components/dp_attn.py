@@ -179,12 +179,10 @@ class MLPSyncBatchInfo:
             )
         tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
-        # One D2H for every field the scheduler reads; each further `.item()` /
-        # `.tolist()` on the device tensor would be its own stream sync, and the
-        # reductions below cost nothing on host. Copy the whole contiguous
-        # tensor rather than the `[:, 0, :]` slice -- that slice is
-        # non-contiguous once attn_tp * attn_cp > 1, which adds a gather kernel
-        # inside the blocking wait.
+        # One D2H for every field: each `.item()` / `.tolist()` on a device
+        # tensor is its own stream sync. Copy the whole tensor, not the
+        # `[:, 0, :]` slice -- that slice is non-contiguous once
+        # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
