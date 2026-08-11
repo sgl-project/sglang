@@ -139,7 +139,8 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
 
     def test_mrope_matches_the_rotary_module(self):
         """With t == h == w every layout agrees, so only distinct rows catch a wrong
-        axis. [24, 20, 20] is Qwen3.5's shape and leaves no pass-through tail.
+        axis. Interleaved [11, 11, 10] is what Qwen3.6-35B-A3B ships, and [24, 20, 20]
+        fills the head dimension, leaving no pass-through tail.
         """
         for section, interleaved in (
             ([11, 11, 10], False),
