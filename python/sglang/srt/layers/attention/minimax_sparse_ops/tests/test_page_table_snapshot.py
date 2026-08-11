@@ -87,6 +87,7 @@ def test_backend_slices_max_batch_buffers_before_snapshot(monkeypatch):
     )
 
     backend = object.__new__(MiniMaxSparseAttnBackend)
+    backend.is_npu = False
     backend._msa_dec_meta = None
     backend._active_page_table = None
     backend._cuda_graph_page_table = torch.empty((4, 4), dtype=torch.int32)
@@ -112,13 +113,19 @@ def test_backend_slices_max_batch_buffers_before_snapshot(monkeypatch):
         extend_seq_lens_cpu=None,
     )
 
-    backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+    backend.init_forward_metadata_out_graph(forward_batch, in_capture=False)
 
-    assert captured["page_table"].shape == (2, 4)
+    assert backend._active_page_table.shape == (2, 4)
+    assert captured["page_table"].shape == (2, 2)
     torch.testing.assert_close(
         captured["req_pool_indices"], torch.tensor([2, 1], dtype=torch.int64)
     )
     torch.testing.assert_close(
         captured["seq_lens"], torch.tensor([8, 7], dtype=torch.int32)
     )
+    assert backend._max_seqlen_k == 8
+
+    backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+    assert backend._active_page_table.shape == (2, 4)
+    assert captured["page_table"].shape == (2, 4)
     assert backend._max_seqlen_k == 16
