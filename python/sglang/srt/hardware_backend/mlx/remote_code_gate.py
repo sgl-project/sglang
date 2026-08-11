@@ -45,9 +45,8 @@ def resolve_model_directory(model_path: str, revision: Optional[str] = None) -> 
     Uses mlx-lm's resolver so the directory is byte-identical to what a
     direct ``mlx_lm.load`` call would consume; existing local paths are
     returned as-is (no network access). mlx-lm 0.31.x exposes this as
-    ``mlx_lm.utils._download`` (formerly ``get_model_path``); mlx-lm is an
-    unpinned dependency, so accept either name and fail with the reason
-    rather than a bare ImportError if it is renamed again.
+    ``mlx_lm.utils._download`` (formerly ``get_model_path``); mlx-lm is
+    unpinned, so accept either name.
     """
     from mlx_lm import utils as mlx_lm_utils
 

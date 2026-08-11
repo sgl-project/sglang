@@ -95,9 +95,8 @@ def configure_kv_cache_dtype(
             model_dtype,
         )
         kv_cache_dtype = model_dtype
-        # The pool is no longer quantized, so the returned tag must stop saying it
-        # is: "auto" is what an unquantized pool reports, and attention backends
-        # gate their descale paths on it (model_runner.kv_cache_dtype_str).
+        # Unquantized pool now, and "auto" is the tag for that; attention
+        # backends gate their descale paths on it (kv_cache_dtype_str).
         resolved_kv_cache_dtype = "auto"
 
     return resolved_kv_cache_dtype, kv_cache_dtype

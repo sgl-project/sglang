@@ -28,8 +28,7 @@ _ARCH = "muse-glimmer"
 class MuseGlimmerAssistantConfig(PretrainedConfig):
 
     model_type = "muse_glimmer_assistant"
-    # The DFlash draft has no head of its own; the target's vocab is borrowed
-    # when the draft worker is built.
+    # The DFlash draft has no head; draft_worker_common borrows the target's.
     vocab_size = None
 
 

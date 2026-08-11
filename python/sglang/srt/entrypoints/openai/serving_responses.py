@@ -2215,8 +2215,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     stream_offset = len(text)
                 if not delta and finish_reason is None:
                     continue
-                # finish_reason is sticky, so gate on `flushed` to drain the
-                # parsers exactly once no matter how many terminal chunks arrive.
+                # finish_reason is sticky, so flush exactly once however many
+                # terminal chunks arrive.
                 flush = (
                     not flushed
                     and finish_reason is not None
