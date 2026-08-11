@@ -144,13 +144,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         """Return contiguous all-layer KV tensors for Ascend HiCache IO."""
         return self._hicache_k_buffer, self._hicache_v_buffer
 
-    def _clear_buffers(self):
-        # The FIA-facing lists and HiCache tensors share storage. Drop both
-        # owners when memory saver releases the device KV pool.
-        del self._hicache_k_buffer
-        del self._hicache_v_buffer
-        super()._clear_buffers()
-
     def _init_kv_copy_and_warmup(self):
         # implementation relies on self.data_strides / self.data_ptrs, which the
         # NPU paged buffer layout never builds.
