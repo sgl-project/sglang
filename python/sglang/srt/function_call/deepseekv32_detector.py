@@ -180,7 +180,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         parameters[param_name] = _partial_json_loads(
                             param_value, Allow.ALL
                         )[0]
-                    except (json.JSONDecodeError, MalformedJSON):
+                    except (json.JSONDecodeError, MalformedJSON, ValueError):
                         parameters[param_name] = param_value.strip()
 
         return json.dumps(parameters, ensure_ascii=False)
@@ -370,10 +370,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
             logger.error(f"Error in parse_streaming_increment: {e}")
             # Re-emit verbatim rather than swallowing the turn; the preamble is
             # still inside current_text unless a completed call advanced past it.
+            # Calls collected in this pass are dropped on purpose: the failure can
+            # land between a tool's name and its arguments, and a named call with
+            # no arguments is worse for the client than none at all.
             self._buffer = ""
             if not current_text.startswith(preamble):
                 current_text = preamble + current_text
-            return StreamingParseResult(normal_text=current_text, calls=all_calls)
+            return StreamingParseResult(normal_text=current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

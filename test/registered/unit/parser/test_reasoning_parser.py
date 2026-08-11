@@ -156,11 +156,14 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(detector._buffer, "")
         self.assertEqual(detector.finish().reasoning_text, "")
 
-    def test_finish_drops_partial_end_tag_when_streaming_reasoning(self):
-        """With stream_reasoning=True the reasoning is emitted chunk by chunk, so
-        finish() must not re-emit. Only a partial end-tag fragment can linger in
-        _buffer; that fragment is an incomplete token, not content, and must be
-        dropped rather than surfaced as reasoning."""
+    def test_finish_flushes_partial_end_tag_when_streaming_reasoning(self):
+        """With stream_reasoning=True everything in _buffer at the end of the
+        stream is a trailing slice that was held back precisely because it could
+        still have grown into `</think>`, so it was never emitted. Since the
+        stream ended it never became a token, and dropping it would lose content
+        whose only crime is looking like the start of one -- reasoning ending in
+        a literal `<` is the common case. Flushing matches stream_reasoning=False
+        and the non-streaming path, which both keep it."""
         detector = BaseReasoningFormatDetector(
             "<think>", "</think>", stream_reasoning=True
         )
@@ -170,8 +173,11 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         )
         self.assertEqual(detector.parse_streaming_increment("</thi").reasoning_text, "")
         end = detector.finish()
-        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.reasoning_text, "</thi")
         self.assertEqual(end.normal_text, "")
+        # State is cleared, so a second finish() is a no-op.
+        self.assertEqual(detector._buffer, "")
+        self.assertEqual(detector.finish().reasoning_text, "")
 
 
 class TestDeepSeekR1Detector(CustomTestCase):
@@ -1024,6 +1030,42 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             "<think>a < b</think>tail",
             ("a < b", "tail"),
         )
+
+    def test_reasoning_truncated_mid_partial_token(self):
+        """Reasoning that happens to end in a `</think>` prefix must keep those
+        characters: the holdback exists to recombine them with the next chunk, so
+        a stream that ends first must flush rather than swallow them."""
+        for chunk_size in self.CHUNK_SIZES:
+            with self.subTest(chunk_size=chunk_size):
+                self.assertEqual(
+                    self._feed(DeepSeekR1Detector(), "<think>compare a <", chunk_size),
+                    ("compare a <", ""),
+                )
+
+    def test_dsv4_reasoning_quoting_dsml_is_chunk_dependent(self):
+        """Accepted divergence, pinned so it is not mistaken for a regression.
+
+        `tool_start_token` ends the reasoning block as soon as the DSML marker
+        appears, but the non-streaming path only does so when no `</think>`
+        follows. Streaming cannot see whether one is still coming, so a model
+        quoting the tool format inside its reasoning splits by chunk size. The
+        DSV4 system prompt shows that marker to the model, so this is reachable.
+        """
+        text = f"<think>format is <{self.DSML}tool_calls></think>answer"
+        by_output = {}
+        for chunk_size in self.CHUNK_SIZES:
+            by_output.setdefault(
+                self._feed(DeepSeekV4Detector(), text, chunk_size), []
+            ).append(chunk_size)
+
+        self.assertEqual(len(by_output), 2, f"expected two variants, got {by_output}")
+        early_cut = ("format is ", f"<{self.DSML}tool_calls></think>answer")
+        whole_buffer = (f"format is <{self.DSML}tool_calls>", "answer")
+        self.assertIn(early_cut, by_output)
+        self.assertIn(whole_buffer, by_output)
+
+        one_shot = DeepSeekV4Detector().detect_and_parse(text)
+        self.assertEqual((one_shot.reasoning_text, one_shot.normal_text), whole_buffer)
 
     def test_dsv4_tool_block_after_think_end(self):
         tool_call = (

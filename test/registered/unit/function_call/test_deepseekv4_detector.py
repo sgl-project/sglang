@@ -131,6 +131,9 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertIn("get_weather", first.normal_text)
         self.assertNotIn("get_weather", second.normal_text)
+        # No half-formed call: the failure can land between a tool's name and its
+        # arguments, so an argument-less named call must not reach the client.
+        self.assertEqual(first.calls, [])
 
 
 if __name__ == "__main__":

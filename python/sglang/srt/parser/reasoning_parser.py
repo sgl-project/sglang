@@ -269,15 +269,18 @@ class BaseReasoningFormatDetector:
 
     @staticmethod
     def _ends_with_partial_token(buffer: str, token: str) -> int:
-        """Length of the trailing slice of `buffer` that is a strict prefix of `token`."""
-        for i in range(1, min(len(buffer) + 1, len(token))):
+        """Length of the longest trailing slice of `buffer` that is a strict prefix
+        of `token`. Longest, so a token whose prefix repeats inside itself does not
+        get cut short and leak the rest of the marker."""
+        for i in range(min(len(buffer), len(token) - 1), 0, -1):
             if token.startswith(buffer[-i:]):
                 return i
         return 0
 
     def finish(self) -> StreamingParseResult:
-        """Flush reasoning buffered under stream_reasoning=False when the stream ends
-        before the end token (e.g. max_tokens cut it short), instead of dropping it.
+        """Flush reasoning still buffered when the stream ends before the end token
+        (e.g. max_tokens cut it short), instead of dropping it: the whole block under
+        stream_reasoning=False, the held-back token suffix under stream_reasoning=True.
         force_nonempty_content emits it as normal_text, else as reasoning_text."""
         if not self._in_reasoning:
             return StreamingParseResult()
@@ -294,9 +297,7 @@ class BaseReasoningFormatDetector:
                 return StreamingParseResult(normal_text=normal_text)
             return StreamingParseResult()
 
-        # An unfinished end token under stream_reasoning=True is an incomplete
-        # token rather than content, and is dropped (see the test of the same name).
-        if not self.stream_reasoning and buffer:
+        if buffer:
             return StreamingParseResult(reasoning_text=buffer)
 
         return StreamingParseResult()
