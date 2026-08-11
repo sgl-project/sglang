@@ -3891,13 +3891,7 @@ class ServerArgs:
                 self._validate_aiter_mla_dcp(prefill_backend=prefill_backend)
 
     def _validate_aiter_mla_dcp(self, *, prefill_backend: Optional[str] = None):
-        """Validate aiter MLA decode-context-parallel (DCP).
-
-        The decode path runs aiter's MLA kernel over each rank's round-robin
-        KV shard (see AiterAttnBackend._mla_decode_fwd_dcp). The kernel tiles
-        the query heads, so any gathered head count is served (Kimi-K3's 96 at
-        tp8 dcp8 works).
-        """
+        """Validate aiter MLA decode-context-parallel (--dcp-size > 1)."""
         from sglang.srt.configs.model_config import AttentionArch
 
         model_config = self.get_model_config()

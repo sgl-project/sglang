@@ -840,42 +840,26 @@ class AiterAttnBackend(AttentionBackend):
             return o
 
     def _dcp_graph_max_local_kv_len(self) -> int:
-        """Fixed upper bound on this rank's local (round-robin) KV shard length,
-        used as ``max_seqlen_kv`` during cuda-graph capture/replay so the
-        segment count (and every derived buffer shape) is static. A rank owns the
-        positions ``pos % W == rank``, so its shard holds at most
-        ``ceil(max_context_len / W)`` tokens."""
+        """Static upper bound on this rank's shard, ceil(max_context_len / W).
+
+        Used as ``max_seqlen_kv`` under cuda graph so every buffer shape is fixed.
+        """
         w = max(self.dcp_world_size, 1)
         return (self.max_context_len + w - 1) // w
 
     def _mla_decode_fwd_dcp(self, q, k_buffer, layer, k_descale):
-        """DCP decode over this rank's round-robin KV shard.
+        """DCP decode over this rank's round-robin KV shard -> (out, base-2 lse).
 
-        Delegates to ``_mla_decode_fwd_dcp_triton``, which returns
-        ``(out, base-2 lse)``.
-
-        NOTE despite living under ``aiter.ops.triton``, ``mla_decode_fwd`` is
-        NOT a Gluon kernel on this arch: it selects its Gluon implementation
-        only under ``IS_DEVICE_ARCH_GFX12`` and otherwise launches
-        ``_triton_kernels.attention.mla._mla_decode_fwd_kernel``. The verify and
-        prefill helpers go through the same entry point and are likewise Triton
-        on gfx950.
+        NOTE ``mla_decode_fwd`` is Triton, not Gluon, on gfx950: it only picks
+        its Gluon path under IS_DEVICE_ARCH_GFX12.
         """
         return self._mla_decode_fwd_dcp_triton(q, k_buffer, layer, k_descale)
 
     def _mla_decode_fwd_dcp_triton(self, q, k_buffer, layer, k_descale):
-        """DCP decode via aiter's Triton MLA kernel over this rank's round-robin
-        KV shard.
+        """DCP decode on aiter's Triton MLA kernel -> (out, base-2 lse).
 
-        The kernel tiles the query heads, so it serves any gathered head count
-        (e.g. Kimi-K3's 96 at tp8 dcp8).
-        Round-robin global-position causal masking is unnecessary for pure decode
-        (q_len == 1): every shard entry is a past token, so this rank attends its
-        whole shard, and partials are merged across ranks by the caller
-        (cp_lse_ag_out_rs_mla) using the base-2 lse returned here.
-
-        Returns (out, lse) with out [tokens, num_gathered_heads, kv_lora_rank] and
-        lse [tokens, num_gathered_heads] in base-2.
+        At q_len == 1 every shard entry is a past token, so no causal masking is
+        needed and this rank simply attends its whole shard.
         """
         from aiter.ops.triton.attention.mla import mla_decode_fwd
 
@@ -936,35 +920,21 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _mla_verify_fwd_dcp(self, q, k_window, layer, k_descale):
-        """DCP target-verify.
-
-        Delegates to ``_mla_verify_fwd_dcp_triton``, which splits the work into
-        a shard-attention stage A and a dense torch matmul stage B.
-        """
+        """DCP target-verify."""
         return self._mla_verify_fwd_dcp_triton(q, k_window, layer, k_descale)
 
     def _mla_verify_fwd_dcp_triton(self, q, k_window, layer, k_descale):
-        """DCP target-verify, split at the verify-window boundary.
+        """DCP target-verify, split at the window boundary -> (out, base-2 lse).
 
-        A verify step queries ``q_len = gamma + 1`` tokens per request against
-        the committed KV plus the window itself. Splitting the key set there
-        avoids the one thing mla_decode_fwd cannot do under DCP -- masking on the GLOBAL
-        position ``g(j) = j * W + r`` rather than the local shard index ``j``:
+        Splitting there avoids the one thing mla_decode_fwd cannot do under DCP:
+        mask on the GLOBAL position g(j) = j * W + r rather than the local index.
 
-        * stage A, the COMMITTED shard: every entry precedes every window token,
-          so no causal masking is needed at all. The metadata flattens the batch
-          into ``bs * q_len`` single-token rows, which puts the kernel in its
-          ``num_tokens_per_seq == 1`` regime where the mask degenerates to
-          ``j < seq_len`` -- exactly "attend this rank's whole shard".
-        * stage B, the in-hand window: dense and not yet sharded, so a plain
-          causal ``q_len x q_len`` attention is correct on its own.
+        * stage A, the committed shard: every entry precedes every window token,
+          so flattening to single-token rows degenerates the mask to "attend the
+          whole shard" and no global masking is needed.
+        * stage B, the in-hand window: dense and unsharded, plain causal attention.
 
-        Stage B is folded in on ONE rank only, so that after the caller's
-        cross-rank merge (cp_lse_ag_out_rs_mla) the window is counted exactly
-        once; the other ranks simply return their shard partial.
-
-        Returns (out [bs * q_len, H_gathered, kv_lora_rank],
-        lse [bs * q_len, H_gathered]) with lse in base-2, ready for that merge.
+        Stage B runs on ONE rank only, so the cross-rank merge counts it once.
         """
         from aiter.ops.triton.attention.mla import mla_decode_fwd
 
@@ -1036,20 +1006,12 @@ class AiterAttnBackend(AttentionBackend):
         return self._mla_prefill_fwd_dcp_triton(q, layer, k_descale, forward_batch)
 
     def _mla_prefill_fwd_dcp_triton(self, q, layer, k_descale, forward_batch):
-        """DCP prefill (extend) via aiter's MLA absorb-prefill kernel over
-        the assembled full-sequence KV in ``attn_dcp_metadata.dcp_kv_buffer``.
+        """DCP prefill (extend) on aiter's MLA absorb-prefill kernel.
 
-        Under DCP the KV pool is physically round-robin sharded (owner rule
-        pos % W == rank, physical = pos // W), so the full per-request sequence
-        cannot be read from this rank's local cache. The model layer
-        (forward_absorb_prepare -> all_gather_kv_cache_for_mla_extend) assembles
-        the full KV — gathered prefix + in-hand new tokens — into dcp_kv_buffer,
-        indexed by dcp_kv_indices with per-request boundaries dcp_kv_indptr.
-
-        Kimi-K3 MLA is NoPE with 12 local heads at tp8; the ASM mla_prefill_fwd
-        and flash_attn_varlen absorb path can't serve those dims. mla_prefill_fwd tiles
-        heads. Q is NOT gathered for extend (each rank computes full attention for
-        its local heads over the full KV — no cross-rank merge).
+        Reads the full sequence from ``attn_dcp_metadata.dcp_kv_buffer``, which
+        the model layer assembles, because the sharded local cache does not hold
+        it. Q is NOT gathered here: each rank attends the full KV with its own
+        local heads, so there is no cross-rank merge.
         """
         from aiter.ops.triton.attention.mla import mla_prefill_fwd
 
@@ -1782,11 +1744,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
     def _dcp_graph_local_len_bounds(self, bs: int) -> tuple[int, int]:
-        """Static (max, total) upper bounds on this rank's local shard lengths
-        for a cuda-graph batch of ``bs`` rows, as accepted by
-        ``plan_dcp_decode_metadata(static_local_len_bounds=...)``. Every row is
-        bounded by the worst-case shard, so the batch total is ``bs`` times it.
-        """
+        """Static (max, total) shard-length bounds for a cuda-graph batch."""
         max_local = self._dcp_graph_max_local_kv_len()
         return max_local, bs * max_local
 
@@ -1799,11 +1757,10 @@ class AiterAttnBackend(AttentionBackend):
         bs: int,
         static_local_len_bounds: Optional[tuple[int, int]] = None,
     ):
-        """Localize kv_indptr / kv_indices to this rank's DCP round-robin shard
-        (in place). When ``seq_lens_cpu`` is available, size the plan from a CPU
-        local-length array (``init_metadata_replay=True``) so no per-step GPU->CPU
-        sync is needed; when only ``static_local_len_bounds`` is available, size it
-        from those bounds, which is equally sync-free.
+        """Localize kv_indptr / kv_indices to this rank's DCP shard, in place.
+
+        Sized from ``seq_lens_cpu`` when available, else from
+        ``static_local_len_bounds``; both avoid a per-step GPU->CPU sync.
         """
         if static_local_len_bounds is not None:
             plan_dcp_decode_metadata(
@@ -1847,14 +1804,10 @@ class AiterAttnBackend(AttentionBackend):
     ):
         """Per-rank page table + shard lengths for the Triton DCP decode.
 
-        Built once per forward (the kernel call is per layer, and rebuilding the
-        table 24x per step is pure overhead). ``kv_indptr`` must already be
-        localized by ``_plan_dcp_decode_metadata``, so its per-request diffs are
-        this rank's shard lengths in tokens (the kernel's ``seqused_k``).
-
-        Both outputs are written into caller-provided buffers on the cuda-graph
-        path: this runs OUT of the graph, so a freshly allocated tensor would be
-        invisible to the captured kernels, which keep the capture-time pointer.
+        Built once per forward, not per layer. ``kv_indptr`` must already be
+        localized by ``_plan_dcp_decode_metadata``. On the cuda-graph path the
+        caller's buffers are filled in place: this runs OUT of the graph, so a
+        fresh tensor would be invisible to the captured kernels.
         """
         from sglang.kernels.ops.attention.dcp_kernels import (
             build_dcp_page_table,
@@ -1891,20 +1844,11 @@ class AiterAttnBackend(AttentionBackend):
         out_lens: Optional[torch.Tensor] = None,
         qo_indptr: Optional[torch.Tensor] = None,
     ):
-        """Per-ROW page table, shard lengths and cu_seqlens_q for the Triton DCP
-        target-verify stage A.
+        """Per-ROW page table, shard lengths and cu_seqlens_q for verify stage A.
 
-        Stage A flattens the ``bs x q_len`` verify window into ``bs * q_len``
-        single-token rows, which is what puts the kernel in its
-        ``num_tokens_per_seq == 1`` regime where the causal mask degenerates to
-        "attend the whole shard" (see _mla_verify_fwd_dcp_triton). Every row of a
-        request shares that request's committed shard, so the decode table and
-        lengths just repeat ``q_len`` times -- expanded once per forward rather
-        than per layer.
-
-        On the cuda-graph path the caller supplies capture-stable buffers: this
-        runs OUT of the graph, so freshly allocated outputs would be invisible to
-        the captured kernels (they keep the capture-time pointer).
+        Stage A flattens the window into ``bs * q_len`` single-token rows (see
+        _mla_verify_fwd_dcp_triton). Rows of one request share its shard, so the
+        decode table just repeats ``q_len`` times, once per forward.
         """
         block_table, local_kv_lens = self._build_dcp_decode_page_table(
             kv_indptr, req_pool_indices, bs, max_local_kv_len
