@@ -98,6 +98,7 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    allow_protected_session_cache: bool = True
 
 
 @dataclasses.dataclass
@@ -334,6 +335,24 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def swa_evictable_size(self):
         return 0
+
+    def mamba_evictable_size(self):
+        return 0
+
+    def evictable_size_without_session_refs(self):
+        return self.evictable_size()
+
+    def full_evictable_size_without_session_refs(self):
+        return self.full_evictable_size()
+
+    def swa_evictable_size_without_session_refs(self):
+        return self.swa_evictable_size()
+
+    def mamba_evictable_size_without_session_refs(self):
+        return self.mamba_evictable_size()
+
+    def request_can_evict_protected_session_cache(self, req: Req) -> bool:
+        return True
 
     def protected_size(self):
         return 0

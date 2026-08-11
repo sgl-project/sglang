@@ -219,6 +219,11 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(self._evict_device_heap)
             if x not in self.tree_core.evictable_device_leaves:
                 continue
+            if (
+                not self._allow_protected_session_cache_eviction
+                and self.session_ref(x) > 0
+            ):
+                return None
             self._evict_device_last_node = x
             return x.id
         return None

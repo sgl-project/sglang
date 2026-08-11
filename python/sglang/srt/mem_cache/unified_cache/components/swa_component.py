@@ -562,6 +562,11 @@ class SWAComponent(TreeComponent):
         ):
             x = self._evict_device_cursor
             assert x.component_data[ct].value is not None
+            if (
+                not self._allow_protected_session_cache_eviction
+                and self.session_ref(x) > 0
+            ):
+                return None
             if x in self.tree_core.evictable_device_leaves and (
                 not enabled or self._can_evict_leaf_atomically(x)
             ):

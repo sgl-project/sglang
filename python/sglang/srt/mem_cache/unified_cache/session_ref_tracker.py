@@ -149,6 +149,23 @@ class UnifiedSessionRefTracker:
             indexed_component_leaves=indexed,
         )
 
+    def request_can_evict_protected_session_cache(self, req: Req) -> bool:
+        """Only the current, non-demoted session generation has entitlement."""
+        if not self.enable_session_radix_cache:
+            return True
+        session = req.session
+        if session is not None and session.streaming:
+            return True
+        session_id = self.session_id_for_req(req)
+        if session_id is None:
+            return True
+        current_generation = self._session_generations.get(session_id)
+        return (
+            current_generation is not None
+            and req.session_generation == current_generation
+            and session_id not in self._demoted_session_ids
+        )
+
     def release_radix_session(self, session_id: str) -> int:
         if not self.enable_session_radix_cache or session_id is None:
             return 0

@@ -83,6 +83,7 @@ def alloc_paged_token_slots_reserve_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
+    allow_protected_session_cache: bool = True,
 ):
     """Allocate reserved draft slots and update DSV4 per-request tables."""
     if dsv4_state_lens is None and batch is not None:
@@ -106,6 +107,7 @@ def alloc_paged_token_slots_reserve_extend(
         req_pool_indices=req_pool_indices,
         dsv4_state_lens=dsv4_state_lens,
         batch=batch,
+        allow_protected_session_cache=allow_protected_session_cache,
     )
     if batch is not None:
         maybe_write_dsv4_extend(

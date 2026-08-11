@@ -56,6 +56,9 @@ class _FakeTreeCache:
     def is_chunk_cache(self):
         return True
 
+    def request_can_evict_protected_session_cache(self, req):
+        return True
+
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(

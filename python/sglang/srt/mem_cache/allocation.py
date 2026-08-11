@@ -146,9 +146,15 @@ def get_last_loc_torch(
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
+    *,
+    allow_protected_session_cache: bool = True,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
-    evict_from_tree_cache(tree_cache, num_tokens)
+    evict_from_tree_cache(
+        tree_cache,
+        num_tokens,
+        allow_protected_session_cache=allow_protected_session_cache,
+    )
 
     out_cache_loc = allocator.alloc(num_tokens)
 
@@ -201,11 +207,16 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
+    allow_protected_session_cache: bool = True,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
-    evict_from_tree_cache(tree_cache, num_tokens)
+    evict_from_tree_cache(
+        tree_cache,
+        num_tokens,
+        allow_protected_session_cache=allow_protected_session_cache,
+    )
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
     extra_alloc_kwargs = {}
@@ -253,6 +264,8 @@ def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
     tree_cache: BasePrefixCache | None,
+    *,
+    allow_protected_session_cache: bool = True,
 ) -> list[int]:
     """Allocate request slots from the pool.
 
@@ -280,7 +293,13 @@ def alloc_req_slots(
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+                tree_cache.evict(
+                    EvictParams(
+                        num_tokens=0,
+                        mamba_num=mamba_num,
+                        allow_protected_session_cache=allow_protected_session_cache,
+                    )
+                )
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(
@@ -300,6 +319,14 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     return batch.tree_cache.page_size
 
 
+def _requests_can_evict_protected_session_cache(
+    tree_cache: BasePrefixCache, reqs: list[Req]
+) -> bool:
+    return bool(reqs) and all(
+        tree_cache.request_can_evict_protected_session_cache(req) for req in reqs
+    )
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -314,6 +341,12 @@ def alloc_for_extend(
     batch.maybe_evict_swa()
 
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    allocation_reqs = [
+        req for req, extend_len in zip(batch.reqs, batch.extend_lens) if extend_len > 0
+    ]
+    allow_protected_session_cache = _requests_can_evict_protected_session_cache(
+        batch.tree_cache, allocation_reqs
+    )
 
     reuse_kv = None
     if batch.is_dllm():
@@ -329,8 +362,17 @@ def alloc_for_extend(
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
+    req_slot_allocation_reqs = [req for req in batch.reqs if req.req_pool_idx is None]
+    req_slots_allow_protected_session_cache = (
+        _requests_can_evict_protected_session_cache(
+            batch.tree_cache, req_slot_allocation_reqs
+        )
+    )
     req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, batch.reqs, batch.tree_cache
+        batch.req_to_token_pool,
+        batch.reqs,
+        batch.tree_cache,
+        allow_protected_session_cache=req_slots_allow_protected_session_cache,
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
@@ -348,7 +390,11 @@ def alloc_for_extend(
             alloc_page_size,
         )
     elif alloc_page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        out_cache_loc = alloc_token_slots(
+            batch.tree_cache,
+            batch.extend_num_tokens,
+            allow_protected_session_cache=allow_protected_session_cache,
+        )
     else:
         # Paged allocation - build last_loc
         last_loc = [
@@ -366,6 +412,7 @@ def alloc_for_extend(
             req_pool_indices=req_pool_indices_device,
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
             batch=batch,
+            allow_protected_session_cache=allow_protected_session_cache,
         )
 
     # Write to req_to_token_pool
@@ -433,8 +480,18 @@ def _alloc_extend_loc_with_kv_reuse(
 
     fresh_slots = None
     if alloc_extend_num_tokens > 0:
+        fresh_reqs = [
+            req for req, should_reuse in zip(batch.reqs, reuse_kv) if not should_reuse
+        ]
+        allow_protected_session_cache = _requests_can_evict_protected_session_cache(
+            batch.tree_cache, fresh_reqs
+        )
         if alloc_page_size == 1:
-            fresh_slots = alloc_token_slots(batch.tree_cache, alloc_extend_num_tokens)
+            fresh_slots = alloc_token_slots(
+                batch.tree_cache,
+                alloc_extend_num_tokens,
+                allow_protected_session_cache=allow_protected_session_cache,
+            )
         else:
             alloc_seq_lens_cpu = torch.tensor(
                 [
@@ -462,6 +519,7 @@ def _alloc_extend_loc_with_kv_reuse(
                 req_pool_indices=req_pool_indices_device,
                 dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
                 batch=batch,
+                allow_protected_session_cache=allow_protected_session_cache,
             )
 
     reuse_dtype = fresh_slots.dtype if fresh_slots is not None else torch.int64
@@ -493,12 +551,17 @@ def alloc_paged_token_slots_decode(
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
+    allow_protected_session_cache: bool = True,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
     # Over estimate the number of tokens: assume each request needs a new page.
     num_tokens = len(seq_lens) * allocator.page_size
-    evict_from_tree_cache(tree_cache, num_tokens)
+    evict_from_tree_cache(
+        tree_cache,
+        num_tokens,
+        allow_protected_session_cache=allow_protected_session_cache,
+    )
 
     # DSV4-NPU allocator also needs req_pool_indices + per-req state lens and
     # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
@@ -545,13 +608,21 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
 
     batch.maybe_evict_swa()
+    allocation_reqs = batch.requests_requiring_next_decode_allocation()
+    allow_protected_session_cache = _requests_can_evict_protected_session_cache(
+        batch.tree_cache, allocation_reqs
+    )
 
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation
-        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        out_cache_loc = alloc_token_slots(
+            batch.tree_cache,
+            bs * token_per_req,
+            allow_protected_session_cache=allow_protected_session_cache,
+        )
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
@@ -567,6 +638,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             req_pool_indices=batch.req_pool_indices,
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
             batch=batch,
+            allow_protected_session_cache=allow_protected_session_cache,
         )
 
     # Write to req_to_token_pool
@@ -685,8 +757,20 @@ def alloc_for_spec_decode(
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
     if num_needed_tokens > 0:
+        allocation_reqs = [
+            req
+            for req, cur_len, nxt_len in zip(reqs, cur_kv_lens_cpu, nxt_kv_lens_cpu)
+            if int(nxt_len) > int(cur_len)
+        ]
+        allow_protected_session_cache = _requests_can_evict_protected_session_cache(
+            tree_cache, allocation_reqs
+        )
         if tree_cache.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
+            out_cache_loc = alloc_token_slots(
+                tree_cache,
+                num_needed_tokens,
+                allow_protected_session_cache=allow_protected_session_cache,
+            )
         else:
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
@@ -704,6 +788,7 @@ def alloc_for_spec_decode(
                 num_needed_tokens,
                 req_pool_indices=req_pool_indices,
                 batch=batch,
+                allow_protected_session_cache=allow_protected_session_cache,
             )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.

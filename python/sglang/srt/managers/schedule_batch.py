@@ -1907,6 +1907,7 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    allow_protected_session_cache: bool = True,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
@@ -1921,7 +1922,11 @@ def release_req(
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-    evict_from_tree_cache(tree_cache, num_tokens)
+    evict_from_tree_cache(
+        tree_cache,
+        num_tokens,
+        allow_protected_session_cache=allow_protected_session_cache,
+    )
 
     req.reset_for_retract()
 
@@ -2759,6 +2764,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
     ):
+        return sum(
+            new_tokens
+            for _, new_tokens in self._requests_and_tokens_required_next_decode(
+                selected_indices
+            )
+        )
+
+    def requests_requiring_next_decode_allocation(
+        self, selected_indices: Optional[List[int]] = None
+    ) -> List[Req]:
+        return [
+            req
+            for req, new_tokens in self._requests_and_tokens_required_next_decode(
+                selected_indices
+            )
+            if new_tokens > 0
+        ]
+
+    def _requests_and_tokens_required_next_decode(
+        self, selected_indices: Optional[List[int]] = None
+    ) -> List[Tuple[Req, int]]:
         page_size = self.token_to_kv_pool_allocator.page_size
         requests = (
             self.reqs
@@ -2767,27 +2793,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
-            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
-            return new_pages * page_size
+            return [
+                (r, page_size if r.kv_committed_len % page_size == 0 else 0)
+                for r in requests
+            ]
 
         return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
         reserve = get_alloc_reserve_per_decode()
-        total = 0
+        required = []
         for r in requests:
             x = max(0, r.kv_committed_len + reserve - r.kv.kv_allocated_len)
             cur = r.kv.kv_allocated_len
             nxt = cur + x
-            total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
-        return total
+            required.append(
+                (r, ceil_align(nxt, page_size) - ceil_align(cur, page_size))
+            )
+        return required
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         """Reclaim evictable tree-cache entries (shortfall only), then report
         whether the next decode step fits in the KV pool."""
-        num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        required = self._requests_and_tokens_required_next_decode(selected_indices)
+        num_tokens = sum(new_tokens for _, new_tokens in required)
+        allocation_reqs = [req for req, new_tokens in required if new_tokens > 0]
+        allow_protected_session_cache = bool(allocation_reqs) and all(
+            self.tree_cache.request_can_evict_protected_session_cache(req)
+            for req in allocation_reqs
+        )
+        evict_from_tree_cache(
+            self.tree_cache,
+            num_tokens,
+            allow_protected_session_cache=allow_protected_session_cache,
+        )
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(
@@ -2795,6 +2835,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
+        # A mixed batch may evict protected session KV only after every demoted
+        # requester has been retracted. Keep normal scheduling order within
+        # each partition.
+        sorted_indices = [
+            i
+            for i in sorted_indices
+            if self.tree_cache.request_can_evict_protected_session_cache(self.reqs[i])
+        ] + [
+            i
+            for i in sorted_indices
+            if not self.tree_cache.request_can_evict_protected_session_cache(
+                self.reqs[i]
+            )
+        ]
 
         retracted_reqs = []
         first_iter = True
@@ -2810,7 +2864,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req = self.reqs[idx]
             retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            self.release_req(
+                idx,
+                len(sorted_indices),
+                server_args,
+                allow_protected_session_cache=(
+                    bool(sorted_indices)
+                    and all(
+                        self.tree_cache.request_can_evict_protected_session_cache(
+                            self.reqs[remaining_idx]
+                        )
+                        for remaining_idx in sorted_indices
+                    )
+                ),
+            )
 
         reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
@@ -2881,7 +2948,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         return sorted_indices
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        server_args: ServerArgs,
+        *,
+        allow_protected_session_cache: bool = True,
+    ):
         release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
@@ -2890,6 +2964,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            allow_protected_session_cache=allow_protected_session_cache,
         )
 
     def prepare_encoder_info_decode(self):

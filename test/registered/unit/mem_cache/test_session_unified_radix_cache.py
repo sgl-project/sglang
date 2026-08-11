@@ -217,6 +217,26 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         self.assertEqual(match_len(self.cache, [1, 2, 3, 4]), 4)
         self.assertEqual(self.full.session_ref(referenced), 1)
 
+    def test_protected_eviction_cutoff_stops_before_session_kv(self):
+        protected = insert(self.cache, [1, 2, 3, 4])
+        insert(self.cache, [7, 8, 9])
+        register(self.cache, [1, 2, 3, 4], "protected")
+
+        self.assertEqual(self.cache.evictable_size(), 7)
+        self.assertEqual(self.cache.evictable_size_without_session_refs(), 3)
+
+        result = self.cache.evict(
+            EvictParams(
+                num_tokens=7,
+                allow_protected_session_cache=False,
+            )
+        )
+
+        self.assertEqual(result.num_tokens_evicted, 3)
+        self.assertEqual(match_len(self.cache, [7, 8, 9]), 0)
+        self.assertEqual(match_len(self.cache, [1, 2, 3, 4]), 4)
+        self.assertEqual(self.full.session_ref(protected), 1)
+
     def test_demote_and_promote_session_cache_priority(self):
         leaf = insert(self.cache, [1, 2, 3, 4])
         generation = self.cache.open_radix_session("s1")
@@ -240,6 +260,35 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         )
         self.assertEqual(promoted.status, "updated")
         self.assertEqual(self.full.session_ref(leaf), 1)
+
+    def test_demoted_request_cannot_evict_protected_session_cache(self):
+        generation = self.cache.open_radix_session("s1")
+        req = SimpleNamespace(
+            session_id="s1",
+            session_generation=generation,
+            session=None,
+        )
+        self.assertTrue(self.cache.request_can_evict_protected_session_cache(req))
+
+        self.cache.set_session_cache_priority(
+            "s1", protected=False, generation=generation
+        )
+
+        self.assertFalse(self.cache.request_can_evict_protected_session_cache(req))
+
+    def test_stale_session_request_cannot_evict_protected_session_cache(self):
+        stale_generation = self.cache.open_radix_session("s1")
+        self.cache.release_radix_session("s1")
+        self.cache.open_radix_session("s1")
+        stale_req = SimpleNamespace(
+            session_id="s1",
+            session_generation=stale_generation,
+            session=None,
+        )
+
+        self.assertFalse(
+            self.cache.request_can_evict_protected_session_cache(stale_req)
+        )
 
     def test_demoted_session_keeps_future_leaves_evictable(self):
         generation = self.cache.open_radix_session("s1")

@@ -1,6 +1,6 @@
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -40,6 +40,29 @@ def _make_decode_batch():
 
 
 class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):
+    def test_mixed_decode_uses_protected_session_eviction_cutoff(self):
+        protected = types.SimpleNamespace(kv_committed_len=4, demoted=False)
+        demoted = types.SimpleNamespace(kv_committed_len=4, demoted=True)
+        batch = ScheduleBatch(reqs=[protected, demoted])
+        batch.spec_algorithm = types.SimpleNamespace(is_none=lambda: True)
+        batch.token_to_kv_pool_allocator = types.SimpleNamespace(
+            page_size=1,
+            available_size=lambda: 2,
+        )
+        batch.tree_cache = MagicMock()
+        batch.tree_cache.request_can_evict_protected_session_cache.side_effect = (
+            lambda req: not req.demoted
+        )
+
+        with patch("sglang.srt.managers.schedule_batch.evict_from_tree_cache") as evict:
+            self.assertTrue(batch.check_decode_mem())
+
+        evict.assert_called_once_with(
+            batch.tree_cache,
+            2,
+            allow_protected_session_cache=False,
+        )
+
     def test_decode_seq_lens_bump_is_out_of_place(self):
         """Each prepare_for_decode call rebinds seq-lens tensors to new +1 objects without mutating the old ones."""
         batch = _make_decode_batch()

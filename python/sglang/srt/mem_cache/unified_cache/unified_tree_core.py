@@ -1188,10 +1188,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 lru_op(lru, node)
 
     def evict_device_start(
-        self, component_type: ComponentType, request_cnt: int
+        self,
+        component_type: ComponentType,
+        request_cnt: int,
+        allow_protected_session_cache: bool = True,
     ) -> None:
         """Begin a component's device-eviction walk for up to request_cnt tokens."""
-        self.components_by_type[component_type].evict_device_start(request_cnt)
+        self.components_by_type[component_type].evict_device_start(
+            request_cnt, allow_protected_session_cache
+        )
 
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
@@ -2366,6 +2371,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def component_evictable_size(self, component_type: ComponentType) -> int:
         """Evictable token count for one component (0 if the component is absent)."""
         return self.component_evictable_size_.get(component_type, 0)
+
+    def component_evictable_size_without_session_refs(
+        self, component_type: ComponentType
+    ) -> int:
+        """Count unlocked device values not covered by a protected session.
+
+        This scan is only used for explicitly demoted requests. The normal
+        admission path keeps using the incrementally maintained O(1) counter.
+        """
+        if component_type not in self.components_by_type:
+            return 0
+        if not self.enable_session_radix_cache:
+            return self.component_evictable_size(component_type)
+        total = 0
+        for node in self._node_arena.values():
+            cd = node.component_data[component_type]
+            if cd.value is not None and cd.lock_ref == 0 and cd.session_ref == 0:
+                total += len(cd.value)
+        return total
 
     def full_evictable_size(self) -> int:
         return self.evictable_size()

@@ -102,7 +102,12 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None,
+    num_tokens: int,
+    *,
+    allow_protected_session_cache: bool = True,
+):
     if tree_cache is None:
         return
 
@@ -120,13 +125,22 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
             tree_cache.evict(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+                EvictParams(
+                    num_tokens=full_num_tokens,
+                    swa_num_tokens=swa_num_tokens,
+                    allow_protected_session_cache=allow_protected_session_cache,
+                )
             )
     else:
         # Standard allocator: evict only the shortfall (mirrors the SWA arm)
         available_size = allocator.available_size()
         if available_size < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
+            tree_cache.evict(
+                EvictParams(
+                    num_tokens=num_tokens - available_size,
+                    allow_protected_session_cache=allow_protected_session_cache,
+                )
+            )
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):

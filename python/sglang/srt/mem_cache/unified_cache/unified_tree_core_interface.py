@@ -208,7 +208,10 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     @abstractmethod
     def evict_device_start(
-        self, component_type: ComponentType, request_cnt: int
+        self,
+        component_type: ComponentType,
+        request_cnt: int,
+        allow_protected_session_cache: bool = True,
     ) -> None:
         """Begin a device-eviction walk for one component."""
         ...
@@ -266,6 +269,13 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     @abstractmethod
     def component_evictable_size(self, component_type: ComponentType) -> int:
         """Evictable token count for one component (0 if the component is absent)."""
+        ...
+
+    @abstractmethod
+    def component_evictable_size_without_session_refs(
+        self, component_type: ComponentType
+    ) -> int:
+        """Unlocked device values not covered by a protected session."""
         ...
 
     @abstractmethod

@@ -47,11 +47,27 @@ class TestPrefillAdder(CustomTestCase):
         full_evictable_size: int = 0,
         swa_evictable_size: int = 0,
         evictable_size: int = 0,
+        unreferenced_evictable_size: int | None = None,
     ) -> MagicMock:
         tree_cache = MagicMock()
         tree_cache.full_evictable_size.return_value = full_evictable_size
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
+        if unreferenced_evictable_size is None:
+            unreferenced_evictable_size = evictable_size
+        tree_cache.full_evictable_size_without_session_refs.return_value = (
+            unreferenced_evictable_size
+        )
+        tree_cache.swa_evictable_size_without_session_refs.return_value = (
+            unreferenced_evictable_size
+        )
+        tree_cache.evictable_size_without_session_refs.return_value = (
+            unreferenced_evictable_size
+        )
+        tree_cache.mamba_evictable_size_without_session_refs.return_value = 0
+        tree_cache.request_can_evict_protected_session_cache.return_value = True
+        tree_cache.supports_mamba.return_value = False
+        tree_cache.is_tree_cache.return_value = True
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
@@ -463,6 +479,41 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    def test_demoted_session_cannot_admit_against_protected_cache(self):
+        self.mock_tree_cache = self.create_tree_cache(
+            evictable_size=100,
+            unreferenced_evictable_size=3,
+        )
+        self.mock_token_allocator.available_size.return_value = 2
+        self.mock_tree_cache.request_can_evict_protected_session_cache.side_effect = (
+            lambda req: req.session_id != "demoted"
+        )
+
+        demoted = self.create_mock_req("demoted", priority=0, max_new_tokens=1)
+        demoted.session_id = "demoted"
+        demoted.full_untruncated_fill_ids = list(range(4))
+        demoted.last_node = MagicMock()
+        demoted.sampling_params.ignore_eos = False
+
+        demoted_result = self.create_adder(self.create_running_batch()).add_one_req(
+            demoted, has_chunked_req=False, truncation_align_size=None
+        )
+        self.mock_tree_cache.evictable_size_without_session_refs.assert_called()
+        self.mock_tree_cache.evictable_size_without_session_refs.reset_mock()
+
+        protected = self.create_mock_req("protected", priority=0, max_new_tokens=1)
+        protected.session_id = "protected"
+        protected.full_untruncated_fill_ids = list(range(4))
+        protected.last_node = MagicMock()
+        protected.sampling_params.ignore_eos = False
+        protected_result = self.create_adder(self.create_running_batch()).add_one_req(
+            protected, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(demoted_result, AddReqResult.NO_TOKEN)
+        self.assertNotEqual(protected_result, AddReqResult.NO_TOKEN)
+        self.mock_tree_cache.evictable_size_without_session_refs.assert_not_called()
 
     def _build_hybrid_swa_chunked_req(
         self,

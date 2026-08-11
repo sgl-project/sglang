@@ -115,6 +115,7 @@ class TreeComponent(ABC):
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False
+        self._allow_protected_session_cache_eviction = True
         # Per-session frontier nodes (the deepest registered node per cached
         # path), not physical tree leaves: a frontier node may have children.
         self._session_leaves: dict[str, set[UnifiedTreeNode]] = defaultdict(set)
@@ -524,11 +525,14 @@ class TreeComponent(ABC):
         - Full evict internal: cascades to SWA + Mamba."""
         return 0
 
-    def evict_device_start(self, request_cnt: int) -> None:
+    def evict_device_start(
+        self, request_cnt: int, allow_protected_session_cache: bool = True
+    ) -> None:
         """Begin this component's device-eviction walk (build its cursor/heap)."""
         assert (
             not self.is_evict_device_ongoing
         ), f"{self.component_type} device eviction already in progress"
+        self._allow_protected_session_cache_eviction = allow_protected_session_cache
         self._evict_device_start(request_cnt)
         self.is_evict_device_ongoing = True
 
@@ -552,6 +556,7 @@ class TreeComponent(ABC):
         ), f"{self.component_type} device eviction not started"
         self._evict_device_end()
         self.is_evict_device_ongoing = False
+        self._allow_protected_session_cache_eviction = True
 
     @abstractmethod
     def _evict_device_start(self, request_cnt: int) -> None:

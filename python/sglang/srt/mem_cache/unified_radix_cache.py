@@ -456,7 +456,9 @@ class UnifiedRadixCache(BasePrefixCache):
             ComponentType.SWA: params.swa_num_tokens,
             ComponentType.MAMBA: params.mamba_num,
         }
-        self._evict_components(request_by_type, tracker)
+        self._evict_components(
+            request_by_type, tracker, params.allow_protected_session_cache
+        )
 
         if (
             self.cache_controller is not None
@@ -531,13 +533,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
+        allow_protected_session_cache: bool,
     ) -> None:
         for ct in self.tree_components:
             request_cnt = request_by_type[ct]
             # Skip eviction walk if request is already met
             if tracker[ct] >= request_cnt:
                 continue
-            self.tree_core.evict_device_start(ct, request_cnt)
+            self.tree_core.evict_device_start(
+                ct, request_cnt, allow_protected_session_cache
+            )
             try:
                 while (
                     node_id := self._evict_device_next_node(ct, tracker)
@@ -1079,7 +1084,15 @@ class UnifiedRadixCache(BasePrefixCache):
             avail = self.token_to_kv_pool_allocator.available_size()
         if avail < kv_tokens:
             needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
+            result = self.evict(
+                EvictParams(
+                    num_tokens=needed,
+                    allow_protected_session_cache=(
+                        req is None
+                        or self.request_can_evict_protected_session_cache(req)
+                    ),
+                )
+            )
             if result.num_tokens_evicted < needed:
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
@@ -2116,6 +2129,9 @@ class UnifiedRadixCache(BasePrefixCache):
             generation=generation,
         )
 
+    def request_can_evict_protected_session_cache(self, req: Req) -> bool:
+        return self.session_refs.request_can_evict_protected_session_cache(req)
+
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)
 
@@ -2145,11 +2161,19 @@ class UnifiedRadixCache(BasePrefixCache):
     def evictable_size(self) -> int:
         return self.tree_core.evictable_size()
 
+    def evictable_size_without_session_refs(self) -> int:
+        return self.tree_core.component_evictable_size_without_session_refs(
+            BASE_COMPONENT_TYPE
+        )
+
     def protected_size(self) -> int:
         return self.tree_core.protected_size()
 
     def full_evictable_size(self) -> int:
         return self.tree_core.full_evictable_size()
+
+    def full_evictable_size_without_session_refs(self) -> int:
+        return self.evictable_size_without_session_refs()
 
     def full_protected_size(self) -> int:
         return self.tree_core.full_protected_size()
@@ -2157,8 +2181,18 @@ class UnifiedRadixCache(BasePrefixCache):
     def swa_evictable_size(self) -> int:
         return self.tree_core.swa_evictable_size()
 
+    def swa_evictable_size_without_session_refs(self) -> int:
+        return self.tree_core.component_evictable_size_without_session_refs(
+            ComponentType.SWA
+        )
+
     def mamba_evictable_size(self) -> int:
         return self.tree_core.mamba_evictable_size()
+
+    def mamba_evictable_size_without_session_refs(self) -> int:
+        return self.tree_core.component_evictable_size_without_session_refs(
+            ComponentType.MAMBA
+        )
 
     def swa_protected_size(self) -> int:
         return self.tree_core.swa_protected_size()
