@@ -1154,9 +1154,9 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.performance_mode, "auto")
         self.assertFalse(args.use_fsdp_inference)
-        # 80gb > image threshold (45gb): only vae kept resident, encoders stay
-        # offloaded layerwise, dit unchanged
-        self.assertTrue(args.dit_cpu_offload)
+        # 80gb > image threshold (45gb): vae and dit stay resident, while the
+        # large encoders use layerwise offload.
+        self.assertFalse(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder"],
@@ -1177,6 +1177,17 @@ class TestOffloadDefaults(unittest.TestCase):
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
         )
+
+    def test_auto_image_preserves_explicit_dit_cpu_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "dit_cpu_offload": True,
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
 
     def test_auto_ltx_original_replaces_component_cpu_offload(
         self,
