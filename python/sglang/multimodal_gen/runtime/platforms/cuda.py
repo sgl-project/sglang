@@ -297,6 +297,44 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video MoBA Attention backend is not installed. ") from e
 
 
+class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+
+    # The blk64 kernel is built `-gencode=arch=compute_100a,code=sm_100a`, which
+    # is arch-specific: 10.3 (B300 / GB300) and 12.x have no cubin. Its own guard
+    # only compares the major version, so it would accept 10.3 and fail later.
+    required_capability = (10, 0)
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        if capability is None or capability != cls.required_capability:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "SubBlock sparse attention needs compute capability "
+                f"{'.'.join(map(str, cls.required_capability))} (B200 / GB200); "
+                f"this device reports {found}."
+            )
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (  # noqa: F401
+                load_bsa_attn_blk64_fwd,
+            )
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (  # noqa: F401
+                SubBlockSparseAttentionBackend,
+            )
+
+            # Importing the entry point catches a missing or broken FlashInfer;
+            # the CUDA extension itself is built lazily on the first call.
+            load_bsa_attn_blk64_fwd()
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn.SubBlockSparseAttentionBackend"
+        except Exception as e:
+            logger.error("Failed to import SubBlock sparse attention: %s", str(e))
+            raise ImportError(
+                "SubBlock sparse attention needs FlashInfer with the blk64 "
+                "block-sparse kernel (flashinfer.cute_dsl.sparse.bsa_attn_blk64_fwd)."
+            ) from e
+
+
 class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FA2
 
@@ -338,6 +376,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
+        _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
     )
