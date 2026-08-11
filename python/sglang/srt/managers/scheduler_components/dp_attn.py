@@ -98,7 +98,7 @@ class MLPSyncBatchInfo:
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
-    def _get_local_tensor(self, device, dtype=torch.int32) -> torch.Tensor:
+    def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
             [
                 self.num_tokens,
@@ -113,7 +113,7 @@ class MLPSyncBatchInfo:
             dtype=dtype,
         )
 
-    def _get_fallback_tensor(self, device, dtype=torch.int32) -> torch.Tensor:
+    def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
             [
                 0,  # num_tokens
