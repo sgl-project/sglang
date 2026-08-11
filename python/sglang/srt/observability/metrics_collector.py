@@ -493,6 +493,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=list(labels.keys()) + ["reason"],
         )
+        # Pre-seed every reason at 0. Without this the series is absent until the
+        # first rejection, so rate() queries and alerts return no data instead of 0
+        # exactly when the server is healthy.
+        for reason in ("queue_full", "priority_preempted", "waiting_timeout"):
+            self.num_queue_rejected_requests_total.labels(**labels, reason=reason)
 
         # =================================================================
         # PD disaggregation

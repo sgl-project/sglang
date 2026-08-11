@@ -93,6 +93,30 @@ class TestMaxQueuedRequests(CustomTestCase):
                     total += sample.value
         return total
 
+    def _exported_rejection_reasons(self) -> set:
+        """Reason labels present on sglang:num_queue_rejected_requests_total."""
+        response = requests.get(f"{self.base_url}/metrics")
+        self.assertEqual(response.status_code, 200)
+
+        return {
+            sample.labels["reason"]
+            for family in text_string_to_metric_families(response.text)
+            for sample in family.samples
+            if sample.name == "sglang:num_queue_rejected_requests_total"
+        }
+
+    def test_queue_rejection_reasons_are_pre_seeded(self):
+        """Every reason is exported before it first fires.
+
+        A labelled Counter has no children until its first increment, which
+        leaves the series missing rather than zero, so rate() and alerting
+        queries return no data precisely when the server is healthy.
+        """
+        self.assertEqual(
+            self._exported_rejection_reasons(),
+            {"queue_full", "priority_preempted", "waiting_timeout"},
+        )
+
     def test_queue_full_rejections_are_counted(self):
         """Verify queue-full rejections are exported as a metric.
 
