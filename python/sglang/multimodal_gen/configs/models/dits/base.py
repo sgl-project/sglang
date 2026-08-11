@@ -10,6 +10,13 @@ from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 
 @dataclass
 class DiTArchConfig(ArchConfig):
+    """Static DiT architecture metadata and checkpoint mappings.
+
+    This object is populated from the source model configuration. It must not
+    contain runtime implementation capabilities or the backend selected for a
+    particular deployment.
+    """
+
     # convert weights name from HF-format to SGLang-dit-format
     param_names_mapping: dict = field(default_factory=dict)
 
