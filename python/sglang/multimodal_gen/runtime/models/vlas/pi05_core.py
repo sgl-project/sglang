@@ -1327,25 +1327,21 @@ class Pi05CoreModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         embs = []
         pad_masks = []
-        att_masks = []
         image_embs = self.paligemma_with_expert.embed_images(images)
         for image_emb, image_mask in zip(image_embs, image_masks, strict=True):
             batch_size, num_image_embs = image_emb.shape[:2]
             embs.append(image_emb)
             pad_masks.append(image_mask[:, None].expand(batch_size, num_image_embs))
-            att_masks += [0] * num_image_embs
 
         lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
         # Match OpenPI's Pi0.5 prefix embedding semantics.
         lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
         embs.append(lang_emb)
         pad_masks.append(token_masks)
-        att_masks += [0] * lang_emb.shape[1]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks_t = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-        att_masks_t = att_masks_t[None, :].expand(pad_masks.shape[0], len(att_masks))
+        att_masks_t = torch.zeros_like(pad_masks)
         return embs, pad_masks, att_masks_t
 
     def embed_suffix(

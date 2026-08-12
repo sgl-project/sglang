@@ -559,6 +559,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         main_process_only=False,
     )
 
+    current_platform.set_device(device)
     init_distributed_environment(
         world_size=world_size,
         rank=rank,
@@ -576,14 +577,6 @@ def maybe_init_distributed_environment_and_model_parallel(
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
     )
-
-    # Only set CUDA device if we're on a CUDA platform
-    if current_platform.is_cuda_alike():
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-    elif current_platform.is_npu():
-        device = torch.device(f"npu:{local_rank}")
-        torch.npu.set_device(device)
 
 
 def model_parallel_is_initialized() -> bool:
@@ -779,6 +772,21 @@ def get_ring_parallel_world_size() -> int:
 
 def get_ring_parallel_rank() -> int:
     return get_sp_group().ring_rank
+
+
+def get_ulysses_ctx() -> tuple[int, int]:
+    """(world_size, rank) of the Ulysses group; (1, 0) when uninitialized
+    (unit tests / single-process debug paths)."""
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
+
+
+def get_ring_ctx() -> tuple[int, int]:
+    """(world_size, rank) of the Ring group; (1, 0) when uninitialized."""
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ring_parallel_world_size(), get_ring_parallel_rank()
 
 
 # PP
