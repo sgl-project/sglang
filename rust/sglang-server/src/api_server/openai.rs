@@ -104,6 +104,12 @@ pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> ser
     })
 }
 
+/// Form an OpenAI error response: unary → `code` plus the JSON `body`,
+/// streaming → 200 with one SSE error frame + `[DONE]`.
+pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream: bool) -> Response {
+    error_response(code, error_payload(code, message), stream)
+}
+
 /// Drain one submitted request to its terminal output: fold frames, disarm
 /// `guard` on a natural terminal, and map errors / validation aborts /
 /// truncation to `(status, message)` for the OpenAI error shape.
@@ -163,9 +169,9 @@ async fn submit_generation(
         // Same `error_response` rule: a committed stream gets 200 plus an
         // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
         // error shape, since this is the OpenAI frontend.
-        Err(_) => Err(error_response(
+        Err(_) => Err(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            error_payload(StatusCode::SERVICE_UNAVAILABLE, "service unavailable"),
+            "service unavailable",
             stream,
         )),
     }

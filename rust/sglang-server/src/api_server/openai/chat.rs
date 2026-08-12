@@ -34,11 +34,10 @@ use super::tools::{
 };
 use super::{
     AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_egress_stream,
-    submit_generation, unix_seconds_u32,
+    openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
-use crate::utils::response::error_response;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -51,56 +50,35 @@ async fn chat_completions(
     let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(StatusCode::BAD_REQUEST, rejection.body_text()),
-                false,
-            );
+            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
     if request.model != state.server_args.served_model_name {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                format!("The model `{}` does not exist", request.model),
-            ),
+            format!("The model `{}` does not exist", request.model),
             false,
         );
     }
     if request.messages.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, "messages cannot be empty"),
-            false,
-        );
+        return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
     }
     if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "image, audio, video, and file message content is not supported",
-            ),
+            "image, audio, video, and file message content is not supported",
             false,
         );
     }
     if request.n == Some(0) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, "n must be at least 1"),
-            false,
-        );
+        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
     }
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
     if max_tokens == Some(0) {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "max_completion_tokens must be positive",
-            ),
+            "max_completion_tokens must be positive",
             false,
         );
     }
@@ -111,23 +89,17 @@ async fn chat_completions(
         || request.web_search_options.is_some()
         || request.mm_processor_kwargs.is_some()
     {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "audio, prediction, web search, and multimodal inputs are not supported",
-            ),
+            "audio, prediction, web search, and multimodal inputs are not supported",
             false,
         );
     }
     #[allow(deprecated)]
     if request.function_call.is_some() || request.functions.is_some() {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "deprecated function_call/functions are not supported; use tools and tool_choice",
-            ),
+            "deprecated function_call/functions are not supported; use tools and tool_choice",
             false,
         );
     }
@@ -142,12 +114,9 @@ async fn chat_completions(
         .then(|| state.server_args.tool_call_parser.clone())
         .flatten();
     if tools_enabled && parser.is_none() {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "tool calls require --tool-call-parser",
-            ),
+            "tool calls require --tool-call-parser",
             false,
         );
     }
@@ -183,11 +152,7 @@ async fn chat_completions(
     ) {
         Ok(sampling) => sampling,
         Err(message) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(StatusCode::BAD_REQUEST, message),
-                false,
-            );
+            return openai_error(StatusCode::BAD_REQUEST, message, false);
         }
     };
 
@@ -286,12 +251,9 @@ pub(super) async fn prepare_chat_request(
     mut request: CreateChatCompletionRequest,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
-        return Err(error_response(
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "this model has no usable chat template",
-            ),
+            "this model has no usable chat template",
             false,
         ));
     };
@@ -301,12 +263,9 @@ pub(super) async fn prepare_chat_request(
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
     let prompt = formatter.render(&request).map_err(|error| {
-        error_response(
+        openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                format!("chat template render failed: {error}"),
-            ),
+            format!("chat template render failed: {error}"),
             false,
         )
     })?;
@@ -482,7 +441,7 @@ pub(super) async fn unary_chat(
         let output = match collect_output(rx, &mut guard, &rid).await {
             Ok(output) => output,
             Err((status, message)) => {
-                return error_response(status, error_payload(status, message), false);
+                return openai_error(status, message, false);
             }
         };
 

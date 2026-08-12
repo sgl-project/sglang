@@ -5,12 +5,11 @@
 use axum::{http::StatusCode, response::Response};
 use tokio::sync::mpsc;
 
-use super::AppState;
+use super::{AppState, native_api::native_error};
 use crate::fsm::RequestState;
 use crate::ids::Rid;
 use crate::message::{EgressItem, EgressSink, Request, RequestKind};
 use crate::tokenizer_manager::TmEvent;
-use crate::utils::response::{error_response, error_value};
 
 /// Submit one request; returns the rid, its hashed routing key, and the egress
 /// receiver. Every request arrives with its final rid — a generate request from
@@ -51,9 +50,9 @@ pub(super) async fn submit(
         Err(_) => {
             tracing::error!(%rid, "tm inbox closed; request rejected");
             // Return 503 so the client can retry.
-            Err(error_response(
+            Err(native_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                error_value(503, "service unavailable"),
+                "service unavailable",
                 stream,
             ))
         }

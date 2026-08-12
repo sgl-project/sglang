@@ -24,14 +24,13 @@ use super::super::guard::AbortGuard;
 use super::super::submit::submit;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_egress_stream,
-    submit_generation, unix_seconds_u32,
+    openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{
     ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, RequestKind,
     SamplingParams, TokenIds,
 };
-use crate::utils::response::error_response;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/completions", post(completions))
@@ -65,89 +64,61 @@ async fn completions(
     let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(StatusCode::BAD_REQUEST, rejection.body_text()),
-                false,
-            );
+            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
     if model != state.server_args.served_model_name {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                format!("The model `{model}` does not exist"),
-            ),
+            format!("The model `{model}` does not exist"),
             false,
         );
     }
 
     if request.prompt_embeds.is_some() {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "prompt_embeds is not supported by the Rust frontend",
-            ),
+            "prompt_embeds is not supported by the Rust frontend",
             false,
         );
     }
     if request.suffix.is_some() {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "suffix is not supported by this model",
-            ),
+            "suffix is not supported by this model",
             false,
         );
     }
     if request.best_of.is_some_and(|best_of| best_of != 1) {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "best_of values greater than 1 are not supported",
-            ),
+            "best_of values greater than 1 are not supported",
             false,
         );
     }
     if request.max_tokens == Some(0) {
-        return error_response(
+        return openai_error(
             StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, "max_tokens must be positive"),
+            "max_tokens must be positive",
             false,
         );
     }
     if request.n == Some(0) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, "n must be at least 1"),
-            false,
-        );
+        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
     }
     let prompts = match completion_prompt_specs(&request.prompt) {
         Ok(prompts) => prompts,
         Err(message) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(StatusCode::BAD_REQUEST, message),
-                false,
-            );
+            return openai_error(StatusCode::BAD_REQUEST, &message, false);
         }
     };
     let mut sampling = match completion_sampling_params(&request) {
         Ok(sampling) => sampling,
         Err(message) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(StatusCode::BAD_REQUEST, message),
-                false,
-            );
+            return openai_error(StatusCode::BAD_REQUEST, &message, false);
         }
     };
     if let Err(error) = sampling.normalize(
@@ -158,23 +129,16 @@ async fn completions(
             .vocab_size
             .unwrap_or(u64::MAX),
     ) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, error.to_string()),
-            false,
-        );
+        return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false);
     }
 
     let n = request.n.unwrap_or(1) as usize;
     let choice_count = match prompts.len().checked_mul(n) {
         Some(count) if count <= MAX_OPENAI_CHOICES => count,
         _ => {
-            return error_response(
+            return openai_error(
                 StatusCode::BAD_REQUEST,
-                error_payload(
-                    StatusCode::BAD_REQUEST,
-                    format!("prompt count times n exceeds the maximum of {MAX_OPENAI_CHOICES}"),
-                ),
+                format!("prompt count times n exceeds the maximum of {MAX_OPENAI_CHOICES}"),
                 false,
             );
         }
@@ -281,43 +245,35 @@ async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<Str
     else {
         // Same rule as `submit_generation`: rebuild the refusal in the OpenAI
         // error shape rather than forwarding the native-shaped response.
-        return Err(error_response(
+        return Err(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            error_payload(StatusCode::SERVICE_UNAVAILABLE, "service unavailable"),
+            "service unavailable",
             false,
         ));
     };
     match rx.recv().await {
         Some(EgressItem::Data(payload)) => String::from_utf8(payload.to_vec()).map_err(|_| {
-            error_response(
+            openai_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                error_payload(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "detokenized prompt is not valid UTF-8",
-                ),
+                "detokenized prompt is not valid UTF-8",
                 false,
             )
         }),
-        Some(EgressItem::Error(crate::error::Error::Validation(message))) => Err(error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, message),
-            false,
-        )),
+        Some(EgressItem::Error(crate::error::Error::Validation(message))) => {
+            Err(openai_error(StatusCode::BAD_REQUEST, &message, false))
+        }
         Some(EgressItem::Error(error)) => {
             let status = StatusCode::from_u16(error.http_status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            Err(error_response(
+            Err(openai_error(
                 status,
-                error_payload(status, format!("failed to decode prompt for echo: {error}")),
+                format!("failed to decode prompt for echo: {error}"),
                 false,
             ))
         }
-        Some(_) | None => Err(error_response(
+        Some(_) | None => Err(openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            error_payload(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to decode prompt for echo: reply channel closed",
-            ),
+            "failed to decode prompt for echo: reply channel closed",
             false,
         )),
     }
@@ -420,7 +376,7 @@ pub(super) async fn unary_completion(
         let output = match collect_output(choice.rx, &mut guard, &choice.rid).await {
             Ok(output) => output,
             Err((status, message)) => {
-                return error_response(status, error_payload(status, message), false);
+                return openai_error(status, &message, false);
             }
         };
 

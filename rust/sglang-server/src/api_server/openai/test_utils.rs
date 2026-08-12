@@ -16,11 +16,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use serde_json::json;
-
-use crate::utils::response::error_response;
 use tower::util::ServiceExt;
 
-use super::routes;
+use super::{openai_error, routes};
 use crate::ids::Rid;
 use crate::message::{ChunkEvent, EgressItem};
 use crate::runtime::ServerArgs;
@@ -165,11 +163,7 @@ pub(super) async fn body_json(response: Response) -> serde_json::Value {
 /// error fields (`type`, `param`, `code`) that the SDKs dispatch on.
 #[tokio::test]
 async fn openai_error_response_covers_unary_and_sse() {
-    let unary = error_response(
-        StatusCode::BAD_REQUEST,
-        super::error_payload(StatusCode::BAD_REQUEST, "bad input"),
-        false,
-    );
+    let unary = openai_error(StatusCode::BAD_REQUEST, "bad input", false);
     assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
     let value = body_json(unary).await;
     assert_eq!(value["error"]["message"], "bad input");
@@ -177,11 +171,7 @@ async fn openai_error_response_covers_unary_and_sse() {
     assert_eq!(value["error"]["code"], 400);
     assert!(value["error"]["param"].is_null());
 
-    let streamed = error_response(
-        StatusCode::BAD_REQUEST,
-        super::error_payload(StatusCode::BAD_REQUEST, "bad input"),
-        true,
-    );
+    let streamed = openai_error(StatusCode::BAD_REQUEST, "bad input", true);
     assert_eq!(streamed.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
         .await
