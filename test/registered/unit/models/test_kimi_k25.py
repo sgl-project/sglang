@@ -894,6 +894,24 @@ def test_kimi_k3_default_media_options_share_one_artifact_key():
     assert len(keys) == 1
 
 
+def test_kimi_k3_output_affecting_media_options_do_not_share_artifacts():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.processor_fingerprint = "processor"
+    digest = "sha256:" + "ab" * 32
+    base = processor._artifact_key(digest, ImageData(url="image.png"))
+
+    assert base != processor._artifact_key(
+        digest, ImageData(url="image.png", detail="low")
+    )
+    assert base != processor._artifact_key(
+        digest, ImageData(url="image.png", max_dynamic_patch=4)
+    )
+    assert base != processor._artifact_key(
+        digest,
+        ImageData(url="image.png", preprocess_kwargs={"max_pixels": 1024}),
+    )
+
+
 def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.processor_fingerprint = "processor"
