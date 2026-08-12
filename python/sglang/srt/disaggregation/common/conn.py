@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
     KVTransferMetric,
+    LayerPipelinedTransferContext,
     StateType,
 )
 from sglang.srt.disaggregation.utils import (
@@ -1078,6 +1079,10 @@ class CommonKVSender(BaseKVSender):
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
+        self._transfer_subset_bytes = 0
+        self.layer_pipelined_transfer_context: Optional[
+            LayerPipelinedTransferContext
+        ] = None
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -1143,6 +1148,7 @@ class CommonKVSender(BaseKVSender):
         total_bytes += (
             self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
         )
+        total_bytes += getattr(self, "_transfer_subset_bytes", 0)
         # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
         total_bytes *= self.kv_mgr.get_kv_replica_factor()
         self._transfer_metric.transfer_total_bytes = total_bytes
@@ -1158,6 +1164,33 @@ class CommonKVSender(BaseKVSender):
             for component_indices in state_indices:
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
+
+    def _record_transfer_subset(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List],
+        kv_data_ptrs_indices_subset: Optional[List[int]],
+        state_data_ptrs_indices_subset: Optional[Dict[int, List[int]]],
+    ) -> None:
+        """Record one layer-pipelined buffer subset by its actual item lengths."""
+        if kv_data_ptrs_indices_subset:
+            kv_item_lens = self.kv_mgr.kv_args.kv_item_lens
+            self._transfer_subset_bytes += len(kv_indices) * sum(
+                kv_item_lens[index] for index in kv_data_ptrs_indices_subset
+            )
+
+        if not state_data_ptrs_indices_subset or not state_indices:
+            return
+        state_item_lens = self.kv_mgr.kv_args.state_item_lens
+        for component_id, buffer_indices in state_data_ptrs_indices_subset.items():
+            if not buffer_indices or component_id >= len(state_indices):
+                continue
+            component_indices = state_indices[component_id]
+            if component_indices is None or component_id >= len(state_item_lens):
+                continue
+            self._transfer_subset_bytes += len(component_indices) * sum(
+                state_item_lens[component_id][index] for index in buffer_indices
+            )
 
     def _prepare_send_indices(
         self,
@@ -1192,6 +1225,28 @@ class CommonKVSender(BaseKVSender):
                 return kv_indices, index_slice, is_last_chunk, True
 
         return kv_indices, index_slice, is_last_chunk, False
+
+    def prepare_layer_pipelined_transfer(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List] = None,
+        *,
+        final_state_indices: Optional[List] = None,
+        skip_dsa_state_layer_ids: Optional[set[int]] = None,
+    ) -> None:
+        """Prepare one request chunk for subsequent layer selection."""
+        kv_indices, index_slice, is_last_chunk, should_skip = (
+            self._prepare_send_indices(kv_indices, state_indices)
+        )
+        self.layer_pipelined_transfer_context = LayerPipelinedTransferContext(
+            kv_indices=kv_indices,
+            state_indices=state_indices,
+            final_state_indices=final_state_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            should_skip=should_skip,
+            skip_dsa_state_layer_ids=skip_dsa_state_layer_ids,
+        )
 
     def send(
         self,

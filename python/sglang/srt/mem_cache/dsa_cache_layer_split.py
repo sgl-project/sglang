@@ -31,11 +31,16 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.srt.disaggregation.base.conn import (
+    BufferType,
+    LayerBufferHandles,
+    StateType,
+)
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import (
     GPU_MEMORY_TYPE_KV_CACHE,
@@ -257,6 +262,31 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.kv_buffer[i][0].nbytes * self.page_size for i in owned_layer_ids
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_buffer_handles_by_layer(
+        self,
+        kv_buffer_offset: int = 0,
+        state_component_ids: Optional[Dict[StateType, int]] = None,
+        state_buffer_offsets: Optional[Dict[StateType, int]] = None,
+    ) -> Dict[int, LayerBufferHandles]:
+        owned_start, _ = self._owned_local_layer_range()
+        state_offset = (state_buffer_offsets or {}).get(StateType.DSA, 0)
+        component_id = (state_component_ids or {}).get(StateType.DSA)
+        handles_by_layer = {}
+        for local_layer_idx in range(self.layer_num):
+            layer_id = self.start_layer + local_layer_idx
+            if not self._is_layer_owned(layer_id):
+                continue
+            buffer_index = local_layer_idx - owned_start
+            handles_by_layer[layer_id] = LayerBufferHandles(
+                buffer_types=[BufferType.KV, BufferType.STATE],
+                raw_data_ptrs_indices=[
+                    kv_buffer_offset + buffer_index,
+                    state_offset + buffer_index,
+                ],
+                state_component_ids=[None, component_id],
+            )
+        return handles_by_layer
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:

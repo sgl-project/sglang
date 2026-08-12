@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -24,6 +24,9 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
+    kv_data_ptrs_indices_subset: Optional[List[int]] = None
+    state_data_ptrs_indices_subset: Optional[Dict[int, List[int]]] = None
+    ready_event: Optional[object] = None
     chunk_id: Optional[int] = None
     num_kv_tokens: Optional[int] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(

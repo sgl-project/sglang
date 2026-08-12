@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -52,6 +52,11 @@ from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.disaggregation.base.conn import (
+    BufferType,
+    LayerBufferHandles,
+    StateType,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -482,6 +487,7 @@ class MambaPool:
 
         self.size = size
         self.device = device
+        self.mamba_layer_ids = mamba_layer_ids
         self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
@@ -1709,6 +1715,30 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
+    def get_buffer_handles_by_layer(
+        self,
+        kv_buffer_offset: int = 0,
+        state_component_ids: Optional[Dict[StateType, int]] = None,
+        state_buffer_offsets: Optional[Dict[StateType, int]] = None,
+    ) -> Dict[int, LayerBufferHandles]:
+        """Return the registered KV buffers for every layer owned by this pool.
+
+        The dictionary uses global layer IDs as keys. ``kv_buffer_offset`` is
+        added to the pool-local buffer index so callers can address this pool
+        within a combined KV buffer list. The state arguments are accepted by
+        the common interface for stateful pool implementations, but are not
+        used by this KV-only pool.
+        """
+        return {
+            self.start_layer
+            + buffer_index: LayerBufferHandles(
+                buffer_types=[BufferType.KV],
+                raw_data_ptrs_indices=[kv_buffer_offset + buffer_index],
+                state_component_ids=[None],
+            )
+            for buffer_index in range(self.layer_num)
+        }
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError()
 
@@ -2210,6 +2240,25 @@ class MHATokenToKVPool(KVCache):
         ]
         item_lens = [d.item_len_bytes(self.page_size) for d in self._kv_buffer_descs]
         return ptrs, lens, item_lens
+
+    def get_buffer_handles_by_layer(
+        self,
+        kv_buffer_offset: int = 0,
+        state_component_ids: Optional[Dict[StateType, int]] = None,
+        state_buffer_offsets: Optional[Dict[StateType, int]] = None,
+    ) -> Dict[int, LayerBufferHandles]:
+        return {
+            self.start_layer
+            + buffer_index: LayerBufferHandles(
+                buffer_types=[BufferType.KV, BufferType.KV],
+                raw_data_ptrs_indices=[
+                    kv_buffer_offset + buffer_index,
+                    kv_buffer_offset + self.layer_num + buffer_index,
+                ],
+                state_component_ids=[None, None],
+            )
+            for buffer_index in range(self.layer_num)
+        }
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         assert not self.use_hnd, (
@@ -3703,6 +3752,48 @@ class HybridLinearKVPool(KVCache):
         layer_ids = list(self.full_attention_layer_id_mapping)
         return layer_ids if self.use_mla else layer_ids * 2
 
+    def get_buffer_handles_by_layer(
+        self,
+        kv_buffer_offset: int = 0,
+        state_component_ids: Optional[Dict[StateType, int]] = None,
+        state_buffer_offsets: Optional[Dict[StateType, int]] = None,
+    ) -> Dict[int, LayerBufferHandles]:
+        handles_by_layer = {}
+        full_handles = self.full_kv_pool.get_buffer_handles_by_layer(
+            kv_buffer_offset=kv_buffer_offset,
+            state_component_ids=state_component_ids,
+            state_buffer_offsets=state_buffer_offsets,
+        )
+        for layer_id, kv_buffer_index in self.full_attention_layer_id_mapping.items():
+            handles_by_layer[layer_id] = full_handles[kv_buffer_index]
+
+        component_id = (state_component_ids or {}).get(StateType.MAMBA)
+        if component_id is None:
+            return handles_by_layer
+
+        mamba_layer_ids = getattr(self.mamba_pool, "mamba_layer_ids", [])
+        num_mamba_layers = len(mamba_layer_ids)
+        if num_mamba_layers:
+            overlap = set(handles_by_layer).intersection(mamba_layer_ids)
+            if overlap:
+                raise RuntimeError(
+                    f"Full-attention and Mamba layer handles overlap: {sorted(overlap)}"
+                )
+            num_state_tensors = (
+                len(self.mamba_pool.get_contiguous_buf_infos()[0]) // num_mamba_layers
+            )
+            state_offset = (state_buffer_offsets or {}).get(StateType.MAMBA, 0)
+            for layer_index, layer_id in enumerate(mamba_layer_ids):
+                handles_by_layer[layer_id] = LayerBufferHandles(
+                    buffer_types=[BufferType.STATE] * num_state_tensors,
+                    raw_data_ptrs_indices=[
+                        state_offset + tensor_id * num_mamba_layers + layer_index
+                        for tensor_id in range(num_state_tensors)
+                    ],
+                    state_component_ids=[component_id] * num_state_tensors,
+                )
+        return handles_by_layer
+
     def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
             self.mamba_pool.get_contiguous_buf_infos()
@@ -4557,6 +4648,27 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
         ]
         return data_ptrs, data_lens, item_lens
+
+    def get_buffer_handles_by_layer(
+        self,
+        kv_buffer_offset: int = 0,
+        state_component_ids: Optional[Dict[StateType, int]] = None,
+        state_buffer_offsets: Optional[Dict[StateType, int]] = None,
+    ) -> Dict[int, LayerBufferHandles]:
+        state_offset = (state_buffer_offsets or {}).get(StateType.DSA, 0)
+        component_id = (state_component_ids or {}).get(StateType.DSA)
+        return {
+            self.start_layer
+            + buffer_index: LayerBufferHandles(
+                buffer_types=[BufferType.KV, BufferType.STATE],
+                raw_data_ptrs_indices=[
+                    kv_buffer_offset + buffer_index,
+                    state_offset + buffer_index,
+                ],
+                state_component_ids=[None, component_id],
+            )
+            for buffer_index in range(self.layer_num)
+        }
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()

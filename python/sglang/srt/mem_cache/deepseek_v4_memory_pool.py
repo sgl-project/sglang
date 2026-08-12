@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Tuple
+from typing import Dict, List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -17,6 +17,11 @@ from sglang.kernels.ops.attention.dsv4 import (
 )
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.disaggregation.base.conn import (
+    BufferType,
+    LayerBufferHandles,
+    StateType,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
@@ -720,6 +725,83 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 item_lens.append(buf[0].nbytes)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_buffer_handles_by_layer(
+        self,
+        kv_buffer_offset: int = 0,
+        state_component_ids: Optional[Dict[StateType, int]] = None,
+        state_buffer_offsets: Optional[Dict[StateType, int]] = None,
+    ) -> Dict[int, LayerBufferHandles]:
+        state_component_ids = state_component_ids or {}
+        state_buffer_offsets = state_buffer_offsets or {}
+        swa_state_type = StateType.SWA_RING if self._unified_kv else StateType.SWA
+        swa_component_id = state_component_ids.get(swa_state_type)
+        c4_layer_count = len(self.c4_indexer_kv_pool.index_k_with_scale_buffer)
+        handles_by_layer = {}
+        for layer_id in range(self._stage_start, self._stage_end):
+            layer_item = self.layer_mapping[layer_id]
+            buffer_types = [BufferType.STATE]
+            raw_indices = [
+                state_buffer_offsets.get(swa_state_type, 0)
+                + layer_id
+                - self._stage_start
+            ]
+            component_ids = [swa_component_id]
+
+            if layer_item.compress_ratio == 4:
+                c4_index = layer_item.compress_layer_id
+                state_offset = (
+                    0 if self._unified_kv else self._stage_end - self._stage_start
+                )
+                c4_state_indices = [
+                    state_offset + c4_index,
+                    state_offset + c4_layer_count + c4_index,
+                ]
+                buffer_types = [
+                    BufferType.KV,
+                    BufferType.KV,
+                    BufferType.STATE,
+                    BufferType.STATE,
+                    BufferType.STATE,
+                ]
+                raw_indices = [
+                    kv_buffer_offset + c4_index,
+                    kv_buffer_offset + c4_layer_count + c4_index,
+                    *[
+                        state_buffer_offsets.get(StateType.SWA, 0) + index
+                        for index in c4_state_indices
+                    ],
+                    state_buffer_offsets.get(swa_state_type, 0)
+                    + layer_id
+                    - self._stage_start,
+                ]
+                component_ids = [
+                    None,
+                    None,
+                    state_component_ids.get(StateType.SWA),
+                    state_component_ids.get(StateType.SWA),
+                    swa_component_id,
+                ]
+            elif layer_item.compress_ratio == 128:
+                c128_index = layer_item.compress_layer_id
+                buffer_types = [BufferType.KV, BufferType.STATE, BufferType.STATE]
+                raw_indices = [
+                    kv_buffer_offset + 2 * c4_layer_count + c128_index,
+                    state_buffer_offsets.get(StateType.C128_STATE, 0) + c128_index,
+                    state_buffer_offsets.get(swa_state_type, 0)
+                    + layer_id
+                    - self._stage_start,
+                ]
+                component_ids = [
+                    None,
+                    state_component_ids.get(StateType.C128_STATE),
+                    swa_component_id,
+                ]
+
+            handles_by_layer[layer_id] = LayerBufferHandles(
+                buffer_types, raw_indices, component_ids
+            )
+        return handles_by_layer
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """SWA-ring region [0, swa_pages) of every unified_kv layer, addressed

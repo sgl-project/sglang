@@ -3,6 +3,11 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import (
+    BufferType,
+    LayerBufferHandles,
+    StateType,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -136,6 +141,36 @@ class SWAKVPool(BaseSWAKVPool):
             full_kv_data_lens,
             full_kv_item_lens,
         )
+
+    def get_buffer_handles_by_layer(
+        self,
+        kv_buffer_offset: int = 0,
+        state_component_ids: Optional[Dict[StateType, int]] = None,
+        state_buffer_offsets: Optional[Dict[StateType, int]] = None,
+    ) -> Dict[int, LayerBufferHandles]:
+        full_handles = self.full_kv_pool.get_buffer_handles_by_layer(
+            kv_buffer_offset=kv_buffer_offset,
+            state_component_ids=state_component_ids,
+            state_buffer_offsets=state_buffer_offsets,
+        )
+        handles_by_layer = {}
+        for layer_id, (buffer_index, is_swa_layer) in self.layers_mapping.items():
+            if not is_swa_layer:
+                handles_by_layer[layer_id] = full_handles[buffer_index]
+                continue
+
+            value_buffer_index = self.swa_layer_nums + buffer_index
+            component_id = (state_component_ids or {}).get(StateType.SWA)
+            state_offset = (state_buffer_offsets or {}).get(StateType.SWA, 0)
+            handles_by_layer[layer_id] = LayerBufferHandles(
+                buffer_types=[BufferType.STATE, BufferType.STATE],
+                raw_data_ptrs_indices=[
+                    state_offset + buffer_index,
+                    state_offset + value_buffer_index,
+                ],
+                state_component_ids=[component_id, component_id],
+            )
+        return handles_by_layer
 
     def get_state_buf_infos(self):
         swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (

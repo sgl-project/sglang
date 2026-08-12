@@ -8,14 +8,20 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    BufferType,
+    KVArgs,
+    KVPoll,
+    LayerPipelinedTransferContext,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -803,6 +809,52 @@ class MooncakeKVManager(CommonKVManager):
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
 
+    @staticmethod
+    def _select_buffer_subset(values: List, indices: List[int]) -> List:
+        return [values[index] for index in indices] if values else []
+
+    def _select_kv_buffer_subset(
+        self,
+        kv_data_ptrs_indices_subset: List[int],
+        dst_kv_ptrs: list[int],
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Select aligned KV pointers and item lengths by raw buffer index."""
+        indices = sorted(kv_data_ptrs_indices_subset)
+        return (
+            self._select_buffer_subset(self.kv_args.kv_data_ptrs, indices),
+            self._select_buffer_subset(dst_kv_ptrs, indices),
+            self._select_buffer_subset(self.kv_args.kv_item_lens, indices),
+        )
+
+    def send_kvcache_subset(
+        self,
+        mooncake_session_id: str,
+        kv_data_ptrs_indices_subset: List[int],
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        """Send a selected subset of registered KV buffers."""
+        if (
+            not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and len(kv_data_ptrs_indices_subset) % 2 != 0
+        ):
+            return -1
+        src_ptrs, dst_ptrs, item_lens = self._select_kv_buffer_subset(
+            kv_data_ptrs_indices_subset, dst_kv_ptrs
+        )
+        return self._send_kvcache_generic(
+            mooncake_session_id=mooncake_session_id,
+            src_data_ptrs=src_ptrs,
+            dst_data_ptrs=dst_ptrs,
+            item_lens=item_lens,
+            prefill_data_indices=prefill_kv_indices,
+            dst_data_indices=dst_kv_indices,
+            executor=executor,
+        )
+
     def send_kvcache_dcp(
         self,
         mooncake_session_id: str,
@@ -922,6 +974,71 @@ class MooncakeKVManager(CommonKVManager):
         each page to ensure correctness for any page_size and head-slicing configuration.
         This may introduce performance overhead (increased TTFT) for long sequences.
         """
+        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, _ = (
+            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+        )
+        return self._send_kvcache_slice_impl(
+            mooncake_session_id=mooncake_session_id,
+            prefill_kv_indices=prefill_kv_indices,
+            dst_kv_indices=dst_kv_indices,
+            dst_tp_rank=dst_tp_rank,
+            dst_attn_tp_size=dst_attn_tp_size,
+            dst_kv_item_len=dst_kv_item_len,
+            executor=executor,
+            src_k_ptrs=src_k_ptrs,
+            src_v_ptrs=src_v_ptrs,
+            dst_k_ptrs=dst_k_ptrs,
+            dst_v_ptrs=dst_v_ptrs,
+        )
+
+    def send_kvcache_slice_subset(
+        self,
+        mooncake_session_id: str,
+        kv_data_ptrs_indices_subset: List[int],
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        dst_kv_item_len: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        """Send head slices for a selected subset of registered KV buffers."""
+        if len(kv_data_ptrs_indices_subset) % 2 != 0:
+            return -1
+        num_layers = len(kv_data_ptrs_indices_subset) // 2
+        selected_src_ptrs, selected_dst_ptrs, _ = self._select_kv_buffer_subset(
+            kv_data_ptrs_indices_subset, dst_kv_ptrs
+        )
+        return self._send_kvcache_slice_impl(
+            mooncake_session_id=mooncake_session_id,
+            prefill_kv_indices=prefill_kv_indices,
+            dst_kv_indices=dst_kv_indices,
+            dst_tp_rank=dst_tp_rank,
+            dst_attn_tp_size=dst_attn_tp_size,
+            dst_kv_item_len=dst_kv_item_len,
+            executor=executor,
+            src_k_ptrs=selected_src_ptrs[:num_layers],
+            src_v_ptrs=selected_src_ptrs[num_layers:],
+            dst_k_ptrs=selected_dst_ptrs[:num_layers],
+            dst_v_ptrs=selected_dst_ptrs[num_layers:],
+        )
+
+    def _send_kvcache_slice_impl(
+        self,
+        *,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        dst_kv_item_len: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        src_k_ptrs: List[int],
+        src_v_ptrs: List[int],
+        dst_k_ptrs: List[int],
+        dst_v_ptrs: List[int],
+    ) -> int:
         # Extract configuration
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         src_kv_item_len = self.kv_args.kv_item_lens[0]
@@ -964,10 +1081,6 @@ class MooncakeKVManager(CommonKVManager):
             ) % src_heads_per_rank
             num_heads_to_send = dst_heads_per_rank
             dst_head_start_offset = 0
-
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-        )
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
@@ -1013,11 +1126,11 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         futures = []
-        for i in range(layers_current_pp_stage):
+        for i in range(len(src_k_ptrs)):
             futures.append(
                 executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
             )
-        for i in range(layers_current_pp_stage):
+        for i in range(len(src_v_ptrs)):
             futures.append(
                 executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
             )
@@ -1180,185 +1293,263 @@ class MooncakeKVManager(CommonKVManager):
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
-        for i, st in enumerate(state_types):
-            indices = (
-                prefill_state_indices[i] if i < len(prefill_state_indices) else None
+        for component_id, state_type in enumerate(state_types):
+            src_indices = (
+                prefill_state_indices[component_id]
+                if component_id < len(prefill_state_indices)
+                else None
             )
-            if indices is None:
+            if src_indices is None:
                 continue
-            src_data_ptrs = self.kv_args.state_data_ptrs[i]
-            src_item_lens = self.kv_args.state_item_lens[i]
-            src_dim_per_tensor = (
-                self.kv_args.state_dim_per_tensor[i]
-                if i < len(self.kv_args.state_dim_per_tensor)
+            component_rc = self._send_state_component(
+                req=req,
+                component_id=component_id,
+                state_type=state_type,
+                src_indices=src_indices,
+                executor=executor,
+                target_rank_registration_info=target_rank_registration_info,
+            )
+            rc = component_rc or rc
+        return rc
+
+    def maybe_send_extra_subset(
+        self,
+        req: TransferInfo,
+        prefill_state_indices: List,
+        state_data_ptrs_indices_subset: Dict[int, List[int]],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+    ) -> int:
+        """Send selected registered state buffers grouped by component."""
+        rc = 0
+        state_types = getattr(self.kv_args, "state_types", [])
+        for component_id, buffer_indices in state_data_ptrs_indices_subset.items():
+            buffer_indices = sorted(buffer_indices)
+            if not buffer_indices:
+                continue
+            src_indices = (
+                prefill_state_indices[component_id]
+                if component_id < len(prefill_state_indices)
+                else None
+            )
+            if src_indices is None:
+                continue
+            component_rc = self._send_state_component(
+                req=req,
+                component_id=component_id,
+                state_type=state_types[component_id],
+                src_indices=src_indices,
+                executor=executor,
+                target_rank_registration_info=target_rank_registration_info,
+                state_data_ptrs_indices_subset=buffer_indices,
+            )
+            rc = component_rc or rc
+        return rc
+
+    def _send_state_component(
+        self,
+        *,
+        req: TransferInfo,
+        component_id: int,
+        state_type: StateType,
+        src_indices,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        target_rank_registration_info: Optional[KVArgsRegisterInfo],
+        state_data_ptrs_indices_subset: Optional[List[int]] = None,
+    ) -> int:
+        src_data_ptrs = self.kv_args.state_data_ptrs[component_id]
+        src_item_lens = self.kv_args.state_item_lens[component_id]
+        src_dim_per_tensor = (
+            self.kv_args.state_dim_per_tensor[component_id]
+            if component_id < len(self.kv_args.state_dim_per_tensor)
+            else []
+        )
+        src_slice_outer_counts = getattr(self.kv_args, "state_slice_outer_counts", [])
+        src_slice_outer_counts = (
+            src_slice_outer_counts[component_id]
+            if component_id < len(src_slice_outer_counts)
+            else []
+        )
+        src_state_layer_ids = getattr(self.kv_args, "state_layer_ids", [])
+        src_state_layer_ids = (
+            src_state_layer_ids[component_id]
+            if component_id < len(src_state_layer_ids)
+            else []
+        )
+        conv_shard_groups = getattr(self.kv_args, "state_conv_shard_groups", [])
+        src_conv_shard_groups = (
+            conv_shard_groups[component_id]
+            if component_id < len(conv_shard_groups)
+            else []
+        )
+        if target_rank_registration_info is not None:
+            dst_data_ptrs = (
+                target_rank_registration_info.dst_state_data_ptrs[component_id]
+                if component_id < len(target_rank_registration_info.dst_state_data_ptrs)
                 else []
             )
-            src_conv_shard_groups = getattr(self.kv_args, "state_conv_shard_groups", [])
-            src_conv_shard_groups = (
-                src_conv_shard_groups[i] if i < len(src_conv_shard_groups) else []
+            dst_item_lens = (
+                target_rank_registration_info.dst_state_item_lens[component_id]
+                if component_id < len(target_rank_registration_info.dst_state_item_lens)
+                else []
             )
-            src_slice_outer_counts = getattr(
-                self.kv_args, "state_slice_outer_counts", []
+            dst_dim_per_tensor = (
+                target_rank_registration_info.dst_state_dim_per_tensor[component_id]
+                if component_id
+                < len(target_rank_registration_info.dst_state_dim_per_tensor)
+                else []
             )
-            src_slice_outer_counts = (
-                src_slice_outer_counts[i] if i < len(src_slice_outer_counts) else []
+            dst_state_layer_ids = (
+                target_rank_registration_info.dst_state_layer_ids[component_id]
+                if component_id < len(target_rank_registration_info.dst_state_layer_ids)
+                else []
             )
-            src_state_layer_ids = self.kv_args.state_layer_ids
-            src_state_layer_ids = (
-                src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
+        else:
+            dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
+            dst_state_layer_ids = []
+        dst_indices = (
+            req.dst_state_indices[component_id]
+            if component_id < len(req.dst_state_indices)
+            else []
+        )
+
+        if state_data_ptrs_indices_subset is not None:
+            select = self._select_buffer_subset
+            src_data_ptrs = select(src_data_ptrs, state_data_ptrs_indices_subset)
+            src_item_lens = select(src_item_lens, state_data_ptrs_indices_subset)
+            src_dim_per_tensor = select(
+                src_dim_per_tensor, state_data_ptrs_indices_subset
             )
-            if target_rank_registration_info is not None:
-                dst_data_ptrs = (
-                    target_rank_registration_info.dst_state_data_ptrs[i]
-                    if i < len(target_rank_registration_info.dst_state_data_ptrs)
-                    else []
+            src_conv_shard_groups = select(
+                src_conv_shard_groups, state_data_ptrs_indices_subset
+            )
+            src_slice_outer_counts = select(
+                src_slice_outer_counts, state_data_ptrs_indices_subset
+            )
+            src_state_layer_ids = select(
+                src_state_layer_ids, state_data_ptrs_indices_subset
+            )
+            if state_type != StateType.MAMBA:
+                dst_data_ptrs = select(dst_data_ptrs, state_data_ptrs_indices_subset)
+                dst_item_lens = select(dst_item_lens, state_data_ptrs_indices_subset)
+                dst_dim_per_tensor = select(
+                    dst_dim_per_tensor, state_data_ptrs_indices_subset
                 )
-                dst_item_lens = (
-                    target_rank_registration_info.dst_state_item_lens[i]
-                    if i < len(target_rank_registration_info.dst_state_item_lens)
-                    else []
+
+        if state_type == StateType.MAMBA:
+            if (
+                target_rank_registration_info is not None
+                and self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size
+            ):
+                return self._send_mamba_state_slice(
+                    req,
+                    src_indices,
+                    src_data_ptrs,
+                    src_item_lens,
+                    src_dim_per_tensor,
+                    dst_data_ptrs,
+                    dst_indices,
+                    dst_item_lens,
+                    dst_dim_per_tensor,
+                    target_rank_registration_info.dst_tp_rank,
+                    target_rank_registration_info.dst_attn_tp_size,
+                    src_conv_shard_groups,
+                    src_slice_outer_counts,
+                    src_state_layer_ids,
+                    dst_state_layer_ids,
                 )
-                dst_dim_per_tensor = (
-                    target_rank_registration_info.dst_state_dim_per_tensor[i]
-                    if i < len(target_rank_registration_info.dst_state_dim_per_tensor)
-                    else []
-                )
-                dst_state_layer_ids = (
-                    target_rank_registration_info.dst_state_layer_ids[i]
-                    if i < len(target_rank_registration_info.dst_state_layer_ids)
-                    else []
-                )
-            else:
-                dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
-                dst_state_layer_ids = []
-            dst_indices = (
-                req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
+            return self._send_mamba_state(
+                req,
+                src_indices,
+                src_data_ptrs,
+                src_item_lens,
+                dst_data_ptrs,
+                dst_indices,
+                dst_item_lens,
+                src_state_layer_ids,
+                dst_state_layer_ids,
             )
 
-            if st == StateType.MAMBA:
-                if (
-                    target_rank_registration_info is not None
-                    and self.attn_tp_size
-                    != target_rank_registration_info.dst_attn_tp_size
-                ):
-                    rc = (
-                        self._send_mamba_state_slice(
-                            req,
-                            indices,
-                            src_data_ptrs,
-                            src_item_lens,
-                            src_dim_per_tensor,
-                            dst_data_ptrs,
-                            dst_indices,
-                            dst_item_lens,
-                            dst_dim_per_tensor,
-                            target_rank_registration_info.dst_tp_rank,
-                            target_rank_registration_info.dst_attn_tp_size,
-                            src_conv_shard_groups,
-                            src_slice_outer_counts,
-                            src_state_layer_ids,
-                            dst_state_layer_ids,
-                        )
-                        or rc
-                    )
-                else:
-                    rc = (
-                        self._send_mamba_state(
-                            req,
-                            indices,
-                            src_data_ptrs,
-                            src_item_lens,
-                            dst_data_ptrs,
-                            dst_indices,
-                            src_state_layer_ids,
-                            dst_state_layer_ids,
-                        )
-                        or rc
-                    )
-            elif self._is_generic_kvcache_state_type(st):
-                if (
-                    target_rank_registration_info is not None
-                    and not self.is_mla_backend
-                    and self.attn_tp_size
-                    != target_rank_registration_info.dst_attn_tp_size
-                ):
-                    raise RuntimeError(
-                        f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
-                    )
-                src_indices = list(indices)
-                dst_indices_local = list(dst_indices)
-                if (
-                    st == StateType.C128_STATE
-                    and len(src_indices) == 0
-                    and len(dst_indices_local) == 0
-                ):
-                    continue
-                if len(src_indices) != len(dst_indices_local):
-                    # These components are position- or request-indexed:
-                    # truncating silently misaligns rows and corrupts KV.
-                    # Paged SWA/DSA tolerate a 1-page drift -> keep the
-                    # lenient truncation below.
-                    if self._requires_exact_state_index_match(st):
-                        raise RuntimeError(
-                            f"{st.upper()} state index length mismatch: "
-                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
-                        )
-                    logger.warning(
-                        f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
-                    )
-                    if len(src_indices) > len(dst_indices_local):
-                        src_indices = src_indices[: len(dst_indices_local)]
-                    else:
-                        dst_indices_local = dst_indices_local[: len(src_indices)]
-                rc = (
-                    self._send_kvcache_generic(
-                        mooncake_session_id=req.mooncake_session_id,
-                        src_data_ptrs=src_data_ptrs,
-                        dst_data_ptrs=dst_data_ptrs,
-                        item_lens=src_item_lens,
-                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
-                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
-                        executor=executor,
-                        state_type=st,
-                    )
-                    or rc
+        if state_type in (
+            StateType.SWA,
+            StateType.DSA,
+            StateType.SWA_RING,
+            StateType.C128_STATE,
+        ):
+            if (
+                target_rank_registration_info is not None
+                and not self.is_mla_backend
+                and self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size
+            ):
+                raise RuntimeError(
+                    "PD Disaggregation does NOT support PD different TP sizes "
+                    f"for non-MLA {state_type.upper()} hybrid models yet."
                 )
-            elif st == StateType.MINIMAX_INDEX_K:
-                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
-                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
-                if self.pp_size is not None and self.pp_size > 1:
+            src_indices = list(src_indices)
+            dst_indices_local = list(dst_indices)
+            if (
+                state_type == StateType.C128_STATE
+                and len(src_indices) == 0
+                and len(dst_indices_local) == 0
+            ):
+                return 0
+            if len(src_indices) != len(dst_indices_local):
+                if state_type in (StateType.SWA_RING, StateType.C128_STATE):
                     raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                        f"{state_type.upper()} state index length mismatch: "
+                        f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
                     )
-                if (
-                    target_rank_registration_info is not None
-                    and self.attn_tp_size
-                    != target_rank_registration_info.dst_attn_tp_size
-                ):
-                    raise RuntimeError(
-                        "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "sparse index yet."
-                    )
-                src_indices = list(indices)
-                dst_indices_local = list(dst_indices)
+                logger.warning(
+                    "len(prefill_state_indices) = %s, len(dst_state_indices) = %s",
+                    len(src_indices),
+                    len(dst_indices_local),
+                )
                 if len(src_indices) > len(dst_indices_local):
                     src_indices = src_indices[: len(dst_indices_local)]
-                elif len(src_indices) < len(dst_indices_local):
+                else:
                     dst_indices_local = dst_indices_local[: len(src_indices)]
-                rc = (
-                    self._send_kvcache_generic(
-                        mooncake_session_id=req.mooncake_session_id,
-                        src_data_ptrs=src_data_ptrs,
-                        dst_data_ptrs=dst_data_ptrs,
-                        item_lens=src_item_lens,
-                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
-                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
-                        executor=executor,
-                        force_flat=True,
-                    )
-                    or rc
+            return self._send_kvcache_generic(
+                mooncake_session_id=req.mooncake_session_id,
+                src_data_ptrs=src_data_ptrs,
+                dst_data_ptrs=dst_data_ptrs,
+                item_lens=src_item_lens,
+                prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
+                executor=executor,
+                state_type=state_type,
+            )
+
+        if state_type == StateType.MINIMAX_INDEX_K:
+            if self.pp_size is not None and self.pp_size > 1:
+                raise RuntimeError(
+                    "PD disagg: PP>1 not supported for MiniMax sparse index yet."
                 )
-        return rc
+            if (
+                target_rank_registration_info is not None
+                and self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size
+            ):
+                raise RuntimeError(
+                    "PD disagg: heterogeneous TP not supported for MiniMax "
+                    "sparse index yet."
+                )
+            src_indices = list(src_indices)
+            dst_indices_local = list(dst_indices)
+            if len(src_indices) > len(dst_indices_local):
+                src_indices = src_indices[: len(dst_indices_local)]
+            elif len(src_indices) < len(dst_indices_local):
+                dst_indices_local = dst_indices_local[: len(src_indices)]
+            return self._send_kvcache_generic(
+                mooncake_session_id=req.mooncake_session_id,
+                src_data_ptrs=src_data_ptrs,
+                dst_data_ptrs=dst_data_ptrs,
+                item_lens=src_item_lens,
+                prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
+                executor=executor,
+                force_flat=True,
+            )
+
+        return 0
 
     def _send_mamba_state(
         self,
@@ -1368,6 +1559,7 @@ class MooncakeKVManager(CommonKVManager):
         src_state_item_lens: list[int],
         dst_state_data_ptrs: list[int],
         dst_mamba_index: list,
+        dst_state_item_lens: list[int],
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
     ):
@@ -1383,10 +1575,11 @@ class MooncakeKVManager(CommonKVManager):
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
-            length = src_state_item_lens[i]
-            src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
-            dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
-            transfer_blocks.append((src_addr, dst_addr, length))
+            src_length = src_state_item_lens[i]
+            dst_length = dst_state_item_lens[j]
+            src_addr = src_state_data_ptrs[i] + src_length * int(prefill_mamba_index[0])
+            dst_addr = dst_state_ptr + dst_length * int(dst_mamba_index[0])
+            transfer_blocks.append((src_addr, dst_addr, src_length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
@@ -1436,6 +1629,7 @@ class MooncakeKVManager(CommonKVManager):
                 src_state_item_lens,
                 dst_state_data_ptrs,
                 dst_mamba_index,
+                dst_state_item_lens,
                 src_layer_ids,
                 dst_layer_ids,
             )
@@ -1564,6 +1758,7 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
+                ready_event_synchronized = False
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
                     self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
@@ -1592,6 +1787,13 @@ class MooncakeKVManager(CommonKVManager):
                                     prefill_unique_rank,
                                 )
                                 break
+
+                        if (
+                            kv_chunk.ready_event is not None
+                            and not ready_event_synchronized
+                        ):
+                            kv_chunk.ready_event.synchronize()
+                            ready_event_synchronized = True
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
@@ -1639,7 +1841,56 @@ class MooncakeKVManager(CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        if (
+                        is_subset = (
+                            kv_chunk.kv_data_ptrs_indices_subset is not None
+                            or kv_chunk.state_data_ptrs_indices_subset is not None
+                        )
+                        if is_subset:
+                            ret = 0
+                            if (
+                                len(kv_chunk.prefill_kv_indices) > 0
+                                and kv_chunk.kv_data_ptrs_indices_subset
+                                and not skip_kv
+                            ):
+                                if (
+                                    self.is_mla_backend
+                                    or self.is_hybrid_mla_backend
+                                    or self.attn_tp_size
+                                    == target_rank_registration_info.dst_attn_tp_size
+                                ):
+                                    ret = self.send_kvcache_subset(
+                                        req.mooncake_session_id,
+                                        kv_chunk.kv_data_ptrs_indices_subset,
+                                        kv_chunk.prefill_kv_indices,
+                                        target_rank_registration_info.dst_kv_ptrs,
+                                        chunked_dst_kv_indice,
+                                        executor,
+                                    )
+                                else:
+                                    ret = self.send_kvcache_slice_subset(
+                                        req.mooncake_session_id,
+                                        kv_chunk.kv_data_ptrs_indices_subset,
+                                        kv_chunk.prefill_kv_indices,
+                                        target_rank_registration_info.dst_kv_ptrs,
+                                        chunked_dst_kv_indice,
+                                        target_rank_registration_info.dst_tp_rank,
+                                        target_rank_registration_info.dst_attn_tp_size,
+                                        target_rank_registration_info.dst_kv_item_len,
+                                        executor,
+                                    )
+                            if (
+                                ret == 0
+                                and kv_chunk.state_data_ptrs_indices_subset
+                                and not skip_state
+                            ):
+                                ret = self.maybe_send_extra_subset(
+                                    req,
+                                    kv_chunk.state_indices or [],
+                                    kv_chunk.state_data_ptrs_indices_subset,
+                                    executor,
+                                    target_rank_registration_info,
+                                )
+                        elif (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
                             or skip_kv
@@ -2024,6 +2275,9 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        kv_data_ptrs_indices_subset: Optional[List[int]] = None,
+        state_data_ptrs_indices_subset: Optional[Dict[int, List[int]]] = None,
+        ready_event: Optional[object] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
@@ -2063,6 +2317,9 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                kv_data_ptrs_indices_subset=kv_data_ptrs_indices_subset,
+                state_data_ptrs_indices_subset=state_data_ptrs_indices_subset,
+                ready_event=ready_event,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
             )
@@ -2173,6 +2430,105 @@ class MooncakeKVSender(CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         self._record_transfer_indices(kv_indices, state_indices)
+
+    def _get_layer_pipelined_transfer_context(
+        self,
+    ) -> LayerPipelinedTransferContext:
+        context = self.layer_pipelined_transfer_context
+        if context is None:
+            raise RuntimeError("prepare_layer_pipelined_transfer must be called first")
+        return context
+
+    def send_layers(
+        self,
+        layer_ids: List[int],
+        is_draft: bool = False,
+        ready_event: Optional[object] = None,
+    ) -> None:
+        context = self._get_layer_pipelined_transfer_context()
+        if context.should_skip:
+            return
+
+        handles_by_layer = (
+            self.kv_mgr.kv_args.draft_buffer_handles
+            if is_draft
+            else self.kv_mgr.kv_args.target_buffer_handles
+        )
+        kv_data_ptrs_indices_subset = []
+        state_data_ptrs_indices_subset = defaultdict(list)
+        for layer_id in layer_ids:
+            handles = handles_by_layer.get(layer_id)
+            if handles is None:
+                continue
+            for buffer_type, raw_index, component_id in zip(
+                handles.buffer_types,
+                handles.raw_data_ptrs_indices,
+                handles.state_component_ids,
+            ):
+                if buffer_type == BufferType.KV:
+                    kv_data_ptrs_indices_subset.append(raw_index)
+                else:
+                    if component_id is None:
+                        raise RuntimeError(
+                            "Layer-pipelined KV transfer found a state buffer "
+                            "without a registered component ID: "
+                            f"layer_id={layer_id}, is_draft={is_draft}, "
+                            f"buffer_type={buffer_type}, raw_index={raw_index}, "
+                            f"state_types={self.kv_mgr.kv_args.state_types}, "
+                            f"state_component_ids={handles.state_component_ids}."
+                        )
+                    if (
+                        not is_draft
+                        and context.skip_dsa_state_layer_ids
+                        and self.kv_mgr.kv_args.state_types[component_id]
+                        == StateType.DSA
+                        and layer_id in context.skip_dsa_state_layer_ids
+                    ):
+                        continue
+                    state_data_ptrs_indices_subset[component_id].append(raw_index)
+
+        if not kv_data_ptrs_indices_subset and not state_data_ptrs_indices_subset:
+            return
+
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            context.kv_indices,
+            context.index_slice,
+            is_last_chunk=False,
+            state_indices=context.state_indices,
+            kv_data_ptrs_indices_subset=kv_data_ptrs_indices_subset,
+            state_data_ptrs_indices_subset=dict(state_data_ptrs_indices_subset),
+            ready_event=ready_event,
+            trace_ctx=self.trace_ctx.copy_for_thread(),
+        )
+        self._record_transfer_subset(
+            context.kv_indices,
+            context.state_indices,
+            kv_data_ptrs_indices_subset,
+            dict(state_data_ptrs_indices_subset),
+        )
+
+    def send_final_metadata(self, ready_event: Optional[object] = None) -> None:
+        context = self._get_layer_pipelined_transfer_context()
+        try:
+            if context.should_skip:
+                return
+
+            final_index = context.index_slice.stop
+            empty_kv_indices = np.array([], dtype=np.int32)
+            self.kv_mgr.add_transfer_request(
+                self.bootstrap_room,
+                empty_kv_indices,
+                slice(final_index, final_index),
+                is_last_chunk=True,
+                aux_index=self.aux_index,
+                state_indices=context.final_state_indices,
+                ready_event=ready_event,
+                trace_ctx=self.trace_ctx.copy_for_thread(),
+            )
+            self._record_transfer_indices(empty_kv_indices, context.final_state_indices)
+        finally:
+            self.layer_pipelined_transfer_context = None
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:

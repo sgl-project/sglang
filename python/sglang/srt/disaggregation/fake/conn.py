@@ -85,6 +85,42 @@ class FakeKVSender(BaseKVSender):
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )
 
+    def prepare_layer_pipelined_transfer(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List] = None,
+        *,
+        final_state_indices: Optional[List] = None,
+        skip_dsa_state_layer_ids: Optional[set[int]] = None,
+    ) -> None:
+        self.layer_pipelined_transfer_context = (
+            kv_indices,
+            state_indices,
+            final_state_indices,
+            skip_dsa_state_layer_ids,
+        )
+
+    def send_layers(
+        self,
+        layer_ids: List[int],
+        is_draft: bool = False,
+        ready_event: Optional[object] = None,
+    ) -> None:
+        if getattr(self, "layer_pipelined_transfer_context", None) is None:
+            raise RuntimeError(
+                "prepare_layer_pipelined_transfer must be called before send_layers"
+            )
+        self.has_sent = True
+        logger.debug(
+            "FakeKVSender send_layers layer_ids=%s is_draft=%s",
+            layer_ids,
+            is_draft,
+        )
+
+    def send_final_metadata(self, ready_event: Optional[object] = None) -> None:
+        self.has_sent = True
+        self.layer_pipelined_transfer_context = None
+
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
 

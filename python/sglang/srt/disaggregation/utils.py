@@ -1003,6 +1003,10 @@ def setup_state_kv_args(
         MiniMaxSparseKVPool,
     )
 
+    kv_args.target_buffer_handles = {}
+    kv_args.draft_buffer_handles = {}
+    target_state_component_ids = {}
+    draft_state_component_ids = {}
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
@@ -1013,6 +1017,38 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
+    def append_state_component_wrapper(
+        state_type,
+        data_ptrs,
+        data_lens,
+        item_lens,
+        dim_per_tensor=None,
+        conv_shard_groups=None,
+        slice_outer_counts=None,
+        layer_ids=None,
+        *,
+        is_draft=False,
+        shared_with_draft=False,
+    ):
+        component_id = len(kv_args.state_types)
+        append_state_component(
+            kv_args,
+            state_type,
+            data_ptrs,
+            data_lens,
+            item_lens,
+            dim_per_tensor,
+            conv_shard_groups,
+            slice_outer_counts,
+            layer_ids,
+        )
+        component_ids = (
+            draft_state_component_ids if is_draft else target_state_component_ids
+        )
+        component_ids[state_type] = component_id
+        if shared_with_draft:
+            draft_state_component_ids[state_type] = component_id
+
     if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
         # Pool ships each sub-pool as its own page-indexed component (fixed order
         # so prefill and decode register identically); skips get_state_buf_infos.
@@ -1022,7 +1058,7 @@ def setup_state_kv_args(
             comp_lens,
             comp_item_lens,
         ) in token_to_kv_pool.get_pd_state_components():
-            append_state_component(kv_args, st, comp_ptrs, comp_lens, comp_item_lens)
+            append_state_component_wrapper(st, comp_ptrs, comp_lens, comp_item_lens)
     elif isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(
@@ -1031,15 +1067,15 @@ def setup_state_kv_args(
             )
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
-            append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
+            append_state_component_wrapper(StateType.MINIMAX_INDEX_K, dp, dl, il)
     elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
-            append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+            append_state_component_wrapper(
+                StateType.SWA, data_ptrs, data_lens, item_lens
             )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
@@ -1050,8 +1086,7 @@ def setup_state_kv_args(
                     token_to_kv_pool.get_unified_swa_ring_buf_infos()
                 )
                 if ring_ptrs:
-                    append_state_component(
-                        kv_args,
+                    append_state_component_wrapper(
                         StateType.SWA_RING,
                         ring_ptrs,
                         ring_lens,
@@ -1062,8 +1097,7 @@ def setup_state_kv_args(
                     token_to_kv_pool.get_c128_state_buf_infos()
                 )
                 if c128_ptrs:
-                    append_state_component(
-                        kv_args,
+                    append_state_component_wrapper(
                         StateType.C128_STATE,
                         c128_ptrs,
                         c128_lens,
@@ -1091,8 +1125,7 @@ def setup_state_kv_args(
             # Global layer ids let the sender pair src/dst entries when the
             # prefill PP stage registers only its own subset of mamba layers.
             layer_ids = token_to_kv_pool.get_state_layer_ids()
-            append_state_component(
-                kv_args,
+            append_state_component_wrapper(
                 StateType.MAMBA,
                 data_ptrs,
                 data_lens,
@@ -1102,6 +1135,7 @@ def setup_state_kv_args(
                 slice_outer_counts,
                 layer_ids,
             )
+
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
@@ -1120,8 +1154,12 @@ def setup_state_kv_args(
                 )
                 kv_args.total_kv_layers = total_kv_layers
             else:
-                append_state_component(
-                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
+                append_state_component_wrapper(
+                    StateType.DSA,
+                    data_ptrs,
+                    data_lens,
+                    item_lens,
+                    shared_with_draft=draft_token_to_kv_pool is not None,
                 )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
@@ -1192,12 +1230,12 @@ def setup_state_kv_args(
             draft_state_type = StateType.SWA
 
         if draft_ptrs:
-            append_state_component(
-                kv_args,
+            append_state_component_wrapper(
                 draft_state_type,
                 draft_ptrs,
                 draft_lens,
                 draft_item_lens,
+                is_draft=True,
             )
 
     if (
@@ -1222,8 +1260,7 @@ def setup_state_kv_args(
                 if hasattr(req_to_token_pool, "get_state_slice_outer_counts")
                 else None
             )
-            append_state_component(
-                kv_args,
+            append_state_component_wrapper(
                 StateType.MAMBA,
                 data_ptrs,
                 data_lens,
@@ -1232,6 +1269,60 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
             )
+
+    def populate_buffer_handles(
+        pool,
+        output,
+        kv_buffer_offset,
+        state_component_ids,
+        state_buffer_offsets=None,
+    ):
+        get_handles = getattr(pool, "get_buffer_handles_by_layer", None)
+        if get_handles is None:
+            return
+        handles_by_layer = get_handles(
+            kv_buffer_offset=kv_buffer_offset,
+            state_component_ids=state_component_ids,
+            state_buffer_offsets=state_buffer_offsets,
+        )
+        overlap = set(output).intersection(handles_by_layer)
+        if overlap:
+            raise RuntimeError(f"Duplicate layer buffer handles: {sorted(overlap)}")
+        output.update(
+            {
+                layer_id: handles
+                for layer_id, handles in handles_by_layer.items()
+                if handles.buffer_types
+            }
+        )
+
+    populate_buffer_handles(
+        token_to_kv_pool,
+        kv_args.target_buffer_handles,
+        0,
+        target_state_component_ids,
+    )
+
+    if draft_token_to_kv_pool is not None:
+        draft_kv_buffer_count = len(
+            draft_token_to_kv_pool.get_contiguous_buf_infos()[0]
+        )
+        draft_state_buffer_offsets = {}
+        if (
+            StateType.DSA in target_state_component_ids
+            and target_state_component_ids.get(StateType.DSA)
+            == draft_state_component_ids.get(StateType.DSA)
+        ):
+            draft_state_buffer_offsets[StateType.DSA] = len(
+                token_to_kv_pool.get_state_buf_infos()[0]
+            )
+        populate_buffer_handles(
+            draft_token_to_kv_pool,
+            kv_args.draft_buffer_handles,
+            len(kv_args.kv_data_ptrs) - draft_kv_buffer_count,
+            draft_state_component_ids,
+            draft_state_buffer_offsets,
+        )
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -26,6 +26,33 @@ class StateType(str, enum.Enum):
     C128_STATE = "c128_state"
 
 
+class BufferType(str, enum.Enum):
+    KV = "kv"
+    STATE = "state"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class LayerBufferHandles:
+    """Registered buffers owned by one layer."""
+
+    buffer_types: List[BufferType]
+    raw_data_ptrs_indices: List[int]
+    state_component_ids: List[Optional[int]]
+
+
+@dataclasses.dataclass
+class LayerPipelinedTransferContext:
+    """Request-specific context prepared before selecting transfer layers."""
+
+    kv_indices: npt.NDArray[np.int32]
+    state_indices: Optional[List]
+    final_state_indices: Optional[List]
+    index_slice: slice
+    is_last_chunk: bool
+    should_skip: bool
+    skip_dsa_state_layer_ids: Optional[set[int]]
+
+
 @dataclasses.dataclass
 class KVTransferMetric:
     # Backends that cannot isolate transfer latency can leave this as None.
@@ -37,6 +64,8 @@ class KVTransferMetric:
 
 class KVArgs:
     engine_rank: int
+    target_buffer_handles: Dict[int, LayerBufferHandles]
+    draft_buffer_handles: Dict[int, LayerBufferHandles]
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
@@ -142,6 +171,36 @@ class BaseKVSender(ABC):
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
         """
         ...
+
+    def prepare_layer_pipelined_transfer(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List] = None,
+        *,
+        final_state_indices: Optional[List] = None,
+        skip_dsa_state_layer_ids: Optional[set[int]] = None,
+    ) -> None:
+        """Prepare request indices before selecting target or draft layers."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support layer-pipelined KV transfer"
+        )
+
+    def send_layers(
+        self,
+        layer_ids: List[int],
+        is_draft: bool = False,
+        ready_event: Optional[object] = None,
+    ) -> None:
+        """Send buffers for the selected target or draft layers."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support layer-pipelined KV transfer"
+        )
+
+    def send_final_metadata(self, ready_event: Optional[object] = None) -> None:
+        """Send remaining state and final request metadata."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support layer-pipelined KV transfer"
+        )
 
     def pop_decode_prefix_len(self) -> int:
         return 0
