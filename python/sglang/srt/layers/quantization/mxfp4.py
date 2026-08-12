@@ -950,6 +950,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
+            # Keep the postprocessed storage registered on the layer so model
+            # state exports contain the tensors consumed by Triton kernels.
+            for name, tensor in (
+                ("w13_weight", w13_weight),
+                ("w13_weight_scale", w13_scale),
+                ("w2_weight", w2_weight),
+                ("w2_weight_scale", w2_scale),
+            ):
+                param = getattr(layer, name)
+                param.data = tensor.storage.data
+                tensor.storage.data = param
+
             self.w13_precision_config = PrecisionConfig(
                 b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
             )
@@ -959,8 +971,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             self.w13_weight_triton_tensor = w13_weight
             self.w2_weight_triton_tensor = w2_weight
-            del layer.w13_weight
-            del layer.w2_weight
         elif _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             if use_intel_amx_backend(layer):
