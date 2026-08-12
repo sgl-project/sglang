@@ -3802,6 +3802,33 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(result.full_kv_hit_length, len(tokens))
         self.assertEqual(result.swa_branching_seqlen, len(tokens))
 
+    def test_swa_branching_seqlen_caps_insert_after_forward(self):
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 1
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+        cache, _, _ = build_fixture(self.cfg)
+        swa = cache.components[ComponentType.SWA]
+        req = mock.Mock(
+            cache_protected_len=4,
+            swa_branching_seqlen=8,
+            kv=mock.Mock(swa_evicted_seqlen=0),
+        )
+
+        for is_finished in (False, True):
+            params = InsertParams()
+            self.assertEqual(
+                swa.prepare_for_caching_req(req, params, 12, is_finished), 8
+            )
+            self.assertEqual(params.swa_evicted_seqlen, 0)
+
+        self.assertIsNone(swa.prepare_for_caching_req(req, InsertParams(), 7, False))
+        req.cache_protected_len = 8
+        self.assertIsNone(swa.prepare_for_caching_req(req, InsertParams(), 12, False))
+
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")

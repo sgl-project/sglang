@@ -794,17 +794,6 @@ class PrefillAdder:
             return 0
         return cap // self.page_size * self.page_size
 
-    @staticmethod
-    def _cap_chunk_at_swa_branch(req: Req, chunk_len: int) -> int:
-        branching_seqlen = req.swa_branching_seqlen
-        if branching_seqlen is None:
-            return chunk_len
-        tokens_to_branch = branching_seqlen - len(req.prefix_indices)
-        if tokens_to_branch <= 0:
-            req.swa_branching_seqlen = None
-            return chunk_len
-        return min(chunk_len, tokens_to_branch)
-
     def _swa_req_never_fits(
         self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
     ) -> bool:
@@ -981,9 +970,7 @@ class PrefillAdder:
         )
         if req.dllm_incomplete_ids and cand_extend_input_len > _rem_tokens:
             return AddReqResult.NO_TOKEN
-        new_len = self._cap_chunk_at_swa_branch(
-            req, min(cand_extend_input_len, _rem_tokens)
-        )
+        new_len = min(cand_extend_input_len, _rem_tokens)
         truncated = cand_extend_input_len > new_len
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
@@ -1340,10 +1327,6 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
-            if chunk_tokens_limit is not None:
-                chunk_tokens_limit = self._cap_chunk_at_swa_branch(
-                    req, chunk_tokens_limit
-                )
 
             if (
                 self.rem_chunk_tokens is None

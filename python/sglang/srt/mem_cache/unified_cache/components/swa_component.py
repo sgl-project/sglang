@@ -748,6 +748,15 @@ class SWAComponent(TreeComponent):
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+
+        # Insert a reached SWA branch without shortening the forward chunk.
+        branching_seqlen = req.swa_branching_seqlen
+        if (
+            branching_seqlen is not None
+            and req.cache_protected_len < branching_seqlen <= token_ids_len
+        ):
+            return branching_seqlen
+
         return None
 
     def free_out_of_window_slots(
