@@ -310,6 +310,73 @@ class ReplicatedLinear(LinearBase):
         return s
 
 
+class MergedReplicatedLinear(ReplicatedLinear):
+    """Packed replicated linear layers with shard-aware weight loading.
+
+    This is the non-tensor-parallel counterpart of
+    :class:`MergedColumnParallelLinear`. It keeps independently stored logical
+    projections in one physical weight so eager inference launches one GEMM.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        self.output_sizes = output_sizes
+        super().__init__(
+            input_size=input_size,
+            output_size=sum(output_sizes),
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            output_sizes=output_sizes,
+            prefix=prefix,
+        )
+
+    def weight_loader(
+        self,
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int | str | None = None,
+    ) -> None:
+        if loaded_shard_id is None:
+            return super().weight_loader(param, loaded_weight)
+
+        if isinstance(loaded_shard_id, str):
+            try:
+                loaded_shard_id = {"q": 0, "k": 1, "v": 2}[loaded_shard_id]
+            except KeyError as exc:
+                raise ValueError(f"Invalid merged shard id: {loaded_shard_id}") from exc
+        if not 0 <= loaded_shard_id < len(self.output_sizes):
+            raise ValueError(f"Invalid merged shard id: {loaded_shard_id}")
+        param_data = param.data
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim is not None:
+            shard_offset = sum(self.output_sizes[:loaded_shard_id])
+            shard_size = self.output_sizes[loaded_shard_id]
+            param_data = param_data.narrow(output_dim, shard_offset, shard_size)
+        elif getattr(param, "is_metadata", False):
+            shard_size = loaded_weight.shape[0]
+            param_data = param_data.narrow(0, loaded_shard_id * shard_size, shard_size)
+        elif getattr(param, "needs_scalar_to_array", False):
+            param_data, loaded_weight = adjust_scalar_to_fused_array(
+                param_data, loaded_weight, loaded_shard_id
+            )
+        if tuple(param_data.shape) != tuple(loaded_weight.shape):
+            raise ValueError(
+                f"Tried to load merged shard of size {loaded_weight.size()} "
+                f"to a parameter slice of size {param_data.size()}"
+            )
+        param_data.copy_(loaded_weight)
+
+
 class ColumnParallelLinear(LinearBase):
     """Linear layer with column parallelism.
 
