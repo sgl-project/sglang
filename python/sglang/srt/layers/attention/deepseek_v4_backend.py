@@ -683,17 +683,9 @@ class DeepseekV4AttnBackend(
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
         self.trtllm_attn: bool = get_exec().kernel.dsv4_attn_backend == "trtllm"
-        # On the trtllm backend, speculative decoding needs metadata prepared
-        # on the host: preparing it inside the captured graphs degrades draft
-        # acceptance (plain decode is unaffected and keeps in-graph prep).
-        # needs_cpu_seq_lens below must use this effective value, because
-        # host-side prep reads the CPU seq-lens mirror.
-        self._prep_in_cuda_graph: bool = envs.SGLANG_PREP_IN_CUDA_GRAPH.get() and not (
-            self.trtllm_attn and self.mtp_enabled
-        )
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda
-            or not self._prep_in_cuda_graph
+            or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
             or self.online_c128_mtp.enabled()
         )
 
@@ -718,8 +710,8 @@ class DeepseekV4AttnBackend(
             )
             self.trtllm_workspace_buffer = _get_trtllm_workspace_buffer(self.device)
 
-        # Pins metadata built inside graph captures; see
-        # init_forward_metadata_in_graph.
+        # Pins the metadata built inside each CUDA-graph capture; see the
+        # comment in init_forward_metadata_in_graph.
         self._captured_full_metadata_refs: List[DSV4Metadata] = []
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -822,7 +814,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if self._prep_in_cuda_graph:
+        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             return DSV4RawDecodeMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -972,7 +964,7 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        if self._prep_in_cuda_graph:
+        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
             bs = len(seq_lens)
             if self.needs_cpu_seq_lens:
@@ -1268,10 +1260,15 @@ class DeepseekV4AttnBackend(
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
                 raw_metadata=self.forward_metadata,
             )
-        # Metadata built inside a capture lives in the shared CUDA-graph
-        # memory pool; keep a reference per captured graph so later bucket
-        # captures cannot reuse its blocks (replays of interleaved buckets
-        # would otherwise read memory another graph's replay last wrote).
+        # Tensors created while capturing a CUDA graph come from the memory
+        # pool shared by all captured graphs. If the last reference is
+        # dropped after capture, the pool hands the block to the next
+        # graph's capture, and two graphs' recorded kernels then address the
+        # same memory -- replaying one bucket's graph can overwrite metadata
+        # another bucket's graph reads on its next replay (observed victim:
+        # page_table, which also feeds the indexer, turning the corruption
+        # into silently wrong top-k KV selection). Holding one reference per
+        # captured graph prevents the pool from ever reusing these blocks.
         if was_raw and torch.cuda.is_current_stream_capturing():
             self._captured_full_metadata_refs.append(self.forward_metadata)
 
