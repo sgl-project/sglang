@@ -469,6 +469,24 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
+def _parse_zmq_tcp_endpoint(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
+    """Return the advertised host and base port for a TCP ZMQ endpoint."""
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    body = endpoint[len("tcp://") :]
+    last_colon = body.rfind(":")
+    if last_colon < 0:
+        return None
+    host = body[:last_colon]
+    try:
+        port = int(body[last_colon + 1 :])
+    except ValueError:
+        return None
+    if not host or not (0 < port < 65536):
+        return None
+    return host, port
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -9805,6 +9823,9 @@ class ServerArgs:
                                                   # DCP shards within a rank
                                                   # rather than adding
                                                   # publishers
+                "snapshot_endpoint_host": "*",    # optional ROUTER endpoint
+                "snapshot_endpoint_port_base": 5757,
+                "snapshot_protocol_version": 1,
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -9818,50 +9839,60 @@ class ServerArgs:
           ipc://, missing port, non-integer port, or port outside
           1..65535).
 
-        Reuses KVEventsConfig.from_cli for JSON parsing; the inline
-        rfind(":") endpoint split mirrors
-        ZmqEventPublisher.offset_endpoint_port rather than adding a
-        new module-level helper.
+        Uses the publisher registry for schema validation and describes only
+        the built-in ZMQ wire protocol understood by the Router. Both the live
+        and optional snapshot endpoints use the same TCP endpoint parser.
         """
         # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
-        from sglang.srt.disaggregation.kv_events import KVEventsConfig
+        from sglang.srt.disaggregation.kv_events import (
+            SNAPSHOT_PROTOCOL_VERSION,
+            EventPublisherFactory,
+            ZmqEventPublisherConfig,
+        )
 
         raw = self.kv_events_config
         page_size = self.page_size
         if not raw or page_size is None or page_size <= 0:
             return None
         try:
-            cfg = KVEventsConfig.from_cli(raw)
+            publisher, cfg = EventPublisherFactory.parse_config(raw)
         except Exception:
             # Malformed JSON / schema mismatch. The publisher would
             # have failed at server startup; /server_info must
             # keep working, so just report "no publisher" to consumers.
             return None
-        if cfg.publisher == "null" or not cfg.endpoint:
+        if publisher != "zmq" or not isinstance(cfg, ZmqEventPublisherConfig):
             return None
-        if not cfg.endpoint.startswith("tcp://"):
+        if not cfg.endpoint:
             return None
-        body = cfg.endpoint[len("tcp://") :]
-        last_colon = body.rfind(":")
-        if last_colon < 0:
+        endpoint = _parse_zmq_tcp_endpoint(cfg.endpoint)
+        if endpoint is None:
             return None
-        host = body[:last_colon]
-        try:
-            port = int(body[last_colon + 1 :])
-        except ValueError:
-            return None
-        if not host or not (0 < port < 65536):
-            return None
+        host, port = endpoint
 
-        return {
-            "publisher": cfg.publisher,
+        descriptor = {
+            "publisher": publisher,
             "endpoint_host": host,
             "endpoint_port_base": port,
             "topic": cfg.topic,
             "block_size": self.kv_event_block_size,
             "dp_size": self.dp_size,
         }
+        # Snapshot support is additive. An invalid or non-TCP snapshot endpoint
+        # does not hide an otherwise usable live publisher; older workers and
+        # configurations simply omit these two fields.
+        snapshot_endpoint = _parse_zmq_tcp_endpoint(cfg.snapshot_endpoint)
+        if snapshot_endpoint is not None:
+            snapshot_host, snapshot_port = snapshot_endpoint
+            descriptor.update(
+                {
+                    "snapshot_endpoint_host": snapshot_host,
+                    "snapshot_endpoint_port_base": snapshot_port,
+                    "snapshot_protocol_version": SNAPSHOT_PROTOCOL_VERSION,
+                }
+            )
+        return descriptor
 
     def should_report_expert_balancedness(self) -> bool:
         return self.expert_balancedness_report_mode != "off"

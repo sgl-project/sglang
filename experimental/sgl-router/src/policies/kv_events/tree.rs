@@ -626,6 +626,19 @@ impl HashTree {
         state.clear_worker(worker);
     }
 
+    /// Atomically replace one replica's complete placement view.
+    ///
+    /// Routing readers observe either the old view or the fully rebuilt view;
+    /// they never observe the intermediate clear/insert sequence used during
+    /// snapshot publication.
+    pub fn replace_worker(&self, worker: &KvWorkerId, records: &[(Option<i64>, Vec<i64>)]) {
+        let mut state = self.state.write();
+        state.clear_worker(worker);
+        for (parent_hash, block_hashes) in records {
+            state.insert(worker, *parent_hash, block_hashes);
+        }
+    }
+
     /// Find the longest path from the root that matches a prefix of
     /// `block_hashes`, optionally starting from the node carrying
     /// `parent_hash`.
@@ -1090,5 +1103,19 @@ mod tests {
         let m = tree.match_prefix(None, &[1, 2, 3]);
         assert_eq!(m.matched_blocks, 3);
         assert_eq!(m.workers, workers(&[&b]));
+    }
+
+    #[test]
+    fn replace_worker_swaps_only_the_target_replica() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        tree.insert(&a, None, &[1, 2]);
+        tree.insert(&b, None, &[1, 2]);
+
+        tree.replace_worker(&a, &[(None, vec![7]), (Some(7), vec![8])]);
+
+        assert_eq!(tree.match_prefix(None, &[7, 8]).workers, workers(&[&a]));
+        assert_eq!(tree.match_prefix(None, &[1, 2]).workers, workers(&[&b]));
     }
 }

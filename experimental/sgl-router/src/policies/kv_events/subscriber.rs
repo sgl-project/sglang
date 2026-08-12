@@ -11,13 +11,15 @@
 //! # Wire format (3-frame multipart)
 //!
 //! Frames published by SGLang:
-//! 1. `topic_bytes` — empty by default, present even when empty.
+//! 1. `topic_bytes` — empty by default, present even when empty. Snapshot-
+//!    capable publishers append NUL-delimited lifecycle epoch and optional
+//!    snapshot-barrier metadata; configured SUB topics remain valid prefixes.
 //! 2. `seq_bytes` — 8-byte big-endian signed `i64`. The publisher emits a
 //!    `-1` sentinel (`ZmqEventPublisher.END_SEQ`) on its replay DEALER
 //!    socket; we defensively recognise the same value on the PUB stream
 //!    and surface it as a [`WorkerEvent::PublisherReset`] so the
 //!    downstream pump can clear its cursor before a reconnecting publisher
-//!    restarts from seq=1.
+//!    restarts from seq=0.
 //! 3. `payload` — msgpack-encoded [`KvEventBatch`].
 //!
 //! # Endpoint construction
@@ -68,6 +70,7 @@ use tracing::{debug, error, info, trace, warn};
 use zeromq::{Socket, SocketRecv, SubSocket, ZmqMessage};
 
 use super::discovery::EventConfig;
+use super::snapshot::PlacementSnapshot;
 use super::tree::KvWorkerId;
 use super::wire::{decode_event_batch, KvEventBatch};
 
@@ -91,6 +94,9 @@ const CONNECT_BACKOFF_CAP: Duration = Duration::from_secs(2);
 /// defense in depth so a future publisher that does broadcast a shutdown
 /// signal is handled correctly.
 const END_SEQ_SENTINEL: i64 = -1;
+const EPOCH_TOPIC_MARKER: &[u8] = b"\0sgl-kv-epoch=";
+const SNAPSHOT_BARRIER_MARKER: &[u8] = b"\0sgl-kv-snapshot=";
+const MAX_TOPIC_METADATA_BYTES: usize = 256;
 
 /// Message forwarded from a per-worker subscriber task to the pump.
 #[derive(Debug)]
@@ -102,14 +108,50 @@ pub enum WorkerEvent {
         /// 8-byte big-endian sequence number from the publisher's monotonic
         /// counter. Useful for replay / gap detection downstream.
         seq: i64,
+        /// Replica lifecycle epoch encoded in the topic suffix by
+        /// snapshot-capable publishers. `None` for legacy workers.
+        epoch: Option<String>,
+        /// Unique snapshot barrier id, present only on the empty batch that
+        /// establishes a snapshot's live-stream cut.
+        barrier_id: Option<String>,
         /// Decoded batch payload.
         batch: KvEventBatch,
     },
+    /// A message had a valid sequence frame but its payload could not be
+    /// decoded. Snapshot-recoverable replicas must invalidate immediately;
+    /// otherwise a final malformed message could leave stale placement data
+    /// visible forever because no later sequence arrives to expose the gap.
+    DecodeFailed { worker: KvWorkerId, seq: i64 },
     /// The publisher emitted its `END_SEQ` (-1) sentinel, signalling
     /// shutdown. A re-connecting publisher will restart its sequence
-    /// counter from 1; the pump uses this to reset the cursor so those
+    /// counter from 0; the pump uses this to reset the cursor so those
     /// fresh events are not filtered as out-of-order.
     PublisherReset { worker: KvWorkerId },
+    /// Lifecycle signal from the index when a worker is detached. It lets the
+    /// pump discard any buffered snapshot state even when no final live event
+    /// arrives after subscriber cancellation.
+    Detached {
+        worker: KvWorkerId,
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Arm one replica for a specific snapshot attempt before the provider is
+    /// asked to emit its barrier. `ack=true` means the pump entered SYNCING;
+    /// `ack=false` means the replica is already READY or a newer attempt is
+    /// armed, so this stale fetch should be skipped.
+    BeginSync {
+        worker: KvWorkerId,
+        generation: u64,
+        ack: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Full-state snapshot fetched by the per-replica synchronization task.
+    /// The pump completes `ack` only after observing the snapshot's live
+    /// barrier and atomically publishing the recovered view.
+    Snapshot {
+        worker: KvWorkerId,
+        generation: u64,
+        snapshot: PlacementSnapshot,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 impl WorkerEvent {
@@ -117,7 +159,11 @@ impl WorkerEvent {
     pub fn worker(&self) -> &KvWorkerId {
         match self {
             Self::Batch { worker, .. } => worker,
+            Self::DecodeFailed { worker, .. } => worker,
             Self::PublisherReset { worker } => worker,
+            Self::Detached { worker, .. } => worker,
+            Self::BeginSync { worker, .. } => worker,
+            Self::Snapshot { worker, .. } => worker,
         }
     }
 }
@@ -215,7 +261,7 @@ impl KvEventSubscriberRegistry {
 
     /// Cancel all subscribers for `worker_url` and await their shutdown.
     pub async fn remove_worker(&self, worker_url: &str) {
-        let drained: Vec<SubscriberHandle> = {
+        let drained: Vec<(KvWorkerId, SubscriberHandle)> = {
             let mut handles = self.inner.handles.lock().await;
             // Pull out every entry whose URL matches; leave the others.
             let to_drop: Vec<KvWorkerId> = handles
@@ -225,21 +271,10 @@ impl KvEventSubscriberRegistry {
                 .collect();
             to_drop
                 .into_iter()
-                .filter_map(|k| handles.remove(&k))
+                .filter_map(|id| handles.remove(&id).map(|handle| (id, handle)))
                 .collect()
         };
-        for h in drained {
-            h.cancel.cancel();
-            // A panicked task surfaces here; we log and continue so one
-            // poisoned subscriber cannot stall the registry.
-            if let Err(e) = h.join.await {
-                warn!(
-                    worker_url = %worker_url,
-                    error = %e,
-                    "subscriber task did not join cleanly"
-                );
-            }
-        }
+        cancel_and_join_subscriber_tasks(drained).await;
     }
 
     /// Sync cancellation: triggers every per-worker token without awaiting
@@ -266,16 +301,24 @@ impl KvEventSubscriberRegistry {
             let mut handles = self.inner.handles.lock().await;
             handles.drain().collect()
         };
-        for (id, h) in drained {
-            h.cancel.cancel();
-            if let Err(e) = h.join.await {
-                warn!(
-                    worker_url = %id.url,
-                    dp_rank = id.dp_rank,
-                    error = %e,
-                    "subscriber task did not join cleanly during shutdown"
-                );
-            }
+        cancel_and_join_subscriber_tasks(drained).await;
+    }
+}
+
+async fn cancel_and_join_subscriber_tasks(handles: Vec<(KvWorkerId, SubscriberHandle)>) {
+    for (_, handle) in &handles {
+        handle.cancel.cancel();
+    }
+    for (id, handle) in handles {
+        // A panicked task surfaces here; log and continue so one poisoned
+        // subscriber cannot prevent the remaining tasks from being joined.
+        if let Err(error) = handle.join.await {
+            warn!(
+                worker_url = %id.url,
+                dp_rank = id.dp_rank,
+                error = %error,
+                "subscriber task did not join cleanly",
+            );
         }
     }
 }
@@ -461,8 +504,10 @@ async fn connect_with_backoff(
 }
 
 /// Validate, parse, and decode a single 3-frame multipart ZMQ message.
-/// Returns `None` (with logging) for any non-event input (bad frame
-/// count, sentinel sequence, or msgpack decode error).
+/// Returns `None` (with logging) for inputs whose worker/sequence identity
+/// cannot be trusted. A payload decode failure with a valid sequence is
+/// forwarded as [`WorkerEvent::DecodeFailed`] so snapshot mode can invalidate
+/// the affected replica immediately.
 fn decode_message(id: &KvWorkerId, msg: ZmqMessage) -> Option<WorkerEvent> {
     if msg.len() != 3 {
         warn!(
@@ -474,12 +519,14 @@ fn decode_message(id: &KvWorkerId, msg: ZmqMessage) -> Option<WorkerEvent> {
         return None;
     }
 
-    // Frame 0 is the topic; we don't use it. Frame 1 is the BE i64 seq;
-    // frame 2 is the msgpack payload. The `len() == 3` guard above means
-    // these indices are always valid, but `?` cleanly bails out if a
-    // future change drops the guard.
+    // Frame 0 is the configured topic plus optional snapshot metadata.
+    // Frame 1 is the BE i64 seq; frame 2 is the msgpack payload. The
+    // `len() == 3` guard above means these indices are always valid.
+    let topic = msg.get(0)?;
     let seq_frame = msg.get(1)?;
     let payload = msg.get(2)?;
+    let epoch = topic_metadata(topic.as_ref(), EPOCH_TOPIC_MARKER);
+    let barrier_id = topic_metadata(topic.as_ref(), SNAPSHOT_BARRIER_MARKER);
 
     // Decode the 8-byte BE seq. Frames smaller or larger than 8 bytes
     // mean a malformed publisher; log and drop.
@@ -516,7 +563,10 @@ fn decode_message(id: &KvWorkerId, msg: ZmqMessage) -> Option<WorkerEvent> {
                 error = %e,
                 "failed to decode KV event batch payload; dropping"
             );
-            return None;
+            return Some(WorkerEvent::DecodeFailed {
+                worker: id.clone(),
+                seq,
+            });
         }
     };
 
@@ -531,8 +581,23 @@ fn decode_message(id: &KvWorkerId, msg: ZmqMessage) -> Option<WorkerEvent> {
     Some(WorkerEvent::Batch {
         worker: id.clone(),
         seq,
+        epoch,
+        barrier_id,
         batch,
     })
+}
+
+fn topic_metadata(topic: &[u8], marker: &[u8]) -> Option<String> {
+    let start = topic
+        .windows(marker.len())
+        .position(|window| window == marker)?
+        + marker.len();
+    let tail = &topic[start..];
+    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    if end == 0 || end > MAX_TOPIC_METADATA_BYTES {
+        return None;
+    }
+    std::str::from_utf8(&tail[..end]).ok().map(str::to_owned)
 }
 
 /// Pull the host out of a routing URL like `http://10.0.0.1:30000` or
@@ -593,6 +658,7 @@ mod tests {
                 topic: String::new(),
                 block_size: 64,
                 dp_size,
+                snapshot: None,
                 is_bigram: false,
             }
         }
@@ -643,9 +709,23 @@ mod tests {
         /// variant. Keeps test assertions terse.
         pub fn expect_batch(ev: WorkerEvent) -> (KvWorkerId, i64, KvEventBatch) {
             match ev {
-                WorkerEvent::Batch { worker, seq, batch } => (worker, seq, batch),
+                WorkerEvent::Batch {
+                    worker, seq, batch, ..
+                } => (worker, seq, batch),
                 WorkerEvent::PublisherReset { worker } => {
                     panic!("expected Batch, got PublisherReset for {worker:?}")
+                }
+                WorkerEvent::DecodeFailed { worker, seq } => {
+                    panic!("expected Batch, got DecodeFailed({seq}) for {worker:?}")
+                }
+                WorkerEvent::Detached { worker, .. } => {
+                    panic!("expected Batch, got Detached for {worker:?}")
+                }
+                WorkerEvent::BeginSync { worker, .. } => {
+                    panic!("expected Batch, got BeginSync for {worker:?}")
+                }
+                WorkerEvent::Snapshot { worker, .. } => {
+                    panic!("expected Batch, got Snapshot for {worker:?}")
                 }
             }
         }
@@ -996,8 +1076,8 @@ mod tests {
         registry.shutdown().await;
     }
 
-    /// Bad msgpack payload is logged and dropped; subsequent valid event
-    /// still arrives.
+    /// Bad msgpack payload is surfaced with its sequence identity; a
+    /// subsequent valid event still arrives.
     #[tokio::test]
     async fn decoding_error_tolerated() {
         let (mut pub_sock, port) = helpers::make_pub_bound().await;
@@ -1023,13 +1103,21 @@ mod tests {
             .await
             .unwrap();
 
-        let event = timeout(Duration::from_millis(500), rx.recv())
+        let failed = timeout(Duration::from_millis(500), rx.recv())
             .await
             .expect("timed out")
             .expect("channel closed");
+        assert!(
+            matches!(failed, WorkerEvent::DecodeFailed { seq: 1, .. }),
+            "bad payload must surface as DecodeFailed, got {failed:?}",
+        );
+
+        let event = timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timed out waiting for valid batch")
+            .expect("channel closed");
         let (_worker, seq, batch) = helpers::expect_batch(event);
         assert_eq!(seq, 2);
-        // We must NOT have received the bad message.
         assert!(matches!(batch.events[0], KvCacheEvent::AllBlocksCleared));
 
         registry.shutdown().await;
@@ -1256,7 +1344,7 @@ mod tests {
 
         // Sentinel seq = -1 now surfaces as PublisherReset (not None) so
         // the downstream pump can clear its cursor before a reconnecting
-        // publisher restarts from seq=1.
+        // publisher restarts from seq=0.
         let sentinel = helpers::build_multipart(-1, b"ignored".to_vec());
         let reset = decode_message(&id, sentinel).expect("END_SEQ forwards");
         assert!(matches!(reset, WorkerEvent::PublisherReset { .. }));
@@ -1267,9 +1355,13 @@ mod tests {
         bad_seq.push_back(Bytes::from_static(b""));
         assert!(decode_message(&id, bad_seq).is_none());
 
-        // Bad payload.
+        // Bad payload still carries a trustworthy sequence identity, so it
+        // is forwarded for snapshot-mode invalidation.
         let bad_payload = helpers::build_multipart(1, vec![0xff, 0xfe]);
-        assert!(decode_message(&id, bad_payload).is_none());
+        assert!(matches!(
+            decode_message(&id, bad_payload),
+            Some(WorkerEvent::DecodeFailed { seq: 1, .. })
+        ));
 
         // Happy path.
         let payload = helpers::encode_all_blocks_cleared_batch(0.0, None);
@@ -1278,6 +1370,22 @@ mod tests {
         let (worker, seq, _batch) = helpers::expect_batch(event);
         assert_eq!(seq, 7);
         assert_eq!(worker, id);
+
+        let payload = helpers::encode_all_blocks_cleared_batch(0.0, None);
+        let metadata = helpers::build_multipart_with_topic(
+            b"kv\0sgl-kv-epoch=epoch-a\0sgl-kv-snapshot=barrier-a",
+            8,
+            payload,
+        );
+        match decode_message(&id, metadata).expect("metadata batch decodes") {
+            WorkerEvent::Batch {
+                epoch, barrier_id, ..
+            } => {
+                assert_eq!(epoch.as_deref(), Some("epoch-a"));
+                assert_eq!(barrier_id.as_deref(), Some("barrier-a"));
+            }
+            other => panic!("expected metadata Batch, got {other:?}"),
+        }
     }
 
     /// Restart-resume contract: after a worker is removed and then re-added

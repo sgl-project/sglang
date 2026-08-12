@@ -48,6 +48,9 @@ pub struct EventConfig {
     /// many SUB connections (one per rank), skipping any rank whose
     /// `port_base + dp_rank` overflows `u16`.
     pub dp_size: u32,
+    /// Optional per-replica placement snapshot endpoint. Per-rank endpoint is
+    /// `tcp://host:<port_base + dp_rank>`.
+    pub snapshot: Option<SnapshotConfig>,
     /// Whether the worker uses EAGLE-family speculative decoding (EAGLE /
     /// EAGLE3 / FROZEN_KV_MTP), reported via `/server_info`'s top-level
     /// `speculative_algorithm`. When true the worker hashes KV blocks over
@@ -56,6 +59,13 @@ pub struct EventConfig {
     /// match the worker's stored hashes — otherwise cache-aware routing
     /// silently never matches and degrades to min-load.
     pub is_bigram: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotConfig {
+    pub host: String,
+    pub port_base: u16,
+    pub protocol_version: u32,
 }
 
 /// Default timeout for the `/server_info` introspection request. The
@@ -114,13 +124,17 @@ pub async fn fetch_event_config(
     // Wildcard bind hosts mean "any interface" on the worker side — the
     // gateway has to connect to a routable address, which it learns from
     // the worker URL.
-    let host = if matches!(
-        block.endpoint_host.as_str(),
-        "*" | "0.0.0.0" | "::" | "[::]"
+    let host = resolve_published_host(block.endpoint_host, &worker_host);
+    let snapshot = match (
+        block.snapshot_endpoint_host,
+        block.snapshot_endpoint_port_base,
     ) {
-        worker_host
-    } else {
-        block.endpoint_host
+        (Some(snapshot_host), Some(snapshot_port)) => Some(SnapshotConfig {
+            host: resolve_published_host(snapshot_host, &worker_host),
+            port_base: snapshot_port,
+            protocol_version: block.snapshot_protocol_version.unwrap_or(1),
+        }),
+        _ => None,
     };
 
     Ok(Some(EventConfig {
@@ -129,8 +143,17 @@ pub async fn fetch_event_config(
         topic: block.topic,
         block_size: block.block_size,
         dp_size: block.dp_size,
+        snapshot,
         is_bigram,
     }))
+}
+
+fn resolve_published_host(advertised_host: String, worker_host: &str) -> String {
+    if matches!(advertised_host.as_str(), "*" | "0.0.0.0" | "::" | "[::]") {
+        worker_host.to_owned()
+    } else {
+        advertised_host
+    }
 }
 
 /// Issue the `/server_info` request with bounded retry on transient errors
@@ -254,6 +277,12 @@ struct KvEventsBlock {
     topic: String,
     block_size: u32,
     dp_size: u32,
+    #[serde(default)]
+    snapshot_endpoint_host: Option<String>,
+    #[serde(default)]
+    snapshot_endpoint_port_base: Option<u16>,
+    #[serde(default)]
+    snapshot_protocol_version: Option<u32>,
 }
 
 #[cfg(test)]
@@ -320,7 +349,35 @@ mod tests {
                 topic: "kv".to_string(),
                 block_size: 64,
                 dp_size: 2,
+                snapshot: None,
                 is_bigram: false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_resolves_snapshot_endpoint_per_worker_host() {
+        let body = Arc::new(json!({
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "block_size": 64,
+                "dp_size": 2,
+                "snapshot_endpoint_host": "0.0.0.0",
+                "snapshot_endpoint_port_base": 5757,
+                "snapshot_protocol_version": 1
+            }
+        }));
+        let (url, _shutdown) = spawn_fake_worker(body).await;
+        let got = fetch_event_config(&url, &client()).await.unwrap().unwrap();
+        assert_eq!(
+            got.snapshot,
+            Some(SnapshotConfig {
+                host: "127.0.0.1".into(),
+                port_base: 5757,
+                protocol_version: 1,
             })
         );
     }
