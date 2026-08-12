@@ -1,5 +1,4 @@
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -17,11 +16,9 @@ from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_dtype_str,
-    get_default_config,
-    get_moe_configs,
 )
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.utils import get_device, is_hip, is_xpu
+from sglang.srt.utils import is_hip
 
 
 def benchmark_config(
@@ -166,7 +163,7 @@ def tune_moe_kernel(
         best_config = None
         best_time = float("inf")
 
-        for ci, config in enumerate(search_space):
+        for config in search_space:
             try:
                 kernel_time = benchmark_config(
                     config, num_tokens, num_experts, shard_intermediate_size,
@@ -194,7 +191,12 @@ def tune_moe_kernel(
     return best_configs
 
 
-def run_moe_tuning(model_config, tp_size, ep_size=1, default_dtype="auto", batch_sizes=None, output_dir=None, verbose=True):
+def run_moe_tuning(model_config, tp_size, ep_size=1, batch_sizes=None, output_dir=None, verbose=True):
+    if not model_config.get("is_moe", False):
+        if verbose:
+            print("  Model is not MoE, skipping MoE tuning.")
+        return {}
+
     E = model_config["num_experts"]
     topk = model_config["topk"]
     hidden_size = model_config["hidden_size"]
@@ -202,10 +204,10 @@ def run_moe_tuning(model_config, tp_size, ep_size=1, default_dtype="auto", batch
     dtype = model_config["dtype"]
     block_shape = model_config["block_shape"]
 
-    use_fp8_w8a8 = default_dtype == "fp8_w8a8"
-    use_int8_w8a8 = default_dtype == "int8_w8a8"
-    use_int8_w8a16 = default_dtype == "int8_w8a16"
-    use_int4_w4a16 = default_dtype == "int4_w4a16"
+    if E == 0:
+        if verbose:
+            print("  No experts found, skipping MoE tuning.")
+        return {}
 
     if verbose:
         print(f"  Model: {model_config['architecture']}")
@@ -215,8 +217,8 @@ def run_moe_tuning(model_config, tp_size, ep_size=1, default_dtype="auto", batch
 
     best_configs = tune_moe_kernel(
         E, shard_intermediate_size, hidden_size, topk, dtype,
-        use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16,
-        False, block_shape, batch_sizes, verbose=verbose,
+        False, False, False, False, False, block_shape,
+        batch_sizes, verbose=verbose,
     )
 
     if not best_configs:
@@ -226,8 +228,7 @@ def run_moe_tuning(model_config, tp_size, ep_size=1, default_dtype="auto", batch
 
     filename = get_config_filename(
         E, shard_intermediate_size, hidden_size, topk, dtype,
-        use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16,
-        False, block_shape,
+        False, False, False, False, False, block_shape,
     )
     saved_path = save_configs(best_configs, filename, output_dir)
     if verbose:
