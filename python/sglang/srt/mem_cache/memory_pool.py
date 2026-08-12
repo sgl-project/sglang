@@ -4387,7 +4387,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     self.page_size == 1
                 ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
-            assert self.page_size == 64
+            # Draft pools under DCP page at 64 * dcp_size (they span the
+            # allocator's virtual loc space; see loc_space_scale in
+            # kv_cache_configurator). The kernels only need 64-alignment.
+            assert self.page_size % 64 == 0, (
+                f"DSA pools require 64-aligned pages, got {self.page_size}"
+            )
         self.index_key_cache = self._create_index_key_cache()
         self._finalize_allocation_log(size)
 
