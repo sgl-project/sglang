@@ -30,7 +30,7 @@ from sglang.srt.layers.moe.ep_to_tp_transform import (
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, initialize_moe_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.runtime_context import get_exec, get_flags
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
@@ -219,25 +219,15 @@ def _mock_flashinfer_trtllm():
 def _force_shared_experts_fusion():
     """Enable fused shared experts for the enclosed block.
 
-    Two independent gates have to be opened:
-
-    * ``DeepseekV2ForCausalLM.determine_num_fused_shared_experts`` only fuses
-      for an allow-list of ``n_routed_experts`` (256 / 384) that the tiny test
-      config is not in. On refusal it also *declares a load-time override*
-      forcing ``disable_shared_experts_fusion=True``, which would clobber the
-      bag override below — so it has to be patched out, not just overridden.
-    * ``DeepseekV2MoE.__init__`` reads ``disable_shared_experts_fusion`` from
-      the resolved ``exec.moe`` bag (not from the ServerArgs record), so that
-      leaf must independently say False for the extra expert slot to appear.
+    The ACTIVE decision lives in the runtime-flags tier: the loader calls
+    install_shared_experts_fusion_decision() once per runner, and the model
+    classes are pure readers via is_shared_experts_fusion_disabled(). These
+    tests construct the model directly, so that installer never runs and the
+    flag keeps whatever initialize_moe_config() seeded — hence the override
+    goes on the flags leaf, not the exec.moe bag (the bag is only consulted
+    when the flag is still None).
     """
-    from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-
-    def _force_fuse(self_model, architecture="DeepseekV3ForCausalLM"):
-        self_model.num_fused_shared_experts = self_model.config.n_shared_experts
-
-    with patch.object(
-        DeepseekV3ForCausalLM, "determine_num_fused_shared_experts", _force_fuse
-    ), get_exec().moe.override(disable_shared_experts_fusion=False):
+    with get_flags().moe.override(disable_shared_experts_fusion=False):
         yield
 
 
