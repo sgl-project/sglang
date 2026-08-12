@@ -118,6 +118,7 @@ class UnifiedTreeNode:
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
         self.hit_count = 0
+        self.external_cache_stored = False
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
@@ -391,6 +392,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
         self.enable_storage = False
+        self.enable_external_cache_linker = False
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
@@ -828,6 +830,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if self.is_write_back:
             return False
         node.hit_count += 1
+        if self.enable_external_cache_linker:
+            return (
+                not node.external_cache_stored
+                and node.hit_count >= self.write_through_threshold
+            )
+            
         return (
             self.enable_hicache
             and not node.backuped
@@ -1033,6 +1041,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.external_cache_stored = child.external_cache_stored
         new_node.creation_time = child.creation_time
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
@@ -1088,7 +1097,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
-        if self.enable_storage:
+        if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
         self._update_evictable_leaf_sets(new_node)
@@ -1848,14 +1857,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _build_backup_kv_action(
         self, node: UnifiedTreeNode, write_back: bool = False
     ) -> BackupKV:
-        """Build the backup action for a node and its unbacked ancestors."""
+        """Build the backup action for a node and its not-yet-persisted ancestors."""
         chain = [node]
         if not write_back:
             ancestor = node.parent
             while (
                 ancestor is not None
                 and ancestor is not self.root_node
-                and not ancestor.backuped
+                and not (ancestor.backuped or ancestor.external_cache_stored)
             ):
                 chain.append(ancestor)
                 ancestor = ancestor.parent

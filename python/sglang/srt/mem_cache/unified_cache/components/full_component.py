@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
+    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchPrefixParams,
@@ -22,10 +23,12 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    LinkerTransferPhase,
     TreeComponent,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -423,6 +426,62 @@ class FullComponent(TreeComponent):
                 self.tree_core._update_evictable_leaf_sets(n)
 
             self.tree_core._update_evictable_leaf_sets(node)
+
+    def _full_allocator(self):
+        """The allocator that owns the full-attention pool alone."""
+        allocator = self.cache.token_to_kv_pool_allocator
+        return allocator.full_attn_allocator if self.cache.is_swa_enabled else allocator
+
+    def build_external_linker_transfer(
+        self,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
+    ) -> Optional[PoolTransfer]:
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            return PoolTransfer(
+                name=PoolName.KV,
+                device_indices=value.to(torch.int64),
+                keys=list(node.hash_value),
+            )
+
+        if not keys:
+            return None
+
+        if phase == LinkerTransferPhase.LOOKUP:
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+        if phase == LinkerTransferPhase.LOAD:
+            allocator = self._full_allocator()
+            num_tokens = len(keys) * self.cache.page_size
+            shortfall = max(0, num_tokens - allocator.available_size())
+            if shortfall:
+                self.cache.evict(EvictParams(num_tokens=shortfall))
+            slots = allocator.alloc(num_tokens)
+            if slots is None:
+                return None
+                
+            return PoolTransfer(
+                name=PoolName.KV,
+                device_indices=slots.to(torch.int64),
+                keys=list(keys),
+            )
+
+    def finish_external_linker_load(
+        self,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        success: bool,
+    ) -> None:
+        if not success:
+            self._full_allocator().free(transfer.device_indices)
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._full_kv_pool_host is None:

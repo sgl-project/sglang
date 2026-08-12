@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
+    EvictParams,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -31,6 +32,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
+    LinkerTransferPhase,
     EvictLayer,
     LRURefreshPhase,
     PreparePrefetchResult,
@@ -876,6 +878,87 @@ class SWAComponent(TreeComponent):
             ]
 
         return None
+
+    def build_external_linker_transfer(
+        self,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
+    ) -> Optional[PoolTransfer]:
+        page = self.cache.page_size
+        window_pages = (self.sliding_window_size + page - 1) // page
+
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None or len(value) < page:
+                return None
+                
+            num_pages = len(value) // page
+            return PoolTransfer(
+                name=PoolName.SWA,
+                device_indices=value[-num_pages * page :].to(torch.int64),
+                keys=node.hash_value[-num_pages:],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+        if not keys:
+            return None
+
+        # `keys` already start at the first device-uncached page, so the trailing
+        # window is simply their tail.
+        tail_keys = list(keys[max(0, len(keys) - window_pages) :])
+        if not tail_keys:
+            return None
+
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            keys=tail_keys,
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        if phase == LinkerTransferPhase.LOAD:
+            num_tokens = len(tail_keys) * page
+            allocator = self.cache.token_to_kv_pool_allocator.swa_attn_allocator
+            shortfall = max(0, num_tokens - allocator.available_size())
+            if shortfall:
+                self.cache.evict(EvictParams(swa_num_tokens=shortfall))
+            transfer.device_indices = allocator.alloc(num_tokens)
+            if transfer.device_indices is None:
+                return None
+            transfer.device_indices = transfer.device_indices.to(torch.int64)
+        return transfer
+
+    def finish_external_linker_load(
+        self,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        success: bool,
+    ) -> None:
+        if not success:
+            self.cache.token_to_kv_pool_allocator.swa_attn_allocator.free(
+                transfer.device_indices
+            )
+            return
+
+        swa_len = len(transfer.device_indices)
+        self.cache.token_to_kv_pool_allocator.set_full_to_swa_mapping(
+            full_transfer.device_indices[-swa_len:], transfer.device_indices
+        )
+        page = self.cache.page_size
+        window = ((self.sliding_window_size + page - 1) // page) * page
+        boundary = max(0, prefix_len - window)
+        if req.kv is None:
+            from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+            req.kv = ReqKvInfo(
+                kv_allocated_len=prefix_len,
+                swa_evicted_seqlen=boundary,
+            )
+        else:
+            req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
 
     def commit_hicache_transfer(
         self,

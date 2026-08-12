@@ -101,7 +101,11 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
-    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx():
+    if (
+        envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
+        or server_args.enable_unified_cache_external_linker
+        or use_mlx()
+    ):
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.is_hybrid_swa:
@@ -190,6 +194,12 @@ def _create_unified_radix_cache(
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )
+    elif server_args.enable_unified_cache_external_linker:
+        cache.init_cache_linker(server_args, params)
+        counter = cache.linker.layer_done_counter
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        kvcache.register_layer_transfer_counter(counter)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
 
 

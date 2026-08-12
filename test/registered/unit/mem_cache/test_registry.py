@@ -37,6 +37,7 @@ def _make_ctx(
     server_args.enable_streaming_session = enable_streaming
     server_args.enable_lmcache = enable_lmcache
     server_args.enable_flexkv = False
+    server_args.enable_unified_cache_external_linker = False
     return TreeCacheBuildContext(
         server_args=server_args,
         params=MagicMock(),
