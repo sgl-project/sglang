@@ -952,15 +952,6 @@ def popen_launch_server(
         other_args = list(other_args)
         other_args += ["--device", str(device)]
 
-    # Prefill dominates capture time: the bucket list runs to chunked_prefill_size
-    # (8192 on H100-class GPUs) and its largest buckets cost seconds each, while
-    # 97% of CI prefill batches are under 1024 tokens -- a server that serves one
-    # test file captures the rest and never replays it. Decode is left alone: its
-    # capture cost is per-phase, not per-bucket. Pass the flag to opt out.
-    prefill_flag = "--cuda-graph-max-bs-prefill"
-    if not any(str(arg).startswith(prefill_flag) for arg in other_args):
-        other_args = list(other_args) + [prefill_flag, "1024"]
-
     # CI-specific: Validate cache and enable offline mode if complete
     if env is None:
         env = os.environ.copy()
@@ -2352,6 +2343,28 @@ def _wait_for_gpu_idle_in_ci(
             pynvml.nvmlShutdown()
         except Exception:
             pass
+
+
+def server_args_variant(server_args, **fields):
+    """A modified deep copy of a config, for a test double whose fixture
+    differs from the (possibly published, read-only) config it starts from.
+    The receiver is untouched; the copy keeps its read-only guard.
+
+    A name may also shadow a method with a fixture value (the runner kits set
+    ``use_mla_backend``, a method ModelRunner itself overwrites at init);
+    names that exist nowhere on the class fail loudly."""
+    variant = copy.deepcopy(server_args)
+    cls = type(variant)
+    unknown = {
+        name
+        for name in fields
+        if name not in cls.__dataclass_fields__ and not hasattr(cls, name)
+    }
+    if unknown:
+        raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    for name, value in fields.items():
+        object.__setattr__(variant, name, value)
+    return variant
 
 
 class CustomTestCase(unittest.TestCase):
