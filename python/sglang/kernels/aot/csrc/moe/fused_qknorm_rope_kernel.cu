@@ -27,6 +27,7 @@
 #include <torch/cuda.h>
 
 #include <cmath>
+#include <cstdint>
 
 #define CHECK_TYPE(x, st) \
   TORCH_CHECK(x.scalar_type() == st, #x " dtype is ", x.scalar_type(), ", while ", st, " is expected")
@@ -45,17 +46,17 @@ struct packed_as;
 
 // Specialization for packed_as used in this kernel.
 template <>
-struct packed_as<uint, 1> {
-  using type = uint;
+struct packed_as<uint32_t, 1> {
+  using type = uint32_t;
 };
 
 template <>
-struct packed_as<uint, 2> {
+struct packed_as<uint32_t, 2> {
   using type = uint2;
 };
 
 template <>
-struct packed_as<uint, 4> {
+struct packed_as<uint32_t, 4> {
   using type = uint4;
 };
 
@@ -150,8 +151,8 @@ __global__ void fusedQKNormRopeKernel(
   float elements[numElemsPerThread];
   constexpr int elemSizeBytes = numElemsPerThread * sizeof(__nv_bfloat16);
   static_assert(elemSizeBytes % 4 == 0, "numSizeBytes must be a multiple of 4");
-  constexpr int vecSize = elemSizeBytes / 4;  // Use packed_as<uint, vecSize> to perform loading/saving.
-  using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
+  constexpr int vecSize = elemSizeBytes / 4;  // Use packed_as<uint32_t, vecSize> to perform loading/saving.
+  using vec_T = typename tensorrt_llm::common::packed_as<uint32_t, vecSize>::type;
 
   int offsetWarp;  // Offset for the warp
   if (isQ) {
@@ -170,7 +171,7 @@ __global__ void fusedQKNormRopeKernel(
   {
     vec_T vec = *reinterpret_cast<vec_T const*>(&qkv[offsetThread]);
     for (int i = 0; i < vecSize; i++) {
-      float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&vec) + i));
+      float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint32_t*>(&vec) + i));
       sumOfSquares += vals.x * vals.x;
       sumOfSquares += vals.y * vals.y;
       elements[2 * i] = vals.x;
@@ -245,7 +246,7 @@ __global__ void fusedQKNormRopeKernel(
     vec_T vec;
     for (int i = 0; i < vecSize; i++) {
       __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
-      reinterpret_cast<__nv_bfloat162&>(*(reinterpret_cast<uint*>(&vec) + i)) = vals;
+      reinterpret_cast<__nv_bfloat162&>(*(reinterpret_cast<uint32_t*>(&vec) + i)) = vals;
     }
     vec_T* outputPtr = reinterpret_cast<vec_T*>(&qkv[offsetThread]);
     *outputPtr = vec;

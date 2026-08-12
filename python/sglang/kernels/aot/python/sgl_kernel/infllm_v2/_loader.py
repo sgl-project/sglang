@@ -9,6 +9,7 @@ candidate locations and loads the extension by file path.
 """
 
 import glob
+import importlib.machinery
 import importlib.util
 import site
 import sys
@@ -57,13 +58,14 @@ def _candidate_dirs() -> List[Path]:
     return unique
 
 
-def _find_so() -> Optional[Path]:
+def _find_extension() -> Optional[Path]:
     for d in _candidate_dirs():
         if not d.is_dir():
             continue
-        matches = sorted(glob.glob(str(d / "infllm_ops*.so")))
-        if matches:
-            return Path(matches[0])
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            matches = sorted(glob.glob(str(d / f"infllm_ops*{suffix}")))
+            if matches:
+                return Path(matches[0])
     return None
 
 
@@ -82,16 +84,18 @@ def load_infllm_ops():
     except Exception:
         pass
 
-    so_path = _find_so()
-    if so_path is None:
+    extension_path = _find_extension()
+    if extension_path is None:
         raise ImportError(
-            "[sgl_kernel] Could not locate the 'infllm_ops' extension (infllm_ops*.so). "
+            "[sgl_kernel] Could not locate the 'infllm_ops' native extension. "
             "Ensure sgl-kernel was built with the InfLLM-V2 FlashAttention backend."
         )
 
-    spec = importlib.util.spec_from_file_location("infllm_ops", str(so_path))
+    spec = importlib.util.spec_from_file_location("infllm_ops", str(extension_path))
     if spec is None or spec.loader is None:
-        raise ImportError(f"[sgl_kernel] Could not create module spec for {so_path}")
+        raise ImportError(
+            f"[sgl_kernel] Could not create module spec for {extension_path}"
+        )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     _infllm_ops = module

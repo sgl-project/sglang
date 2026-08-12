@@ -43,11 +43,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
+#ifdef SGL_KERNEL_ENABLE_CUTLASS_MLA
   m.def(
       "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe, Tensor kv_c_and_k_pe_cache, Tensor seq_lens, Tensor "
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
+#endif
 
   /*
    * From csrc/infllm_v2
@@ -110,6 +112,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/gemm
    */
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kCUDA, &awq_dequantize);
 
@@ -122,6 +125,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
       "bias) -> Tensor");
   m.impl("fp8_scaled_mm", torch::kCUDA, &fp8_scaled_mm);
+#endif
 
   m.def(
       "sgl_per_token_group_quant_8bit(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
@@ -139,6 +143,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/gemm/gptq
    */
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
   m.def(
       "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool "
       "use_shuffle, int bit) -> Tensor");
@@ -146,6 +151,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   m.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
+#endif
 
   /*
    * From csrc/moe
@@ -176,12 +182,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // now routes through the unified Triton router
   // (python/sglang/kernels/ops/moe/moe_fused_gate.py).
 
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
   m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
       "a_scales_ptrs, Tensor b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
       "stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, Tensor problem_sizes, Tensor "
       "expert_offsets, Tensor workspace) -> ()");
   m.impl("fp8_blockwise_scaled_grouped_mm", torch::kCUDA, &fp8_blockwise_scaled_grouped_mm);
+#endif
 
   m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
@@ -221,6 +229,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/moe/cutlass_moe/w4a8
    */
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
   m.def(
       "get_cutlass_w4a8_moe_mm_data(Tensor topk_ids, Tensor! expert_offsets, "
       "                        Tensor! problem_sizes1, Tensor! problem_sizes2, "
@@ -236,6 +245,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "               Tensor b_strides, Tensor d_strides, Tensor s_strides,"
       "               int chunk_size, int topk) -> ()");
   m.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
+#endif
 
   /*
    * From csrc/speculative
@@ -350,6 +360,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From Sparse Flash Attention
    */
+#ifdef SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN
   m.def(
       "fwd_sparse(Tensor! q, Tensor k, Tensor v, "
       "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
@@ -390,6 +401,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "   int context_size, int block_size_M, int block_size_N, "
       "   bool causal) -> ()");
   m.impl("convert_vertical_slash_indexes_mergehead", torch::kCUDA, &convert_vertical_slash_indexes_mergehead);
+#endif
 
   /*
    * From csrc/grammar
@@ -432,6 +444,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/mamba
    */
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
   m.def(
       "causal_conv1d_update(Tensor! x,"
       "Tensor! conv_state,"
@@ -453,10 +466,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool silu_activation,"
       "int pad_slot_id) -> ()");
   m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
+#endif
 
   /*
    * From csrc/expert_sepcialization
    */
+#ifdef SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
   m.def(
       "es_fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
       "stride_a, Tensor stride_b, Tensor stride_d, Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> "
@@ -470,6 +485,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
       "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
   m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
+#endif
 }
 
 REGISTER_EXTENSION(common_ops)

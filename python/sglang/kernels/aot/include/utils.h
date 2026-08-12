@@ -372,17 +372,17 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 #ifndef USE_ROCM
 #include <c10/util/Float8_e4m3fn.h>
 using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
+#define FP8_E4M3_MAX 448.0f
 #else  // USE_ROCM
 #if HIP_FP8_TYPE_FNUZ
 #include <c10/util/Float8_e4m3fnuz.h>
 using FP8_TYPE = c10::Float8_e4m3fnuz;
-constexpr auto FP8_E4M3_MAX = 224.0f;
+#define FP8_E4M3_MAX 224.0f
 #else
 #if HIP_FP8_TYPE_E4M3
 #include <c10/util/Float8_e4m3fn.h>
 using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
+#define FP8_E4M3_MAX 448.0f
 #else
 #error "fp8 is not supported in this processor (arch < gfx942)."
 #endif  // HIP_FP8_TYPE_E4M3
@@ -456,7 +456,13 @@ inline torch::Tensor pad_tensor(const torch::Tensor& tensor, int64_t alignment =
 // Get the next power of 2 of a number
 inline uint32_t next_pow2(uint32_t x) noexcept {
   if (x <= 1) return 1;
-  return 1u << (32 - __builtin_clz(x - 1));
+  --x;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  return x + 1;
 }
 
 /*

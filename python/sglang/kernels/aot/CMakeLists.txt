@@ -13,6 +13,58 @@ set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" SGL_KERNEL_SYSTEM_PROCESSOR)
+set(SGL_KERNEL_IS_ARM64 OFF)
+if(SGL_KERNEL_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(SGL_KERNEL_IS_ARM64 ON)
+endif()
+
+set(DEFAULT_SGL_KERNEL_BUILD_SM90 ON)
+set(DEFAULT_SGL_KERNEL_BUILD_INFLLM ON)
+set(DEFAULT_SGL_KERNEL_BUILD_SPATIAL ON)
+set(DEFAULT_SGL_KERNEL_BUILD_FLASHMLA ON)
+set(DEFAULT_SGL_KERNEL_INSTALL_TRITON_KERNELS ON)
+set(DEFAULT_SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN ON)
+set(DEFAULT_SGL_KERNEL_ENABLE_CUTLASS_MLA ON)
+set(DEFAULT_SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS ON)
+if(WIN32)
+    set(DEFAULT_SGL_KERNEL_BUILD_SM90 OFF)
+    set(DEFAULT_SGL_KERNEL_BUILD_INFLLM OFF)
+    set(DEFAULT_SGL_KERNEL_BUILD_SPATIAL OFF)
+    set(DEFAULT_SGL_KERNEL_BUILD_FLASHMLA OFF)
+    set(DEFAULT_SGL_KERNEL_INSTALL_TRITON_KERNELS OFF)
+    set(DEFAULT_SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN OFF)
+    set(DEFAULT_SGL_KERNEL_ENABLE_CUTLASS_MLA OFF)
+    set(DEFAULT_SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS OFF)
+endif()
+
+option(SGL_KERNEL_BUILD_SM90 "Build the SM90 fast-math common_ops variant" ${DEFAULT_SGL_KERNEL_BUILD_SM90})
+option(SGL_KERNEL_BUILD_INFLLM "Build the optional InfLLM-V2 extension" ${DEFAULT_SGL_KERNEL_BUILD_INFLLM})
+option(SGL_KERNEL_BUILD_SPATIAL "Build the optional spatial extension" ${DEFAULT_SGL_KERNEL_BUILD_SPATIAL})
+option(SGL_KERNEL_BUILD_FLASHMLA "Build the optional FlashMLA extension" ${DEFAULT_SGL_KERNEL_BUILD_FLASHMLA})
+option(SGL_KERNEL_INSTALL_TRITON_KERNELS "Bundle triton_kernels in the wheel" ${DEFAULT_SGL_KERNEL_INSTALL_TRITON_KERNELS})
+option(
+    SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN
+    "Build the sparse FlashAttention operators in common_ops"
+    ${DEFAULT_SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN}
+)
+option(
+    SGL_KERNEL_ENABLE_CUTLASS_MLA
+    "Build the AOT CUTLASS MLA decode operators"
+    ${DEFAULT_SGL_KERNEL_ENABLE_CUTLASS_MLA}
+)
+option(
+    SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
+    "Build optional CUTLASS, expert-specialization, AWQ, GPTQ, and legacy FP8 GEMM operators"
+    ${DEFAULT_SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS}
+)
+set(
+    SGL_KERNEL_CUDA_ARCHITECTURES
+    ""
+    CACHE STRING
+    "Optional semicolon/comma-separated CUDA architecture suffixes (for example 121a)"
+)
+
 # GitHub Artifactory
 set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 
@@ -20,29 +72,49 @@ set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 # CXX
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+set(SGL_KERNEL_CXX_STANDARD 17)
+if(MSVC)
+    # Current Windows ARM64 PyTorch headers use C++20 features.
+    set(SGL_KERNEL_CXX_STANDARD 20)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/O2>)
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+endif()
+set(CMAKE_CXX_STANDARD ${SGL_KERNEL_CXX_STANDARD})
+set(CMAKE_CUDA_STANDARD ${SGL_KERNEL_CXX_STANDARD})
 
 # CUDA
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
+set(SGL_KERNEL_CUDA_VERSION "${CUDAToolkit_VERSION}")
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
-message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
-    message("CUDA_VERSION ${CUDA_VERSION} >= 13.0")
-elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
-    message("CUDA_VERSION ${CUDA_VERSION} >= 12.8")
-elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
-    message("CUDA_VERSION ${CUDA_VERSION} >= 12.4")
-elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.1")
-    message("CUDA_VERSION ${CUDA_VERSION} >= 12.1")
-elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "11.8")
-    message("CUDA_VERSION ${CUDA_VERSION} >= 11.8")
+message(STATUS "Detected CUDA_VERSION=${SGL_KERNEL_CUDA_VERSION}")
+if ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+    message("CUDA_VERSION ${SGL_KERNEL_CUDA_VERSION} >= 13.0")
+elseif ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
+    message("CUDA_VERSION ${SGL_KERNEL_CUDA_VERSION} >= 12.8")
+elseif ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+    message("CUDA_VERSION ${SGL_KERNEL_CUDA_VERSION} >= 12.4")
+elseif ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "12.1")
+    message("CUDA_VERSION ${SGL_KERNEL_CUDA_VERSION} >= 12.1")
+elseif ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "11.8")
+    message("CUDA_VERSION ${SGL_KERNEL_CUDA_VERSION} >= 11.8")
 endif()
 
 # Torch
 find_package(Torch REQUIRED)
+if(MSVC)
+    # CUTLASS uses host/device facade functions whose host branch calls host-only
+    # helpers. PyTorch promotes NVCC's cross-execution-space diagnostic to an
+    # error globally, even though the device branch is discarded.
+    string(REPLACE
+        "--Werror cross-execution-space-call"
+        ""
+        CMAKE_CUDA_FLAGS
+        "${CMAKE_CUDA_FLAGS}"
+    )
+endif()
 clear_cuda_arches(CMAKE_FLAG)
 
 # Third Party repos
@@ -63,12 +135,14 @@ FetchContent_Declare(
 FetchContent_Populate(repo-fmt)
 
 # Triton kernel
-FetchContent_Declare(
-    repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.7.1.tar.gz
-    URL_HASH SHA256=7d998625d1035ac496d06a81117727647169422ee67b8889609f06fd5367c491
-)
-FetchContent_Populate(repo-triton)
+if(SGL_KERNEL_INSTALL_TRITON_KERNELS)
+    FetchContent_Declare(
+        repo-triton
+        URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.7.1.tar.gz
+        URL_HASH SHA256=7d998625d1035ac496d06a81117727647169422ee67b8889609f06fd5367c491
+    )
+    FetchContent_Populate(repo-triton)
+endif()
 
 # flashinfer
 FetchContent_Declare(
@@ -77,6 +151,37 @@ FetchContent_Declare(
     URL_HASH SHA256=931dfd118f4b6de8c7d98702153c7c03840139170af21a07607693bd9749744d
 )
 FetchContent_Populate(repo-flashinfer)
+if(MSVC)
+    set(FLASHINFER_VEC_DTYPES "${repo-flashinfer_SOURCE_DIR}/include/flashinfer/vec_dtypes.cuh")
+    file(READ "${FLASHINFER_VEC_DTYPES}" FLASHINFER_VEC_DTYPES_CONTENT)
+    string(REPLACE
+        "#define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__"
+        "#define FLASHINFER_INLINE __forceinline__ __device__"
+        FLASHINFER_VEC_DTYPES_CONTENT
+        "${FLASHINFER_VEC_DTYPES_CONTENT}"
+    )
+    file(WRITE "${FLASHINFER_VEC_DTYPES}" "${FLASHINFER_VEC_DTYPES_CONTENT}")
+
+    set(FLASHINFER_MATH "${repo-flashinfer_SOURCE_DIR}/include/flashinfer/math.cuh")
+    file(READ "${FLASHINFER_MATH}" FLASHINFER_MATH_CONTENT)
+    string(REPLACE
+        "ushort y_u16;"
+        "unsigned short y_u16;"
+        FLASHINFER_MATH_CONTENT
+        "${FLASHINFER_MATH_CONTENT}"
+    )
+    file(WRITE "${FLASHINFER_MATH}" "${FLASHINFER_MATH_CONTENT}")
+
+    set(FLASHINFER_PYTORCH_UTILS "${repo-flashinfer_SOURCE_DIR}/csrc/pytorch_extension_utils.h")
+    file(READ "${FLASHINFER_PYTORCH_UTILS}" FLASHINFER_PYTORCH_UTILS_CONTENT)
+    string(REPLACE
+        "FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)"
+        "#if !defined(_MSC_VER)\nFLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)\n#endif"
+        FLASHINFER_PYTORCH_UTILS_CONTENT
+        "${FLASHINFER_PYTORCH_UTILS_CONTENT}"
+    )
+    file(WRITE "${FLASHINFER_PYTORCH_UTILS}" "${FLASHINFER_PYTORCH_UTILS_CONTENT}")
+endif()
 
 # flash-attention
 FetchContent_Declare(
@@ -96,7 +201,7 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
 endif()
 
 # Configure gencode below SM90
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+if(SGL_KERNEL_IS_ARM64)
     set(DEFAULT_ENABLE_BELOW_SM90 OFF)
     message(STATUS "For aarch64, disable gencode below SM90 by default")
 else()
@@ -106,10 +211,10 @@ endif()
 option(ENABLE_BELOW_SM90 "Enable gencode below SM90" ${DEFAULT_ENABLE_BELOW_SM90})
 
 set(DEFAULT_SGL_KERNEL_ENABLE_FA3 OFF)
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+if (SGL_KERNEL_IS_ARM64)
     message(STATUS "For aarch64, disable FA3 by default")
 endif()
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+if ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND NOT SGL_KERNEL_IS_ARM64)
     set(DEFAULT_SGL_KERNEL_ENABLE_FA3 ON)
 endif()
 
@@ -122,10 +227,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DNDEBUG"
     "-DOPERATOR_NAMESPACE=sgl-kernel"
     "-O3"
-    "-Xcompiler"
-    "-fPIC"
-    "-gencode=arch=compute_90,code=sm_90"
-    "-std=c++17"
+    "-std=c++${SGL_KERNEL_CXX_STANDARD}"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
     "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
@@ -141,13 +243,6 @@ set(SGL_KERNEL_CUDA_FLAGS
     # option named SGL_KERNEL_COMPILE_THREADS, default value 32.
     # "--threads=32"
 
-    # Supress warnings
-    "-Xcompiler=-Wno-clang-format-violations"
-    "-Xcompiler=-Wno-conversion"
-    "-Xcompiler=-Wno-deprecated-declarations"
-    "-Xcompiler=-Wno-terminate"
-    "-Xcompiler=-Wfatal-errors"
-    "-Xcompiler=-ftemplate-backtrace-limit=1"
     "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
     "-Xcudafe=--diag_suppress=2361"  # invalid narrowing conversion from "char" to "signed char"
 
@@ -155,6 +250,25 @@ set(SGL_KERNEL_CUDA_FLAGS
     # "--ptxas-options=-v"
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
+
+if(MSVC)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-Xcompiler=/O2"
+        "-Xcompiler=/EHsc"
+        "-Xcompiler=/DNOMINMAX"
+        "-Xcompiler=/Zc:preprocessor"
+    )
+else()
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-Xcompiler=-fPIC"
+        "-Xcompiler=-Wno-clang-format-violations"
+        "-Xcompiler=-Wno-conversion"
+        "-Xcompiler=-Wno-deprecated-declarations"
+        "-Xcompiler=-Wno-terminate"
+        "-Xcompiler=-Wfatal-errors"
+        "-Xcompiler=-ftemplate-backtrace-limit=1"
+    )
+endif()
 
 set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default 32")
 
@@ -178,6 +292,22 @@ option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
+if(SGL_KERNEL_CUDA_ARCHITECTURES)
+    string(REPLACE "," ";" SGL_KERNEL_CUDA_ARCH_LIST "${SGL_KERNEL_CUDA_ARCHITECTURES}")
+    foreach(SGL_KERNEL_CUDA_ARCH IN LISTS SGL_KERNEL_CUDA_ARCH_LIST)
+        string(STRIP "${SGL_KERNEL_CUDA_ARCH}" SGL_KERNEL_CUDA_ARCH)
+        if(NOT SGL_KERNEL_CUDA_ARCH MATCHES "^[0-9]+[af]?$")
+            message(FATAL_ERROR "Invalid CUDA architecture '${SGL_KERNEL_CUDA_ARCH}'")
+        endif()
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_${SGL_KERNEL_CUDA_ARCH},code=sm_${SGL_KERNEL_CUDA_ARCH}"
+        )
+    endforeach()
+    message(STATUS "Using explicit CUDA architectures: ${SGL_KERNEL_CUDA_ARCH_LIST}")
+else()
+    list(APPEND SGL_KERNEL_CUDA_FLAGS "-gencode=arch=compute_90,code=sm_90")
+endif()
+
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DFLASHINFER_ENABLE_BF16"
@@ -192,12 +322,12 @@ if (SGL_KERNEL_ENABLE_FP8)
     )
 endif()
 
-if (ENABLE_BELOW_SM90)
+if (NOT SGL_KERNEL_CUDA_ARCHITECTURES AND ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_80,code=sm_80"
         "-gencode=arch=compute_89,code=sm_89"
     )
-    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    if (SGL_KERNEL_IS_ARM64)
         list(APPEND SGL_KERNEL_CUDA_FLAGS
             "-gencode=arch=compute_87,code=sm_87"
         )
@@ -205,9 +335,9 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if (NOT SGL_KERNEL_CUDA_ARCHITECTURES AND ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A))
     # sm_100f is available in CUDA 12.9+ and covers all sm_100, sm_103, sm_107, sm_10x
-    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.9")
+    if ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "12.9")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
             "-gencode=arch=compute_100f,code=sm_100f"
         )
@@ -220,18 +350,18 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
         "-gencode=arch=compute_120a,code=sm_120a"
     )
     # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
-    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+    if ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
             "--compress-mode=size"
         )
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        if (SGL_KERNEL_IS_ARM64)
             list(APPEND SGL_KERNEL_CUDA_FLAGS
                 "-gencode=arch=compute_110a,code=sm_110a"
                 "-gencode=arch=compute_121a,code=sm_121a"
             )
         endif()
     else()
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        if (SGL_KERNEL_IS_ARM64)
             list(APPEND SGL_KERNEL_CUDA_FLAGS
                 "-gencode=arch=compute_101a,code=sm_101a"
             )
@@ -239,13 +369,13 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_FA3)
+if ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_FA3)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
+if ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DENABLE_NVFP4=1"
     )
@@ -255,7 +385,6 @@ endif()
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
-    "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
@@ -266,35 +395,22 @@ set(SOURCES
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
-    "csrc/expert_specialization/es_fp8_blockwise.cu"
-    "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
-    "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
-
-    "csrc/gemm/awq_kernel.cu"
-    "csrc/gemm/fp8_gemm_kernel.cu"
-    "csrc/gemm/int8_gemm_kernel.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_group_quant_8bit_v2.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
-    "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
     "csrc/infllm_v2/max_pooling.cu"
 
     "csrc/kvcacheio/transfer.cu"
-    "csrc/mamba/causal_conv1d.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 
-    "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
-    "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
-    "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/fused_qknorm_rope_kernel.cu"
     "csrc/moe/moe_sum.cu"
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/moe_topk_sigmoid_kernels.cu"
-    "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
     "csrc/quantization/gguf/gguf_kernel.cu"
@@ -305,14 +421,38 @@ set(SOURCES
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
-
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
+if(SGL_KERNEL_ENABLE_CUTLASS_MLA)
+    list(APPEND SOURCES "csrc/attention/cutlass_mla_kernel.cu")
+endif()
+
+if(SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS)
+    list(APPEND SOURCES
+        "csrc/expert_specialization/es_fp8_blockwise.cu"
+        "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
+        "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
+        "csrc/gemm/awq_kernel.cu"
+        "csrc/gemm/fp8_gemm_kernel.cu"
+        "csrc/gemm/int8_gemm_kernel.cu"
+        "csrc/gemm/gptq/gptq_kernel.cu"
+        "csrc/mamba/causal_conv1d.cu"
+        "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
+        "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
+        "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
+        "csrc/moe/fp8_blockwise_moe_kernel.cu"
+    )
+endif()
+
+if(SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN)
+    list(APPEND SOURCES
+        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
+        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
+        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
+        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
+        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
+    )
+endif()
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
@@ -325,17 +465,20 @@ set(INCLUDES
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
-Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-
-target_compile_options(common_ops_sm90_build PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
-)
-target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
-# Set output name and separate build directory to avoid conflicts
-set_target_properties(common_ops_sm90_build PROPERTIES
-    OUTPUT_NAME "common_ops"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
-)
+set(SGL_KERNEL_COMMON_TARGETS)
+if(SGL_KERNEL_BUILD_SM90)
+    Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+    target_compile_options(common_ops_sm90_build PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
+    )
+    target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
+    set_target_properties(common_ops_sm90_build PROPERTIES
+        OUTPUT_NAME "common_ops"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
+    )
+    list(APPEND SGL_KERNEL_COMMON_TARGETS common_ops_sm90_build)
+endif()
 
 # =========================== Common SM100+ Build ============================= #
 # Build SM100+ library with precise math (same namespace, different directory)
@@ -349,44 +492,85 @@ target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
 set_target_properties(common_ops_sm100_build PROPERTIES
     OUTPUT_NAME "common_ops"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
 )
+list(APPEND SGL_KERNEL_COMMON_TARGETS common_ops_sm100_build)
 
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
-execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
-    OUTPUT_VARIABLE TORCH_CXX11_ABI
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-if(TORCH_CXX11_ABI STREQUAL "0")
-    message(STATUS "Using old C++ ABI (-D_GLIBCXX_USE_CXX11_ABI=0)")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
-else()
-    message(STATUS "Using new C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI=1)")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
+if(NOT MSVC)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
+        OUTPUT_VARIABLE TORCH_CXX11_ABI
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(TORCH_CXX11_ABI STREQUAL "0")
+        message(STATUS "Using old C++ ABI (-D_GLIBCXX_USE_CXX11_ABI=0)")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
+    else()
+        message(STATUS "Using new C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI=1)")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
+    endif()
 endif()
 
-target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+foreach(SGL_KERNEL_COMMON_TARGET IN LISTS SGL_KERNEL_COMMON_TARGETS)
+    target_link_libraries(
+        ${SGL_KERNEL_COMMON_TARGET}
+        PRIVATE
+        ${TORCH_LIBRARIES}
+        c10
+        CUDA::cuda_driver
+        CUDA::cudart
+        CUDA::cublas
+        CUDA::cublasLt
+    )
+    target_compile_definitions(
+        ${SGL_KERNEL_COMMON_TARGET}
+        PRIVATE
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        FLASHATTENTION_DISABLE_UNEVEN_K
+    )
+    if(SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN)
+        target_compile_definitions(
+            ${SGL_KERNEL_COMMON_TARGET}
+            PRIVATE
+            SGL_KERNEL_ENABLE_SPARSE_FLASH_ATTN
+        )
+    endif()
+    if(SGL_KERNEL_ENABLE_CUTLASS_MLA)
+        target_compile_definitions(
+            ${SGL_KERNEL_COMMON_TARGET}
+            PRIVATE
+            SGL_KERNEL_ENABLE_CUTLASS_MLA
+        )
+    endif()
+    if(SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS)
+        target_compile_definitions(
+            ${SGL_KERNEL_COMMON_TARGET}
+            PRIVATE
+            SGL_KERNEL_ENABLE_EXTENDED_CUDA_OPS
+        )
+    endif()
+endforeach()
 
 # sparse flash attention
-target_compile_definitions(common_ops_sm90_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
-target_compile_definitions(common_ops_sm100_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
-
 # Install to different subdirectories
 # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
 # and install them to the specified destinations
-install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
-install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+if(SGL_KERNEL_BUILD_SM90)
+    install(
+        TARGETS common_ops_sm90_build
+        LIBRARY DESTINATION sgl_kernel/sm90
+        RUNTIME DESTINATION sgl_kernel/sm90
+    )
+endif()
+install(
+    TARGETS common_ops_sm100_build
+    LIBRARY DESTINATION sgl_kernel/sm100
+    RUNTIME DESTINATION sgl_kernel/sm100
+)
 
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file
@@ -490,6 +674,7 @@ endif()
 # vendored static_switch.h forces bf16 and dispatches headdim to {64, 128}
 # only). Backward kernels are intentionally omitted because SGLang only uses
 # these ops for inference.
+if(SGL_KERNEL_BUILD_INFLLM)
 set(INFLLM_FLASH_CUDA_FLAGS
     "-DNDEBUG"
     "-O3"
@@ -517,7 +702,7 @@ if (ENABLE_BELOW_SM90)
     list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_80,code=sm_80")
 endif()
 list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_90,code=sm_90")
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if ("${SGL_KERNEL_CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_120a,code=sm_120a")
 endif()
 
@@ -542,9 +727,15 @@ target_include_directories(infllm_ops PRIVATE
 # THPGeneratorClass from libtorch_python (not part of TORCH_LIBRARIES).
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED)
 target_link_libraries(infllm_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} c10 cuda)
-install(TARGETS infllm_ops LIBRARY DESTINATION "sgl_kernel")
+install(
+    TARGETS infllm_ops
+    LIBRARY DESTINATION "sgl_kernel"
+    RUNTIME DESTINATION "sgl_kernel"
+)
+endif()
 
 # Build spatial_ops as a separate, optional extension for green contexts
+if(SGL_KERNEL_BUILD_SPATIAL)
 set(SPATIAL_SOURCES
     "csrc/spatial/greenctx_stream.cu"
     "csrc/spatial_extension.cc"
@@ -553,13 +744,22 @@ set(SPATIAL_SOURCES
 Python_add_library(spatial_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SPATIAL_SOURCES})
 target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
-install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
+install(
+    TARGETS spatial_ops
+    LIBRARY DESTINATION sgl_kernel
+    RUNTIME DESTINATION sgl_kernel
+)
+endif()
 
 # ============================ Extra Install: FLashMLA ============================= #
+if(SGL_KERNEL_BUILD_FLASHMLA)
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+endif()
 
 # ============================ Extra Install: triton kernels ============================= #
+if(SGL_KERNEL_INSTALL_TRITON_KERNELS)
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
         DESTINATION "triton_kernels"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
+endif()
