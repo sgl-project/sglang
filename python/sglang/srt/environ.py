@@ -594,9 +594,10 @@ class Envs:
     # an unsupported shape falls back to NCCL, so there is no size knob here.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     # Elements the IPC workspace is sized for. It cannot grow after construction,
-    # so 0 sizes it for one prefill chunk (chunked_prefill_size * hidden). Set it
-    # to cap the ~2 * world_size * max_numel * itemsize bytes per rank instead,
-    # at the cost of leaving reductions above the cap on NCCL.
+    # so 0 sizes it for the widest decode (cuda_graph_config[decode].max_bs *
+    # hidden) and leaves prefill chunks on NCCL, which measured faster than
+    # routing them here. Raise it to hand larger reductions to the kernels; it
+    # costs ~2 * world_size * max_numel * itemsize bytes per rank.
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # AMD & ROCm

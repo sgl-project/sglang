@@ -31,23 +31,33 @@ of its own -- it asks and obeys.
 
 Workspace sizing
 ----------------
-The workspace cannot grow after construction and costs roughly
-``2 * world_size * max_numel * itemsize`` bytes per rank, so it has to be sized
-for the largest reduction the model will issue: one prefill chunk, i.e.
-``chunked_prefill_size * hidden``. Sizing it for decode instead is a false
-economy -- it saves ~3 GiB of KV but leaves the prefill reduction on NCCL, and
-measured end to end that costs more than the memory is worth: at 8 ranks, TP8,
-8k context, TTFT was 2.2 s with a prefill-sized workspace against 12.0 s with a
-decode-sized one, where NCCL alone was 8.5 s. Splitting reductions across two
-paths is worse than committing to either.
+The workspace is sized for decode, ``cuda_graph_max_bs * hidden``, which leaves
+every prefill chunk on NCCL. That split is deliberate. These kernels win by
+latency at small messages; a prefill chunk is three orders of magnitude larger,
+and there NCCL's ring is the better algorithm. Measured at 8 ranks, TP8, 8k
+context, against NCCL as the baseline:
 
-``chunked_prefill_size`` comes from the server args, but the hidden size is not
-known when the group is built, so the workspace is created on the first eligible
-tensor, whose trailing dimension is exactly that hidden size. Ranks run the same
-sequence of reductions, so they all reach that first call with the same shape and
-build the same workspace. ``SGLANG_PCIE_IPC_MAX_NUMEL`` overrides the derivation
-for deployments that would rather cap the memory and leave large reductions on
-NCCL.
+===================  ==========  ==========  ===============
+Workspace            TTFT        TPOT        Output tok/s
+===================  ==========  ==========  ===============
+NCCL only            1910 ms     21.14 ms    35.02
+prefill-sized        3176 ms     13.64 ms    38.43
+decode-sized         1849 ms     13.62 ms    48.05
+===================  ==========  ==========  ===============
+
+Handing prefill to these kernels costs 66% on TTFT and buys nothing on TPOT.
+The decode-sized workspace keeps the whole TPOT win, stays level with NCCL on
+TTFT, and is the only one of the three that is not worse than NCCL anywhere we
+measured. It is also ~250x smaller, which matters at long context: at 128k with
+4 concurrent requests the prefill-sized workspace regressed TPOT by 45%, and
+that regression disappears when it is sized for decode.
+
+The bound comes from the server args, but the hidden size is not known when the
+group is built, so the workspace is created on the first eligible tensor, whose
+trailing dimension is exactly that hidden size. Ranks run the same sequence of
+reductions, so they all reach that first call with the same shape and build the
+same workspace. ``SGLANG_PCIE_IPC_MAX_NUMEL`` overrides the derivation for
+deployments that want to hand larger reductions to the kernels anyway.
 """
 
 import logging
@@ -64,17 +74,24 @@ logger = logging.getLogger(__name__)
 # The kernels build IPC channels for these world sizes only.
 _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 
-# Fallback when the server args do not carry a chunk size (unit tests, embedded
-# use). Large enough for any decode shape we serve; prefill stays on NCCL.
-_FALLBACK_MAX_NUMEL = 64 * 8192
+# Fallback decode width when the server args are absent (unit tests, embedded
+# use). Covers the batch sizes we serve; anything larger stays on NCCL.
+_FALLBACK_DECODE_WIDTH = 64
 
 
-def _chunked_prefill_size() -> Optional[int]:
-    """Tokens in one prefill forward, or None when the server args are absent."""
+def _decode_width() -> Optional[int]:
+    """Rows in the widest decode reduction, or None when the server args are absent.
+
+    Decode runs inside a captured graph, so the largest captured batch bounds the
+    reduction. Speculative decoding verifies several tokens per sequence in one
+    forward, and the decode phase's ``max_bs`` is the batch the runner captures
+    for, which already accounts for that.
+    """
     try:
         from sglang.srt.server_args import get_global_server_args
 
-        return get_global_server_args().chunked_prefill_size
+        config = get_global_server_args().cuda_graph_config
+        return config.decode.max_bs if config is not None else None
     except Exception:
         return None
 
@@ -125,7 +142,7 @@ class PcieIpcCommunicator:
         )
 
     def _ensure_workspace(self, inp: torch.Tensor) -> bool:
-        """Build the workspace for one prefill chunk, using ``inp`` for the hidden size.
+        """Build the workspace for the widest decode, using ``inp`` for the hidden size.
 
         Every rank issues the same reductions in the same order, so they all arrive
         here with the same shape and agree on ``max_numel`` without extra exchange.
@@ -140,8 +157,7 @@ class PcieIpcCommunicator:
             max_numel = override
         else:
             hidden = inp.shape[-1]
-            chunk = _chunked_prefill_size()
-            max_numel = chunk * hidden if chunk else _FALLBACK_MAX_NUMEL
+            max_numel = (_decode_width() or _FALLBACK_DECODE_WIDTH) * hidden
 
         try:
             self._workspace = self._workspace_cls(
