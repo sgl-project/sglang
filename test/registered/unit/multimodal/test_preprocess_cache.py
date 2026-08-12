@@ -14,6 +14,7 @@ from PIL import Image
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
     build_artifact_key,
+    build_feature_hash,
     build_processor_fingerprint,
     estimate_cache_size_bytes,
     parse_content_hash,
@@ -229,6 +230,23 @@ class TestMediaIdentity(unittest.TestCase):
         )
         self.assertNotEqual(base, changed_backend)
         self.assertNotEqual(base, changed_config)
+
+    def test_feature_hash_includes_artifact_and_processor_output(self):
+        digest = snapshot_media(b"image").content_digest
+        first = build_artifact_key(
+            digest,
+            modality="image",
+            processor_fingerprint="processor-a",
+        )
+        second = build_artifact_key(
+            digest,
+            modality="image",
+            processor_fingerprint="processor-b",
+        )
+        self.assertNotEqual(build_feature_hash(first, 1), build_feature_hash(second, 1))
+        self.assertNotEqual(build_feature_hash(first, 1), build_feature_hash(first, 2))
+        with self.assertRaises(ValueError):
+            build_feature_hash(first, -1)
 
 
 class TestMultimodalPreprocessCache(unittest.TestCase):
