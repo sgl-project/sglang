@@ -48,9 +48,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -291,7 +289,7 @@ class Dots3MoE(nn.Module):
         is_nextn: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
@@ -381,7 +379,7 @@ class Dots3MoE(nn.Module):
 
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
@@ -1868,7 +1866,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
         self.pp_group = get_pp_group()
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.model = Dots3Model(
@@ -1906,7 +1904,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             or hf_config.n_shared_experts != 1
         ):
             return "Shared-expert fusion is unsupported for this Dots3 configuration."
-        if get_moe_expert_parallel_world_size() > 1:
+        if get_parallel().moe_ep_size > 1:
             return "Dots3 shared-expert fusion is unsupported with expert parallelism."
         if quant_config is not None and quant_config.get_name() == "w4afp8":
             return (
