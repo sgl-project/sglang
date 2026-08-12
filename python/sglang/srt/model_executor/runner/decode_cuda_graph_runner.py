@@ -530,9 +530,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return not draft_is_deepseek_v4(server_args=model_runner.server_args)
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return num_tokens // self.captured_req_width
-        return min(num_tokens, self.max_bs)
+        # Capture each token tier at its natural request geometry
+        # (num_tokens // width slots of width tokens) so every admitted batch
+        # (raw_bs <= slots) stages a layout inside the captured box. For tiers
+        # below max_bs the old min(num_tokens, max_bs) packed rows of one token
+        # each, which no multi-token verify batch reproduces and crashed at
+        # replay. Batches whose request count exceeds a tier's natural slot
+        # capacity are not admitted and fall back to eager, which is safe.
+        return num_tokens // self.captured_req_width
 
     def _capture_ragged_verify_layout(self, num_tokens: int):
         if not self.ragged_verify_mode:
