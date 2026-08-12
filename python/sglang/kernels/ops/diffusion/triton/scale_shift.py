@@ -744,8 +744,23 @@ if current_platform.is_musa():
     fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
 
 if current_platform.is_cpu():
-    from .torch_fallback import (
-        fuse_scale_shift_kernel_native,
-    )
+    import sgl_kernel  # noqa: F401
 
-    fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
+    def _fuse_scale_shift_kernel_cpu(
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        scale_constant: float = 1.0,
+        block_l: int = 128,
+        block_c: int = 128,
+    ) -> torch.Tensor:
+        del block_l, block_c
+
+        return torch.ops.sgl_kernel.fused_scale_shift_cpu(
+            x,
+            scale,
+            shift,
+            scale_constant,
+        )
+
+    fuse_scale_shift_kernel = _fuse_scale_shift_kernel_cpu

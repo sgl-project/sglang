@@ -742,6 +742,66 @@ class _ScaleResidualNormScaleShift(CustomOp):
             modulated = normalized * (1 + scale) + shift
         return modulated, residual_output
 
+    def forward_cpu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual.numel() == 0 or x.numel() == 0:
+            return self.forward_native(
+                residual,
+                x,
+                gate,
+                shift,
+                scale,
+            )
+
+        if residual.dtype != x.dtype:
+            return self.forward_native(
+                residual,
+                x,
+                gate,
+                shift,
+                scale,
+            )
+        param_dtype = scale.dtype
+        if shift.dtype != param_dtype:
+            shift = shift.to(dtype=param_dtype)
+        if isinstance(gate, torch.Tensor):
+            gate_tensor = (
+                gate if gate.dtype == param_dtype else gate.to(dtype=param_dtype)
+            )
+        elif isinstance(gate, (int, float)) and gate == 1:
+            gate_tensor = None
+        else:
+            return self.forward_native(
+                residual,
+                x,
+                gate,
+                shift,
+                scale,
+            )
+        weight = getattr(self.norm, "weight", None)
+        bias = getattr(self.norm, "bias", None)
+        if weight is not None and weight.dtype != param_dtype:
+            weight = weight.to(dtype=param_dtype)
+        if bias is not None and bias.dtype != param_dtype:
+            bias = bias.to(dtype=param_dtype)
+        return torch.ops.sgl_kernel.fused_scale_residual_norm_scale_shift_cpu(
+            residual,
+            x,
+            gate_tensor,
+            weight,
+            bias,
+            scale,
+            shift,
+            self.norm_type,
+            self.eps,
+        )
+
 
 class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
     norm_type = "layer"
@@ -864,6 +924,25 @@ class _NormScaleShift(CustomOp):
             return modulated.to(x.dtype)
 
         return (normalized * (1 + scale) + shift).to(x.dtype)
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = getattr(self.norm, "weight", None)
+        bias = getattr(self.norm, "bias", None)
+
+        return torch.ops.sgl_kernel.fused_norm_scale_shift_cpu(
+            x,
+            weight,
+            bias,
+            scale,
+            shift,
+            self.norm_type,
+            self.eps,
+        )
 
 
 class LayerNormScaleShift(_NormScaleShift):

@@ -394,5 +394,129 @@ class TestFusedQKGemmaRMSNorm:
         )
 
 
+class TestFusedScaleShiftKernels:
+    @staticmethod
+    def rmsnorm_ref(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        x_fp32 = x.float()
+        variance = x_fp32.square().mean(
+            dim=-1,
+            keepdim=True,
+        )
+        return x_fp32 * torch.rsqrt(variance + eps) * weight.float()
+
+    def test_fused_scale_shift(self):
+        B, S, D = 2, 4, 67
+        dtype = torch.bfloat16
+
+        x = torch.randn(B, S, D, dtype=dtype)
+        scale = torch.randn(B, 1, D, dtype=dtype)
+        shift = torch.randn(B, S, D, dtype=dtype)
+
+        out = torch.ops.sgl_kernel.fused_scale_shift_cpu(
+            x,
+            scale,
+            shift,
+            1.0,
+        )
+
+        ref = (x.float() * (1.0 + scale.float()) + shift.float()).to(dtype)
+
+        torch.testing.assert_close(
+            out,
+            ref,
+            atol=precision[dtype],
+            rtol=precision[dtype],
+        )
+
+    def test_fused_norm_scale_shift(self):
+        B, S, D = 2, 4, 67
+        dtype = torch.bfloat16
+
+        x = torch.randn(B, S, D, dtype=dtype)
+        weight = torch.randn(D, dtype=dtype)
+        scale = torch.randn(B, 1, D, dtype=dtype)
+        shift = torch.randn(B, S, D, dtype=dtype)
+
+        out = torch.ops.sgl_kernel.fused_norm_scale_shift_cpu(
+            x,
+            weight,
+            None,
+            scale,
+            shift,
+            "rms",
+            eps,
+        )
+
+        normalized = self.rmsnorm_ref(
+            x,
+            weight,
+            eps,
+        )
+
+        ref = (normalized * (1.0 + scale.float()) + shift.float()).to(dtype)
+
+        torch.testing.assert_close(
+            out,
+            ref,
+            atol=precision[dtype],
+            rtol=precision[dtype],
+        )
+
+    def test_fused_scale_residual_norm_scale_shift(self):
+        B, S, D = 2, 4, 67
+        dtype = torch.bfloat16
+
+        x = torch.randn(B, S, D, dtype=dtype)
+        residual = torch.randn(B, S, D, dtype=dtype)
+        gate = torch.randn(D, dtype=dtype)
+        weight = torch.randn(D, dtype=dtype)
+        scale = torch.randn(B, 1, D, dtype=dtype)
+        shift = torch.randn(B, S, D, dtype=dtype)
+
+        out, residual_out = (
+            torch.ops.sgl_kernel.fused_scale_residual_norm_scale_shift_cpu(
+                residual,
+                x,
+                gate,
+                weight,
+                None,
+                scale,
+                shift,
+                "rms",
+                eps,
+            )
+        )
+
+        residual_fp32 = residual.float() + x.float() * gate.float()
+
+        ref_residual = residual_fp32.to(dtype)
+
+        normalized = self.rmsnorm_ref(
+            residual_fp32,
+            weight,
+            eps,
+        )
+
+        ref_out = (normalized * (1.0 + scale.float()) + shift.float()).to(dtype)
+
+        torch.testing.assert_close(
+            residual_out,
+            ref_residual,
+            atol=precision[dtype],
+            rtol=precision[dtype],
+        )
+
+        torch.testing.assert_close(
+            out,
+            ref_out,
+            atol=precision[dtype],
+            rtol=precision[dtype],
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

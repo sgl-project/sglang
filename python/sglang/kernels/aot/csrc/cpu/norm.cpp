@@ -148,6 +148,27 @@ struct NormTraits<NormMode::RMSNormGated> : NormTraitsBase {
 #endif
 };
 
+template <typename scale_t, typename shift_t>
+inline void apply_scale_shift_vec(
+    at::vec::Vectorized<float>& x0,
+    at::vec::Vectorized<float>& x1,
+    const scale_t* __restrict__ scale,
+    const shift_t* __restrict__ shift,
+    int64_t scale_stride_c,
+    int64_t shift_stride_c,
+    int64_t c,
+    float scale_constant = 1.0f);
+
+template <typename scale_t, typename shift_t>
+inline float apply_scale_shift_scalar(
+    float x,
+    const scale_t* __restrict__ scale,
+    const shift_t* __restrict__ shift,
+    int64_t scale_stride_c,
+    int64_t shift_stride_c,
+    int64_t c,
+    float scale_constant = 1.0f);
+
 template <NormMode M, typename scalar_t, int D>
 struct NormReduce;
 
@@ -239,31 +260,55 @@ struct NormReduce<M, at::BFloat16, D> {
 };
 #endif
 
-template <NormMode M, typename scalar_t, bool has_residual>
+template <NormMode M, typename scalar_t, bool has_residual, bool has_scale_shift = false, typename param_t = scalar_t>
 struct NormReduceGeneric {
   static inline void apply(
       scalar_t* __restrict__ out,
       const scalar_t* __restrict__ input,
-      const scalar_t* __restrict__ gate,
+      const scalar_t* __restrict__ norm_gate,
       scalar_t* __restrict__ residual,
       const NormParams& params,
-      int D) {
+      int D,
+      const param_t* __restrict__ scale = nullptr,
+      const param_t* __restrict__ shift = nullptr,
+      int64_t scale_stride_c = 0,
+      int64_t shift_stride_c = 0,
+      const param_t* __restrict__ residual_gate = nullptr,
+      int64_t residual_gate_stride_c = 0,
+      scalar_t* __restrict__ residual_output = nullptr) {
+    scalar_t* __restrict__ residual_store = nullptr;
+    if constexpr (has_residual) {
+      residual_store = residual_output != nullptr ? residual_output : residual;
+    }
     using bVec = at::vec::Vectorized<scalar_t>;
     using fVec = at::vec::Vectorized<float>;
     constexpr int kVecSize = bVec::size();
 
     const bool use_bias = params.bias != nullptr;
+    const bool use_weight = params.weight != nullptr;
     fVec sum_fvec{0.f}, sum2_fvec{0.f};
     float sum_val{0.f}, sum2_val{0.f};
-
-    int d;
+    int64_t d;
 #pragma GCC unroll 4
     for (d = 0; d <= D - kVecSize; d += kVecSize) {
       auto [x_fvec0, x_fvec1] = load_float_vec2(input + d);
       if constexpr (has_residual) {
-        auto [r_fvec0, r_fvec1] = load_float_vec2(residual + d);
-        x_fvec0 += r_fvec0;
-        x_fvec1 += r_fvec1;
+        if (residual_gate != nullptr) {
+          apply_scale_shift_vec(
+              x_fvec0,
+              x_fvec1,
+              residual_gate,
+              residual,
+              residual_gate_stride_c,
+              /*shift_stride_c=*/1,
+              d,
+              /*scale_constant=*/0.0f);
+        } else {
+          // gate=None means gate=1.
+          auto [r_fvec0, r_fvec1] = load_float_vec2(residual + d);
+          x_fvec0 += r_fvec0;
+          x_fvec1 += r_fvec1;
+        }
       }
       sum2_fvec += x_fvec0 * x_fvec0;
       sum2_fvec += x_fvec1 * x_fvec1;
@@ -276,7 +321,18 @@ struct NormReduceGeneric {
     for (; d < D; ++d) {
       float x_val = static_cast<float>(input[d]);
       if constexpr (has_residual) {
-        x_val += static_cast<float>(residual[d]);
+        if (residual_gate != nullptr) {
+          x_val = apply_scale_shift_scalar(
+              x_val,
+              residual_gate,
+              residual,
+              residual_gate_stride_c,
+              /*shift_stride_c=*/1,
+              d,
+              /*scale_constant=*/0.0f);
+        } else {
+          x_val += static_cast<float>(residual[d]);
+        }
       }
       sum2_val += x_val * x_val;
       if constexpr (NormTraits<M>::has_mean) {
@@ -302,10 +358,24 @@ struct NormReduceGeneric {
     for (d = 0; d <= D - kVecSize; d += kVecSize) {
       auto [x_fvec0, x_fvec1] = load_float_vec2(input + d);
       if constexpr (has_residual) {
-        auto [r_fvec0, r_fvec1] = load_float_vec2(residual + d);
-        x_fvec0 += r_fvec0;
-        x_fvec1 += r_fvec1;
-        convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(residual + d);
+        if (residual_gate != nullptr) {
+          apply_scale_shift_vec(
+              x_fvec0,
+              x_fvec1,
+              residual_gate,
+              residual,
+              residual_gate_stride_c,
+              /*shift_stride_c=*/1,
+              d,
+              /*scale_constant=*/0.0f);
+        } else {
+          auto [r_fvec0, r_fvec1] = load_float_vec2(residual + d);
+
+          x_fvec0 += r_fvec0;
+          x_fvec1 += r_fvec1;
+        }
+        // Write residual + gate * x to the second output.
+        convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(residual_store + d);
       }
       if constexpr (NormTraits<M>::has_mean) {
         x_fvec0 = x_fvec0 - mean_fvec;
@@ -314,13 +384,15 @@ struct NormReduceGeneric {
       x_fvec0 = x_fvec0 * scale_fvec;
       x_fvec1 = x_fvec1 * scale_fvec;
       if constexpr (NormTraits<M>::has_weight) {
-        auto [w_fvec0, w_fvec1] = load_float_vec2(static_cast<const scalar_t*>(params.weight) + d);
-        if constexpr (NormTraits<M>::has_shift) {
-          w_fvec0 = NormTraits<M>::apply_shift(w_fvec0, shift_fvec);
-          w_fvec1 = NormTraits<M>::apply_shift(w_fvec1, shift_fvec);
+        if (use_weight) {
+          auto [w_fvec0, w_fvec1] = load_float_vec2(static_cast<const scalar_t*>(params.weight) + d);
+          if constexpr (NormTraits<M>::has_shift) {
+            w_fvec0 = NormTraits<M>::apply_shift(w_fvec0, shift_fvec);
+            w_fvec1 = NormTraits<M>::apply_shift(w_fvec1, shift_fvec);
+          }
+          x_fvec0 = NormTraits<M>::apply_weight(x_fvec0, w_fvec0);
+          x_fvec1 = NormTraits<M>::apply_weight(x_fvec1, w_fvec1);
         }
-        x_fvec0 = NormTraits<M>::apply_weight(x_fvec0, w_fvec0);
-        x_fvec1 = NormTraits<M>::apply_weight(x_fvec1, w_fvec1);
       }
       if constexpr (NormTraits<M>::has_bias) {
         if (use_bias) {
@@ -330,9 +402,12 @@ struct NormReduceGeneric {
         }
       }
       if constexpr (NormTraits<M>::has_gate) {
-        auto [g_fvec0, g_fvec1] = load_float_vec2(static_cast<const scalar_t*>(gate) + d);
+        auto [g_fvec0, g_fvec1] = load_float_vec2(static_cast<const scalar_t*>(norm_gate) + d);
         x_fvec0 = NormTraits<M>::apply_gate(x_fvec0, g_fvec0);
         x_fvec1 = NormTraits<M>::apply_gate(x_fvec1, g_fvec1);
+      }
+      if constexpr (has_scale_shift) {
+        apply_scale_shift_vec(x_fvec0, x_fvec1, scale, shift, scale_stride_c, shift_stride_c, d);
       }
       bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
       out_bvec.store(out + d);
@@ -341,19 +416,32 @@ struct NormReduceGeneric {
     for (; d < D; ++d) {
       float x_val = static_cast<float>(input[d]);
       if constexpr (has_residual) {
-        x_val += static_cast<float>(residual[d]);
-        residual[d] = static_cast<scalar_t>(x_val);
+        if (residual_gate != nullptr) {
+          x_val = apply_scale_shift_scalar(
+              x_val,
+              residual_gate,
+              residual,
+              residual_gate_stride_c,
+              /*shift_stride_c=*/1,
+              d,
+              /*scale_constant=*/0.0f);
+        } else {
+          x_val += static_cast<float>(residual[d]);
+        }
+        residual_store[d] = static_cast<scalar_t>(x_val);
       }
       if constexpr (NormTraits<M>::has_mean) {
         x_val -= mean;
       }
       x_val *= rsqrt_var;
       if constexpr (NormTraits<M>::has_weight) {
-        float w_val = static_cast<float>(static_cast<const scalar_t*>(params.weight)[d]);
-        if constexpr (NormTraits<M>::has_shift) {
-          w_val = NormTraits<M>::apply_shift(w_val, params.shift);
+        if (use_weight) {
+          float w_val = static_cast<float>(static_cast<const scalar_t*>(params.weight)[d]);
+          if constexpr (NormTraits<M>::has_shift) {
+            w_val = NormTraits<M>::apply_shift(w_val, params.shift);
+          }
+          x_val = NormTraits<M>::apply_weight(x_val, w_val);
         }
-        x_val = NormTraits<M>::apply_weight(x_val, w_val);
       }
       if constexpr (NormTraits<M>::has_bias) {
         if (use_bias) {
@@ -362,8 +450,11 @@ struct NormReduceGeneric {
         }
       }
       if constexpr (NormTraits<M>::has_gate) {
-        float g_val = static_cast<float>(static_cast<const scalar_t*>(gate)[d]);
+        float g_val = static_cast<float>(static_cast<const scalar_t*>(norm_gate)[d]);
         x_val = NormTraits<M>::apply_gate(x_val, g_val);
+      }
+      if constexpr (has_scale_shift) {
+        x_val = apply_scale_shift_scalar(x_val, scale, shift, scale_stride_c, shift_stride_c, d);
       }
       out[d] = static_cast<scalar_t>(x_val);
     }
@@ -466,9 +557,305 @@ void fused_qk_norm4d_kernel_impl(
     }
   });
 }
+struct ScaleShiftBroadcastParams {
+  // Normal 1D/2D/3D broadcast:
+  //   offset = b * stride_b + l * stride_l + c * stride_c
+  //
+  // Frame-based 4D broadcast:
+  //   tensor shape [B, F, 1, C]
+  //   offset = b * stride_b
+  //          + (l / frame_seqlen) * stride_f
+  //          + c * stride_c
 
+  int64_t stride_b{0};
+  int64_t stride_l{0};
+  int64_t stride_c{0};
+
+  int64_t stride_f{0};
+  int64_t frame_seqlen{1};
+  bool frame_broadcast{false};
+
+  inline int64_t row_offset(int64_t b, int64_t l) const {
+    if (frame_broadcast) {
+      return b * stride_b + (l / frame_seqlen) * stride_f;
+    }
+    return b * stride_b + l * stride_l;
+  }
+};
+
+template <NormMode M, typename scalar_t, typename param_t>
+void fused_norm_scale_shift_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const param_t* __restrict__ scale,
+    const param_t* __restrict__ shift,
+    const NormParams& p,
+    const ScaleShiftBroadcastParams& scale_params,
+    const ScaleShiftBroadcastParams& shift_params) {
+  // This kernel only supports logical [B, S, D].
+  TORCH_INTERNAL_ASSERT(p.H == 1);
+
+  const int64_t B = p.B;
+  const int64_t S = p.T;
+  const int64_t D = p.D;
+  const int64_t num_rows = B * S;
+
+  at::parallel_for(0, num_rows, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      const int64_t b = row / S;
+      const int64_t s = row % S;
+
+      const int64_t input_offset = p.input_offset(
+          b,
+          /*h=*/0,
+          s);
+
+      // out is newly allocated and contiguous.
+      const int64_t output_offset = row * D;
+
+      const param_t* __restrict__ scale_ptr = scale + scale_params.row_offset(b, s);
+
+      const param_t* __restrict__ shift_ptr = shift + shift_params.row_offset(b, s);
+
+      NormReduceGeneric<M, scalar_t, false, true, param_t>::apply(
+          out + output_offset,
+          input + input_offset,
+          /*norm_gate=*/nullptr,
+          /*residual=*/nullptr,
+          p,
+          D,
+          scale_ptr,
+          shift_ptr,
+          scale_params.stride_c,
+          shift_params.stride_c);
+    }
+  });
+}
+
+template <NormMode M, typename scalar_t, typename param_t>
+void fused_scale_residual_norm_scale_shift_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ residual_output,
+    const scalar_t* __restrict__ residual,
+    const scalar_t* __restrict__ input,
+    const param_t* __restrict__ gate,
+    const param_t* __restrict__ scale,
+    const param_t* __restrict__ shift,
+    int64_t residual_stride_b,
+    int64_t residual_stride_s,
+    const NormParams& p,
+    const ScaleShiftBroadcastParams& gate_params,
+    const ScaleShiftBroadcastParams& scale_params,
+    const ScaleShiftBroadcastParams& shift_params) {
+  const int64_t B = p.B;
+  const int64_t S = p.T;
+  const int64_t D = p.D;
+  const int64_t num_rows = B * S;
+
+  at::parallel_for(0, num_rows, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      const int64_t b = row / S;
+      const int64_t s = row % S;
+      const scalar_t* __restrict__ input_ptr = input + p.input_offset(b, 0, s);
+      scalar_t* __restrict__ residual_ptr =
+          const_cast<scalar_t*>(residual + b * residual_stride_b + s * residual_stride_s);
+      scalar_t* __restrict__ residual_output_ptr = residual_output + row * D;
+      scalar_t* __restrict__ output_ptr = output + row * D;
+
+      const param_t* __restrict__ gate_ptr = gate == nullptr ? nullptr : gate + gate_params.row_offset(b, s);
+
+      const param_t* __restrict__ scale_ptr = scale + scale_params.row_offset(b, s);
+
+      const param_t* __restrict__ shift_ptr = shift + shift_params.row_offset(b, s);
+
+      NormReduceGeneric<M, scalar_t, true, true, param_t>::apply(
+          output_ptr,
+          input_ptr,
+          /*norm_gate=*/nullptr,
+          residual_ptr,
+          p,
+          D,
+          scale_ptr,
+          shift_ptr,
+          scale_params.stride_c,
+          shift_params.stride_c,
+          gate_ptr,
+          gate_params.stride_c,
+          residual_output_ptr);
+    }
+  });
+}
 #undef LAUNCH_PARALLEL_LOOP
 #undef LAUNCH_PARALLEL_LOOP_HD
+ScaleShiftBroadcastParams make_scale_shift_broadcast_params(
+    const at::Tensor& tensor, int64_t batch_size, int64_t seq_len, int64_t hidden_size, const char* tensor_name) {
+  ScaleShiftBroadcastParams params;
+
+  // Scalar, regardless of whether its shape is [], [1], [1, 1], etc.
+  if (tensor.numel() == 1) {
+    return params;
+  }
+
+  TORCH_CHECK(
+      tensor.dim() >= 1 && tensor.dim() <= 4,
+      tensor_name,
+      " must be a scalar or a 1D/2D/3D/4D tensor, got ",
+      tensor.dim(),
+      "D.");
+
+  switch (tensor.dim()) {
+    case 1: {
+      // [C] or [1]
+      params.stride_c = tensor.size(0) == 1 ? 0 : tensor.stride(0);
+      break;
+    }
+
+    case 2: {
+      // [B, C], [1, C], [B, 1], [1, 1]
+      params.stride_b = tensor.size(0) == 1 ? 0 : tensor.stride(0);
+      params.stride_c = tensor.size(1) == 1 ? 0 : tensor.stride(1);
+      break;
+    }
+
+    case 3: {
+      // Broadcastable to [B, L, C]
+      params.stride_b = tensor.size(0) == 1 ? 0 : tensor.stride(0);
+      params.stride_l = tensor.size(1) == 1 ? 0 : tensor.stride(1);
+      params.stride_c = tensor.size(2) == 1 ? 0 : tensor.stride(2);
+      break;
+    }
+
+    case 4: {
+      // [B, F, 1, C], used by frame-based diffusion models.
+      const int64_t num_frames = tensor.size(1);
+      TORCH_CHECK(
+          seq_len % num_frames == 0,
+          tensor_name,
+          " frame dimension must divide sequence length, got seq_len=",
+          seq_len,
+          " and frames=",
+          num_frames,
+          ".");
+      params.frame_broadcast = true;
+      params.frame_seqlen = seq_len / num_frames;
+      params.stride_b = tensor.size(0) == 1 ? 0 : tensor.stride(0);
+      params.stride_f = tensor.stride(1);
+      params.stride_c = tensor.size(3) == 1 ? 0 : tensor.stride(3);
+      break;
+    }
+
+    default:
+      TORCH_INTERNAL_ASSERT(false);
+  }
+  TORCH_CHECK(
+      params.stride_c == 0 || params.stride_c == 1,
+      tensor_name,
+      " hidden dimension must be contiguous or broadcast, got stride ",
+      params.stride_c);
+  return params;
+}
+template <typename scale_t, typename shift_t>
+inline void apply_scale_shift_vec(
+    at::vec::Vectorized<float>& x0,
+    at::vec::Vectorized<float>& x1,
+    const scale_t* __restrict__ scale,
+    const shift_t* __restrict__ shift,
+    int64_t scale_stride_c,
+    int64_t shift_stride_c,
+    int64_t c,
+    float scale_constant) {
+  using fVec = at::vec::Vectorized<float>;
+  const fVec scale_constant_vec(scale_constant);
+  fVec scale0;
+  fVec scale1;
+
+  if (scale_stride_c == 0) {
+    const fVec scale_vec(static_cast<float>(scale[0]));
+    scale0 = scale_vec;
+    scale1 = scale_vec;
+  } else {
+    std::tie(scale0, scale1) = load_float_vec2(scale + c);
+  }
+
+  fVec shift0;
+  fVec shift1;
+
+  if (shift_stride_c == 0) {
+    const fVec shift_vec(static_cast<float>(shift[0]));
+    shift0 = shift_vec;
+    shift1 = shift_vec;
+  } else {
+    std::tie(shift0, shift1) = load_float_vec2(shift + c);
+  }
+  x0 = x0 * (scale_constant_vec + scale0) + shift0;
+  x1 = x1 * (scale_constant_vec + scale1) + shift1;
+}
+
+template <typename scale_t, typename shift_t>
+inline float apply_scale_shift_scalar(
+    float x,
+    const scale_t* __restrict__ scale,
+    const shift_t* __restrict__ shift,
+    int64_t scale_stride_c,
+    int64_t shift_stride_c,
+    int64_t c,
+    float scale_constant) {
+  const float scale_value = static_cast<float>(scale[c * scale_stride_c]);
+  const float shift_value = static_cast<float>(shift[c * shift_stride_c]);
+  return x * (scale_constant + scale_value) + shift_value;
+}
+
+template <typename scalar_t, typename param_t>
+void fused_scale_shift_kernel_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const param_t* __restrict__ scale,
+    const param_t* __restrict__ shift,
+    int64_t batch_size,
+    int64_t seq_len,
+    int64_t hidden_size,
+    int64_t input_stride_b,
+    int64_t input_stride_l,
+    const ScaleShiftBroadcastParams& scale_params,
+    const ScaleShiftBroadcastParams& shift_params,
+    float scale_constant) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+
+  constexpr int64_t kVecSize = bVec::size();
+
+  const int64_t num_rows = batch_size * seq_len;
+
+  at::parallel_for(0, num_rows, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      const int64_t b = row / seq_len;
+      const int64_t l = row % seq_len;
+      const scalar_t* __restrict__ input_ptr = input + b * input_stride_b + l * input_stride_l;
+
+      const param_t* __restrict__ scale_ptr = scale + scale_params.row_offset(b, l);
+
+      const param_t* __restrict__ shift_ptr = shift + shift_params.row_offset(b, l);
+
+      // output is newly allocated and contiguous.
+      scalar_t* __restrict__ output_ptr = output + row * hidden_size;
+
+      int64_t d = 0;
+#pragma GCC unroll 4
+      for (; d <= hidden_size - kVecSize; d += kVecSize) {
+        auto [x0, x1] = load_float_vec2(input_ptr + d);
+        apply_scale_shift_vec(
+            x0, x1, scale_ptr, shift_ptr, scale_params.stride_c, shift_params.stride_c, d, scale_constant);
+        convert_from_float_ext<scalar_t>(x0, x1).store(output_ptr + d);
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        const float x = static_cast<float>(input_ptr[d]);
+        const float result = apply_scale_shift_scalar(
+            x, scale_ptr, shift_ptr, scale_params.stride_c, shift_params.stride_c, d, scale_constant);
+        output_ptr[d] = static_cast<scalar_t>(result);
+      }
+    }
+  });
+}
 }  // anonymous namespace
 
 template <int... Dims>
@@ -491,6 +878,217 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
     norm4d_kernel_impl<NormMode::L2Norm, scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), p);
   });
   return output;
+}
+
+at::Tensor fused_scale_shift_cpu(
+    const at::Tensor& input, const at::Tensor& scale, const at::Tensor& shift, double scale_constant) {
+  CHECK_INPUT_ND<3>(input);
+  const auto dtype = input.scalar_type();
+  TORCH_CHECK(scale.scalar_type() == shift.scalar_type(), "scale dtype must match shift dtype.");
+  const int64_t batch_size = input.size(0);
+  const int64_t seq_len = input.size(1);
+  const int64_t hidden_size = input.size(2);
+
+  at::Tensor output = at::empty(input.sizes(), input.options());
+
+  if (input.numel() == 0) {
+    return output;
+  }
+
+  const auto scale_params = make_scale_shift_broadcast_params(scale, batch_size, seq_len, hidden_size, "scale");
+
+  const auto shift_params = make_scale_shift_broadcast_params(shift, batch_size, seq_len, hidden_size, "shift");
+
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(dtype, scale.scalar_type(), "fused_scale_shift_cpu", [&] {
+    fused_scale_shift_kernel_impl<scalar_t, param_t>(
+        output.data_ptr<scalar_t>(),
+        input.data_ptr<scalar_t>(),
+        scale.data_ptr<param_t>(),
+        shift.data_ptr<param_t>(),
+        batch_size,
+        seq_len,
+        hidden_size,
+        input.stride(0),
+        input.stride(1),
+        scale_params,
+        shift_params,
+        static_cast<float>(scale_constant));
+  });
+
+  return output;
+}
+at::Tensor fused_norm_scale_shift_cpu(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& bias,
+    const at::Tensor& scale,
+    const at::Tensor& shift,
+    const std::string& norm_type,
+    double eps) {
+  CHECK_INPUT_ND<3>(input);
+  const auto st = input.scalar_type();
+
+  TORCH_CHECK(
+      norm_type == "rms" || norm_type == "layer", "norm_type must be \"rms\" or \"layer\", got ", norm_type, ".");
+
+  TORCH_CHECK(scale.scalar_type() == shift.scalar_type(), "scale dtype must match shift dtype.");
+
+  const int64_t B = input.size(0);
+  const int64_t S = input.size(1);
+  const int64_t D = input.size(2);
+
+  if (weight.has_value()) {
+    CHECK_INPUT_SHAPE_DTYPE<false>(weight.value(), {D}, st);
+  }
+
+  if (bias.has_value()) {
+    TORCH_CHECK(norm_type == "layer", "bias is only supported for LayerNorm.");
+    CHECK_INPUT_SHAPE_DTYPE<false>(bias.value(), {D}, st);
+  }
+
+  const auto scale_params = make_scale_shift_broadcast_params(scale, B, S, D, "scale");
+  const auto shift_params = make_scale_shift_broadcast_params(shift, B, S, D, "shift");
+
+  NormParams p{input, static_cast<float>(eps)};
+
+  p.weight = weight.has_value() ? weight.value().data_ptr() : nullptr;
+
+  p.bias = bias.has_value() ? bias.value().data_ptr() : nullptr;
+
+  at::Tensor output = at::empty(input.sizes(), input.options());
+
+  if (input.numel() == 0) {
+    return output;
+  }
+
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(st, scale.scalar_type(), "fused_norm_scale_shift_cpu", [&] {
+    if (norm_type == "rms") {
+      fused_norm_scale_shift_kernel_impl<NormMode::RMSNorm, scalar_t, param_t>(
+          output.data_ptr<scalar_t>(),
+          input.data_ptr<scalar_t>(),
+          scale.data_ptr<param_t>(),
+          shift.data_ptr<param_t>(),
+          p,
+          scale_params,
+          shift_params);
+    } else {
+      fused_norm_scale_shift_kernel_impl<NormMode::LayerNorm, scalar_t, param_t>(
+          output.data_ptr<scalar_t>(),
+          input.data_ptr<scalar_t>(),
+          scale.data_ptr<param_t>(),
+          shift.data_ptr<param_t>(),
+          p,
+          scale_params,
+          shift_params);
+    }
+  });
+
+  return output;
+}
+std::tuple<at::Tensor, at::Tensor> fused_scale_residual_norm_scale_shift_cpu(
+    const at::Tensor& residual,
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& gate,
+    const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& bias,
+    const at::Tensor& scale,
+    const at::Tensor& shift,
+    const std::string& norm_type,
+    double eps) {
+  CHECK_INPUT_ND<3>(input);
+  CHECK_INPUT_ND<3>(residual);
+
+  const auto st = input.scalar_type();
+
+  TORCH_CHECK(
+      residual.sizes() == input.sizes(),
+      "residual shape must match input shape, got ",
+      residual.sizes(),
+      " and ",
+      input.sizes(),
+      ".");
+
+  TORCH_CHECK(residual.scalar_type() == st, "residual dtype must match input dtype.");
+
+  TORCH_CHECK(
+      norm_type == "rms" || norm_type == "layer", "norm_type must be \"rms\" or \"layer\", got ", norm_type, ".");
+
+  const int64_t B = input.size(0);
+  const int64_t S = input.size(1);
+  const int64_t D = input.size(2);
+
+  TORCH_CHECK(scale.scalar_type() == shift.scalar_type(), "scale dtype must match shift dtype.");
+
+  if (weight.has_value()) {
+    CHECK_INPUT_SHAPE_DTYPE<false>(weight.value(), {D}, st);
+  }
+
+  if (bias.has_value()) {
+    TORCH_CHECK(norm_type == "layer", "bias is only supported for LayerNorm.");
+    CHECK_INPUT_SHAPE_DTYPE<false>(bias.value(), {D}, st);
+  }
+
+  const ScaleShiftBroadcastParams scale_params = make_scale_shift_broadcast_params(scale, B, S, D, "scale");
+  const ScaleShiftBroadcastParams shift_params = make_scale_shift_broadcast_params(shift, B, S, D, "shift");
+  ScaleShiftBroadcastParams gate_params;
+
+  if (gate.has_value()) {
+    TORCH_CHECK(gate->scalar_type() == scale.scalar_type(), "gate dtype must match scale dtype.");
+    gate_params = make_scale_shift_broadcast_params(gate.value(), B, S, D, "gate");
+  }
+  NormParams p{input, static_cast<float>(eps)};
+
+  p.weight = weight.has_value() ? weight.value().data_ptr() : nullptr;
+
+  p.bias = bias.has_value() ? bias.value().data_ptr() : nullptr;
+
+  at::Tensor output = at::empty(input.sizes(), input.options());
+
+  at::Tensor residual_output = at::empty(input.sizes(), input.options());
+
+  if (input.numel() == 0) {
+    return {
+        output,
+        residual_output,
+    };
+  }
+
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(st, scale.scalar_type(), "fused_scale_residual_norm_scale_shift_cpu", [&] {
+    const param_t* gate_ptr = gate.has_value() ? gate->data_ptr<param_t>() : nullptr;
+    if (norm_type == "rms") {
+      fused_scale_residual_norm_scale_shift_kernel_impl<NormMode::RMSNorm, scalar_t, param_t>(
+          output.data_ptr<scalar_t>(),
+          residual_output.data_ptr<scalar_t>(),
+          residual.data_ptr<scalar_t>(),
+          input.data_ptr<scalar_t>(),
+          gate_ptr,
+          scale.data_ptr<param_t>(),
+          shift.data_ptr<param_t>(),
+          residual.stride(0),
+          residual.stride(1),
+          p,
+          gate_params,
+          scale_params,
+          shift_params);
+    } else {
+      fused_scale_residual_norm_scale_shift_kernel_impl<NormMode::LayerNorm, scalar_t, param_t>(
+          output.data_ptr<scalar_t>(),
+          residual_output.data_ptr<scalar_t>(),
+          residual.data_ptr<scalar_t>(),
+          input.data_ptr<scalar_t>(),
+          gate_ptr,
+          scale.data_ptr<param_t>(),
+          shift.data_ptr<param_t>(),
+          residual.stride(0),
+          residual.stride(1),
+          p,
+          gate_params,
+          scale_params,
+          shift_params);
+    }
+  });
+
+  return {output, residual_output};
 }
 
 // input : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
