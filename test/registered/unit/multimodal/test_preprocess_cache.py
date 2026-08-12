@@ -258,6 +258,26 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_cancelled_reservation_waiter_does_not_cancel_owner(self):
+        async def run():
+            cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
+            owner = cache.reserve_many(["key"])[0]
+            joiner = cache.reserve_many(["key"])[0]
+            self.assertTrue(owner.owner)
+            self.assertFalse(joiner.owner)
+
+            waiter = asyncio.create_task(cache.wait(joiner))
+            await asyncio.sleep(0)
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+
+            cache.fulfill(owner, b"artifact")
+            self.assertEqual(owner.future.result(), b"artifact")
+            self.assertEqual(cache.get("key"), b"artifact")
+
+        asyncio.run(run())
+
     def test_disabled_cache_does_not_join_or_retain(self):
         async def run():
             cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=0)
