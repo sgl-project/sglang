@@ -11,6 +11,7 @@ on:
   schedule:
     - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
   pull_request:
+    branches: [main, ep_main]
   workflow_dispatch:
     inputs:
       force_continue_on_error:

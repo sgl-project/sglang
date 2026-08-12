@@ -35,6 +35,9 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
         image_repo: str = "lmsysorg/sglang",
         version: str = "0.6.0",
         build_commit: str = "abcdef1234567890",
+        build_tree: str = "tree1234567890abcdef",
+        python_manifest_sha256: str = "manifest1234567890abcdef",
+        build_source: str = "https://github.com/bytedance-iaas/sglang",
         build_url: str = "https://github.com/sgl-project/sglang/actions/runs/1",
         date: str = "20260429",
     ) -> list[str]:
@@ -52,6 +55,12 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
                 version,
                 "--build-commit",
                 build_commit,
+                "--build-tree",
+                build_tree,
+                "--python-manifest-sha256",
+                python_manifest_sha256,
+                "--build-source",
+                build_source,
                 "--build-url",
                 build_url,
                 "--date",
@@ -87,6 +96,9 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
             self.build_args(args),
             {
                 "SGLANG_BUILD_COMMIT": "abcdef1234567890",
+                "SGLANG_BUILD_TREE": "tree1234567890abcdef",
+                "SGLANG_PYTHON_MANIFEST_SHA256": "manifest1234567890abcdef",
+                "SGLANG_BUILD_SOURCE": "https://github.com/bytedance-iaas/sglang",
                 "SGLANG_BUILD_URL": (
                     "https://github.com/sgl-project/sglang/actions/runs/1"
                 ),
@@ -174,16 +186,24 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
         for stage in (framework_stage, runtime_stage):
             for expected in (
                 "ARG SGLANG_BUILD_COMMIT=unknown",
+                "ARG SGLANG_BUILD_TREE=unknown",
+                "ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown",
+                "ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang",
                 "ARG SGLANG_BUILD_URL=",
                 "ARG SGLANG_IMAGE_TAG=local/sglang:dev",
                 "SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown}",
+                "SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown}",
+                "SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown}",
+                "SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang}",
                 "SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-}",
                 "SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}",
-                'org.opencontainers.image.source="https://github.com/sgl-project/sglang"',
+                'org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}"',
                 'org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}"',
                 'org.opencontainers.image.version="${SGLANG_IMAGE_TAG}"',
                 'org.opencontainers.image.url="${SGLANG_BUILD_URL}"',
                 'ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}"',
+                'ai.sglang.build.tree="${SGLANG_BUILD_TREE}"',
+                'ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}"',
                 'ai.sglang.build.url="${SGLANG_BUILD_URL}"',
                 'ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"',
             ):

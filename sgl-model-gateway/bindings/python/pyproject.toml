@@ -13,7 +13,7 @@ authors = [
     {name = "Byron Hsu", email = "byronhsu1230@gmail.com"}
 ]
 requires-python = ">=3.8"
-readme = "../../README.md"
+readme = "README.md"
 license = { text = "Apache-2.0" }
 classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
@@ -51,7 +51,7 @@ sglang-router = "sglang_router.cli:main"
 [tool.maturin]
 python-source = "src"
 module-name = "sglang_router.sglang_router_rs"
-# Exclude bindings/python/README.md to use root README only
+# Keep the README as package metadata, but do not include it in the wheel payload.
 exclude = ["README.md"]
 
 [tool.pytest.ini_options]

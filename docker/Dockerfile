@@ -48,11 +48,12 @@ fi
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
 # PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget software-properties-common \
+    apt update && apt install -y --no-install-recommends wget curl software-properties-common \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+        -o get-pip.py https://bootstrap.pypa.io/get-pip.py \
     && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
@@ -192,8 +193,11 @@ WORKDIR /sgl-workspace
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal \
+RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+    && rm /tmp/rustup-init.sh \
     && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
@@ -434,12 +438,19 @@ RUN CMAKE_VERSION=3.31.1 \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /tools
+RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/just-install.sh https://just.systems/install.sh \
+    && sed -i "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" /tmp/just-install.sh \
+    && bash /tmp/just-install.sh --tag 1.42.4 --to /tools \
+    && rm /tmp/just-install.sh \
+    && test -x /tools/just
 
 # Install oh-my-zsh and plugins
-RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
+RUN curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/oh-my-zsh-install.sh https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh \
+    && sh /tmp/oh-my-zsh-install.sh "" --unattended \
+    && rm /tmp/oh-my-zsh-install.sh \
     && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
@@ -462,7 +473,11 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y \
+    && rm /tmp/rustup-init.sh \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
@@ -792,16 +807,24 @@ WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_TREE=unknown
+ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown
+ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown} \
+    SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown} \
+    SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+LABEL org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.tree="${SGLANG_BUILD_TREE}" \
+      ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
@@ -887,7 +910,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+        -o get-pip.py https://bootstrap.pypa.io/get-pip.py \
     && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
@@ -962,16 +986,24 @@ WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_TREE=unknown
+ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown
+ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown} \
+    SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown} \
+    SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+LABEL org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.tree="${SGLANG_BUILD_TREE}" \
+      ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 

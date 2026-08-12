@@ -1,0 +1,125 @@
+name: Sync Docker Images to Volcengine CR
+
+on:
+  workflow_dispatch:
+    inputs:
+      sglang_source:
+        description: "Source SGLang image repository without tag"
+        required: false
+        default: "docker.io/lmsysorg/sglang"
+      sglang_tags:
+        description: "Comma or newline separated SGLang tags to sync. Special values: version, today-nightly."
+        required: false
+        default: "version,today-nightly"
+      sglang_repository:
+        description: "Destination SGLang repository inside the Volcengine CR namespace"
+        required: false
+        default: ""
+      vllm_source:
+        description: "Source vLLM image repository without tag"
+        required: false
+        default: "docker.io/vllm/vllm-openai"
+      vllm_tags:
+        description: "Comma or newline separated vLLM tags to sync. Automatic selectors prefer Ubuntu 24.04 tags and fall back to unsuffixed tags when unavailable."
+        required: false
+        default: "version,today-nightly"
+      vllm_repository:
+        description: "Destination vLLM repository inside the Volcengine CR namespace"
+        required: false
+        default: ""
+      platform:
+        description: "Platform to sync from multi-arch source images"
+        required: false
+        default: "linux/amd64"
+  schedule:
+    # UTC+8 17:00, after the usual upstream SGLang and vLLM nightly image builds.
+    - cron: "0 9 * * *"
+
+concurrency:
+  group: sync-docker-images-to-volcengine-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'nightly' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: x64-docker-build-node
+    environment: prod
+    env:
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+      SGLANG_SOURCE: ${{ inputs.sglang_source || 'docker.io/lmsysorg/sglang' }}
+      SGLANG_TAGS: ${{ inputs.sglang_tags || 'version,today-nightly' }}
+      SGLANG_REPOSITORY: ${{ inputs.sglang_repository || vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+      VLLM_SOURCE: ${{ inputs.vllm_source || 'docker.io/vllm/vllm-openai' }}
+      VLLM_TAGS: ${{ inputs.vllm_tags || 'version,today-nightly' }}
+      VLLM_REPOSITORY: ${{ inputs.vllm_repository || vars.VOLCENGINE_CR_VLLM_REPOSITORY || 'vllm' }}
+      SYNC_PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Volcengine CR configuration
+        run: |
+          set -euo pipefail
+          if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ]; then
+            echo "::error::Volcengine CR variables are required: VOLCENGINE_CR_REGISTRY and VOLCENGINE_CR_NAMESPACE"
+            exit 1
+          fi
+          if [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
+            echo "::error::Volcengine CR secrets are required: VOLCENGINE_CR_USERNAME and VOLCENGINE_CR_PASSWORD"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx with local Docker Hub mirror
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
+      - name: Show sync plan
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/sync_docker_images_to_volcengine.py \
+            --registry "${VOLCENGINE_CR_REGISTRY}" \
+            --namespace "${VOLCENGINE_CR_NAMESPACE}" \
+            --sglang-source "${SGLANG_SOURCE}" \
+            --sglang-repository "${SGLANG_REPOSITORY}" \
+            --sglang-tags "${SGLANG_TAGS}" \
+            --vllm-source "${VLLM_SOURCE}" \
+            --vllm-repository "${VLLM_REPOSITORY}" \
+            --vllm-tags "${VLLM_TAGS}" \
+            --platform "${SYNC_PLATFORM}"
+
+      - name: Sync images
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/sync_docker_images_to_volcengine.py \
+            --registry "${VOLCENGINE_CR_REGISTRY}" \
+            --namespace "${VOLCENGINE_CR_NAMESPACE}" \
+            --sglang-source "${SGLANG_SOURCE}" \
+            --sglang-repository "${SGLANG_REPOSITORY}" \
+            --sglang-tags "${SGLANG_TAGS}" \
+            --vllm-source "${VLLM_SOURCE}" \
+            --vllm-repository "${VLLM_REPOSITORY}" \
+            --vllm-tags "${VLLM_TAGS}" \
+            --platform "${SYNC_PLATFORM}" \
+            --execute

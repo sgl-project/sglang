@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       tag:
-        description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
+        description: "Custom tag suffix"
         required: false
         default: ""
       image_repo:
@@ -32,11 +32,25 @@ on:
         description: "Overlay output suffix appended to the base tag. EMPTY = overwrite the base tag(s); non-empty = append (e.g. 'msa')."
         required: false
         default: ""
+      compile_kernel:
+        description: "Build sgl-kernel from source (Volcengine fork only)"
+        required: false
+        type: boolean
+        default: true
+      private_debug_base_only:
+        description: "Volcengine fork only: build and publish exactly one AMD64 CUDA 13 base image, without compiling a kernel wheel or building SBO/W4A8 variants."
+        required: false
+        type: boolean
+        default: false
+      private_debug_verify_image:
+        description: "Volcengine fork only: verify an existing private debug image by immutable digest (repo@sha256:...), without rebuilding it."
+        required: false
+        default: ""
   schedule:
     - cron: "0 0 * * *"
 
 concurrency:
-  group: release-docker-dev-${{ inputs.tag || inputs.pr_number || 'nightly' }}
+  group: release-docker-dev-${{ inputs.private_debug_verify_image != '' && format('verify-{0}', github.run_id) || inputs.tag || inputs.pr_number || 'nightly' }}
   cancel-in-progress: true
 
 jobs:
@@ -81,14 +95,12 @@ jobs:
             SUFFIX="-pr-${{ inputs.pr_number }}"
           fi
 
-          # Build tag config. dev-cu13 / nightly-dev-cu13 are published as
-          # aliases on the cu130 image for backwards compatibility with
-          # consumers pinned to the pre-flip names.
+          # Build tag config. Development images are CUDA 13 only.
           if [ -z "${SUFFIX}" ]; then
             # Nightly: include dated tags
-            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
+            TAG_CONFIG='[{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
           else
-            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
+            TAG_CONFIG="[{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
           fi
           echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
 
@@ -140,7 +152,7 @@ jobs:
 
   build-and-publish:
     needs: prepare
-    if: ${{ !inputs.build_only }}
+    if: ${{ github.repository == 'sgl-project/sglang' && !inputs.build_only }}
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
       docker_target: framework_final
@@ -211,10 +223,10 @@ jobs:
 
   cleanup-nightly:
     needs: build-and-publish
-    if: ${{ !inputs.build_only && !inputs.tag && !inputs.pr_number }}
+    if: ${{ github.repository == 'sgl-project/sglang' && !inputs.build_only && !inputs.tag && !inputs.pr_number }}
     uses: ./.github/workflows/_docker-cleanup-nightly.yml
     with:
-      tag_prefixes: '["nightly-dev", "nightly-dev-cu12", "nightly-dev-cu13"]'
+      tag_prefixes: '["nightly-dev", "nightly-dev-cu13"]'
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
     secrets: inherit
 
@@ -261,3 +273,162 @@ jobs:
             -f Dockerfile.overlay \
             $OUT_ARGS \
             --push .
+
+  build-dev-kernel-wheel:
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_tag: x86-cu13
+            cuda_version: "13.0"
+    uses: ./.github/workflows/release-whl-kernel.yml
+    with:
+      checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+      cuda_version: ${{ matrix.cuda_version }}
+      artifact_name: sgl-kernel-${{ matrix.arch_tag }}
+
+  build-dev:
+    needs: [build-dev-kernel-wheel]
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && always() && (needs.build-dev-kernel-wheel.result == 'success' || needs.build-dev-kernel-wheel.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
+            publish_default_cuda_alias: true
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 0
+            variant_suffix: ""
+            artifact_name: sgl-kernel-x86-cu13
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
+            publish_default_cuda_alias: true
+            hopper_sbo: 1
+            w4a8_per_tensor_transfer: 0
+            variant_suffix: sbo
+            artifact_name: sgl-kernel-x86-cu13
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
+            publish_default_cuda_alias: true
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 1
+            variant_suffix: w4a8
+            artifact_name: sgl-kernel-x86-cu13
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: framework_final
+      checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+      cuda_key: ${{ matrix.cuda_key }}
+      cuda_version: ${{ matrix.cuda_version }}
+      cuda_suffix: ${{ matrix.cuda_suffix }}
+      publish_default_cuda_alias: ${{ matrix.publish_default_cuda_alias }}
+      variant_suffix: ${{ matrix.variant_suffix }}
+      tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
+      use_environment: prod
+      artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      extra_build_args: >-
+        --build-arg BRANCH_TYPE=local
+        --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
+        --build-arg HOPPER_SBO=${{ matrix.hopper_sbo }}
+        --build-arg W4A8_PER_TENSOR_TRANSFER=${{ matrix.w4a8_per_tensor_transfer }}
+        --build-arg HTTP_PROXY=http://100.68.162.211:3128
+        --build-arg HTTPS_PROXY=http://100.68.162.211:3128
+        --build-arg ALL_PROXY=http://100.68.162.211:3128
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
+    secrets: inherit
+
+  build-dev-debug-base:
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && inputs.private_debug_base_only && inputs.private_debug_verify_image == '' }}
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: framework_final
+      checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+      cuda_key: cu130
+      cuda_version: 13.0.1
+      cuda_suffix: cu130
+      publish_default_cuda_alias: false
+      image_tag_override: ${{ format('debug-{0}-{1}-{2}', inputs.tag || 'servingkit', github.run_id, github.run_attempt) }}
+      use_environment: prod
+      extra_build_args: >-
+        --build-arg BRANCH_TYPE=local
+        --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
+        --build-arg HOPPER_SBO=0
+        --build-arg W4A8_PER_TENSOR_TRANSFER=0
+        --build-arg HTTP_PROXY=http://100.68.162.211:3128
+        --build-arg HTTPS_PROXY=http://100.68.162.211:3128
+        --build-arg ALL_PROXY=http://100.68.162.211:3128
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
+    secrets: inherit
+
+  verify-private-debug-image:
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && inputs.private_debug_verify_image != '' }}
+    environment: prod
+    runs-on: x64-docker-build-node
+    env:
+      IMAGE_REF: ${{ inputs.private_debug_verify_image }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+    steps:
+      - name: Checkout verification script
+        uses: actions/checkout@v4
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          REGISTRY_HOST="${IMAGE_REF%%/*}"
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${REGISTRY_HOST}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
+      - name: Verify existing AMD64 image and source provenance
+        run: |
+          set -euo pipefail
+          case "${IMAGE_REF}" in
+            *@sha256:*) ;;
+            *) echo "private_debug_verify_image must be an immutable repo@sha256:... reference" >&2; exit 1 ;;
+          esac
+          docker buildx imagetools inspect "${IMAGE_REF}"
+          docker pull "${IMAGE_REF}"
+
+          python3 - "${IMAGE_REF}" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          inspect = json.loads(
+              subprocess.check_output(["docker", "image", "inspect", sys.argv[1]])
+          )[0]
+          if inspect["Architecture"] != "amd64":
+              raise SystemExit(f"unexpected architecture: {inspect['Architecture']}")
+          labels = inspect["Config"].get("Labels") or {}
+          required = (
+              "ai.sglang.build.commit",
+              "ai.sglang.build.tree",
+              "ai.sglang.build.python-manifest-sha256",
+              "org.opencontainers.image.source",
+          )
+          missing = [key for key in required if not labels.get(key)]
+          if missing:
+              raise SystemExit(f"missing image provenance labels: {missing}")
+          if labels["org.opencontainers.image.source"] != "https://github.com/bytedance-iaas/sglang":
+              raise SystemExit("unexpected image source label")
+          print(json.dumps({"architecture": inspect["Architecture"], **{key: labels[key] for key in required}}))
+          PY
+
+          docker run --rm -i --entrypoint python3 "${IMAGE_REF}" - < scripts/ci/verify_private_image_runtime.py
+          docker run --rm --entrypoint bash "${IMAGE_REF}" -lc '
+            set -euo pipefail
+            command -v oniond
+            python3 -m py_compile scripts/eic_integration_check.py
+            python3 -m pytest -q test/registered/unit/test_runtime_context.py -k TestMoeFlagsGroup
+            python3 -m pytest -q test/registered/unit/test_model_overrides.py -k deepseek_spec_moe_resolution
+          '

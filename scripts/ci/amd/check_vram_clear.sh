@@ -17,7 +17,10 @@ check_vram_clear() {
             echo "✓ VRAM usage is within acceptable limits on all GPUs"
             return 0
         fi
-   fi
+    fi
+
+    echo "ERROR: rocm-smi is not available; cannot verify that VRAM is clear." >&2
+    return 1
 }
 
 # If this script is run directly (not sourced), run the check

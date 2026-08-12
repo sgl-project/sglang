@@ -48,6 +48,9 @@ def build_arg_tokens(
     image_repo: str,
     version: str,
     build_commit: str,
+    build_tree: str,
+    python_manifest_sha256: str,
+    build_source: str,
     build_url: str,
     date: str,
     short_sha: str,
@@ -55,6 +58,9 @@ def build_arg_tokens(
     image_tag = select_tag(tag_config, cuda, version, date, short_sha)
     build_args = {
         "SGLANG_BUILD_COMMIT": build_commit,
+        "SGLANG_BUILD_TREE": build_tree,
+        "SGLANG_PYTHON_MANIFEST_SHA256": python_manifest_sha256,
+        "SGLANG_BUILD_SOURCE": build_source,
         "SGLANG_BUILD_URL": build_url,
         "SGLANG_IMAGE_TAG": f"{image_repo}:{image_tag}",
     }
@@ -77,6 +83,19 @@ def parse_args() -> argparse.Namespace:
         "--build-commit",
         required=True,
         help="Commit checked out for the Docker build.",
+    )
+    parser.add_argument(
+        "--build-tree", required=True, help="Git tree checked out for the Docker build."
+    )
+    parser.add_argument(
+        "--python-manifest-sha256",
+        required=True,
+        help="Deterministic digest of the tracked Python source manifest.",
+    )
+    parser.add_argument(
+        "--build-source",
+        required=True,
+        help="Repository URL for the checked-out source.",
     )
     parser.add_argument("--build-url", default="", help="CI run URL.")
     parser.add_argument(
@@ -103,6 +122,9 @@ def main() -> int:
             image_repo=args.image_repo,
             version=args.sgl_version,
             build_commit=args.build_commit,
+            build_tree=args.build_tree,
+            python_manifest_sha256=args.python_manifest_sha256,
+            build_source=args.build_source,
             build_url=args.build_url,
             date=args.date,
             short_sha=short_sha,

@@ -1,22 +1,23 @@
 name: Release Docker Images
 #
-# Builds and publishes framework Docker images (full development environment):
-#   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest (cuda 13)
-#   - lmsysorg/sglang:v{version}-cu129, lmsysorg/sglang:latest-cu129
+# Builds and publishes framework Docker images to Volcengine CR:
+#   - v{sglang}.byted.{internal_release}.{timestamp} (CUDA 13)
+#   - v{sglang}.byted.{internal_release}.{timestamp}-cu130
+#   - v{sglang}.byted.{internal_release}.{timestamp}-{sbo,w4a8}[-cu130]
 #
 on:
   push:
     tags:
       - "v[0-9]+.*"
+      - "[0-9]+.*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to build (without v prefix, e.g., 0.5.7)"
-        required: true
-      image_repo:
-        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        description: "SGLang version for sgl-project builds; fallback internal version for Byted builds"
         required: false
-        default: "lmsysorg/sglang"
+      internal_version:
+        description: "Byted internal version for Volcengine tags, e.g. 0.0.11"
+        required: false
 
 jobs:
   resolve-version:
@@ -40,6 +41,7 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
   build-and-publish:
+    if: github.repository == 'sgl-project/sglang'
     needs: resolve-version
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
@@ -49,7 +51,108 @@ jobs:
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
       tag_config: |
         [
-          {"cuda": "cu130", "tags": ["v${{ needs.resolve-version.outputs.version }}", "latest", "v${{ needs.resolve-version.outputs.version }}-cu130", "latest-cu130"]},
-          {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}-cu129", "latest-cu129"]}
+          {"cuda": "cu130", "tags": ["v${{ needs.resolve-version.outputs.version }}", "latest", "v${{ needs.resolve-version.outputs.version }}-cu130", "latest-cu130"]}
         ]
+    secrets: inherit
+
+  resolve-volcengine-release:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: ubuntu-22.04
+    outputs:
+      community-version: ${{ steps.release.outputs.community-version }}
+      internal-version: ${{ steps.release.outputs.internal-version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch version tags
+        run: git fetch --force --tags origin
+
+      - name: Resolve Volcengine release versions
+        id: release
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            INTERNAL_VERSION="${{ github.event.inputs.internal_version || github.event.inputs.version }}"
+            RAW_TAG="v${INTERNAL_VERSION}"
+            if ! git rev-parse -q --verify "refs/tags/${RAW_TAG}" >/dev/null; then
+              RAW_TAG="${INTERNAL_VERSION}"
+            fi
+          else
+            RAW_TAG="${GITHUB_REF_NAME}"
+            INTERNAL_VERSION="${RAW_TAG#v}"
+          fi
+
+          if [ -z "${RAW_TAG}" ] || ! git rev-parse -q --verify "refs/tags/${RAW_TAG}" >/dev/null; then
+            echo "::error::Volcengine image publishing requires an existing git tag for the internal version"
+            exit 1
+          fi
+
+          INTERNAL_VERSION="${INTERNAL_VERSION#v}"
+          if [ -z "${INTERNAL_VERSION}" ] || ! echo "${INTERNAL_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)*$'; then
+            echo "::error::Invalid internal version: ${INTERNAL_VERSION} (expected: X.Y.Z, for example 0.0.11)"
+            exit 1
+          fi
+
+          COMMUNITY_VERSION="$(python3 python/tools/get_version_tag.py --tag-only | sed 's/^v//')"
+          if [ -z "${COMMUNITY_VERSION}" ] || ! echo "${COMMUNITY_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid community version resolved from checkout: ${COMMUNITY_VERSION}"
+            exit 1
+          fi
+
+          echo "community-version=${COMMUNITY_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "internal-version=${INTERNAL_VERSION}" >> "$GITHUB_OUTPUT"
+
+  build-and-publish-volcengine:
+    if: github.repository == 'bytedance-iaas/sglang'
+    needs: [resolve-volcengine-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
+            publish_default_cuda_alias: true
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 0
+            variant_suffix: ""
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
+            publish_default_cuda_alias: true
+            hopper_sbo: 1
+            w4a8_per_tensor_transfer: 0
+            variant_suffix: sbo
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
+            publish_default_cuda_alias: true
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 1
+            variant_suffix: w4a8
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: framework_final
+      cuda_key: ${{ matrix.cuda_key }}
+      cuda_version: ${{ matrix.cuda_version }}
+      cuda_suffix: ${{ matrix.cuda_suffix }}
+      publish_default_cuda_alias: ${{ matrix.publish_default_cuda_alias }}
+      variant_suffix: ${{ matrix.variant_suffix }}
+      sgl_version: ${{ needs.resolve-volcengine-release.outputs.community-version }}
+      tag_mode: version
+      tag_value: ${{ needs.resolve-volcengine-release.outputs.internal-version }}
+      use_environment: prod
+      extra_build_args: >-
+        --build-arg HTTP_PROXY=http://100.68.162.211:3128
+        --build-arg HTTPS_PROXY=http://100.68.162.211:3128
+        --build-arg ALL_PROXY=http://100.68.162.211:3128
+        --build-arg HOPPER_SBO=${{ matrix.hopper_sbo }}
+        --build-arg W4A8_PER_TENSOR_TRANSFER=${{ matrix.w4a8_per_tensor_transfer }}
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
     secrets: inherit
