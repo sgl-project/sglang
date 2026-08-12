@@ -809,6 +809,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             return False
         if effort == "none":
             return False
+        return bool(config.default_enabled)
 
     def _make_response_output_items(
         self,
