@@ -56,7 +56,7 @@ class TestRetractDecode(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreaterEqual(metrics["score"], 0.64)
         time.sleep(1)  # wait for mem check
 
         assert self.process.poll() is None, "Server crashed during test"

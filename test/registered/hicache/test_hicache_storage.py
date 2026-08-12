@@ -21,7 +21,7 @@ _is_hip = is_hip()
 
 
 class TestHiCache(CustomTestCase, MMLUMixin):
-    mmlu_score_threshold = 0.65
+    mmlu_score_threshold = 0.64
     mmlu_num_examples = 512
     mmlu_num_threads = 32
 

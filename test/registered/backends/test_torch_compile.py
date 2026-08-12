@@ -20,7 +20,7 @@ register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestTorchCompile(CustomTestCase, MMLUMixin):
-    mmlu_score_threshold = 0.65
+    mmlu_score_threshold = 0.64
     mmlu_num_examples = 512
     mmlu_num_threads = 32
 

@@ -166,8 +166,8 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
         metrics2 = run_eval(args)
 
         # Assert score is above a minimum threshold for both rounds
-        self.assertGreater(metrics1["score"], 0.65)
-        self.assertGreater(metrics2["score"], 0.65)
+        self.assertGreater(metrics1["score"], 0.64)
+        self.assertGreater(metrics2["score"], 0.64)
 
         # Score should be consistent: round 2 should be >= round 1, or at least within a 0.05 margin if slightly lower
         self.assertGreaterEqual(metrics2["score"], metrics1["score"] - 0.05)

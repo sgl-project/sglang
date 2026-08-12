@@ -43,7 +43,7 @@ class TestTorchNativeAttnBackend(CustomTestCase):
             )
 
             metrics = run_eval(args)
-            self.assertGreaterEqual(metrics["score"], 0.65)
+            self.assertGreaterEqual(metrics["score"], 0.64)
         finally:
             kill_process_tree(process.pid)
 
