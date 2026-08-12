@@ -481,16 +481,6 @@ fn chat_event_stream(
         parallel_tool_calls,
     } = tool_cfg;
     let count = submitted.len();
-    // One stateful reasoning splitter per choice (Python keeps a
-    // `reasoning_parser_dict` per index); empty when no parser is set. Built
-    // out here and moved into the stream — the parser string never needs to.
-    let mut reasoning_splitters: Vec<ReasoningStreamSplitter> = if reasoning_parser.is_some() {
-        (0..count)
-            .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref()))
-            .collect()
-    } else {
-        vec![]
-    };
     let role_preamble: Vec<_> = submitted
         .iter()
         .map(|choice| {
@@ -505,18 +495,24 @@ fn chat_event_stream(
             )
         })
         .collect();
-    // Assistant-role deltas first, then every driver step rendered to its
-    // wire chunks — plain stream combinators, no generator blocks.
-    let raw = futures::stream::iter(role_preamble).chain(
-        choice_step_stream(submitted, guard).flat_map(move |step| {
-            futures::stream::iter(render_chat_step(
-                step,
-                &mut reasoning_splitters,
-                &chunks,
-                include_usage,
-                want_logprobs,
-            ))
+    let mut renderer = ChatStreamRenderer {
+        // One stateful reasoning splitter per choice (Python keeps a
+        // `reasoning_parser_dict` per index); `None` when no parser is set.
+        reasoning_splitters: reasoning_parser.as_deref().map(|parser| {
+            (0..count)
+                .map(|_| ReasoningStreamSplitter::new(Some(parser)))
+                .collect()
         }),
+        identity: chunks,
+        include_usage,
+        want_logprobs,
+    };
+    // Assistant-role deltas first, then every driver step rendered to its
+    // wire chunks — plain stream combinators, no generator blocks. The
+    // renderer moves into `flat_map`, so its state never crosses a signature.
+    let raw = futures::stream::iter(role_preamble).chain(
+        choice_step_stream(submitted, guard)
+            .flat_map(move |step| futures::stream::iter(renderer.step(step))),
     );
 
     let parsed: std::pin::Pin<
@@ -551,42 +547,51 @@ fn chat_event_stream(
         )))
 }
 
-/// Render one driver step into zero or more wire chunk envelopes. Pure and
-/// synchronous — the stream layer above is plumbing only.
-fn render_chat_step(
-    step: ChoiceStep,
-    reasoning_splitters: &mut [ReasoningStreamSplitter],
-    chunks: &ChatResponseIdentity,
+/// Streaming render state: the per-choice reasoning splitters (the only
+/// mutable piece — each `Output` step may advance one) plus the render-time
+/// constants. Owned by the stream's `flat_map` closure, so the mutation
+/// never crosses a function signature.
+struct ChatStreamRenderer {
+    reasoning_splitters: Option<Vec<ReasoningStreamSplitter>>,
+    identity: ChatResponseIdentity,
     include_usage: bool,
     want_logprobs: bool,
-) -> Vec<Annotated<CreateChatCompletionStreamResponse>> {
-    match step {
-        ChoiceStep::Error(payload) => vec![ChatResponseIdentity::error(payload)],
-        ChoiceStep::Usage {
-            prompt_tokens,
-            completion_tokens,
-        } => {
-            if include_usage {
-                vec![chunks.chunk(
-                    vec![],
-                    Some(completion_usage(
-                        prompt_tokens,
-                        u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-                    )),
-                )]
-            } else {
-                vec![]
+}
+
+impl ChatStreamRenderer {
+    /// Render one driver step into zero or more wire chunk envelopes.
+    /// Synchronous — the stream layer above is plumbing only.
+    fn step(&mut self, step: ChoiceStep) -> Vec<Annotated<CreateChatCompletionStreamResponse>> {
+        match step {
+            ChoiceStep::Error(payload) => vec![ChatResponseIdentity::error(payload)],
+            ChoiceStep::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                if self.include_usage {
+                    vec![self.identity.chunk(
+                        vec![],
+                        Some(completion_usage(
+                            prompt_tokens,
+                            u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                        )),
+                    )]
+                } else {
+                    vec![]
+                }
             }
+            ChoiceStep::Output { index, output, .. } => chat_output_chunks(
+                index,
+                output,
+                self.reasoning_splitters
+                    .as_mut()
+                    .and_then(|splitters| splitters.get_mut(index)),
+                self.want_logprobs,
+            )
+            .into_iter()
+            .map(|choice| self.identity.chunk(vec![choice], None))
+            .collect(),
         }
-        ChoiceStep::Output { index, output, .. } => chat_output_chunks(
-            index,
-            output,
-            reasoning_splitters.get_mut(index),
-            want_logprobs,
-        )
-        .into_iter()
-        .map(|choice| chunks.chunk(vec![choice], None))
-        .collect(),
     }
 }
 
