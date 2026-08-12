@@ -2561,6 +2561,13 @@ mod tests {
     /// violation renders as a hit rate above 100% or a negative loss bar, so it
     /// must fail at the booking site rather than in Grafana.
     #[test]
+    // The invariant is enforced with `debug_assert!`, which is compiled OUT under
+    // `cargo test --release` (CI tier-2), so the expected panic only fires in debug
+    // builds. Ignore in release rather than delete — the debug run still guards it.
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "relies on debug_assert!, a no-op in release builds"
+    )]
     #[should_panic(expected = "locality decomposition must nest")]
     fn cache_aware_blocks_reject_a_selected_count_above_matched() {
         let reg = MetricsRegistry::new();
@@ -2568,6 +2575,12 @@ mod tests {
     }
 
     #[test]
+    // See the sibling test above: `debug_assert!` is a no-op under `--release`,
+    // so ignore there; the debug test run still exercises the panic.
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "relies on debug_assert!, a no-op in release builds"
+    )]
     #[should_panic(expected = "locality decomposition must nest")]
     fn cache_aware_blocks_reject_a_matched_count_above_query() {
         let reg = MetricsRegistry::new();
