@@ -867,6 +867,20 @@ class Scheduler(
                     reasoning_parser.detector.think_end_token,
                 )
 
+            if reasoning_parser.detector.think_start_token:
+                think_start_ids = self.tokenizer.encode(
+                    reasoning_parser.detector.think_start_token,
+                    add_special_tokens=False,
+                )
+                if think_start_ids:
+                    self.model_config.think_start_ids = think_start_ids
+                else:
+                    logger.warning(
+                        "Reasoning parser think_start_token %r could not be encoded; "
+                        "reasoning_tokens will count from the first output token.",
+                        reasoning_parser.detector.think_start_token,
+                    )
+
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:
             initialize_mamba_selective_state_update_backend(self.server_args)

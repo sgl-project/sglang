@@ -66,7 +66,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         enable_overlap=False,
         enable_overlap_mlx=False,
         server_args=SimpleNamespace(enable_metrics=False),
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(think_start_ids=None, think_end_ids=None),
         token_to_kv_pool_allocator=None,
         tree_cache=None,
         hisparse_coordinator=None,
@@ -82,13 +82,15 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     )
 
 
-def _make_req(terminate_after: int) -> Req:
+def _make_req(terminate_after: int, origin_input_ids=None) -> Req:
     sp = SamplingParams(max_new_tokens=256, temperature=0)
     sp.normalize(None)
     req = Req(
         rid="r0",
         origin_input_text="",
-        origin_input_ids=[1, 2, 3],
+        origin_input_ids=(
+            origin_input_ids if origin_input_ids is not None else [1, 2, 3]
+        ),
         sampling_params=sp,
     )
     req.grammar = _FakeGrammar(terminate_after=terminate_after)
@@ -135,17 +137,79 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
 
 class TestReasoningTokenAccounting(CustomTestCase):
-    def test_multi_token_end_can_span_decode_steps(self):
-        req = _make_req(terminate_after=99)
+    THINK_START = [5, 6]
+    THINK_END = [7, 8]
+
+    def _make_reasoning_setup(self, origin_input_ids=None, with_start_ids=True):
+        req = _make_req(terminate_after=99, origin_input_ids=origin_input_ids)
         req.require_reasoning = True
         processor = _make_processor()
-        processor.model_config.think_end_ids = [7, 8]
+        if with_start_ids:
+            processor.model_config.think_start_ids = self.THINK_START
+        processor.model_config.think_end_ids = self.THINK_END
+        return req, processor
+
+    def test_multi_token_end_can_span_decode_steps(self):
+        req, processor = self._make_reasoning_setup(with_start_ids=False)
 
         processor._maybe_update_reasoning_tokens(req, [10, 7])
         processor._maybe_update_reasoning_tokens(req, [8, 11])
 
         self.assertEqual(req.reasoning_tokens, 3)
         self.assertTrue(req._is_reasoning_over)
+
+    def test_output_without_thinking_block_reports_no_reasoning(self):
+        req, processor = self._make_reasoning_setup()
+
+        processor._maybe_update_reasoning_tokens(req, [10, 11])
+        processor._maybe_update_reasoning_tokens(req, [12, 13])
+
+        self.assertEqual(req.reasoning_tokens, 0)
+        self.assertFalse(req._is_reasoning_over)
+
+    def test_start_emitted_in_output_counts_from_first_token(self):
+        req, processor = self._make_reasoning_setup()
+
+        processor._maybe_update_reasoning_tokens(req, [10, 5])
+        processor._maybe_update_reasoning_tokens(req, [6, 11])
+        processor._maybe_update_reasoning_tokens(req, [7, 8, 12])
+
+        self.assertEqual(req.reasoning_tokens, 6)
+        self.assertTrue(req._is_reasoning_over)
+
+    def test_prefilled_start_in_prompt_opens_the_block(self):
+        req, processor = self._make_reasoning_setup(origin_input_ids=[1, 5, 6])
+
+        processor._maybe_update_reasoning_tokens(req, [10, 11])
+
+        self.assertEqual(req.reasoning_tokens, 2)
+        self.assertFalse(req._is_reasoning_over)
+
+    def test_prompt_start_closed_by_a_later_end_does_not_open_the_block(self):
+        req, processor = self._make_reasoning_setup(origin_input_ids=[5, 6, 9, 7, 8])
+
+        processor._maybe_update_reasoning_tokens(req, [10, 11])
+
+        self.assertEqual(req.reasoning_tokens, 0)
+
+    def test_token_appended_without_counting_is_still_seen(self):
+        req, processor = self._make_reasoning_setup()
+        req.output_ids.append(5)
+        req.output_ids.extend([6, 11])
+
+        processor._maybe_update_reasoning_tokens(req, [6, 11])
+
+        self.assertEqual(req.reasoning_tokens, 3)
+        self.assertTrue(req._is_reasoning_started)
+
+    def test_end_delimiter_without_a_start_is_not_reasoning(self):
+        req, processor = self._make_reasoning_setup()
+
+        processor._maybe_update_reasoning_tokens(req, [10, 11])
+        processor._maybe_update_reasoning_tokens(req, [7, 8, 12])
+
+        self.assertEqual(req.reasoning_tokens, 0)
+        self.assertFalse(req._is_reasoning_over)
 
 
 if __name__ == "__main__":
