@@ -156,6 +156,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ltx-2",
         "minimax-h3",
         "minimaxai/minimax-h3",
+        "nvidia/cosmos3-nano",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
         "qwen-image",
@@ -175,6 +176,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LTX2PipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
+        "Cosmos3Config",
         "SanaPipelineConfig",
         "ZImagePipelineConfig",
     }
@@ -597,7 +599,7 @@ class ServerArgs(DisaggServerArgsMixin):
             pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
             and self._is_breakable_cuda_graph_supported_model()
         ):
-            if not self.warmup_resolutions:
+            if not self.warmup_resolutions and self.warmup_mode != "request":
                 self._default_bcg_warmup_resolution()
             return
 
@@ -1032,9 +1034,15 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.warmup_resolutions is not None and self.warmup_mode in (None, "off"):
             self.warmup_mode = "request"
 
-        # BCG captures every graph during a synthetic warmup forward at startup
-        # so serving never records a fresh graph.
-        if self.enable_breakable_cuda_graph and self.disagg_role == RoleType.MONOLITHIC:
+        # BCG must capture before serving. Preserve an explicit request warmup:
+        # it is the only way to capture request-only dimensions such as the
+        # Cosmos3 image/video frame count. Otherwise use the synthetic startup
+        # warmup as the safe default.
+        if (
+            self.enable_breakable_cuda_graph
+            and self.disagg_role == RoleType.MONOLITHIC
+            and self.warmup_mode != "request"
+        ):
             self.warmup_mode = "server"
 
         # Disaggregated roles do not host the HTTP startup request. Preserve

@@ -19,6 +19,12 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
+    prompt_padding as bcg_utils,
+)
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+    DiffusionBreakableCudaGraphRunner,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
@@ -799,6 +805,12 @@ class Cosmos3DenoisingStage(PipelineStage):
         self.scheduler = scheduler
         self.server_args = server_args
         self._logged_parallel_config = False
+        self._bcg_runner = None
+
+        if server_args is not None and server_args.enable_breakable_cuda_graph:
+            self._bcg_runner = DiffusionBreakableCudaGraphRunner(
+                transformer, get_local_torch_device()
+            )
         self._logged_cfg_split = False
 
         # Apply torch.compile if enabled
@@ -895,6 +907,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         action_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
+        forward_batch: Req | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run transformer forward pass.
 
@@ -911,24 +924,56 @@ class Cosmos3DenoisingStage(PipelineStage):
         """
         if current_timestep is None:
             current_timestep = int(timestep.flatten()[0].item())
-        with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
-            return self.transformer(
-                hidden_states=latents,
-                encoder_hidden_states=None,  # Not used by Cosmos3
-                timestep=timestep,
-                text_ids=text_ids,
-                text_mask=text_mask,
-                fps=fps,
-                cache_key=cache_key,
-                noisy_frame_mask=noisy_frame_mask,
-                max_text_seq_len=max_text_seq_len,
-                sound_latents=sound_latents,
-                action_latents=action_latents,
-                action_domain_ids=action_domain_ids,
-                action_noisy_mask=action_noisy_mask,
-                action_fps=action_fps,
-                action_start_frame_offset=action_start_frame_offset,
-            )
+        call_kwargs = dict(
+            hidden_states=latents,
+            encoder_hidden_states=None,
+            timestep=timestep,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            fps=fps,
+            cache_key=cache_key,
+            noisy_frame_mask=noisy_frame_mask,
+            max_text_seq_len=max_text_seq_len,
+            sound_latents=sound_latents,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+            action_noisy_mask=action_noisy_mask,
+            action_fps=action_fps,
+            action_start_frame_offset=action_start_frame_offset,
+        )
+        with set_forward_context(
+            current_timestep=current_timestep,
+            attn_metadata=None,
+            forward_batch=(
+                forward_batch
+                if forward_batch is not None
+                else getattr(self, "_current_forward_batch", None)
+            ),
+        ):
+            if self._bcg_runner is not None:
+                buckets = self.server_args.resolved_bcg_text_buckets()
+                if bool(
+                    getattr(
+                        (
+                            forward_batch
+                            if forward_batch is not None
+                            else getattr(self, "_current_forward_batch", None)
+                        ),
+                        "is_warmup",
+                        False,
+                    )
+                ):
+                    for bucket in buckets:
+                        self._bcg_runner.capture(
+                            **bcg_utils.select_prompt_padder(
+                                self.transformer, call_kwargs
+                            )(call_kwargs, self.transformer, (bucket,))
+                        )
+                call_kwargs = bcg_utils.select_prompt_padder(
+                    self.transformer, call_kwargs
+                )(call_kwargs, self.transformer, buckets)
+            transformer = self._bcg_runner or self.transformer
+            return transformer(**call_kwargs)
 
     def _manage_device_placement(self, server_args: ServerArgs):
         """Move transformer to GPU if CPU offload is enabled."""
@@ -961,6 +1006,7 @@ class Cosmos3DenoisingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the denoising loop with CFG and optional I2V conditioning."""
+        self._current_forward_batch = batch
         self._manage_device_placement(server_args)
 
         latents = batch.latents

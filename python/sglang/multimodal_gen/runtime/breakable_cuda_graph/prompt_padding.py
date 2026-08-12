@@ -274,6 +274,16 @@ PromptPadder = Callable[[dict, Any, tuple], dict]
 _PROMPT_PADDERS: list[tuple[Callable[[Any, dict], bool], PromptPadder]] = []
 
 
+def _cosmos3_padder(
+    call_kwargs: dict, _current_model: Any, buckets: tuple[int, ...]
+) -> dict:
+    out = pad_masked_prompt_kwargs(call_kwargs, buckets)
+    text_mask = first_tensor(out.get("text_mask"))
+    if text_mask is not None and out.get("max_text_seq_len") is not None:
+        out["max_text_seq_len"] = int(text_mask.shape[1])
+    return out
+
+
 def register_prompt_padder(
     predicate: Callable[[Any, dict], bool], padder: PromptPadder
 ) -> None:
@@ -304,4 +314,9 @@ def _ensure_model_padders_registered() -> None:
         minimax_h3,
         qwen_image,
         zimage,
+    )
+
+    register_prompt_padder(
+        lambda model, _kwargs: transformer_class_name_matches(model, "cosmos3"),
+        _cosmos3_padder,
     )
