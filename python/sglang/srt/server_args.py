@@ -816,6 +816,25 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = 16384
+    long_prefill_token_threshold: A[
+        int,
+        Arg(
+            help=(
+                "Cap on how many prefill tokens a single request may take from one "
+                "prefill batch. A request whose remaining prefill exceeds this is "
+                "chunked at the threshold, leaving the rest of the batch budget free "
+                "to admit other requests into the same forward, so one long prompt "
+                "cannot hold the prefill batch to itself for the whole of its prefill. "
+                "0 (default) disables the cap and preserves current behavior. Only "
+                "applies with chunked prefill enabled; set it below "
+                "--chunked-prefill-size for it to have an effect. Rounded down to a "
+                "multiple of the page size, with a floor of one page."
+                + f"\n\n{human_readable_int.__doc__}"
+            ),
+            type_parser=human_readable_int,
+        ),
+        NS("schedule"),
+    ] = 0
     prefill_max_requests: A[
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
@@ -8937,6 +8956,13 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+        # Check the long-prefill cap. Whether it actually applies also depends on
+        # chunked prefill being enabled, which is resolved later (GPU-dependent
+        # defaults); the scheduler warns there, where the final values are known.
+        assert (
+            self.long_prefill_token_threshold >= 0
+        ), "long_prefill_token_threshold must be non-negative (0 disables the cap)"
 
         # Check pdmux
         if self.enable_pdmux:

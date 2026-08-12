@@ -1164,6 +1164,28 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        # Per-request share of the prefill batch budget. Only meaningful with chunked
+        # prefill: without chunking there is no way to spread a long request across
+        # passes, so the cap would only be able to refuse it.
+        requested_long_prefill = get_schedule().long_prefill_token_threshold
+        self.long_prefill_token_threshold = (
+            requested_long_prefill if self.chunked_prefill_size is not None else 0
+        )
+        if requested_long_prefill > 0:
+            if self.chunked_prefill_size is None:
+                logger.warning(
+                    "long_prefill_token_threshold=%d is ignored because chunked prefill "
+                    "is disabled; a request cannot be spread over passes without it.",
+                    requested_long_prefill,
+                )
+            elif requested_long_prefill >= self.chunked_prefill_size:
+                logger.warning(
+                    "long_prefill_token_threshold=%d >= chunked_prefill_size=%d, so a "
+                    "long request can still take the whole prefill batch budget. Set it "
+                    "below chunked_prefill_size to leave room for other requests.",
+                    requested_long_prefill,
+                    self.chunked_prefill_size,
+                )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -3257,6 +3279,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            long_prefill_token_threshold=self.long_prefill_token_threshold,
         )
 
         if self.chunked_req is not None:

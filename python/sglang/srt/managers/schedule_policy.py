@@ -506,9 +506,11 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        long_prefill_token_threshold: int = 0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
+        self.long_prefill_token_threshold = long_prefill_token_threshold
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -702,6 +704,34 @@ class PrefillAdder:
             )
 
         return available_and_evictable - self.cur_rem_token_offset
+
+    def _apply_long_prefill_cap(self, rem_tokens: int) -> int:
+        """Cap one request's share of this prefill batch's token budget.
+
+        Without a cap, a request whose remaining prefill exceeds the batch budget
+        takes all of it (`chunked_prefill_size`), so `rem_chunk_tokens` reaches 0
+        and `budget_state()` refuses every other waiting request. That repeats on
+        every pass until the long prefill finishes, so a single long prompt holds
+        the prefill batch for its whole prefill and every other request in the
+        queue waits behind it.
+
+        With the cap set, a long request takes at most `long_prefill_token_threshold`
+        tokens per pass and the remainder of the budget stays available to admit
+        other requests into the same forward. The long request still makes progress
+        every pass -- it is slowed, not starved -- and short requests stop paying its
+        prefill latency.
+
+        The cap is floored at one page so a long request always makes progress, and
+        rounded down to a page multiple to keep the paged allocator's alignment
+        invariants (the chunked branch of `add_one_req` re-aligns as well).
+        `rem_tokens <= 0` is passed through untouched: those are the exhausted-budget
+        paths, whose own handling must not be masked here.
+        """
+        if self.long_prefill_token_threshold <= 0 or rem_tokens <= 0:
+            return rem_tokens
+        capped = min(rem_tokens, self.long_prefill_token_threshold)
+        capped = capped // self.page_size * self.page_size
+        return max(capped, min(self.page_size, rem_tokens))
 
     def _swa_budget_for_req(
         self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
@@ -991,12 +1021,16 @@ class PrefillAdder:
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
+            # Long-prefill cap: leave budget for other requests in this batch so a
+            # multi-chunk request cannot hold the prefill batch to itself for the
+            # whole of its prefill. See `_long_prefill_cap`.
+            _rem_tokens = self._apply_long_prefill_cap(_rem_tokens)
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
                     return req
-                _rem_tokens = self.rem_chunk_tokens
+                _rem_tokens = self._apply_long_prefill_cap(self.rem_chunk_tokens)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1245,6 +1279,14 @@ class PrefillAdder:
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
                     return AddReqResult.NO_TOKEN
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+
+        # Long-prefill cap, applied before the chunked/non-chunked split below so a
+        # request that already fits under the cap still prefills in a single pass:
+        # only requests longer than the threshold are chunked by it. Composes with the
+        # SWA cap above (whichever is tighter wins). Skipped when chunked prefill is
+        # off -- there is no chunking to spread the request over.
+        if chunk_tokens_limit is not None:
+            chunk_tokens_limit = self._apply_long_prefill_cap(chunk_tokens_limit)
 
         if (
             self.rem_chunk_tokens is None

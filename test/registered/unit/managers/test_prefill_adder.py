@@ -890,6 +890,158 @@ class TestPrefillAdder(CustomTestCase):
             )._swa_req_never_fits(**req)
         )
 
+    # ---- long_prefill_token_threshold -------------------------------------
+
+    def _long_prefill_adder(
+        self,
+        *,
+        threshold,
+        rem_chunk=8192,
+        page_size=64,
+        rem_input=16384,
+        available=10_000_000,
+    ):
+        self.mock_token_allocator.available_size.return_value = available
+        self.mock_token_allocator.full_available_size.return_value = available
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=page_size,
+            rem_chunk_tokens=rem_chunk,
+            rem_input_tokens=rem_input,
+            long_prefill_token_threshold=threshold,
+        )
+        return adder
+
+    def _long_prefill_req(self, rid, extend_input_len, prefix_len=0):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=128)
+        req.prefix_indices = list(range(prefix_len))
+        req.full_untruncated_fill_ids = list(range(prefix_len + extend_input_len))
+        # add_one_req reads these; create_mock_req only covers the add_chunked_req
+        # and preemption paths the other tests exercise.
+        req.sampling_params.ignore_eos = False
+        req.last_node = MagicMock()
+        req.swa_host_hit_length = 0
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def test_long_prefill_cap_leaves_budget_for_other_requests(self):
+        # The behaviour this flag exists for. Without the cap a long chunked req
+        # consumes the whole batch budget (rem_chunk_tokens -> 0), so every other
+        # waiting request is refused and waits out the long prefill. With it, the
+        # long req takes its capped share and a short req still joins the batch.
+        THRESHOLD, REM_CHUNK = 2048, 8192
+        adder = self._long_prefill_adder(threshold=THRESHOLD, rem_chunk=REM_CHUNK)
+
+        long_req = self._long_prefill_req("long", extend_input_len=500_000)
+        self.assertIs(adder.add_chunked_req(long_req), long_req)  # still truncated
+        start, end = long_req.set_extend_range.call_args.args
+        self.assertEqual(end - start, THRESHOLD)
+        self.assertEqual(adder.rem_chunk_tokens, REM_CHUNK - THRESHOLD)
+
+        short_req = self._long_prefill_req("short", extend_input_len=1024)
+        result = adder.add_one_req(
+            short_req, has_chunked_req=True, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertIn(short_req, adder.can_run_list)
+
+    def test_without_cap_long_req_takes_whole_budget(self):
+        # Baseline for the test above: threshold=0 keeps today's behaviour, so the
+        # regression this flag guards against is visible in the same terms.
+        REM_CHUNK = 8192
+        adder = self._long_prefill_adder(threshold=0, rem_chunk=REM_CHUNK)
+
+        long_req = self._long_prefill_req("long", extend_input_len=500_000)
+        adder.add_chunked_req(long_req)
+        start, end = long_req.set_extend_range.call_args.args
+
+        self.assertEqual(end - start, REM_CHUNK)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+        self.assertEqual(adder.budget_state(), AddReqResult.OTHER)
+
+    def test_long_prefill_cap_does_not_chunk_requests_under_threshold(self):
+        # A request already shorter than the cap must still prefill in one pass:
+        # the cap picks which requests get chunked, it does not add chunking.
+        adder = self._long_prefill_adder(threshold=2048)
+        req = self._long_prefill_req("short", extend_input_len=512)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertIsNone(adder.new_chunked_req)  # not chunked
+        start, end = req.set_extend_range.call_args.args
+        self.assertEqual(end - start, 512)
+
+    def test_long_prefill_cap_chunks_new_long_request(self):
+        # The cap applies on a long request's first pass too, not only to an
+        # already-chunked one, so it cannot take the whole budget on arrival.
+        THRESHOLD = 2048
+        adder = self._long_prefill_adder(threshold=THRESHOLD)
+        req = self._long_prefill_req("long", extend_input_len=500_000)
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertIs(adder.new_chunked_req, req)
+        start, end = req.set_extend_range.call_args.args
+        self.assertEqual(end - start, THRESHOLD)
+
+    def test_long_prefill_cap_is_page_aligned(self):
+        # trunc_len feeds a paged allocator, so a threshold that is not a page
+        # multiple must round down rather than break alignment.
+        PAGE, THRESHOLD = 64, 2000  # 2000 = 31.25 pages
+        adder = self._long_prefill_adder(threshold=THRESHOLD, page_size=PAGE)
+        req = self._long_prefill_req("long", extend_input_len=500_000)
+
+        adder.add_chunked_req(req)
+
+        start, end = req.set_extend_range.call_args.args
+        self.assertEqual(end - start, THRESHOLD // PAGE * PAGE)  # 1984
+        self.assertEqual((end - start) % PAGE, 0)
+
+    def test_long_prefill_cap_floors_at_one_page(self):
+        # A threshold below one page must not round down to zero: the long
+        # request has to keep making progress, or it never finishes.
+        PAGE = 64
+        adder = self._long_prefill_adder(threshold=8, page_size=PAGE)
+        req = self._long_prefill_req("long", extend_input_len=500_000)
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)
+        start, end = req.set_extend_range.call_args.args
+        self.assertEqual(end - start, PAGE)
+
+    def test_long_prefill_cap_disabled_by_default(self):
+        # Default (0) must be a no-op: same chunk size as before the flag existed.
+        REM_CHUNK = 8192
+        adder = self._long_prefill_adder(threshold=0, rem_chunk=REM_CHUNK)
+
+        self.assertEqual(adder._apply_long_prefill_cap(REM_CHUNK), REM_CHUNK)
+
+    def test_long_prefill_cap_passes_through_exhausted_budget(self):
+        # <= 0 marks the exhausted-budget paths, which callers handle themselves
+        # (add_chunked_req's memory-leak fallback, add_one_req's trunc_len <= 0
+        # refusal). The cap must not rewrite those into a positive allocation.
+        adder = self._long_prefill_adder(threshold=2048)
+
+        self.assertEqual(adder._apply_long_prefill_cap(0), 0)
+        self.assertEqual(adder._apply_long_prefill_cap(-128), -128)
+
+    def test_long_prefill_cap_composes_with_swa_cap(self):
+        # Both caps bound the same value; the tighter one must win so neither
+        # the SWA pool reservation nor the fairness cap can be exceeded.
+        adder = self._long_prefill_adder(threshold=4096)
+        self.assertEqual(adder._apply_long_prefill_cap(1024), 1024)  # SWA tighter
+        adder_tight = self._long_prefill_adder(threshold=512)
+        self.assertEqual(adder_tight._apply_long_prefill_cap(1024), 512)  # cap tighter
+
 
 if __name__ == "__main__":
     unittest.main()
