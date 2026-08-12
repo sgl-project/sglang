@@ -55,7 +55,7 @@ export const config = {
         {
           id: "text",
           label: "Text only",
-          flags: ["--language-model-only"],
+          flags: ["--language-only"],
         },
       ],
     },
