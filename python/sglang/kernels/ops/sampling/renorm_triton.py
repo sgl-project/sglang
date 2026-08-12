@@ -27,7 +27,6 @@ from sglang.kernels.ops.sampling.top_p_select_triton import (
 )
 
 _BLOCK_SIZE = 1024
-_HIERARCHICAL_TOP_P_MIN_ROWS = 24
 
 
 @triton.jit
@@ -231,7 +230,7 @@ def top_p_renorm_probs_triton(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    if torch.version.hip is not None and probs.shape[0] >= _HIERARCHICAL_TOP_P_MIN_ROWS:
+    if torch.version.hip is not None:
         return top_p_renorm_probs_triton_hierarchical(probs, top_p)
     return top_p_renorm_probs_triton_scale_fast(probs, top_p)
 

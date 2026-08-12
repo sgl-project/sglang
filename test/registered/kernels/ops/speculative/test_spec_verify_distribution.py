@@ -406,26 +406,21 @@ class TestTritonTopPFastPath(CustomTestCase):
         self.assertTrue(torch.equal(got > 0, expected > 0))
 
     @unittest.skipUnless(torch.version.hip is not None, "ROCm-only dispatch test")
-    def test_hierarchical_selector_uses_measured_row_threshold(self):
+    def test_hierarchical_selector_dispatches_on_rocm(self):
         from sglang.kernels.ops.sampling import renorm_triton
 
-        for rows, expected_calls in ((12, 0), (24, 1)):
-            with self.subTest(rows=rows):
-                probs = torch.softmax(
-                    torch.randn((rows, 1549), dtype=torch.float32, device=self.device)
-                    * 8,
-                    dim=-1,
-                )
-                top_ps = torch.full(
-                    (rows,), 0.95, dtype=torch.float32, device=self.device
-                )
-                with patch.object(
-                    renorm_triton,
-                    "top_p_renorm_probs_triton_hierarchical",
-                    wraps=renorm_triton.top_p_renorm_probs_triton_hierarchical,
-                ) as hierarchical:
-                    renorm_triton.top_p_renorm_probs_triton(probs, top_ps)
-                self.assertEqual(hierarchical.call_count, expected_calls)
+        probs = torch.softmax(
+            torch.randn((1, 1549), dtype=torch.float32, device=self.device) * 8,
+            dim=-1,
+        )
+        top_ps = torch.full((1,), 0.95, dtype=torch.float32, device=self.device)
+        with patch.object(
+            renorm_triton,
+            "top_p_renorm_probs_triton_hierarchical",
+            wraps=renorm_triton.top_p_renorm_probs_triton_hierarchical,
+        ) as hierarchical:
+            renorm_triton.top_p_renorm_probs_triton(probs, top_ps)
+        hierarchical.assert_called_once()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "GPU is required for this test.")
