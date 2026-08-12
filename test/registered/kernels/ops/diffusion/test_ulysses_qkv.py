@@ -40,6 +40,28 @@ def test_pack_qkv_destination_major_is_bit_exact(dtype):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_pack_qkv_destination_major_accepts_strided_views(dtype):
+    """q/k/v reach this kernel as views of one projection output, not as tensors.
+
+    Keeping the checkpoint's per-head [q, k, v] row order makes the projection
+    emit [rows, heads, 3, head_size], so q/k/v are its unbind views: contiguous
+    on the last axis only, with a 3*head_size head stride. The kernel reads
+    through strides, so packing those views has to match packing dense copies.
+    """
+    torch.manual_seed(0)
+    rows, world_size, global_heads, head_size = 17, 4, 12, 64
+    qkv = torch.randn(rows, global_heads, 3, head_size, device="cuda", dtype=dtype)
+    q, k, v = qkv.unbind(dim=2)
+    assert q.stride(-1) == 1 and not q.is_contiguous()
+
+    strided = pack_qkv_destination_major(q, k, v, world_size)
+    dense = pack_qkv_destination_major(
+        q.contiguous(), k.contiguous(), v.contiguous(), world_size
+    )
+    assert torch.equal(strided, dense)
+
+
 def test_pack_qkv_destination_major_validates_inputs():
     q = torch.empty(2, 4, 8, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="same 3D shape"):

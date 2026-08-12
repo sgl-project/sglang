@@ -99,6 +99,71 @@ def test_native_weight_names_and_grouped_qkv_reorder():
             )
 
 
+def test_native_qkv_order_yields_the_same_q_k_v():
+    """Keeping the checkpoint's row order must not move a single value.
+
+    The rows arrive per head as [q, k, v]. The reordering path rewrites them to
+    [q_all, k_all, v_all] and splits the projection output by thirds; the native
+    path leaves them alone and splits on the head's inner axis. It is the same
+    GEMM either way -- only which output row lands where changes -- so the two
+    have to agree bit for bit, not merely close.
+    """
+    heads, head_dim, hidden, rows = 8, 4, 6, 17
+    torch.manual_seed(0)
+    raw = torch.randn(heads * 3 * head_dim, hidden)
+    reordered = _reorder_grouped_qkv_to_qkv(
+        raw, num_query_groups=heads, heads_per_group=1, head_dim=head_dim
+    )
+    x = torch.randn(rows, hidden)
+
+    native = (x @ raw.T).view(rows, heads, 3, head_dim).unbind(dim=2)
+    legacy = tuple(
+        t.view(rows, heads, head_dim)
+        for t in (x @ reordered.T).split(heads * head_dim, dim=-1)
+    )
+    for name, a, b in zip("qkv", native, legacy):
+        assert torch.equal(a, b), name
+
+    # The native views are strided, which is what every consumer downstream has
+    # to accept; only the last axis is guaranteed contiguous.
+    assert native[0].stride() == (heads * 3 * head_dim, 3 * head_dim, 1)
+
+
+def test_native_qkv_order_makes_a_column_shard_a_head_range():
+    """A contiguous column shard must be exactly a range of whole heads.
+
+    This is what lets the stock ColumnParallelLinear loader replace the custom
+    one. Were it to stop holding, tensor parallelism would split heads across
+    ranks with the right shapes and the wrong contents -- silently.
+    """
+    heads, head_dim, hidden = 8, 4, 6
+    torch.manual_seed(0)
+    raw = torch.randn(heads * 3 * head_dim, hidden)
+    for tp_size in (1, 2, 4, 8):
+        shard = raw.shape[0] // tp_size
+        local_heads = heads // tp_size
+        for tp_rank in range(tp_size):
+            assert torch.equal(
+                raw.narrow(0, tp_rank * shard, shard),
+                raw.view(heads, 3, head_dim, hidden)
+                .narrow(0, tp_rank * local_heads, local_heads)
+                .reshape(shard, hidden),
+            ), (tp_size, tp_rank)
+
+    # The reordered layout is why MergedColumnParallelLinear exists: there the
+    # same contiguous shard is a slice of q only.
+    reordered = _reorder_grouped_qkv_to_qkv(
+        raw, num_query_groups=heads, heads_per_group=1, head_dim=head_dim
+    )
+    shard = reordered.shape[0] // 2
+    assert not torch.equal(
+        reordered.narrow(0, 0, shard),
+        raw.view(heads, 3, head_dim, hidden)
+        .narrow(0, 0, heads // 2)
+        .reshape(shard, hidden),
+    )
+
+
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():
     arch = MiniMaxH3DiTArchConfig()
     model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
@@ -164,8 +229,21 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
         )
 
     assert model._fsdp_mixed_dtype_params
+    # Unquantised, the checkpoint's rows are kept as they are, and rank-local
+    # FSDP can shard them directly -- a contiguous row range is a head range --
+    # so no pre-shard transform is installed. Quantisation still reorders, and
+    # still needs one.
     qkv_weight = model.blocks[0].attn.qkv_proj.weight
-    assert callable(qkv_weight.rank_local_weight_transform)
+    assert not hasattr(qkv_weight, "rank_local_weight_transform")
+    with torch.device("meta"):
+        quantised = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=Fp8Config(ignored_layers=[]),
+        )
+    assert callable(
+        quantised.blocks[0].attn.qkv_proj.weight.rank_local_weight_transform
+    )
     for name, tensor in model.state_dict().items():
         if name in expected_fp32:
             assert tensor.dtype == torch.float32, name

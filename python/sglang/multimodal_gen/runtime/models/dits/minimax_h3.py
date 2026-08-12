@@ -531,20 +531,37 @@ class MiniMaxH3Attention(nn.Module):
         self.prefix = prefix
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
-        # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
-        # matrix must be sharded independently; a plain ColumnParallelLinear
-        # would instead slice across the concatenated tensor and is incorrect
-        # for TP > 1.
-        self.qkv_proj = MergedColumnParallelLinear(
-            arch.hidden_size,
-            [self.inner_dim] * 3,
-            bias=False,
-            gather_output=False,
-            params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self._install_qkv_weight_loader(arch)
+        # The checkpoint stores one fused qkv tensor whose rows are ordered per
+        # head as [q, k, v]. That order is what makes a plain contiguous column
+        # shard correct: rows [r*3*inner/tp, ...) are exactly heads
+        # [r*H/tp, ...), each with its own q, k and v -- which is what the
+        # upstream layout was designed for. So the stock sharding and loader
+        # already do the right thing and the rows never need reordering.
+        # Quantisation keeps the old path: there the row order belongs to the
+        # quant method's layout, and splitting the tensor into three logical
+        # matrices decides the shape of its scales.
+        self.native_qkv_order = quant_config is None
+        if self.native_qkv_order:
+            self.qkv_proj = ColumnParallelLinear(
+                arch.hidden_size,
+                3 * self.inner_dim,
+                bias=False,
+                gather_output=False,
+                params_dtype=_BF16_DTYPE,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+        else:
+            self.qkv_proj = MergedColumnParallelLinear(
+                arch.hidden_size,
+                [self.inner_dim] * 3,
+                bias=False,
+                gather_output=False,
+                params_dtype=_BF16_DTYPE,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self._install_qkv_weight_loader(arch)
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         # cache width covers cos/sin for temporal, height, and width frequencies
@@ -644,10 +661,15 @@ class MiniMaxH3Attention(nn.Module):
         """
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
-        q, k, v = qkv.split(self.local_inner_dim, dim=-1)
-        q = q.view(total, self.num_heads, self.head_dim)
-        k = k.view(total, self.num_heads, self.head_dim)
-        v = v.view(total, self.num_heads, self.head_dim)
+        if self.native_qkv_order:
+            # Rows are per-head [q, k, v], so the head axis comes first and the
+            # three views share the last axis with a 3*head_dim head stride.
+            q, k, v = qkv.view(total, self.num_heads, 3, self.head_dim).unbind(dim=2)
+        else:
+            q, k, v = qkv.split(self.local_inner_dim, dim=-1)
+            q = q.view(total, self.num_heads, self.head_dim)
+            k = k.view(total, self.num_heads, self.head_dim)
+            v = v.view(total, self.num_heads, self.head_dim)
         if rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
