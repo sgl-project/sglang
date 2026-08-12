@@ -2,7 +2,7 @@
 
 The CPU tests in ``test_fp8_bpreshuffle_scale.py`` only prove the stride formula
 against a fabricated layout. They cannot catch ``aiter_per1x128_quant(
-transpose_scale=True)`` emitting the wrong layout, the ``_emit_bpreshuffle``
+transpose_scale=True)`` emitting the wrong layout, the ``emit_bpreshuffle_scale``
 gating being wrong, or an integration mismatch with the CK bpreshuffle GEMM.
 
 These tests exercise the real kernels ``aiter_w8a8_block_fp8_linear`` routes
@@ -75,11 +75,18 @@ class TestDenseBpreshuffleScaleNoCopy(CustomTestCase):
                     x, quant_dtype=fp8, transpose_scale=False
                 )
                 mat = materialize_bpreshuffle_fp8_scale(s_f)
-                self.assertEqual(mat.stride(), (1, m))  # bpreshuffle column-major
 
                 # M == 1 stays on the materialize path in production (>= 2 gate).
+                # There materialize is a no-op: the [1, G] row-major and [G, 1]
+                # column-major byte orders coincide, so it keeps the natural (G, 1)
+                # stride (NOT the (1, M) column-major stride taken for M >= 2) and
+                # shares storage; the scale values must survive intact.
                 if m < 2:
+                    self.assertEqual(mat.stride(), (s_f.shape[1], 1))  # (G, 1)
+                    self.assertTrue(torch.equal(mat, s_f))
                     continue
+
+                self.assertEqual(mat.stride(), (1, m))  # bpreshuffle column-major
 
                 # Optimized path: transposed emit + zero-copy view.
                 q_t, s_t = fp8_utils.aiter_per1x128_quant(
@@ -130,10 +137,27 @@ class TestDenseBpreshuffleScaleNoCopy(CustomTestCase):
             with self.subTest(m=m):
                 x = self._rand_input(m)
 
-                # New path, exactly as shipped.
-                out_new = fp8_utils.aiter_w8a8_block_fp8_linear(
-                    x, weight, _BLOCK, weight_scale
-                )
+                # New path, exactly as shipped. Also pin that it really takes the
+                # CK bpreshuffle GEMM (use_triton == False) -- the path this PR
+                # optimizes -- so a future tuned-shape-list change can't silently
+                # route this coverage through Triton and void the equivalence check.
+                with (
+                    mock.patch.object(
+                        fp8_utils,
+                        "gemm_a8w8_blockscale_bpreshuffle",
+                        wraps=fp8_utils.gemm_a8w8_blockscale_bpreshuffle,
+                    ) as spy_bpreshuffle,
+                    mock.patch.object(
+                        fp8_utils,
+                        "triton_gemm_a8w8_blockscale",
+                        wraps=fp8_utils.triton_gemm_a8w8_blockscale,
+                    ) as spy_triton,
+                ):
+                    out_new = fp8_utils.aiter_w8a8_block_fp8_linear(
+                        x, weight, _BLOCK, weight_scale
+                    )
+                spy_bpreshuffle.assert_called_once()
+                spy_triton.assert_not_called()
 
                 # Old path: row-major quant + materialize relayout. Patching both
                 # the quant flag and the relayout helper reconstructs the original

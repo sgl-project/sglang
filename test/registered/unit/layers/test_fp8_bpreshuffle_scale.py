@@ -154,18 +154,24 @@ class TestBpreshuffleScaleFreshQuantNoCopy(CustomTestCase):
 
     def test_m1_uses_materialize_path_values_and_layout(self):
         """Production gates the no-copy emit on ``input_2d.shape[0] >= 2``
-        (`_emit_bpreshuffle`), so a single row (M == 1) keeps the materialize
-        path. Pin that fallback's values and resulting bpreshuffle layout: the
-        `(1, M)` == `(1, 1)` column-major stride with scale values intact. The
-        actual M==1 gating through aiter_w8a8_block_fp8_linear is exercised on
-        gfx95 in test_fp8_bpreshuffle_dense_linear_mi35x.py."""
+        (`emit_bpreshuffle_scale`), so a single row (M == 1) keeps the materialize
+        path. At M == 1 the ``[1, G]`` row-major and ``[G, 1]`` column-major byte
+        orders coincide, so ``materialize_bpreshuffle_fp8_scale`` is a no-op: the
+        ``[G, 1]`` transpose is already contiguous for the singleton dim, so
+        ``.contiguous()`` copies nothing and the result keeps the natural
+        ``(G, 1)`` stride (NOT the ``(1, M)`` column-major stride it produces for
+        M >= 2) while sharing the input's storage. Values must survive intact; the
+        downstream bpreshuffle GEMM consumes the same bytes either way. The actual
+        M==1 gating through aiter_w8a8_block_fp8_linear is exercised on gfx95 in
+        test_fp8_bpreshuffle_dense_linear_mi35x.py."""
         scale = torch.arange(4, dtype=torch.float32).reshape(1, 4)  # [M=1, G=4]
 
         materialized = materialize_bpreshuffle_fp8_scale(scale)
 
         self.assertTrue(torch.equal(materialized, scale))
         self.assertEqual(materialized.shape, (1, 4))
-        self.assertEqual(materialized.stride(), (1, 1))
+        self.assertEqual(materialized.stride(), (scale.shape[1], 1))  # (G, 1)
+        self.assertEqual(materialized.data_ptr(), scale.data_ptr())  # no-op share
         self.assertTrue(materialized.t().is_contiguous())
 
 
