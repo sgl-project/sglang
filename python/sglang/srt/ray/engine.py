@@ -175,6 +175,23 @@ def _validate_custom_placement_group(pg: PlacementGroup, world_size: int) -> Non
         )
 
 
+def get_scheduler_actor_name(
+    *,
+    rank0_node_ip: str,
+    dp_rank: int,
+    pp_rank: int,
+    tp_rank: int,
+    port: int,
+    bundle_idx: int,
+) -> str:
+    """Return the Ray actor name for a SchedulerActor. Can be used to retrive scheduler ray actors"""
+    return (
+        f"sglang_scheduler_node{rank0_node_ip}"
+        f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
+        f"_port{port}_bundle{bundle_idx}"
+    )
+
+
 def _create_scheduler_actor(
     pg: PlacementGroup,
     bundle_idx: int,
@@ -208,12 +225,13 @@ def _create_scheduler_actor(
         # run_event_loop() blocks one thread for the actor's lifetime; leave a spare
         # for pull_weights, which the trainer calls while generation is paused.
         max_concurrency=2 if rdt else 1,
-        # The http `port` disambiguates engines co-located on one node, letting the
-        # trainer find these actors via list_named_actors.
-        name=(
-            f"sglang_scheduler_node{rank0_node_ip}"
-            f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
-            f"_port{server_args.port}_pg{pg.id.hex()[:8]}_bundle{bundle_idx}"
+        name=get_scheduler_actor_name(
+            rank0_node_ip=rank0_node_ip,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
+            tp_rank=tp_rank,
+            port=server_args.port,
+            bundle_idx=bundle_idx,
         ),
         # Non-detached named actors are not listed cross-job, so the trainer (a
         # separate Ray job) could not discover them. RayEngine.shutdown kills these.
