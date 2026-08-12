@@ -70,7 +70,7 @@ class TestMuseGlimmerDflashAssistantGSM8K(CustomTestCase, GSM8KMixin):
                 "muse",
                 "--tool-call-parser",
                 "muse",
-                "--language-model-only",
+                "--language-only",
                 "--speculative-algorithm",
                 "DFLASH",
                 "--speculative-draft-model-path",

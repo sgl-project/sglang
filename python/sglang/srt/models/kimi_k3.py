@@ -3011,7 +3011,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # shard work across ranks image-wise via the DP runner.
         self.use_data_parallel = True
 
-        self.vision_tower = KimiK3VisionTower(config.vision_config)
+        # No local tower: an encoder sends features already embedded.
+        self.vision_tower = (
+            None
+            if getattr(config, "language_model_only", False)
+            else KimiK3VisionTower(config.vision_config)
+        )
         self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
 
         self.language_model = None

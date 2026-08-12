@@ -667,13 +667,18 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         # Create vision tower
-        self.vision_tower = MoonViT3dPretrainedModel(
-            config.vision_config,
-            use_data_parallel=self.use_data_parallel,
-            quant_config=(
-                quant_config if isinstance(quant_config, ModelSlimConfig) else None
-            ),
-            prefix="vision_tower",
+        # No local tower: an encoder sends features already embedded.
+        self.vision_tower = (
+            None
+            if getattr(config, "language_model_only", False)
+            else MoonViT3dPretrainedModel(
+                config.vision_config,
+                use_data_parallel=self.use_data_parallel,
+                quant_config=(
+                    quant_config if isinstance(quant_config, ModelSlimConfig) else None
+                ),
+                prefix="vision_tower",
+            )
         )
         # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
@@ -694,7 +699,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
         if self.language_model is not None and hasattr(self.language_model, "dtype"):
             target_dtype = self.language_model.dtype
-            self.vision_tower = self.vision_tower.to(dtype=target_dtype)
+            if self.vision_tower is not None:
+                self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
     @property

@@ -467,7 +467,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         server_args = self.server_args
 
         # Initialize tokenizer and processor
-        if self.model_config.is_multimodal and not server_args.language_model_only:
+        if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
@@ -1024,11 +1024,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         contains_mm_input = obj.contains_mm_input()
-        if contains_mm_input and self.server_args.language_model_only:
-            raise ValueError(
-                "Multimodal inputs are not supported when --language-model-only "
-                "is set; the encoder is not loaded. Restart without the flag."
-            )
         is_mossvl = (
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures
@@ -1070,9 +1065,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 if mm_inputs is None:
                     if self.server_args.language_only:
-                        logger.warning(
-                            "Encoder embedding not available, "
-                            "falling back to local mm processing"
+                        raise ValueError(
+                            "No encoder produced embeddings for this request and "
+                            "--language-only leaves no local vision tower to fall "
+                            "back on. Register an encoder (--encoder-urls or the "
+                            "EncoderBootstrapServer) before sending multimodal "
+                            "requests."
                         )
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,

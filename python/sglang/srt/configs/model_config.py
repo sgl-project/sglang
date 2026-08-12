@@ -264,7 +264,6 @@ class ModelConfig:
         is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
-        language_model_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
@@ -536,10 +535,10 @@ class ModelConfig:
 
         self.hf_config.encoder_only = encoder_only
         self.hf_config.language_only = language_only
-        # Checkpoints declare this one themselves (hf_transformers/processor.py),
-        # so the flag may only turn it on: writing the default back would build a
-        # vision tower with no weights to fill.
-        self.hf_config.language_model_only = language_model_only or self.is_lm_only
+        # Either the operator asked for the language half only, or the checkpoint
+        # declares itself text-only (hf_transformers/processor.py). Both mean the
+        # same thing to the model: no vision tower.
+        self.hf_config.language_model_only = language_only or self.is_lm_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
@@ -588,7 +587,6 @@ class ModelConfig:
             override_config_file=override_config_file,
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
-            language_model_only=server_args.language_model_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
             is_draft_quantization_explicit=(

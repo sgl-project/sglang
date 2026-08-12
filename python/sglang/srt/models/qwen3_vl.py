@@ -1345,7 +1345,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         if mm_inputs and mm_inputs.mm_items:
-            _require_vision(self)
+            _require_vision(self, mm_inputs.mm_items)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1589,15 +1589,26 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-def _require_vision(model) -> None:
+def _require_vision(model, items=None) -> None:
+    """Raise unless this model can turn *items* into image features.
+
+    A server without a local tower can still serve items an encoder already
+    embedded for it, so precomputed items are always allowed.
+    """
     if (
-        getattr(model, "language_model_only", False)
-        and getattr(model, "visual", None) is None
+        not getattr(model, "language_model_only", False)
+        or getattr(model, "visual", None) is not None
     ):
-        raise RuntimeError(
-            "Checkpoint is marked language_model_only=True and was loaded "
-            "without a vision encoder; multimodal inputs are not supported."
-        )
+        return
+    if items and all(
+        getattr(item, "precomputed_embeddings", None) is not None for item in items
+    ):
+        return
+    raise RuntimeError(
+        "This server has no vision encoder (--language-only, or the checkpoint "
+        "declares language_model_only=True) and no encoder supplied embeddings "
+        "for these multimodal inputs."
+    )
 
 
 EntryClass = Qwen3VLForConditionalGeneration

@@ -64,7 +64,12 @@ class DotsVLMForCausalLM(nn.Module):
             )
 
         # Initialize vision tower (matching transformers naming for weight compatibility)
-        self.vision_tower = DotsVisionTransformer(config.vision_config)
+        # No local tower: an encoder sends features already embedded.
+        self.vision_tower = (
+            None
+            if getattr(config, "language_model_only", False)
+            else DotsVisionTransformer(config.vision_config)
+        )
 
     def _pad_vit_attn_dummy_heads(self, name: str, loaded_weight: torch.Tensor):
         """pad attn qkv weights for dummy heads"""

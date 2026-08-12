@@ -3106,14 +3106,12 @@ class ServerArgs:
         bool, "For MLLM with an encoder, launch an encoder-only server", NS("disagg")
     ] = False
     language_only: A[
-        bool, "For VLM, load weights for the language model only.", NS("disagg")
-    ] = False
-    language_model_only: A[
         bool,
-        "Skip the multimodal encoder entirely: its weights are never loaded and the "
-        "tower is never built, freeing that GPU memory for KV cache. Multimodal "
-        "requests are rejected. Unlike --language-only this is a standalone mode, "
-        "not part of encoder/decoder disaggregation.",
+        "Serve the language half of a VLM only: the vision tower is never built "
+        "and its weights are never loaded, freeing that memory for KV cache. "
+        "Image features must come from an encoder server, registered either up "
+        "front with --encoder-urls or dynamically via the EncoderBootstrapServer; "
+        "multimodal requests are rejected while no encoder is available.",
         NS("disagg"),
     ] = False
     encoder_transfer_backend: A[
@@ -4897,7 +4895,6 @@ class ServerArgs:
             if (
                 model_config.is_multimodal
                 and not self.language_only
-                and not self.language_model_only
                 and self.disaggregation_mode != "decode"
             ):
                 self.adjust_mem_fraction_for_vlm(model_config)
@@ -6429,11 +6426,7 @@ class ServerArgs:
                     raise ValueError(
                         "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
                     )
-                if (
-                    model_config.is_multimodal
-                    and not self.language_only
-                    and not self.language_model_only
-                ):
+                if model_config.is_multimodal and not self.language_only:
                     raise ValueError(
                         "MiMo V2 CP-v2 only supports text inference; add "
                         "--language-only."
@@ -7541,39 +7534,7 @@ class ServerArgs:
         except Exception:
             return False
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
-
-    def _handle_language_model_only(self):
-        if not self.language_model_only:
-            return
-        for flag, name in (
-            (self.encoder_only, "--encoder-only"),
-            (self.language_only, "--language-only"),
-            (self.enable_prefix_mm_cache, "--enable-prefix-mm-cache"),
-            (
-                self.enable_broadcast_mm_inputs_process,
-                "--enable-broadcast-mm-inputs-process",
-            ),
-            (self.mm_enable_dp_encoder, "--mm-enable-dp-encoder"),
-        ):
-            if flag:
-                raise ValueError(
-                    f"--language-model-only cannot be combined with {name}"
-                )
-        if self.disaggregation_mode != "null":
-            raise ValueError(
-                "--language-model-only is incompatible with --disaggregation-mode "
-                "prefill/decode"
-            )
-        architectures = self.get_model_config().hf_config.architectures
-        if not any(a in self.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures):
-            raise ValueError(
-                f"--language-model-only does not support {architectures}. "
-                f"Supported: {list(self.LANGUAGE_MODEL_ONLY_ARCHITECTURES)}."
-            )
-
     def _handle_encoder_disaggregation(self):
-        self._handle_language_model_only()
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
                 "--enable-prefix-mm-cache requires --encoder-only to be enabled"
@@ -7615,7 +7576,10 @@ class ServerArgs:
                     model_arch,
                     self.tp_size,
                 )
-        if (self.encoder_only or self.language_only) and model_arch not in [
+        takes_part_in_epd = self.encoder_only or (
+            self.language_only and len(self.encoder_urls) > 0
+        )
+        if takes_part_in_epd and model_arch not in [
             "Qwen2VLForConditionalGeneration",
             "Qwen3VLForConditionalGeneration",
             "Qwen2_5_VLForConditionalGeneration",
@@ -8566,6 +8530,13 @@ class ServerArgs:
             dest="incremental_streaming_output",
             new_flag="--incremental-streaming-output",
             help="[Deprecated] Use --incremental-streaming-output instead.",
+        )
+        parser.add_argument(
+            "--language-model-only",
+            action=DeprecatedStoreTrueAction,
+            dest="language_only",
+            new_flag="--language-only",
+            help="[Deprecated] Use --language-only instead.",
         )
         parser.add_argument(
             "--prefill-round-robin-balance",
