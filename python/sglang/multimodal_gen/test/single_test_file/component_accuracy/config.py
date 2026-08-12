@@ -49,8 +49,9 @@ CASE_THRESHOLDS: Dict[str, Dict[ComponentType, float]] = {
     "wan2_2_t2v_a14b_2gpu": {ComponentType.TRANSFORMER: 0.99},
     "wan2_2_t2v_a14b_teacache_2gpu": {ComponentType.TRANSFORMER: 0.99},
     "wan2_2_t2v_a14b_lora_2gpu": {ComponentType.TRANSFORMER: 0.99},
-    "zimage_image_t2i_2_gpus": {ComponentType.TRANSFORMER: 0.9935},
-    "zimage_image_t2i_2_gpus_non_square": {ComponentType.TRANSFORMER: 0.9935},
+    # H100/H200 FlashAttention runs vary between roughly 0.99338 and 0.99350.
+    "zimage_image_t2i_2_gpus": {ComponentType.TRANSFORMER: 0.993},
+    "zimage_image_t2i_2_gpus_non_square": {ComponentType.TRANSFORMER: 0.993},
 }
 
 # Active skip policy. Keep this limited to cases with current, concrete evidence

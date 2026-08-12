@@ -154,7 +154,7 @@ async fn generate(
     let stream = body.stream;
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
-    let (payloads, is_batch) = match body.into_requests() {
+    let (mut payloads, is_batch) = match body.into_requests() {
         Ok(v) => v,
         // The error carries its own status (a bad batch is `Validation` → 400).
         Err(e) => {
@@ -162,6 +162,11 @@ async fn generate(
             return pre_submit_error(code, &e.to_string(), stream);
         }
     };
+    // Media I/O (URL downloads, file reads) happens here, on the API runtime
+    // — never on the MM worker pool (see `prefetch`).
+    if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
+        return pre_submit_error(StatusCode::BAD_REQUEST, &e, stream);
+    }
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
         let payload = payloads
@@ -243,7 +248,7 @@ async fn drain_unary(
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, error_value(code, &e.to_string()), true);
             }
-            EgressItem::Control(_) => continue, // never on `/generate`
+            EgressItem::Control(_) | EgressItem::Data(_) => continue, // never on `/generate`
         }
     }
     // Sender dropped without a terminal item: the shard dropped this request (a
@@ -376,7 +381,7 @@ fn generation_event_stream(
                         terminal = Some(out);
                     }
                     EgressItem::Error(e) => failed = Some(e),
-                    EgressItem::Control(_) => {} // never on /generate
+                    EgressItem::Control(_) | EgressItem::Data(_) => {} // never on /generate
                 }
             }
 

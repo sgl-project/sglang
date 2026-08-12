@@ -530,6 +530,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             model_path="dummy",
             page_size=self.cfg.page_size,
             hicache_io_backend="direct",
+            hicache_mem_layout="page_first_direct",
             hicache_write_policy=write_policy,
         )
         set_global_server_args_for_scheduler(server_args)
@@ -2785,6 +2786,8 @@ class UnifiedRadixCacheSuite:
                 cd = ancestor.component_data[ct]
                 if cd.value is not None and cd.host_value is None:
                     cd.host_value = cd.value.clone()
+            # A real backup registers duplicate tracking at its ack.
+            cache.tree_core._update_duplicate_tracking(ancestor)
 
     def _simulate_backup_tree(self, cache):
         """Backup all non-root nodes (simulates write-through)."""
@@ -2869,6 +2872,7 @@ class UnifiedRadixCacheSuite:
             model_path="dummy",
             page_size=self.cfg.page_size,
             hicache_io_backend="direct",
+            hicache_mem_layout="page_first_direct",
             hicache_write_policy=write_policy,
             hicache_storage_backend=storage_backend,
             hicache_storage_backend_extra_config=storage_extra_config,
@@ -3824,6 +3828,10 @@ class UnifiedRadixCacheSuite:
             leaf, device_frees, host_frees, target=EvictLayer.HOST
         )
         cache._free_values(device_frees, host_frees)
+        full_host_pool = cache.cache_controller.mem_pool_host
+        mamba_host_pool = cache.components[ComponentType.MAMBA]._mamba_pool_host
+        full_available_before = full_host_pool.available_size()
+        mamba_available_before = mamba_host_pool.available_size()
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
@@ -3841,12 +3849,27 @@ class UnifiedRadixCacheSuite:
             req_to_token_pool,
             tokens[:branching_seqlen],
         )
+        cache.writing_check(write_back=True)
+        # Full was already backed up, so only one Mamba slot is allocated.
+        self.assertEqual(
+            full_host_pool.available_size(),
+            full_available_before,
+        )
+        self.assertEqual(
+            mamba_host_pool.available_size(),
+            mamba_available_before - 1,
+        )
+
         second_match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
 
         self.assertEqual(len(second_match.device_indices), branching_seqlen)
         self.assertIsNone(second_match.mamba_branching_seqlen)
+        branching_node = cache.resolve_node_handle(second_match.last_device_node)
+        self.assertIsNotNone(
+            branching_node.component_data[ComponentType.MAMBA].host_value
+        )
 
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
@@ -6231,6 +6254,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
             model_path="dummy",
             page_size=self.cfg.page_size,
             hicache_io_backend="direct",
+            hicache_mem_layout="page_first_direct",
             hicache_write_policy=write_policy,
         )
         server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)

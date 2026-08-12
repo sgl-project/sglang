@@ -20,6 +20,7 @@ from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -52,12 +53,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -66,31 +67,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
-
-def _get_qkv_projections(
-    attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
-):
-    if attn.use_fused_qkv:
-        qkv, _ = attn.to_qkv(hidden_states)
-        query, key, value = [t.contiguous() for t in qkv.chunk(3, dim=-1)]
-    else:
-        query, _ = attn.to_q(hidden_states)
-        key, _ = attn.to_k(hidden_states)
-        value, _ = attn.to_v(hidden_states)
-
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if attn.use_fused_added_qkv:
-            added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = [
-                t.contiguous() for t in added_qkv.chunk(3, dim=-1)
-            ]
-        else:
-            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
+_get_qkv_projections = get_qkv_projections
 
 
 class Flux2SwiGLU(nn.Module):
@@ -548,9 +525,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.local_heads, -1))
         value = value.unflatten(-1, (self.local_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
+        cos_sin_cache = None
         if freqs_cis is not None:
             cos, sin = freqs_cis
             cos_sin_cache = torch.cat(
@@ -560,9 +535,19 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
                 ],
                 dim=-1,
             )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
+
+        # QK-norm (+ RoPE) via the shared helper so the fused kernel path is used
+        # here too — the single-stream block previously ran norm and RoPE as separate ops.
+        query, key = apply_qk_norm_with_optional_rope(
+            q=query,
+            k=key,
+            q_norm=self.norm_q,
+            k_norm=self.norm_k,
+            head_dim=self.head_dim,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=False,
+            allow_inplace=True,
+        )
         hidden_states = self.attn(
             query,
             key,
@@ -649,7 +634,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             **joint_attention_kwargs,
         )
 
-        hidden_states = hidden_states + mod_gate * attn_output
+        hidden_states = residual_gate_add(hidden_states, attn_output, mod_gate)
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
@@ -734,15 +719,21 @@ class Flux2TransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         # Modulation parameters shape: [1, 1, self.dim]
-        (shift_msa, scale_msa, gate_msa), (
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
+        (
+            (shift_msa, scale_msa, gate_msa),
+            (
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ),
         ) = temb_mod_params_img
-        (c_shift_msa, c_scale_msa, c_gate_msa), (
-            c_shift_mlp,
-            c_scale_mlp,
-            c_gate_mlp,
+        (
+            (c_shift_msa, c_scale_msa, c_gate_msa),
+            (
+                c_shift_mlp,
+                c_scale_mlp,
+                c_gate_mlp,
+            ),
         ) = temb_mod_params_txt
 
         # Img stream
@@ -767,18 +758,18 @@ class Flux2TransformerBlock(nn.Module):
         attn_output, context_attn_output = attention_outputs
 
         # Process attention outputs for the image stream (`hidden_states`).
-        attn_output = gate_msa * attn_output
-        hidden_states = hidden_states + attn_output
+        hidden_states = residual_gate_add(hidden_states, attn_output, gate_msa)
 
         norm_hidden_states = self.norm2(hidden_states)
         norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
 
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = hidden_states + gate_mlp * ff_output
+        hidden_states = residual_gate_add(hidden_states, ff_output, gate_mlp)
 
         # Process attention outputs for the text stream (`encoder_hidden_states`).
-        context_attn_output = c_gate_msa * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
+        encoder_hidden_states = residual_gate_add(
+            encoder_hidden_states, context_attn_output, c_gate_msa
+        )
 
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
         norm_encoder_hidden_states = (
@@ -786,7 +777,9 @@ class Flux2TransformerBlock(nn.Module):
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
+        encoder_hidden_states = residual_gate_add(
+            encoder_hidden_states, context_ff_output, c_gate_mlp
+        )
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 

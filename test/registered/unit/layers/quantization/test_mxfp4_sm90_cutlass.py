@@ -48,6 +48,8 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.core import ActivationType
 
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
 GROUP_SIZE = 32  # MXFP4 block size
 
 
@@ -57,6 +59,12 @@ class _MockLayer:
     We construct one by hand so the test stays out of SGLang's distributed init
     path (``get_tp_group`` etc.).
     """
+
+    def __init__(self):
+        # The SM90 weight-processing path reads the runner config for the
+        # gate/up row layout (``gate_up_interleaved``) and the activation. A
+        # real ``FusedMoE`` always carries one, so the stand-in does too.
+        self.moe_runner_config = MoeRunnerConfig()
 
 
 class _MockTopKOutput:
