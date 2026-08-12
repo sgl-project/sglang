@@ -14,10 +14,11 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd")
 
 PAGE_SIZE = 2
 
@@ -37,6 +38,7 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
             model_path="dummy",
             page_size=PAGE_SIZE,
             hicache_io_backend="direct",
+            hicache_mem_layout="layer_first",
             hicache_write_policy="write_through",
         )
         set_global_server_args_for_scheduler(server_args)

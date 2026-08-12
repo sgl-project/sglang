@@ -43,7 +43,7 @@ class OutOfBandError:
         return json.dumps(dataclasses.asdict(self))
 
     @classmethod
-    def from_json(cls, text: str) -> "OutOfBandError":
+    def from_json(cls, text: str) -> OutOfBandError:
         return cls(**json.loads(text))
 
 

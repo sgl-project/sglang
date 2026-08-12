@@ -135,9 +135,11 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertIs(kwargs["camera_conditions"], camera_conditions)
         self.assertIs(kwargs["chunk_plucker"], chunk_plucker)
 
-    def test_get_model_deployment_config_enables_dit_layerwise_offload(self) -> None:
+    def test_deployment_config_enables_memory_mode_dit_layerwise_offload(
+        self,
+    ) -> None:
         deployment = self.config.get_model_deployment_config()
-        self.assertTrue(deployment.auto_dit_layerwise_offload)
+        self.assertEqual(deployment.dit_layerwise_offload_modes, ("memory",))
         self.assertEqual(deployment.fsdp_auto_min_available_memory_gb, 60)
 
     def test_text_encoder_padding_matches_cfg_concat_contract(self) -> None:
@@ -1078,6 +1080,44 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
 
         self.assertTrue(torch.allclose(combined_from_pos_rank, serial))
         self.assertTrue(torch.allclose(combined_from_neg_rank, serial))
+
+    def test_scheduler_tensors_move_to_target_device(self) -> None:
+        scheduler = SimpleNamespace(
+            sigmas=torch.tensor([1.0, 0.0]),
+            timesteps=torch.tensor([1000.0, 0.0]),
+            untouched="value",
+        )
+
+        SanaWMDenoisingStage._move_scheduler_tensors_to_device(
+            scheduler, torch.device("cpu")
+        )
+
+        self.assertEqual(scheduler.sigmas.device.type, "cpu")
+        self.assertEqual(scheduler.timesteps.device.type, "cpu")
+        self.assertEqual(scheduler.untouched, "value")
+
+        class PropertyScheduler:
+            def __init__(self):
+                self._sigmas = torch.tensor([1.0, 0.0])
+                self._timesteps = torch.tensor([1000.0, 0.0])
+                self.untouched = "value"
+
+            @property
+            def sigmas(self):
+                return self._sigmas
+
+            @property
+            def timesteps(self):
+                return self._timesteps
+
+        property_scheduler = PropertyScheduler()
+        SanaWMDenoisingStage._move_scheduler_tensors_to_device(
+            property_scheduler, torch.device("cpu")
+        )
+
+        self.assertEqual(property_scheduler.sigmas.device.type, "cpu")
+        self.assertEqual(property_scheduler.timesteps.device.type, "cpu")
+        self.assertEqual(property_scheduler.untouched, "value")
 
 
 class TestSanaWMNativeDiTChunking(unittest.TestCase):

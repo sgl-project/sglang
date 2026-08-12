@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 
 def _await_control(
-    ctx: "ScriptedContext",
+    ctx: ScriptedContext,
     *,
     path: str,
     json,
@@ -38,7 +38,7 @@ def _await_control(
 
 
 def pause_generation(
-    ctx: "ScriptedContext", *, mode: Literal["retract", "in_place"]
+    ctx: ScriptedContext, *, mode: Literal["retract", "in_place"]
 ) -> None:
     _await_control(
         ctx,
@@ -48,7 +48,7 @@ def pause_generation(
     )
 
 
-def continue_generation(ctx: "ScriptedContext", *, torch_empty_cache: bool) -> None:
+def continue_generation(ctx: ScriptedContext, *, torch_empty_cache: bool) -> None:
     _await_control(
         ctx,
         path="/continue_generation",
@@ -57,7 +57,7 @@ def continue_generation(ctx: "ScriptedContext", *, torch_empty_cache: bool) -> N
     )
 
 
-def abort_all(ctx: "ScriptedContext") -> None:
+def abort_all(ctx: ScriptedContext) -> None:
     _await_control(
         ctx,
         path="/abort_request",
@@ -66,7 +66,7 @@ def abort_all(ctx: "ScriptedContext") -> None:
     )
 
 
-def abort(ctx: "ScriptedContext", *, rid: str, await_arrival: bool = True) -> None:
+def abort(ctx: ScriptedContext, *, rid: str, await_arrival: bool = True) -> None:
     _await_control(
         ctx,
         path="/abort_request",
@@ -76,7 +76,7 @@ def abort(ctx: "ScriptedContext", *, rid: str, await_arrival: bool = True) -> No
     )
 
 
-def flush_cache(ctx: "ScriptedContext") -> None:
+def flush_cache(ctx: ScriptedContext) -> None:
     _await_control(
         ctx,
         path="/flush_cache",

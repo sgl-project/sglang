@@ -96,9 +96,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         engine.shutdown()
 
     def test_update_weights_from_tensor_load_format_custom(self):
-        custom_loader_name = (
-            "sglang.srt.model_executor.model_runner._model_load_weights_direct"
-        )
+        custom_loader_name = "sglang.srt.model_executor.model_runner_components.weight_updater._model_load_weights_direct"
         engine = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             custom_weight_loader=[custom_loader_name],

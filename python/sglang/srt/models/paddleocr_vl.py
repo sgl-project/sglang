@@ -25,7 +25,11 @@ from transformers.activations import GELUActivation
 from transformers.utils import torch_int
 
 from sglang.srt.layers.activation import get_act_fn
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -345,6 +349,7 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: Optional[List[torch.Tensor]] = None,
         rope_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> Tuple[torch.FloatTensor]:
 
         residual = hidden_states
@@ -355,6 +360,7 @@ class SiglipEncoderLayer(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_emb,
+            forward_metadata=forward_metadata,
         )
 
         hidden_states = residual + hidden_states
@@ -447,6 +453,9 @@ class SiglipEncoder(nn.Module):
         if is_npu() and isinstance(cu_seqlens, torch.Tensor):
             cu_seqlens = cu_seqlens.to("cpu")
         attn_cu_seqlens = cu_seqlens
+        forward_metadata = prepare_vision_attention_metadata(
+            attn_cu_seqlens, device=hidden_states.device
+        )
         hidden_states = inputs_embeds
 
         for encoder_layer in self.layers:
@@ -454,6 +463,7 @@ class SiglipEncoder(nn.Module):
                 hidden_states,
                 cu_seqlens=attn_cu_seqlens,
                 rope_emb=rope_emb,
+                forward_metadata=forward_metadata,
             )
         return hidden_states
 

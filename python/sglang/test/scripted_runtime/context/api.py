@@ -34,9 +34,9 @@ class ScriptedContext:
     def __init__(
         self,
         *,
-        scheduler_hook: "ScriptedSchedulerHook",
-        tokenizer_recv_proxy: Optional["ScriptedTokenizerRecvProxy"],
-        http_poster: "BackgroundHttpPoster",
+        scheduler_hook: ScriptedSchedulerHook,
+        tokenizer_recv_proxy: Optional[ScriptedTokenizerRecvProxy],
+        http_poster: BackgroundHttpPoster,
     ) -> None:
         assert (
             scheduler_hook._is_driver
@@ -67,7 +67,7 @@ class ScriptedContext:
         stop_token_ids: Optional[List[int]] = None,
         temperature: Optional[float] = None,
         lora_path: Optional[str] = None,
-    ) -> "ScriptedReqHandle":
+    ) -> ScriptedReqHandle:
         return self._req_starter.start_req(
             prompt_len=prompt_len,
             max_new_tokens=max_new_tokens,
@@ -93,7 +93,7 @@ class ScriptedContext:
     def abort_all(self) -> None:
         return lifecycle.abort_all(self)
 
-    def abort(self, handle: "ScriptedReqHandle", *, await_arrival: bool = True) -> None:
+    def abort(self, handle: ScriptedReqHandle, *, await_arrival: bool = True) -> None:
         return lifecycle.abort(self, rid=handle.rid, await_arrival=await_arrival)
 
     def flush_cache(self) -> None:
@@ -133,7 +133,7 @@ class ScriptedContext:
     def last_batch_forward_mode(self) -> Optional[str]:
         return queries.last_batch_forward_mode(self)
 
-    def find_req_by_rid(self, rid: str) -> Optional["Req"]:
+    def find_req_by_rid(self, rid: str) -> Optional[Req]:
         return queries.find_req_by_rid(self, rid)
 
     def is_finished(self, rid: str) -> bool:
@@ -148,7 +148,7 @@ class ScriptedContext:
     def remaining_prompt_tokens(self, rid: str) -> int:
         return queries.remaining_prompt_tokens(self, rid)
 
-    def list_active_reqs(self) -> List["Req"]:
+    def list_active_reqs(self) -> List[Req]:
         return queries.list_active_reqs(self)
 
     def chunks_done(self, rid: str) -> int:

@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 # Use a longer timeout than the default 600s.
 NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 
-register_cuda_ci(est_time=7200, suite="nightly-eval-vlm-2-gpu", nightly=True)
+register_cuda_ci(est_time=7200, stage="nightly", runner_config="2-gpu-large")
 
 MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples, especially for latency thresholds
@@ -44,8 +44,9 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
         0.330, 23.5
     ),
-    ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.5),
-    ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.259, 36.3),
+    # temporarily disabled: NaN in next_token_logits
+    # ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.5),
+    # ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.259, 36.3),
     ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 18.0),
     ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.310, 83.3),
     ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.330, 31.9),

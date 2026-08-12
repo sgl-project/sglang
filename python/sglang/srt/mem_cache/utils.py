@@ -13,10 +13,34 @@
 # ==============================================================================
 """Common utilities."""
 
-import hashlib
 from typing import Any, Callable, List, Optional, Tuple
 
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_triton as get_mla_kv_buffer_triton,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_fp8_quant_kernel as set_mla_kv_buffer_fp8_quant_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_kernel as set_mla_kv_buffer_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_triton as set_mla_kv_buffer_triton,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_triton_fp8_quant as set_mla_kv_buffer_triton_fp8_quant,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_scale_buffer_kernel as set_mla_kv_scale_buffer_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
+)
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
     FIFOStrategy,
@@ -26,30 +50,6 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
     PriorityStrategy,
     SLRUStrategy,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    get_mla_kv_buffer_triton as get_mla_kv_buffer_triton,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_fp8_quant_kernel as set_mla_kv_buffer_fp8_quant_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_kernel as set_mla_kv_buffer_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_triton as set_mla_kv_buffer_triton,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_triton_fp8_quant as set_mla_kv_buffer_triton_fp8_quant,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_scale_buffer_kernel as set_mla_kv_scale_buffer_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
 )
 
 _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
@@ -103,22 +103,13 @@ def maybe_init_custom_mem_pool(
         return False, None, None
 
 
-def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
-    hasher = hashlib.sha256()
-
-    if prior_hash:
-        hasher.update(bytes.fromhex(prior_hash))
-
-    for t in token_ids:
-        if isinstance(t, tuple):
-            # EAGLE bigram mode: hash both elements to uniquely identify the bigram
-            for elem in t:
-                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
-        else:
-            # Regular mode: single integer token
-            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
-
-    return hasher.hexdigest()
+def get_hash_str(
+    token_ids: List[int],
+    prior_hash: Optional[str] = None,
+    page_size: Optional[int] = None,
+) -> str | List[str]:
+    prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
+    return get_native_hash(token_ids, prior_digest, page_size)
 
 
 def hash_str_to_int64(hash_str: str) -> int:
@@ -134,21 +125,13 @@ def hash_str_to_int64(hash_str: str) -> int:
 
 def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
     """Compute SHA256-based hash values for position-aware KV block IDs."""
-    hash_values = []
-
     parent_hash = None
     if node.parent is not None and node.parent.hash_value is not None:
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
             parent_hash = node.parent.hash_value[-1]
 
-    logical_len = len(node.key)
-    for start in range(0, logical_len, page_size):
-        end = min(start + page_size, logical_len)
-        if end <= start:
-            continue
-        hash_val = node.key.hash_page(start, end, parent_hash)
-        hash_values.append(hash_val)
-        parent_hash = hash_val
+    hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
+    assert isinstance(hash_values, list)
     return hash_values
 
 

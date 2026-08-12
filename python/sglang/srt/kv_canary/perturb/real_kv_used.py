@@ -37,9 +37,9 @@ logger = logging.getLogger(__name__)
 
 def run(
     *,
-    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional[ForwardBatch],
     config: PerturbConfig,
-    req_to_token_pool: "ReqToTokenPool",
+    req_to_token_pool: ReqToTokenPool,
     buffer_groups: tuple[CanaryBufferGroup, ...],
     swa_window_size: int,
     warmup_gate: WarmupGate,
@@ -111,8 +111,8 @@ def run(
 
 def _pick_active_slot_for_group(
     *,
-    maybe_inaccurate_forward_batch: "ForwardBatch",
-    req_to_token_pool: "ReqToTokenPool",
+    maybe_inaccurate_forward_batch: ForwardBatch,
+    req_to_token_pool: ReqToTokenPool,
     group: CanaryBufferGroup,
     swa_window_size: int,
 ) -> Optional[ReqToTokenEntry]:
