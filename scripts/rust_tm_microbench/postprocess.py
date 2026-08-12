@@ -23,6 +23,11 @@ PY_RE = re.compile(
 )
 UNIQ_RE = re.compile(r"#[0-9a-f]{16}$")
 
+# input_ids requests skip the tokenizer pool: one segment covers the whole
+# ingress FSM instead of the four tokenize-path segments.
+IDS_COLLAPSE = {"ingress_fsm", "tokenize", "tok_return_wait", "presend_validate"}
+SEG_IDS = ("ingress_no_tokenize", "ing_pickup", "encode_start")
+
 # (segment, from-stamp, to-stamp): telescopes client_send -> client_first.
 SEGMENTS = [
     ("net_send", "client_send", "http_recv"),
@@ -98,7 +103,11 @@ def main():
                 "segments_ms": {},
                 "incomplete": False,
             }
-            for name, a, b in SEGMENTS:
+            chain = SEGMENTS if "tok_start" in s else [
+                SEG_IDS if n[0] == "ingress_fsm" else n
+                for n in SEGMENTS if n[0] not in IDS_COLLAPSE or n[0] == "ingress_fsm"
+            ]
+            for name, a, b in chain:
                 if a in s and b in s:
                     row["segments_ms"][name] = (s[b] - s[a]) / 1e6
                 else:
@@ -119,7 +128,7 @@ def main():
     agg = {}
     for length, rs in sorted(by_len.items()):
         seg_stats = {}
-        for name, _, _ in SEGMENTS:
+        for name in rs[0]["segments_ms"]:
             vals = [r["segments_ms"][name] for r in rs]
             seg_stats[name] = {
                 "mean": statistics.mean(vals),
@@ -148,7 +157,7 @@ def main():
 
     lens = sorted(by_len)
     print(f"\n{'segment':<22}" + "".join(f"{length:>12}" for length in lens))
-    for name, _, _ in SEGMENTS:
+    for name in agg[str(lens[0])]["segments"]:
         row = "".join(f"{agg[str(le)]['segments'][name]['mean']:>12.3f}" for le in lens)
         print(f"{name:<22}{row}")
     print(

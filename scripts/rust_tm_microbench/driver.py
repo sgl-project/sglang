@@ -33,9 +33,9 @@ def build_prompt(tokenizer, target_len: int, seed: int) -> str:
     return text
 
 
-async def run_one(url: str, prompt: str, rid: str, output_len: int) -> dict:
+async def run_one(url: str, prompt, rid: str, output_len: int) -> dict:
     payload = {
-        "text": prompt,
+        ("input_ids" if isinstance(prompt, list) else "text"): prompt,
         "rid": rid,
         "stream": True,
         "sampling_params": {
@@ -89,6 +89,8 @@ async def main():
     ap.add_argument("--output-len", type=int, default=8)
     ap.add_argument("--out", required=True)
     ap.add_argument("--prompt-cache", help="JSON file to save/load prompts")
+    ap.add_argument("--use-input-ids", action="store_true",
+                    help="send input_ids (skips server-side tokenize)")
     args = ap.parse_args()
 
     url = f"http://{args.host}:{args.port}/generate"
@@ -107,6 +109,12 @@ async def main():
         ]
         if args.prompt_cache:
             json.dump(prompts, open(args.prompt_cache, "w"))
+
+    if args.use_input_ids:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(args.model)
+        prompts = [tok.encode(p, add_special_tokens=True) for p in prompts]
 
     results = []
     for i, prompt in enumerate(prompts):
