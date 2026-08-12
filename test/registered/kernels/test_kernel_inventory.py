@@ -154,11 +154,10 @@ def test_internal_registry_target_attributes_are_declared():
 
 
 # `load_jit` takes in-tree names and absolute paths on the same keyword, so this
-# check can only reach the declarations spelled out in the source. These modules
-# assemble their file lists at runtime from packages outside `jit/csrc` -- the
-# vendored trtllm-gen sources -- where there is no in-tree name to verify. A new
-# entry belongs here only for that same reason.
-_RUNTIME_JIT_SOURCE_MODULES = {"moe/trtllm_gen_moe.py"}
+# check can only reach the declarations spelled out in the source. A module that
+# assembles its file list at runtime from a package outside `jit/csrc` has no
+# in-tree name to verify and belongs here; there is none at the moment.
+_RUNTIME_JIT_SOURCE_MODULES: set[str] = set()
 
 
 def test_jit_source_declarations_exist():

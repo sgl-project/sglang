@@ -381,11 +381,12 @@ def test_build_lock_excludes_a_second_holder(tmp_path):
 def test_pinned_build_directory_is_locked(tmp_path, monkeypatch):
     """A caller-pinned `build_directory` is shared, not private.
 
-    `trtllm_gen_moe` pins one directory keyed by its cubin pool, so all eight
-    tensor-parallel ranks land in it at once. Without the lock they each ran
-    ninja there simultaneously and clobbered each other's build log — observed
-    on an 8-GPU b300 job as `ninja: error: opening build log`. Reproduced
-    locally at 2-4 crashes out of 8 ranks before the fix, 0 after.
+    The trtllm-gen MoE loader used to pin one directory keyed by its cubin pool,
+    so all eight tensor-parallel ranks landed in it at once. Without the lock
+    they each ran ninja there simultaneously and clobbered each other's build
+    log — observed on an 8-GPU b300 job as `ninja: error: opening build log`,
+    and reproduced locally at 2-4 crashes out of 8 ranks before the fix, 0
+    after. Nothing pins a directory today, but the keyword still does.
     """
     import fcntl
 
@@ -566,11 +567,11 @@ def test_module_name_is_derived_from_the_args():
 def test_the_published_name_is_the_library_the_build_produces():
     """`jit_module_name` must name the file the build actually writes.
 
-    A caller that pins `build_directory` finds its library there by this name --
-    trtllm-gen MoE reopens it with ctypes to reach C symbols tvm-ffi does not
-    export. That directory is keyed by the caller, not by this convention, so a
-    library built by another version of the JIT layer can sit beside it and a
-    name that drifts silently selects the wrong one.
+    Finding a library inside a pinned `build_directory` is only sound if its
+    name is known: that directory is keyed by whatever the caller calls it, not
+    by this convention, so libraries built by other versions of the JIT layer
+    can sit beside it. Picking one by shape instead of by name is what made
+    trtllm-gen MoE set its cubin callback on a stale library.
     """
     from sglang.kernels.jit.utils.compile.spec import jit_module_name
 

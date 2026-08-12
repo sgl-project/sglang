@@ -23,7 +23,7 @@ _MODULE_NAME_PREFIX = "sgl_kernel_jit_"
 def jit_module_name(*args: str) -> str:
     """The library basename (without ``.so``) that ``load_jit(*args)`` builds.
 
-    A caller that pins ``build_directory`` needs to find its own library there
+    A caller that pins ``build_directory`` has to find its own library there
     afterwards, and that directory is shared: it is keyed by what the caller
     names it, not by this convention, so libraries built by other versions of
     this code can sit alongside. Addressing the artifact by name is the only way
