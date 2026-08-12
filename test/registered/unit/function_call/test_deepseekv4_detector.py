@@ -102,6 +102,53 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertEqual(len(result.calls), 2)
 
+    def test_prose_between_two_tool_calls_is_streamed(self):
+        """Prose sitting between two calls used to be dropped outright: the lead
+        was only recovered for the first call, and consuming the second call
+        advanced the buffer straight past the text in front of it."""
+        normal, calls = self._feed(
+            [_weather_call("SF"), "\n\nNow the other city.\n\n", _weather_call("NY")]
+        )
+
+        self.assertIn("Now the other city.", normal)
+        self.assertNotIn(DSML, normal)
+        self.assertEqual([c.name for c in calls if c.name], ["get_weather"] * 2)
+
+    def test_prose_after_the_last_tool_call_is_streamed(self):
+        """Trailing prose used to be stranded: the section closer keeps the DSML
+        guard true for the rest of the turn, so the buffer holding the text was
+        never released and nothing flushes it at end of turn."""
+        detector = DeepSeekV4Detector()
+        normal = ""
+        for chunk in [_weather_call("SF"), "\n\nThat's the forecast."]:
+            normal += detector.parse_streaming_increment(chunk, self.tools).normal_text
+
+        self.assertIn("That's the forecast.", normal)
+        self.assertNotIn(DSML, normal)
+        self.assertEqual(detector._buffer, "")
+
+    def test_trailing_prose_is_chunk_invariant(self):
+        """Where the deltas happen to split must not change what the client sees.
+        The lead of a call spanning several chunks is emitted once, and text after
+        a call reads the same whether or not it shares a delta with the closer."""
+        text = _weather_call("SF") + "\n\nAnd that is that."
+        one_shot, _ = self._feed([text])
+
+        for size in (1, 2, 3, 7, 13):
+            with self.subTest(chunk_size=size):
+                split, _ = self._feed(
+                    [text[i : i + size] for i in range(0, len(text), size)]
+                )
+                self.assertEqual(split, one_shot)
+
+    def test_prose_with_angle_bracket_is_not_held_back(self):
+        """Only a suffix that could still grow into a DSML marker may be withheld.
+        Holding every `<` would strand ordinary prose until end of turn, and no
+        end-of-turn flush exists to release it."""
+        normal, _ = self._feed([_weather_call("SF"), "\n\n5 < 6 and a < b."])
+
+        self.assertIn("5 < 6 and a < b.", normal)
+
     def test_parse_error_neither_swallows_nor_duplicates(self):
         """An unexpected parse error must not empty the turn, and the dropped
         buffer must not come back on the next delta."""

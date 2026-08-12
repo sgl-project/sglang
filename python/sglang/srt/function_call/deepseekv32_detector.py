@@ -226,6 +226,80 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
+    def _markers(self) -> tuple[str, ...]:
+        """Every DSML tag this detector can meet, longest-lived first.
+
+        Read off the instance rather than cached at construction: subclasses set
+        their own `bot_token` / `eot_token` after `super().__init__()` (V4 says
+        `tool_calls` where V3.2 says `function_calls`).
+        """
+        return (
+            self.bot_token,
+            self.eot_token,
+            self.invoke_end_token,
+            "<｜DSML｜invoke",
+        )
+
+    def _strip_section_markers(self, text: str) -> str:
+        """Drop whole DSML tags, along with the newlines that indent them.
+
+        The indent belongs to the tag, not to the prose around it, which is why
+        `detect_and_parse` never shows it either. Safe to swallow here only
+        because `_split_flushable` refuses to release a trailing newline once a
+        call has been seen, so an indent is still in the buffer when its tag
+        lands however the chunks fell.
+        """
+        for token in (self.eot_token, self.invoke_end_token, self.bot_token):
+            text = re.sub(rf"\n*{re.escape(token)}", "", text)
+        return text
+
+    def _split_flushable(self, text: str) -> tuple[str, str]:
+        """Split `text` into (safe to emit now, hold back for the next chunk).
+
+        Held back: a suffix that is a strict prefix of a real marker, and -- once
+        a call has been seen -- a trailing run of newlines, which may yet turn
+        out to be the indent of a tag rather than prose. Emitting an indent is
+        not something a later chunk can take back, and that is what would make
+        the output depend on where the deltas split.
+
+        The newline hold is deliberately conditional. A turn with no tool call
+        at all never reaches the tag-stripping paths, so holding its trailing
+        newlines would strand them: nothing flushes the buffer at end of turn.
+
+        Nothing else is held: prose that merely contains `<` ("5 < 6") streams
+        out immediately.
+        """
+        hold_from = len(text)
+        start = text.rfind("<")
+        if start != -1:
+            tail = text[start:]
+            if any(
+                len(tail) < len(marker) and marker.startswith(tail)
+                for marker in self._markers()
+            ):
+                hold_from = start
+        if self.current_tool_id != -1:
+            # Whatever is held takes its indent with it, otherwise the newlines
+            # in front of a half-arrived tag go out before the tag is known.
+            hold_from = len(text[:hold_from].rstrip("\n"))
+        return text[:hold_from], text[hold_from:]
+
+    def _lead_text(
+        self, current_text: str, *, call_start: int, trim_trailing_newlines: bool
+    ) -> str:
+        """The normal text sitting in front of the call that starts at `call_start`.
+
+        `trim_trailing_newlines` is only for the very first call, where the trim
+        keeps this path agreeing with `detect_and_parse`. Later calls must not
+        trim: the same newlines are emitted untouched when the prose arrives in
+        its own chunk, and the result may not depend on the chunk boundaries.
+        """
+        bot_pos = current_text.rfind(self.bot_token, 0, call_start)
+        if bot_pos != -1:
+            call_start = bot_pos
+        lead = self._strip_section_markers(current_text[:call_start])
+        return lead.removesuffix("\n\n") if trim_trailing_newlines else lead
+
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
     ) -> StreamingParseResult:
@@ -252,16 +326,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
             and not potentially_dsml
             and not ends_with_prefix
         ):
-            self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token]:
                 if e_token in current_text:
                     current_text = current_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=current_text)
+            flushable, self._buffer = self._split_flushable(current_text)
+            return StreamingParseResult(normal_text=flushable)
 
         all_calls: list[ToolCallItem] = []
-        # Only recovered for the first call: the DSML guard above never releases a
-        # buffer that still holds a marker, so later prose stays buffered.
-        preamble = ""
+        normal_text_parts: list[str] = []
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -278,17 +350,26 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     invoke_match
                 )
 
+                is_first_call = self.current_tool_id == -1
+
                 # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
+                if is_first_call:
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
-                    call_start = invoke_match.start()
-                    bot_pos = current_text.rfind(self.bot_token, 0, call_start)
-                    if bot_pos != -1:
-                        call_start = bot_pos
-                    # Same trailing-newline trim as detect_and_parse, so both agree.
-                    preamble = current_text[:call_start].removesuffix("\n\n")
+
+                # Whatever precedes this call is content the model meant to show.
+                # Guarded on `current_tool_name_sent` so it runs exactly once per
+                # call: it is only False the first time a call is seen, so an
+                # invoke that spans chunks can't re-emit the same lead.
+                if not self.current_tool_name_sent:
+                    normal_text_parts.append(
+                        self._lead_text(
+                            current_text,
+                            call_start=invoke_match.start(),
+                            trim_trailing_newlines=is_first_call,
+                        )
+                    )
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -363,19 +444,32 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Wait for more chunks until we see </｜DSML｜invoke>
                     break
 
-            # No more invoke blocks found
-            return StreamingParseResult(normal_text=preamble, calls=all_calls)
+            # No more invoke blocks found. Anything still buffered is trailing
+            # prose: the guard at the top can never release it, because the
+            # section closer keeps `potentially_dsml` true for the rest of the
+            # turn. Flush it here instead, holding back only a suffix that could
+            # still grow into a marker.
+            if not self.has_tool_call(current_text):
+                flushable, self._buffer = self._split_flushable(
+                    self._strip_section_markers(current_text)
+                )
+                normal_text_parts.append(flushable)
+
+            return StreamingParseResult(
+                normal_text="".join(normal_text_parts), calls=all_calls
+            )
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            # Re-emit verbatim rather than swallowing the turn; the preamble is
-            # still inside current_text unless a completed call advanced past it.
+            # Re-emit verbatim rather than swallowing the turn; leads already
+            # collected sit in front of whatever current_text still holds.
             # Calls are dropped on purpose: the failure can land between a tool's
             # name and its arguments, and a half-formed call is worse than none.
             self._buffer = ""
-            if not current_text.startswith(preamble):
-                current_text = preamble + current_text
-            return StreamingParseResult(normal_text=current_text)
+            emitted = "".join(normal_text_parts)
+            if emitted and current_text.startswith(emitted):
+                emitted = ""
+            return StreamingParseResult(normal_text=emitted + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
