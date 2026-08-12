@@ -21,11 +21,6 @@ Qwen3.5 lm-eval gate so the Qwen3.5 accuracy tests stay together).
 
 import ast
 import os
-
-# Set HF cache for MI35x.
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -51,7 +46,6 @@ register_amd_ci(
 
 INVALID = -9999999
 
-QWEN35_MXFP4_LOCAL_PATH = "/data2/models/amd-Qwen3.5-397B-A17B-MXFP4"
 QWEN35_MXFP4_HF_MODEL_ID = "amd/Qwen3.5-397B-A17B-MXFP4"
 SERVER_LAUNCH_TIMEOUT = 3600
 # TP=4 matches the AMD model-card reproduction recipe and keeps model-load + full
@@ -70,15 +64,6 @@ GSM8K_MAX_NEW_TOKENS = int(os.environ.get("GSM8K_MAX_NEW_TOKENS", "8192"))
 # Promoting shared_expert.down_proj to FP8 is accuracy-neutral, and Qwen3.5-MXFP4
 # scores ~0.94-0.97 on this harness, so 0.92 gates real regressions with margin.
 GSM8K_ACCURACY_THRESHOLD = 0.92
-
-
-def get_model_path() -> str:
-    env_path = os.environ.get("QWEN35_MXFP4_MODEL_PATH")
-    if env_path:
-        return env_path
-    if os.path.exists(QWEN35_MXFP4_LOCAL_PATH):
-        return QWEN35_MXFP4_LOCAL_PATH
-    return QWEN35_MXFP4_HF_MODEL_ID
 
 
 def get_one_example(lines, i, include_answer):
@@ -160,7 +145,7 @@ def run_gsm8k_benchmark(
 class TestQwen35MXFP4DenseFp8MI35x(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = get_model_path()
+        cls.model = QWEN35_MXFP4_HF_MODEL_ID
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
