@@ -436,6 +436,11 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        # Dispatchers are not nn.Modules, so they cannot register their own
+        # buffers; the AITER expert mask would not survive a memory-saver resume.
+        expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)
+        if expert_mask is not None:
+            self.register_buffer("expert_mask_gpu", expert_mask, persistent=False)
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
 
         if (
