@@ -196,13 +196,12 @@ class TritonAttnBackend(AttentionBackend):
             and self.use_mla
             and is_kimi_k3(model_runner.model_config.hf_config)
         )
-        # Qwen3.5-397B under TP4/TP8 has multiple local Q heads sharing one
-        # replicated KV head. Opt in to the grouped-head kernel; its runtime
-        # shape guard falls back when a layout exposes multiple local KV heads.
+        # Qwen3.5 has multiple local Q heads sharing one replicated KV head.
+        # Prefer the grouped-head kernel; its runtime shape guard falls back
+        # when a layout exposes multiple local KV heads.
         self.use_qwen3_5_shared_kv_verify = (
             is_gfx95_supported()
             and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
-            and envs.SGLANG_OPT_USE_QWEN3_5_SHARED_KV_VERIFY.get()
             and self.topk == 1
             and not self.use_mla
             and is_qwen3_5(model_runner.model_config.hf_config)
