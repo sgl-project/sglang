@@ -634,8 +634,22 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     # fp8 kv-cache under aiter MLA DCP. Validated for Kimi-K3 on gfx950 only,
-    # so it stays opt-in rather than becoming the default.
+    # so it stays opt-in rather than becoming the default. Not available on the
+    # Gluon path, which caps fp8 at batch size 1; see
+    # SGLANG_USE_AITER_GLUON_MLA_DCP.
     SGLANG_EXPERIMENTAL_AITER_DCP_FP8 = EnvBool(False)
+    # Run the DCP MLA paths on aiter's Gluon kernel
+    # (aiter.ops.triton.gluon.mla_gluon) instead of the Triton MLA kernel
+    # reached via aiter.ops.triton.attention.mla.mla_decode_fwd. Needs
+    # triton >= 3.7 (it passes cga_layout= to PaddedSharedLayout); aiter's own
+    # guard only checks >= 3.6, so on 3.6 this fails at kernel-compile time
+    # rather than at import -- ServerArgs preflights it instead
+    # (_validate_gluon_mla_dcp_buildable). Off by default because the win
+    # depends on how long each rank's KV shard is: +8..+51% once a rank holds
+    # ~1150 tokens or more, but -5% at gsm8k's ~125 tokens/rank. Cannot serve
+    # fp8 kv-cache above batch 1, so it is mutually exclusive with
+    # SGLANG_EXPERIMENTAL_AITER_DCP_FP8.
+    SGLANG_USE_AITER_GLUON_MLA_DCP = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")

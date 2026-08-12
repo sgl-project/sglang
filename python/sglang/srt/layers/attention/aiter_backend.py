@@ -24,6 +24,7 @@ from sglang.kernels.ops.kvcache.aiter_unified_attention import (
     scatter_ragged_to_page_table_kernel,
     scatter_req_to_token_to_page_table_kernel,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dcp import (
     dcp_enabled,
@@ -141,6 +142,10 @@ class ForwardMetadata:
     # Stage A flattens the window to one row per query token, so it needs its
     # own arange cu_seqlens_q; qo_indptr stays the per-request boundaries.
     dcp_verify_qo_indptr: Optional[torch.Tensor] = None
+    # Per-ROW TOKEN table for the Gluon DCP target-verify stage A. mla_gluon
+    # pages at 1 token, so it cannot read dcp_block_table (pages of page_size);
+    # only built when SGLANG_USE_AITER_GLUON_MLA_DCP is on.
+    dcp_verify_token_table: Optional[torch.Tensor] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -844,10 +849,70 @@ class AiterAttnBackend(AttentionBackend):
     def _mla_decode_fwd_dcp(self, q, k_buffer, layer, k_descale):
         """DCP decode over this rank's round-robin KV shard -> (out, base-2 lse).
 
-        NOTE ``mla_decode_fwd`` is Triton, not Gluon, on gfx950: it only picks
-        its Gluon path under IS_DEVICE_ARCH_GFX12.
+        Two interchangeable kernels, same contract:
+
+        * ``_mla_decode_fwd_dcp_triton`` (default) -- aiter's Triton MLA kernel,
+          reached through ``aiter.ops.triton.attention.mla.mla_decode_fwd``.
+        * ``_mla_decode_fwd_dcp_gluon`` -- aiter's Gluon MLA kernel
+          (``aiter.ops.triton.gluon.mla_gluon``), gated on
+          SGLANG_USE_AITER_GLUON_MLA_DCP because it needs triton >= 3.7.
+
+        NOTE the two are NOT the same kernel family: on gfx950 ``mla_decode_fwd``
+        picks its Gluon implementation only under ``IS_DEVICE_ARCH_GFX12`` and
+        otherwise launches ``_triton_kernels.attention.mla._mla_decode_fwd_kernel``.
+        The verify and prefill helpers go through the same entry point and are
+        likewise Triton on this arch.
         """
+        if envs.SGLANG_USE_AITER_GLUON_MLA_DCP.get():
+            return self._mla_decode_fwd_dcp_gluon(q, layer)
         return self._mla_decode_fwd_dcp_triton(q, k_buffer, layer, k_descale)
+
+    def _mla_decode_fwd_dcp_gluon(self, q, layer):
+        """DCP decode on aiter's Gluon MLA kernel -> (out, base-2 lse).
+
+        Takes the shard in ``mla_gluon``'s varlen form -- the per-rank token
+        indices and request boundaries that ``_plan_dcp_decode_metadata``
+        already localized in place (``kv_values // dcp_world_size`` are physical
+        rows of this rank's pool). That needs neither the paged block table nor
+        the segment reduce the Triton path requires.
+
+        ``min_kv_seq_len=1`` pins NUM_KV_SPLITS to 1, which keeps the grid and
+        every buffer shape static (cuda-graph safe) and is the regime this
+        kernel wins biggest in -- it is flat in batch where the Triton path is
+        linear. It costs throughput only at small batch with a long shard,
+        where splitting would fill the machine; sizing splits from a static
+        per-graph bound is the follow-up.
+        """
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
+
+        from sglang.kernels.ops.attention.dcp_kernels import _LOG2E
+
+        fm = self.forward_metadata
+        bs = fm.kv_indptr.shape[0] - 1
+        num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
+        kv_lora_rank = layer.v_head_dim
+
+        q3 = q.view(bs, num_heads, layer.qk_head_dim)
+        kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            -1, layer.qk_head_dim
+        )
+        out = q.new_empty((bs, num_heads, kv_lora_rank), dtype=self.input_dtype)
+
+        _, lse = mla_gluon(
+            q3[:, :, :kv_lora_rank],
+            q3[:, :, kv_lora_rank:],
+            kv_c,
+            out,
+            fm.kv_indices,
+            fm.kv_indptr[: bs + 1],
+            layer.scaling,
+            use_2d_view=False,
+            min_kv_seq_len=1,
+            return_lse=True,
+        )
+        # mla_gluon returns a natural-log lse; the cross-rank merge
+        # (cp_lse_ag_out_rs_mla) takes base-2.
+        return out, lse.view(bs, num_heads) * _LOG2E.value
 
     def _mla_decode_fwd_dcp_triton(self, q, k_buffer, layer, k_descale):
         """DCP decode on aiter's Triton MLA kernel -> (out, base-2 lse).
@@ -914,8 +979,74 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _mla_verify_fwd_dcp(self, q, k_window, layer, k_descale):
-        """DCP target-verify."""
+        """DCP target-verify.
+
+        Both variants use the same two-stage split (see the Triton one below);
+        only stage A's kernel differs. Stage B is a dense causal attention
+        either way. The Gluon variant needs the per-row TOKEN table, which is
+        only built when the flag is on -- fall back if it is missing (e.g. a
+        graph captured before the flag was read).
+        """
+        if (
+            envs.SGLANG_USE_AITER_GLUON_MLA_DCP.get()
+            and self.forward_metadata.dcp_verify_token_table is not None
+        ):
+            return self._mla_verify_fwd_dcp_gluon(q, k_window, layer)
         return self._mla_verify_fwd_dcp_triton(q, k_window, layer, k_descale)
+
+    def _mla_verify_fwd_dcp_gluon(self, q, k_window, layer):
+        """DCP target-verify stage A on aiter's Gluon MLA kernel.
+
+        The metadata already flattened the ``bs x q_len`` window into
+        ``bs * q_len`` single-token rows, so this is a plain decode for
+        mla_gluon: q is 3-D (qlen 1) and every row attends its whole committed
+        shard, bounded by its own ``cache_seqlens``. Rows of one request repeat
+        that request's shard, which is what ``dcp_verify_token_table`` holds.
+
+        ``min_kv_seq_len=1`` pins NUM_KV_SPLITS to 1 for the same
+        capture-stability reason as the decode path.
+        """
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
+
+        from sglang.kernels.ops.attention.dcp_kernels import (
+            _LOG2E,
+            dcp_lse_combine_base2,
+            dense_causal_mla_attn_base2,
+        )
+
+        fm = self.forward_metadata
+        q_len = fm.max_q_len
+        num_heads = layer.tp_q_head_num
+        kv_lora_rank = layer.v_head_dim
+        seqused_k = fm.dcp_local_kv_lens
+        n_rows = seqused_k.shape[0]
+        bs = n_rows // q_len
+
+        q3 = q.view(n_rows, num_heads, layer.qk_head_dim)
+        out_a = q.new_empty((n_rows, num_heads, kv_lora_rank), dtype=self.input_dtype)
+        _, lse_a = mla_gluon(
+            q3[:, :, :kv_lora_rank],
+            q3[:, :, kv_lora_rank:],
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                -1, layer.qk_head_dim
+            ),
+            out_a,
+            fm.dcp_verify_token_table,
+            seqused_k,
+            layer.scaling,
+            use_2d_view=True,
+            min_kv_seq_len=1,
+            return_lse=True,
+        )
+        lse_a = lse_a.view(n_rows, num_heads) * _LOG2E.value
+
+        if fm.dcp_cp_rank != 0:
+            return out_a, lse_a
+
+        out_b, lse_b = dense_causal_mla_attn_base2(
+            q, k_window, layer.scaling, bs, q_len, kv_lora_rank
+        )
+        return dcp_lse_combine_base2(out_a, lse_a, out_b, lse_b, self.input_dtype)
 
     def _mla_verify_fwd_dcp_triton(self, q, k_window, layer, k_descale):
         """DCP target-verify, split at the window boundary -> (out, base-2 lse).
@@ -996,8 +1127,58 @@ class AiterAttnBackend(AttentionBackend):
         return dcp_lse_combine_base2(out_a, lse_a, out_b, lse_b, self.input_dtype)
 
     def _mla_prefill_fwd_dcp(self, q, layer, k_descale, forward_batch):
-        """DCP prefill (extend) on aiter's Triton absorb-prefill kernel."""
+        """DCP prefill (extend), on the Gluon MLA kernel when it can serve the
+        batch and on aiter's Triton absorb-prefill kernel otherwise.
+
+        ``mla_gluon`` has no ``qo_indptr``: its MTP mode takes q as
+        ``[bs, qlen, nhead, dim]``, so one compiled kernel serves any qlen but
+        every request in the batch must contribute the SAME number of extend
+        tokens. A prefill batch is ragged in general, so this dispatches per
+        batch rather than per config, and the Triton path stays the fallback.
+        """
+        if envs.SGLANG_USE_AITER_GLUON_MLA_DCP.get():
+            extend_lens = forward_batch.extend_seq_lens_cpu
+            if extend_lens and len(set(extend_lens)) == 1:
+                return self._mla_prefill_fwd_dcp_gluon(
+                    q, layer, forward_batch, q_len=extend_lens[0]
+                )
         return self._mla_prefill_fwd_dcp_triton(q, layer, k_descale, forward_batch)
+
+    def _mla_prefill_fwd_dcp_gluon(self, q, layer, forward_batch, q_len: int):
+        """DCP prefill (extend) on aiter's Gluon MLA kernel, MTP mode.
+
+        Same assembled-KV setup as the Triton path below, but taken in
+        ``mla_gluon``'s varlen form (``dcp_kv_indices`` + ``dcp_kv_indptr``), so
+        it needs neither the page repack nor a paged block table. MTP masking is
+        ``q_pos attends KV[0, seq_len - q_len + q_pos]``, which is exactly the
+        extend window: ``seq_len`` is the request's assembled prefix + extend and
+        ``q_len`` its extend count.
+        """
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
+
+        dcp_meta = forward_batch.attn_dcp_metadata
+        kv_indptr = dcp_meta.dcp_kv_indptr
+        bs = kv_indptr.shape[0] - 1
+        num_heads = layer.tp_q_head_num
+        kv_lora_rank = layer.v_head_dim
+
+        q4 = q.view(bs, q_len, num_heads, layer.qk_head_dim)
+        out = q.new_empty(
+            (q.shape[0], num_heads * kv_lora_rank), dtype=self.input_dtype
+        )
+        mla_gluon(
+            q4[..., :kv_lora_rank],
+            q4[..., kv_lora_rank:],
+            dcp_meta.dcp_kv_buffer.view(-1, layer.qk_head_dim),
+            out.view(bs, q_len, num_heads, kv_lora_rank),
+            dcp_meta.dcp_kv_indices,
+            kv_indptr[: bs + 1],
+            layer.scaling,
+            use_2d_view=False,
+            min_kv_seq_len=1,
+            return_lse=False,
+        )
+        return out
 
     def _mla_prefill_fwd_dcp_triton(self, q, layer, k_descale, forward_batch):
         """DCP prefill (extend) on aiter's MLA absorb-prefill kernel.
@@ -1204,6 +1385,7 @@ class AiterAttnBackend(AttentionBackend):
         dcp_block_table = None
         dcp_local_kv_lens = None
         dcp_verify_qo_indptr = None
+        dcp_verify_token_table = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -1508,6 +1690,15 @@ class AiterAttnBackend(AttentionBackend):
                         draft_num,
                         (max_kv_len + self.dcp_world_size - 1) // self.dcp_world_size,
                     )
+                    if envs.SGLANG_USE_AITER_GLUON_MLA_DCP.get():
+                        dcp_verify_token_table = self._build_dcp_verify_token_table(
+                            kv_indptr,
+                            kv_indices,
+                            bs,
+                            draft_num,
+                            (max_kv_len + self.dcp_world_size - 1)
+                            // self.dcp_world_size,
+                        )
 
                 # if self.kv_cache_dtype == fp8_dtype:
                 if _use_mla_ps_kernel and not verify_dcp:
@@ -1561,6 +1752,7 @@ class AiterAttnBackend(AttentionBackend):
                     dcp_block_table=dcp_block_table,
                     dcp_local_kv_lens=dcp_local_kv_lens,
                     dcp_verify_qo_indptr=dcp_verify_qo_indptr,
+                    dcp_verify_token_table=dcp_verify_token_table,
                 )
             else:
                 draft_num = forward_batch.input_ids.shape[0] // bs
@@ -1860,6 +2052,36 @@ class AiterAttnBackend(AttentionBackend):
             )
         return out, out_lens, qo_indptr
 
+    def _build_dcp_verify_token_table(
+        self,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        bs: int,
+        q_len: int,
+        max_local_kv_len: int,
+        out: Optional[torch.Tensor] = None,
+    ):
+        """Per-ROW TOKEN table for the Gluon verify stage A.
+
+        Same expansion as the page table above -- every row of a request shares
+        that request's committed shard -- but one column per TOKEN, because
+        ``mla_gluon`` fixes PAGE_SIZE at 1. Built from the ragged
+        (kv_indptr, kv_indices) that ``_plan_dcp_decode_metadata`` already
+        localized, so it costs one scatter per forward, not per layer.
+
+        On the cuda-graph path the caller supplies a capture-stable buffer: this
+        runs OUT of the graph, so a freshly allocated output would be invisible
+        to the captured kernels (they keep the capture-time pointer).
+        """
+        from sglang.kernels.ops.attention.dcp_kernels import build_dcp_block_table
+
+        per_req = build_dcp_block_table(kv_indptr, kv_indices, bs, max_local_kv_len)
+        n_rows = bs * q_len
+        if out is None:
+            out = per_req.new_empty((n_rows, per_req.shape[1]))
+        out.view(bs, q_len, -1).copy_(per_req.unsqueeze(1).expand(bs, q_len, -1))
+        return out
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -1916,6 +2138,18 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 self.cuda_graph_dcp_verify_qo_indptr = torch.arange(
                     n_verify_rows + 1, dtype=torch.int32, device=self.device
+                )
+                # One column per TOKEN rather than per page, so this is
+                # page_size times wider than the block table above. Only the
+                # Gluon path reads it; skip the allocation otherwise.
+                self.cuda_graph_dcp_verify_token_table = (
+                    torch.zeros(
+                        (n_verify_rows, self._dcp_graph_max_local_kv_len()),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    if envs.SGLANG_USE_AITER_GLUON_MLA_DCP.get()
+                    else None
                 )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
@@ -2041,6 +2275,7 @@ class AiterAttnBackend(AttentionBackend):
         dcp_block_table = None
         dcp_local_kv_lens = None
         dcp_verify_qo_indptr = None
+        dcp_verify_token_table = None
 
         swa_page_table = None
         max_kv_len = (
@@ -2293,6 +2528,15 @@ class AiterAttnBackend(AttentionBackend):
                     out_lens=self.cuda_graph_dcp_verify_local_kv_lens[:n_rows],
                     qo_indptr=self.cuda_graph_dcp_verify_qo_indptr[: n_rows + 1],
                 )
+                if self.cuda_graph_dcp_verify_token_table is not None:
+                    dcp_verify_token_table = self._build_dcp_verify_token_table(
+                        kv_indptr,
+                        kv_indices,
+                        bs,
+                        self.num_draft_tokens,
+                        self._dcp_graph_max_local_kv_len(),
+                        out=self.cuda_graph_dcp_verify_token_table[:n_rows],
+                    )
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
@@ -2343,6 +2587,7 @@ class AiterAttnBackend(AttentionBackend):
                     dcp_block_table=dcp_block_table,
                     dcp_local_kv_lens=dcp_local_kv_lens,
                     dcp_verify_qo_indptr=dcp_verify_qo_indptr,
+                    dcp_verify_token_table=dcp_verify_token_table,
                 )
             else:
                 max_q_len = verify_tokens_per_req

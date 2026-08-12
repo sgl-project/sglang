@@ -3898,16 +3898,65 @@ class ServerArgs:
         if model_config.attention_arch != AttentionArch.MLA:
             return
 
-        if "fp8" in (self.kv_cache_dtype or "") and not (
-            envs.SGLANG_EXPERIMENTAL_AITER_DCP_FP8.get()
-        ):
-            raise ValueError(
-                "aiter MLA decode context parallel (--dcp-size > 1) defaults to "
-                "bf16 kv-cache. fp8 kv-cache has been validated for Kimi-K3 on "
-                "gfx950 only (gsm8k within the run-to-run band of bf16, KV pool "
-                "exactly 2x); it stays opt-in pending broader coverage. Set "
-                "SGLANG_EXPERIMENTAL_AITER_DCP_FP8=1 to enable it."
+        use_gluon = envs.SGLANG_USE_AITER_GLUON_MLA_DCP.get()
+        if use_gluon:
+            self._validate_gluon_mla_dcp_buildable()
+
+        if "fp8" in (self.kv_cache_dtype or ""):
+            if use_gluon:
+                # mla_gluon's fp8 regime (bh16bn128) asserts batch_size == 1,
+                # so it cannot serve a real decode batch.
+                raise ValueError(
+                    "fp8 kv-cache cannot be combined with "
+                    "SGLANG_USE_AITER_GLUON_MLA_DCP=1: aiter's Gluon MLA kernel "
+                    "only accepts fp8 at batch size 1. Unset the flag to take "
+                    "the Triton DCP path, which serves fp8 at any batch size."
+                )
+            if not envs.SGLANG_EXPERIMENTAL_AITER_DCP_FP8.get():
+                raise ValueError(
+                    "aiter MLA decode context parallel (--dcp-size > 1) defaults "
+                    "to bf16 kv-cache. fp8 kv-cache has been validated on the "
+                    "Triton DCP path for Kimi-K3 on gfx950 only (gsm8k within "
+                    "the run-to-run band of bf16, KV pool exactly 2x); it stays "
+                    "opt-in pending broader coverage. Set "
+                    "SGLANG_EXPERIMENTAL_AITER_DCP_FP8=1 to enable it."
+                )
+
+    def _validate_gluon_mla_dcp_buildable(self):
+        """Reject SGLANG_USE_AITER_GLUON_MLA_DCP when triton is too old.
+
+        ``aiter.ops.triton.gluon.mla_gluon`` builds its shared-memory layout
+        with ``gl.PaddedSharedLayout(..., cga_layout=...)``, a kwarg that only
+        exists from triton 3.7. On 3.6 nothing complains until the kernel is
+        compiled -- i.e. during cuda-graph capture, minutes into startup, as a
+        CompilationError naming neither triton nor this flag (and with
+        --disable-cuda-graph it moves to the first decode request instead).
+        aiter's own guard misses it too: ``aiter/ops/triton/gluon/__init__.py``
+        only rejects below 3.6.0, so a ``3.6.0+git...`` build sails past.
+        """
+        try:
+            from triton.experimental.gluon import language as gl
+        except ImportError as e:
+            reason = f"triton's gluon language is not importable ({e})"
+        else:
+            import inspect
+
+            params = inspect.signature(gl.PaddedSharedLayout.__init__).parameters
+            if "cga_layout" in params:
+                return
+            import triton
+
+            reason = (
+                f"the installed triton ({triton.__version__}) does not accept "
+                "gl.PaddedSharedLayout(cga_layout=...), which the kernel requires"
             )
+
+        raise ValueError(
+            "SGLANG_USE_AITER_GLUON_MLA_DCP=1 selects aiter's Gluon MLA kernel "
+            f"for the DCP decode path, but {reason}. That kernel needs "
+            "triton >= 3.7. Either unset SGLANG_USE_AITER_GLUON_MLA_DCP to use "
+            "the Triton DCP path, or upgrade triton."
+        )
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
