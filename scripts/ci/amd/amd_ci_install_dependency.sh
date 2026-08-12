@@ -359,6 +359,15 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
 
+    # `setup.py develop` does not compile any kernel module, so the rebuild above
+    # leaves the JIT cache empty. Pay that cost here instead of inside a test,
+    # where a cold module blocks the scheduler loop past its 300s watchdog.
+    echo "[CI-AITER-CHECK] === AITER KERNEL WARMUP START ==="
+    docker exec -e GPU_ARCHS="${GPU_ARCH_LIST}" ci_sglang \
+        python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py \
+        || echo "[CI-AITER-CHECK] AITER warmup did not complete; continuing"
+    echo "[CI-AITER-CHECK] === AITER KERNEL WARMUP COMPLETE ==="
+
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi
 
@@ -367,14 +376,3 @@ echo "[CI-AITER-CHECK] === AITER VERSION CHECK END ==="
 # Must be the final pip operation: force httpx>=0.25.0 so the anthropic SDK can
 # construct its httpx transport (see ensure_httpx definition above).
 ensure_httpx
-
-
-# # Clear pre-built AITER kernels from Docker image to avoid segfaults
-# # The Docker image may contain pre-compiled kernels incompatible with the current environment
-# echo "Clearing pre-built AITER kernels from Docker image..."
-# docker exec ci_sglang find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
-# docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
-
-# # Pre-build AITER kernels to avoid timeout during tests
-# echo "Warming up AITER JIT kernels..."
-# docker exec -e SGLANG_USE_AITER=1 ci_sglang python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"
