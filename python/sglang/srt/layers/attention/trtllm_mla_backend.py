@@ -89,25 +89,6 @@ TRTLLM_BLOCK_CONSTRAINT = 128
 
 TRTLLM_MLA_MAX_BATCH_SIZE = 8192
 
-# sglang's MLA DCP merge (deepseek_common/attention_forward_methods/forward_mla.py)
-# reduces with is_lse_base_on_e=False, i.e. it expects a base-2 LSE. Rebasing a
-# natural-log LSE is a single multiply by log2(e); the softmax output itself is
-# base-invariant.
-LSE_BASE2_FROM_NATURAL_LOG = math.log2(math.e)
-
-# Whether a flashinfer MLA decode kernel returns a natural-log LSE, and so needs
-# the rebase above. flashinfer's own trtllm-gen MLA test asserts only the LSE
-# dtype, shape and finiteness, never its base, so this is not documented
-# upstream and was measured on B200/SM100 (flashinfer 0.6.15.post1) against a
-# torch.logsumexp reference: trtllm-gen already emits base-2
-# (median lse/ln_ref = 1.442695 = log2(e), max abs error 4e-6 against the
-# rebased reference), while cute-dsl emits natural log. An unlisted backend
-# falls back to no rebase, matching trtllm-gen.
-DECODE_LSE_IS_NATURAL_LOG_BY_BACKEND = {
-    "trtllm-gen": False,
-    "cute-dsl": True,
-}
-
 
 def _multi_ctas_kv_counter_bytes(
     device: torch.device, num_q_heads: int, batch_size: int
@@ -218,10 +199,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
         pass
 
-    # Resolved per instance from ``backend`` in __init__; the class default keeps
-    # the no-rebase behaviour for instances built without it.
-    decode_lse_is_natural_log: bool = False
-
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -258,9 +235,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Runtime parameters
         self.backend = backend
-        self.decode_lse_is_natural_log = DECODE_LSE_IS_NATURAL_LOG_BY_BACKEND.get(
-            backend, False
-        )
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
@@ -1083,7 +1057,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
                 self._multi_ctas_kv_counter_buffer
             )
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
             enable_pdl=_ENABLE_PDL,
@@ -1099,12 +1073,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             **extra_kwargs,
         )
-        if not return_lse:
-            return out
-        raw_out, lse = out
-        if self.decode_lse_is_natural_log:
-            lse = lse * LSE_BASE2_FROM_NATURAL_LOG
-        return raw_out, lse
 
     def _run_prefill_kernel(
         self,
