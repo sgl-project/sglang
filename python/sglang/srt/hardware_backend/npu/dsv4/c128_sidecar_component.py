@@ -1,8 +1,7 @@
 """C128 sidecar ownership for the DSV4 NPU Unified Radix Cache.
 
-One sidecar page contains the 16 C128 KV entries produced by a 2048-token
-Full prefix group.  The component deliberately exposes only complete groups to
-the radix tree: partial tail pages remain request-owned.
+The component deliberately exposes only complete physical C128 pages to the
+radix tree; partial tail pages remain request-owned.
 """
 
 from __future__ import annotations
@@ -37,9 +36,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import (
         UnifiedTreeNode,
     )
-
-
-C128_GROUP_TOKENS = 2048
 
 
 class C128SidecarComponent(TreeComponent):
@@ -101,7 +97,7 @@ class C128SidecarComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
-        # A page is attached only to the node ending its 2048-token group.
+        # A page is attached only to the node ending its full physical group.
         return lambda node: node.component_data[self.component_type].value is not None
 
     def finalize_match_result_in_cache(
@@ -125,7 +121,8 @@ class C128SidecarComponent(TreeComponent):
             if chunks
             else self.allocator.c128_attn_allocator.free_pages.new_empty((0,))
         )
-        assert pages.numel() == len(result.device_indices) // C128_GROUP_TOKENS
+        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
+        assert pages.numel() == len(result.device_indices) // group_tokens
         self.cache.req_to_token_pool.set_c128_prefix_pages(req, pages)
         return result
 
@@ -139,8 +136,9 @@ class C128SidecarComponent(TreeComponent):
     ) -> None:
         pages = params.c128_value
         assert pages is not None
-        start = total_prefix_len // C128_GROUP_TOKENS
-        end = (total_prefix_len + prefix_len) // C128_GROUP_TOKENS
+        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
+        start = total_prefix_len // group_tokens
+        end = (total_prefix_len + prefix_len) // group_tokens
         self._attach(node, pages[start:end])
 
     @staticmethod
@@ -211,14 +209,13 @@ class C128SidecarComponent(TreeComponent):
 
         # Full/SWA may initially represent the new suffix as one long leaf.
         # Materialize every complete C128 group boundary so a later branch can
-        # always match the nearest 2048-token prefix instead of falling back to
+        # always match the nearest full C128-page prefix instead of falling back to
         # the previous, potentially much shorter, Radix node.
-        first_boundary = (
-            result.prefix_len // C128_GROUP_TOKENS + 1
-        ) * C128_GROUP_TOKENS
-        for boundary in range(first_boundary, len(params.key) + 1, C128_GROUP_TOKENS):
+        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
+        first_boundary = (result.prefix_len // group_tokens + 1) * group_tokens
+        for boundary in range(first_boundary, len(params.key) + 1, group_tokens):
             boundary_node = self._ensure_boundary_node(node, boundary, cache_actions)
-            page_index = boundary // C128_GROUP_TOKENS - 1
+            page_index = boundary // group_tokens - 1
             self._attach(boundary_node, params.c128_value[page_index : page_index + 1])
 
     def redistribute_on_node_split(
@@ -260,8 +257,9 @@ class C128SidecarComponent(TreeComponent):
         logical_len = token_ids_len
         if self.tree_core.is_eagle and logical_len > 0:
             logical_len -= 1
-        cache_len = logical_len // C128_GROUP_TOKENS * C128_GROUP_TOKENS
-        num_pages = cache_len // C128_GROUP_TOKENS
+        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
+        cache_len = logical_len // group_tokens * group_tokens
+        num_pages = cache_len // group_tokens
         insert_params.c128_value = self.cache.req_to_token_pool.req_to_c128_sidecar[
             int(req.req_pool_idx), :num_pages
         ].clone()

@@ -33,13 +33,11 @@ from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 
-C128_PAGE_SIZE = 16
-
-
 def get_last_loc(
     req_to_c128_sidecar: torch.Tensor,
     req_pool_indices: torch.Tensor,
     prefix_lens: torch.Tensor,
+    page_size: int,
 ) -> torch.Tensor:
     """Slot id of each req's last already-allocated token, or -1 when
     ``prefix_lens[i] == 0`` (fresh req).
@@ -50,12 +48,11 @@ def get_last_loc(
     """
     req_pool_indices = req_pool_indices.to(torch.int64)
     last_pos = (prefix_lens.to(torch.int64) - 1).clamp(min=0)
-    page_ids = req_to_c128_sidecar[
-        req_pool_indices, last_pos // C128_PAGE_SIZE
-    ].to(prefix_lens.dtype)
+    page_ids = req_to_c128_sidecar[req_pool_indices, last_pos // page_size].to(
+        prefix_lens.dtype
+    )
     last_loc = (
-        page_ids * C128_PAGE_SIZE
-        + last_pos.to(prefix_lens.dtype) % C128_PAGE_SIZE
+        page_ids * page_size + last_pos.to(prefix_lens.dtype) % page_size
     )
     return torch.where(prefix_lens > 0, last_loc, torch.full_like(prefix_lens, -1))
 
@@ -128,7 +125,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # paged allocator. pool_size is in compressed-token units.
             return NPUPagedTokenToKVPoolAllocator(
                 pool_size,
-                page_size=C128_PAGE_SIZE,
+                page_size=pool.kernel_page_size,
                 dtype=dtype,
                 device=device,
                 kvcache=pool,
@@ -190,7 +187,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         free_pages = page_ids[self.c128_page_refcount[page_ids] == 0]
         if free_pages.numel() > 0:
-            self.c128_attn_allocator.free(free_pages * C128_PAGE_SIZE)
+            self.c128_attn_allocator.free(
+                free_pages * self.c128_attn_allocator.page_size
+            )
 
     def replace_req_c128_prefix(
         self, req_pool_idx: int, page_ids: torch.Tensor, req_to_token_pool
@@ -246,9 +245,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         c_table = self._cur_req_to_token_pool.req_to_c128_sidecar
         c_prefix = (prefix_lens // ratio).to(prefix_lens.dtype)
         c_seq = (seq_lens // ratio).to(seq_lens.dtype)
-        c_last_loc = get_last_loc(c_table, req_pool_indices, c_prefix).to(
-            last_loc_dtype
-        )
+        c_last_loc = get_last_loc(
+            c_table, req_pool_indices, c_prefix, allocator.page_size
+        ).to(last_loc_dtype)
 
         result = allocator.alloc_extend(
             c_prefix,
@@ -267,14 +266,12 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def _has_c128_sidecar_capacity(
         self, prefix_lens_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
     ) -> bool:
-        prefix_groups = (
-            prefix_lens_cpu // 128 + C128_PAGE_SIZE - 1
-        ) // C128_PAGE_SIZE
-        seq_groups = (
-            seq_lens_cpu // 128 + C128_PAGE_SIZE - 1
-        ) // C128_PAGE_SIZE
+        ratio = 128
+        page_size = self.c128_attn_allocator.page_size
+        prefix_groups = (prefix_lens_cpu // ratio + page_size - 1) // page_size
+        seq_groups = (seq_lens_cpu // ratio + page_size - 1) // page_size
         need = int((seq_groups - prefix_groups).clamp(min=0).sum().item())
-        return need <= self.c128_attn_allocator.available_size() // C128_PAGE_SIZE
+        return need <= self.c128_attn_allocator.available_size() // page_size
 
     def _alloc_compressed_kv(
         self,
@@ -488,7 +485,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def resize(self, config) -> None:
         self.c128_attn_allocator.size = int(config.c128_max_total_num_tokens)
         self.c128_attn_allocator.num_pages = (
-            self.c128_attn_allocator.size // C128_PAGE_SIZE
+            self.c128_attn_allocator.size // self.c128_attn_allocator.page_size
         )
         super().resize(config)
 

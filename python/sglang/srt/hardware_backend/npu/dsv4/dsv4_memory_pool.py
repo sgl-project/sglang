@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
 )
+from sglang.srt.runtime_context import get_server_args
 
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
@@ -34,10 +35,9 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
 
     ``npu_sparse_attn_sharedkv`` reads KV in PA_ND layout
     ``(num_pages, kernel_page_size, num_kv_heads=1, dim)`` with ``dim`` packing
-    K_nope + K_rope as bf16. C4 uses its native 32-token page so its physical
-    page id can be shared with the corresponding 128-token full page. C128 uses
-    a 16-slot sidecar page for each 2048-token Full logical group. SWA uses
-    ``kernel_page_size == page_size``.
+    K_nope + K_rope as bf16. C4 uses its native page so its physical page id can
+    be shared with the corresponding full page. C128 uses its independently
+    configured physical page size; Full/SWA use the global page size.
     The CUDA fp8-packed-bytes layout (the base ``create_buffer``) is untouched.
     """
 
@@ -236,6 +236,16 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     accessors instead).
     """
 
+    def __init__(self, *args, **kwargs):
+        c128_page_size = get_server_args().c128_page_size
+        if c128_page_size <= 0 or c128_page_size % 16 != 0:
+            raise ValueError(
+                "c128_page_size must be a positive multiple of 16 for the NPU "
+                f"sparse-attention operator, got {c128_page_size}"
+            )
+        self.c128_page_size = c128_page_size
+        super().__init__(*args, **kwargs)
+
     def _make_kv_pool(
         self,
         *,
@@ -254,11 +264,16 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             "enable_hisparse is not supported on the NPU DSV4 KV pool "
             f"(got c4 pool class {cls.__name__})."
         )
-        # C4 uses its native page size; other pools keep the global page size.
+        # Full/SWA use the global page size, C4 uses its native compressed page,
+        # and C128 has an independent physical page size.
         is_c4_pool = page_size * 4 == global_page_size
-        kernel_page_size = page_size if is_c4_pool else global_page_size
-        if page_size == 1:
-            kernel_page_size = 16
+        is_c128_pool = page_size * 128 == global_page_size
+        if is_c4_pool:
+            kernel_page_size = page_size
+        elif is_c128_pool:
+            kernel_page_size = self.c128_page_size
+        else:
+            kernel_page_size = global_page_size
         return NPUDeepSeekV4SingleKVPool(
             size,
             page_size,
@@ -518,44 +533,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             safe_swa_loc,
             kv_out,
         )
-
-    # ------------------------------------------------------------------
-    # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.
-    # CompressStatePool stores a fused [kv | score] tensor; split is a last-dim slice.
-    # ------------------------------------------------------------------
-
-    def set_state_buffer(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        kv: torch.Tensor,
-        score: torch.Tensor,
-        from_indexer: bool,
-    ) -> None:
-        # KVAndScore.kv_score is [..., 2*coff*head_dim] = [kv | score].
-        kv_score = self._get_state_pool(layer_id, from_indexer).kv_score_buffer.kv_score
-        last_dim = kv_score.shape[-1]
-        half = last_dim // 2
-        kv_view = kv.reshape(-1, half).to(kv_score.dtype)
-        score_view = score.reshape(-1, half).to(kv_score.dtype)
-        kv_score[loc, :half] = kv_view
-        kv_score[loc, half:] = score_view
-
-    def get_state_buffer(
-        self,
-        layer_id: int,
-        from_indexer: bool,
-        kv_indices: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        kv_score = self._get_state_pool(layer_id, from_indexer).kv_score_buffer.kv_score
-        if kv_indices is not None:
-            kv_score = kv_score[kv_indices]
-        last_dim = kv_score.shape[-1]
-        half = last_dim // 2
-        kv = kv_score[..., :half].unsqueeze(-2)  # add num_kv_heads=1 axis
-        score = kv_score[..., half:].unsqueeze(-2)
-        return kv, score
-
     def set_compress_buffer(
         self,
         layer_id: int,

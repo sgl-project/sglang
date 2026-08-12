@@ -3,7 +3,7 @@
 Subclass of ``ReqToTokenPool`` that adds the one auxiliary per-request table
 needed by the DSV4 attention backend:
 
-  * ``req_to_c128_sidecar`` — one C128 page id per 2048 raw tokens
+  * ``req_to_c128_sidecar`` — one page id per C128 physical page
 
 C4 locations are derived from the base full-token table, and SWA locations use
 the existing full-to-SWA mapping. The sidecar is populated by the existing
@@ -17,6 +17,7 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
@@ -31,7 +32,11 @@ class DSV4ReqToTokenTablesMixin:
     """
 
     def _init_dsv4_tables(
-        self, max_context_len: int, device: str, enable_memory_saver: bool
+        self,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        c128_page_size: int,
     ) -> None:
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -41,23 +46,28 @@ class DSV4ReqToTokenTablesMixin:
         # register_dsv4_allocator after both exist, so free(req) can release
         # c128 pages. None at construction so base clear() runs safely.
         self._dsv4_allocator = None
+        self.c128_page_size = c128_page_size
 
-        # One C128 sidecar page per 16 Full pages / 2048 raw tokens.
+        group_tokens = 128 * c128_page_size
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_c128_sidecar = torch.zeros(
-                (self._alloc_size, max(1, (max_context_len + 2047) // 2048)),
+                (
+                    self._alloc_size,
+                    max(1, (max_context_len + group_tokens - 1) // group_tokens),
+                ),
                 dtype=torch.int32,
                 device=device,
             )
 
     def write_c128(self, indices, values: torch.Tensor) -> None:
         req_pool_idx, token_slice = indices
-        first_group = (token_slice.start + 15) // 16
-        end_group = (token_slice.stop + 15) // 16
+        page_size = self.c128_page_size
+        first_group = (token_slice.start + page_size - 1) // page_size
+        end_group = (token_slice.stop + page_size - 1) // page_size
         if first_group == end_group:
             return
         groups = torch.arange(first_group, end_group, device=values.device)
-        pages = values[groups * 16 - token_slice.start] // 16
+        pages = values[groups * page_size - token_slice.start] // page_size
         prefix_pages = self.req_to_c128_sidecar[req_pool_idx, :end_group].clone()
         prefix_pages[groups] = pages
         self._dsv4_allocator.replace_req_c128_prefix(
@@ -66,7 +76,7 @@ class DSV4ReqToTokenTablesMixin:
 
     def register_dsv4_allocator(self, allocator) -> None:
         """Wire the DSV4NPUTokenToKVPoolAllocator ref so ``free(req)`` can
-        release C128 KV pages and clear the fixed C128 state bank."""
+        release C128 KV pages."""
         self._dsv4_allocator = allocator
 
     def set_c128_prefix_pages(self, req, page_ids: torch.Tensor) -> None:
@@ -123,7 +133,12 @@ class DSV4NPUReqToTokenPool(DSV4ReqToTokenTablesMixin, ReqToTokenPool):
         enable_memory_saver: bool,
     ):
         super().__init__(size, max_context_len, device, enable_memory_saver)
-        self._init_dsv4_tables(max_context_len, device, enable_memory_saver)
+        self._init_dsv4_tables(
+            max_context_len,
+            device,
+            enable_memory_saver,
+            get_server_args().c128_page_size,
+        )
 
     def free(self, req):
         self._dsv4_free(req)
@@ -152,7 +167,12 @@ class DSV4NPUDecodeReqToTokenPool(DSV4ReqToTokenTablesMixin, DecodeReqToTokenPoo
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
-        self._init_dsv4_tables(max_context_len, device, enable_memory_saver)
+        self._init_dsv4_tables(
+            max_context_len,
+            device,
+            enable_memory_saver,
+            get_server_args().c128_page_size,
+        )
 
     def free(self, req):
         self._dsv4_free(req)
