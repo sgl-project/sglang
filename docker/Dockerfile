@@ -497,6 +497,25 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Onion model/data tooling only for private-delivery builds.
+ARG INSTALL_ONION=0
+ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
+ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
+RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
+    if [ "$INSTALL_ONION" = "1" ]; then \
+        VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+        && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}" \
+            | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} ${VERSION_CODENAME} main" \
+            > /etc/apt/sources.list.d/volctools.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends onion-ai-data \
+        && rm -rf /var/lib/apt/lists/* \
+        && apt-get clean; \
+    else \
+        echo "Skipping Onion installation (INSTALL_ONION=${INSTALL_ONION})"; \
+    fi
+
 # =============================================================================
 # Python packages and tools (before source copy for better caching)
 # =============================================================================
@@ -783,6 +802,25 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# Install Onion model/data tooling only for private-delivery builds.
+ARG INSTALL_ONION=0
+ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
+ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
+RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
+    if [ "$INSTALL_ONION" = "1" ]; then \
+        VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+        && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}" \
+            | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} ${VERSION_CODENAME} main" \
+            > /etc/apt/sources.list.d/volctools.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends onion-ai-data \
+        && rm -rf /var/lib/apt/lists/* \
+        && apt-get clean; \
+    else \
+        echo "Skipping Onion installation (INSTALL_ONION=${INSTALL_ONION})"; \
+    fi
 
 # create virtual env for sglang to avoid conflict with system python packages
 RUN python3 -m venv /opt/sglang
