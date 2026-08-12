@@ -311,6 +311,7 @@ class TpModelWorker(BaseTpWorker):
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
+        random_seed: Optional[int] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -370,8 +371,13 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers.
-        # Elastic joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_joiner:
+        # Elastic joiners cannot enter the launch-time WORLD broadcast. Neither can a
+        # draft worker that exists on a subset of ranks (prefill-side PP builds it on
+        # the last stage only); it takes the seed the target already broadcast, which
+        # keeps the value identical to today's re-broadcast on every other setup.
+        if random_seed is not None:
+            self.random_seed = random_seed
+        elif server_args.is_ep_joiner:
             self.random_seed = server_args.random_seed
         else:
             self.random_seed = broadcast_pyobj(

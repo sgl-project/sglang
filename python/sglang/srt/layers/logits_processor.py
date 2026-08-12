@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -69,6 +70,22 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedLinearMethod",
     "PackWeightMethod",
 }
+
+
+def _trace_e2e_logits(stage: str, **fields) -> None:
+    """Opt-in stage trace for diagnosing post-MoE DP-attention stalls."""
+    if os.getenv("SGLANG_TRACE_LOGITS_E2E", "0") != "1":
+        return
+    try:
+        parallel = get_parallel()
+        rank = (
+            f"dp={parallel.attn_dp_rank} "
+            f"tp={parallel.tp_rank}"
+        )
+    except Exception:
+        rank = "rank=unknown"
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"SGLANG_TRACE_LOGITS_E2E {rank} stage={stage} {details}", flush=True)
 
 
 def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
@@ -718,24 +735,50 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        _trace_e2e_logits(
+            "get_logits_enter",
+            hidden_shape=tuple(hidden_states.shape),
+            dp_gather=self.do_tensor_parallel_all_gather_dp_attn,
+            tp_gather=self.do_tensor_parallel_all_gather,
+        )
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
+        _trace_e2e_logits(
+            "dp_hidden_gather_returned",
+            global_shape=tuple(hidden_states.shape),
+            local_shape=tuple(local_hidden_states.shape),
+        )
 
+        if os.getenv("SGLANG_TRACE_LOGITS_E2E_SYNC", "0") == "1":
+            _trace_e2e_logits("pre_lm_head_sync_enter")
+            torch.cuda.synchronize()
+            _trace_e2e_logits("pre_lm_head_sync_returned")
+
+        _trace_e2e_logits("lm_head_enter", hidden_shape=tuple(hidden_states.shape))
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
+        if os.getenv("SGLANG_TRACE_LOGITS_E2E_SYNC", "0") == "1":
+            _trace_e2e_logits("post_lm_head_sync_enter")
+            torch.cuda.synchronize()
+            _trace_e2e_logits("post_lm_head_sync_returned")
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
         if self.do_tensor_parallel_all_gather:
+            _trace_e2e_logits("tp_logits_gather_enter", logits_shape=tuple(logits.shape))
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
                 logits = self._logits_gatherer(logits)
+            _trace_e2e_logits("tp_logits_gather_returned", logits_shape=tuple(logits.shape))
 
+        _trace_e2e_logits("dp_logits_scatter_enter", logits_shape=tuple(logits.shape))
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
         )
+        _trace_e2e_logits("dp_logits_scatter_returned", logits_shape=tuple(logits.shape))
 
         logits = self._copy_logits_to_buffer(
             logits, logits_metadata, use_buffer=use_logits_buffer
@@ -803,10 +846,27 @@ class LogitsProcessor(nn.Module):
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.do_tensor_parallel_all_gather_dp_attn:
+            _trace_e2e_logits(
+                "dp_metadata_enter",
+                local_shape=tuple(hidden_states.shape),
+                global_counts_cpu=logits_metadata.global_num_tokens_for_logprob_cpu,
+            )
             logits_metadata.compute_dp_attention_metadata()
+            _trace_e2e_logits(
+                "dp_metadata_returned",
+                buffer_shape=tuple(logits_metadata.gathered_buffer.shape),
+                local_start=logits_metadata.dp_local_start_pos,
+                local_tokens=logits_metadata.dp_local_num_tokens,
+            )
             local_hidden_states = hidden_states
             hidden_states = logits_metadata.gathered_buffer
+            _trace_e2e_logits(
+                "dp_hidden_gather_enter",
+                global_shape=tuple(hidden_states.shape),
+                local_shape=tuple(local_hidden_states.shape),
+            )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            _trace_e2e_logits("dp_hidden_gather_collective_returned")
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
 

@@ -1,1 +1,53 @@
-.gitignore
+# Build-context allowlist.
+#
+# This file used to be a symlink to .gitignore. That let the entire repository
+# into the build context, and `COPY . /sgl-workspace/sglang` then shipped it all
+# inside a distributable image: the test suite, internal benchmarks, the docs
+# site, CI workflows, the model gateway, and the agent skill directories under
+# .claude -- including python/sglang/multimodal_gen/.claude, which sits inside
+# the runtime tree and so survives any top-level filtering.
+#
+# None of that has a runtime role, and all of it is proprietary: anyone able to
+# pull the image could read it. The context is therefore an explicit allowlist of
+# what the image actually needs, rather than a denylist inherited from git.
+#
+# .gitignore and .dockerignore answer different questions -- "what should not be
+# committed" versus "what should not leave the building" -- and sharing one file
+# between them is what let this happen.
+
+# Exclude everything, then re-admit only what is needed.
+*
+
+# The runtime package: what `pip install -e python` installs.
+!python/
+# The Dockerfiles run cuda_pins.sh and apply_deepep_v2_patch.sh out of the copied
+# tree, not only from /opt/qwen38, so the build needs this directory.
+!docker/
+# Required at BUILD time, not run time: python/setup.py points setuptools-rust at
+# ../rust (lines 3 and 178), so `pip install -e python` fails without it --
+# "no cargo workspace at rust/Cargo.toml". Excluding it would force
+# SGLANG_BUILD_RUST_EXTS=none, i.e. an image with no Rust extensions at all,
+# which is a capability change disguised as a size reduction. The Dockerfile
+# still deletes rust/*/target afterwards, so no build output ships.
+!rust/
+# Both are tiny. Dropping them on a guess that nothing reads them would risk
+# breaking gRPC codegen or a vendored build for no meaningful reduction.
+!proto/
+!3rdparty/
+# Apache-2.0 requires the licence to accompany distributions of a derived work,
+# and this image is one. It is not runtime code, but it does have to ship.
+!LICENSE
+
+# Re-exclude what must not travel even inside the allowlisted trees. These come
+# after the allowlist entries on purpose: the last matching pattern wins.
+**/.claude/
+
+# Build artifacts. Previously covered by .gitignore through the symlink; restated
+# so a `docker build` from a dirty checkout cannot smuggle them in either.
+**/__pycache__/
+**/*.py[cod]
+**/*.so
+**/build/
+**/dist/
+**/*.egg-info/
+.git/

@@ -38,6 +38,7 @@ Backend selection comes from cuda_graph_config.prefill:
 from __future__ import annotations
 
 import copy
+import dataclasses
 import inspect
 import logging
 from contextlib import contextmanager
@@ -307,6 +308,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            pp_size=self.model_runner.pp_group.world_size,
+            hc_hidden_size=getattr(
+                self.model_runner.model_config, "hc_hidden_size", None
+            ),
+            pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -608,6 +614,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         return forward_batch.positions
 
+    def _static_pp_proxy_tensors(self, num_tokens: int) -> Optional[PPProxyTensors]:
+        buffers = self.buffers.pp_proxy_tensors
+        if buffers is None:
+            return None
+        return PPProxyTensors(
+            {key: value[:num_tokens] for key, value in buffers.items()}
+        )
+
     @contextmanager
     def _prefill_forward_context(
         self,
@@ -664,6 +678,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         set_is_extend_in_batch(False)
 
         with self._prefill_forward_context(forward_batch):
+            pp_kwargs = self.model_runner._pp_kwargs(
+                self._static_pp_proxy_tensors(num_tokens)
+            )
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
@@ -672,12 +689,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     positions,
                     forward_batch,
                     forward_batch.input_embeds,
+                    **pp_kwargs,
                 )
             # tc_piecewise: compile/capture the outer model.forward path.
             return self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
+                **pp_kwargs,
             )
 
     def _run_dummy_forward(self, num_tokens: int) -> None:
@@ -1429,6 +1448,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_bs=bs,
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
+            pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
         )
 
         registry = self.buffer_registry
@@ -1481,6 +1501,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else forward_batch.global_forward_mode
         )
 
+        # The eager tail of the draft model concatenates spec hidden states
+        # with embeddings of the padded input_ids, so the batch must carry the
+        # bucket-sized static buffer view rather than the raw-length live
+        # tensor. The buffer prefix is refreshed from the live tensor below.
+        padded_spec_info = forward_batch.spec_info
+        if (
+            self.static_draft_hidden_states is not None
+            and padded_spec_info is not None
+            and getattr(padded_spec_info, "hidden_states", None) is not None
+        ):
+            padded_spec_info = dataclasses.replace(
+                padded_spec_info,
+                hidden_states=self.static_draft_hidden_states[:static_num_tokens],
+            )
+
         static_forward_batch = ForwardBatch(
             forward_mode=pcg_forward_mode,
             batch_size=bs,
@@ -1524,7 +1559,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=forward_batch.spec_algorithm,
-            spec_info=forward_batch.spec_info,
+            spec_info=padded_spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=num_token_non_padded,
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
@@ -1717,8 +1752,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(output, EmbeddingPoolerOutput):
             return output
         assert isinstance(output, PPProxyTensors)
-        raise NotImplementedError(
-            "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
+        return PPProxyTensors(
+            {key: value[: self.raw_num_tokens] for key, value in output.tensors.items()}
         )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:

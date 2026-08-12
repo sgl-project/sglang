@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -21,6 +22,9 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
+from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
+    validate_replay_state_indices_cpu,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -33,6 +37,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
 
 logger = logging.getLogger(__name__)
+_validate_mamba_replay_state_indices = (
+    os.environ.get("SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES", "0") == "1"
+)
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -579,6 +586,18 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_indices = self._translate_mamba_indices(mamba_indices)
             mamba_indices[bs - num_padding :] = -1
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        if _validate_mamba_replay_state_indices and not in_capture:
+            # This function runs before graph replay.  The diagnostic CPU copy
+            # deliberately synchronizes here so malformed live/padded indices
+            # fail before any captured indexed state update can consume them.
+            valid_bs = bs - int(num_padding)
+            validate_replay_state_indices_cpu(
+                mamba_indices.detach().cpu(),
+                valid_bs=valid_bs,
+                total_bs=bs,
+                num_state_slots=self.req_to_token_pool.mamba_pool.size + 1,
+                pad_slot_id=self.pad_slot_id,
+            )
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
         # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices

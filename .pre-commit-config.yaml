@@ -1,5 +1,5 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/kernels/ops/attention/flash_attn/cute)
+exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/kernels/ops/attention/flash_attn/cute|python/sglang/srt/layers/flashinfer_fallback/comm/(mnnvl_cutedsl/|mnnvl_cutedsl_ar\.py))
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -67,6 +68,19 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
+def _trace_e2e_sampler(stage: str, **fields) -> None:
+    """Opt-in sampler stage trace for DP-attention E2E diagnostics."""
+    if os.getenv("SGLANG_TRACE_SAMPLER_E2E", "0") != "1":
+        return
+    try:
+        parallel = get_parallel()
+        rank = f"dp={parallel.attn_dp_rank} tp={parallel.tp_rank}"
+    except Exception:
+        rank = "rank=unknown"
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"SGLANG_TRACE_SAMPLER_E2E {rank} stage={stage} {details}", flush=True)
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -118,12 +132,20 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+        _trace_e2e_sampler(
+            "forward_enter",
+            logits_shape=tuple(logits.shape),
+            all_greedy=sampling_info.is_all_greedy,
+        )
 
         # Preprocess logits (custom processors and NaN handling)
+        _trace_e2e_sampler("preprocess_enter")
         logits = self._preprocess_logits(logits, sampling_info)
+        _trace_e2e_sampler("preprocess_returned")
         return_sampling_mask = any(sampling_info.return_sampling_masks or [])
 
         if sampling_info.is_all_greedy:
+            _trace_e2e_sampler("greedy_enter")
             if _use_aiter and not _disable_aiter_greedy_sample:
                 batch_next_token_ids = torch.empty(
                     logits.shape[0], device=logits.device, dtype=torch.int32
@@ -131,6 +153,9 @@ class Sampler(nn.Module):
                 _aiter_greedy_sample(batch_next_token_ids, logits)
             else:
                 batch_next_token_ids = torch.argmax(logits, -1)
+            _trace_e2e_sampler(
+                "greedy_returned", output_shape=tuple(batch_next_token_ids.shape)
+            )
             if return_sampling_mask:
                 self._attach_greedy_sampling_mask_to_output(
                     logits_output, sampling_info, batch_next_token_ids
@@ -239,8 +264,11 @@ class Sampler(nn.Module):
             )
             logprob_result.write_output_to(logits_output)
 
+        _trace_e2e_sampler("token_sync_enter")
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+        _trace_e2e_sampler("token_sync_returned")
 
+        _trace_e2e_sampler("forward_returned")
         return batch_next_token_ids
 
     def _sample_from_probs(

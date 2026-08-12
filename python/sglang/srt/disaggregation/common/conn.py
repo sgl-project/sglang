@@ -1369,6 +1369,7 @@ class CommonKVReceiver(BaseKVReceiver):
             response = _get_bootstrap_session(self.bootstrap_addr).get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
+                bootstrap_info["pp_rank"] = int(target_pp_rank)
                 return bootstrap_info
             else:
                 logger.error(

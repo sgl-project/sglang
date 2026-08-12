@@ -274,6 +274,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "flashinfer",
     "megamoe",
     "pplx",
+    "deepep_v2",
     "ascend_tp",
 ]
 
@@ -304,7 +305,12 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
+BF16_GEMM_BACKEND_CHOICES = [
+    "auto",
+    "cutedsl",
+    "flashinfer_pr4266",
+    "torch",
+]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
@@ -1729,7 +1735,7 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K), 'flashinfer_pr4266' (legacy compatibility alias for the optimized CuTe DSL path), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),
@@ -2291,6 +2297,8 @@ class ServerArgs:
             "flashinfer",
             "megamoe",
             "pplx",
+            "deepep_v2",
+            "ascend_tp",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -2299,6 +2307,21 @@ class ServerArgs:
         ),
         NS("exec.moe"),
     ] = "none"
+    deepep_v2_mode: A[
+        Literal["direct", "hybrid"],
+        "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "
+        "`direct` (single-node NVLink) or `hybrid` (multi-node scale-out). "
+        "Layout/grouped-GEMM and the decode CUDA graph are chosen per batch by "
+        "inference phase, independent of this knob; not equivalent to DeepEP v1 "
+        "normal/low_latency.",
+        NS("exec.moe"),
+    ] = "direct"
+    deepep_v2_dispatcher_output_dtype: A[
+        Literal["auto", "bf16", "fp8"],
+        "DeepEP v2 dispatcher output dtype. `auto`: fp8 for the DeepGEMM runner, bf16 for "
+        "Triton.",
+        NS("exec.moe"),
+    ] = "auto"
     moe_runner_backend: A[
         str,
         Arg(
@@ -6710,6 +6733,119 @@ class ServerArgs:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
+        if a2a_backend == "deepep_v2":
+            if self.moe_runner_backend == "auto":
+                # The generic auto -> runner resolution above only fires for
+                # moe_a2a_backend "none", so deepep_v2 would otherwise reach the
+                # check below with the default "auto" and fail. deep_gemm is the
+                # production FP8 path, triton the BF16 functional path. Key off the
+                # dispatcher output dtype and default to the deep_gemm FP8 path:
+                # self.quantization is not reliably resolved at server-args time
+                # (FP8 is detected from the checkpoint later), so it cannot drive
+                # this; a genuinely BF16 run should set
+                # --deepep-v2-dispatcher-output-dtype bf16 (or --moe-runner-backend
+                # triton).
+                self.moe_runner_backend = (
+                    "triton"
+                    if self.deepep_v2_dispatcher_output_dtype == "bf16"
+                    else "deep_gemm"
+                )
+                logger.warning(
+                    "DeepEP v2 MoE: resolved --moe-runner-backend auto -> %s "
+                    "(--deepep-v2-dispatcher-output-dtype=%s).",
+                    self.moe_runner_backend,
+                    self.deepep_v2_dispatcher_output_dtype,
+                )
+            if self.moe_runner_backend not in ["deep_gemm", "triton"]:
+                raise ValueError(
+                    "DeepEP v2 MoE currently supports only "
+                    "--moe-runner-backend deep_gemm or triton. "
+                    f"Got {self.moe_runner_backend!r}. Add a runner adapter before "
+                    "enabling DeepEP v2 with other MoE runners."
+                )
+            if self.enable_two_batch_overlap or self.enable_single_batch_overlap:
+                raise ValueError(
+                    "DeepEP v2 MoE has not implemented the TBO/SBO overlap hooks yet. "
+                    "Disable --enable-two-batch-overlap and "
+                    "--enable-single-batch-overlap when using --moe-a2a-backend deepep_v2."
+                )
+            if self.enforce_shared_experts_fusion:
+                raise ValueError(
+                    "DeepEP v2 MoE has not validated fused shared experts yet. "
+                    "Remove --enforce-shared-experts-fusion when using "
+                    "--moe-a2a-backend deepep_v2."
+                )
+            deepep_v2_cap = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            # Prefill capacity pre-check: the ElasticBuffer capacity is per
+            # physical MoE sender rank. At this point chunked_prefill_size has
+            # already been divided by attention DP. Before an A2A dispatcher,
+            # LayerCommunicator uses SCATTERED MLP mode and reduce-scatters that
+            # per-DP chunk over attention TP, so divide by attention TP as well.
+            # Without this second division DP4 x TP4 would incorrectly compare
+            # its 2048-token DP-worker chunk to the buffer even though each
+            # DeepEP sender receives only 512 tokens.
+            if (
+                self.chunked_prefill_size
+                and self.chunked_prefill_size > 0
+                and (self.disaggregation_mode != "decode")
+            ):
+                attn_dp_size = (
+                    self.dp_size if resolved_view(self).enable_dp_attention else 1
+                )
+                attn_tp_size = max(1, self.tp_size // attn_dp_size // self.attn_cp_size)
+                prefill_tokens_per_sender = math.ceil(
+                    self.chunked_prefill_size / attn_tp_size
+                )
+                if prefill_tokens_per_sender > deepep_v2_cap:
+                    raise ValueError(
+                        "DeepEP v2 MoE: the per-sender prefill dispatch budget "
+                        f"({prefill_tokens_per_sender} tokens, from a "
+                        f"{self.chunked_prefill_size}-token DP-worker chunk "
+                        f"reduce-scattered over attention TP={attn_tp_size}) "
+                        "exceeds the per-rank dispatch buffer "
+                        "capacity SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_"
+                        f"RANK={deepep_v2_cap}. Raise the env (it sizes the "
+                        "communication buffer) or lower --chunked-prefill-size."
+                    )
+            # CUDA graph is safe on the DeepEP v2 decode masked-GEMM path under ANY
+            # comm mode (direct or hybrid): the masked layout is chosen per-batch by
+            # inference phase (decode), not by the comm mode, giving static shapes
+            # with no host readback. deep_gemm runner + fp8 dispatch are required;
+            # every other combination (triton/bf16, or the prefill/extend contiguous
+            # path) needs a host readback / cpu_sync and is not capturable, so the
+            # decode graph is disabled there (the prefill graph is always disabled).
+            deepep_v2_fp8 = self.deepep_v2_dispatcher_output_dtype == "fp8" or (
+                self.deepep_v2_dispatcher_output_dtype == "auto"
+                and self.moe_runner_backend == "deep_gemm"
+            )
+            deepep_v2_graph_ok = (
+                self.moe_runner_backend == "deep_gemm" and deepep_v2_fp8
+            )
+            if not deepep_v2_graph_ok:
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            else:
+                # The decode masked-GEMM path is capture-safe under any comm mode
+                # (static shapes, no host readback). The prefill/extend path goes
+                # through the non-masked contiguous layout with a host readback and
+                # is not capturable, so keep the decode graph but always disable the
+                # prefill graph under DeepEP v2.
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.warning(
+                f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+            logger.warning(
+                "DeepEP v2 MoE is using deepep_v2_mode=%s. This controls "
+                "ElasticBuffer direct/hybrid mode and is independent from "
+                "--deepep-mode normal/low_latency. DeepEP v2 MoE enables the "
+                "decode CUDA graph on the deep_gemm + fp8 masked decode path "
+                "(any comm mode) and disables shared expert fusion. "
+                "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
+                "per-rank communication buffer capacity, not a model limit; "
+                "increase it for large prefill/chunked-prefill workloads.",
+                self.deepep_v2_mode,
+            )
+
         if (
             self.moe_a2a_backend == "none" and is_npu()
         ) or self.moe_a2a_backend == "ascend_tp":
@@ -6718,8 +6854,16 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "flashinfer":
             assert (
-                resolved_view(self).enable_dp_attention and self.dp_size == self.tp_size
-            ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
+                resolved_view(self).enable_dp_attention
+                and self.dp_size > 1
+                and self.tp_size % self.dp_size == 0
+            ), (
+                "FlashInfer MoE A2A requires --enable-dp-attention and a "
+                "data-parallel size that divides the TP/EP world."
+            )
+            logger.warning(
+                f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
             if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
@@ -6733,8 +6877,14 @@ class ServerArgs:
             assert resolved_view(self).moe_runner_backend in [
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
+                "flashinfer_trtllm",
                 "flashinfer_trtllm_routed",
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
+                "deep_gemm",
+            ], (
+                "FlashInfer MoE A2A is supported with flashinfer_cutlass, "
+                "flashinfer_cutedsl, flashinfer_trtllm, "
+                "flashinfer_trtllm_routed, or deep_gemm."
+            )
 
         if a2a_backend == "mori":
             if self.deepep_mode == "auto":
@@ -8763,8 +8913,16 @@ class ServerArgs:
 
         if self.pp_size > 1:
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
+            # A PD prefill engine runs speculative decoding as a single extend step
+            # (target forward + one draft extend); there is no accept length and no
+            # per-step hidden-state feedback, so it composes with the pipeline. The
+            # decode side still owns the draft loop and stays unsupported.
+            assert (
+                self.speculative_algorithm is None
+                or self.disaggregation_mode == "prefill"
+            ), "Pipeline parallelism is only compatible with speculative decoding on a PD prefill engine"
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "

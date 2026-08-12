@@ -105,10 +105,14 @@ def init_torch_distributed(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
 
+    # The draft worker reuses the target's resolved memory_pool_config, so its own
+    # pre_model_load_memory feeds nothing cross-rank. Keep the WORLD reduction on the
+    # target only: a draft that exists on a subset of ranks (prefill-side PP builds it
+    # on the last stage) would otherwise enter a collective the other ranks never join.
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
-        distributed=get_world_group().world_size > 1,
+        distributed=get_world_group().world_size > 1 and not is_draft_worker,
         cpu_group=get_world_group().cpu_group,
     )
     tp_group = get_tp_group()

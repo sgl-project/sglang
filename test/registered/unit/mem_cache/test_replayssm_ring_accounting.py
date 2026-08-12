@@ -19,6 +19,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
     Mamba2StateShape,
 )
+from sglang.srt.mem_cache.kv_cache_configurator import _pp_local_per_request_bytes
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -80,6 +81,19 @@ class TestReplaySSMRingAccounting(CustomTestCase):
     def test_zero_len_ring(self):
         self.assertEqual(_gdn_params().replayssm_ring_bytes_per_req(record_len=0), 0)
         self.assertEqual(_kda_params().replayssm_ring_bytes_per_req(record_len=0), 0)
+
+    def test_pp_local_state_budget(self):
+        # Four equal-cost linear layers globally, two owned by this PP stage.
+        self.assertEqual(
+            _pp_local_per_request_bytes(4096, [0, 1, 3, 4], 1, 4),
+            2048,
+        )
+
+    def test_pp_local_state_budget_empty_stage(self):
+        self.assertEqual(
+            _pp_local_per_request_bytes(4096, [0, 1, 3, 4], 5, 8),
+            0,
+        )
 
 
 if __name__ == "__main__":

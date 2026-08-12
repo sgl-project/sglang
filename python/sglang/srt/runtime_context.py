@@ -376,6 +376,10 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    # True only while constructing/running the speculative draft model.  A2A
+    # dispatchers use it to keep draft CUDA graphs off the target model's
+    # one-sided communication workspace.
+    speculative_context: bool = False
 
 
 @dataclasses.dataclass

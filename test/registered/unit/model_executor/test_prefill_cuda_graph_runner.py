@@ -9,7 +9,10 @@ import torch
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_prefill_graph,
 )
@@ -83,6 +86,22 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             )
 
         self.assertIs(capture.runner, eager_runner)
+
+    def test_pp_proxy_output_is_trimmed_to_raw_prefill_tokens(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.raw_num_tokens = 3
+        output = PPProxyTensors(
+            {
+                "hidden_states": torch.arange(32).view(8, 4),
+                "residual": torch.arange(32, 64).view(8, 4),
+            }
+        )
+
+        trimmed = runner._finalize_execute_output(output)
+
+        self.assertIsInstance(trimmed, PPProxyTensors)
+        self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
+        self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
     def test_prefix_chunk_capacity_is_aggregate_and_can_be_overridden(self):
         model_runner = SimpleNamespace(

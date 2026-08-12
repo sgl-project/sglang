@@ -660,6 +660,15 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    # Diagnostic only: allow an external E2E driver to establish a balanced
+    # DP16 batch instead of letting the router's singleton health request
+    # create the [1, 0, ..., 0] idle-rank case first.
+    if (
+        os.getenv("SGLANG_DIAG_BYPASS_HEALTH_GENERATE", "0") == "1"
+        and request.url.path in ("/health", "/health_generate")
+    ):
+        return Response(status_code=200)
+
     if (
         not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"

@@ -51,6 +51,30 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def get_draft_kv_pool(
+    *,
+    draft_worker: BaseTpWorker,
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+):
+    """Return the draft token-to-KV pool for the current draft worker,
+    or None when no draft KV pool is available."""
+    if draft_worker is None or spec_algorithm.is_ngram():
+        return None
+
+    # V2 workers nest the draft runner under `.draft_worker`. That inner worker is
+    # None on ranks that do not host the draft (prefill-side PP builds it only on
+    # the last stage), and those ranks own no draft KV pool.
+    if draft_worker.draft_worker is None:
+        return None
+
+    if server_args.enable_multi_layer_eagle:
+        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+    else:
+        draft_runner = draft_worker.draft_worker.draft_runner
+    return draft_runner.token_to_kv_pool
+
+
 def maybe_register_hicache_draft(
     *,
     tree_cache,

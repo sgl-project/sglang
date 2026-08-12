@@ -108,11 +108,15 @@ class DecodeStagingHandler:
             self._wm_subscribers[key] = (receiver, session_id)
 
     def num_writers_for(self, receiver) -> int:
-        """Compute num_writers for a specific request based on its prefill TP."""
-        prefill_tp = receiver.prefill_info.attn_tp_size
+        """Compute all TP and PP writers expected for a staging chunk."""
+        prefill_info = receiver.prefill_info
+        prefill_tp = prefill_info.attn_tp_size
         if prefill_tp > self.decode_tp:
-            return prefill_tp // max(1, self.decode_tp)
-        return 1
+            tp_writers = prefill_tp // max(1, self.decode_tp)
+        else:
+            tp_writers = 1
+        pp_writers = prefill_info.pp_size // self.kv_manager.pp_size
+        return tp_writers * pp_writers
 
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int) -> DecodeStagingHandler:
@@ -535,10 +539,14 @@ class StagingRegisterInfo:
 
     base_ptr: int = 0
     total_size: int = 0
+    # Staging slot order is [all K layers, all V layers], which differs from the
+    # kv_data_ptrs order once draft KV buffers are appended. Empty when the peer
+    # predates this field; callers then fall back to kv_layer_ids.
+    slot_layer_ids: List[int] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq_fields(
-        cls, msg: list, msg_start_offset: int
+        cls, msg: list, msg_start_offset: int, slot_ids_index: Optional[int] = None
     ) -> Optional[StagingRegisterInfo]:
         i = msg_start_offset
         base_ptr = (
@@ -551,7 +559,17 @@ class StagingRegisterInfo:
         )
         if base_ptr == 0 and total_size == 0:
             return None
-        return cls(base_ptr=base_ptr, total_size=total_size)
+        slot_layer_ids: List[int] = []
+        if (
+            slot_ids_index is not None
+            and len(msg) > slot_ids_index
+            and len(msg[slot_ids_index]) > 0
+        ):
+            raw = msg[slot_ids_index]
+            slot_layer_ids = list(struct.unpack(f"{len(raw) // 8}Q", raw))
+        return cls(
+            base_ptr=base_ptr, total_size=total_size, slot_layer_ids=slot_layer_ids
+        )
 
 
 class PrefillStagingStrategy:
@@ -643,7 +661,13 @@ class PrefillStagingStrategy:
                 target_info.dst_tp_rank,
                 target_info.dst_attn_tp_size,
                 target_info.dst_kv_item_len,
+                target_info.dst_kv_layer_ids,
                 staging_buffer=self.staging_buffer,
+                dst_slot_layer_ids=(
+                    target_info.staging.slot_layer_ids
+                    if target_info.staging is not None
+                    else None
+                ),
             )
         except Exception as e:
             raise RuntimeError(
@@ -742,6 +766,7 @@ def handle_staging_req(
     chunk_idx = int(msg[2].decode("ascii"))
     chunk_num_pages = int(msg[3].decode("ascii"))
     session_id = msg[4].decode("ascii")
+    requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 else None
 
     if staging_allocator is None:
         logger.warning(
@@ -824,6 +849,8 @@ def handle_staging_req(
     bootstrap_infos = room_bootstrap.get(room)
     if bootstrap_infos:
         for bi in bootstrap_infos:
+            if requester_pp_rank is not None and bi["pp_rank"] != requester_pp_rank:
+                continue
             try:
                 sock, lock = receiver._connect_to_bootstrap_server(bi)
                 with lock:
@@ -849,6 +876,7 @@ def prefetch_staging_reqs(
     chunked_prefill_size: int,
     staging_requested: set,
     prefetch_sockets: dict,
+    requester_pp_rank: Optional[int] = None,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -894,14 +922,15 @@ def prefetch_staging_reqs(
                         sock.setsockopt(zmq.IPV6, 1)
                     sock.connect(ep)
                     prefetch_sockets[ep] = sock
-                prefetch_sockets[ep].send_multipart(
-                    [
-                        b"STAGING_REQ",
-                        str(room).encode("ascii"),
-                        str(chunk_idx).encode("ascii"),
-                        str(chunk_pages).encode("ascii"),
-                        session_id.encode("ascii"),
-                    ]
-                )
+                request = [
+                    b"STAGING_REQ",
+                    str(room).encode("ascii"),
+                    str(chunk_idx).encode("ascii"),
+                    str(chunk_pages).encode("ascii"),
+                    session_id.encode("ascii"),
+                ]
+                if requester_pp_rank is not None:
+                    request.append(str(requester_pp_rank).encode("ascii"))
+                prefetch_sockets[ep].send_multipart(request)
             except Exception:
                 staging_requested.discard(stg_key)

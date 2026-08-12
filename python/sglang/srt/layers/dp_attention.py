@@ -94,7 +94,17 @@ class DpPaddingMode(IntEnum):
         # Force MAX_LEN so all ranks are padded to equal token counts.
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        if get_moe_a2a_backend().is_pplx():
+        moe_a2a_backend = get_moe_a2a_backend()
+        if moe_a2a_backend.is_pplx():
+            return DpPaddingMode.MAX_LEN
+
+        # Diagnostic gate for DeepEP v2 ElasticBuffer on ragged DP batches.
+        # Keeping this behind an environment variable makes the A/B change
+        # strictly limited to padding: communication mode, kernels, model and
+        # request payload remain identical.
+        if moe_a2a_backend.is_deepep_v2() and get_bool_env_var(
+            "SGLANG_DEEPEP_V2_FORCE_MAX_LEN"
+        ):
             return DpPaddingMode.MAX_LEN
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding

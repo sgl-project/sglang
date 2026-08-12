@@ -184,7 +184,7 @@ class KVArgsRegisterInfo:
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
         )
 
 
@@ -320,11 +320,20 @@ class MooncakeKVManager(CommonKVManager):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
 
-    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
+    def set_kv_buffer_tensors(
+        self,
+        k_buffers: list,
+        v_buffers: list,
+        page_size: int,
+        slot_layer_ids: Optional[List[int]] = None,
+    ):
+        # slot_layer_ids follows the staging slot order (every k_buffer, then
+        # every v_buffer), which is not kv_args.kv_layer_ids once a draft exists.
         self.kv_buffer_tensors = {
             "k_buffers": k_buffers,
             "v_buffers": v_buffers,
             "page_size": page_size,
+            "slot_layer_ids": list(slot_layer_ids or []),
         }
 
     def _init_staging_buffers(self, count: int):
@@ -510,6 +519,7 @@ class MooncakeKVManager(CommonKVManager):
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            requester_pp_rank=self.pp_rank,
         )
 
     def send_kvcache_staged(
@@ -521,7 +531,9 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
+        dst_layer_ids: List[int],
         staging_buffer=None,
+        dst_slot_layer_ids: Optional[List[int]] = None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -553,7 +565,27 @@ class MooncakeKVManager(CommonKVManager):
 
         num_tokens = len(prefill_kv_indices) * page_size
         per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
-        per_rank_bytes = per_layer_bytes * num_layers * 2
+        local_bytes = per_layer_bytes * num_layers * 2
+
+        if self.pp_size > 1:
+            # Pair staging slots, not kv_data_ptrs entries: the gather lays out
+            # [every k_buffer, every v_buffer], which stops matching kv_layer_ids
+            # once draft KV buffers are appended.
+            src_slot_ids = (
+                self.kv_buffer_tensors.get("slot_layer_ids")
+                or self.kv_args.kv_layer_ids
+            )
+            dst_slot_ids = dst_slot_layer_ids or dst_layer_ids
+            pairs = build_transfer_entry_pairs(
+                src_slot_ids,
+                dst_slot_ids,
+                num_layers * 2,
+                len(dst_slot_ids),
+            )
+            dst_num_layers = len(dst_slot_ids) // 2
+        else:
+            pairs = None
+            dst_num_layers = num_layers
 
         num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
@@ -562,21 +594,20 @@ class MooncakeKVManager(CommonKVManager):
             total_kv_heads,
             num_tokens,
             head_dim * dtype_size,
-            num_layers,
+            dst_num_layers,
         )
         writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
         rank_offset = sum(writer_rank_bytes[:writer_idx])
 
-        if not staging_buffer.fits(per_rank_bytes):
+        if not staging_buffer.fits(local_bytes):
             logger.warning(
-                f"Prefill staging too small for {per_rank_bytes} bytes, falling back"
+                f"Prefill staging too small for {local_bytes} bytes, falling back"
             )
             return -1
         if dst_staging_size < total_staging_needed:
             logger.warning(
                 f"Decode staging too small: need {total_staging_needed} bytes "
-                f"({num_writers if self.attn_tp_size > dst_attn_tp_size else 1} writers "
-                f"x {per_rank_bytes} bytes/rank), have {dst_staging_size}, falling back"
+                f"for {dst_num_layers} layers, have {dst_staging_size}, falling back"
             )
             return -1
 
@@ -595,16 +626,29 @@ class MooncakeKVManager(CommonKVManager):
             self.kv_args.gpu_id,
         )
 
-        dst_write_ptr = dst_staging_ptr + rank_offset
-        ret = self._transfer_data(
-            mooncake_session_id,
-            [(staging_buffer.get_ptr(), dst_write_ptr, per_rank_bytes)],
-        )
+        if pairs is None:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr(),
+                    dst_staging_ptr + rank_offset,
+                    local_bytes,
+                )
+            ]
+        else:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr() + src_idx * per_layer_bytes,
+                    dst_staging_ptr + rank_offset + dst_idx * per_layer_bytes,
+                    per_layer_bytes,
+                )
+                for src_idx, dst_idx in pairs
+            ]
+        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
         if ret != 0:
             raise RuntimeError(
                 f"[Staging] Bulk RDMA transfer failed with ret={ret}. "
                 f"src_ptr=0x{staging_buffer.get_ptr():x}, "
-                f"dst_ptr=0x{dst_write_ptr:x}, size={per_rank_bytes}. "
+                f"dst_ptr=0x{dst_staging_ptr + rank_offset:x}, size={local_bytes}. "
                 f"The decode staging buffer may not be properly registered."
             )
         return ret
@@ -658,10 +702,19 @@ class MooncakeKVManager(CommonKVManager):
         layers_params = None
 
         # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
+        # When both peers publish layer ids the pairing is exact, so prefer it
+        # over positional slicing regardless of backend; a plain-MHA model
+        # publishes no ids and is unaffected.
+        has_layer_ids = bool(src_layer_ids or dst_layer_ids)
+        if (
+            self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or force_flat
+            or has_layer_ids
+        ):
             # Layer IDs map PP-local buffers to global decode entries.
             # Registrations without them retain the existing PP mapping.
-            if src_layer_ids or dst_layer_ids:
+            if has_layer_ids:
                 pairs = build_transfer_entry_pairs(
                     src_layer_ids,
                     dst_layer_ids,
@@ -916,6 +969,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: Optional[List[int]] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -968,9 +1022,35 @@ class MooncakeKVManager(CommonKVManager):
             num_heads_to_send = dst_heads_per_rank
             dst_head_start_offset = 0
 
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-        )
+        src_data_ptrs = self.kv_args.kv_data_ptrs
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if src_layer_ids or dst_layer_ids:
+            # Pair by layer id. Required once draft KV buffers are appended: the
+            # flat list is then no longer [K block, V block], so the half-split
+            # in get_mha_kv_ptrs_with_pp mislabels entries.
+            if any(l != src_kv_item_len for l in self.kv_args.kv_item_lens):
+                logger.error(
+                    f"[{mooncake_session_id}] head-sliced transfer assumes one item "
+                    f"length for every KV entry, got {set(self.kv_args.kv_item_lens)}"
+                )
+                return -1
+            layer_ptr_pairs = [
+                (src_data_ptrs[i], dst_kv_ptrs[j])
+                for i, j in build_transfer_entry_pairs(
+                    src_layer_ids,
+                    dst_layer_ids or [],
+                    len(src_data_ptrs),
+                    len(dst_kv_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
+                )
+            ]
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_kv_ptrs)
+            )
+            layer_ptr_pairs = [
+                (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(layers_current_pp_stage)
+            ] + [(src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)]
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
@@ -1015,15 +1095,10 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
-        futures = []
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
-            )
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
-            )
+        futures = [
+            executor.submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
+            for src_layer_ptr, dst_layer_ptr in layer_ptr_pairs
+        ]
 
         for future in concurrent.futures.as_completed(futures):
             status = future.result()
@@ -1719,6 +1794,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
+                                target_rank_registration_info.dst_kv_layer_ids,
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -2310,6 +2386,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             else:
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
+            staging_slots = getattr(self.kv_mgr, "kv_buffer_tensors", None) or {}
+            packed_staging_slot_layer_ids = b"".join(
+                struct.pack("Q", layer_id)
+                for layer_id in (staging_slots.get("slot_layer_ids") or [])
+            )
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             try:
@@ -2334,6 +2415,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            packed_staging_slot_layer_ids,
                         ]
                     )
             except zmq.ZMQError:

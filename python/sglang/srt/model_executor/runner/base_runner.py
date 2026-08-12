@@ -113,7 +113,7 @@ def _allocate_decode_buffers(
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
             pp_proxy_tensors = {
-                "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
             if not is_mhc:
                 # Only Kimi K3 supplies num_blocks: its PP bank is token-major
@@ -121,7 +121,7 @@ def _allocate_decode_buffers(
                 residual_shape = (
                     (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                     if pp_proxy_residual_num_blocks is not None
-                    else (max_bs, hidden_size)
+                    else (max_num_token, hidden_size)
                 )
                 pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
             if pp_proxy_topk_size is not None:
@@ -230,6 +230,14 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+
+        # Model-owned communication resources may depend on the resolved
+        # request pool and must be compiled/allocated before graph capture.
+        prepare_model_resources = getattr(
+            mr.model, "prepare_before_cuda_graph_capture", None
+        )
+        if prepare_model_resources is not None:
+            prepare_model_resources(mr)
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -385,7 +393,13 @@ class BaseRunner(ABC):
             else get_server_return_hidden_states_mode(mr.server_args)
         )
         num_tokens_per_req = 1
-        if mr.spec_algorithm.is_speculative():
+        # A PD prefill target worker's pool has no SpeculativeState, so a
+        # TARGET_VERIFY dummy forward would trip the linear-attn backend's
+        # pool-type assert. Warm up in plain DECODE instead.
+        _is_pd_prefill_target = (
+            mr.server_args.disaggregation_mode == "prefill" and not mr.is_draft_worker
+        )
+        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
             if mr.is_draft_worker:
                 assert (
                     mr.spec_algorithm.supports_target_verify_for_draft()

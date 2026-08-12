@@ -122,6 +122,32 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
+
+def _pp_local_per_request_bytes(
+    total_bytes: int,
+    layer_ids: list[int],
+    start_layer: int,
+    end_layer: int,
+) -> int:
+    """Scale a layer-linear state cost to the current PP stage.
+
+    ``BaseLinearStateParams`` reports bytes for every linear-attention layer in
+    the model config, while the PP memory pools below allocate only layers in
+    ``[start_layer, end_layer)``.  Budgeting the global value makes the error
+    grow with PP size and can reject configurations whose real local pools fit.
+    """
+    if not layer_ids:
+        return 0
+    if total_bytes % len(layer_ids) != 0:
+        raise ValueError(
+            "Linear-state bytes must be uniform per layer: "
+            f"total_bytes={total_bytes}, num_layers={len(layer_ids)}"
+        )
+    local_layer_count = sum(
+        start_layer <= layer_id < end_layer for layer_id in layer_ids
+    )
+    return total_bytes // len(layer_ids) * local_layer_count
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.unified_memory_pool import (
@@ -791,7 +817,14 @@ class KVCacheConfigurator:
             ),
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
             enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
-            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            # A PD prefill server never runs TARGET_VERIFY, so skip the
+            # verify-only per-draft-token state snapshots (see the draft-head
+            # case above: None => the pool skips SpeculativeState).
+            speculative_num_draft_tokens=(
+                None
+                if get_disagg().disaggregation_mode == "prefill"
+                else self.server_args.max_speculative_num_draft_tokens
+            ),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
