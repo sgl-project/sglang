@@ -193,12 +193,6 @@ def build_local_partition_assignment(
         standalone_files=[
             item.item_id for item in my_items if item.kind == "standalone"
         ],
-        estimated_time=round(sum(item.est_time for item in my_items), 1),
-        missing_standalone_estimates=[
-            item.item_id
-            for item in my_items
-            if item.kind == "standalone" and item.used_fallback_estimate
-        ],
     )
 
 
