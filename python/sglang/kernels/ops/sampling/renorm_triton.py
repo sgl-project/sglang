@@ -196,9 +196,8 @@ def top_p_renorm_probs_triton_hierarchical(
         return probs.clone()
     assert probs.shape[1] > 0
 
-    values, _, _, _, _, _ = top_p_select_hierarchical_triton(
+    values = top_p_select_hierarchical_triton(
         probs,
-        top_ps,
         chunk_size=chunk_size,
         num_warps=num_warps,
     )

@@ -345,8 +345,7 @@ class TestTritonTopPFastPath(CustomTestCase):
         *_, fast_path = top_p_fast_prefix(probs.contiguous(), top_ps)
         self.assertTrue(bool(fast_path.all()))
 
-    def test_hierarchical_selector_values_sums_and_metadata(self):
-        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+    def test_hierarchical_selector_values(self):
         from sglang.kernels.ops.sampling.top_p_select_triton import (
             top_p_select_hierarchical_triton,
         )
@@ -368,36 +367,9 @@ class TestTritonTopPFastPath(CustomTestCase):
                     * 8,
                     dim=-1,
                 )
-                top_ps = torch.full(
-                    (rows,), 0.95, dtype=torch.float32, device=self.device
-                )
-                (
-                    expected_values,
-                    _,
-                    expected_pivots,
-                    expected_normalizers,
-                    expected_fast,
-                ) = top_p_fast_prefix(probs, top_ps)
-                (
-                    values,
-                    row_sums,
-                    pivots,
-                    normalizers,
-                    fast_path,
-                    fallback,
-                ) = top_p_select_hierarchical_triton(
-                    probs, top_ps, chunk_size=chunk_size
-                )
+                expected_values, _ = torch.topk(probs, 32, dim=-1, sorted=True)
+                values = top_p_select_hierarchical_triton(probs, chunk_size=chunk_size)
                 torch.testing.assert_close(values, expected_values, rtol=0, atol=0)
-                torch.testing.assert_close(
-                    row_sums, probs.sum(dim=-1), rtol=2e-5, atol=2e-6
-                )
-                torch.testing.assert_close(pivots, expected_pivots, rtol=0, atol=0)
-                torch.testing.assert_close(
-                    normalizers, expected_normalizers, rtol=2e-5, atol=2e-6
-                )
-                self.assertTrue(torch.equal(fast_path, expected_fast))
-                self.assertEqual(bool(fallback.item()), not bool(expected_fast.all()))
 
     def test_hierarchical_matches_topk_path_at_large_vocab_boundaries(self):
         from sglang.kernels.ops.sampling.renorm_triton import (
