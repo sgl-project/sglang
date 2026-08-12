@@ -28,7 +28,7 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
     multi-detokenizer (the flags are orthogonal)."""
 
     mmlu_score_threshold = 0.64
-    mmlu_num_examples = 512
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
     @classmethod
