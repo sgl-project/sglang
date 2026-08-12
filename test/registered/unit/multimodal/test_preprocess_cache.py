@@ -43,7 +43,9 @@ class TestMediaIdentity(unittest.TestCase):
                 parse_content_hash(invalid)
 
     def test_same_bytes_have_same_identity_across_input_forms(self):
-        payload = b"strict-media-identity"
+        # Keep the encoded data URL above common filesystem filename limits;
+        # probing it as a local path must not raise ENAMETOOLONG.
+        payload = b"strict-media-identity" * 32
         data_url = (
             "data:application/octet-stream;base64," + base64.b64encode(payload).decode()
         )
