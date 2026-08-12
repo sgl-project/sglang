@@ -13,6 +13,7 @@ if [ -n "$VERSION_FROM_TAG" ]; then
 else
   echo "Warning: No version tags resolved; using default $SGLANG_VERSION" >&2
 fi
+VERSION_RESOLVE_SECONDS=$SECONDS
 
 
 # Default base tags (can be overridden by command line arguments)
@@ -228,8 +229,16 @@ if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
   fi
 fi
 if (( pulled_from_mirror == 0 )); then
+  IMAGE_SOURCE="docker-hub"
   retry_with_backoff 6 docker pull "${IMAGE}"
+else
+  IMAGE_SOURCE="registry-mirror"
 fi
+
+# One greppable line per job; see amd_ci_start_container.sh.
+echo "[amd-ci-setup] image=${IMAGE} source=${IMAGE_SOURCE}" \
+     "version_resolve=${VERSION_RESOLVE_SECONDS}s" \
+     "image_acquire=$(( SECONDS - VERSION_RESOLVE_SECONDS ))s"
 
 CACHE_HOST=/home/runner/sglang-data
 if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then

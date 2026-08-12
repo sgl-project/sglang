@@ -15,6 +15,7 @@ if [ -n "$VERSION_FROM_TAG" ]; then
 else
   echo "Warning: No version tags resolved; using default $SGLANG_VERSION" >&2
 fi
+VERSION_RESOLVE_SECONDS=$SECONDS
 
 
 # Default base tags (can be overridden by command line arguments)
@@ -240,9 +241,11 @@ find_latest_image() {
 }
 
 # Determine which image to use
+IMAGE_SOURCE="unknown"
 if [[ -n "${CUSTOM_IMAGE}" ]]; then
   # Use explicitly provided custom image
   IMAGE="${CUSTOM_IMAGE}"
+  IMAGE_SOURCE="custom-image"
   echo "Using custom image: ${IMAGE}"
   if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
     docker pull "${IMAGE}"
@@ -274,6 +277,7 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
     -t "${IMAGE}" \
     -f "${DOCKERFILE}" \
     "${DOCKERFILE_DIR}"
+  IMAGE_SOURCE="dockerfile-build"
   echo "Successfully built image: ${IMAGE}"
 else
   # Find the latest pre-built image
@@ -294,9 +298,18 @@ else
     fi
   fi
   if (( pulled_from_mirror == 0 )); then
+    IMAGE_SOURCE="docker-hub"
     retry_with_backoff 6 docker pull "${IMAGE}"
+  else
+    IMAGE_SOURCE="registry-mirror"
   fi
 fi
+
+# One greppable line per job so the nightly dashboard can track where setup time
+# goes and how often the mirror is actually serving the image.
+echo "[amd-ci-setup] image=${IMAGE} source=${IMAGE_SOURCE}" \
+     "version_resolve=${VERSION_RESOLVE_SECONDS}s" \
+     "image_acquire=$(( SECONDS - VERSION_RESOLVE_SECONDS ))s"
 
 CACHE_HOST=/home/runner/sglang-data
 if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
