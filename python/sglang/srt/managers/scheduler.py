@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
     get_device,
@@ -90,6 +90,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_dsa_seed_metadata_dim,
     prepare_abort,
+    unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -268,6 +269,7 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
+    flush_trace_batch,
     set_schedule_time_batch,
     set_time_batch,
 )
@@ -313,6 +315,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
+    resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
@@ -810,7 +813,7 @@ class Scheduler(
                     tokenizer_mode=get_serving().tokenizer_mode,
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
-                    use_fast=not get_mm().disable_fast_image_processor,
+                    image_processor_backend=resolve_image_processor_backend(get_mm()),
                     tokenizer_backend=get_serving().tokenizer_backend,
                     model_name=get_model().model_path,
                 )
@@ -826,7 +829,11 @@ class Scheduler(
 
         # Load multimodal processor for M-RoPE fallback computation.
         self._mm_processor = None
-        if self.model_config.is_multimodal and self.processor is not None:
+        if (
+            self.model_config.is_multimodal
+            and self.processor is not None
+            and not server_args.language_model_only
+        ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
                 self._mm_processor = get_mm_processor(
@@ -1395,8 +1402,18 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+            # Requests with a sent chunk that are not yet on the inflight queue.
+            self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
+        if (
+            self.enable_unified_memory
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            self.token_to_kv_pool_allocator.set_disagg_move_gate(
+                unified_memory_disagg_move_gate(self)
+            )
 
         # Init mm receiver for EPD disaggregation mode
         if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
@@ -2927,6 +2944,7 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
@@ -3889,6 +3907,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # Flush async trace ops here: in overlap mode this CPU work runs while
+        # the next batch's GPU forward is in flight, giving free overlap.
+        flush_trace_batch(batch.reqs)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():

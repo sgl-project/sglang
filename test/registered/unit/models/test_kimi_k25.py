@@ -39,11 +39,11 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.srt.utils.cuda_ipc_transport_utils import (
+from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
