@@ -22,16 +22,7 @@
 
 #include "layout.h"
 
-// Reuse the vector type expected by the pinned sparse FlashMLA producer.
-#include "components/sparse_fp8_dequant.h"
-
 namespace sm90::nvfp4 {
-
-__device__ __forceinline__ uint64_t load_packed_e2m1x16(const void* address) {
-  uint64_t value;
-  asm volatile("ld.global.nc.L1::evict_last.L2::128B.u64 %0, [%1];" : "=l"(value) : "l"(address));
-  return value;
-}
 
 struct E2M1Bf16Lut {
   // The low and high bytes of the eight positive E2M1 magnitudes, split into

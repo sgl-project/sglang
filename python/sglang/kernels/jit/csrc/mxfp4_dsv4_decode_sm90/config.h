@@ -13,32 +13,30 @@ using namespace cute;
 
 namespace sm90::decode::sparse_mxfp4_dsv4 {
 
-template <int NUM_HEADS, bool IS_V32 = false>
+template <int NUM_HEADS>
 class KernelTemplate {
  public:
   static_assert(NUM_HEADS == 64 || NUM_HEADS == 128);
-  static_assert(!IS_V32 || NUM_HEADS == 64);
   static constexpr int NUM_M_BLOCKS = NUM_HEADS / 64;
   static constexpr int CLUSTER_SIZE = NUM_M_BLOCKS;
 
-  static constexpr int HEAD_DIM_K = IS_V32 ? 576 : 512;
+  static constexpr int HEAD_DIM_K = 512;
   static constexpr int HEAD_DIM_V = 512;
   static constexpr int HEAD_DIM_ROPE = 64;
-  static constexpr int HEAD_DIM_NOPE = IS_V32 ? 512 : 448;
+  static constexpr int HEAD_DIM_NOPE = 448;
   static constexpr int PACKED_NOPE_BYTES = HEAD_DIM_NOPE / 2;
-  // MXFP4 (non-V32) uses one E8M0 scale per 32 NoPE dims; V32 keeps NVFP4's
-  // block-16 E4M3 layout.
-  static constexpr int SCALE_BLOCK_SIZE = IS_V32 ? 16 : 32;
+  // One E8M0 scale per 32 NoPE dims.
+  static constexpr int SCALE_BLOCK_SIZE = 32;
   static constexpr int NUM_SCALES = HEAD_DIM_NOPE / SCALE_BLOCK_SIZE;
-  // MXFP4 pads the scale area to 16 bytes so the RoPE payload starts at a
+  // The scale area is padded to 16 bytes so the RoPE payload starts at a
   // 4-byte boundary (224 + 14 + 2 = 240).
-  static constexpr int PAD_BYTES = IS_V32 ? 0 : 2;
+  static constexpr int PAD_BYTES = 2;
   static constexpr int ROPE_BYTES = HEAD_DIM_ROPE * sizeof(bf16);
   static constexpr int BYTES_PER_TOKEN = PACKED_NOPE_BYTES + NUM_SCALES + PAD_BYTES + ROPE_BYTES;
 
-  static_assert(PACKED_NOPE_BYTES == (IS_V32 ? 256 : 224));
-  static_assert(NUM_SCALES == (IS_V32 ? 32 : 14));
-  static_assert(BYTES_PER_TOKEN == (IS_V32 ? 416 : 368));
+  static_assert(PACKED_NOPE_BYTES == 224);
+  static_assert(NUM_SCALES == 14);
+  static_assert(BYTES_PER_TOKEN == 368);
 
   static constexpr int NUM_THREADS = 128 * 3;
   static constexpr int BLOCK_M = 64;
@@ -93,7 +91,7 @@ class KernelTemplate {
     CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
     bool is_kv_valid[NUM_K_BUFS][TOPK_BLOCK_SIZE];
 
-    float sM[BLOCK_M], sL[BLOCK_M], sScale[NUM_K_BUFS][BLOCK_M], sOScale[BLOCK_M];
+    float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
     // WG0/WG1 arrive once per request after store_o (which writes the oBuf
     // union overlay of the K buffers); the producer waits it before writing

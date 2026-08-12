@@ -15,7 +15,7 @@ void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel(const SparseAttnDecodeParams
 // for graph-replayed DSV4 inputs.
 void run_get_dsv4_mxfp4_decoding_sched_meta_kernel(const GetDecodeSchedMetaParams& params);
 
-template <int NUM_HEADS, bool IS_V32 = false>
+template <int NUM_HEADS>
 void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl(const SparseAttnDecodeParams& params);
 
 }  // namespace sm90::decode::sparse_mxfp4_dsv4
