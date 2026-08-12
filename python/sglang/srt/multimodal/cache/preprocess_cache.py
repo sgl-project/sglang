@@ -92,6 +92,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
         self.max_entries = max_entries
         self._entries: OrderedDict[K, _Entry[V]] = OrderedDict()
         self._inflight: dict[K, tuple[concurrent.futures.Future[V], int]] = {}
+        self._background_tasks: set[asyncio.Task] = set()
         self._lock = threading.Lock()
         self._generation = 0
         self.current_size_bytes = 0
@@ -193,28 +194,57 @@ class MultimodalPreprocessCache(Generic[K, V]):
                 self.singleflight_joins += 1
                 owner = False
 
-        if not owner:
-            # A waiter owns only its local await.  Cancelling it must not
-            # cancel the shared future and poison the owner or other waiters.
-            value = await asyncio.shield(asyncio.wrap_future(future))
-            return CacheLookup(value, hit=False, joined=True)
+        if owner:
+            self.create_background_task(
+                self._compute_owned_value(
+                    key, future, generation, compute, size_bytes=size_bytes
+                )
+            )
 
+        # The cache owns the shared computation. Cancelling either its first
+        # caller or a later joiner ends only that caller's local await.
+        value = await asyncio.shield(asyncio.wrap_future(future))
+        return CacheLookup(value, hit=False, joined=not owner)
+
+    async def _compute_owned_value(
+        self,
+        key: K,
+        future: concurrent.futures.Future[V],
+        generation: int,
+        compute: Callable[[], Awaitable[V]],
+        *,
+        size_bytes: Optional[Callable[[V], Optional[int]]],
+    ) -> None:
         try:
             value = await compute()
             measured = size_bytes(value) if size_bytes is not None else None
             self.put(key, value, measured, _generation=generation)
             future.set_result(value)
-            return CacheLookup(value, hit=False)
         except BaseException as exc:
             future.set_exception(exc)
             # Retrieve the exception locally when no waiter joined, avoiding a
             # noisy "Future exception was never retrieved" warning.
             future.exception()
-            raise
         finally:
             with self._lock:
                 if self._inflight.get(key) == (future, generation):
                     self._inflight.pop(key, None)
+
+    def _background_task_done(self, task: asyncio.Task) -> None:
+        with self._lock:
+            self._background_tasks.discard(task)
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    def create_background_task(self, awaitable: Awaitable[Any]) -> asyncio.Task:
+        """Keep shared cache work alive independently of one caller task."""
+        task = asyncio.create_task(awaitable)
+        with self._lock:
+            self._background_tasks.add(task)
+        task.add_done_callback(self._background_task_done)
+        return task
 
     def stats(self) -> dict[str, int]:
         with self._lock:
