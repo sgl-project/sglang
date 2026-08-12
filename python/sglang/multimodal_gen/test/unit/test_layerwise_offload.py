@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
     is_resident_layerwise_module,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class _FakeStream:
@@ -161,8 +162,13 @@ class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         self.layerwise_offload_managers = [SimpleNamespace(enabled=enabled)]
 
 
+class _TestServerArgs(SimpleNamespace):
+    should_cpu_offload_component = ServerArgs.should_cpu_offload_component
+
+
 def _server_args(**kwargs):
     defaults = dict(
+        cpu_offload_components=None,
         use_fsdp_inference=False,
         dit_cpu_offload=False,
         text_encoder_cpu_offload=False,
@@ -173,7 +179,7 @@ def _server_args(**kwargs):
         pin_cpu_memory=False,
     )
     defaults.update(kwargs)
-    return SimpleNamespace(**defaults)
+    return _TestServerArgs(**defaults)
 
 
 def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
