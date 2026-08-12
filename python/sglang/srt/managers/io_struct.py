@@ -185,6 +185,10 @@ class GenerateReqInput:
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
+    # Native /generate opt-in for callers that already ran the multimodal
+    # processor and supply its expanded token ids. Currently supported only by
+    # the Qwen3-VL processor.
+    parse_expanded_mm_input_ids: bool = False
     # Optional per-image hashes the caller has already computed (hex strings).
     # Single request: one hash per image. Batch request: either one hash per
     # request when each request has one image, or one list of hashes per request.
@@ -782,6 +786,7 @@ class GenerateReqInput:
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
+            parse_expanded_mm_input_ids=self.parse_expanded_mm_input_ids,
             sampling_params=self.sampling_params[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
