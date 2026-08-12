@@ -8,12 +8,14 @@ python3 test_forward_split_prefill.py
 """
 
 import unittest
+from array import array
 
 import numpy as np
 import torch
 
-from sglang.bench_one_batch import TreeCacheNamespace
+from sglang.benchmark.one_batch import TreeCacheNamespace
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -56,14 +58,9 @@ class TestForwardSplitPrefill(CustomTestCase):
             model_config=cls.model_config,
             mem_fraction_static=cls.server_args.mem_fraction_static,
             gpu_id=0,
-            tp_rank=0,
-            tp_size=cls.tp_size,
-            pp_rank=0,
-            pp_size=1,
+            ps=ParallelState.trivial(tp_size=cls.tp_size),
             nccl_port=cls.port_args.nccl_port,
             server_args=cls.server_args,
-            moe_ep_rank=0,
-            moe_ep_size=1,
         )
 
         cls.tokenizer = get_tokenizer(
@@ -91,12 +88,14 @@ class TestForwardSplitPrefill(CustomTestCase):
             req = Req(
                 rid=i,
                 origin_input_text="",
-                origin_input_ids=list(input_ids[i]),
+                origin_input_ids=array("q", input_ids[i]),
                 sampling_params=sampling_params,
             )
-            req.fill_ids = req.origin_input_ids
+            req.full_untruncated_fill_ids = req.origin_input_ids
             req.logprob_start_len = -1
-            req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+            req.set_extend_range(
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
             reqs.append(req)
 
         # Create dummy tree_cache for tests (no prefix caching, just allocation)
@@ -121,7 +120,11 @@ class TestForwardSplitPrefill(CustomTestCase):
             batch.forward_mode = ForwardMode.SPLIT_PREFILL
 
         # Create forward batch
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            return_hidden_states_before_norm=False,
+        )
 
         return forward_batch
 

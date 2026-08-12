@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
@@ -10,7 +11,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
 )
 from sglang.srt.environ import ToolStrictLevel, envs
+from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
@@ -23,14 +26,18 @@ from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
+from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
+from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
+from sglang.srt.function_call.minimax_m3 import MinimaxM3Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.muse_glimmer_detector import MuseGlimmerDetector
 from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -55,6 +62,8 @@ class FunctionCallParser:
     """
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
+        "apertus2509": Apertus2509Detector,
+        "cohere_command4": CohereCommand4Detector,
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
         "deepseekv32": DeepSeekV32Detector,
@@ -64,11 +73,13 @@ class FunctionCallParser:
         "glm47": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
         "kimi_k2": KimiK2Detector,
+        "kimi_k3": KimiK3Detector,
         "lfm2": Lfm2Detector,
         "llama3": Llama32Detector,
         "mimo": MiMoDetector,
         "minicpm5": MiniCPM5Detector,
         "mistral": MistralDetector,
+        "muse": MuseGlimmerDetector,
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,
@@ -77,18 +88,25 @@ class FunctionCallParser:
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
         "minimax-m2": MinimaxM2Detector,
+        "minimax-m3": MinimaxM3Detector,
         "trinity": TrinityDetector,
         "interns1": InternlmDetector,
         "hermes": HermesDetector,
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
         "gemma4": Gemma4Detector,
+        "inkling": InklingDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
+    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
-            detector = detector_class()
+            kwargs = {}
+            if tokenizer is not None:
+                sig = inspect.signature(detector_class)
+                if "tokenizer" in sig.parameters:
+                    kwargs["tokenizer"] = tokenizer
+            detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 
@@ -125,9 +143,10 @@ class FunctionCallParser:
         """
         if not self.tools:
             return full_text, []
+        has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
-        if tool_call_list:
+        if tool_call_list or has_tool_call:
             return parsed_result.normal_text, tool_call_list
         else:
             return full_text, []
@@ -157,6 +176,17 @@ class FunctionCallParser:
             final_normal_text = sp_result.normal_text
 
         return final_normal_text, final_calls
+
+    def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
+        """Flush detector state once the stream ends.
+
+        Text a detector held back waiting for a marker (which can no longer
+        arrive) is released as normal text; see BaseFormatDetector.finish().
+        """
+        if not self.tools:
+            return "", []
+        sp_result = self.detector.finish(self.tools)
+        return sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
@@ -235,11 +265,33 @@ class FunctionCallParser:
 
         # Highest priority: model-native structural_tag when available.
         try:
-            if is_required or should_constrain_auto:
-                structural_tag = self.detector.get_structural_tag(
+            if tool_choice == "auto" and not should_constrain_auto:
+                structural_tag = self.detector.get_auto_tool_call_structural_tag(
                     tools=self.tools,
                     thinking_mode=thinking_mode,
+                    parallel_tool_calls=parallel_tool_calls,
+                )
+                if structural_tag is not None:
+                    return ("structural_tag", structural_tag)
+
+            if is_required or should_constrain_auto:
+                structural_tag_tools = self.tools
+                if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
+                    structural_tag_tools = [
+                        tool.model_copy(
+                            update={
+                                "function": tool.function.model_copy(
+                                    update={"strict": True}
+                                )
+                            }
+                        )
+                        for tool in self.tools
+                    ]
+                structural_tag = self.detector.get_structural_tag(
+                    tools=structural_tag_tools,
+                    thinking_mode=thinking_mode,
                     tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
                 )
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)
@@ -253,7 +305,9 @@ class FunctionCallParser:
                     tag = self.get_legacy_structural_tag(at_least_one=is_required)
                     return ("structural_tag", tag)
 
-            if tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+            if (
+                tool_choice == "required" or isinstance(tool_choice, ToolChoice)
+            ) and not self.detector.parses_required_natively():
                 json_schema = get_json_schema_constraint(
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )

@@ -3,10 +3,15 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+
+from sglang.srt.observability.trace import (
+    TraceNullContext,
+    TraceReqContext,
+)
 
 
 @dataclasses.dataclass
@@ -20,6 +25,13 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    num_kv_tokens: Optional[int] = None
+    trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
+        default_factory=TraceNullContext
+    )
+    # Set when the staging worker first counts this chunk toward the per-room
+    # outstanding count; stays set across re-enqueue on a watermark defer.
+    staging_counted: bool = False
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
@@ -98,8 +110,18 @@ def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
 ) -> Tuple[List[npt.NDArray[np.int32]], List[npt.NDArray[np.int32]]]:
     """Vectorised NumPy implementation."""
-    if src_indices.size == 0:
+    # src/dst indices are transferred pairwise, so an empty side means there is
+    # nothing to transfer. Guarding both sides (not just src) avoids a cryptic
+    # NumPy broadcast error from np.diff() below when only one side is empty, e.g.
+    # a non-empty prefill DSA/SWA state list paired with an empty decode registration.
+    if src_indices.size == 0 or dst_indices.size == 0:
         return [], []
+
+    if src_indices.size != dst_indices.size:
+        raise ValueError(
+            "group_concurrent_contiguous requires equal-length src/dst index arrays, "
+            f"got {src_indices.size} and {dst_indices.size}"
+        )
 
     brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
     src_groups = np.split(src_indices, brk)
@@ -109,3 +131,71 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+
+@dataclasses.dataclass(frozen=True)
+class DCPTokenTransferPlan:
+    src_token_indices: npt.NDArray[np.int64]
+    dst_token_indices: npt.NDArray[np.int64]
+
+
+def build_dcp_token_transfer_plan(
+    src_page_indices: npt.NDArray[np.int32],
+    dst_page_indices: npt.NDArray[np.int32],
+    *,
+    physical_page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    src_page_offset: int = 0,
+    decode_prefix_len: int = 0,
+    num_kv_tokens: Optional[int] = None,
+) -> DCPTokenTransferPlan:
+    virtual_page_size = physical_page_size * dcp_size
+    if decode_prefix_len % virtual_page_size != 0:
+        raise ValueError(
+            "PD DCP transfer requires decode_prefix_len to align to the virtual "
+            f"DCP page size ({virtual_page_size}), got {decode_prefix_len}"
+        )
+
+    src_pages = np.asarray(src_page_indices, dtype=np.int64)
+    dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
+    source_capacity = src_pages.size * physical_page_size
+    if num_kv_tokens is None:
+        num_kv_tokens = source_capacity
+    if not 0 <= num_kv_tokens <= source_capacity:
+        raise ValueError(
+            "num_kv_tokens must fit in the provided source pages, "
+            f"got tokens={num_kv_tokens}, capacity={source_capacity}"
+        )
+    if src_pages.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return DCPTokenTransferPlan(empty, empty.copy())
+
+    chunk_start = decode_prefix_len + src_page_offset * physical_page_size
+    first_owned_offset = (dcp_rank - chunk_start) % dcp_size
+    owned_offsets = np.arange(
+        first_owned_offset, num_kv_tokens, dcp_size, dtype=np.int64
+    )
+    src_token_indices = (
+        src_pages[owned_offsets // physical_page_size] * physical_page_size
+        + owned_offsets % physical_page_size
+    )
+
+    relative_positions = src_page_offset * physical_page_size + owned_offsets
+    dst_local_offsets = relative_positions // dcp_size
+    dst_page_ordinals = dst_local_offsets // physical_page_size
+    if dst_page_ordinals.size and (
+        dst_pages.size == 0 or int(dst_page_ordinals.max()) >= dst_pages.size
+    ):
+        required_pages = int(dst_page_ordinals.max()) + 1
+        raise ValueError(
+            "Insufficient destination DCP pages: "
+            f"required={required_pages}, provided={dst_pages.size}, "
+            f"src_page_offset={src_page_offset}, dcp_rank={dcp_rank}"
+        )
+
+    dst_token_indices = (
+        dst_pages[dst_page_ordinals] * physical_page_size
+        + dst_local_offsets % physical_page_size
+    )
+    return DCPTokenTransferPlan(src_token_indices, dst_token_indices)

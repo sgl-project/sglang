@@ -40,7 +40,11 @@ class Cosmos3Config(PipelineConfig):
     vae_tiling: bool = False
     vae_sp: bool = False
 
-    # Sourced from scheduler_config.json in the checkpoint.
+    # Cosmos3 reference inference uses FlowUniPC even when the checkpoint
+    # scheduler_config.json advertises a different scheduler class.
+    scheduler_class_override: str | None = "FlowUniPCMultistepScheduler"
+
+    # Per-request mode defaults are applied in Cosmos3TimestepPreparationStage.
     flow_shift: float | None = None
 
     precision: str = "bf16"
@@ -51,16 +55,20 @@ class Cosmos3Config(PipelineConfig):
     use_duration_template: bool = True
     use_system_prompt: bool = False
 
+    # Filesystem path to dataset-derived action stats (JSON) for action
+    # (de)normalization. Set at server launch rather than per request, since it
+    # names a server-side file. ``None`` disables normalization.
+    action_stats_path: str | None = None
+
     def __post_init__(self):
         self.vae_config.arch_config.z_dim = 48
         # Encoder is needed for I2V; T2V/T2I never invoke it.
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
-        # WanVAE defaults use_parallel_encode/decode to True, which silently
-        # activates an SP-sharded VAE path when sp_world_size > 1 and produces
-        # garbled pixels for cosmos3's latent shape.
+        # keep WanVAE encode replicated because parallel encode changes I2V
+        # conditioning latents when sp_world_size > 1
         self.vae_config.use_parallel_encode = False
-        self.vae_config.use_parallel_decode = False
+        self.vae_config.use_parallel_decode = True
 
     def adjust_num_frames(self, num_frames: int) -> int:
         """Round ``num_frames`` so ``(n - 1) % 4 == 0`` for the VAE.
@@ -76,3 +84,9 @@ class Cosmos3Config(PipelineConfig):
                 (num_frames - 1) // vae_scale_factor_temporal
             ) * vae_scale_factor_temporal + 1
         return num_frames
+
+    def supports_action_endpoint(self) -> bool:
+        # The public Cosmos3 family shares one pipeline/config across visual-only
+        # and action-capable checkpoints. The loaded transformer validates that
+        # an action head is actually present when an action request is submitted.
+        return True

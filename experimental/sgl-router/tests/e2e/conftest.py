@@ -2,7 +2,7 @@
 
 Two flavors of fixtures coexist here:
 
-  1. **Session-scoped smoke fixtures** (``sglang_server`` + ``router``) —
+  1. **Session-scoped sanity fixtures** (``sglang_server`` + ``router``) —
      launch ONE SGLang worker + ONE router on fixed ports for the whole
      test session. Used by the lightweight ``test_chat_smoke.py`` /
      ``test_tokenize_smoke.py`` files. These are the cheap "did the
@@ -166,81 +166,64 @@ def _find_tokenizer_path(model: str) -> str:
     return model
 
 
-def build_smoke_router_config(
+def build_smoke_router_args(
     *,
     host: str,
     port: int,
     model: str,
     tokenizer_path: str,
     sglang_url: str,
-) -> str:
-    """Build the TOML the smoke `router` fixture writes to disk.
+) -> list[str]:
+    """Build the sgl-router CLI flags the single-worker ``router`` fixture launches.
 
-    Returns ``main_config_text`` carrying ``[server]``, ``[[models]]``,
-    and ``[discovery] backend = "static_urls"`` with the worker URL
-    inline. The Rust ``Config`` struct requires a ``[discovery]``
-    section (``DiscoveryConfig`` has no ``#[serde(default)]``) and has
-    no top-level ``workers`` field. The previous ``static_file``
-    backend was replaced by ``static_urls`` (which holds the URL list
-    inline rather than via a side-car file).
+    Static single-worker discovery (``--worker-urls``) pointed at the one
+    SGLang worker, serving exactly one model.
     """
-    return f"""\
-[server]
-host = "{host}"
-port = {port}
-
-[[models]]
-id = "{model}"
-tokenizer_path = "{tokenizer_path}"
-
-[discovery]
-backend = "static_urls"
-
-[discovery.static_urls]
-urls = ["{sglang_url}"]
-"""
+    return [
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--model-id",
+        model,
+        "--tokenizer-path",
+        tokenizer_path,
+        "--worker-urls",
+        sglang_url,
+    ]
 
 
 @pytest.fixture(scope="session")
 def router(sglang_server):  # noqa: ARG001  (sglang_server must start first)
     """Launch sgl-router on port 8090 pointed at the SGLang worker."""
     tok_path = _find_tokenizer_path(MODEL)
-    cfg_handle = tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False)
-    cfg_path = Path(cfg_handle.name)
-    main_text = build_smoke_router_config(
+    args = build_smoke_router_args(
         host="0.0.0.0",
         port=ROUTER_PORT,
         model=MODEL,
         tokenizer_path=tok_path,
         sglang_url=f"http://localhost:{SGLANG_PORT}",
     )
-    cfg_handle.write(main_text)
-    cfg_handle.close()
 
+    proc = subprocess.Popen(
+        [str(_BINARY), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    # try/finally so the router is always reaped — on a readiness-probe
+    # failure, a test-body error, or a session-teardown exception alike.
     try:
-        proc = subprocess.Popen(
-            [str(_BINARY), "--config", str(cfg_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-
-        try:
-            _wait_http(f"http://localhost:{ROUTER_PORT}/readyz", timeout=60)
-        except Exception:
-            proc.send_signal(signal.SIGTERM)
-            proc.wait(timeout=30)
-            raise
-
+        _wait_http(f"http://localhost:{ROUTER_PORT}/readyz", timeout=60)
         yield f"http://localhost:{ROUTER_PORT}"
-
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
     finally:
-        cfg_path.unlink(missing_ok=True)
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
 
 # ---------------------------------------------------------------------------

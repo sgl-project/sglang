@@ -1,6 +1,8 @@
-"""triton attention backend (EAGLE3 spec v2 + EAGLE/Llama-2 spec v1).
+"""triton attention backend, EAGLE3 chain drafting.
 
-triton runs everywhere, so this stays on the cheap (5090) runner.
+triton runs everywhere, so this stays on the cheap (5090) runner. triton tree
+verify is covered by attention/unittests/dense/test_triton.py, and the tree
+accept-path compaction e2e lives in test_spec_eagle_topk.py.
 """
 
 import unittest
@@ -14,9 +16,9 @@ from sglang.test.kits.spec_server_kits import (
     SpecLogprobKit,
     SpecPenaltyKit,
 )
-from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
+from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
-register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=230, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestEagle3Triton(
@@ -27,20 +29,12 @@ class TestEagle3Triton(
     SpecPenaltyKit,
     SpecFeatureKit,
 ):
-    """EAGLE3 spec v2 on triton (kits listed in bases)."""
+    """Overlap scheduler on triton (kits listed in bases)."""
 
     attention_backend = "triton"
-    max_running_requests = 64
-    cuda_graph_max_bs = 64
-    gsm8k_num_examples = 1000
+    gsm8k_num_examples = 200
     gsm8k_check_accept_len = False
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
-
-
-class TestEagleLlama2Triton(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
-    """EAGLE/Llama-2 topk=8 on triton (spec v1)."""
-
-    attention_backend = "triton"
 
 
 if __name__ == "__main__":

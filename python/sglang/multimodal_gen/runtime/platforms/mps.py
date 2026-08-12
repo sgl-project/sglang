@@ -41,6 +41,10 @@ class MpsPlatform(Platform):
         return torch.device("mps")
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        pass
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 
@@ -78,7 +82,7 @@ class MpsPlatform(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,

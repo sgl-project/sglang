@@ -5,8 +5,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 
+from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
+from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
+    can_use_fused_layernorm_modulate,
+    fused_layernorm_modulate_raw,
+    is_plain_layer_norm,
+)
 from sglang.multimodal_gen.configs.models.dits.sana import SanaConfig
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -15,6 +22,137 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_SANA_LN_MOD = BitExactFusionGate("Sana fused LN+modulate", per_signature=True)
+# Direct module-level state keeps BCG warmup launch overhead equal to the
+# pre-refactor path; the gate still owns first-sight verification transitions.
+_SANA_LN_MOD_SIGS = _SANA_LN_MOD.verified_sigs
+assert _SANA_LN_MOD_SIGS is not None
+_SANA_LN_MOD_DISABLED = False
+
+
+def _eager_ln_modulate(
+    norm: nn.LayerNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    return norm(x) * (1 + scale) + shift
+
+
+def _sana_ln_modulate(
+    norm: nn.LayerNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """Single-kernel ``LN(x) * (1 + scale) + shift``, bit-exact vs eager.
+
+    ``scale`` / ``shift`` are Sana's ``(batch, 1, dim)`` adaLN rows.  Each
+    new input signature is verified with ``torch.equal`` against the eager
+    chain (bit-exactness depends on which LayerNorm kernel aten dispatches
+    to); any mismatch disables the fast path permanently.
+
+    The fusion only engages in CUDA-graph contexts (stream capture, or the
+    non-default stream the breakable-CUDA-graph runner warms up and captures
+    on, #33989), where replay pays no Python launch cost.  Sana's eager mode
+    is CPU-launch bound and one Triton launch costs more Python than the
+    whole aten chain it replaces (+14% forward wall), so default-stream
+    serving keeps the eager chain.
+
+    ``x`` reaches every site transposed (patch-embed / GLUMBConv permute
+    layout); aten's LayerNorm contiguizes internally, and the fast path
+    issues the same copy explicitly.
+    """
+    global _SANA_LN_MOD_DISABLED
+
+    if _SANA_LN_MOD_DISABLED or torch.compiler.is_compiling() or not x.is_cuda:
+        return _eager_ln_modulate(norm, x, scale, shift)
+
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing and torch.cuda.current_stream() == torch.cuda.default_stream():
+        return _eager_ln_modulate(norm, x, scale, shift)
+
+    sig = (
+        x.shape,
+        x.stride(),
+        x.dtype,
+        scale.shape,
+        scale.stride(),
+        shift.stride(),
+        norm.eps,
+    )
+    if sig in _SANA_LN_MOD_SIGS:
+        return fused_layernorm_modulate_raw(
+            x.contiguous(), scale[:, 0], shift[:, 0], norm.eps
+        )
+    if capturing:
+        # unverified signature during capture: cannot sync-verify here
+        return _eager_ln_modulate(norm, x, scale, shift)
+
+    if (
+        x.dtype is torch.bfloat16
+        and x.dim() == 3
+        and scale.dim() == 3
+        and scale.shape[1] == 1
+        and shift.shape == scale.shape
+        and is_plain_layer_norm(norm, x.shape[-1])
+    ):
+        x_c = x.contiguous()
+        if not can_use_fused_layernorm_modulate(x_c, scale[:, 0], shift[:, 0]):
+            return _eager_ln_modulate(norm, x, scale, shift)
+        try:
+            out = fused_layernorm_modulate_raw(x_c, scale[:, 0], shift[:, 0], norm.eps)
+        except Exception as exc:
+            _SANA_LN_MOD.on_exception(exc, logger=logger)
+            _SANA_LN_MOD_DISABLED = True
+        else:
+            result = _SANA_LN_MOD.accept_or_fallback(
+                out,
+                _eager_ln_modulate(norm, x, scale, shift),
+                sig=sig,
+                logger=logger,
+                mismatch_msg=(
+                    "Sana fused LN+modulate fast path is not bit-exact against "
+                    "this platform's LayerNorm dispatch; falling back to eager"
+                ),
+            )
+            _SANA_LN_MOD_DISABLED = _SANA_LN_MOD.disabled
+            return result
+
+    return _eager_ln_modulate(norm, x, scale, shift)
+
+
+def _mps_safe_linear(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    if x.device.type != "mps":
+        return linear(x)
+
+    return F.linear(
+        x.to(torch.float32),
+        linear.weight.to(torch.float32),
+        None if linear.bias is None else linear.bias.to(torch.float32),
+    ).to(x.dtype)
+
+
+def _mps_safe_conv2d(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+    if x.device.type != "mps":
+        return conv(x)
+
+    return F.conv2d(
+        x.to(torch.float32),
+        conv.weight.to(torch.float32),
+        None if conv.bias is None else conv.bias.to(torch.float32),
+        conv.stride,
+        conv.padding,
+        conv.dilation,
+        conv.groups,
+    ).to(x.dtype)
+
+
+def _mps_match_dtype(tensor: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    if ref.device.type == "mps" and tensor.dtype != ref.dtype:
+        return tensor.to(dtype=ref.dtype)
+    return tensor
 
 
 class SanaCombinedTimestepSizeEmbeddings(nn.Module):
@@ -31,7 +169,16 @@ class SanaCombinedTimestepSizeEmbeddings(nn.Module):
         timesteps_proj = self.time_proj(timestep)
         if hidden_dtype is not None:
             timesteps_proj = timesteps_proj.to(dtype=hidden_dtype)
-        timesteps_emb = self.timestep_embedder(timesteps_proj)
+        if timesteps_proj.device.type == "mps":
+            embedder = self.timestep_embedder
+            timesteps_emb = _mps_safe_linear(embedder.linear_1, timesteps_proj)
+            if embedder.act is not None:
+                timesteps_emb = embedder.act(timesteps_emb)
+            timesteps_emb = _mps_safe_linear(embedder.linear_2, timesteps_emb)
+            if embedder.post_act is not None:
+                timesteps_emb = embedder.post_act(timesteps_emb)
+        else:
+            timesteps_emb = self.timestep_embedder(timesteps_proj)
         return timesteps_emb
 
 
@@ -44,7 +191,7 @@ class SanaAdaLayerNormSingle(nn.Module):
 
     def forward(self, timestep, hidden_dtype=None):
         embedded_timestep = self.emb(timestep, hidden_dtype=hidden_dtype)
-        out = self.linear(self.silu(embedded_timestep))
+        out = _mps_safe_linear(self.linear, self.silu(embedded_timestep))
         return out, embedded_timestep
 
 
@@ -54,10 +201,9 @@ class SanaModulatedNorm(nn.Module):
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
 
     def forward(self, x, temb, scale_shift_table):
-        x = self.norm(x)
+        scale_shift_table = _mps_match_dtype(scale_shift_table, temb)
         shift, scale = (scale_shift_table[None] + temb[:, None]).chunk(2, dim=1)
-        x = x * (1 + scale) + shift
-        return x
+        return _sana_ln_modulate(self.norm, x, scale, shift)
 
 
 class GLUMBConv(nn.Module):
@@ -79,12 +225,12 @@ class GLUMBConv(nn.Module):
         self.conv_point = nn.Conv2d(hidden_channels, out_channels, 1, 1, 0, bias=False)
 
     def forward(self, hidden_states):
-        hidden_states = self.conv_inverted(hidden_states)
+        hidden_states = _mps_safe_conv2d(self.conv_inverted, hidden_states)
         hidden_states = self.nonlinearity(hidden_states)
-        hidden_states = self.conv_depth(hidden_states)
+        hidden_states = _mps_safe_conv2d(self.conv_depth, hidden_states)
         hidden_states, gate = torch.chunk(hidden_states, 2, dim=1)
         hidden_states = hidden_states * self.nonlinearity(gate)
-        hidden_states = self.conv_point(hidden_states)
+        hidden_states = _mps_safe_conv2d(self.conv_point, hidden_states)
         return hidden_states
 
 
@@ -97,9 +243,11 @@ class SanaLinearAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
 
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
-        self.to_k = nn.Linear(query_dim, inner_dim, bias=bias)
-        self.to_v = nn.Linear(query_dim, inner_dim, bias=bias)
+        self.inner_dim = inner_dim
+        # Self-attention q/k/v share the same input -> one packed GEMM.
+        self.to_qkv = MergedColumnParallelLinear(
+            query_dim, [inner_dim, inner_dim, inner_dim], bias=bias, gather_output=True
+        )
         self.to_out = nn.ModuleList(
             [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
         )
@@ -107,9 +255,10 @@ class SanaLinearAttention(nn.Module):
     def forward(self, hidden_states):
         B, S, _ = hidden_states.shape
 
-        query = self.to_q(hidden_states)
-        key = self.to_k(hidden_states)
-        value = self.to_v(hidden_states)
+        qkv, _ = self.to_qkv(hidden_states)
+        query, key, value = qkv.split(
+            [self.inner_dim, self.inner_dim, self.inner_dim], dim=-1
+        )
 
         query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
@@ -125,7 +274,7 @@ class SanaLinearAttention(nn.Module):
         hidden_states = qkv / normalizer
 
         hidden_states = hidden_states.transpose(1, 2).reshape(B, S, -1)
-        hidden_states = self.to_out[0](hidden_states)
+        hidden_states = _mps_safe_linear(self.to_out[0], hidden_states)
         return hidden_states
 
 
@@ -136,9 +285,12 @@ class SanaCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
 
+        self.inner_dim = inner_dim
         self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
-        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
-        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        # k/v share the (step-invariant) encoder input -> one packed GEMM.
+        self.to_kv = MergedColumnParallelLinear(
+            cross_attention_dim, [inner_dim, inner_dim], bias=bias, gather_output=True
+        )
         self.to_out = nn.ModuleList(
             [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
         )
@@ -149,9 +301,9 @@ class SanaCrossAttention(nn.Module):
         B, S, _ = hidden_states.shape
         T = encoder_hidden_states.shape[1]
 
-        query = self.to_q(hidden_states)
-        key = self.to_k(encoder_hidden_states)
-        value = self.to_v(encoder_hidden_states)
+        query = _mps_safe_linear(self.to_q, hidden_states)
+        kv, _ = self.to_kv(encoder_hidden_states)
+        key, value = kv.split([self.inner_dim, self.inner_dim], dim=-1)
 
         query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
@@ -166,7 +318,7 @@ class SanaCrossAttention(nn.Module):
             query, key, value, attn_mask=attn_mask
         )
         hidden_states = hidden_states.transpose(1, 2).reshape(B, S, -1)
-        hidden_states = self.to_out[0](hidden_states)
+        hidden_states = _mps_safe_linear(self.to_out[0], hidden_states)
         return hidden_states
 
 
@@ -217,12 +369,12 @@ class SanaTransformerBlock(nn.Module):
     ):
         batch_size = hidden_states.shape[0]
 
+        scale_shift_table = _mps_match_dtype(self.scale_shift_table, timestep)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
+            scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
 
-        norm_hidden = self.norm1(hidden_states)
-        norm_hidden = norm_hidden * (1 + scale_msa) + shift_msa
+        norm_hidden = _sana_ln_modulate(self.norm1, hidden_states, scale_msa, shift_msa)
         attn_output = self.attn1(norm_hidden)
         hidden_states = hidden_states + gate_msa * attn_output
 
@@ -231,8 +383,7 @@ class SanaTransformerBlock(nn.Module):
         )
         hidden_states = hidden_states + attn_output
 
-        norm_hidden = self.norm2(hidden_states)
-        norm_hidden = norm_hidden * (1 + scale_mlp) + shift_mlp
+        norm_hidden = _sana_ln_modulate(self.norm2, hidden_states, scale_mlp, shift_mlp)
         norm_hidden = norm_hidden.unflatten(1, (height, width)).permute(0, 3, 1, 2)
         ff_output = self.ff(norm_hidden)
         ff_output = ff_output.flatten(2, 3).permute(0, 2, 1)
@@ -255,7 +406,7 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     def __init__(self, config: SanaConfig, hf_config=None, **kwargs):
         super().__init__(config, hf_config=hf_config or {}, **kwargs)
 
-        arch = config.arch_config
+        arch = self.config
         self.out_channels = arch.out_channels
         self.patch_size = arch.patch_size
         self.inner_dim = arch.num_attention_heads * arch.attention_head_dim
@@ -332,7 +483,7 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         post_patch_height = height // p
         post_patch_width = width // p
 
-        hidden_states = self.patch_embed["proj"](hidden_states)
+        hidden_states = _mps_safe_conv2d(self.patch_embed["proj"], hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         timestep_emb, embedded_timestep = self.time_embed(
@@ -342,7 +493,16 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if isinstance(encoder_attention_mask, (list, tuple)):
             encoder_attention_mask = encoder_attention_mask[0]
 
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        if encoder_hidden_states.device.type == "mps":
+            encoder_hidden_states = _mps_safe_linear(
+                self.caption_projection.linear_1, encoder_hidden_states
+            )
+            encoder_hidden_states = self.caption_projection.act_1(encoder_hidden_states)
+            encoder_hidden_states = _mps_safe_linear(
+                self.caption_projection.linear_2, encoder_hidden_states
+            )
+        else:
+            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
         if encoder_hidden_states.shape[0] != batch_size:
             encoder_hidden_states = encoder_hidden_states.expand(
                 batch_size, -1, -1
@@ -372,7 +532,7 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_states = self.norm_out(
             hidden_states, embedded_timestep, self.scale_shift_table
         )
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states = _mps_safe_linear(self.proj_out, hidden_states)
         hidden_states = hidden_states.reshape(
             batch_size, post_patch_height, post_patch_width, p, p, self.out_channels
         )

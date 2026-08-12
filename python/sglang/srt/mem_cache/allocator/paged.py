@@ -19,14 +19,24 @@ from __future__ import annotations
 Page-aligned memory pool.
 """
 
+
 from typing import TYPE_CHECKING
 
 import torch
-import triton
-import triton.language as tl
 
+from sglang.kernels.ops.memory.allocator import (
+    alloc_decode_kernel,
+    alloc_extend_kernel,
+)
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_num_new_pages,
+    is_hip,
+    next_power_of_2,
+)
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -92,128 +102,6 @@ def alloc_extend_naive(
             ).view(-1)
 
 
-@triton.jit
-def alloc_extend_kernel(
-    pre_lens_ptr,
-    seq_lens_ptr,
-    last_loc_ptr,
-    free_page_ptr,
-    out_indices,
-    bs_upper: tl.constexpr,
-    page_size: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid)
-    extend_lens = seq_lens - pre_lens
-
-    seq_len = tl.load(seq_lens_ptr + pid)
-    pre_len = tl.load(pre_lens_ptr + pid)
-    extend_len = seq_len - pre_len
-
-    sum_extend_lens = tl.sum(extend_lens)
-    output_start_loc = sum_extend_lens - extend_len
-
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
-
-    num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
-        pre_len + page_size - 1
-    ) // page_size
-    sum_num_new_pages = tl.sum(num_new_pages)
-    new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
-
-    # Part 1: fill the old partial page
-    last_loc = tl.load(last_loc_ptr + pid)
-    num_part1 = (
-        min(seq_len, (pre_len + page_size - 1) // page_size * page_size) - pre_len
-    )
-    offset_one_page = tl.arange(0, page_size)
-    tl.store(
-        out_indices + output_start_loc + offset_one_page,
-        last_loc + 1 + offset_one_page,
-        mask=offset_one_page < num_part1,
-    )
-    if pre_len + num_part1 == seq_len:
-        return
-
-    # Part 2: fill the new full pages using a dynamic blocked loop.
-    # The loop bound is derived from num_part2 (runtime value), so Triton
-    # generates a real loop instead of unrolling — no constexpr dependency
-    # on extend size and only one kernel compilation.
-    num_part2 = (
-        seq_len // page_size * page_size
-        - (pre_len + page_size - 1) // page_size * page_size
-    )
-    BLOCK_EXTEND: tl.constexpr = 4096
-    num_blocks = (num_part2 + BLOCK_EXTEND - 1) // BLOCK_EXTEND
-    for block_id in range(num_blocks):
-        offset_in_block = tl.arange(0, BLOCK_EXTEND)
-        offset = block_id * BLOCK_EXTEND + offset_in_block
-        mask = offset < num_part2
-        page_start = tl.load(
-            free_page_ptr + new_page_start_loc + offset // page_size,
-            mask=mask,
-        )
-        tl.store(
-            out_indices + output_start_loc + num_part1 + offset,
-            page_start * page_size + offset % page_size,
-            mask=mask,
-        )
-    if pre_len + num_part1 + num_part2 == seq_len:
-        return
-
-    # Part 3: fill the new partial page
-    num_part3 = seq_len - seq_len // page_size * page_size
-    start_loc = tl.load(
-        free_page_ptr + new_page_start_loc + num_page_start_loc_self - 1
-    )
-    tl.store(
-        out_indices + output_start_loc + num_part1 + num_part2 + offset_one_page,
-        start_loc * page_size + offset_one_page,
-        mask=offset_one_page < num_part3,
-    )
-
-
-@triton.jit
-def alloc_decode_kernel(
-    seq_lens_ptr,
-    last_loc_ptr,
-    free_page_ptr,
-    out_indices,
-    bs_upper: tl.constexpr,
-    page_size: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.where(load_offset <= pid, seq_lens - 1, seq_lens)
-
-    seq_len = tl.load(seq_lens_ptr + pid)
-    pre_len = seq_len - 1
-
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
-
-    num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
-        pre_len + page_size - 1
-    ) // page_size
-    sum_num_new_pages = tl.sum(num_new_pages)
-    new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
-
-    if num_page_start_loc_self == 0:
-        last_loc = tl.load(last_loc_ptr + pid)
-        tl.store(out_indices + pid, last_loc + 1)
-    else:
-        page = tl.load(free_page_ptr + new_page_start_loc)
-        tl.store(out_indices + pid, page * page_size)
-
-
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """
     An allocator managing the indices to kv cache data.
@@ -236,6 +124,26 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+
+        # Pre-warm the torch.unique HIP kernel used in free(). When a request
+        # finishes with a prompt that already exists in the radix tree (e.g.
+        # bench_serving sending the same warmup+measured prompt), the radix
+        # cache's _insert_helper frees the duplicate KV indices via
+        # token_to_kv_pool_allocator.free(value[start:prefix_len]). That call
+        # path runs `torch.unique(free_index // self.page_size)` on a
+        # ~prompt_len-sized int64 tensor. The first such call on AMD ROCm
+        # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms, which
+        # shows up as a mysterious "second-request slow" (Run 1) for
+        # repeated-prompt benchmarks. Running it once at init time moves
+        # that JIT cost to startup. This is a ROCm-only JIT cost, so the
+        # warm-up is gated on _is_hip and skipped on other platforms.
+        if _is_hip and torch.cuda.is_available():
+            try:
+                _warmup = torch.arange(1024, dtype=torch.int64, device=device)
+                _ = torch.unique(_warmup // page_size)
+                torch.cuda.synchronize()
+            except Exception:
+                pass
         self.clear()
 
     def alloc(self, need_size: int):
@@ -355,16 +263,70 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
-            if self.need_sort:
-                self.release_pages = torch.cat((free_page_indices, self.release_pages))
-            else:
-                self.free_pages = torch.cat((free_page_indices, self.free_pages))
+            self._release_page_ids(torch.unique(free_index // self.page_size))
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
 
         if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+            self._debug_check_no_duplicate_pages()
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Fixed-shape counterpart of free(): a page's tokens sit consecutively
+        in the kv row, so page representatives are stride slices -- no
+        torch.unique, whose data-dependent output shape forces a device sync.
+        Contract: see base; a page must be freed by only one call per group."""
+        if free_index.numel() == 0:
+            return
+
+        ps = self.page_size
+        offset = start_pos % ps
+        if offset == 0:
+            pieces = (free_index[::ps],)
+        else:
+            pieces = (free_index[:1], free_index[ps - offset :: ps])
+
+        if self.debug_mode:
+            # reference unique on CPU: the NPU subclass deliberately avoids device unique
+            page_ids = torch.cat([p // ps for p in pieces])
+            assert torch.equal(
+                torch.sort(page_ids.cpu())[0],
+                torch.unique(free_index.cpu() // ps),
+            )
+
+        if self.is_not_in_free_group:
+            self._release_page_ids(*(p // ps for p in pieces))
+            if self.debug_mode:
+                self._debug_check_no_duplicate_pages()
+        else:
+            self.free_page_reps_group.extend(
+                self._copy_for_free_group(piece) for piece in pieces
+            )
+
+    def _debug_check_no_duplicate_pages(self):
+        # span both containers: need_sort (PD disagg) routes frees into release_pages
+        pages = torch.cat((self.free_pages, self.release_pages))
+        assert len(torch.unique(pages)) == len(pages)
+
+    def _release_page_ids(self, *page_ids: torch.Tensor):
+        if self.need_sort:
+            self.release_pages = torch.cat((*page_ids, self.release_pages))
+        else:
+            self.free_pages = torch.cat((*page_ids, self.free_pages))
+
+    def free_group_begin(self):
+        super().free_group_begin()
+        self.free_page_reps_group = []
+
+    def free_group_end(self):
+        super().free_group_end()
+        if self.free_page_reps_group:
+            self._release_page_ids(
+                torch.cat(self.free_page_reps_group) // self.page_size
+            )
+            self.free_page_reps_group = []
+        if self.debug_mode:
+            # the no-double-free contract can only break across a group's calls
+            self._debug_check_no_duplicate_pages()
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -373,6 +335,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.is_not_in_free_group = True
         self.free_group = []
+        self.free_page_reps_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def get_cpu_copy(self, indices, mamba_indices=None):

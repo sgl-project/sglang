@@ -8,8 +8,8 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.mem_cache.unified_cache_components import ComponentType
-    from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
         TreeComponent,
     )
 
@@ -25,13 +25,16 @@ class CacheInitParams:
     tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     attn_cp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     attn_tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
+    pp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
     disable_finished_insert: bool = False
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
+    enable_session_radix_cache: bool = False
 
     enable_mamba_extra_buffer: bool = False
+    enable_mamba_extra_buffer_lazy: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1
@@ -50,3 +53,5 @@ class CacheInitParams:
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
         None
     )
+
+    mtp_draft_device_pools: tuple[object, ...] = ()

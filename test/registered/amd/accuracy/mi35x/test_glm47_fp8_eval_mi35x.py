@@ -5,12 +5,6 @@ Tests GLM-4.7-FP8 accuracy using GSM8K benchmark on MI35x.
 Registry: nightly-amd-8-gpu-mi35x-glm47-fp8 suite
 """
 
-import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams

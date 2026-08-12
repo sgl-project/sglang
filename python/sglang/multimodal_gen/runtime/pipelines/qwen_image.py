@@ -8,30 +8,18 @@ from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    calculate_linear_shift,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered import (
     QwenImageLayeredBeforeDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
+    QwenImageProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-
-# TODO(will): move PRECISION_TO_TYPE to better place
-
-logger = init_logger(__name__)
-
-
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
 
 
 def prepare_mu(batch: Req, server_args: ServerArgs):
@@ -41,15 +29,11 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     image_seq_len = (int(height) // vae_scale_factor // 2) * (
         int(width) // vae_scale_factor // 2
     )
-    mu = calculate_shift(
+    return "mu", calculate_linear_shift(
         image_seq_len,
-        # hard code, since scheduler_config is not in PipelineConfig now
-        256,
-        8192,
-        0.5,
-        0.9,
+        max_seq_len=8192,
+        max_shift=0.9,
     )
-    return "mu", mu
 
 
 class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
@@ -64,7 +48,10 @@ class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_standard_t2i_stages(prepare_extra_timestep_kwargs=[prepare_mu])
+        self.add_standard_t2i_stages(
+            prepare_extra_timestep_kwargs=[prepare_mu],
+            progressive_denoising_stage_cls=QwenImageProgressiveDenoisingStage,
+        )
 
 
 class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):

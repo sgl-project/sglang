@@ -1,24 +1,38 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import sglang.srt.managers.schedule_policy as schedule_policy
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    estimate_prefill_extend_tile_metrics,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cpu_ci,
-    register_cuda_ci,
-)
+from sglang.srt.utils.common import Range
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+class _RecordingDelayer:
+    """Duck-typed stand-in for PrefillDelayerSinglePassExecutor that records
+    the local_prefillable value of every negotiate call and returns a fixed
+    verdict."""
+
+    def __init__(self, allow: bool):
+        self.allow = allow
+        self.calls = []
+
+    def negotiate_should_allow_prefill(self, local_prefillable, **kwargs):
+        self.calls.append(local_prefillable)
+        return self.allow
 
 
 class TestPrefillAdder(CustomTestCase):
@@ -49,11 +63,13 @@ class TestPrefillAdder(CustomTestCase):
         full_available_size: int = 0,
         swa_available_size: int = 0,
         available_size: int = 0,
+        size_swa: int = 1_000_000,
     ) -> MagicMock:
         allocator = MagicMock()
         allocator.full_available_size.return_value = full_available_size
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
+        allocator.size_swa = size_swa
         return allocator
 
     def create_running_batch(self, reqs=None) -> MagicMock:
@@ -76,12 +92,16 @@ class TestPrefillAdder(CustomTestCase):
         req = MagicMock(spec=Req)
         req.rid = str(rid)
         req.priority = priority
-        req.extend_input_len = 0
-        req.extend_logprob_start_len = 0
+        req.prefix_indices = []
+        req.full_untruncated_fill_ids = []
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.retracted_stain = False
+        req.host_hit_length = 0
+        req.storage_hit_length = 0
         req.finished.return_value = False
+        req.needs_host_load_back.return_value = False
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -381,10 +401,9 @@ class TestPrefillAdder(CustomTestCase):
 
         # Add a prefill that exactly consumes the chunk budget
         req1 = self.create_mock_req("req1", priority=0, max_new_tokens=64)
-        req1.extend_input_len = 56
         req1.host_hit_length = 0
         req1.prefix_indices = []
-        req1.fill_ids = list(range(56))
+        req1.full_untruncated_fill_ids = list(range(56))
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
 
@@ -415,10 +434,9 @@ class TestPrefillAdder(CustomTestCase):
 
         # Same prefill no longer exhausts the chunk budget
         req2 = self.create_mock_req("req2", priority=0, max_new_tokens=64)
-        req2.extend_input_len = 56
         req2.host_hit_length = 0
         req2.prefix_indices = []
-        req2.fill_ids = list(range(56))
+        req2.full_untruncated_fill_ids = list(range(56))
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
 
@@ -432,10 +450,9 @@ class TestPrefillAdder(CustomTestCase):
 
         # Fit last small prefill request
         req3 = self.create_mock_req("req3", priority=0, max_new_tokens=16)
-        req3.extend_input_len = 3
         req3.host_hit_length = 0
         req3.prefix_indices = []
-        req3.fill_ids = list(range(3))
+        req3.full_untruncated_fill_ids = list(range(3))
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
 
@@ -469,10 +486,17 @@ class TestPrefillAdder(CustomTestCase):
         adder.is_hybrid_swa = is_hybrid_swa
 
         req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
-        req.extend_input_len = extend_input_len
         req.prefix_indices = []
-        req.fill_ids = list(range(extend_input_len))
-        req.set_extend_input_len = MagicMock()
+        req.full_untruncated_fill_ids = list(range(extend_input_len))
+        # set_extend_range is the only writer of extend_range; the production
+        # path reads req.extend_range.length right after calling it, so the mock
+        # must actually set the attribute (a spec=Req mock has the method but
+        # not the instance attribute).
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
         return adder, req
 
     def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):
@@ -489,8 +513,9 @@ class TestPrefillAdder(CustomTestCase):
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)  # truncated → chunked prefill continues
-        req.set_extend_input_len.assert_called_once()
-        new_len = req.set_extend_input_len.call_args.args[0]
+        req.set_extend_range.assert_called_once()
+        start, end = req.set_extend_range.call_args.args
+        new_len = end - start
         self.assertLessEqual(new_len + PAGE_SIZE, REM_SWA)
         self.assertEqual(new_len, REM_SWA - PAGE_SIZE)
 
@@ -502,26 +527,34 @@ class TestPrefillAdder(CustomTestCase):
         adder, req = self._build_hybrid_swa_chunked_req(
             page_size=PAGE_SIZE, rem_swa=PAGE_SIZE
         )
-        original_len = req.extend_input_len
 
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)
-        req.set_extend_input_len.assert_not_called()
-        self.assertEqual(req.extend_input_len, original_len)
+        req.set_extend_range.assert_not_called()
         self.assertEqual(len(adder.can_run_list), 0)
 
     def test_swa_budget_for_req(self):
+        # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,
+        # where alloc = min(extend, rem_chunk). The decode headroom is the SWA the
+        # request adds to its own sliding window (extend + decode), capped at the
+        # window -- a cached prefix funds the rest -- rather than a constant
+        # window, which over-charged short requests into an admission livelock.
         cases = [
-            # (extend, rem_chunk, window, page, expected, label)
-            (64, None, 128, 16, 128 + 16, "no_cap_floor_active"),
-            (200, None, 256, 32, 256 + 32, "no_cap_floor_active_other_dims"),
-            (300, None, 128, 16, 300 + 16, "no_cap_floor_inactive"),
-            (200, 50, 64, 8, 64 + 8, "cap_binds_then_floor"),
-            (300, 500, 64, 64, 300 + 64, "cap_does_not_bind"),
-            (0, None, 128, 16, 128 + 16, "extend_zero_floor_only"),
+            # (extend, max_new, rem_chunk, window, page, expected, label)
+            (64, 512, None, 128, 16, 128 + 16, "long_decode_hits_window_floor"),
+            (64, 32, None, 128, 16, 96 + 16, "short_req_reserves_below_window"),
+            (10, 20, None, 512, 8, 30 + 8, "short_resume_tiny_budget"),
+            (300, 512, None, 128, 16, 300 + 16, "big_extend_over_window"),
+            (200, 512, 50, 64, 8, 64 + 8, "chunk_capped_alloc_hits_floor"),
+            # Multi-chunk: alloc = rem_chunk (1024) caps a huge extend, and the
+            # chunk itself exceeds the window, so term1 = alloc - window is driven
+            # by the chunk, not the full extend -> budget = chunk + page.
+            (2000, 256, 1024, 512, 16, 1024 + 16, "multichunk_alloc_over_window"),
+            (0, 512, None, 128, 16, 128 + 16, "extend_zero_long_decode"),
+            (0, 40, None, 128, 16, 40 + 16, "extend_zero_short_decode"),
         ]
-        for extend, rem_chunk, window, page, expected, label in cases:
+        for extend, max_new, rem_chunk, window, page, expected, label in cases:
             with self.subTest(label=label):
                 self.mock_tree_cache.sliding_window_size = window
                 adder = self.create_adder(
@@ -529,7 +562,205 @@ class TestPrefillAdder(CustomTestCase):
                     page_size=page,
                     rem_chunk_tokens=rem_chunk,
                 )
-                self.assertEqual(adder._swa_budget_for_req(extend), expected)
+                self.assertEqual(adder._swa_budget_for_req(extend, max_new), expected)
+
+    def test_swa_admission_admits_short_cached_resume_at_two_window_pool(self):
+        # Livelock regression (real incident). At an SWA pool ~= 2 sliding
+        # windows, a cached-prefix resume matches >= 1 window (locked, excluded
+        # from rem_swa) and has only a short uncached tail + a little decode
+        # left. The pre-fix constant-window reservation charged a second full
+        # window, so the admission gate (swa_needed >= rem_swa_tokens) rejected
+        # it every scheduler iteration while LPM kept it at the queue head --
+        # 100% scheduler CPU, idle GPU. Capping the reservation at
+        # min(extend + decode, window) admits it.
+        WINDOW, PAGE, REM_SWA = 128, 8, 100
+        PREFIX, EXTEND = 200, 16  # cached prefix > window; short uncached tail
+        self.mock_token_allocator.swa_available_size.return_value = REM_SWA
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.sliding_window_size = WINDOW
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        adder = self.create_adder(self.create_running_batch(), page_size=PAGE)
+        adder.is_hybrid_swa = True
+
+        req = self.create_mock_req(
+            "resume", priority=0, max_new_tokens=40, output_len=10
+        )
+        req.prefix_indices = list(range(PREFIX))
+        req.full_untruncated_fill_ids = list(range(PREFIX + EXTEND))
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.last_node = MagicMock()
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        req.sampling_params = SimpleNamespace(max_new_tokens=40, ignore_eos=False)
+
+        # Pre-fix: a constant sliding-window reservation rejects the resume.
+        with patch.object(adder, "_swa_reserved_tokens", return_value=WINDOW + PAGE):
+            self.assertIs(
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                ),
+                AddReqResult.NO_TOKEN,
+            )
+        self.assertEqual(len(adder.can_run_list), 0)
+
+        # Fix: min(extend + decode, window) reservation admits it.
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertIn(req, adder.can_run_list)
+
+    def test_swa_new_tokens_clamps_remaining_not_total(self):
+        # Remaining decode headroom must be min(max_new - generated, CLIP)
+        # (subtract-then-clip). The reversed order (clip-then-subtract) zeroes
+        # out a request that has already generated >= CLIP tokens but still has a
+        # long decode ahead, under-reserving its SWA window -> OOM risk on resume
+        # of a long-generation request.
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS as CLIP
+
+        adder = self.create_adder(self.create_running_batch())
+        cases = [
+            # (max_new, generated, expected, label)
+            (100, 10, 90, "below_clip_normal"),
+            (40, 100, 0, "already_finished"),
+            # clip-then-subtract would give 3996; subtract-then-clip caps at CLIP.
+            (CLIP + 6000, 100, CLIP, "long_gen_small_output_caps_at_clip"),
+            # clip-then-subtract would give 0; the long decode still needs CLIP.
+            (CLIP + 6000, CLIP + 100, CLIP, "long_gen_output_over_clip"),
+        ]
+        for max_new, generated, expected, label in cases:
+            with self.subTest(label=label):
+                req = self.create_mock_req(
+                    label, priority=0, max_new_tokens=max_new, output_len=generated
+                )
+                self.assertEqual(adder._swa_new_tokens(req), expected)
+
+    def test_delayer_not_consulted_when_kv_budget_rejects(self):
+        """A rank whose first candidate fails the KV-budget gate must NOT
+        report local_prefillable=True: add_one_req returns NO_TOKEN before
+        negotiating, and finalize() later reports the rank as not
+        prefillable. Regression guard: the negotiate used to run at the top
+        of add_one_req, so under KV pressure a full rank still claimed
+        prefillable=True, the delayer saw "all prefillable" and allowed, the
+        full ranks then NO_TOKEN'ed out, and the DP-synced forward mixed
+        prefill and decode — the exact pattern the delayer exists to
+        prevent."""
+        delayer = _RecordingDelayer(allow=True)
+        adder = self._create_delayer_adder(available_tokens=10, delayer=delayer)
+
+        result = adder.add_one_req(
+            self._create_delayer_req(50),
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(delayer.calls, [])
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_delayer_not_consulted_when_post_lock_recheck_rejects(self):
+        """Locking the request's own prefix converts evictable tokens into
+        protected ones, so a request can pass the pre-lock KV gate yet fail
+        the post-lock recheck — precisely the high-utilization regime the
+        delayer targets. The negotiate must sit after that recheck too, or
+        the rank claims prefillable=True and then runs decode."""
+        delayer = _RecordingDelayer(allow=True)
+        adder = self._create_delayer_adder(available_tokens=10, delayer=delayer)
+        # Pre-lock budget is covered by evictable tokens; inc_lock_ref pins
+        # them (evictable -> protected), shrinking the budget below demand.
+        self.mock_tree_cache.evictable_size.return_value = 1000
+        self.mock_tree_cache.full_evictable_size.return_value = 1000
+
+        def _pin_prefix(node):
+            self.mock_tree_cache.evictable_size.return_value = 0
+            self.mock_tree_cache.full_evictable_size.return_value = 0
+            return IncLockRefResult()
+
+        self.mock_tree_cache.inc_lock_ref.side_effect = _pin_prefix
+
+        result = adder.add_one_req(
+            self._create_delayer_req(50),
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(delayer.calls, [])
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_delay_verdict_blocks_admissible_request(self):
+        """An admissible request must still be gated by the (relocated)
+        negotiate: on a delay verdict it is not admitted, and the rank
+        reported prefillable=True exactly once."""
+        delayer = _RecordingDelayer(allow=False)
+        adder = self._create_delayer_adder(available_tokens=100_000, delayer=delayer)
+
+        result = adder.add_one_req(
+            self._create_delayer_req(50),
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(delayer.calls, [True])
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_allow_verdict_admits_request(self):
+        """On an allow verdict the request proceeds through admission — the
+        relocated negotiate must not block the commit path."""
+        delayer = _RecordingDelayer(allow=True)
+        adder = self._create_delayer_adder(available_tokens=100_000, delayer=delayer)
+        req = self._create_delayer_req(50)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(delayer.calls, [True])
+        self.assertIn(req, adder.can_run_list)
+
+    def test_chunked_req_negotiates_prefillable_and_proceeds(self):
+        """A rank resuming a chunked prefill runs it this pass regardless of
+        the verdict, so add_chunked_req must report prefillable=True (else a
+        rank with an empty waiting queue reports False via finalize() and
+        peers delay while it prefills alone) and must not drop the chunk on
+        a delay verdict (that would leak memory)."""
+        delayer = _RecordingDelayer(allow=False)
+        adder = self._create_delayer_adder(
+            available_tokens=100_000, delayer=delayer, rem_chunk_tokens=500
+        )
+        req = self._create_delayer_req(200)
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIsNone(result)  # chunk fully admitted, not truncated
+        self.assertEqual(delayer.calls, [True])
+        self.assertIn(req, adder.can_run_list)
+
+    def _create_delayer_adder(self, *, available_tokens, delayer, **kwargs):
+        self.mock_token_allocator.available_size.return_value = available_tokens
+        self.mock_token_allocator.full_available_size.return_value = available_tokens
+        return self.create_adder(
+            self.create_running_batch(),
+            prefill_delayer_single_pass=delayer,
+            **kwargs,
+        )
+
+    def _create_delayer_req(self, num_tokens: int):
+        req = self.create_mock_req("delayer_req", priority=0, max_new_tokens=8)
+        req.full_untruncated_fill_ids = list(range(num_tokens))
+        req.host_hit_length = 0
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
 
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
@@ -546,8 +777,118 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_chunked_req(req)
         self.assertIsNone(result)
-        req.set_extend_input_len.assert_called_once_with(200)
+        req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
+
+    def _adder_with_extend_lens(self, extend_lens):
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.can_run_list = [
+            SimpleNamespace(extend_input_len=length) for length in extend_lens
+        ]
+        # BLOCK_M is auto-detected from the attention backend in production; the
+        # __new__ helper bypasses __init__, so set it explicitly. 64 matches the
+        # block_m the tile-count assertions below are computed against.
+        adder.prefill_tile_block_m = 64
+        return adder
+
+    def test_estimate_prefill_extend_tile_metrics(self):
+        metrics = estimate_prefill_extend_tile_metrics([1, 7, 13, 129], block_m=64)
+
+        self.assertEqual(metrics["q_tiles_per_request"], [1, 1, 1, 3])
+        self.assertEqual(metrics["legacy_q_tiles_per_head"], 12)
+        self.assertEqual(metrics["compact_q_tiles_per_head"], 6)
+        self.assertEqual(metrics["saved_q_tiles_per_head"], 6)
+        self.assertEqual(metrics["saved_q_tile_ratio"], 0.5)
+
+    def test_compact_prefill_tile_budget_admits_more_than_legacy(self):
+        adder = self._adder_with_extend_lens([1, 7, 13])
+
+        # The tile-budget admission is gated on HIP in production; force the gate
+        # on so this vendor-neutral admission-math check runs on any CI runner.
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "compact"),
+        ):
+            self.assertIsNone(adder._check_prefill_tile_budget(129))
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
+        ):
+            self.assertEqual(adder._check_prefill_tile_budget(129), AddReqResult.OTHER)
+
+    def test_prefill_tile_budget_always_allows_first_request(self):
+        adder = self._adder_with_extend_lens([])
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 1),
+        ):
+            self.assertIsNone(adder._check_prefill_tile_budget(4096))
+
+    def test_prefill_tile_budget_disabled_on_non_hip(self):
+        # AMD-only: on non-HIP vendors the tile-budget admission must be a no-op
+        # even when the budget env is set, so scheduler behavior is unchanged.
+        adder = self._adder_with_extend_lens([1, 7, 13])
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", False),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
+        ):
+            self.assertIsNone(adder._check_prefill_tile_budget(129))
+
+    # ---- _swa_req_never_fits: the gate on the _swa_chunk_cap escape hatch ----
+    # The hatch shrinks a chunk and admits it instead of waiting; it must fire
+    # ONLY for a request whose SWA budget can never fit the drained pool (true
+    # head-of-line livelock). Admitting transient-pressure requests instead
+    # collapses the SWA evictable cushion and causes a retraction storm.
+
+    def create_swa_adder(
+        self, *, size_swa: int, sliding_window: int, page_size: int = 16
+    ) -> PrefillAdder:
+        self.mock_tree_cache.sliding_window_size = sliding_window
+        self.mock_token_allocator = self.create_token_allocator(size_swa=size_swa)
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=page_size,
+            rem_chunk_tokens=512,
+        )
+
+    def test_swa_never_fits_false_under_transient_pressure(self):
+        # Small request against an ample pool: budget << pool, so it would fit
+        # once running decodes drain -> must wait, not take the hatch.
+        adder = self.create_swa_adder(size_swa=1024, sliding_window=128)
+        self.assertFalse(
+            adder._swa_req_never_fits(extend_input_len=256, max_new_tokens=64)
+        )
+
+    def test_swa_never_fits_true_when_budget_exceeds_whole_pool(self):
+        # A large host-hit load-back charge pushes the budget past the entire
+        # pool: it can never fit however far the pool drains -> hatch.
+        adder = self.create_swa_adder(size_swa=1024, sliding_window=128)
+        self.assertTrue(
+            adder._swa_req_never_fits(
+                extend_input_len=256, max_new_tokens=64, swa_host_hit_length=4096
+            )
+        )
+
+    def test_swa_never_fits_is_gated_by_pool_capacity(self):
+        # Same request; only the pool size changes. Proves the check compares
+        # the budget against size_swa (guards against a wrong-accessor bug).
+        req = dict(extend_input_len=256, max_new_tokens=64, swa_host_hit_length=600)
+        self.assertTrue(
+            self.create_swa_adder(size_swa=512, sliding_window=128)._swa_req_never_fits(
+                **req
+            )
+        )
+        self.assertFalse(
+            self.create_swa_adder(
+                size_swa=4096, sliding_window=128
+            )._swa_req_never_fits(**req)
+        )
 
 
 if __name__ == "__main__":

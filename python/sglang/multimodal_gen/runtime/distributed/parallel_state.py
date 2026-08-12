@@ -66,8 +66,10 @@ _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
+_VAE_DECODE: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
+_VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -122,6 +124,10 @@ def get_world_group() -> GroupCoordinator:
     return _WORLD
 
 
+def world_group_is_initialized() -> bool:
+    return _WORLD is not None
+
+
 def init_world_group(
     ranks: list[int], local_rank: int, backend: str
 ) -> GroupCoordinator:
@@ -132,6 +138,34 @@ def init_world_group(
         use_device_communicator=True,
         group_name="world",
     )
+
+
+def _sync_srt_world_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._WORLD is None:
+        srt_parallel_state._WORLD = _WORLD
+
+
+def _clear_srt_world_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._WORLD is _WORLD:
+        srt_parallel_state._WORLD = None
+
+
+def _sync_srt_tp_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._TP is None:
+        srt_parallel_state._TP = _TP
+
+
+def _clear_srt_tp_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._TP is _TP:
+        srt_parallel_state._TP = None
 
 
 def init_parallel_group_coordinator(
@@ -148,6 +182,7 @@ def init_parallel_group_coordinator(
         "tensor",
         "sequence",
         "classifier_free_guidance",
+        "vae_decode",
     ], f"parallel_mode {parallel_mode} is not supported"
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
@@ -165,13 +200,28 @@ def init_parallel_group_coordinator(
             **kwargs,
         )
     else:
-        # fallback to GroupCoordinator
         return GroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
-            group_name="cfg_group",
+            use_device_communicator=parallel_mode != "tensor",
+            use_srt_custom_allreduce=parallel_mode == "tensor",
+            group_name=(
+                "tp_group"
+                if parallel_mode == "tensor"
+                else (
+                    "vae_decode_group" if parallel_mode == "vae_decode" else "cfg_group"
+                )
+            ),
         )
+
+
+def _get_vae_decode_group_ranks(
+    rank_generator: RankGenerator,
+) -> list[list[int]]:
+    # VAE decode happens after each DP replica owns a different request result.
+    # Decode can shard one request across TP/SP/PP/CFG ranks, but must not cross DP.
+    return rank_generator.get_ranks(_VAE_DECODE_PARALLEL_AXES)
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -257,6 +307,7 @@ def init_distributed_environment(
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
+    _sync_srt_world_group()
 
 
 def get_sp_group() -> SequenceParallelGroupCoordinator:
@@ -429,6 +480,16 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
+    _sync_srt_tp_group()
+
+    global _VAE_DECODE
+    assert _VAE_DECODE is None, "VAE decode parallel group is already initialized"
+    _VAE_DECODE = init_parallel_group_coordinator(
+        group_ranks=_get_vae_decode_group_ranks(rank_generator),
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="vae_decode",
+    )
 
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
@@ -498,6 +559,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         main_process_only=False,
     )
 
+    current_platform.set_device(device)
     init_distributed_environment(
         world_size=world_size,
         rank=rank,
@@ -516,14 +578,6 @@ def maybe_init_distributed_environment_and_model_parallel(
         sequence_parallel_degree=sp_size,
     )
 
-    # Only set CUDA device if we're on a CUDA platform
-    if current_platform.is_cuda_alike():
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-    elif current_platform.is_npu():
-        device = torch.device(f"npu:{local_rank}")
-        torch.npu.set_device(device)
-
 
 def model_parallel_is_initialized() -> bool:
     """Check if model parallel groups are initialized."""
@@ -533,6 +587,7 @@ def model_parallel_is_initialized() -> bool:
         and _SP is not None
         and _PP is not None
         and _TP is not None
+        and _VAE_DECODE is not None
     )
 
 
@@ -574,6 +629,7 @@ def get_tp_rank() -> int:
 
 def destroy_distributed_environment() -> None:
     global _WORLD
+    _clear_srt_world_group()
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
@@ -718,6 +774,21 @@ def get_ring_parallel_rank() -> int:
     return get_sp_group().ring_rank
 
 
+def get_ulysses_ctx() -> tuple[int, int]:
+    """(world_size, rank) of the Ulysses group; (1, 0) when uninitialized
+    (unit tests / single-process debug paths)."""
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
+
+
+def get_ring_ctx() -> tuple[int, int]:
+    """(world_size, rank) of the Ring group; (1, 0) when uninitialized."""
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ring_parallel_world_size(), get_ring_parallel_rank()
+
+
 # PP
 def get_pp_group() -> PipelineGroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
@@ -808,6 +879,19 @@ def get_vae_parallel_rank() -> int:
     return torch.distributed.get_rank(group=get_vae_parallel_group())
 
 
+def get_decode_parallel_group_coordinator() -> GroupCoordinator:
+    assert _VAE_DECODE is not None, "VAE decode parallel group is not initialized"
+    return _VAE_DECODE
+
+
+def get_decode_parallel_world_size() -> int:
+    return get_decode_parallel_group_coordinator().world_size
+
+
+def get_decode_parallel_rank() -> int:
+    return get_decode_parallel_group_coordinator().rank_in_group
+
+
 def init_dit_group(
     dit_parallel_size: int,
     backend: str,
@@ -838,14 +922,38 @@ def init_vae_group(
 
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
-    global _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE
+    global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE
 
-    for group in (_TP, _SP, _DP, _CFG, _PP):
+    _clear_srt_tp_group()
+    # The IPC transport keeps CUDA mappings associated with the current
+    # Ulysses group. Drop them before tearing down the process groups.
+    from .device_communicators.ipc_a2a import IPC_A2A
+    from .parallel_groups import PROCESS_GROUP
+
+    IPC_A2A.reset()
+
+    for group in (_TP, _SP, _DP, _CFG, _PP, _VAE_DECODE):
         if group is not None:
             group.destroy()
+
+    # Ulysses and Ring groups are created separately from the SP coordinator,
+    # so GroupCoordinator.destroy() does not own or release them. Explicitly
+    # destroy them here; otherwise repeated Ulysses/Ring topology switches leak
+    # NCCL communicators and their CUDA memory.
+    destroyed_sequence_groups = []
+    for group in (PROCESS_GROUP.ULYSSES_PG, PROCESS_GROUP.RING_PG):
+        if (
+            group is not None
+            and group is not torch.distributed.group.WORLD
+            and all(group is not destroyed for destroyed in destroyed_sequence_groups)
+        ):
+            torch.distributed.destroy_process_group(group)
+            destroyed_sequence_groups.append(group)
+    PROCESS_GROUP.ULYSSES_PG = None
+    PROCESS_GROUP.RING_PG = None
 
     for group in (_DIT, _VAE):
         if group is not None:
             torch.distributed.destroy_process_group(group)
 
-    _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE = (None,) * 7
+    _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE = (None,) * 8

@@ -4,10 +4,11 @@ import unittest
 from typing import ClassVar
 
 from sglang.srt.kv_canary.perturb.config import TargetGroupKind
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.pd_fixture import CanaryPDFixture
 
 register_cuda_ci(est_time=180, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=231, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 class _PDPerturbBase(CanaryPDFixture):
@@ -37,7 +38,14 @@ class _PDPerturbBase(CanaryPDFixture):
     ) -> None:
         # send_parallel_short_requests defaults to max_new_tokens=100 so D-side runs
         # decode forwards that exercise canary verify on the transferred prefix.
-        self.send_parallel_short_requests(n=4)
+        #
+        # distinct_prompts is required for the violation to surface reliably:
+        # with a shared prompt, P-side radix caching rewrites each request's
+        # req_to_token row to the first-inserted (canonical) copy's slots in
+        # cache_unfinished_req BEFORE send_kv_chunk snapshots the indices, so a
+        # flip on a deduped duplicate slot is freed untransferred and never
+        # re-verified on either side.
+        self.send_parallel_short_requests(n=4, distinct_prompts=True)
         # D-side: first decode forward re-verifies the transferred prefix slots,
         # so the flip MUST surface as real_kv_hash violation.
         self.assert_per_forward_violation_reported(

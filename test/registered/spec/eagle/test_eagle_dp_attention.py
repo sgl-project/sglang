@@ -21,10 +21,7 @@ from sglang.test.test_utils import (
 )
 
 # EAGLE3 with DP attention (tp=2, dp=2, requires 4 GPUs).
-# Per-commit EAGLE + DP-attn coverage on CUDA is provided by
-# test_eagle_infer_beta_dp_attention.py (B200 4-gpu), so this H100 variant
-# is gated to extra-b only.
-register_cuda_ci(est_time=99, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=99, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
 
@@ -57,10 +54,10 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             "triton" if is_in_amd_ci() else "fa3",
             "--mem-fraction-static",
             "0.75",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "64",
         ]
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

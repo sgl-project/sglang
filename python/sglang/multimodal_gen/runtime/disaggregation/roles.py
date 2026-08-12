@@ -49,6 +49,7 @@ def get_module_role(module_name: str) -> "RoleType | None":
 
     denoising_prefixes = (
         "transformer",
+        "unconditional_transformer",
         "video_dit",
         "audio_dit",
         "dual_tower_bridge",

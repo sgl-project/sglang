@@ -5,6 +5,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if current_platform.is_npu():
     import torch_npu
@@ -13,7 +14,7 @@ if current_platform.is_npu():
         ["profiler.profile", torch_npu.profiler.profile],
         ["profiler.schedule", torch_npu.profiler.schedule],
     ]
-    torch_npu._apply_patches(patches)
+    apply_torch_npu_patches(torch_npu, patches)
 
 logger = init_logger(__name__)
 

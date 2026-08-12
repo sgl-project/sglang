@@ -3,7 +3,7 @@
 
 use crate::policies::{Policy, SelectionContext};
 use crate::workers::Worker;
-use rand::seq::IteratorRandom;
+use rand::Rng;
 use std::sync::Arc;
 
 #[derive(Debug, Default)]
@@ -20,11 +20,14 @@ impl Policy for PowerOfTwoChoicesPolicy {
         match workers.len() {
             0 => None,
             1 => Some(workers[0].clone()),
-            _ => {
+            len => {
                 let mut rng = rand::thread_rng();
-                let mut chosen = workers.iter().choose_multiple(&mut rng, 2);
-                chosen.sort_by_key(|w| w.active_load());
-                Some(chosen[0].clone())
+                let i = rng.gen_range(0..len);
+                let mut j = rng.gen_range(0..len - 1);
+                if j >= i {
+                    j += 1;
+                }
+                Some(std::cmp::min_by_key(&workers[i], &workers[j], |w| w.active_load()).clone())
             }
         }
     }

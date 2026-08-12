@@ -12,20 +12,18 @@ from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL: int = 60
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
     SGLANG_DIFFUSION_CACHE_ROOT: str = os.path.expanduser("~/.cache/sgl_diffusion")
     SGLANG_DIFFUSION_CONFIG_ROOT: str = os.path.expanduser("~/.config/sgl_diffusion")
-    SGLANG_DIFFUSION_CONFIGURE_LOGGING: int = 1
     SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
-    SGLANG_DIFFUSION_LOGGING_CONFIG_PATH: str | None = None
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
+    SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
@@ -34,6 +32,17 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
+    # on by default; engages only on 2 ranks with peer-to-peer access and falls
+    # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
+    # the resolver below -- that is the value the runtime reads.
+    SGLANG_DIFFUSION_IPC_A2A: bool = True
+    # a deadlock backstop, not a per-step budget: a rank can legitimately stall
+    # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
+    # retires the transport on every rank and fails the request
+    SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS: float = 10000.0
+    # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
+    # slots and is never freed, so multi-resolution serving needs a cap
+    SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -56,9 +65,12 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
+    SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW: bool = False
+    SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
+    SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
+    SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
-    SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
@@ -77,10 +89,6 @@ def get_default_config_root() -> str:
         "XDG_CONFIG_HOME",
         os.path.join(os.path.expanduser("~"), ".config"),
     )
-
-
-def maybe_convert_int(value: str | None) -> int | None:
-    return int(value) if value is not None else None
 
 
 # helpers for environment variable definitions
@@ -104,20 +112,6 @@ def _lazy_float(key: str, default: str | float) -> Callable[[], float]:
 
 def _lazy_bool(key: str, default: str = "false") -> Callable[[], bool]:
     return lambda: get_bool_env_var(key, default)
-
-
-def _lazy_bool_any(keys: list[str], default: str = "false") -> Callable[[], bool]:
-    def _getter():
-        for key in keys:
-            if get_bool_env_var(key, "false"):
-                return True
-        return (
-            get_bool_env_var("", default)
-            if not keys
-            else get_bool_env_var(keys[0], default)
-        )
-
-    return _getter
 
 
 def _lazy_path(
@@ -153,13 +147,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default this is 1.
     # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
     "NVCC_THREADS": _lazy_str("NVCC_THREADS"),
-    # If set, sgl_diffusion will use precompiled binaries (*.so)
-    "SGLANG_DIFFUSION_USE_PRECOMPILED": _lazy_bool_any(
-        [
-            "SGLANG_DIFFUSION_USE_PRECOMPILED",
-            "SGLANG_DIFFUSION_PRECOMPILED_WHEEL_LOCATION",
-        ]
-    ),
     # CMake build type
     # If not set, defaults to "Debug" or "RelWithDebInfo"
     # Available options: "Debug", "Release", "RelWithDebInfo"
@@ -182,39 +169,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_DIFFUSION_CACHE_ROOT",
         lambda: os.path.join(get_default_cache_root(), "sgl_diffusion"),
     ),
-    # Interval in seconds to log a warning message when the ring buffer is full
-    "SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL": _lazy_int(
-        "SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL", 60
-    ),
     # Path to the NCCL library file. It is needed because nccl>=2.19 brought
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
     "SGLANG_DIFFUSION_NCCL_SO_PATH": _lazy_str("SGLANG_DIFFUSION_NCCL_SO_PATH"),
     # when `SGLANG_DIFFUSION_NCCL_SO_PATH` is not set, sgl_diffusion will try to find the nccl
     # library file in the locations specified by `LD_LIBRARY_PATH`
     "LD_LIBRARY_PATH": _lazy_str("LD_LIBRARY_PATH"),
-    # Internal flag to enable Dynamo fullgraph capture
-    "SGLANG_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE": _lazy_bool(
-        "SGLANG_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE", "1"
-    ),
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": _lazy_int("LOCAL_RANK", 0),
     # used to control the visible devices in the distributed setting
     "CUDA_VISIBLE_DEVICES": _lazy_str("CUDA_VISIBLE_DEVICES"),
-    # timeout for each iteration in the engine
-    "SGLANG_DIFFUSION_ENGINE_ITERATION_TIMEOUT_S": _lazy_int(
-        "SGLANG_DIFFUSION_ENGINE_ITERATION_TIMEOUT_S", 60
-    ),
-    # Logging configuration
-    # If set to 0, sgl_diffusion will not configure logging
-    # If set to 1, sgl_diffusion will configure logging using the default configuration
-    #    or the configuration file specified by SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
-    "SGLANG_DIFFUSION_CONFIGURE_LOGGING": _lazy_int(
-        "SGLANG_DIFFUSION_CONFIGURE_LOGGING", 1
-    ),
-    "SGLANG_DIFFUSION_LOGGING_CONFIG_PATH": _lazy_str(
-        "SGLANG_DIFFUSION_LOGGING_CONFIG_PATH"
-    ),
     # this is used for configuring the default logging level
     "SGLANG_DIFFUSION_LOGGING_LEVEL": _lazy_str(
         "SGLANG_DIFFUSION_LOGGING_LEVEL", "INFO"
@@ -239,6 +204,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
         "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
     ),
+    # Internal per-worker platform override used by disaggregated role launch.
+    # Empty means normal platform auto-detection.
+    "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
+        "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
+    ),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
@@ -261,6 +231,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
+    # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
+    "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
+        "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
+    ),
+    "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
+        "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
+    ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),
@@ -288,6 +266,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
+    "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW": _lazy_bool(
+        "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW"
+    ),
+    "SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES": _lazy_int(
+        "SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES"
+    ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
     # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.
     # Supported values:
@@ -298,6 +282,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Legacy aliases `cudnn` and `trtllm` are also accepted.
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
+    ),
+    # Experimental opt-in for W8A8 FP8 GEMM in diffusion weight-only FP8 linears.
+    # When disabled, FP8 weights are dequantized to compute dtype before matmul.
+    "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
+    ),
+    # Dequantize storage-only FP8 linear weights to the compute dtype once,
+    # at first use (bit-identical outputs; trades weight VRAM for skipping
+    # the per-forward dequant pass). Weights are kept FP8-resident when free
+    # memory is low or when this flag is disabled.
+    "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
+        "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

@@ -9,7 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Literal, cast
+from typing import Any, Callable, Iterator, Literal, cast
 
 import torch
 from tqdm import tqdm
@@ -48,6 +48,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
+    ProgressiveDenoisingStage,
+    ProgressiveDenoisingStageRouter,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -78,6 +82,7 @@ class ComposedPipelineBase(ABC):
 
     # the name of the pipeline it associated with, in diffusers
     pipeline_name: str
+    default_model_subfolder: str | None = None
 
     def is_lora_effective(self):
         return False
@@ -168,7 +173,32 @@ class ComposedPipelineBase(ABC):
         self.modules[module_name] = module
 
     def _load_config(self) -> dict[str, Any]:
-        model_path = maybe_download_model(self.model_path, force_diffusers_model=True)
+        model_subfolder = self.server_args.model_subfolder
+        if model_subfolder is None and not os.path.isfile(
+            os.path.join(self.model_path, "model_index.json")
+        ):
+            model_subfolder = self.default_model_subfolder
+
+        if model_subfolder is None:
+            model_path = maybe_download_model(
+                self.model_path, force_diffusers_model=True
+            )
+        else:
+            model_subfolder = os.path.normpath(model_subfolder)
+            if (
+                os.path.isabs(model_subfolder)
+                or model_subfolder == ".."
+                or model_subfolder.startswith(f"..{os.sep}")
+            ):
+                raise ValueError(
+                    f"model_subfolder must stay inside the model repository: {model_subfolder!r}"
+                )
+            model_root = maybe_download_model(
+                self.model_path,
+                allow_patterns=[f"{model_subfolder}/**"],
+            )
+            model_path = os.path.join(model_root, model_subfolder)
+
         self.model_path = model_path
         logger.info("Model path: %s", model_path)
         config = verify_model_config_and_directory(model_path)
@@ -440,13 +470,26 @@ class ComposedPipelineBase(ABC):
         component_load_specs: list[ComponentLoadSpec] = []
 
         # enqueue only real weight loads (e.g., scheduler, tokenizer is excluded); skipped/provided modules keep old handling
-        for index, (
-            module_name,
-            (
-                transformers_or_diffusers,
-                architecture,
-            ),
-        ) in enumerate(model_index.items()):
+        for index, (module_name, component_spec) in enumerate(model_index.items()):
+            # Diffusers uses JSON null for unavailable optional components.
+            # Check before unpacking the normal [library, architecture] pair.
+            if component_spec is None:
+                logger.warning(
+                    "Module %s in model_index.json has null value, removing from required_config_modules",
+                    module_name,
+                )
+                if module_name in self.required_config_modules:
+                    self.required_config_modules.remove(module_name)
+                continue
+            if (
+                not isinstance(component_spec, (list, tuple))
+                or len(component_spec) != 2
+            ):
+                raise ValueError(
+                    f"Module {module_name!r} in model_index.json must be null or "
+                    f"a [library, architecture] pair, got {component_spec!r}"
+                )
+            transformers_or_diffusers, architecture = component_spec
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",
@@ -650,14 +693,24 @@ class ComposedPipelineBase(ABC):
 
     def add_standard_text_encoding_stage(
         self,
-        text_encoder_key: str = "text_encoder",
-        tokenizer_key: str = "tokenizer",
+        text_encoder_key: str | list[str] = "text_encoder",
+        tokenizer_key: str | list[str] = "tokenizer",
+        stage_name: str | None = None,
     ) -> "ComposedPipelineBase":
+        text_encoder_keys = (
+            [text_encoder_key]
+            if isinstance(text_encoder_key, str)
+            else text_encoder_key
+        )
+        tokenizer_keys = (
+            [tokenizer_key] if isinstance(tokenizer_key, str) else tokenizer_key
+        )
         return self.add_stage(
             TextEncodingStage(
-                text_encoders=[self.get_module(text_encoder_key)],
-                tokenizers=[self.get_module(tokenizer_key)],
+                text_encoders=[self.get_module(key) for key in text_encoder_keys],
+                tokenizers=[self.get_module(key) for key in tokenizer_keys],
             ),
+            stage_name,
         )
 
     def add_standard_timestep_preparation_stage(
@@ -718,6 +771,42 @@ class ComposedPipelineBase(ABC):
             stage_name,
         )
 
+    def add_progressive_denoising_stage(
+        self,
+        progressive_stage_cls: type[ProgressiveDenoisingStage],
+        transformer_key: str = "transformer",
+        transformer_2_key: str | None = "transformer_2",
+        scheduler_key: str = "scheduler",
+        vae_key: str | None = "vae",
+        stage_name: str = "denoising_stage",
+    ) -> "ComposedPipelineBase":
+
+        def create_stage() -> PipelineStage:
+            kwargs = {
+                "transformer": self.get_module(transformer_key),
+                "scheduler": self.get_module(scheduler_key),
+                "pipeline": self,
+            }
+
+            if transformer_2_key:
+                transformer_2 = self.get_module(transformer_2_key, None)
+                if transformer_2 is not None:
+                    kwargs["transformer_2"] = transformer_2
+
+            if vae_key:
+                kwargs["vae"] = self.get_module(vae_key, None)
+
+            return ProgressiveDenoisingStageRouter(
+                standard_stage=DenoisingStage(**kwargs),
+                progressive_stage_factory=lambda: progressive_stage_cls(**kwargs),
+            )
+
+        return self.add_stage_factory(
+            RoleType.DENOISER,
+            create_stage,
+            stage_name,
+        )
+
     def add_standard_decoding_stage(
         self,
         vae_key: str = "vae",
@@ -740,19 +829,30 @@ class ComposedPipelineBase(ABC):
     def add_standard_t2i_stages(
         self,
         include_input_validation: bool = True,
+        text_encoder_key: str | list[str] = "text_encoder",
+        tokenizer_key: str | list[str] = "tokenizer",
+        text_encoding_stage_name: str | None = None,
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
+        progressive_denoising_stage_cls: type[ProgressiveDenoisingStage] | None = None,
     ) -> "ComposedPipelineBase":
 
         if include_input_validation:
             self.add_stage(InputValidationStage())
 
-        self.add_standard_text_encoding_stage()
+        self.add_standard_text_encoding_stage(
+            text_encoder_key=text_encoder_key,
+            tokenizer_key=tokenizer_key,
+            stage_name=text_encoding_stage_name,
+        )
 
         self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
-        self.add_standard_denoising_stage()
+        if progressive_denoising_stage_cls is None:
+            self.add_standard_denoising_stage()
+        else:
+            self.add_progressive_denoising_stage(progressive_denoising_stage_cls)
         self.add_standard_decoding_stage()
 
         return self
@@ -770,6 +870,7 @@ class ComposedPipelineBase(ABC):
         image_vae_key: str = "vae",
         image_vae_stage_kwargs: dict[str, Any] | None = None,
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
+        progressive_denoising_stage_cls: type[ProgressiveDenoisingStage] | None = None,
     ) -> "ComposedPipelineBase":
         if include_input_validation:
             self.add_stage(
@@ -806,7 +907,10 @@ class ComposedPipelineBase(ABC):
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
-        self.add_standard_denoising_stage()
+        if progressive_denoising_stage_cls is None:
+            self.add_standard_denoising_stage()
+        else:
+            self.add_progressive_denoising_stage(progressive_denoising_stage_cls)
         self.add_standard_decoding_stage()
         return self
 
@@ -914,7 +1018,12 @@ class ComposedPipelineBase(ABC):
 
         # Execute each stage
         if not batch.is_warmup and not batch.suppress_logs:
-            logger.info(
+            stage_logger = (
+                logger.debug
+                if server_args.pipeline_config.task_type.is_action_gen()
+                else logger.info
+            )
+            stage_logger(
                 "Running pipeline stages: %s",
                 list(self._stage_name_mapping.keys()),
                 main_process_only=True,
@@ -942,7 +1051,12 @@ class ComposedPipelineBase(ABC):
             )
 
         if not batches[0].is_warmup and not batches[0].suppress_logs:
-            logger.info(
+            stage_logger = (
+                logger.debug
+                if server_args.pipeline_config.task_type.is_action_gen()
+                else logger.info
+            )
+            stage_logger(
                 "Running grouped pipeline stages: %s",
                 list(self._stage_name_mapping.keys()),
                 main_process_only=True,
@@ -950,4 +1064,28 @@ class ComposedPipelineBase(ABC):
 
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
+        )
+
+    @torch.no_grad()
+    def forward_batch_sequentially(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> Iterator[OutputBatch]:
+        """Yield grouped outputs as each terminal-stage invocation completes."""
+        if len(batches) == 1 and (
+            not server_args.pipeline_config.supports_sequential_multi_output_inference()
+            or max(1, int(batches[0].num_outputs_per_prompt or 1)) == 1
+        ):
+            yield self.forward(batches[0], server_args)
+            return
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+        yield from self.executor.execute_group_sequentially_with_profiling(
+            self.stages,
+            batches,
+            server_args,
         )

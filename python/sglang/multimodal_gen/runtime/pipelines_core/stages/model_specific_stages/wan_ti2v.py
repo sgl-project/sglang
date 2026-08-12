@@ -3,6 +3,7 @@
 import math
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -110,7 +111,14 @@ def prepare_wan_ti2v_sp_inputs(
         if reserved_frames_masks is not None:
             reserved_frames_mask = reserved_frames_masks[0]
             time_dim = reserved_frames_mask.shape[1]
-            if time_dim > 0 and time_dim % sp_world_size == 0:
+            if time_dim > 0:
+                pad_len = (sp_world_size - time_dim % sp_world_size) % sp_world_size
+                if pad_len:
+                    reserved_frames_mask = F.pad(
+                        reserved_frames_mask,
+                        (0, 0, 0, 0, 0, pad_len),
+                        value=1.0,
+                    )
                 reserved_frames_mask_sp_tensor = rearrange(
                     reserved_frames_mask,
                     "c (n t) h w -> c n t h w",
@@ -138,15 +146,14 @@ def expand_wan_ti2v_timestep(
     target_dtype: torch.dtype,
     seq_len: int,
     reserved_frames_mask: torch.Tensor | None,
+    patch_size: tuple[int, int, int],
 ) -> torch.Tensor:
     """Expand the timestep tensor for Wan TI2V's first-frame masking semantics."""
 
     batch_size = batch.raw_latent_shape[0]
     t_device_rounded = t_device.to(target_dtype)
 
-    local_seq_len = seq_len
-    if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
-        local_seq_len = seq_len // get_sp_world_size()
+    local_seq_len = _get_wan_ti2v_local_seq_len(batch, seq_len, patch_size)
 
     if get_sp_parallel_rank() == 0 and reserved_frames_mask is not None:
         temp_ts = (reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded).flatten()
@@ -159,6 +166,17 @@ def expand_wan_ti2v_timestep(
         return temp_ts.unsqueeze(0).repeat(batch_size, 1)
 
     return t_device.repeat(batch_size, local_seq_len)
+
+
+def _get_wan_ti2v_local_seq_len(
+    batch: Req, fallback_seq_len: int, patch_size: tuple[int, int, int]
+) -> int:
+    latents = batch.latents
+    if latents is None or latents.ndim != 5:
+        return fallback_seq_len
+
+    _, _, local_t, latent_h, latent_w = latents.shape
+    return int(local_t * latent_h * latent_w // (patch_size[1] * patch_size[2]))
 
 
 def blend_wan_ti2v_latents(
