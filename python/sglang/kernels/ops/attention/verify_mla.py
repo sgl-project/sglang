@@ -692,7 +692,6 @@ def verify_mla_fwd(
         sinks=sinks,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
-        allow_mla=True,
     ):
         return False
     if k_extend.shape[1] != 1:

@@ -668,7 +668,6 @@ def can_handle(
     sinks=None,
     logit_cap=0.0,
     xai_temperature_len=-1,
-    allow_mla=False,
 ):
     """Return True iff the split-KV verify path can serve this exact problem
     with the same result as extend_attention_fwd. Conservative: anything not
@@ -712,7 +711,7 @@ def can_handle(
     # latent KV cache and an absorbed-attention layout the split-KV verify
     # kernel is not built for; it GPU-faults on that shape. Fall back to
     # extend_attention_fwd, which handles MLA correctly.
-    if not allow_mla and q_extend.shape[2] != v_extend.shape[2]:
+    if q_extend.shape[2] != v_extend.shape[2]:
         return False
     # NOTE: must NOT read any tensor *values* here (no .item()/.cpu()): the
     # target-verify step runs inside a captured CUDA/HIP graph, where a
