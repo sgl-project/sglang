@@ -53,7 +53,8 @@ out = llm.generate(
 ```
 
 `mm_content_hashes` describes input content. It is not interchangeable with
-`mm_hashes`, which remains the processor-output/embedding cache identity. See
+legacy `mm_hashes`, which controls the external-router and pad sentinel rather
+than the processor-derived embedding identity. See
 [VLM preprocessing and caching](../advanced_features/vlm_preprocessing_cache).
 
 The examples below demonstrate all three approaches with both Qwen2.5-VL and Llama 4 models.

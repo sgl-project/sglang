@@ -24,9 +24,10 @@ SGLang keeps four identities separate:
 | Embedding | ViT output indexed by the feature hash | Skip vision encoding when every required TP rank has the entry. |
 
 The prompt is not part of the per-image artifact key. A new turn rebuilds prompt
-tokens and image offsets while reusing image work. `mm_hashes` remains the
-processor-output/embedding identity; `mm_content_hashes` identifies input media.
-Do not substitute one for the other.
+tokens and image offsets while reusing image work. `mm_content_hashes` identifies
+input media. Legacy `mm_hashes` controls the external-router and pad sentinel;
+it cannot replace the processor-derived feature identity used for embedding
+reuse. Do not substitute one for the other.
 
 ## Correctness contract
 
