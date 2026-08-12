@@ -124,6 +124,36 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.block_size_k,
             )
         self._msa_dec_meta = None
+
+        # ---- IndexCache ----
+        # Reuse the decode block selection (topk_idx) across sparse layers:
+        # recompute the lightning indexer only on 1 of every `stride` sparse
+        # layers (the "cadence" layers) and reuse the last selection on the rest.
+        self.indexcache_stride = envs.SGLANG_MINIMAX_INDEXCACHE_STRIDE.get() or 0
+        self.indexcache_mode = (
+            envs.SGLANG_MINIMAX_INDEXCACHE_MODE.get() or "full"
+        ).lower()
+        # Execution-order position of each sparse layer (0,1,2,... over the sorted
+        # sparse layer ids); a layer is a cadence layer iff pos % stride == 0.
+        self._sparse_layer_pos = {
+            lid: i for i, lid in enumerate(sorted(self.sparse_layer_ids))
+        }
+        # Per-forward cache of the last computed index state
+        # (idx_o, main_topk_idx, real_seq_lens); reset every forward in
+        # init_forward_metadata_out_graph. Reused within a single forward only,
+        # so it is CUDA-graph safe (cadence layers run before reuse layers).
+        self._indexcache_state = None
+        if self.indexcache_stride and self.indexcache_stride > 1:
+            logger.warning(
+                "[MiniMaxSparse] IndexCache ENABLED: stride=%d mode=%r "
+                "(decode indexer reused on %d of every %d sparse layers; "
+                "accuracy-gate this change, e.g. GSM8K).",
+                self.indexcache_stride,
+                self.indexcache_mode,
+                self.indexcache_stride - 1,
+                self.indexcache_stride,
+            )
+
         if self.use_msa:
             from sglang.srt.runtime_context import get_parallel
 
@@ -198,6 +228,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # cuda-graph replay views are a SimpleNamespace without extend_seq_lens_cpu,
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         self._msa_dec_meta = None
+        # New forward -> drop the IndexCache selection so the first (cadence)
+        # sparse layer of this forward recomputes it.
+        self._indexcache_state = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
@@ -516,7 +549,31 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             q = _quant_q_fp8(q, layer.q_scale_float)
             idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
-        idx_o, o = minimax_sparse_decode(
+        # ---- IndexCache: recompute (cadence) vs reuse ----
+        # A sparse layer recomputes the lightning indexer iff it is a cadence
+        # layer (pos % stride == 0) or IndexCache is off; otherwise it reuses the
+        # last cached selection. All sparse layers of a forward run in order
+        # (cadence before reuse), so within-forward reuse is CUDA-graph safe.
+        stride = self.indexcache_stride
+        indexcache_on = bool(stride and stride > 1)
+        pos = self._sparse_layer_pos.get(layer.layer_id, 0)
+        is_reuse = (
+            indexcache_on
+            and (pos % stride != 0)
+            and (self._indexcache_state is not None)
+        )
+        # "full" mode reuses the cached idx_o; if this layer needs a real idx_o
+        # (index value enabled) but the cadence layer had none, recompute instead
+        # so index_o_proj never receives a stale/None idx_o.
+        if (
+            is_reuse
+            and self.indexcache_mode != "topk"
+            and not disable_value
+            and self._indexcache_state[0] is None
+        ):
+            is_reuse = False
+
+        common_args = (
             q,
             None,
             k_cache,
@@ -534,6 +591,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.topk_blocks,
             self.init_blocks,
             self.local_blocks,
+        )
+        common_kwargs = dict(
             score_type=self.score_type,
             disable_index_value=disable_value,
             dense_main_attn_fn=attn_fn,
@@ -548,6 +607,34 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_k_scale=layer.idx_k_scale_float,
             idx_v_scale=layer.idx_v_scale_float,
         )
+
+        if not is_reuse:
+            # Cadence layer (or IndexCache off): run the indexer, cache its state.
+            idx_o, o, main_topk_idx, real_seq_lens = minimax_sparse_decode(
+                *common_args, return_index_state=True, **common_kwargs
+            )
+            if indexcache_on:
+                self._indexcache_state = (idx_o, main_topk_idx, real_seq_lens)
+        else:
+            cached_idx_o, cached_topk_idx, cached_real_seq_lens = self._indexcache_state
+            if self.indexcache_mode == "topk":
+                # Recompute idx_o; reuse only the block selection.
+                idx_o, o = minimax_sparse_decode(
+                    *common_args,
+                    reuse_main_topk_idx=cached_topk_idx,
+                    reuse_real_seq_lens=cached_real_seq_lens,
+                    **common_kwargs,
+                )
+            else:
+                # "full": skip the indexer entirely, reuse idx_o + selection.
+                idx_o, o = minimax_sparse_decode(
+                    *common_args,
+                    skip_indexer=True,
+                    reuse_idx_o=(None if disable_value else cached_idx_o),
+                    reuse_main_topk_idx=cached_topk_idx,
+                    reuse_real_seq_lens=cached_real_seq_lens,
+                    **common_kwargs,
+                )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
             o.reshape(q.shape[0], -1).contiguous(),
