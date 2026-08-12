@@ -206,3 +206,9 @@ def test_adapter_benchmark_switches_restore_old_materializations(monkeypatch):
     assert mega.tensors.topk_ids.data_ptr() != topk_ids.data_ptr()
     assert mega.used_view is False
     assert result.hidden_states is output
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
