@@ -8,7 +8,6 @@ from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _with_early_finalize_shared_load,
 )
-from sglang.srt.layers.flashinfer_provider import _make_provider
 from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
     Qwen35MoeFinalizeHandoff,
     is_supported_forward_mode,
@@ -46,22 +45,14 @@ class _TestConfig:
     profiles: tuple[_TestProfile, ...]
 
 
-_TEST_DEFAULT_CONFIG = _TestConfig(
-    profiles=(
-        _TestProfile(
-            finalize_routes=_TestRoutes(targets=(_TestTarget(_TestPreset()),))
-        ),
-    )
-)
-
-
 @pytest.mark.parametrize(
     ("forward_mode", "expected"),
     [
         (ForwardMode.DECODE, True),
         (ForwardMode.EXTEND, True),
         (ForwardMode.IDLE, False),
-        (ForwardMode.TARGET_VERIFY, False),
+        (ForwardMode.TARGET_VERIFY, True),
+        (ForwardMode.DRAFT_EXTEND_V2, False),
     ],
 )
 def test_supported_forward_modes(forward_mode, expected):
@@ -105,185 +96,6 @@ def test_deferred_handoff_reuses_producer_storage():
     assert handoff.expert_weights.data_ptr() == expert_weights.data_ptr()
     assert handoff.permuted_indices.data_ptr() == permuted_indices.data_ptr()
     assert handoff.gated_shared_output is gated_shared_output
-
-
-class _CompleteWorkspace:
-    def __init__(
-        self,
-        tp_size,
-        tp_rank,
-        max_token_num,
-        hidden_dim,
-        dtype,
-        *,
-        group,
-        top_k,
-        rms_eps,
-        routed_scaling_factor,
-        weight_bias,
-        include_shared_expert,
-        add_residual,
-        write_residual_output,
-        config=_TEST_DEFAULT_CONFIG,
-    ):
-        pass
-
-    def is_buffer_size_sufficient(
-        self, tp_size, num_tokens, hidden_dim, dtype, use_oneshot=None
-    ):
-        pass
-
-    def destroy(self):
-        pass
-
-
-def _complete_allreduce(
-    input,
-    workspace,
-    pattern,
-    launch_with_pdl,
-    residual_in,
-    residual_out,
-    norm_out,
-    rms_gamma,
-    rms_eps,
-    weight_bias,
-    expanded_idx_to_permuted_idx,
-    expert_scale_factor,
-    shared_expert_output,
-):
-    pass
-
-
-def _complete_comm(allreduce_fusion=_complete_allreduce):
-    return SimpleNamespace(
-        AllReduceFusionPattern=SimpleNamespace(
-            kARResidualRMSNorm=1,
-            kMoEFinalizeARResidualRMSNorm=7,
-        ),
-        allreduce_fusion=allreduce_fusion,
-    )
-
-
-def test_provider_requires_the_stable_backend_specific_abi():
-    provider = _make_provider(
-        _complete_comm(),
-        _CompleteWorkspace,
-        default_config=_TEST_DEFAULT_CONFIG,
-    )
-    assert provider is not None
-    assert provider.workspace_type is _CompleteWorkspace
-    assert provider.default_config is _TEST_DEFAULT_CONFIG
-
-    class WorkspaceWithoutRoutedScale:
-        def __init__(
-            self,
-            tp_size,
-            tp_rank,
-            max_token_num,
-            hidden_dim,
-            dtype,
-            *,
-            group,
-            top_k,
-            rms_eps,
-            weight_bias,
-            include_shared_expert,
-            add_residual,
-            write_residual_output,
-            config=_TEST_DEFAULT_CONFIG,
-        ):
-            pass
-
-        def is_buffer_size_sufficient(
-            self, tp_size, num_tokens, hidden_dim, dtype, use_oneshot=None
-        ):
-            pass
-
-        def destroy(self):
-            pass
-
-    assert (
-        _make_provider(
-            _complete_comm(),
-            WorkspaceWithoutRoutedScale,
-            default_config=_TEST_DEFAULT_CONFIG,
-        )
-        is None
-    )
-
-
-def test_provider_accepts_forward_compatible_kwargs_abi():
-    class Workspace:
-        def __init__(self, **kwargs):
-            pass
-
-        def is_buffer_size_sufficient(self, **kwargs):
-            pass
-
-        def destroy(self):
-            pass
-
-    def allreduce_fusion(**kwargs):
-        pass
-
-    assert (
-        _make_provider(
-            _complete_comm(allreduce_fusion),
-            Workspace,
-            default_config=_TEST_DEFAULT_CONFIG,
-        )
-        is not None
-    )
-
-
-def test_provider_rejects_incomplete_unified_api():
-    assert (
-        _make_provider(
-            SimpleNamespace(
-                AllReduceFusionPattern=_complete_comm().AllReduceFusionPattern
-            ),
-            _CompleteWorkspace,
-            default_config=_TEST_DEFAULT_CONFIG,
-        )
-        is None
-    )
-
-    def allreduce_without_pdl(
-        input,
-        workspace,
-        pattern,
-        residual_in,
-        residual_out,
-        norm_out,
-        rms_gamma,
-        rms_eps,
-        weight_bias,
-        expanded_idx_to_permuted_idx,
-        expert_scale_factor,
-        shared_expert_output,
-    ):
-        pass
-
-    assert (
-        _make_provider(
-            _complete_comm(allreduce_without_pdl),
-            _CompleteWorkspace,
-            default_config=_TEST_DEFAULT_CONFIG,
-        )
-        is None
-    )
-    assert (
-        _make_provider(
-            SimpleNamespace(
-                AllReduceFusionPattern=SimpleNamespace(kARResidualRMSNorm=1),
-                allreduce_fusion=_complete_allreduce,
-            ),
-            _CompleteWorkspace,
-            default_config=_TEST_DEFAULT_CONFIG,
-        )
-        is None
-    )
 
 
 def test_qwen_workspace_config_enables_only_supported_finalize_presets():
@@ -330,13 +142,11 @@ def test_wrapper_calls_only_the_stable_unified_api():
     wrapper.device = torch.device("cpu")
     wrapper.workspace = object()
     wrapper.supports = lambda m: True
-    wrapper.provider = SimpleNamespace(
-        patterns=SimpleNamespace(
-            kARResidualRMSNorm=1,
-            kMoEFinalizeARResidualRMSNorm=7,
-        ),
-        allreduce_fusion=lambda **kwargs: calls.append(kwargs),
+    wrapper._patterns = SimpleNamespace(
+        kARResidualRMSNorm=1,
+        kMoEFinalizeARResidualRMSNorm=7,
     )
+    wrapper._allreduce_fusion = lambda **kwargs: calls.append(kwargs)
 
     routed_output = torch.empty(8, 8, dtype=torch.bfloat16)
     expert_weights = torch.empty(4, 2, dtype=torch.bfloat16)

@@ -9,11 +9,14 @@ import torch
 sys.path.insert(
     0,
     str(
-        Path(__file__).resolve().parents[5]
-        / "python/sglang/srt/layers/attention/mamba"
+        Path(__file__).resolve().parents[5] / "python/sglang/srt/layers/attention/mamba"
     ),
 )
 from replay_state_indices_validator import validate_replay_state_indices_cpu
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestReplayStateIndicesValidator(unittest.TestCase):

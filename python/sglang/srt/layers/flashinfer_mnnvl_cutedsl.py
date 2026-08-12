@@ -11,12 +11,30 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from sglang.srt.layers.flashinfer_provider import get_flashinfer_comm_provider
-
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
+
+
+def _import_flashinfer_backend():
+    try:
+        from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
+        from flashinfer.comm.mnnvl_cutedsl import DEFAULT_CONFIG
+        from flashinfer.comm.mnnvl_cutedsl_ar import (
+            MNNVLCuteDSLAllReduceFusionWorkspace,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "MNNVL CuTe DSL fusion requires a FlashInfer build that ships "
+            "flashinfer.comm.mnnvl_cutedsl"
+        ) from error
+    return (
+        MNNVLCuteDSLAllReduceFusionWorkspace,
+        allreduce_fusion,
+        AllReduceFusionPattern,
+        DEFAULT_CONFIG,
+    )
 
 
 def _with_early_finalize_shared_load(config):
@@ -111,16 +129,19 @@ class FlashInferMNNVLCuteDSLARFusion:
                 self.device,
             )
 
-            self.provider = get_flashinfer_comm_provider()
+            (
+                workspace_type,
+                self._allreduce_fusion,
+                self._patterns,
+                default_config,
+            ) = _import_flashinfer_backend()
             # Qwen's shared-expert handoff is complete before this fused finalize
             # launch. Opt only finalize kernels into FlashInfer's faster early
             # shared load; standalone AllReduce kernels retain the safe ordering.
             from sglang.srt.runtime_context import get_spec
 
             if get_spec().speculative_algorithm is None:
-                self.workspace_config = _with_early_finalize_shared_load(
-                    self.provider.default_config
-                )
+                self.workspace_config = _with_early_finalize_shared_load(default_config)
             else:
                 # The early shared load lets the fused finalize PDL-preload
                 # the shared-expert buffer before its predecessor completes.
@@ -132,8 +153,8 @@ class FlashInferMNNVLCuteDSLARFusion:
                     "CuTe DSL finalize presets on the safe (non-early-load) "
                     "ordering."
                 )
-                self.workspace_config = self.provider.default_config
-            self.workspace = self.provider.workspace_type(
+                self.workspace_config = default_config
+            self.workspace = workspace_type(
                 tp_size=dist.get_world_size(process_group),
                 tp_rank=dist.get_rank(process_group),
                 max_token_num=self.max_m,
@@ -191,8 +212,8 @@ class FlashInferMNNVLCuteDSLARFusion:
                 shape, dtype=torch.bfloat16, device=self.device
             )
 
-        pattern = self.provider.patterns.kMoEFinalizeARResidualRMSNorm
-        self.provider.allreduce_fusion(
+        pattern = self._patterns.kMoEFinalizeARResidualRMSNorm
+        self._allreduce_fusion(
             input=routed_output,
             workspace=self.workspace,
             pattern=pattern,
@@ -228,8 +249,8 @@ class FlashInferMNNVLCuteDSLARFusion:
         if residual_output is None:
             residual_output = torch.empty_like(local_contribution)
 
-        pattern = self.provider.patterns.kARResidualRMSNorm
-        self.provider.allreduce_fusion(
+        pattern = self._patterns.kARResidualRMSNorm
+        self._allreduce_fusion(
             input=local_contribution,
             workspace=self.workspace,
             pattern=pattern,

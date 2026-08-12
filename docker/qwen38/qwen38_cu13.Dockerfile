@@ -14,10 +14,10 @@
 #   2. NCCL pinned to the version the DeepEP v2 wheel requires, staged at
 #      /opt/nccl-2.30.7/lib so the srt-slurm configs can LD_PRELOAD it without
 #      a host library mount
-#   3. FlashInfer, replacing the base's release: flashinfer-python from a pinned
-#      git commit (PR #4358, the Blackwell MNNVL CuTe DSL all-reduce backend),
-#      with the nightly's prebuilt flashinfer-cubin and flashinfer-jit-cache
-#      alongside it, since neither is published per commit.
+#   3. FlashInfer, replacing the base's release: the pinned nightly trio
+#      (python + cubin + jit-cache), which ships the Blackwell MNNVL CuTe DSL
+#      all-reduce backend (PR #4358) and the standalone BF16 direct GEMM kernel
+#      (PR #4266).
 #      nvidia-cutlass-dsl is floored at 4.7.0 because the CuTe DSL kernels call
 #      PipelineTmaAsync.create(enable_multicast_signaling=..)
 #   4. this repo's SGLang code, copied from the build context and editable-installed
@@ -82,30 +82,17 @@ RUN NCCL_EXPECTED="${NCCL_PIN_VERSION}" python3 -c 'import os; from importlib.me
 
 # --- 2. NCCL preload path: staged at the END of the build, see below ---
 
-# --- 3. FlashInfer: nightly cubin/jit-cache, python from a pinned commit ---
+# --- 3. FlashInfer: the pinned nightly trio ---
 # Named apart from the base's ENV FLASHINFER_VERSION, which would otherwise
 # shadow a same-named ARG and silently resolve to the base's 0.6.15.post1.
 #
-# The nightly version below no longer covers flashinfer-python: that comes from
-# FLASHINFER_GIT_COMMIT instead. cubin and jit-cache stay on the nightly because
-# they are prebuilt artifacts published per nightly date and per release only --
-# no wheel of either exists for an arbitrary commit. The nightly named here must
-# therefore be the one whose main the pinned commit merges, so the prebuilt
-# kernels correspond to the source they were compiled from.
-ARG FLASHINFER_NIGHTLY_VERSION=0.6.18.dev20260807
+# 0.6.18.dev20260811 is the first nightly whose flashinfer-python ships
+# flashinfer.comm.mnnvl_cutedsl (PR #4358, the Blackwell MNNVL CuTe DSL
+# all-reduce backend this image's GB300 target needs), so all three packages
+# now come from the same nightly and no git-commit install is needed.
+ARG FLASHINFER_NIGHTLY_VERSION=0.6.18.dev20260811
 ARG FLASHINFER_JIT_CACHE_CUDA_TAG=cu130
 ARG CUTLASS_DSL_MIN_VERSION=4.7.0
-
-# flashinfer-ai/flashinfer#4358, "feat(comm): add Blackwell MNNVL CuTe DSL
-# all-reduce fusion backend" -- the MNNVL path this image's GB300 target needs.
-# Pinned to the PR's merge commit on main, which is what keeps it fetchable. An
-# earlier pin of a PR-branch commit (23922f9a) built fine until that branch was
-# deleted, after which git refused to serve the object at all -- "upload-pack:
-# not our ref", because no remaining ref reaches it. A commit on main cannot rot
-# that way. It also carries the PR's two later review fixes, which the branch
-# snapshot predated.
-ARG FLASHINFER_GIT_REPO=https://github.com/flashinfer-ai/flashinfer.git
-ARG FLASHINFER_GIT_COMMIT=906181e3f4cf4bcc81835fb480db4011bbd80b62
 
 # Uninstall first: a mixed python/cubin/jit-cache installation fails at import,
 # and pip would otherwise leave the base's jit-cache shadowing JIT compilation.
@@ -119,52 +106,24 @@ ARG FLASHINFER_GIT_COMMIT=906181e3f4cf4bcc81835fb480db4011bbd80b62
 # what matters is that it is below 2.30 and therefore lacks the GIN API. The pin
 # is re-applied after all pip work completes -- see the final stage, which
 # asserts the version rather than trusting it.
-#
-# The git clone needs its submodules, and not as an optimisation: the released
-# wheel packages the cccl, cutlass and spdlog headers into flashinfer/data for
-# runtime JIT compilation, so a non-recursive clone yields a package that
-# imports fine and then cannot compile a kernel. Shallow, blob-filtered, and
-# deleted in the same layer because cutlass and cccl are large.
 RUN python3 -m pip uninstall -y \
       flashinfer-python flashinfer-cubin flashinfer-jit-cache && \
     rm -rf /root/.cache/flashinfer && \
     python3 -m pip install \
+      "flashinfer-python==${FLASHINFER_NIGHTLY_VERSION}" \
       "flashinfer-cubin==${FLASHINFER_NIGHTLY_VERSION}" \
       "flashinfer-jit-cache==${FLASHINFER_NIGHTLY_VERSION}+${FLASHINFER_JIT_CACHE_CUDA_TAG}" \
       --extra-index-url https://flashinfer.ai/whl/nightly/ \
       --extra-index-url "https://flashinfer.ai/whl/nightly/${FLASHINFER_JIT_CACHE_CUDA_TAG}/" && \
-    git clone --filter=blob:none "${FLASHINFER_GIT_REPO}" /tmp/flashinfer && \
-    git -C /tmp/flashinfer checkout --detach "${FLASHINFER_GIT_COMMIT}" && \
-    git -C /tmp/flashinfer submodule update --init --recursive --depth 1 && \
-    python3 -m pip install --no-deps /tmp/flashinfer && \
     python3 -m pip install "nvidia-cutlass-dsl[cu13]>=${CUTLASS_DSL_MIN_VERSION}" && \
-    # Assert the prebuilt pair is the nightly this commit was matched against.
-    # flashinfer-python is deliberately NOT compared -- see the opt-out below.
     FLASHINFER_EXPECTED="${FLASHINFER_NIGHTLY_VERSION}" \
     FLASHINFER_CUDA_TAG="${FLASHINFER_JIT_CACHE_CUDA_TAG}" \
-    python3 -c 'import os; from importlib.metadata import version; e = os.environ["FLASHINFER_EXPECTED"]; tag = os.environ["FLASHINFER_CUDA_TAG"]; got = {p: version(p) for p in ("flashinfer-cubin", "flashinfer-jit-cache")}; assert got["flashinfer-cubin"].split("+")[0] == e, got; assert got["flashinfer-jit-cache"].startswith(e + "+" + tag), got' && \
-    rm -rf /tmp/flashinfer /root/.cache/pip
+    python3 -c 'import os; from importlib.metadata import version; e = os.environ["FLASHINFER_EXPECTED"]; tag = os.environ["FLASHINFER_CUDA_TAG"]; got = {p: version(p) for p in ("flashinfer-python", "flashinfer-cubin", "flashinfer-jit-cache")}; assert got["flashinfer-python"] == e, got; assert got["flashinfer-cubin"].split("+")[0] == e, got; assert got["flashinfer-jit-cache"].startswith(e + "+" + tag), got' && \
+    rm -rf /root/.cache/pip
 
-# flashinfer-python now reports the pinned commit's version while cubin and
-# jit-cache report the nightly's. flashinfer/jit/env.py raises RuntimeError at
-# import on exactly that mismatch, for both packages, and this variable is the
-# opt-out its own error message tells you to use. The alternative -- installing
-# no cubin and no jit-cache, which makes the check skip itself -- would send
-# every existing kernel through runtime JIT on first use, so the mismatch is
-# accepted knowingly instead.
-#
-# The cost is that the check is now off for good, including for a mismatch
-# nobody intended, which is what the assertions above and below are for.
-ENV FLASHINFER_DISABLE_VERSION_CHECK=1
-
-# FLASHINFER_VERSION describes the prebuilt artifacts, which is what a consumer
-# reading it wants to know; the python tree is recorded separately because the
-# two genuinely differ in this image.
 ENV FLASHINFER_VERSION=${FLASHINFER_NIGHTLY_VERSION}
-ENV FLASHINFER_PYTHON_GIT_COMMIT=${FLASHINFER_GIT_COMMIT}
 
-LABEL ai.radixark.flashinfer.python_git_commit="${FLASHINFER_GIT_COMMIT}" \
-      ai.radixark.flashinfer.prebuilt_nightly="${FLASHINFER_NIGHTLY_VERSION}"
+LABEL ai.radixark.flashinfer.prebuilt_nightly="${FLASHINFER_NIGHTLY_VERSION}"
 
 # This tree's BF16 Split-K GEMM loads FlashInfer PR #4266's standalone direct
 # kernel by file path out of SGLANG_FLASHINFER_PR4266_SOURCE (see
@@ -177,21 +136,20 @@ LABEL ai.radixark.flashinfer.python_git_commit="${FLASHINFER_GIT_COMMIT}" \
 # start is worse than a build that stops here.
 #
 # `import flashinfer` here is load-bearing beyond resolving the path: it runs
-# flashinfer/jit/env.py, so it is where a failed version-check opt-out would
-# surface. The two file checks then confirm the pinned commit is the tree that
-# actually got installed -- checked as files rather than imports because these
-# modules pull in CuTe DSL, which cannot load on a CPU build host.
+# flashinfer/jit/env.py, so a python/cubin/jit-cache version mismatch would
+# surface here. The two file checks then confirm the nightly actually ships the
+# kernels this image depends on -- checked as files rather than imports because
+# these modules pull in CuTe DSL, which cannot load on a CPU build host.
 RUN FI_ROOT="$(python3 -c 'import pathlib, flashinfer; print(pathlib.Path(flashinfer.__file__).resolve().parent.parent)')" && \
     ln -sfn "${FI_ROOT}" /opt/flashinfer-src && \
     if [ ! -f /opt/flashinfer-src/flashinfer/gemm/kernels/dense_bf16_gemm_direct.py ]; then \
-        echo "ERROR: flashinfer at ${FLASHINFER_GIT_COMMIT} does not ship flashinfer/gemm/kernels/dense_bf16_gemm_direct.py (PR #4266)." >&2; \
+        echo "ERROR: flashinfer ${FLASHINFER_NIGHTLY_VERSION} does not ship flashinfer/gemm/kernels/dense_bf16_gemm_direct.py (PR #4266)." >&2; \
         echo "       Pin a FlashInfer that carries it, or serve with SGLANG_ENABLE_BF16_SPLITK_GEMM=0." >&2; \
         exit 1; \
     fi && \
     if [ ! -f /opt/flashinfer-src/flashinfer/comm/mnnvl_cutedsl/__init__.py ]; then \
-        echo "ERROR: flashinfer at ${FLASHINFER_GIT_COMMIT} does not ship flashinfer/comm/mnnvl_cutedsl (PR #4358)." >&2; \
-        echo "       That commit is the reason this image builds flashinfer-python from git;" >&2; \
-        echo "       if it is absent, the wrong ref was installed." >&2; \
+        echo "ERROR: flashinfer ${FLASHINFER_NIGHTLY_VERSION} does not ship flashinfer/comm/mnnvl_cutedsl (PR #4358)." >&2; \
+        echo "       Pin a nightly at or after 0.6.18.dev20260811." >&2; \
         exit 1; \
     fi
 
