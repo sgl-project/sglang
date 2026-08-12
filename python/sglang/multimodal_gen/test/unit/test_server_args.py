@@ -100,7 +100,7 @@ def _mock_cuda_platform(
             side_effect=get_available_gpu_memory,
         ),
         patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_for_wan_by_default",
+            "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
             return_value=True,
         ),
     ):
@@ -765,7 +765,7 @@ class TestOffloadDefaults(unittest.TestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_for_wan_by_default",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
                 return_value=True,
             ),
             patch(
@@ -911,17 +911,21 @@ class TestOffloadDefaults(unittest.TestCase):
         sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
-        self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
+        self.assertEqual(qwen_deployment.dit_layerwise_offload_modes, ())
 
         self.assertIsNone(wan_deployment.fsdp_auto_min_available_memory_gb)
-        self.assertTrue(wan_deployment.auto_dit_layerwise_offload)
+        self.assertEqual(wan_deployment.dit_layerwise_offload_modes, ("memory",))
 
         self.assertIsNone(mova_deployment.fsdp_auto_min_available_memory_gb)
-        self.assertTrue(mova_deployment.auto_dit_layerwise_offload)
+        self.assertEqual(
+            mova_deployment.dit_layerwise_offload_modes, ("auto", "memory")
+        )
+        self.assertEqual(mova_deployment.keep_resident_min_available_gb, 130)
+        self.assertEqual(mova_deployment.keep_resident_components, ("dit", "vae"))
 
         self.assertEqual(zimage_deployment.fsdp_auto_min_available_memory_gb, 40)
         self.assertTrue(zimage_deployment.fsdp_auto_requires_cfg)
-        self.assertFalse(zimage_deployment.auto_dit_layerwise_offload)
+        self.assertEqual(zimage_deployment.dit_layerwise_offload_modes, ())
 
         self.assertEqual(ltx_deployment.keep_resident_min_available_gb, 70)
         self.assertEqual(ltx_deployment.keep_resident_components, ("dit",))
@@ -939,7 +943,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
-        self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
+        self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
 
         # fasthunyuan no longer pins 150gb -- falls back to the global video default
         fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
@@ -1210,7 +1214,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_mova_layerwise_offload_does_not_implicitly_add_dit(self):
+    def test_auto_mova_layerwise_offload_adds_dit_below_memory_threshold(self):
         args = self._from_dict_with_pipeline_config(
             MOVAPipelineConfig(),
             kwargs={
@@ -1222,7 +1226,37 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["dit", "text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_auto_mova_keeps_dit_resident_at_memory_threshold(self):
+        args = self._from_dict_with_pipeline_config(
+            MOVAPipelineConfig(),
+            memory_gb=140,
+            kwargs={
+                "model_path": "OpenMOSS-Team/MOVA-360p",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder"],
+        )
+
+    def test_memory_sana_wm_layerwise_offload_adds_dit(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "performance_mode": "memory",
+            },
+        )
+
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
     def test_auto_fastwan_layerwise_offload_does_not_implicitly_add_dit(self):
