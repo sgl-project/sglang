@@ -595,7 +595,7 @@ class TestPrefillAdder(CustomTestCase):
             patch(
                 f"{module}._is_flashinfer_attention_backend", return_value=True
             ) as is_flashinfer,
-            patch(f"{module}._is_hip", False),
+            patch(f"{module}.is_hip", return_value=False) as mock_is_hip,
             patch(f"{module}.is_npu", return_value=False),
         ):
             self.assertTrue(PrefillCudaGraphRunner.can_run_graph(runner, forward_batch))
@@ -629,6 +629,12 @@ class TestPrefillAdder(CustomTestCase):
                 PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
             )
             runner.device = "cuda"
+
+            mock_is_hip.return_value = True
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            mock_is_hip.return_value = False
 
             is_flashinfer.return_value = False
             self.assertFalse(
