@@ -437,6 +437,21 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
     def test_lora_path_normalization(self):
         """Test normalization of lora_path."""
+        req = GenerateReqInput(text="Hello", lora_path=["path1"])
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.lora_path, "path1")
+
+        req = GenerateReqInput(
+            text="Hello", lora_path=["path1"], sampling_params={"n": 2}
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.lora_path, ["path1", "path1"])
+        self.assertEqual([req[i].lora_path for i in range(2)], ["path1", "path1"])
+
+        req = GenerateReqInput(text="Hello", lora_path=["path1", "path2"])
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
         # Test single lora_path with batch input
         req = GenerateReqInput(text=["Hello", "World"], lora_path="path/to/lora")
 
@@ -467,6 +482,12 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         req.normalize_batch_and_arguments()
         self.assertEqual(req.lora_path, expected_lora_paths)
+
+        for lora_paths in (["x", "y"], ["x", "y", "z", "w"]):
+            with self.subTest(lora_paths=lora_paths):
+                req = GenerateReqInput(text=["a", "b", "c"], lora_path=lora_paths)
+                with self.assertRaisesRegex(ValueError, "batch size"):
+                    req.normalize_batch_and_arguments()
 
     def test_extra_key_normalization(self):
         """Test normalization of extra_key."""
