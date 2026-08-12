@@ -40,6 +40,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+from test_multi_ended_allocator import _FakeUnifiedSWAKVPool
 
 from sglang.srt.mem_cache.kv_index_source import KVIndexSource
 from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -47,7 +48,6 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
-from test_multi_ended_allocator import _FakeUnifiedSWAKVPool
 
 _DEV = "cpu"
 _FULL_L = 2
@@ -93,24 +93,22 @@ def _build_composite(ps, full_mult=1, swa_mult=1, n_full_pages=16, n_swa_pages=8
         full_kernel_page_multiplier=full_mult,
         swa_kernel_page_multiplier=swa_mult,
     )
+    # The real UnifiedSWAKVPool carries the pool-level full->swa translate, so
+    # the fake must too: it IS the runner's token_to_kv_pool (see _make_source),
+    # and a stand-in that lacked the method would force a wrapper object,
+    # modelling a pool/allocator split that never occurs for a target runner.
+    kvcache.translate_loc_from_full_to_swa = allocator.translate_loc_from_full_to_swa
     return allocator
 
 
-class _FakeSwaTranslatePool:
-    """Just the pool-level method KVIndexSource wires for translate_swa."""
-
-    def __init__(self, allocator):
-        self._allocator = allocator
-
-    def translate_loc_from_full_to_swa(self, kv_indices, *, out=None):
-        return self._allocator.translate_loc_from_full_to_swa(kv_indices, out=out)
-
-
 def _make_source(allocator, req_to_token, ps):
+    """A TARGET runner's source: its token_to_kv_pool IS the allocator's own
+    kvcache. (A draft runner shares the allocator but owns a different pool —
+    see TestPoolOwnership.)"""
     return KVIndexSource(
         req_to_token=req_to_token,
         token_to_kv_pool_allocator=allocator,
-        token_to_kv_pool=_FakeSwaTranslatePool(allocator),
+        token_to_kv_pool=allocator.get_kvcache(),
         page_size=ps,
         device=_DEV,
     )
@@ -145,9 +143,7 @@ class TestPassthrough(unittest.TestCase):
         )
         self.assertFalse(src.enabled)
         rows = torch.tensor([2, 0])
-        view = src.batch_view(
-            req_pool_indices=rows, seq_lens=torch.tensor([5, 3])
-        )
+        view = src.batch_view(req_pool_indices=rows, seq_lens=torch.tensor([5, 3]))
         self.assertIs(view.table, req_to_token)
         self.assertIs(view.rows, rows)
         self.assertEqual(view.row_stride, req_to_token.stride(0))
@@ -205,9 +201,7 @@ class TestCanonicalBuild(unittest.TestCase):
         full-physical proof."""
         for ps in (1, 4):
             for full_mult, swa_mult in ((1, 1), (2 * _FULL_L, 2 * _SWA_L)):
-                allocator = _build_composite(
-                    ps, full_mult=full_mult, swa_mult=swa_mult
-                )
+                allocator = _build_composite(ps, full_mult=full_mult, swa_mult=swa_mult)
                 req_to_token, rows, seq_lens = _alloc_and_fill(
                     allocator, ps, lens=[5 * ps, 2 * ps, 3 * ps - 1]
                 )
@@ -300,9 +294,7 @@ class TestVerifyWidenedLengths(unittest.TestCase):
                 (view.table, allocator.full_v2p_page_table, "full"),
                 (view.swa_table, allocator.swa_v2p_page_table, "swa"),
             ):
-                want = _reference_table(
-                    req_to_token, rows, widened, v2p, 1, ps, width
-                )
+                want = _reference_table(req_to_token, rows, widened, v2p, 1, ps, width)
                 self.assertTrue(
                     torch.equal(table, want),
                     f"widened {tag} table off-formula (ps={ps})",
@@ -319,6 +311,7 @@ class TestVerifyWidenedLengths(unittest.TestCase):
             last_col = -(-total[0] // ps) - 1
             self.assertEqual(int(narrow.table[0, last_col]), 0)
             self.assertNotEqual(int(view.table[0, last_col]), 0)
+
 
 class TestBuildInto(unittest.TestCase):
     """build_into fills a backend-owned padded block table's live prefix with
@@ -382,7 +375,6 @@ class TestBuildInto(unittest.TestCase):
                 seq_lens=torch.tensor([1]),
             )
 
-
     def test_verify_widened_lengths_fill_draft_pages(self):
         """The trtllm/flashmla consumption route under TARGET_VERIFY: the
         callers widen seq_lens by the draft length ABOVE the builder, and
@@ -402,8 +394,13 @@ class TestBuildInto(unittest.TestCase):
         got = src.build_into(out=out, req_pool_indices=rows, seq_lens=widened)
         self.assertIs(got, out)
         want = _reference_table(
-            req_to_token, rows, widened, allocator.full_v2p_page_table,
-            1, ps, width_pages,
+            req_to_token,
+            rows,
+            widened,
+            allocator.full_v2p_page_table,
+            1,
+            ps,
+            width_pages,
         )
         for b, n in enumerate(total):
             live = -(-n // ps)
@@ -415,6 +412,106 @@ class TestBuildInto(unittest.TestCase):
                 bool((out[b, live:] == -1).all()),
                 f"row {b}: sentinel tail past the widened prefix was touched",
             )
+
+
+class TestPoolOwnership(unittest.TestCase):
+    """A runner only gets the kernel-facing id space when the pool IT reads and
+    writes is the one the allocator's ids address.
+
+    Bug this guards (reproduced on unmodified upstream main, with DSPARK +
+    --enable-unified-memory): a speculative draft runner is handed the TARGET's
+    allocator — so both share one slot index space and one req_to_token — while
+    owning a SEPARATE KV buffer sized to the allocator's SLOT count. Probing the
+    allocator alone reports "unified" for that runner, so its indices get mapped
+    into the target's kernel-facing space (dense ids up to
+    num_pages * multiplier) and then used to address a buffer with only
+    num_slots rows. Both the read gather and the KV store run out of bounds;
+    on GPU that surfaces as an illegal memory access or a device-side
+    bounds assert on the first decode step.
+    """
+
+    def test_real_factory_bundle_satisfies_the_ownership_identity(self):
+        """The guard rests on `allocator.get_kvcache() is token_to_kv_pool`
+        holding for a REAL target bundle. If a factory ever returned a pool
+        the allocator does not hold, the guard would silently disable the
+        unified path for EVERY model — so pin it against the real factory
+        rather than against this file's own construction."""
+        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+
+        bundle = init_unified_swa_pools(
+            device="cpu",
+            kv_cache_dtype=torch.float16,
+            head_num=2,
+            head_dim=8,
+            v_head_dim=8,
+            swa_head_num=2,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
+            page_size=1,
+            start_layer=0,
+            end_layer=4,
+            swa_attention_layer_ids=[1, 3],
+            full_attention_layer_ids=[0, 2],
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=32,
+            enable_memory_saver=False,
+            need_sort=False,
+        )
+        self.assertIs(
+            bundle.token_to_kv_pool_allocator.get_kvcache(),
+            bundle.token_to_kv_pool,
+        )
+        src = KVIndexSource(
+            req_to_token=torch.zeros((2, 8), dtype=torch.int32, device=_DEV),
+            token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
+            token_to_kv_pool=bundle.token_to_kv_pool,
+            page_size=1,
+            device=_DEV,
+        )
+        self.assertTrue(src.enabled)
+
+    def test_runner_with_its_own_pool_is_disabled(self):
+        """The draft-runner shape: same allocator, different pool."""
+        alloc = _build_composite(ps=1)
+        req_to_token = torch.zeros((2, 8), dtype=torch.int32, device=_DEV)
+        own_pool = SimpleNamespace()  # a separate buffer, not the composite's
+        src = KVIndexSource(
+            req_to_token=req_to_token,
+            token_to_kv_pool_allocator=alloc,
+            token_to_kv_pool=own_pool,
+            page_size=1,
+            device=_DEV,
+        )
+        self.assertFalse(src.enabled)
+
+    def test_disabled_source_is_strict_passthrough_on_both_rails(self):
+        """Consequence of the guard: the draft runner must see RAW virtual ids
+        on the read rail and an UNTOUCHED write loc — those index its own pool
+        directly. A translate on either side is the bug."""
+        alloc = _build_composite(ps=1)
+        req_to_token = torch.arange(16, dtype=torch.int32, device=_DEV).view(2, 8)
+        src = KVIndexSource(
+            req_to_token=req_to_token,
+            token_to_kv_pool_allocator=alloc,
+            token_to_kv_pool=SimpleNamespace(),
+            page_size=1,
+            device=_DEV,
+        )
+        rows = torch.tensor([1, 0], dtype=torch.int32, device=_DEV)
+        view = src.batch_view(
+            req_pool_indices=rows,
+            seq_lens=torch.tensor([3, 2], dtype=torch.int32, device=_DEV),
+        )
+        # Read rail: the EXACT objects a static-pool backend reads today.
+        self.assertIs(view.table, req_to_token)
+        self.assertIs(view.rows, rows)
+        self.assertFalse(view.kernel_facing)
+        # Write rail: rebind is a no-op, loc keeps its identity and no flag.
+        loc = torch.tensor([5, 6], dtype=torch.int64, device=_DEV)
+        fb = SimpleNamespace(out_cache_loc=loc)
+        src.rebind_write_loc(fb)
+        self.assertIs(fb.out_cache_loc, loc)
+        self.assertFalse(getattr(fb, "out_cache_loc_is_physical", False))
 
 
 class TestCaptureContract(unittest.TestCase):
@@ -451,9 +548,7 @@ class TestCaptureContract(unittest.TestCase):
 
     def test_rows_pointer_stable_after_capture_init(self):
         allocator = _build_composite(1)
-        src = _make_source(
-            allocator, torch.zeros((2, 8), dtype=torch.int64), 1
-        )
+        src = _make_source(allocator, torch.zeros((2, 8), dtype=torch.int64), 1)
         src.ensure_capture_buffers(max_bs=8, max_context_len=8)
         r1 = src._rows_for(3)
         r2 = src._rows_for(5)

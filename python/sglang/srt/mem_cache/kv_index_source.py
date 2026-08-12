@@ -97,12 +97,22 @@ class KVIndexSource:
         self.device = device
 
         # Capability probe — by TYPE, once. The unified composites (and only
-        # they) carry the kernel-facing id surface added in D3; anything else
-        # is a static pool and gets the strict passthrough.
+        # they) carry the kernel-facing id surface; anything else is a static
+        # pool and gets the strict passthrough.
+        #
+        # The allocator alone is NOT sufficient. A speculative draft runner is
+        # handed the TARGET's allocator (so both share one slot index space and
+        # one req_to_token) while owning a SEPARATE KV buffer, sized to the
+        # allocator's SLOT count. Translating for such a runner would map its
+        # indices into the target's kernel-facing space — dense ids running to
+        # num_pages * multiplier — and use them to address a buffer with only
+        # num_slots rows: out of bounds on both the read and the write side.
+        # So also require that the pool THIS runner reads and writes IS the one
+        # the allocator's ids address.
         self.enabled = isinstance(
             token_to_kv_pool_allocator,
             (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
-        )
+        ) and (token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool)
         if self.enabled:
             alloc = token_to_kv_pool_allocator
             self._full_v2p = alloc.full_v2p_page_table
@@ -153,9 +163,7 @@ class KVIndexSource:
                 (max_bs, max_pages), dtype=torch.int32, device=self.device
             )
         if self._rows is None or self._rows.numel() < max_bs:
-            self._rows = torch.arange(
-                max_bs, dtype=torch.int64, device=self.device
-            )
+            self._rows = torch.arange(max_bs, dtype=torch.int64, device=self.device)
 
     # -- per-batch view --------------------------------------------------------
 
@@ -209,9 +217,7 @@ class KVIndexSource:
                 "(from the batch's seq_lens_cpu max)"
             )
             width = max_pages
-            out_full = torch.zeros(
-                (bs, width), dtype=torch.int32, device=self.device
-            )
+            out_full = torch.zeros((bs, width), dtype=torch.int32, device=self.device)
             out_swa = (
                 torch.zeros((bs, width), dtype=torch.int32, device=self.device)
                 if self._swa_v2p is not None
@@ -274,9 +280,7 @@ class KVIndexSource:
             forward_batch.swa_out_cache_loc = self._translate_swa(
                 forward_batch.out_cache_loc
             )
-        forward_batch.out_cache_loc = self._translate_full(
-            forward_batch.out_cache_loc
-        )
+        forward_batch.out_cache_loc = self._translate_full(forward_batch.out_cache_loc)
         forward_batch.out_cache_loc_is_physical = True
         forward_batch._kv_index_source = self
 
@@ -358,4 +362,3 @@ class KVIndexSource:
             assert out is None, "passthrough translate takes no out="
             return kv_indices
         return self._translate_full(kv_indices, out=out)
-
