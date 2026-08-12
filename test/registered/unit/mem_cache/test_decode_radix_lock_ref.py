@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.utils.common import Range
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_cache_with_pools(page_size=1):
@@ -92,7 +93,7 @@ def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
     return MockReq(fill_ids, req_pool_idx, cache_protected_len, last_node)
 
 
-class TestDecodeLockRefScenarios(unittest.TestCase):
+class TestDecodeLockRefScenarios(CustomTestCase):
     """Test lock_ref balance across decode transfer scenarios."""
 
     def _populate_prefix(self, cache, prefix_ids, prefix_values):
@@ -291,6 +292,29 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
         self.assertEqual(cache.protected_size(), 0)
         self.assertEqual(cache.evictable_size(), 0)
+
+    def test_failure_frees_kv_without_committed_token_id(self):
+        """Rejecting an uncommitted token must release its allocated KV slot."""
+        cache, req_to_token = _make_cache_with_pools()
+        kv_indices = torch.tensor([100, 200, 300], dtype=torch.int64)
+        req_to_token[0, : len(kv_indices)] = kv_indices
+
+        req = _make_req(
+            fill_ids=[10, 20, 30],
+            req_pool_idx=0,
+            cache_protected_len=0,
+            last_node=cache.root_node,
+        )
+        req.output_ids = array("q")
+
+        cache.token_to_kv_pool_allocator.reset_mock()
+        cache.cache_finished_req(
+            req, is_insert=False, kv_len_to_handle=req.kv_committed_len
+        )
+
+        free_call = cache.token_to_kv_pool_allocator.free_segment.call_args
+        torch.testing.assert_close(free_call.args[0], kv_indices)
+        self.assertEqual(free_call.kwargs["start_pos"], 0)
 
     def test_pop_preallocated_rechecks_budget_after_lock(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
