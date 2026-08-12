@@ -14,14 +14,14 @@
   },
   "sglang": {
     "base_commit": "a39f7f4c291915633d3889491c5b90fa64bf6beb",
-    "experiment_commit": "9aee3f46195c0af94c33121af1424f5f2fc4492c",
-    "experiment_tree": "0b93105a2ebd7dc58b673f2dfc5685d2f6df13bb",
-    "patch_sha256": "f0710b92a250aed3d41dc3fc3ee06c126489d54c5f3203a85b0768116f166f57",
+    "experiment_commit": "0505c37ee9d1b2a9afbe17767fbd41a4afc1b249",
+    "experiment_tree": "a1b7cc3d104df9ab2a6d3390a56ab6d603a63329",
+    "patch_sha256": "ec12e52facb661d7b9bd94bcf672587d1ccf0a95db3427ad073cd577e0219ddb",
     "change": "Do not reserve speculative TARGET_VERIFY intermediate SSM memory on a disaggregated Prefill worker because its actual HybridReqToTokenPool passes speculative_num_draft_tokens=None.",
     "targeted_validation": {
       "py_compile": "pass",
       "diff_check": "pass",
-      "cpu_unit_test": "pending AGA ARM64 container canary",
+      "cpu_unit_test": "pass: AGA CPU job 430009 targeted predicate; full module collection blocked by pre-existing source/container import mismatch",
       "real_agentx_canary": "pending"
     }
   },
