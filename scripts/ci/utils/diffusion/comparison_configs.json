@@ -13,7 +13,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --dit-layerwise-offload false --tp-size 2",
+                    "serve_args": "--warmup-mode server --dit-layerwise-offload false --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -29,7 +29,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --dit-layerwise-offload false --tp-size 2",
+                    "serve_args": "--warmup-mode server --dit-layerwise-offload false --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -45,7 +45,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --tp-size 2",
+                    "serve_args": "--warmup-mode server --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -62,7 +62,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --tp-size 2",
+                    "serve_args": "--warmup-mode server --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -78,7 +78,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --tp-size 2",
+                    "serve_args": "--warmup-mode server --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -95,7 +95,7 @@
             "num_gpus": 4,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
+                    "serve_args": "--warmup-mode server --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
                 }
             }
@@ -113,7 +113,7 @@
             "num_gpus": 1,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup",
+                    "serve_args": "--warmup-mode server",
                     "extra_env": {}
                 }
             }
@@ -131,7 +131,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2",
+                    "serve_args": "--warmup-mode server --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2",
                     "extra_env": {}
                 }
             }
@@ -147,7 +147,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --tp-size 2 --attention-backend fa",
+                    "serve_args": "--warmup-mode server --tp-size 2 --attention-backend fa",
                     "extra_env": {}
                 }
             }
@@ -164,7 +164,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --tp-size 2",
+                    "serve_args": "--warmup-mode server --tp-size 2",
                     "extra_env": {"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"}
                 }
             }
@@ -182,7 +182,7 @@
             "num_gpus": 4,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
+                    "serve_args": "--warmup-mode server --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
                 }
             }

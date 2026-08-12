@@ -1,5 +1,13 @@
 # SGLang public APIs
 
+# sglang.srt.environ must run before the rest of this file's imports
+# (hf_transformers_patches, lang.api, ...), which pull in torch and
+# FlashInfer: those claim these cache dirs early, and the first value set is
+# the one that sticks. Safe here -- environ has no heavy dependency (no torch).
+from sglang.srt.environ import redirect_third_party_caches
+
+redirect_third_party_caches()
+
 # Install stubs early for platforms where certain dependencies are unavailable
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
 # get_device_properties).  This must run before any downstream imports.

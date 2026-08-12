@@ -619,7 +619,9 @@ def _fused_moe_kernel_sequence(
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
+            assert (
+                _is_cuda or _is_hip or _is_xpu
+            ), "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
@@ -629,8 +631,8 @@ def _fused_moe_kernel_sequence(
                     swiglu_limit_for_triton = swiglu_limit
                 else:
                     assert (
-                        _is_cuda
-                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                        _is_cuda or _is_xpu
+                    ), "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
                     swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
             else:
                 half = N // 2
@@ -685,6 +687,17 @@ def _fused_moe_kernel_sequence(
                 x = intermediate_cache1.view(-1, N)
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
+    elif activation == "situ" and is_gated:
+        d = N // 2
+        x = intermediate_cache1.view(-1, N)
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        situ_beta = gemm1_alpha if gemm1_alpha is not None else 4.0
+        gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+        situ_linear_beta = gemm1_limit
+        if situ_linear_beta is not None:
+            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+        intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
     elif activation == "gelu" and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"

@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBack
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
+    build_verify_intermediate_state_indices,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
 )
@@ -346,8 +347,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        self.verify_intermediate_state_indices = torch.arange(
-            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
+        self.verify_intermediate_state_indices = (
+            build_verify_intermediate_state_indices(
+                self.req_to_token_pool.size,
+                model_runner.server_args,
+                model_runner.device,
+            )
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -427,7 +433,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_force_flush=replayssm_force_flush,
             )
             self._track_mamba_state_decode(
-                forward_batch, conv_states, ssm_states, cache_indices
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
             )
             return core_attn_out
 
@@ -456,7 +462,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
+            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
 
         return core_attn_out
@@ -633,13 +639,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
-                # the pool gates OFF under --enable-gdn-replayssm-spec (the
+                # the pool gates OFF under --enable-linear-replayssm-spec (the
                 # same flag that makes `use_replayssm_spec` true above), so
                 # this branch is unreachable with a None buffer by
                 # construction -- keep it loud rather than silently frozen.
                 assert intermediate_state_cache is not None, (
                     "recurrent target_verify fallback requires intermediate_ssm, "
-                    "which is not allocated under --enable-gdn-replayssm-spec"
+                    "which is not allocated under --enable-linear-replayssm-spec"
                 )
                 core_attn_out = self.kernel_dispatcher.target_verify(
                     A_log=layer.A_log,
