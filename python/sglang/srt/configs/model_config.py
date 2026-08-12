@@ -1517,7 +1517,7 @@ class ModelConfig:
                         break
 
             # Verify quantization configurations.
-            if self.quantization is None:
+            if self.quantization is None and not self.is_draft_quantization_explicit:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method

@@ -93,6 +93,17 @@ class TestPrepareServerArgs(CustomTestCase):
 
         self.assertFalse(reconstructed._speculative_draft_quantization_explicitly_set)
 
+    def test_unquant_draft_does_not_auto_detect_target_quant(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            quantization="gptq",
+            speculative_draft_model_quantization="unquant",
+        )
+        server_args._handle_missing_default_values()
+
+        self.assertIsNone(server_args.speculative_draft_model_quantization)
+        self.assertTrue(server_args._speculative_draft_quantization_explicitly_set)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")

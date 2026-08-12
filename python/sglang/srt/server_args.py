@@ -4192,19 +4192,11 @@ class ServerArgs:
         if envs.SGLANG_USE_MODELSCOPE.get():
             self._handle_modelscope_paths()
 
-        # In speculative scenario:
-        # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
-        # - Otherwise, the draft model defaults to the same quantization as the target model.
-        if self._speculative_draft_quantization_explicitly_set is None:
-            self._speculative_draft_quantization_explicitly_set = (
-                self.speculative_draft_model_quantization is not None
-            )
-        if self.speculative_draft_model_quantization is None:
-            self.speculative_draft_model_quantization = self.quantization
+        draft_quant_was_explicit = self.speculative_draft_model_quantization is not None
 
-        # Resolve --quantization unquant before model config validation. Record
-        # the explicit opt-out so later auto-detection does not re-enable
-        # quantization.
+        # Resolve --quantization unquant before we inherit the draft quant from
+        # the target model. Otherwise an explicit `--speculative-draft-model-
+        # quantization unquant` would get overwritten by the target's quant.
         if self.quantization == "unquant":
             self.quantization = None
             self._quantization_explicitly_unset = True
@@ -4212,6 +4204,19 @@ class ServerArgs:
             self._quantization_explicitly_unset = False
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+        # In speculative scenario:
+        # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
+        # - Otherwise, the draft model defaults to the same quantization as the target model.
+        if self._speculative_draft_quantization_explicitly_set is None:
+            self._speculative_draft_quantization_explicitly_set = (
+                draft_quant_was_explicit
+            )
+        if (
+            self.speculative_draft_model_quantization is None
+            and not self._speculative_draft_quantization_explicitly_set
+        ):
+            self.speculative_draft_model_quantization = self.quantization
 
     def _handle_modelscope_paths(self):
         """Resolve model / tokenizer / speculative-draft paths from the local
