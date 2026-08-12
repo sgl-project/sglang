@@ -194,7 +194,9 @@ class MultimodalPreprocessCache(Generic[K, V]):
                 owner = False
 
         if not owner:
-            value = await asyncio.wrap_future(future)
+            # A waiter owns only its local await.  Cancelling it must not
+            # cancel the shared future and poison the owner or other waiters.
+            value = await asyncio.shield(asyncio.wrap_future(future))
             return CacheLookup(value, hit=False, joined=True)
 
         try:
