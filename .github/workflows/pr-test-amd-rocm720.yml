@@ -47,7 +47,6 @@ on:
           - stage-b-test-2-gpu-large-amd-rocm720
           - multimodal-gen-test-1-gpu-amd-rocm720
           - multimodal-gen-test-2-gpu-amd-rocm720
-          - multimodal-gen-unit-test-amd-rocm720
           - stage-c-test-large-8-gpu-amd-rocm720
           - stage-c-test-large-8-gpu-amd-mi35x-rocm720
           - stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720
@@ -755,6 +754,23 @@ jobs:
           echo "=== Post-test System Memory Status ==="
           free -h
 
+      # The mm_gen `unit` suite is portable CPU-style tests that finish in a
+      # few minutes, which does not justify a job of its own: on mi300 the
+      # container pull plus dependency install costs ~2h before any test runs.
+      # Ride along on the shard that is already warm. Runs after the diffusion
+      # tests, and on failure too, so a diffusion regression cannot hide it.
+      # Skips the CUDA-only ltx2_vae_channels_last memory-format assertion.
+      - name: Run diffusion unit tests
+        if: matrix.part == 0 && (success() || failure())
+        timeout-minutes: 30
+        run: |
+          docker exec \
+            -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+            -w /sglang-checkout/python \
+            ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
+              --suite unit \
+              -k "not ltx2_vae_channels_last"
+
       - name: Upload diffusion failure artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -893,62 +909,6 @@ jobs:
           path: diffusion-failures/
           if-no-files-found: ignore
           retention-days: 7
-
-  # ROCm 7.2.0 counterpart of `multimodal-gen-unit-test-amd`: run the portable
-  # mm_gen `unit` suite on ROCm 7.2.0 too. Skips the CUDA-only
-  # ltx2_vae_channels_last file (channels_last_3d assertions the ROCm conv path
-  # doesn't reproduce).
-  multimodal-gen-unit-test-amd-rocm720:
-    needs: [check-changes]
-    if: |
-      always() &&
-      (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-unit-test-amd-rocm720,')) ||
-        (
-          !(inputs.target_stage || inputs.target_stage_select) &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: linux-mi300-1gpu-sglang
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: python/sglang/kernels/aot/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
-          docker exec ci_sglang pip install amdsmi
-
-      - name: Run diffusion unit tests
-        timeout-minutes: 60
-        run: |
-          # Skip ltx2_vae_channels_last: it asserts CUDA `channels_last_3d`
-          # memory-format behavior that the ROCm conv path doesn't reproduce.
-          docker exec \
-            -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
-            -w /sglang-checkout/python \
-            ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
-              --suite unit \
-              -k "not ltx2_vae_channels_last"
 
   stage-c-test-4-gpu-amd-rocm720:
     needs: [check-changes, stage-b-test-1-gpu-small-amd-rocm720, stage-b-test-2-gpu-large-amd-rocm720]
@@ -1349,7 +1309,6 @@ jobs:
         sgl-kernel-unit-test-2-gpu-amd-rocm720,
         multimodal-gen-test-1-gpu-amd-rocm720,
         multimodal-gen-test-2-gpu-amd-rocm720,
-        multimodal-gen-unit-test-amd-rocm720,
 
         stage-a-test-1-gpu-small-amd-rocm720,
         jit-kernel-unit-test-amd-rocm720,
