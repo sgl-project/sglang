@@ -469,6 +469,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            if (
+                draft_kv_data_ptrs
+                and get_parallel().attn_dcp_size > 1
+                and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            ):
+                raise RuntimeError(
+                    "PD decode DCP does not support DeepSeek-V4 draft KV transfer "
+                    "yet. DeepSeek-V4 draft KV pools are replicated while DCP "
+                    "relayout shards target KV by token, so combining them in one "
+                    "transfer envelope would apply the target DCP plan to draft KV "
+                    "entries."
+                )
             kv_layer_ids += get_transfer_draft_kv_layer_ids(len(draft_kv_data_ptrs))
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
