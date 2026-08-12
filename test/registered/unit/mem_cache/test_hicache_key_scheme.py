@@ -410,7 +410,7 @@ class TestDeriveNamespace(CustomTestCase):
 
 class TestUnifiedKVPlan(CustomTestCase):
     """plan_unified_kv: any partition knob selects the adapter, whose
-    unified byte order makes the namespace layout-neutral (unified-v1)."""
+    unified byte order makes the namespace layout-neutral (unified-v2)."""
 
     def _plan(self, **overrides):
         kwargs = dict(
@@ -442,7 +442,7 @@ class TestUnifiedKVPlan(CustomTestCase):
         # head knob alone: adapter, single layer window, head chunks.
         plan = self._plan(head_group_knob=2)
         self.assertTrue(plan.adapter)
-        self.assertEqual(plan.namespace.object_layout, "unified-v1")
+        self.assertEqual(plan.namespace.object_layout, "unified-v2")
         self.assertEqual(plan.layer_ranges, [(0, 61)])
         self.assertEqual(plan.head_ranges, [(0, 2), (2, 4)])
         self.assertEqual(len(plan.suffixes), 2)
@@ -466,7 +466,7 @@ class TestUnifiedKVPlan(CustomTestCase):
             layer_partition=30,
         )
         self.assertTrue(plan.adapter)
-        self.assertEqual(plan.namespace.object_layout, "unified-v1")
+        self.assertEqual(plan.namespace.object_layout, "unified-v2")
         self.assertIsNone(plan.head_ranges)
         self.assertEqual(plan.layer_ranges, [(0, 30), (30, 60), (60, 61)])
         # head_group alone is a no-op for replicated pools (no head axis).
@@ -1003,9 +1003,18 @@ class TestMhaDirectChunks(CustomTestCase):
             [2 * layer_stride, 2 * layer_stride, 4 * layer_stride, 4 * layer_stride],
         )
 
-    def test_multi_head_chunks_stage(self):
+    def test_whole_head_shard_chunks_are_direct(self):
+        """Under the (layer, token, head, dim) order a layer-range chunk over
+        the rank's whole head shard is one contiguous range on
+        page_first_direct — the case cross-PP reuse needs."""
         pool = self._pool(head_num=2)
-        self.assertFalse(pool.unified_zero_copy([(0, 2)], [(0, 2)]))
+        self.assertTrue(pool.unified_zero_copy([(0, 2), (2, 6)], [(0, 2)]))
+
+    def test_head_subgroup_chunks_stage(self):
+        """Cutting the head axis is what forces the staging copy: it breaks
+        contiguity at the token axis on every host layout."""
+        pool = self._pool(head_num=2)
+        self.assertFalse(pool.unified_zero_copy([(0, 2)], [(0, 1), (1, 2)]))
 
     def test_rejects_split_kv_pools(self):
         import torch
@@ -1121,9 +1130,18 @@ class TestLayoutAdapterGatherScatter(CustomTestCase):
         layer_ranges, head_ranges = self._grid()
         indices = torch.arange(self._PAGES * self._PS)
         # Unified-order bytes computed straight from the logical tensor:
-        # page-major, layer-range, head-range, K then V.
+        # page-major, layer-range, head-range, K then V. The logical tensor is
+        # (kv, head, layer, token, dim); the stored order is
+        # (layer, token, head, dim), hence the permute.
         expected = b"".join(
-            bytes(L[kv, h0:h1, l0:l1].contiguous().view(torch.uint8).flatten().tolist())
+            bytes(
+                L[kv, h0:h1, l0:l1]
+                .permute(1, 2, 0, 3)
+                .contiguous()
+                .view(torch.uint8)
+                .flatten()
+                .tolist()
+            )
             for L in logical
             for l0, l1 in layer_ranges
             for h0, h1 in head_ranges
@@ -1176,10 +1194,13 @@ class TestLayoutAdapterGatherScatter(CustomTestCase):
             )
             for p, L in enumerate(logical):
                 got = reader._page_kv_view_unified(p * self._PS)
+                want = L.permute(0, 2, 3, 1, 4)  # -> (kv, layer, token, head, dim)
                 for l0, l1 in layer_ranges:
                     for h0, h1 in head_ranges:
                         self.assertTrue(
-                            torch.equal(got[:, h0:h1, l0:l1], L[:, h0:h1, l0:l1])
+                            torch.equal(
+                                got[:, l0:l1, :, h0:h1], want[:, l0:l1, :, h0:h1]
+                            )
                         )
 
 
@@ -1278,10 +1299,11 @@ class TestLayoutAdapterStaging(CustomTestCase):
             reader.scatter(sub_indices, [True] * len(sub_keys))
         for p, L in enumerate(logical):
             got = reader.pool._page_kv_view_unified(p * gs._PS)
+            want = L.permute(0, 2, 3, 1, 4)  # -> (kv, layer, token, head, dim)
             for l0, l1 in layer_ranges:
                 for h0, h1 in head_ranges:
                     self.assertTrue(
-                        torch.equal(got[:, h0:h1, l0:l1], L[:, h0:h1, l0:l1])
+                        torch.equal(got[:, l0:l1, :, h0:h1], want[:, l0:l1, :, h0:h1])
                     )
 
 

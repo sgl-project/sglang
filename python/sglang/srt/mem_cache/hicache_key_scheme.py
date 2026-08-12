@@ -31,11 +31,12 @@ range, its head shard) and objects keep the raw pool-layout bytes. Setting
 chunk) in the extra config switches the namespace to the **layout adapter**
 (:func:`plan_unified_kv`): a rank owns the (layer window x head group)
 cross product of chunks, and every object carries the same unified byte
-order — (head, layer, token, dim) per K/V half — regardless of the host
-pool layout (``object_layout`` becomes the constant ``unified-v1``). The
+order — (layer, token, head, dim) per K/V half, MLA (layer, token, dim) —
+which is ``page_first_direct``'s own page block, regardless of the host
+pool layout (``object_layout`` becomes the constant ``unified-v2``). The
 pool adapters convert on the fly and skip the copy for slabs that already
-sit in that order contiguously (e.g. MLA on page_first_direct stays
-zero-copy).
+sit in that order contiguously — which on ``page_first_direct`` is every
+slab whenever the fleet grid does not cut the kv-head axis, MLA included.
 
 The namespace digest prefixes every key: deployments share objects iff every
 identity field matches, so configuration differences partition into disjoint
@@ -390,7 +391,7 @@ def plan_unified_kv(
     """Derive the namespace and this rank's chunk plan from deployment facts.
 
     Any partition knob switches the namespace to adapter mode: objects carry
-    the unified byte order (object_layout "unified-v1"), so the pool layout
+    the unified byte order (object_layout "unified-v2"), so the pool layout
     never constrains which fleets can share.
     """
     adapter = layer_partition is not None or (
@@ -426,7 +427,7 @@ def plan_unified_kv(
             "--hicache-storage-key-scheme rank-suffix."
         )
 
-    object_layout = "unified-v1" if adapter else pool_layout
+    object_layout = "unified-v2" if adapter else pool_layout
     namespace = derive_namespace(
         model_id=model_id,
         dtype=dtype,
@@ -484,7 +485,7 @@ class KVCacheLayoutAdapter:
 
     The host pools expose the unified gather/scatter primitives; this
     class owns everything else a backend needs to serve a partitioned
-    (unified-v1) namespace: the per-chunk key fan-out, the sub-batch
+    (unified-v2) namespace: the per-chunk key fan-out, the sub-batch
     geometry, and one pinned staging buffer per IO direction (backup and
     prefetch run on concurrent controller threads). A backend brings only
     its own pointer-based batch put/get and, for RDMA transports, a
