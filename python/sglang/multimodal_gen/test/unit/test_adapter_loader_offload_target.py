@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """`AdapterLoader` places each component by its own offload policy.
 
-The loader serves three components, and the policy does not answer the same for
-all of them: `connectors` follows `dit_cpu_offload`, while `duration_head` and
-`diffusion_decoder` default to staying resident. Asking about a fixed name
-would push the latter two to the CPU whenever `--dit-cpu-offload` is set.
+`connectors` follows `dit_cpu_offload`; `duration_head` and `diffusion_decoder`
+stay resident by default. Asking about a fixed name would push the latter two to
+the CPU whenever `--dit-cpu-offload` is set.
 """
 
 import unittest
@@ -47,8 +46,8 @@ class TestAdapterLoaderOffloadTarget(unittest.TestCase):
         self.assertFalse(server_args.should_cpu_offload_component("connectors"))
 
     def test_loader_does_not_hardcode_a_component_name_for_placement(self):
-        # The regression this guards: a literal "connectors" in the placement
-        # call, which would make all three components follow dit_cpu_offload.
+        # A literal "connectors" here would make all three follow
+        # dit_cpu_offload.
         import inspect
 
         source = inspect.getsource(AdapterLoader.load_customized)

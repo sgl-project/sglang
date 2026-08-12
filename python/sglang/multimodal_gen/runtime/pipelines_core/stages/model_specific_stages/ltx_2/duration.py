@@ -44,8 +44,8 @@ class LTX2DurationStage(PipelineStage):
         if isinstance(audio_tokens, list):
             audio_tokens = audio_tokens[0]
 
-        # The head predicts one duration; a CFG batch carries [negative, positive]
-        # and duplicated rows, so predict from the first positive row only.
+        # A CFG batch carries [negative, positive] with duplicated rows, so
+        # predict from the first positive row only.
         with torch.no_grad():
             num_frames = self.duration_head.predict_num_frames(
                 video_tokens[:1],

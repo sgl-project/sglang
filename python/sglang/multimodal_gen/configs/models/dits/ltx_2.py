@@ -47,10 +47,7 @@ class LTX2AttentionFunction(str, Enum):
     DEFAULT = "default"
 
 
-# Parameter name mappings from HuggingFace checkpoint keys to SGLang module names.
-# We use upstream variable names (patchify_proj, adaln_single) but HF uses different keys.
-#
-# HF key -> SGLang key (upstream naming)
+# HF checkpoint key -> SGLang module name (SGLang follows upstream naming).
 LTX2_PARAM_NAMES_MAPPING: dict[str, str] = {
     r"^model\.diffusion_model\.(.*)$": r"\1",
     r"^proj_in\.(.*)$": r"patchify_proj.\1",
@@ -69,7 +66,6 @@ LTX2_PARAM_NAMES_MAPPING: dict[str, str] = {
     r"^av_cross_attn_video_a2v_gate\.(.*)$": r"av_ca_a2v_gate_adaln_single.\1",
     r"^av_cross_attn_audio_v2a_gate\.(.*)$": r"av_ca_v2a_gate_adaln_single.\1",
     # Scale Shift Tables (Block Level)
-    # HF: scale_shift_table_a2v_ca_video -> SGLang: video_a2v_cross_attn_scale_shift_table
     r"(.*)scale_shift_table_a2v_ca_video": r"\1video_a2v_cross_attn_scale_shift_table",
     r"(.*)scale_shift_table_a2v_ca_audio": r"\1audio_a2v_cross_attn_scale_shift_table",
 }
@@ -92,7 +88,6 @@ LTX2_REVERSE_PARAM_NAMES_MAPPING: dict[str, str] = {
     r"^av_ca_a2v_gate_adaln_single\.(.*)$": r"av_cross_attn_video_a2v_gate.\1",
     r"^av_ca_v2a_gate_adaln_single\.(.*)$": r"av_cross_attn_audio_v2a_gate.\1",
     # Scale Shift Tables (Block Level)
-    # SGLang: video_a2v_cross_attn_scale_shift_table -> HF: scale_shift_table_a2v_ca_video
     r"(.*)video_a2v_cross_attn_scale_shift_table": r"\1scale_shift_table_a2v_ca_video",
     r"(.*)audio_a2v_cross_attn_scale_shift_table": r"\1scale_shift_table_a2v_ca_audio",
 }
@@ -128,10 +123,9 @@ class LTX2ArchConfig(DiTArchConfig):
     cross_attention_adaln: bool = False
     caption_proj_before_connector: bool = False
 
-    # LTX-2.5. `ff_bias` / `audio_ff_bias` mirror the upstream flags of the same
-    # name; 2.5 drops the bias on the video feed-forward but keeps the audio one.
+    # LTX-2.5 drops the video feed-forward bias but keeps the audio one.
     # `use_keyframes_abs_pos_embedding` only allocates the parameter so the
-    # checkpoint round-trips -- the denoising forward does not consume it.
+    # checkpoint round-trips; the forward does not consume it.
     ff_bias: bool = True
     audio_ff_bias: bool = True
     use_keyframes_abs_pos_embedding: bool = False

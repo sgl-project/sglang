@@ -40,8 +40,7 @@ class AdapterLoader(ComponentLoader):
     component_names = ["connectors", "duration_head", "diffusion_decoder"]
     expected_library = "diffusers"
 
-    # Each adapter carries its own arch config; `update_model_arch` then fills it
-    # straight from the component's `config.json`.
+    # `update_model_arch` fills each from the component's `config.json`.
     _CONFIG_CLASSES = {
         "connectors": LTX2ConnectorConfig,
         "duration_head": LTX2DurationHeadConfig,
@@ -71,10 +70,9 @@ class AdapterLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        # Ask about the component actually being loaded: this loader also serves
-        # `duration_head` and `diffusion_decoder`, which the offload policy
-        # answers differently from `connectors` (the latter follows
-        # `dit_cpu_offload`, the other two default to staying resident).
+        # Not a fixed name: the policy answers differently for `connectors`
+        # (follows `dit_cpu_offload`) than for the other two, which stay
+        # resident by default.
         target_device = self.target_device(
             server_args.should_cpu_offload_component(component_name)
         )
@@ -93,10 +91,9 @@ class AdapterLoader(ComponentLoader):
         loaded = {_remap_connector_key(k, mapping): v for k, v in loaded.items()}
 
         missing, unexpected = model.load_state_dict(loaded, strict=False)
-        # `strict=False` is needed because a checkpoint carries either the shared
+        # `strict=False` because a checkpoint carries either the shared
         # `text_proj_in` or the per-modality projections, never both. Anything
-        # else left uninitialized would surface much later as garbage
-        # embeddings, so fail loudly here instead.
+        # else uninitialized would surface later as garbage embeddings.
         if missing or unexpected:
             raise ValueError(
                 f"Adapter weights at '{component_model_path}' do not match the "

@@ -867,8 +867,7 @@ class LTX23VideoMidBlock3d(nn.Module):
 
 # Like LTXVideoUpBlock3d but with no conv_in and the updated LTX2VideoResnetBlock3d
 # Per-stage upsampling strides, selected by the decoder's `upsample_type`.
-# LTX-2 upsamples every decoder stage in all three dimensions; LTX-2.5 mixes
-# spatial-only and temporal-only stages.
+# LTX-2 upsamples every stage in 3D; LTX-2.5 mixes spatial- and temporal-only.
 _UPSAMPLE_STRIDES: dict[str, tuple[int, int, int]] = {
     "spatial": (1, 2, 2),
     "temporal": (2, 1, 1),
@@ -1266,9 +1265,8 @@ class LTX2VideoDecoder3d(nn.Module):
         inject_noise = tuple(reversed(inject_noise))
         upsample_residual = tuple(reversed(upsample_residual))
         upsample_factor = tuple(reversed(upsample_factor))
-        # NOTE: `upsample_type` is deliberately *not* reversed -- upstream
-        # indexes it in decoder order while the other per-stage lists are given
-        # in encoder order.
+        # Deliberately not reversed: upstream indexes `upsample_type` in
+        # decoder order, the sibling lists in encoder order.
         output_channel = block_out_channels[0]
 
         self.conv_in = LTX2VideoCausalConv3d(

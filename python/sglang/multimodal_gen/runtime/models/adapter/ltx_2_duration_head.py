@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """LTX-2.5 duration head.
 
-Predicts the natural shot length implied by a caption, from the text connector
-outputs. Used only when the caller omits `num_frames`. Ships from LTX-2.5
-onward; LTX-2 / 2.3 checkpoints have no such component.
+Predicts the shot length a caption implies from the text connector outputs.
+Used only when the caller omits `num_frames`.
 """
 
 import torch
@@ -141,7 +140,7 @@ class LTX2DurationHead(nn.Module):
             )
         seconds = predicted_seconds.item()
 
-        # Floor min_frames at 1 so the grid arithmetic below cannot go negative.
+        # Floor at 1 so the grid arithmetic cannot go negative.
         min_frames = max(1, round(min_seconds * frame_rate))
         max_frames = round(max_seconds * frame_rate)
         clamped_frames = max(min_frames, min(round(seconds * frame_rate), max_frames))
@@ -151,14 +150,13 @@ class LTX2DurationHead(nn.Module):
         ) * temporal_compression_ratio + 1
 
         if num_frames < min_frames:
-            # Flooring undershot the lower bound; the next grid point up is the
-            # in-bounds choice.
+            # Flooring undershot the lower bound; take the next grid point up.
             snapped_up = num_frames + temporal_compression_ratio
             if snapped_up <= max_frames:
                 num_frames = snapped_up
             else:
-                # The bounds admit no grid point at all. Take the nearest one --
-                # overshooting by under a grid step beats refusing to generate.
+                # No grid point fits the bounds; overshooting by under a step
+                # beats refusing to generate.
                 if abs(snapped_up - clamped_frames) < abs(num_frames - clamped_frames):
                     num_frames = snapped_up
                 logger.warning(

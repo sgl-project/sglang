@@ -455,12 +455,10 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # The activation quantization kernels index the input as row-major and
-        # assert on it. Diffusion backbones routinely hand a linear something
-        # permuted -- LTX-2 packs its latents into a channel-major view, for
-        # instance -- so normalise here rather than at each producer: doing it
-        # upstream would also change which GEMM kernel the unquantized path
-        # picks, and with it that path's output. No-op when already contiguous.
+        # The activation quantization kernels assert on row-major input, and
+        # diffusion backbones routinely pass a permuted view. Normalising at the
+        # producer instead would also move the unquantized path's output, by
+        # changing which GEMM kernel it picks. No-op when already contiguous.
         if not x.is_contiguous():
             x = x.contiguous()
 

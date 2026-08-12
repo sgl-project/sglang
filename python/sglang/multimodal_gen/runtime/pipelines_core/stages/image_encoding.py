@@ -535,11 +535,9 @@ class LTX2ImageEncodingStage(PipelineStage):
 
     # -- image preprocessing ---------------------------------------------
 
-    # Conditioning images are re-compressed to match the compression the model
-    # was trained against. LTX-2 / 2.3 trained at CRF 33; LTX-2.5 at 18.
-    # Upstream keys this off the text-encoder generation
-    # (`resolve_default_image_crf`), which is the only signal that distinguishes
-    # them -- Gemma 3 for <= 2.3, Gemma 4 for 2.5.
+    # Conditioning images are re-compressed to match training: CRF 33 for
+    # LTX-2 / 2.3, 18 for LTX-2.5. Like upstream, keyed off the text-encoder
+    # generation -- the only signal that separates them.
     _DEFAULT_IMAGE_CRF = 33
     _LTX_2_5_IMAGE_CRF = 18
     _GEMMA_4_MODEL_TYPES = ("gemma4_unified", "gemma4")

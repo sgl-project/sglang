@@ -226,9 +226,8 @@ class PipelineConfig:
     vae_precision: str = "fp32"
     vae_decode_precision: str | None = None
     vae_tiling: bool = True
-    # LTX-2.5's diffusion decoder. Tiling bounds the attention grid its stages
-    # see, which is what makes a full-length decode tractable; turn it off to
-    # decode the whole volume at once.
+    # Bounds the attention grid the diffusion decoder's stages see, which is
+    # what makes a full-length decode tractable.
     diffusion_decoder_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True

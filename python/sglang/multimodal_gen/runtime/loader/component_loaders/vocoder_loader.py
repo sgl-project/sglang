@@ -67,8 +67,7 @@ class VocoderLoader(ComponentLoader):
         loaded = {_remap_vocoder_key(k, mapping): v for k, v in loaded.items()}
 
         missing_keys, unexpected_keys = vocoder.load_state_dict(loaded, strict=False)
-        # A silently half-loaded vocoder produces plausible-looking but wrong
-        # audio, so surface any mismatch instead of warning past it.
+        # A half-loaded vocoder produces plausible but wrong audio.
         if missing_keys or unexpected_keys:
             raise ValueError(
                 f"Vocoder weights at '{component_model_path}' do not match the "
@@ -79,8 +78,7 @@ class VocoderLoader(ComponentLoader):
 
 
 def _remap_vocoder_key(key: str, param_names_mapping: dict[str, str]) -> str:
-    # Every rule is applied in order: a single key can need more than one
-    # (e.g. `resnets` -> `resblocks` *and* the downsample-filter nesting).
+    # Applied in order, not first-match: one key can need several rules.
     for pattern, replacement in param_names_mapping.items():
         key = re.sub(pattern, replacement, key)
     return key

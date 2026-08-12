@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """LTX-2.5 diffusion video decoder.
 
-Replaces the convolutional VAE decoder with a small diffusion model: stages 1-4
-deterministically upsample the latent into a context volume using neighborhood
-attention, and stage 5 denoises patchified pixels conditioned on that context.
-As shipped (`model_output_type="x0"`, one step) stage 5 runs once and its
-prediction *is* the output.
+An alternative to the convolutional VAE decoder: stages 1-4 deterministically
+upsample the latent into a context volume, and stage 5 denoises patchified
+pixels conditioned on it. As shipped (`model_output_type="x0"`, one step) that
+single prediction *is* the output.
 
-Attention here is 3D *neighborhood* attention: each query attends to a fixed
-window that shifts inward at the grid borders so it always covers exactly
-`kernel_size` positions. Like upstream this prefers NATTEN's fused `na3d`
-kernel and falls back to a FlexAttention block mask when NATTEN is missing, so
-NATTEN is an optimisation rather than a hard dependency.
+Attention is 3D *neighborhood* attention -- each query attends to a fixed window
+that shifts inward at the grid borders. Prefers NATTEN's fused `na3d` like
+upstream, falling back to a FlexAttention block mask when NATTEN is missing.
 """
 
 import math
@@ -28,11 +25,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-# Tokens per tile in the SwiGLU MLP. `w_gate(x)` and `w_up(x)` are both
-# hidden-width and their product makes a third, so evaluating a whole video at
-# once holds three hidden-width tensors live at the same time. Bounding a token
-# *count* keeps that independent of resolution. Tiling is exact: the MLP is
-# pointwise across tokens.
+# Bounds the three hidden-width temporaries the SwiGLU holds live. Exact: the
+# MLP is pointwise across tokens.
 _SWIGLU_TILE_SIZE = 16384
 
 _na3d_fn: object = None
@@ -42,11 +36,7 @@ _NA3D_UNAVAILABLE = object()
 def _na3d():
     """NATTEN's fused 3D neighborhood attention, or `None` if unavailable.
 
-    This is the kernel upstream uses, and it is the fast path: it walks only the
-    window around each query instead of scoring against a mask over the whole
-    sequence. Measured at a 1.08M-token stage-5 grid it runs ~4.8x faster than
-    the compiled `flex_attention` fallback, and needs no block mask at all --
-    the window is an argument, not a materialised structure.
+    ~4.8x the compiled `flex_attention` fallback, and needs no block mask.
     """
     global _na3d_fn
     if _na3d_fn is None:
@@ -116,10 +106,8 @@ def _unpatchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     )
 
 
-# Block masks are pure functions of the grid and kernel, but cost O(S^2) to
-# build -- measured at 17.5 s for a 1.08M-token stage. A decode reuses each
-# stage's mask across its blocks already; this keeps them across *decodes*, so a
-# server answering repeated requests at one resolution pays the cost once.
+# O(S^2) to build (17.5 s at 1.08M tokens) and a pure function of grid and
+# kernel, so a server at one resolution pays it once.
 _BLOCK_MASK_CACHE: dict = {}
 _BLOCK_MASK_CACHE_MAX = 16
 
@@ -165,9 +153,8 @@ def _neighborhood_block_mask(
         return window_t & window_h & window_w
 
     seq_len = num_frames * hw
-    # `_compile=True` is not an optimisation here but a requirement: the eager
-    # path evaluates `mask_mod` over every (query, key) pair, which is O(S^2)
-    # booleans and tens of GiB at production grids.
+    # `_compile=True` is required, not an optimisation: the eager path
+    # materialises O(S^2) booleans, tens of GiB at production grids.
     block_mask = create_block_mask(
         mask_mod,
         B=None,
@@ -187,17 +174,15 @@ class LTX2VideoVaeRotaryPosEmbed3D(nn.Module):
     """Absolute 3D rotary embedding over the (T, H, W) grid.
 
     `head_dim` splits into (T, H, W) chunks, each rotated by its own axis
-    position. Positions are plain 0-based indices: attention is a local window
-    with no causal masking, so only relative offsets matter and a shared origin
-    shift is a no-op.
+    position.
     """
 
     def __init__(self, head_dim: int, base: float = 10000.0) -> None:
         super().__init__()
         if head_dim % 8 != 0:
             raise ValueError(f"head_dim must be a multiple of 8, got {head_dim}.")
-        # A quarter to T, the rest halved between H and W, both halves kept even
-        # so each holds whole rotation pairs.
+        # A quarter to T, the rest split H/W, both kept even for whole
+        # rotation pairs.
         dim_t = (head_dim // 4) // 2 * 2
         dim_hw = (head_dim - dim_t) // 2
         if dim_hw % 2 != 0:
@@ -299,10 +284,9 @@ class LTX2VideoVaeNeighborhoodAttention(nn.Module):
         return self.rope(query), self.rope(key), value
 
     def build_block_mask(self, hidden_states: torch.Tensor):
-        """The window mask for this grid. Fixed within a stage, so built once.
+        """The window mask for this grid, or `None` when NATTEN handles it.
 
-        `None` when NATTEN is available: that path takes the window as an
-        argument, and building the mask anyway would cost O(S^2) for nothing.
+        Fixed within a stage, so built once.
         """
         if _na3d() is not None:
             return None
@@ -325,9 +309,8 @@ class LTX2VideoVaeNeighborhoodAttention(nn.Module):
 
         na3d = _na3d()
         if na3d is not None:
-            # `project_qkv` already yields NATTEN's (B, T, H, W, heads, dim)
-            # layout, so the fast path needs no reshaping. scale=1.0: the query
-            # is already scaled in project_qkv.
+            # `project_qkv` already yields NATTEN's layout. scale=1.0: the
+            # query is pre-scaled there.
             hidden_states = na3d(
                 query, key, value, kernel_size=self.kernel_size, scale=1.0
             )
@@ -549,8 +532,7 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
                 "decoder_model_output_type must be 'x0' or 'v', got "
                 f"{arch.decoder_model_output_type!r}."
             )
-        # Stage widths and the reductions are two views of the same thing; an
-        # inconsistent pair would only fail deep inside the first block.
+        # An inconsistent pair would only fail deep inside the first block.
         for stage_idx, reduction in enumerate(reductions):
             expected = stage_channels[stage_idx] // reduction
             if stage_channels[stage_idx + 1] != expected:
@@ -566,9 +548,8 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
         self.default_num_inference_steps = arch.decoder_num_inference_steps
         self.temporal_compression_ratio = arch.temporal_compression_ratio
         self.context_channels = stage_channels[-1]
-        # The window shifts inward at the grid border, so the last latent frame
-        # is replicated through stages 1-4 and cropped before stage 5, moving
-        # that border past the frames that are kept.
+        # Replicated through stages 1-4 and cropped before stage 5, moving the
+        # border effect past the frames that are kept.
         self.trailing_pad_latent_frames = (stage_kernels[0][0] // 2) * 2
 
         self.conv_in = nn.Linear(arch.latent_channels, stage_channels[0], bias=True)
@@ -632,8 +613,7 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
         hidden_states = hidden_states.permute(0, 2, 3, 4, 1)
         hidden_states = self.conv_in(hidden_states)
         for blocks, upsample in zip(self.det_stages[:-1], self.upsamples[:-1]):
-            # Grid and kernel are fixed within a stage, so one mask serves all
-            # of its blocks.
+            # Fixed within a stage, so one mask serves all of its blocks.
             block_mask = blocks[0].attn.build_block_mask(hidden_states)
             for block in blocks:
                 hidden_states = block(hidden_states, block_mask)
@@ -731,8 +711,7 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
     ) -> torch.Tensor:
         num_inference_steps = num_inference_steps or self.default_num_inference_steps
         latent_context = self.forward_stage_4(self.forward_stages_1_to_3(hidden_states))
-        # The context grid is the stage-5 token grid, so the pixel canvas is its
-        # shape times the patch size.
+        # Pixel canvas = stage-5 token grid times the patch size.
         pixel_shape = (
             hidden_states.shape[0],
             self.out_channels,
@@ -787,12 +766,9 @@ class LTX2VideoDiffusionDecoderModel(nn.Module):
             "latents_std", torch.ones(latent_channels), persistent=True
         )
 
-        # Tiling runs the memory- and compute-dominant stages (the last
-        # deterministic stage and the diffusion blocks) on overlapping tiles.
-        # The earlier stages always see the whole latent, so it changes the
-        # output only near tile borders. The caller owns this: the decoding
-        # stage sets it from `--diffusion-decoder-tiling`. Tile sizes match
-        # upstream.
+        # Tiles the last deterministic stage and the diffusion blocks, so the
+        # output only moves near tile borders. Set by the decoding stage from
+        # `--diffusion-decoder-tiling`; tile sizes match upstream.
         self.use_tiling = False
         self.tile_sample_min_height = 768
         self.tile_sample_min_width = 768
@@ -862,8 +838,7 @@ class LTX2VideoDiffusionDecoderModel(nn.Module):
         step_h = self.tile_sample_stride_height // scale_h
         tile_w = self.tile_sample_min_width // scale_w
         step_w = self.tile_sample_stride_width // scale_w
-        # A tile has to satisfy both remaining kernels: stage 4 sees it as-is,
-        # stage 5 sees it scaled by the upsample stride.
+        # Stage 4 sees the tile as-is, stage 5 sees it scaled by the stride.
         min_sizes = [
             max(k4, -(-k5 // stride))
             for k4, k5, stride in zip(
@@ -872,8 +847,8 @@ class LTX2VideoDiffusionDecoderModel(nn.Module):
         ]
 
         features = decoder.forward_stages_1_to_3(hidden_states)
-        # The trailing ghost frames replicate through the earlier temporal
-        # upsamples, whose composed mapping is affine in their stride product.
+        # Trailing ghost frames replicate through the earlier temporal
+        # upsamples; the composed mapping is affine in their stride product.
         ghost = decoder.trailing_pad_latent_frames * math.prod(
             up.stride[0] for up in decoder.upsamples[:-1]
         )
@@ -887,9 +862,8 @@ class LTX2VideoDiffusionDecoderModel(nn.Module):
         blend_height = (tile_h - step_h) * scale_h
         blend_width = (tile_w - step_w) * scale_w
 
-        # A single-step x0 decode predicts pixels from pure noise, so each tile
-        # may draw its own. A multi-step decode integrates noise across steps, so
-        # overlapping tiles have to start from one shared canvas.
+        # Single-step x0 predicts from pure noise, so tiles may draw their own.
+        # Multi-step integrates across steps and needs one shared canvas.
         single_step_x0 = num_inference_steps == 1 and decoder.model_output_type == "x0"
         x_t_full = None
         if not single_step_x0:

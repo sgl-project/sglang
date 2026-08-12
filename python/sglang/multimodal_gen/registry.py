@@ -701,13 +701,10 @@ def _register_configs():
             lambda path: "ltx-2.3" in path.lower(),
         ],
     )
-    # LTX-2.5 keeps the LTX-2 pipeline class and sigma path; only the component
-    # geometry and the pinned distilled schedule differ.
-    #
-    # Only the `-Diffusers` repo is listed: unlike LTX-2.3 it already ships a full
-    # diffusers layout, so no model overlay is needed. `Lightricks/LTX-2.5` itself
-    # is a ComfyUI-style split pack of bare `.safetensors` and would need an
-    # overlay (see `runtime/utils/model_overlay.py`) before it could be loaded.
+    # Keeps the LTX-2 pipeline class; only component geometry and the pinned
+    # distilled schedule differ. Only the `-Diffusers` repo is listed --
+    # `Lightricks/LTX-2.5` is a split pack of bare `.safetensors` and would need
+    # a model overlay first.
     register_configs(
         sampling_param_cls=LTX25SamplingParams,
         pipeline_config_cls=LTX25PipelineConfig,

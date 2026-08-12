@@ -33,9 +33,8 @@ class TestIpcInputA2AQkvGuard(unittest.TestCase):
         self.assertIsNone(self._call(q, k, v))
 
     def test_self_attention_shapes_reach_the_ipc_path(self):
-        # Equal shapes must get past the guard. Without a real IPC group the
-        # call still returns None, but from `_ipc_ready_group`, so patch that to
-        # prove the guard is not what rejected it.
+        # Without a real IPC group this returns None either way, so patch the
+        # group lookup to prove the guard is not what rejected it.
         q = torch.zeros(1, 128, 8, 64)
         group = mock.MagicMock(return_value=None)
         with mock.patch.object(

@@ -28,8 +28,7 @@ class LTX2AVDecodingStage(DecodingStage):
         super().__init__(vae, pipeline)
         self.audio_vae = audio_vae
         self.vocoder = vocoder
-        # LTX-2.5 only. When the request asks for it, this replaces the
-        # convolutional decoder; the latents and their denormalization are
+        # Replaces the convolutional decoder; latents and denormalization are
         # identical either way.
         self.diffusion_decoder = diffusion_decoder
         # Add video processor for postprocessing
@@ -64,8 +63,7 @@ class LTX2AVDecodingStage(DecodingStage):
         It is a diffusion model in its own right, so it needs a generator; the
         request's seed keeps a decode reproducible.
         """
-        # Without tiling every stage attends over the whole volume, and the
-        # neighborhood block mask costs O(tokens^2) to build -- minutes at a
+        # Untiled, every stage attends over the whole volume -- minutes at a
         # full-length 121-frame grid.
         self.diffusion_decoder.use_tiling = bool(
             server_args.pipeline_config.diffusion_decoder_tiling

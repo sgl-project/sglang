@@ -7,18 +7,17 @@ from sglang.multimodal_gen.configs.models.vocoder.base import (
     VocoderConfig,
 )
 
-# LTX-2.5's `LTX2VocoderWithBWE` stores both generator stacks with diffusers
-# module names, while SGLang's core follows the upstream ltx-core naming. The
-# `vocoder.` / `bwe_generator.` prefixes are identical on both sides.
+# `LTX2VocoderWithBWE` stores both stacks with diffusers module names; SGLang
+# follows ltx-core naming. The `vocoder.` / `bwe_generator.` prefixes match.
 LTX_VOCODER_PARAM_NAMES_MAPPING: dict[str, str] = {
     r"^(vocoder|bwe_generator)\.conv_in\.(.*)$": r"\1.conv_pre.\2",
     r"^(vocoder|bwe_generator)\.conv_out\.(.*)$": r"\1.conv_post.\2",
     r"^(vocoder|bwe_generator)\.act_out\.(.*)$": r"\1.act_post.\2",
     r"^(vocoder|bwe_generator)\.upsamplers\.(.*)$": r"\1.ups.\2",
     r"^(vocoder|bwe_generator)\.resnets\.(.*)$": r"\1.resblocks.\2",
-    # SGLang's DownSample1d holds its kernel on a LowPassFilter1d submodule,
-    # whereas UpSample1d registers it directly. Applied after the renames above,
-    # so the rules must be evaluated in order rather than first-match-wins.
+    # DownSample1d holds its kernel on a LowPassFilter1d submodule; UpSample1d
+    # registers it directly. Must run after the renames above, so the rules are
+    # evaluated in order rather than first-match-wins.
     r"^(vocoder|bwe_generator)\.(.*)downsample\.filter$": r"\1.\2downsample.lowpass.filter",
 }
 
@@ -43,9 +42,8 @@ class LTXVocoderArchConfig(VocoderArchConfig):
     sample_rate: int = 24000
 
     # --- LTX-2.5 `LTX2VocoderWithBWE` fields -------------------------------
-    # A bandwidth-extension stage runs after the base vocoder: the base stack
-    # synthesises at `input_sampling_rate`, a mel STFT re-analyses that signal,
-    # and the BWE stack resynthesises at `output_sampling_rate`.
+    # The base stack synthesises at `input_sampling_rate`, a mel STFT
+    # re-analyses it, and the BWE stack resynthesises at `output_sampling_rate`.
     act_fn: str = "snake"
     final_act_fn: str | None = None
     final_bias: bool = True
@@ -69,8 +67,7 @@ class LTXVocoderArchConfig(VocoderArchConfig):
     bwe_resnet_kernel_sizes: List[int] = field(default_factory=list)
     bwe_resnet_dilations: List[List[int]] = field(default_factory=list)
 
-    # Nested upstream-style config. `LTX2Vocoder` switches to its BWE branch
-    # when this carries a "bwe" entry; derived below for diffusers checkpoints.
+    # `LTX2Vocoder` takes its BWE branch when this carries a "bwe" entry.
     vocoder: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:

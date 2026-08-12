@@ -5,10 +5,9 @@ from sglang.multimodal_gen.configs.models.adapter.base import (
     AdapterConfig,
 )
 
-# LTX-2.5 ships diffusers-format connectors, whose per-modality projections are
-# named `video_text_proj_in` / `audio_text_proj_in`. SGLang follows the upstream
-# ltx-core naming (`*_aggregate_embed`). Every other connector weight already
-# matches diffusers exactly.
+# Diffusers names the per-modality projections `video_text_proj_in` /
+# `audio_text_proj_in`; SGLang follows ltx-core (`*_aggregate_embed`). Every
+# other connector weight already matches.
 LTX2_CONNECTOR_PARAM_NAMES_MAPPING: dict[str, str] = {
     r"^video_text_proj_in\.(.*)$": r"video_aggregate_embed.\1",
     r"^audio_text_proj_in\.(.*)$": r"audio_aggregate_embed.\1",
@@ -41,11 +40,10 @@ class LTX2ConnectorArchConfig(AdapterArchConfig):
     video_connector_num_layers: int = 2
     video_connector_num_learnable_registers: int = 128
 
-    # Names used by the diffusers `connectors/config.json`. `update_model_arch`
-    # copies the JSON verbatim onto this object, so declare them here and derive
-    # the SGLang-side fields in `__post_init__` rather than reading the JSON
-    # names at every use site. LTX-2.0 leaves `per_modality_projections` false
-    # and keeps the single shared `text_proj_in`; LTX-2.3/2.5 set it.
+    # `update_model_arch` copies `connectors/config.json` verbatim onto this
+    # object, so declare its names here and derive the SGLang-side fields in
+    # `__post_init__`. LTX-2.0 leaves `per_modality_projections` false and keeps
+    # one shared `text_proj_in`; LTX-2.3 / 2.5 set it.
     per_modality_projections: bool = False
     video_hidden_dim: int = 4096
     audio_hidden_dim: int = 2048
@@ -62,8 +60,7 @@ class LTX2ConnectorArchConfig(AdapterArchConfig):
             self.video_feature_extractor_out_features = self.video_hidden_dim
             self.audio_feature_extractor_out_features = self.audio_hidden_dim
 
-        # Upstream gates the two connectors separately, but they are always
-        # configured together in released checkpoints.
+        # Upstream gates these separately; released checkpoints always pair them.
         if self.video_gated_attn or self.audio_gated_attn:
             self.connector_apply_gated_attention = True
 

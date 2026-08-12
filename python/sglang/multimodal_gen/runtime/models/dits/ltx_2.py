@@ -1205,8 +1205,7 @@ class LTX2TransformerBlock(nn.Module):
         )
 
         # 4. Feedforward layers
-        # LTX-2.5 drops the bias on the video feed-forward but keeps it on the
-        # audio one (`ff_bias: false` / `audio_ff_bias: true`).
+        # LTX-2.5: `ff_bias: false`, `audio_ff_bias: true`.
         self.ff = LTX2FeedForward(
             dim, dim_out=dim, bias=ff_bias, quant_config=quant_config
         )
@@ -1569,9 +1568,8 @@ class LTX2TransformerBlock(nn.Module):
 class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
     _compile_conditions = [is_blocks_or_transformer_blocks]
-    # Class-level defaults satisfy BaseDiT's `__init_subclass__` contract and
-    # cover LTX-2. `__init__` overrides them per instance from the arch config so
-    # variants (LTX-2.5) can extend the mapping.
+    # Class-level defaults satisfy BaseDiT's `__init_subclass__` contract;
+    # `__init__` overrides them per instance so variants can extend the mapping.
     param_names_mapping = LTX2ArchConfig().param_names_mapping
     reverse_param_names_mapping = LTX2ArchConfig().reverse_param_names_mapping
     lora_param_names_mapping = LTX2ArchConfig().lora_param_names_mapping
@@ -1649,8 +1647,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         super().__init__(config=config, hf_config=hf_config)
 
         arch = self.config
-        # Checkpoint naming is arch-config metadata, not a runtime capability:
-        # take it from this model's own config so variants can extend it.
+        # Checkpoint naming is arch-config metadata, not a runtime capability.
         self.param_names_mapping = arch.param_names_mapping
         self.reverse_param_names_mapping = arch.reverse_param_names_mapping
         self.lora_param_names_mapping = arch.lora_param_names_mapping
@@ -1680,9 +1677,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             quant_config=quant_config,
         )
 
-        # Marks single-pixel-frame keyframe tokens (LTX-2.5+). Zero-initialized
-        # upstream and not consumed by the regular denoising forward; it is held
-        # here so the checkpoint round-trips.
+        # Marks single-pixel-frame keyframe tokens. Zero-initialized upstream
+        # and unused by the denoising forward; held so the checkpoint
+        # round-trips.
         self.keyframes_abs_pos_embedding: nn.Parameter | None = None
         if arch.use_keyframes_abs_pos_embedding:
             self.keyframes_abs_pos_embedding = nn.Parameter(

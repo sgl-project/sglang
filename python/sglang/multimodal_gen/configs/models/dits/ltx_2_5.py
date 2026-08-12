@@ -9,9 +9,8 @@ from sglang.multimodal_gen.configs.models.dits.ltx_2 import (
     LTX2RopeType,
 )
 
-# LTX-2.5 ships the prompt adaLN modules under `prompt_adaln` / `audio_prompt_adaln`
-# and adds the keyframe position embedding. Everything else in the checkpoint is
-# already covered by the shared LTX-2 mapping.
+# LTX-2.5 renames the prompt adaLN modules and adds the keyframe position
+# embedding; the shared LTX-2 mapping covers everything else.
 LTX25_EXTRA_PARAM_NAMES_MAPPING: dict[str, str] = {
     r"^prompt_adaln\.(.*)$": r"prompt_adaln_single.\1",
     r"^audio_prompt_adaln\.(.*)$": r"audio_prompt_adaln_single.\1",
@@ -60,8 +59,7 @@ class LTX25ArchConfig(LTX2ArchConfig):
     audio_ff_bias: bool = True
     use_keyframes_abs_pos_embedding: bool = True
 
-    # Connector geometry grew from 2 layers to 8; mirrored here because the
-    # fields also appear in transformer/config.json.
+    # Mirrored here because these also appear in transformer/config.json.
     connector_num_attention_heads: int = 32
     connector_num_layers: int = 8
     audio_connector_attention_head_dim: int = 64

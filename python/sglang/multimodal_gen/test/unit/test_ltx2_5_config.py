@@ -44,9 +44,8 @@ class TestLTX25DiTConfig(unittest.TestCase):
         self.assertTrue(arch.audio_ff_bias)
 
     def test_param_names_mapping_extends_ltx2(self):
-        # Regression: the DiT used to read this mapping off a class attribute
-        # pinned to LTX2ArchConfig, so the LTX-2.5 renames never reached the
-        # loader and weight loading fell back to diffusers.
+        # Regression: read off a class attribute pinned to LTX2ArchConfig, the
+        # LTX-2.5 renames never reached the loader.
         arch = LTX25ArchConfig()
         for rule in LTX2ArchConfig().param_names_mapping:
             self.assertIn(rule, arch.param_names_mapping)
@@ -73,8 +72,7 @@ class TestLTX25DiTConfig(unittest.TestCase):
 
 
 class TestLTX25VAEConfig(unittest.TestCase):
-    # Reversed like the sibling per-stage lists, `upsample_type` would give the
-    # wrong upsampler strides. Upstream indexes it in decoder order.
+    # Reversed like its sibling lists, this would give the wrong strides.
     EXPECTED_STRIDES = {
         "spatiotemporal": (2, 2, 2),
         "temporal": (2, 1, 1),
@@ -240,11 +238,8 @@ class TestLTX25PipelineConfig(unittest.TestCase):
         self.assertFalse(is_ltx23_native_variant(config.vae_config.arch_config))
 
     def test_registry_resolves_ltx_variants_apart(self):
-        # `_get_config_info` rather than `get_model_info`: the latter also reads
-        # `model_index.json` from the Hub to pick the pipeline class, which
-        # makes it network-dependent and, offline, silently resolves to the
-        # generic diffusers config. What matters here is the path-to-config
-        # mapping, and that is pure string matching.
+        # Not `get_model_info`: it also reads `model_index.json` from the Hub,
+        # and offline that silently resolves to the generic diffusers config.
         from sglang.multimodal_gen.registry import _get_config_info
 
         self.assertIs(

@@ -172,8 +172,8 @@ class LTX2SigmaPreparationStage(PipelineStage):
         batch.extra["ltx2_phase"] = "stage1"
         pinned_sigmas = server_args.pipeline_config.default_sigmas
         if pinned_sigmas:
-            # Distilled checkpoints (LTX-2.5) ship an explicit schedule; handing
-            # them a generic linear one silently costs quality.
+            # Distilled checkpoints ship an explicit schedule; a generic linear
+            # one silently costs quality.
             if int(batch.num_inference_steps) != len(pinned_sigmas):
                 logger.info(
                     "Overriding num_inference_steps=%d with the pinned distilled "
@@ -236,7 +236,7 @@ def _add_ltx2_front_stages(pipeline: ComposedPipelineBase):
             LTX2TextConnectorStage(connectors=pipeline.get_module("connectors")),
         ]
     )
-    # LTX-2.5 only. Must run before latent preparation, which derives shapes from
+    # Must run before latent preparation, which derives shapes from
     # `num_frames`. A no-op unless the request sets `auto_duration`.
     duration_head = pipeline.get_module("duration_head", None)
     if duration_head is not None:
@@ -337,17 +337,14 @@ class _BaseLTX2Pipeline(LoRAPipeline):
         "connectors",
     ]
 
-    # LTX-2.5 ships two DiTs: the distilled one `model_index.json` points at, and
-    # `transformer_full/`, the full / SFT weights, which the index deliberately
-    # omits. `--model-variant dev` selects the latter.
+    # `model_index.json` points at the distilled DiT; the full / SFT weights in
+    # `transformer_full/` are deliberately omitted from it.
     _DEV_VARIANTS = frozenset({"dev", "full", "sft"})
     _DEV_TRANSFORMER_SUBFOLDER = "transformer_full"
 
     def __init__(self, model_path, server_args, required_config_modules=None, **kwargs):
         self._maybe_route_dev_transformer(model_path, server_args)
-        # The duration head ships from LTX-2.5 onward and is absent from LTX-2 /
-        # LTX-2.3 checkpoints, so it can only be required when the model
-        # actually declares it.
+        # LTX-2 / 2.3 ship neither, so require them only when declared.
         modules = list(required_config_modules or self._required_config_modules)
         for optional in ("duration_head", "diffusion_decoder"):
             if optional not in modules and self._declares_component(
@@ -399,8 +396,8 @@ class _BaseLTX2Pipeline(LoRAPipeline):
         orig = self.get_module("scheduler")
         scheduler_overrides: dict = {}
         if self._is_dev_variant(server_args):
-            # `scheduler/` is configured for the distilled DiT, which wants the
-            # schedule exactly as given. The full DiT needs the shifting back.
+            # `scheduler/` is configured for the distilled DiT; the full DiT
+            # needs the shifting back.
             scheduler_overrides = {
                 "use_dynamic_shifting": True,
                 "shift_terminal": 0.1,
@@ -679,10 +676,8 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self.modules["spatial_upsampler"] = module
         self.memory_usages["spatial_upsampler"] = memory_usage
 
-        # LTX-2 / 2.3 two-stage merges a distilled LoRA onto the dev DiT per
-        # stage. LTX-2.5's shipped transformer is already distilled -- its
-        # two-stage recipe is stage 1, x2 latent upsample, then a 3-sigma tail,
-        # with no LoRA anywhere -- so the LoRA is optional there.
+        # LTX-2 / 2.3 merge a distilled LoRA per stage; LTX-2.5's transformer
+        # is already distilled, so the LoRA is optional there.
         distilled_lora_path = server_args.component_paths.get("distilled_lora")
         if not distilled_lora_path and not self._transformer_is_predistilled(
             server_args
@@ -936,9 +931,8 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         return lora_nicknames, lora_paths, lora_strengths, lora_targets
 
     def switch_lora_phase(self, phase: str, batch: Req | None = None) -> None:
-        # A pre-distilled DiT (LTX-2.5) has no distilled LoRA to switch to, and
-        # both stages run the same weights. Guarding here rather than per-stage
-        # covers every caller, including the refinement stage.
+        # A pre-distilled DiT has no LoRA to switch to and runs the same
+        # weights in both stages. Guarding here covers every caller.
         if self._distilled_lora_path is None:
             self._active_lora_phase = phase
             return
