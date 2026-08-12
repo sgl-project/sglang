@@ -124,7 +124,7 @@ Selecting weights:
 | 1 very tight GPU | `--dit-layerwise-offload` | Cuts peak memory by roughly 10 GB, at about 4x the wall clock. |
 | 2 GPUs, long sequences | `--num-gpus 2 --ulysses-degree 2` | Sequence parallel; the memory/long-sequence tool. |
 | 2 GPUs, large DiT | `--num-gpus 2 --tp-size 2` | Tensor parallel across attention heads. |
-| 2 GPUs, dev weights | `--num-gpus 2 --enable-cfg-parallel` | Splits the guided and unguided branches across GPUs. Measured 1.69x on denoising. |
+| 2 GPUs, dev weights | `--num-gpus 2 --enable-cfg-parallel` | Splits the guided and unguided branches across GPUs. Measured 1.77x on denoising (15.1s to 8.5s, 960×544 / 57 frames / 30 steps). |
 
 <Warning>
 **CFG parallelism does not apply on the default (distilled) path.** That DiT
