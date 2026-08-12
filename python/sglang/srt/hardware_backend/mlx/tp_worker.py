@@ -90,6 +90,7 @@ class MlxTpModelWorker(TpModelWorker):
             disable_radix_cache=get_memory().disable_radix_cache,
             mem_fraction_static=get_schedule().mem_fraction_static,
             quantization=get_model().quantization,
+            revision=get_model().revision,
             enable_sampling=get_device().mlx_enable_sampling,
             sampling_rng_seed=get_device().random_seed,
             deterministic_seeding=(
