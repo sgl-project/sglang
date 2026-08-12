@@ -185,7 +185,21 @@ class TestMetalCaptureProfilerMPS(unittest.TestCase):
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
 class TestSchedulerProfilerManagerMPS(unittest.TestCase):
-    """SchedulerProfilerManager._start_profile handles Metal capture failures."""
+    """SchedulerProfilerManager._start_profile handles Metal capture failures.
+
+    apply_metal_profiler_patches() dispatches on use_mlx(), which reads
+    SGLANG_USE_MLX and is cached for the process (tensor_bridge.use_mlx).
+    This class exists to exercise the MPS strategy, so it pins use_mlx at
+    its point of use in profiler.py rather than the ambient environment;
+    an env-only pin would not reliably override an already-cached value.
+    """
+
+    def setUp(self):
+        patcher = patch(
+            "sglang.srt.hardware_backend.mlx.profiler.use_mlx", return_value=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _make_manager(self, output_dir):
         from sglang.srt.managers.scheduler_components.profiler_manager import (
@@ -203,8 +217,14 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
         mgr._init_profile(output_dir, None, None, None, None, None, False, "test")
         return mgr
 
+    # MetalCaptureProfiler has two strategies: start_mlx drives
+    # mx.metal.start_capture, start_mps drives torch.mps.profiler.metal_capture.
+    # This manager takes the MPS one, so that is the symbol to stand in for --
+    # patching mx.metal here leaves the real Metal capture running, which fails
+    # with "Capture layer is not inserted" unless MTL_CAPTURE_ENABLED=1 is set
+    # in the environment.
     def test_start_profile_failure_does_not_crash(self):
-        import mlx.core as mx
+        import torch
 
         from sglang.srt.hardware_backend.mlx.profiler import (
             apply_metal_profiler_patches,
@@ -215,20 +235,22 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mgr = self._make_manager(tmp)
             with patch.object(
-                mx.metal,
-                "start_capture",
+                torch.mps.profiler,
+                "metal_capture",
                 side_effect=RuntimeError("Capture layer is not inserted"),
             ):
                 result = mgr._start_profile()
 
         self.assertFalse(result.success)
+        self.assertIn("Capture layer is not inserted", result.message)
         self.assertFalse(mgr.profile_in_progress)
         self.assertIsNone(mgr.torch_profiler)
 
     def test_start_profile_success_with_mock_capture(self):
+        from unittest.mock import MagicMock
         from unittest.mock import patch as mock_patch
 
-        import mlx.core as mx
+        import torch
 
         from sglang.srt.hardware_backend.mlx.profiler import (
             apply_metal_profiler_patches,
@@ -238,14 +260,17 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             mgr = self._make_manager(tmp)
-            with mock_patch.object(mx.metal, "start_capture"), mock_patch.object(
-                mx.metal, "stop_capture"
+            capture_ctx = MagicMock()
+            with mock_patch.object(
+                torch.mps.profiler, "metal_capture", return_value=capture_ctx
             ), mock_patch("torch.distributed.barrier"):
                 result = mgr._start_profile()
-                self.assertTrue(result.success)
+                self.assertTrue(result.success, result.message)
                 self.assertTrue(mgr.profile_in_progress)
+                capture_ctx.__enter__.assert_called_once()
                 mgr._stop_profile()
                 self.assertFalse(mgr.profile_in_progress)
+                capture_ctx.__exit__.assert_called_once()
 
 
 if __name__ == "__main__":

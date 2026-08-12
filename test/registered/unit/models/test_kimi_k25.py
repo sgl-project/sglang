@@ -39,11 +39,11 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.cuda_ipc_transport_utils import (
+from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -317,7 +317,11 @@ def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
     tower = _MoonViT3dTower()
     pixel_values = torch.randn(4, 2)
 
-    with get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0):
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
+    with get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    ):
         output = run_dp_sharded_mrope_vision_model(
             tower, pixel_values, [[1, 2, 2]], rope_type="rope_2d_packed"
         )
@@ -331,7 +335,11 @@ def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
     pixel_values = torch.randn(4, 2)
     loader = Mock(return_value=pixel_values)
 
-    with get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0):
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
+    with get_context().override_server_args(tp_size=1), get_parallel().override(
+        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    ):
         output = run_dp_sharded_mrope_vision_model(
             tower,
             None,
@@ -479,11 +487,10 @@ def test_kimi_non_dp_keeps_grid_thws_on_the_host():
     model.mm_projector = _IdentityProjector()
     items = [_image_item(torch.randn(4, 2), [[1, 2, 2]])]
 
-    with get_parallel().override(
+    # The IPC consumer count asks for the *configured* TP size (matching
+    # MmItemMemoryPool.try_to_recycle), so the double publishes one too.
+    with get_context().override_server_args(tp_size=1), get_parallel().override(
         tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-    ), patch(
-        "sglang.srt.models.kimi_k25.get_server_args",
-        return_value=SimpleNamespace(tp_size=1),
     ):
         model.get_image_feature(items)
 

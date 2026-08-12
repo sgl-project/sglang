@@ -203,6 +203,9 @@ DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST = "Efficient-Large-Model/SANA-WM_bidirection
 DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST = (
     "Efficient-Large-Model/SANA-WM_streaming"
 )
+DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST = (
+    "Efficient-Large-Model/SANA-Video_2B_480p_diffusers"
+)
 
 
 def print_value_formatted(description: str, value: int | float | str):
@@ -914,12 +917,11 @@ def get_clip_model() -> tuple[Any, Any]:
             if "RobertaProcessing" not in str(e):
                 raise
             logger.warning(
-                "Fast CLIP processor failed (%s), retrying with use_fast=False", e
+                "CLIP processor failed (%s), retrying with compatibility shim", e
             )
             processor = _load_clip_processor_with_roberta_processing_compat(
                 CLIPProcessor,
                 CLIP_MODEL_NAME,
-                use_fast=False,
             )
         model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
 
