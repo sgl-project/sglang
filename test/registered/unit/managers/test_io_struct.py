@@ -164,6 +164,33 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Check text expansion
         self.assertEqual(req.text, expected_text)
 
+    def test_invalid_parallel_sample_count_is_rejected_before_expansion(self):
+        invalid_sampling_params = (
+            {"n": 0},
+            {"n": -1},
+            {"n": False},
+            {"n": 1.5},
+            {"n": "2"},
+            [{"n": 0}, {"n": 0}],
+        )
+
+        for sampling_params in invalid_sampling_params:
+            with self.subTest(sampling_params=sampling_params):
+                req = GenerateReqInput(
+                    text=["Hello", "World"], sampling_params=sampling_params
+                )
+                with self.assertRaisesRegex(ValueError, "n must be a positive integer"):
+                    req.normalize_batch_and_arguments()
+                self.assertEqual(req.text, ["Hello", "World"])
+
+    def test_null_parallel_sample_count_uses_default(self):
+        req = GenerateReqInput(text=["Hello", "World"], sampling_params={"n": None})
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.parallel_sample_num, 1)
+        self.assertEqual(req.text, ["Hello", "World"])
+
     def test_return_hidden_states_expands_with_parallel_sampling(self):
         req = GenerateReqInput(
             text=["Prompt 1", "Prompt 2"],

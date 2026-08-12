@@ -88,6 +88,31 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     stop_regex_max_len: int = 0  # set by normalize()
     is_normalized: bool = False  # set by normalize()
 
+    @staticmethod
+    def normalize_n(n: object) -> int:
+        if n is None:
+            return 1
+        if type(n) is not int or n < 1:
+            raise ValueError(f"n must be a positive integer, got {n!r}.")
+        return n
+
+    @staticmethod
+    def _normalize_stop_strings(value: object, name: str) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            values = [value]
+        elif isinstance(value, list):
+            values = value
+        else:
+            raise ValueError(f"{name} must be a string or a list of strings.")
+
+        if not all(isinstance(item, str) for item in values):
+            raise ValueError(f"{name} must be a string or a list of strings.")
+        if any(item == "" for item in values):
+            raise ValueError(f"{name} cannot contain an empty string.")
+        return values
+
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers
         # (e.g. /generate) can pass null without crashing verify().
@@ -97,13 +122,15 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         if self.is_normalized:
             return
 
-        self.stop_strs = self.stop
+        self.stop_strs = self._normalize_stop_strings(self.stop, "stop")
         if self.stop_token_ids:
             filtered = {int(t) for t in self.stop_token_ids if t is not None}
             self.stop_token_ids = filtered or None
         else:
             self.stop_token_ids = None
-        self.stop_regex_strs = self.stop_regex
+        self.stop_regex_strs = self._normalize_stop_strings(
+            self.stop_regex, "stop_regex"
+        )
         self.temperature = self.temperature if self.temperature is not None else 1.0
         self.top_p = self.top_p if self.top_p is not None else 1.0
         self.top_k = self.top_k if self.top_k is not None else -1
@@ -120,7 +147,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.min_new_tokens = (
             self.min_new_tokens if self.min_new_tokens is not None else 0
         )
-        self.n = self.n if self.n is not None else 1
+        self.n = self.normalize_n(self.n)
         self.ignore_eos = self.ignore_eos if self.ignore_eos is not None else False
         self.skip_special_tokens = (
             self.skip_special_tokens if self.skip_special_tokens is not None else True
@@ -153,6 +180,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."
             )
+        self.normalize_n(self.n)
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
@@ -197,6 +225,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+        self._normalize_stop_strings(self.stop_strs, "stop")
+        self._normalize_stop_strings(self.stop_regex_strs, "stop_regex")
 
         grammars = [
             self.json_schema,
@@ -211,37 +241,26 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
 
     def normalize(self, tokenizer):
         # Process stop strings
-        if self.stop_strs is None:
-            self.stop_strs = []
-            self.stop_str_max_len = 0
-        else:
-            if isinstance(self.stop_strs, str):
-                self.stop_strs = [self.stop_strs]
-
-            stop_str_max_len = 0
-            for stop_str in self.stop_strs:
-                if tokenizer is not None:
-                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
-                    stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
-                else:
-                    stop_str_max_len = max(stop_str_max_len, len(stop_str))
-            self.stop_str_max_len = stop_str_max_len
+        stop_strs = self._normalize_stop_strings(self.stop_strs, "stop")
+        self.stop_strs = stop_strs
+        stop_str_max_len = 0
+        for stop_str in stop_strs:
+            if tokenizer is not None:
+                stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
+                stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+            else:
+                stop_str_max_len = max(stop_str_max_len, len(stop_str))
+        self.stop_str_max_len = stop_str_max_len
 
         # Process stop regex strings
-        if self.stop_regex_strs is None:
-            self.stop_regex_strs = []
-            self.stop_regex_max_len = 0
-        else:
-            if isinstance(self.stop_regex_strs, str):
-                self.stop_regex_strs = [self.stop_regex_strs]
-
-            stop_regex_max_len = 0
-            for stop_regex in self.stop_regex_strs:
-                stop_regex_max_len = max(
-                    stop_regex_max_len, get_max_seq_length(stop_regex)
-                )
-
-            self.stop_regex_max_len = stop_regex_max_len
+        stop_regex_strs = self._normalize_stop_strings(
+            self.stop_regex_strs, "stop_regex"
+        )
+        self.stop_regex_strs = stop_regex_strs
+        stop_regex_max_len = 0
+        for stop_regex in stop_regex_strs:
+            stop_regex_max_len = max(stop_regex_max_len, get_max_seq_length(stop_regex))
+        self.stop_regex_max_len = stop_regex_max_len
 
         # Validate tokenizer is available for tokenizer-dependent features
         raise_if_tokenizer_required(

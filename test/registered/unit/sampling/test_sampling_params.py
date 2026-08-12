@@ -8,7 +8,7 @@ register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 import copy
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec
 
@@ -309,6 +309,35 @@ class TestSamplingParamsVerify(CustomTestCase):
             with self.subTest(grammar=grammar):
                 self._make(**{grammar: value}).verify(self.VOCAB_SIZE)
 
+    def test_n_is_a_positive_integer(self):
+        for value in (0, -1, False, 1.5, "2"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "n must be a positive integer"),
+            ):
+                self._make(n=value)
+
+        for value, expected in ((None, 1), (1, 1), (2, 2)):
+            with self.subTest(value=value):
+                self.assertEqual(self._make(n=value).n, expected)
+
+    def test_stop_values_are_normalized_and_validated(self):
+        valid_values = ((None, []), ("done", ["done"]), (["a", "b"], ["a", "b"]))
+        invalid_values = ("", ["ok", ""], ["ok", 1], 1, ("done",))
+
+        for name in ("stop", "stop_regex"):
+            internal_name = f"{name}_strs"
+            for value, expected in valid_values:
+                with self.subTest(name=name, value=value):
+                    params = self._make(**{name: value})
+                    self.assertEqual(getattr(params, internal_name), expected)
+            for value in invalid_values:
+                with (
+                    self.subTest(name=name, value=value),
+                    self.assertRaises(ValueError),
+                ):
+                    self._make(**{name: value})
+
 
 class TestSamplingParamsNormalize(CustomTestCase):
 
@@ -322,6 +351,22 @@ class TestSamplingParamsNormalize(CustomTestCase):
         else:
             tokenizer.encode.return_value = [1]  # Default: 1 token
         return tokenizer
+
+    def test_malformed_stop_values_fail_before_normalization_effects(self):
+        for internal_name in ("stop_strs", "stop_regex_strs"):
+            with self.subTest(internal_name=internal_name):
+                params = SamplingParams()
+                setattr(params, internal_name, ["valid", 1])
+                tokenizer = self._mock_tokenizer()
+                with (
+                    patch(
+                        "sglang.srt.sampling.sampling_params.get_max_seq_length"
+                    ) as parse_regex,
+                    self.assertRaises(ValueError),
+                ):
+                    params.normalize(tokenizer)
+                tokenizer.encode.assert_not_called()
+                parse_regex.assert_not_called()
 
     def test_none_stop_strs_becomes_empty_list(self):
         """Test that normalize() converts None stop to empty list with max_len=0."""

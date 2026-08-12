@@ -453,11 +453,17 @@ class GenerateReqInput:
             self.parallel_sample_num = 1
             return
         elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
+            self.parallel_sample_num = SamplingParams.normalize_n(
+                self.sampling_params.get("n")
+            )
         else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            self.parallel_sample_num = SamplingParams.normalize_n(
+                self.sampling_params[0].get("n")
+            )
             for sampling_params in self.sampling_params:
-                if self.parallel_sample_num != sampling_params.get("n", 1):
+                if self.parallel_sample_num != SamplingParams.normalize_n(
+                    sampling_params.get("n")
+                ):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
