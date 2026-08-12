@@ -5,10 +5,16 @@ suite when standalone files outnumber the shards, and the shards must agree on
 who runs what without talking to each other.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
+from sglang.multimodal_gen.test import run_suite
 from sglang.multimodal_gen.test.partitioning import PartitionItem, assign_partition
-from sglang.multimodal_gen.test.run_suite import build_local_partition_assignment
+from sglang.multimodal_gen.test.run_suite import (
+    PartitionAssignment,
+    build_local_partition_assignment,
+)
 from sglang.multimodal_gen.test.server.gpu_cases import (
     PARAMETRIZED_CASE_GROUPS,
     STANDALONE_FILES,
@@ -66,3 +72,39 @@ def test_suite_is_fully_scheduled_for_any_shard_count(suite, total_partitions):
     # shards with the parametrized cases instead.
     assert sorted(scheduled_case_ids) == sorted(expected_case_ids)
     assert sorted(scheduled_standalone_files) == sorted(expected_standalone_files)
+
+
+def test_failing_cases_do_not_skip_the_shards_standalone_files(monkeypatch, tmp_path):
+    """Standalone files used to own a shard, so cases could not block them."""
+    standalone_rel = "../single_test_file/test_disagg_server.py"
+    executed_standalone = []
+
+    def fake_run_standalone_file(suite, rel, target_dir, extra_filter=None):
+        executed_standalone.append(rel)
+        key = f"standalone:{rel}"
+        return 0, [key], {key: "pass"}, {"used_fallback_estimate": False}
+
+    monkeypatch.setattr(
+        run_suite, "run_pytest", lambda *a, **k: (1, ["a_case"], {"a_case": "fail"})
+    )
+    monkeypatch.setattr(run_suite, "_run_standalone_file", fake_run_standalone_file)
+    monkeypatch.setattr(
+        run_suite, "_get_parametrized_files_for_case_ids", lambda *a, **k: ["a_file.py"]
+    )
+    monkeypatch.setattr(run_suite, "write_execution_report", lambda **kwargs: "")
+
+    args = SimpleNamespace(
+        suite="2-gpu",
+        partition_id=0,
+        total_partitions=2,
+        filter=None,
+        continue_on_error=False,
+    )
+    exit_code = run_suite._run_partition_assignment(
+        args,
+        tmp_path,
+        PartitionAssignment(case_ids=["a_case"], standalone_files=[standalone_rel]),
+    )
+
+    assert executed_standalone == [standalone_rel]
+    assert exit_code == 1

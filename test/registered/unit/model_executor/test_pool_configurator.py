@@ -678,6 +678,37 @@ class TestDflashDraftKvBudget(unittest.TestCase):
             0,
         )
 
+    def test_dcp_replication_scales_draft_budget(self):
+        """The replicated draft pool spans every DCP virtual location."""
+        draft_kv_per_token = 10_240
+        mr = _make_model_runner()
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=5,
+            dflash_draft_cell_size_per_token=draft_kv_per_token,
+        )
+
+        target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
+        for dcp_size in (1, 8):
+            with self.subTest(dcp_size=dcp_size):
+                # TP=8 makes both topologies valid. The mock deliberately keeps
+                # target geometry fixed so this assertion isolates the draft term.
+                with (
+                    mock_cpu_env(tp_size=8),
+                    get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        create_memory_pool_configurator,
+                    )
+
+                    cfg = create_memory_pool_configurator(mr)
+
+                self.assertEqual(
+                    cfg._cell_size,
+                    target_kv_per_token + draft_kv_per_token * dcp_size,
+                )
+
     def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
         """HybridSWA carried no draft term, so the draft pool fell outside the budget."""
         available = 10_000_000

@@ -179,15 +179,11 @@ def build_local_partition_assignment(
         for case in _get_dynamic_suite_cases(suite)
     ]
     for standalone_file in STANDALONE_FILES.get(suite, []):
-        est_time, used_fallback_estimate = get_standalone_file_est_time(
-            suite, standalone_file
-        )
         items.append(
             PartitionItem(
                 kind="standalone",
                 item_id=standalone_file,
-                est_time=est_time,
-                used_fallback_estimate=used_fallback_estimate,
+                est_time=get_standalone_file_est_time(suite, standalone_file)[0],
             )
         )
 
@@ -196,12 +192,6 @@ def build_local_partition_assignment(
         case_ids=[item.item_id for item in my_items if item.kind == "case"],
         standalone_files=[
             item.item_id for item in my_items if item.kind == "standalone"
-        ],
-        estimated_time=round(sum(item.est_time for item in my_items), 1),
-        missing_standalone_estimates=[
-            item.item_id
-            for item in my_items
-            if item.kind == "standalone" and item.used_fallback_estimate
         ],
     )
 
@@ -561,21 +551,12 @@ def _run_partition_assignment(
         _merge_execution_results(
             executed_cases, case_results, new_executed_cases, new_case_results
         )
+        # A failing case must not swallow this shard's standalone files: they
+        # are separate pytest runs, and they only share a shard because the
+        # shard count is fixed. --continue-on-error still decides whether a
+        # failing standalone file stops the ones queued behind it.
         if exit_code != 0 and overall_exit_code == 0:
             overall_exit_code = exit_code
-        if exit_code != 0 and not args.continue_on_error:
-            write_execution_report(
-                suite=args.suite,
-                partition_id=args.partition_id,
-                total_partitions=args.total_partitions,
-                executed_cases=executed_cases,
-                is_standalone=False,
-                standalone_file=None,
-                case_results=case_results,
-                missing_standalone_estimates=missing_standalone_estimates,
-                standalone_measurements=standalone_measurements,
-            )
-            return overall_exit_code
 
     if assignment.standalone_files:
         standalone_estimate = sum(
