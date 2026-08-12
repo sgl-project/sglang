@@ -1777,9 +1777,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
-        self.is_mrope_enabled = "mrope_section" in rope_config
+        self.is_mrope_enabled = (
+            not self.language_model_only and "mrope_section" in rope_config
+        )
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes if self.visual is not None else []
+        )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
@@ -1935,9 +1939,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
-        self.is_mrope_enabled = "mrope_section" in rope_config
+        self.is_mrope_enabled = (
+            not self.language_model_only and "mrope_section" in rope_config
+        )
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes if self.visual is not None else []
+        )
+
         self.num_fused_shared_experts = 0
         if _use_aiter and not _disable_shared_experts_fusion():
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
@@ -1952,13 +1961,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return module_name.startswith("model.layers.")
 
     def _get_num_fused_shared_experts(self):
-        if not (
-            hasattr(self.model, "layers")
-            and len(self.model.layers) > 0
-            and hasattr(self.model.layers[0].mlp, "num_fused_shared_experts")
-        ):
+        if not hasattr(self.model, "layers"):
             return 0
-        return self.model.layers[0].mlp.num_fused_shared_experts
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            mlp = getattr(self.model.layers[layer_id], "mlp", None)
+            if hasattr(mlp, "num_fused_shared_experts"):
+                return mlp.num_fused_shared_experts
+        return 0
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None

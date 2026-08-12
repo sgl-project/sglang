@@ -741,12 +741,12 @@ class TestIdeogram4(unittest.TestCase):
             ["transformer", "unconditional_transformer"],
         )
 
-    def test_ideogram_attention_backend_is_passed_from_config(self):
+    def test_ideogram_attention_backend_is_declared_by_runtime_model(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         config = Ideogram4DiTConfig()
         self.assertEqual(
-            config.arch_config._supported_attention_backends,
+            Ideogram4Transformer2DModel._supported_attention_backends,
             {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
         )
         prev_args = server_args_module._global_server_args
@@ -763,7 +763,7 @@ class TestIdeogram4(unittest.TestCase):
 
         self.assertEqual(
             model.supported_attention_backends,
-            config.arch_config._supported_attention_backends,
+            Ideogram4Transformer2DModel._supported_attention_backends,
         )
         self.assertEqual(
             model.layers[0].attention.attn.backend,
