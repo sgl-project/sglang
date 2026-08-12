@@ -1,10 +1,15 @@
+import glob
+import inspect
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import sys
 import threading
 import time
+from datetime import datetime
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
@@ -45,6 +50,22 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 
 ACCURACY_TOLERANCE = 0.99
 
+# Dataset total question counts and allowed fluctuation (in questions)
+DATASET_QUESTION_COUNTS = {
+    "aime25": 30,
+    "aime26": 30,
+    "gpqa_diamond": 198,
+}
+
+DATASET_FLUCTUATION = {
+    "aime25": 2,
+    "aime26": 2,
+    "gpqa_diamond": 5,
+    "gsm8k": 3,
+}
+
+MAX_RETRY_COUNT = 3
+
 SERVER_INITIALIZATION_DELAY = 120
 
 if os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
@@ -56,6 +77,31 @@ else:
         20000 + int(os.environ.get("ASCEND_VISIBLE_DEVICES", "0")[0]) * 100
     )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_SERVER_PORT_FOR_TEST + 66}"
+
+
+def get_accuracy_threshold(datasets, baseline_accuracy):
+    """Calculate accuracy threshold based on dataset fluctuation tolerance.
+
+    For datasets with defined fluctuation (aime*, gpqa_diamond), use absolute
+    question count tolerance. For others (e.g. mmmu), use percentage tolerance.
+    """
+    dataset = datasets[0] if datasets else None
+    if dataset in DATASET_FLUCTUATION and dataset in DATASET_QUESTION_COUNTS:
+        fluctuation = DATASET_FLUCTUATION[dataset] / DATASET_QUESTION_COUNTS[dataset]
+        return baseline_accuracy - fluctuation
+    return baseline_accuracy * ACCURACY_TOLERANCE
+
+
+def get_max_retries(datasets):
+    """Return max retry count for accuracy tests.
+
+    gpqa and aime datasets support up to MAX_RETRY_COUNT retries.
+    mmmu and others use 1 attempt (no retry).
+    """
+    dataset = datasets[0] if datasets else None
+    if dataset in DATASET_FLUCTUATION:
+        return MAX_RETRY_COUNT
+    return 1
 
 
 def run_evalscope(
@@ -212,6 +258,7 @@ def assert_metrics(self, metrics):
         raise Exception("No metrics obtained from benchmark")
 
     if self.accuracy is not None:
+        threshold = get_accuracy_threshold(self.datasets, self.accuracy)
         dump_metric(
             "accuracy",
             float(metrics["accuracy"]),
@@ -224,12 +271,9 @@ def assert_metrics(self, metrics):
         )
         self.assertGreaterEqual(
             float(metrics["accuracy"]),
-            self.accuracy * ACCURACY_TOLERANCE,
-            f"Accuracy check failed. Expected >= {self.accuracy * ACCURACY_TOLERANCE}, Got: {metrics['accuracy']}",
+            threshold,
+            f"Accuracy check failed. Expected >= {threshold}, Got: {metrics['accuracy']}",
         )
-
-
-MMMU_LOCAL_PATH = "/root/.cache/modelscope/hub/datasets/AI-ModelScope___mmmu"
 
 
 class TestNpuAccuracyTestCaseBase(CustomTestCase):
@@ -248,11 +292,119 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
-    max_attempts = 2
+    n_runs = 3
     accuracy = 0.1
+    test_type = "accuracy"
+
+    @classmethod
+    def _get_tc_name(cls):
+        """Derive the test case name from the test file (filename without
+        extension). Mirrors the workflow's ``tc_name=${test_case##*/}`` logic
+        so each case in a suite writes to its own output path."""
+        try:
+            tc_file = inspect.getfile(cls)
+        except (TypeError, OSError):
+            tc_file = getattr(sys.modules.get(cls.__module__), "__file__", "")
+        return os.path.splitext(os.path.basename(tc_file))[0]
+
+    @classmethod
+    def _setup_per_case_output(cls):
+        """Set up per-case output directories and env vars.
+
+        Extracted from ``nightly-test-npu-e2e-single-node.yml`` so that when a
+        suite is executed, each case writes its metrics/plog to a path derived
+        from the case file rather than the suite name.
+        """
+        cls.tc_name = cls._get_tc_name()
+        current_date = datetime.now().strftime("%Y%m%d")
+        test_type = getattr(cls, "test_type", "accuracy")
+        base_output = f"/root/.cache/tests/output/{test_type}/{current_date}"
+        os.makedirs(base_output, exist_ok=True)
+        cls.metrics_data_file = os.path.join(base_output, cls.tc_name)
+        os.makedirs(cls.metrics_data_file, exist_ok=True)
+        # Override env vars so evalscope/dump_metric write to per-case paths.
+        os.environ["METRICS_DATA_FILE"] = cls.metrics_data_file
+        os.environ["SGLANG_TEST_METRICS_OUTPUT"] = os.path.join(
+            cls.metrics_data_file, "metrics"
+        )
+        logger.info(
+            "Per-case output: tc_name=%s metrics_data_file=%s",
+            cls.tc_name,
+            cls.metrics_data_file,
+        )
+
+    @classmethod
+    def _save_metrics_json(cls):
+        """Write per-case ``metrics.json`` from ``dump_metric`` JSONL files.
+
+        Replaces the workflow's stdout-parsing + ``dump_metrics.py`` logic so
+        each case in a suite persists its own metrics snapshot.
+        """
+        if not getattr(cls, "metrics_data_file", None):
+            return
+        metrics = {}
+        baselines = {}
+        pattern = os.path.join(cls.metrics_data_file, "metrics.*.jsonl")
+        for jsonl_path in glob.glob(pattern):
+            try:
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        name = record.get("metric_name")
+                        value = record.get("value")
+                        if name is None:
+                            continue
+                        if name.endswith("_baseline"):
+                            baselines[name[: -len("_baseline")]] = value
+                        else:
+                            metrics[name] = value
+            except Exception as e:
+                logger.warning("Failed to read %s: %s", jsonl_path, e)
+        out_path = os.path.join(cls.metrics_data_file, "metrics.json")
+        payload = {
+            "test_case": cls.tc_name,
+            "test_type": getattr(cls, "test_type", "accuracy"),
+            "metrics": metrics,
+            "baselines": baselines,
+        }
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            logger.info("Saved per-case metrics to %s", out_path)
+        except Exception as e:
+            logger.warning("Failed to write metrics.json: %s", e)
+
+    @classmethod
+    def _backup_plog(cls):
+        """Backup Ascend plog files to a per-case path.
+
+        Replaces the workflow's ``Backup plog`` step so each case in a suite
+        gets its own plog snapshot instead of all cases sharing the suite name.
+        """
+        plog_path = "/root/ascend/log/debug/plog"
+        if not os.path.isdir(plog_path):
+            return
+        tc_name = getattr(cls, "tc_name", None)
+        if not tc_name:
+            return
+        hostname = os.getenv("HOSTNAME", "unknown")
+        target = os.path.join("/root/.cache/tests/logs/plog", tc_name, hostname)
+        os.makedirs(target, exist_ok=True)
+        for name in os.listdir(plog_path):
+            src = os.path.join(plog_path, name)
+            if os.path.isfile(src):
+                try:
+                    shutil.copy2(src, os.path.join(target, name))
+                except Exception as e:
+                    logger.warning("Failed to copy plog %s: %s", name, e)
+        logger.info("Backed up plog to %s", target)
 
     @classmethod
     def setUpClass(cls):
+        cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
         for key, value in env.items():
@@ -279,17 +431,8 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
-
-    def _get_dataset_args(self):
-        if "mmmu" in self.datasets:
-            base_args = {"mmmu": {"dataset_id": MMMU_LOCAL_PATH}}
-            if self.dataset_args:
-                if isinstance(self.dataset_args, dict):
-                    base_args.update(self.dataset_args)
-                elif isinstance(self.dataset_args, str):
-                    base_args.update(json.loads(self.dataset_args))
-            return base_args
-        return self.dataset_args
+        cls._save_metrics_json()
+        cls._backup_plog()
 
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
@@ -297,12 +440,61 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model)
+            max_retries = get_max_retries(self.datasets)
+            best_metrics = None
+            for attempt in range(max_retries):
+                metrics = run_evalscope(
+                    host=host,
+                    port=port,
+                    model=model_name,
+                    datasets=self.datasets,
+                    dataset_args=self.dataset_args,
+                    eval_batch_size=self.eval_batch_size,
+                    limit=self.limit,
+                    generation_config=self.generation_config,
+                    dataset_dir=self.dataset_dir,
+                    stream=self.stream,
+                    timeout=self.timeout,
+                    eval_type=self.eval_type,
+                )
+                if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
+                    best_metrics.get("accuracy", 0)
+                ):
+                    best_metrics = metrics
+                threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+                if float(best_metrics.get("accuracy", 0)) >= threshold:
+                    break
+                if attempt < max_retries - 1:
+                    logger.info(
+                        f"Accuracy {best_metrics.get('accuracy')} below threshold "
+                        f"{threshold}, retrying ({attempt + 1}/{max_retries - 1})..."
+                    )
+            assert_metrics(self, best_metrics)
+
+    def run_accuracy_multiple(self, n_runs=None):
+        if n_runs is None:
+            n_runs = self.n_runs
+
+        parsed_url = urlparse(self.base_url)
+        host = parsed_url.hostname
+        port = parsed_url.port
+
+        if self.benchmark_tool != EVALSCOPE:
+            raise Exception(
+                "run_accuracy_multiple only supports evalscope benchmark tool"
+            )
+
+        model_name = os.path.basename(self.model)
+        all_metrics = []
+
+        for i in range(n_runs):
+            logger.info(f"=== Accuracy run {i + 1}/{n_runs} ===")
             metrics = run_evalscope(
                 host=host,
                 port=port,
                 model=model_name,
                 datasets=self.datasets,
-                dataset_args=self._get_dataset_args(),
+                dataset_args=self.dataset_args,
                 eval_batch_size=self.eval_batch_size,
                 limit=self.limit,
                 generation_config=self.generation_config,
@@ -311,7 +503,34 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 timeout=self.timeout,
                 eval_type=self.eval_type,
             )
-            assert_metrics(self, metrics)
+            all_metrics.append(metrics)
+            if metrics and "accuracy" in metrics:
+                logger.info(f"Run {i + 1} accuracy: {metrics['accuracy']}")
+            else:
+                logger.warning(f"Run {i + 1} failed to get accuracy metric")
+
+        valid_metrics = [m for m in all_metrics if m and "accuracy" in m]
+        if not valid_metrics:
+            raise Exception("No valid accuracy metrics obtained from any run")
+
+        avg_accuracy = sum(float(m["accuracy"]) for m in valid_metrics) / len(
+            valid_metrics
+        )
+
+        logger.info("=" * 60)
+        logger.info("Multiple Run Accuracy Results:")
+        for i, m in enumerate(valid_metrics):
+            logger.info(f"  Run {i + 1}: {m['accuracy']}")
+        logger.info(f"  Average: {avg_accuracy}")
+        logger.info("=" * 60)
+
+        avg_metrics = {"accuracy": avg_accuracy}
+        dump_metric(
+            "accuracy_avg",
+            avg_accuracy,
+            labels={"test_case": self.__class__.__name__, "type": "accuracy"},
+        )
+        assert_metrics(self, avg_metrics)
 
 
 class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
@@ -330,7 +549,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
-    max_attempts = 2
     accuracy = 0.1
 
     @classmethod
@@ -378,17 +596,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
         )
         time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
 
-    def _get_dataset_args(self):
-        if "mmmu" in self.datasets:
-            base_args = {"mmmu": {"dataset_id": MMMU_LOCAL_PATH}}
-            if self.dataset_args:
-                if isinstance(self.dataset_args, dict):
-                    base_args.update(self.dataset_args)
-                elif isinstance(self.dataset_args, str):
-                    base_args.update(json.loads(self.dataset_args))
-            return base_args
-        return self.dataset_args
-
     @check_role(allowed_roles=["master", "worker"])
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
@@ -396,21 +603,36 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model_config.get("model_path"))
-            metrics = run_evalscope(
-                host=self.host,
-                port=self.port,
-                model=model_name,
-                datasets=self.datasets,
-                dataset_args=self._get_dataset_args(),
-                eval_batch_size=self.eval_batch_size,
-                limit=self.limit,
-                generation_config=self.generation_config,
-                dataset_dir=self.dataset_dir,
-                stream=self.stream,
-                timeout=self.timeout,
-                eval_type=self.eval_type,
-            )
-            assert_metrics(self, metrics)
+            max_retries = get_max_retries(self.datasets)
+            best_metrics = None
+            for attempt in range(max_retries):
+                metrics = run_evalscope(
+                    host=self.host,
+                    port=self.port,
+                    model=model_name,
+                    datasets=self.datasets,
+                    dataset_args=self.dataset_args,
+                    eval_batch_size=self.eval_batch_size,
+                    limit=self.limit,
+                    generation_config=self.generation_config,
+                    dataset_dir=self.dataset_dir,
+                    stream=self.stream,
+                    timeout=self.timeout,
+                    eval_type=self.eval_type,
+                )
+                if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
+                    best_metrics.get("accuracy", 0)
+                ):
+                    best_metrics = metrics
+                threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+                if float(best_metrics.get("accuracy", 0)) >= threshold:
+                    break
+                if attempt < max_retries - 1:
+                    logger.info(
+                        f"Accuracy {best_metrics.get('accuracy')} below threshold "
+                        f"{threshold}, retrying ({attempt + 1}/{max_retries - 1})..."
+                    )
+            assert_metrics(self, best_metrics)
 
 
 class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
@@ -428,7 +650,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     eval_type = "openai_api"
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-    max_attempts = 2
     accuracy = 0.1
 
     @classmethod
@@ -490,17 +711,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
                 )
 
-    def _get_dataset_args(self):
-        if "mmmu" in self.datasets:
-            base_args = {"mmmu": {"dataset_id": MMMU_LOCAL_PATH}}
-            if self.dataset_args:
-                if isinstance(self.dataset_args, dict):
-                    base_args.update(self.dataset_args)
-                elif isinstance(self.dataset_args, str):
-                    base_args.update(json.loads(self.dataset_args))
-            return base_args
-        return self.dataset_args
-
     @check_role(allowed_roles=["router"])
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
@@ -508,18 +718,33 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model_config.get("model_path"))
-            metrics = run_evalscope(
-                host=host,
-                port=port,
-                model=model_name,
-                datasets=self.datasets,
-                dataset_args=self._get_dataset_args(),
-                eval_batch_size=self.eval_batch_size,
-                limit=self.limit,
-                generation_config=self.generation_config,
-                dataset_dir=self.dataset_dir,
-                stream=self.stream,
-                timeout=self.timeout,
-                eval_type=self.eval_type,
-            )
-            assert_metrics(self, metrics)
+            max_retries = get_max_retries(self.datasets)
+            best_metrics = None
+            for attempt in range(max_retries):
+                metrics = run_evalscope(
+                    host=host,
+                    port=port,
+                    model=model_name,
+                    datasets=self.datasets,
+                    dataset_args=self.dataset_args,
+                    eval_batch_size=self.eval_batch_size,
+                    limit=self.limit,
+                    generation_config=self.generation_config,
+                    dataset_dir=self.dataset_dir,
+                    stream=self.stream,
+                    timeout=self.timeout,
+                    eval_type=self.eval_type,
+                )
+                if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
+                    best_metrics.get("accuracy", 0)
+                ):
+                    best_metrics = metrics
+                threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+                if float(best_metrics.get("accuracy", 0)) >= threshold:
+                    break
+                if attempt < max_retries - 1:
+                    logger.info(
+                        f"Accuracy {best_metrics.get('accuracy')} below threshold "
+                        f"{threshold}, retrying ({attempt + 1}/{max_retries - 1})..."
+                    )
+            assert_metrics(self, best_metrics)

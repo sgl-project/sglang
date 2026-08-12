@@ -1,0 +1,65 @@
+[package]
+name = "sglang-mm"
+description = "Rust-accelerated multimodal preprocessing for SGLang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Consumed by python/setup.py: registers this crate as a PyO3 extension module
+# of the main sglang wheel at the given import path. debug = false keeps
+# editable installs on release builds (image preprocessing is perf-sensitive).
+# features: the wheel build needs the PyO3 bindings, which are NOT default (see
+# [features] below).
+[package.metadata.sglang]
+python-module = "sglang.srt.multimodal._core"
+debug = false
+features = ["python", "parallel"]
+
+[lib]
+# Unique per-crate artifact name (the shared workspace target/ dir cannot hold
+# two `lib_core` cdylibs). The importable Python module is still `_core`: the
+# name comes from the `#[pymodule]` entry point and the setuptools-rust
+# `target` in python/pyproject.toml, which renames the built artifact.
+name = "sglang_mm_core"
+# cdylib: the PyO3 module (`sglang.srt.multimodal._core`).
+# rlib:   pure-Rust core linked by sglang-server's native MM path.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Both features are deliberately NOT default: cargo unifies a package's
+# features across everything selected in one invocation, so anything default-on
+# here would leak back into sglang-server's copy of this crate under
+# `cargo build --workspace` even though the server depends on it with
+# `default-features = false`. Opting in explicitly keeps the pure-Rust core
+# pure no matter how the workspace is built; the wheel asks for both via
+# `[package.metadata.sglang] features` above.
+default = []
+# Every PyO3 binding.
+python = ["dep:pyo3", "dep:numpy"]
+# Fan work out onto crate-owned rayon pools (see `common::par`). Off for the
+# rlib: sglang-server provides concurrency across requests and owns its core
+# budget, so preprocessing runs inline on the calling thread and rayon is not
+# linked at all. Orthogonal to `python` so both shapes stay testable.
+parallel = ["dep:rayon"]
+
+[dependencies]
+pyo3 = { workspace = true, optional = true }
+numpy = { version = "0.29", optional = true }
+
+base64 = "0.22"
+blake3 = "1"
+half = "2.4"
+# The formats the Python (PIL) path commonly accepts; all pure-Rust decoders.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+    "gif",
+    "bmp",
+] }
+rayon = { version = "1.10", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Native media fetch (stage 1 of the server MM pipeline); rustls so the
+# extension never links the system OpenSSL.
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }

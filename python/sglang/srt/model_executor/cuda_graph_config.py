@@ -16,7 +16,7 @@ cuda_graph_config, and the --cuda-graph-config JSON CLI parser.
 
 Module-level imports are pure stdlib — no torch / sglang.srt deps — so
 ServerArgs can import everything here without pulling in backend
-classes. check_cuda_graph_backend lazy-imports get_global_server_args
+classes. check_cuda_graph_backend lazy-imports the config accessor
 inside the function body to preserve that invariant.
 """
 
@@ -52,20 +52,35 @@ ALLOWED_BACKENDS_PER_PHASE = {
         Backend.TC_PIECEWISE,
         Backend.DISABLED,
     ),
-    # full is rejected for prefill — full CUDA graph capture only
-    # fits fixed-shape and prefill is variable-shape. Use breakable
-    # or tc_piecewise for prefill.
-    Phase.PREFILL: (Backend.BREAKABLE, Backend.TC_PIECEWISE, Backend.DISABLED),
+    # full for prefill captures one whole-forward graph per num_tokens
+    # bucket with a fixed request-slot count; replay pads num_tokens up to
+    # the nearest captured bucket. Opt-in: the padding waste is the
+    # operator's call.
+    Phase.PREFILL: (
+        Backend.FULL,
+        Backend.BREAKABLE,
+        Backend.TC_PIECEWISE,
+        Backend.DISABLED,
+    ),
 }
 
 # Per-phase settings schema. Keys other than backend are runner-level
 # (read by any backend in that phase); tc_compiler is the lone
 # backend-specific knob (only meaningful when backend == tc_piecewise).
-# For prefill, bs carries the captured shape size (token count for
-# tc_piecewise, request count for breakable) — one shape knob per phase.
+# For prefill, bs carries aggregate-token capture buckets for every backend;
+# full_prefill_max_req separately controls Full's fixed request-slot count.
+# full_prefill_max_req and full_prefill_prefix_chunk_tokens are prefill-only and
+# only meaningful when backend == full.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
-    Phase.PREFILL: ("backend", "max_bs", "bs", "tc_compiler"),
+    Phase.PREFILL: (
+        "backend",
+        "max_bs",
+        "bs",
+        "tc_compiler",
+        "full_prefill_max_req",
+        "full_prefill_prefix_chunk_tokens",
+    ),
 }
 
 
@@ -78,6 +93,30 @@ class PhaseConfig:
     bs: Optional[List[int]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
+    # Only meaningful for the prefill phase with backend == full: max number of
+    # request slots baked into each captured graph. Real bs <= full_prefill_max_req
+    # reuses the graph (unused slots become zero-length sentinels); larger
+    # batches fall back to eager. Ignored by BCG and TC_PIECEWISE. None
+    # auto-derives chunked_prefill_size // 512.
+    full_prefill_max_req: Optional[int] = None
+    # Only meaningful for Full prefill CUDA graphs that capture a distinct
+    # cached-prefix topology: aggregate cached-prefix tokens represented by one
+    # fixed-capacity chunk across all request slots. FullCG captures 1/2/4/8/16
+    # chunk variants and chooses the smallest one covering a batch. None uses
+    # the scheduler's aggregate chunked_prefill_size token budget.
+    full_prefill_prefix_chunk_tokens: Optional[int] = None
+
+
+def default_prefill_backend() -> str:
+    """BCG (breakable) is the prefill default on CUDA only; other platforms
+    (HIP/NPU/...) keep tc_piecewise until BCG is validated there. Full-graph
+    prefill capture is opt-in per model architecture via the declarative
+    registry (see _inkling_overrides in arg_groups/overrides.py), not a global
+    default. Lazy import keeps this module's stdlib-only import invariant (see
+    module docstring)."""
+    from sglang.srt.utils import is_cuda
+
+    return Backend.BREAKABLE if is_cuda() else Backend.TC_PIECEWISE
 
 
 @dataclass
@@ -88,7 +127,7 @@ class CudaGraphConfig:
         default_factory=lambda: PhaseConfig(backend=Backend.FULL)
     )
     prefill: PhaseConfig = field(
-        default_factory=lambda: PhaseConfig(backend=Backend.TC_PIECEWISE)
+        default_factory=lambda: PhaseConfig(backend=default_prefill_backend())
     )
 
     def __getitem__(self, phase: str) -> PhaseConfig:
@@ -141,15 +180,14 @@ def _diff_phase(actual: PhaseConfig, baseline: PhaseConfig) -> Dict[str, Any]:
 
 def check_cuda_graph_backend(phase: str, backend: str) -> bool:
     """True if cuda_graph_config[phase].backend == backend on the
-    global server args. Returns False if the global server args have not
-    been initialized yet (e.g. unit tests, early startup)."""
-    from sglang.srt.server_args import get_global_server_args
+    published config. Returns False if the config has not been published
+    yet (e.g. unit tests, early startup)."""
+    from sglang.srt.runtime_context import get_exec
 
     try:
-        server_args = get_global_server_args()
+        cfg = get_exec().graph.cuda_graph_config
     except ValueError:
         return False
-    cfg = server_args.cuda_graph_config
     if cfg is None or phase not in Phase.ALL:
         return False
     return getattr(cfg, phase).backend == backend

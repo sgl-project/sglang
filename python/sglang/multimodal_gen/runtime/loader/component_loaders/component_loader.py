@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     component_name_to_loader_cls,
     get_memory_usage_of_component,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+    is_fsdp_managed_module,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
     is_layerwise_offloaded_module,
@@ -92,10 +95,14 @@ class ComponentLoader(ABC):
         self.component_architecture: str | None = None
 
     def should_offload(
-        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+        self,
+        server_args: ServerArgs,
+        model_config: ModelConfig | None = None,
+        component_name: str | None = None,
     ):
-        # not offload by default
-        return False
+        return component_name is not None and server_args.should_cpu_offload_component(
+            component_name
+        )
 
     def target_device(self, should_offload):
         if should_offload:
@@ -113,9 +120,12 @@ class ComponentLoader(ABC):
         return {}
 
     def should_raise_customized_load_error(
-        self, _server_args: ServerArgs, _component_name: str
+        self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        return False
+        native_only_components = getattr(
+            server_args.pipeline_config, "native_only_components", ()
+        )
+        return component_name in native_only_components
 
     @staticmethod
     def _is_component_set_as_layerwise_load(
@@ -173,6 +183,49 @@ class ComponentLoader(ABC):
             return component
         return component.to(get_local_torch_device())
 
+    def _load_customized_with_context(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        attn_backend: Any,
+        component_attn_name: str | None,
+    ) -> AutoModel:
+        with component_attn_backend_context_manager(
+            attn_backend, component_name=component_attn_name
+        ):
+            load_kwargs = self.customized_load_kwargs_for_component(
+                server_args, component_name
+            )
+            component = self.load_customized(
+                component_model_path, server_args, component_name, **load_kwargs
+            )
+            return self._maybe_configure_layerwise_after_startup_cpu_staging(
+                component, server_args, component_name, load_kwargs
+            )
+
+    def _load_native_with_context(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        transformers_or_diffusers: str,
+        attn_backend: Any,
+        component_attn_name: str | None,
+    ) -> AutoModel:
+        with component_attn_backend_context_manager(
+            attn_backend, component_name=component_attn_name
+        ):
+            component = self.load_native(
+                component_model_path,
+                server_args,
+                transformers_or_diffusers,
+                component_name,
+            )
+        should_offload = self.should_offload(server_args, component_name=component_name)
+        target_device = self.target_device(should_offload)
+        return component.to(device=target_device)
+
     def load(
         self,
         component_model_path: str,
@@ -209,19 +262,13 @@ class ComponentLoader(ABC):
                     matched_backend_key,
                 )
         try:
-            with component_attn_backend_context_manager(
-                attn_backend, component_name=component_attn_name
-            ):
-                load_kwargs = self.customized_load_kwargs_for_component(
-                    server_args, component_name
-                )
-                component = self.load_customized(
-                    component_model_path, server_args, component_name, **load_kwargs
-                )
-                # configure layerwise to make enough VRAM headroom
-                component = self._maybe_configure_layerwise_after_startup_cpu_staging(
-                    component, server_args, component_name, load_kwargs
-                )
+            component = self._load_customized_with_context(
+                component_model_path,
+                server_args,
+                component_name,
+                attn_backend,
+                component_attn_name,
+            )
             source = "sgl-diffusion"
         except Exception as e:
             if self.should_raise_customized_load_error(server_args, component_name):
@@ -240,18 +287,14 @@ class ComponentLoader(ABC):
                     f"Error while loading customized {component_name}, falling back to native version"
                 )
             # fallback to native version
-            with component_attn_backend_context_manager(
-                attn_backend, component_name=component_attn_name
-            ):
-                component = self.load_native(
-                    component_model_path,
-                    server_args,
-                    transformers_or_diffusers,
-                    component_name,
-                )
-            should_offload = self.should_offload(server_args)
-            target_device = self.target_device(should_offload)
-            component = component.to(device=target_device)
+            component = self._load_native_with_context(
+                component_model_path,
+                server_args,
+                component_name,
+                transformers_or_diffusers,
+                attn_backend,
+                component_attn_name,
+            )
             source = "native"
             logger.warning(
                 "Native component %s: %s is loaded, performance may be sub-optimal",
@@ -265,6 +308,12 @@ class ComponentLoader(ABC):
         else:
             if isinstance(component, nn.Module):
                 component = component.eval()
+                if (
+                    server_args.cpu_offload_components is not None
+                    and server_args.should_cpu_offload_component(component_name)
+                    and not is_fsdp_managed_module(component)
+                ):
+                    component = component.to("cpu")
             current_gpu_mem = current_platform.get_available_gpu_memory()
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem
@@ -386,6 +435,9 @@ class ComponentLoader(ABC):
         ):
             transformers_or_diffusers = "diffusers"
 
+        if transformers_or_diffusers.startswith("lingbot_video"):
+            transformers_or_diffusers = "diffusers"
+
         return transformers_or_diffusers
 
     @classmethod
@@ -441,7 +493,9 @@ class ImageProcessorLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
-        return AutoImageProcessor.from_pretrained(component_model_path, use_fast=True)
+        return AutoImageProcessor.from_pretrained(
+            component_model_path, backend="torchvision"
+        )
 
 
 class AutoProcessorLoader(ComponentLoader):

@@ -19,6 +19,7 @@ from transformers import Lfm2VlConfig as HFLfm2VlConfig
 from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.get_logger(__name__)
 
@@ -65,7 +66,6 @@ class Lfm2VlConfig(HFLfm2VlConfig):
         LFM2 uses ShortConv layers with a small fixed-size cache (kernel_size - 1).
         Unlike full Mamba2 models, LFM2 only uses the conv state, not SSM temporal state.
         """
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         conv_layer_ids = self.linear_layer_ids
         if not conv_layer_ids:
@@ -75,9 +75,9 @@ class Lfm2VlConfig(HFLfm2VlConfig):
         # conv_L_cache in config is kernel_size (e.g., 3)
         conv_kernel = int(self.text_config.conv_L_cache)
 
-        # get_attention_tp_size() requires initialization, default to 1 if not available
+        # get_parallel().attn_tp_size requires initialization, default to 1 if not available
         try:
-            tp_size = get_attention_tp_size()
+            tp_size = get_parallel().attn_tp_size
         except (AssertionError, RuntimeError):
             tp_size = 1
 

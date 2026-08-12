@@ -45,10 +45,10 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
     def test_cli_name_differs_from_field_name(self):
         """cli_name maps a different CLI flag to the dataclass field via dest."""
         sa = self._parse(
-            ["--fp8-gemm-backend", "triton", "--fp4-gemm-backend", "cutlass"]
+            ["--fp8-gemm-backend", "triton", "--fp4-gemm-backend", "marlin"]
         )
         self.assertEqual(sa.fp8_gemm_runner_backend, "triton")
-        self.assertEqual(sa.fp4_gemm_runner_backend, "cutlass")
+        self.assertEqual(sa.fp4_gemm_runner_backend, "marlin")
 
     def test_nargs_question_with_const(self):
         """nargs='?' + const='' for --model-checksum."""
@@ -86,6 +86,12 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         )
         self.assertEqual(sa.deepep_mode, "low_latency")
         self.assertEqual(sa.elastic_ep_backend, "none")
+
+    def test_image_processor_backend_choices(self):
+        for backend in ("auto", "torchvision", "pil"):
+            with self.subTest(backend=backend):
+                sa = self._parse(["--image-processor-backend", backend])
+                self.assertEqual(sa.image_processor_backend, backend)
 
     def test_deprecated_flags_still_work(self):
         """Deprecated flags set the correct dest field."""

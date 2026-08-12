@@ -18,11 +18,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 if current_platform.is_cuda():
-    from sglang.jit_kernel.diffusion.causal_conv3d_cat_pad import (
+    from sglang.kernels.ops.diffusion.causal_conv3d_cat_pad import (
         can_use_fused_causal_conv3d_cat_pad_cuda,
         fused_causal_conv3d_cat_pad_cuda,
     )
-    from sglang.jit_kernel.diffusion.triton.causal_conv3d_pad import (
+    from sglang.kernels.ops.diffusion.triton.causal_conv3d_pad import (
         fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
     )
 else:
@@ -108,6 +108,8 @@ def _can_fuse_causal_conv3d_cat_pad(
     padding: list[int],
 ) -> bool:
     if cache_x is None or fused_causal_conv3d_cat_pad is None:
+        return False
+    if not current_platform.is_cuda():
         return False
     if not x.is_cuda or not x.is_contiguous() or not cache_x.is_contiguous():
         return False

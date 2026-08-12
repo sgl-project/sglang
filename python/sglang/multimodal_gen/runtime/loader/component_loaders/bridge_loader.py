@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -73,33 +74,40 @@ class BridgeLoader(ComponentLoader):
             default_dtype,
         )
 
+        component_cpu_offload = server_args.should_cpu_offload_component(component_name)
+
         # Use the FSDP loader when FSDP is requested or shard rules are declared.
         fsdp_shard_conditions = getattr(model_cls, "_fsdp_shard_conditions", None)
         if server_args.use_fsdp_inference or (
             server_args.hsdp_shard_dim is not None and fsdp_shard_conditions
         ):
+            local_torch_device = get_local_torch_device()
             # Load with FSDP support
             model = maybe_load_fsdp_model(
                 model_cls=model_cls,
                 init_params={"config": bridge_config, "hf_config": hf_config},
                 weight_dir_list=safetensors_list,
-                device=get_local_torch_device(),
+                device=local_torch_device,
                 hsdp_replicate_dim=server_args.hsdp_replicate_dim,
                 hsdp_shard_dim=server_args.hsdp_shard_dim,
-                cpu_offload=server_args.dit_cpu_offload,
+                cpu_offload=component_cpu_offload,
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 fsdp_inference=server_args.use_fsdp_inference,
                 param_dtype=default_dtype,
                 reduce_dtype=torch.float32,
                 output_dtype=None,
                 strict=False,
+                weight_load_plan=WeightLoadPlan(
+                    checkpoint_load_device=local_torch_device
+                ),
             )
         else:
             # Fallback to simple loading (for non-FSDP or legacy models)
             model = model_cls.from_pretrained(
                 component_model_path, torch_dtype=default_dtype
             )
-            model = model.to(device=get_local_torch_device(), dtype=default_dtype)
+            target_device = self.target_device(component_cpu_offload)
+            model = model.to(device=target_device, dtype=default_dtype)
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded bridge model with %.2fM parameters", total_params / 1e6)

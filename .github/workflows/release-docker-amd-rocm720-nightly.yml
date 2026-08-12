@@ -134,7 +134,7 @@ jobs:
   # of publish failed; legs without an artifact will fail at download and be
   # the only ones marked red.
   push_local_registry:
-    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish') }}
+    if: ${{ false }}
     runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish
@@ -167,7 +167,7 @@ jobs:
       - name: Mirror rocm/sgl-dev to local registry
         run: |
           src="rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          dst="10.245.143.50:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
+          dst="10.44.14.109:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
           docker pull "${src}"
           docker tag "${src}" "${dst}"
           docker push "${dst}"

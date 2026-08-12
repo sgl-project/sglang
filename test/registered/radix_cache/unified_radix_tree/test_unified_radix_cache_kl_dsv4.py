@@ -19,9 +19,10 @@ from sglang.test.test_utils import (
 )
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
+DSV4_DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=1000, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=1500, stage="extra-b", runner_config="4-gpu-h100")
 
 
 def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
@@ -68,7 +69,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
             "--chunked-prefill-size",
             "8192",
             "--mem-fraction-static",
-            "0.9",
+            "0.92",
             "--disable-shared-experts-fusion",
             "--enable-hierarchical-cache",
             "--hicache-ratio",
@@ -112,7 +113,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
 class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
     TestUnifiedDeepSeekV4FlashHiCache
 ):
-    """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
+    """DeepSeek V4 Flash HiCache layout check: page_first_direct + direct."""
 
     hicache_io_backend = "kernel"
     hicache_mem_layout = "layer_first"
@@ -126,6 +127,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
 
     l3_prefetch_page_size = 256
     l3_prefetch_prompt_pages = 4
+    max_running_requests = 4
 
     @classmethod
     def setUpClass(cls):
@@ -147,7 +149,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--chunked-prefill-size",
                 "8192",
                 "--mem-fraction-static",
-                "0.9",
+                "0.92",
                 "--disable-shared-experts-fusion",
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",
@@ -164,6 +166,8 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "file",
                 "--swa-full-tokens-ratio",
                 "0.25",
+                "--max-running-requests",
+                str(cls.max_running_requests),
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
@@ -325,6 +329,65 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
             f"Expected EAGLE request to load KV from HiCache file storage, got {cached_details=}",
         )
         self.assertEqual(cached_details.get("storage_backend"), "HiCacheFile")
+
+
+class TestUnifiedDeepSeekV4FlashDSparkHiCacheL3(
+    TestUnifiedDeepSeekV4FlashEagleHiCacheL3
+):
+    """DeepSeek V4 Flash DSpark + HiCache L3 should load from storage."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DSV4_DSPARK_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.hicache_dir = tempfile.mkdtemp(prefix="hicache_l3_dspark_dsv4_")
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DSV4_FLASH_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp-size",
+                "4",
+                "--attention-backend",
+                "compressed",
+                "--page-size",
+                str(cls.page_size),
+                "--chunked-prefill-size",
+                "8192",
+                "--mem-fraction-static",
+                "0.95",
+                "--disable-shared-experts-fusion",
+                "--enable-hierarchical-cache",
+                "--hicache-ratio",
+                "2",
+                "--hicache-write-policy",
+                "write_through",
+                "--hicache-storage-prefetch-policy",
+                "wait_complete",
+                "--hicache-io-backend",
+                "kernel",
+                "--hicache-mem-layout",
+                "page_first",
+                "--hicache-storage-backend",
+                "file",
+                "--enable-cache-report",
+                "--swa-full-tokens-ratio",
+                "0.25",
+                "--max-total-tokens",
+                "20000",
+                "--max-running-requests",
+                "4",
+                "--moe-runner-backend",
+                "marlin",
+                "--speculative-algorithm",
+                "DSPARK",
+            ],
+            env={
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -5,24 +5,19 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_zimage_layer
 from sglang.multimodal_gen.runtime.distributed import (
-    get_sp_parallel_rank,
     get_sp_world_size,
     get_tp_world_size,
-    sequence_model_parallel_all_gather,
-)
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_ring_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
-    UlyssesAttention,
     USPAttention,
+    build_varlen_mask_meta_from_lengths,
+    build_varlen_mask_meta_from_ranges,
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import (
-    RMSNorm,
     apply_qk_norm_with_optional_rope,
-    apply_rmsnorm_tanh_mul_add,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -47,6 +42,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -60,12 +58,103 @@ ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 
 
-class SelectFirstElement(nn.Module):
-    def __init__(self):
-        super().__init__()
+class ZImageRMSNorm(nn.Module):
+    """RMSNorm that preserves Z-Image's native bf16 behavior.
 
-    def forward(self, x):
-        return x[0]
+    Z-Image does not upcast hidden states to fp32 for RMSNorm.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.variance_epsilon = eps
+        self.hidden_size = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        output = x * torch.rsqrt(
+            x.pow(2).mean(dim=-1, keepdim=True) + self.variance_epsilon
+        )
+        output = output * self.weight.to(device=x.device, dtype=x.dtype)
+        return output.to(orig_dtype)
+
+
+def zimage_rmsnorm_tanh_mul_add(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    norm: ZImageRMSNorm,
+    enable_fused: bool = True,
+) -> torch.Tensor:
+    if enable_fused:
+        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
+            rmsnorm_tanh_residual,
+        )
+
+        y = rmsnorm_tanh_residual(
+            x,
+            gate,
+            residual,
+            norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
+            norm.variance_epsilon,
+        )
+        if y is not None:
+            return y
+    return residual + torch.tanh(gate) * norm(x)
+
+
+def zimage_rmsnorm_scale(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    norm: ZImageRMSNorm,
+    enable_fused: bool = True,
+) -> torch.Tensor:
+    if enable_fused:
+        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
+            rmsnorm_scale,
+        )
+
+        y = rmsnorm_scale(
+            x,
+            norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
+            scale,
+            norm.variance_epsilon,
+        )
+        if y is not None:
+            return y
+    return norm(x) * scale
+
+
+def zimage_native_qk_rmsnorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    norm_q: ZImageRMSNorm,
+    norm_k: ZImageRMSNorm,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Fused per-head ZImageRMSNorm for q/k, bit-exact vs the eager fallback.
+
+    Replaces `apply_qk_norm`'s eager chain (`q_norm(q.reshape(-1, head_dim))`)
+    with one Triton launch per tensor that reads the strided fused-qkv slices
+    directly. Returns contiguous (q, k) or None when unsupported.
+    """
+    from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
+        can_use_qk_rmsnorm_native,
+        zimage_qk_rmsnorm_native,
+    )
+
+    q_weight = norm_q.weight.data
+    k_weight = norm_k.weight.data
+    if not (
+        can_use_qk_rmsnorm_native(q, q_weight, head_dim)
+        and can_use_qk_rmsnorm_native(k, k_weight, head_dim)
+    ):
+        return None
+    q_out = zimage_qk_rmsnorm_native(q, q_weight, norm_q.variance_epsilon)
+    k_out = zimage_qk_rmsnorm_native(k, k_weight, norm_k.variance_epsilon)
+    if q_out is None or k_out is None:
+        return None
+    return q_out, k_out
 
 
 class TimestepEmbedder(nn.Module):
@@ -167,6 +256,7 @@ class ZImageAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
+        self.enable_zimage_qk_fusion = quant_config is None
 
         tp_size = get_tp_world_size()
         assert (
@@ -217,8 +307,8 @@ class ZImageAttention(nn.Module):
             )
 
         if self.qk_norm:
-            self.norm_q = RMSNorm(self.head_dim, eps=eps)
-            self.norm_k = RMSNorm(self.head_dim, eps=eps)
+            self.norm_q = ZImageRMSNorm(self.head_dim, eps=eps)
+            self.norm_k = ZImageRMSNorm(self.head_dim, eps=eps)
         else:
             self.norm_q = None
             self.norm_k = None
@@ -244,22 +334,28 @@ class ZImageAttention(nn.Module):
             softmax_scale=None,
             causal=False,
         )
-        self.ulysses_attn = UlyssesAttention(
-            num_heads=self.local_num_heads,
-            head_size=self.head_dim,
-            num_kv_heads=self.local_num_kv_heads,
-            softmax_scale=None,
-            causal=False,
-        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        rope_cos_sin_cache: Optional[torch.Tensor] = None,
+        rope_positions: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask_meta: Optional[dict] = None,
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
         skip_sequence_parallel_override: bool = False,
     ):
+        # The fused native qk-norm kernel reads the strided fused-qkv slices
+        # directly and writes contiguous outputs, so q/k materialization is
+        # deferred to it on the main (rope-cache) path.
+        try_native_qk_norm = (
+            self.qk_norm
+            and rope_cos_sin_cache is not None
+            and self.enable_zimage_qk_fusion
+            and not torch.compiler.is_compiling()
+        )
         if self.use_fused_qkv:
             qkv, _ = self.to_qkv(hidden_states)
             q, k, v = qkv.split(
@@ -270,8 +366,9 @@ class ZImageAttention(nn.Module):
                 ],
                 dim=-1,
             )
-            q = q.contiguous()
-            k = k.contiguous()
+            if not try_native_qk_norm:
+                q = q.contiguous()
+                k = k.contiguous()
             v = v.contiguous()
         else:
             q, _ = self.to_q(hidden_states)
@@ -281,9 +378,78 @@ class ZImageAttention(nn.Module):
         k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
         v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
 
-        if freqs_cis is not None:
+        if rope_cos_sin_cache is not None:
+            if self.qk_norm:
+                fused_qk = None
+                if try_native_qk_norm:
+                    fused_qk = zimage_native_qk_rmsnorm(
+                        q, k, self.norm_q, self.norm_k, self.head_dim
+                    )
+                if fused_qk is not None:
+                    q, k = fused_qk
+                    # positions=None is handled identically to the eager
+                    # fallback (arange over seqlen, repeated across batch).
+                    q, k = apply_flashinfer_rope_qk_inplace(
+                        q,
+                        k,
+                        rope_cos_sin_cache,
+                        head_size=self.head_dim,
+                        is_neox=False,
+                        positions=rope_positions,
+                    )
+                else:
+                    q = q.contiguous()
+                    k = k.contiguous()
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        cos_sin_cache=rope_cos_sin_cache,
+                        is_neox=False,
+                        positions=rope_positions,
+                        allow_inplace=False,
+                    )
+            else:
+                q, k = apply_flashinfer_rope_qk_inplace(
+                    q,
+                    k,
+                    rope_cos_sin_cache,
+                    is_neox=False,
+                    positions=rope_positions,
+                )
+        elif freqs_cis is not None:
             cos, sin = freqs_cis
-            if _is_cuda and q.shape == k.shape:
+            if cos.dim() == 3:
+                batch_size, seq_len = q.shape[:2]
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                ).reshape(batch_size * seq_len, -1)
+                positions = torch.arange(
+                    batch_size * seq_len, device=q.device, dtype=torch.long
+                )
+                if self.qk_norm:
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        cos_sin_cache=cos_sin_cache,
+                        is_neox=False,
+                        positions=positions,
+                        allow_inplace=self.enable_zimage_qk_fusion,
+                    )
+                else:
+                    q, k = apply_flashinfer_rope_qk_inplace(
+                        q, k, cos_sin_cache, is_neox=False, positions=positions
+                    )
+            elif _is_cuda and q.shape == k.shape:
                 cos_sin_cache = torch.cat(
                     [
                         cos.to(dtype=torch.float32).contiguous(),
@@ -300,7 +466,7 @@ class ZImageAttention(nn.Module):
                         head_dim=self.head_dim,
                         cos_sin_cache=cos_sin_cache,
                         is_neox=False,
-                        allow_inplace=True,
+                        allow_inplace=self.enable_zimage_qk_fusion,
                     )
                 else:
                     q, k = apply_flashinfer_rope_qk_inplace(
@@ -314,7 +480,7 @@ class ZImageAttention(nn.Module):
                         q_norm=self.norm_q,
                         k_norm=self.norm_k,
                         head_dim=self.head_dim,
-                        allow_inplace=True,
+                        allow_inplace=self.enable_zimage_qk_fusion,
                     )
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
@@ -325,46 +491,19 @@ class ZImageAttention(nn.Module):
                 q_norm=self.norm_q,
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
-                allow_inplace=True,
+                allow_inplace=self.enable_zimage_qk_fusion,
             )
 
-        if (
-            num_replicated_suffix > 0
-            and get_sp_world_size() > 1
-            and get_ring_parallel_world_size() == 1
-        ):
-            # the cap (last num_replicated_suffix tokens), as condition, should be replicated
-            q_shard, q_rep = (
-                q[:, :-num_replicated_suffix],
-                q[:, -num_replicated_suffix:],
-            )
-            k_shard, k_rep = (
-                k[:, :-num_replicated_suffix],
-                k[:, -num_replicated_suffix:],
-            )
-            v_shard, v_rep = (
-                v[:, :-num_replicated_suffix],
-                v[:, -num_replicated_suffix:],
-            )
-            hidden_states, hidden_states_rep = self.ulysses_attn(
-                q_shard,
-                k_shard,
-                v_shard,
-                replicated_q=q_rep,
-                replicated_k=k_rep,
-                replicated_v=v_rep,
-            )
-            assert hidden_states_rep is not None
-            hidden_states = torch.cat([hidden_states, hidden_states_rep], dim=1)
-        else:
-            hidden_states = self.attn(
-                q,
-                k,
-                v,
-                num_replicated_prefix=num_replicated_prefix,
-                num_replicated_suffix=num_replicated_suffix,
-                skip_sequence_parallel_override=skip_sequence_parallel_override,
-            )
+        hidden_states = self.attn(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
+            num_replicated_suffix=num_replicated_suffix,
+            skip_sequence_parallel_override=skip_sequence_parallel_override,
+        )
         hidden_states = hidden_states.flatten(2)
 
         hidden_states, _ = self.to_out[0](hidden_states)
@@ -390,6 +529,7 @@ class ZImageTransformerBlock(nn.Module):
         self.head_dim = dim // n_heads
         self.layer_id = layer_id
         self.modulation = modulation
+        self.enable_zimage_native_norm_fusion = quant_config is None
 
         self.attention = ZImageAttention(
             dim=dim,
@@ -438,11 +578,11 @@ class ZImageTransformerBlock(nn.Module):
                 prefix=f"{prefix}.feed_forward",
             )
 
-        self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
+        self.attention_norm1 = ZImageRMSNorm(dim, eps=norm_eps)
+        self.ffn_norm1 = ZImageRMSNorm(dim, eps=norm_eps)
 
-        self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
+        self.attention_norm2 = ZImageRMSNorm(dim, eps=norm_eps)
+        self.ffn_norm2 = ZImageRMSNorm(dim, eps=norm_eps)
 
         if modulation:
             self.adaLN_modulation = nn.Sequential(
@@ -454,6 +594,10 @@ class ZImageTransformerBlock(nn.Module):
         x: torch.Tensor,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         adaln_input: Optional[torch.Tensor] = None,
+        rope_cos_sin_cache: Optional[torch.Tensor] = None,
+        rope_positions: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask_meta: Optional[dict] = None,
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
         skip_sequence_parallel_override: bool = False,
@@ -468,51 +612,54 @@ class ZImageTransformerBlock(nn.Module):
 
             # Attention block
             attn_out = self.attention(
-                self.attention_norm1(x) * scale_msa,
+                zimage_rmsnorm_scale(
+                    x,
+                    scale_msa,
+                    self.attention_norm1,
+                    self.enable_zimage_native_norm_fusion,
+                ),
                 freqs_cis=freqs_cis,
+                rope_cos_sin_cache=rope_cos_sin_cache,
+                rope_positions=rope_positions,
+                attn_mask=attn_mask,
+                attn_mask_meta=attn_mask_meta,
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
                 skip_sequence_parallel_override=skip_sequence_parallel_override,
             )
-            if (
-                _is_cuda
-                and attn_out.is_cuda
-                and attn_out.shape[-1] % 256 == 0
-                and attn_out.shape[-1] <= 8192
-                and self.attention_norm2.variance_epsilon
-                == self.ffn_norm1.variance_epsilon
-            ):
-                from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
-                    fused_norm_tanh_mul_add_norm_scale,
-                )
-
-                x, ffn_in = fused_norm_tanh_mul_add_norm_scale(
-                    attn_out.contiguous(),
-                    self.attention_norm2.weight.data.contiguous(),
-                    None,
-                    gate_msa.contiguous(),
-                    x.contiguous(),
-                    self.ffn_norm1.weight.data.contiguous(),
-                    None,
-                    scale_mlp.contiguous(),
-                    "rms",
-                    self.attention_norm2.variance_epsilon,
-                )
-            else:
-                x = apply_rmsnorm_tanh_mul_add(
-                    attn_out, gate_msa, x, self.attention_norm2
-                )
-                ffn_in = self.ffn_norm1(x) * (1.0 + scale_mlp)
+            x = zimage_rmsnorm_tanh_mul_add(
+                attn_out,
+                gate_msa,
+                x,
+                self.attention_norm2,
+                self.enable_zimage_native_norm_fusion,
+            )
+            ffn_in = zimage_rmsnorm_scale(
+                x,
+                1.0 + scale_mlp,
+                self.ffn_norm1,
+                self.enable_zimage_native_norm_fusion,
+            )
 
             # FFN block
             ffn_out = self.feed_forward(ffn_in)
-            x = apply_rmsnorm_tanh_mul_add(ffn_out, gate_mlp, x, self.ffn_norm2)
+            x = zimage_rmsnorm_tanh_mul_add(
+                ffn_out,
+                gate_mlp,
+                x,
+                self.ffn_norm2,
+                self.enable_zimage_native_norm_fusion,
+            )
         else:
             # Attention block
             attn_input = self.attention_norm1(x)
             attn_out = self.attention(
                 attn_input,
                 freqs_cis=freqs_cis,
+                rope_cos_sin_cache=rope_cos_sin_cache,
+                rope_positions=rope_positions,
+                attn_mask=attn_mask,
+                attn_mask_meta=attn_mask_meta,
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
                 skip_sequence_parallel_override=skip_sequence_parallel_override,
@@ -622,9 +769,7 @@ class RopeEmbedder:
 class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
-    _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
-    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
-
+    _fsdp_shard_conditions = [is_zimage_layer]
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         ZImageDitConfig().arch_config.reverse_param_names_mapping
@@ -667,8 +812,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
-        self.config_data = config  # Store config
-        arch_config = config.arch_config
+        arch_config = self.config
 
         self.in_channels = arch_config.in_channels
         self.out_channels = arch_config.out_channels
@@ -741,7 +885,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.cap_embedder = nn.Sequential(
-            RMSNorm(arch_config.cap_feat_dim, eps=arch_config.norm_eps),
+            ZImageRMSNorm(arch_config.cap_feat_dim, eps=arch_config.norm_eps),
             ReplicatedLinear(arch_config.cap_feat_dim, self.dim, bias=True),
         )
 
@@ -817,6 +961,8 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         patch_size: int,
         f_patch_size: int,
         image_seq_len_target: int | None = None,
+        caption_valid_lens: torch.Tensor | None = None,
+        caption_valid_mask: torch.Tensor | None = None,
     ):
         """Patchify images and pad image/caption tokens to batch targets.
 
@@ -831,6 +977,10 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
         if not all_image:
             raise ValueError("Z-Image batch must contain at least one image latent")
+        if caption_valid_mask is not None and caption_valid_mask.shape[0] != len(
+            all_cap_feats
+        ):
+            raise ValueError("caption_valid_mask must have one row per Z-Image caption")
 
         pH = pW = patch_size
         pF = f_patch_size
@@ -839,6 +989,9 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         all_cap_feats_out = []
         all_image_valid_lens = []
         all_cap_valid_lens = []
+        all_cap_valid_masks = []
+        all_image_attn_lens = []
+        all_cap_attn_lens = []
         image_records = []
 
         cap_seq_len_target = max(
@@ -846,15 +999,40 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             for cap_feat in all_cap_feats
         )
 
-        for cap_feat in all_cap_feats:
+        if caption_valid_lens is not None:
+            caption_valid_lens = caption_valid_lens.to(
+                device=all_cap_feats[0].device, dtype=torch.long
+            )
+
+        for idx, cap_feat in enumerate(all_cap_feats):
             cap_ori_len = cap_feat.size(0)
+            cap_attn_len = self._ceil_to_multiple(cap_ori_len, SEQ_MULTI_OF)
             cap_padding_len = cap_seq_len_target - cap_ori_len
             cap_padded_feat = torch.cat(
                 [cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)],
                 dim=0,
             )
             all_cap_feats_out.append(cap_padded_feat)
-            all_cap_valid_lens.append(cap_ori_len)
+            if caption_valid_mask is not None:
+                mask_row = caption_valid_mask[idx].to(
+                    device=cap_feat.device, dtype=torch.bool
+                )
+                if mask_row.dim() != 1:
+                    mask_row = mask_row.reshape(-1)
+                if mask_row.shape[0] > cap_seq_len_target:
+                    mask_row = mask_row[:cap_seq_len_target]
+                elif mask_row.shape[0] < cap_seq_len_target:
+                    mask_row = torch.nn.functional.pad(
+                        mask_row,
+                        (0, cap_seq_len_target - mask_row.shape[0]),
+                        value=0,
+                    )
+                all_cap_valid_masks.append(mask_row)
+            if caption_valid_lens is None:
+                all_cap_valid_lens.append(cap_ori_len)
+            else:
+                all_cap_valid_lens.append(caption_valid_lens[idx])
+            all_cap_attn_lens.append(cap_attn_len)
 
         target_image_seq_len = image_seq_len_target or 0
         for image in all_image:
@@ -869,13 +1047,17 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 F_tokens * H_tokens * W_tokens, pF * pH * pW * C
             )
             image_ori_len = image.size(0)
-            target_image_seq_len = max(
-                target_image_seq_len,
+            image_attn_len = max(
+                image_seq_len_target or 0,
                 self._ceil_to_multiple(image_ori_len, SEQ_MULTI_OF),
             )
-            image_records.append((image, image_size, image_ori_len))
+            target_image_seq_len = max(
+                target_image_seq_len,
+                image_attn_len,
+            )
+            image_records.append((image, image_size, image_ori_len, image_attn_len))
 
-        for image, image_size, image_ori_len in image_records:
+        for image, image_size, image_ori_len, image_attn_len in image_records:
             image_padding_len = target_image_seq_len - image_ori_len
             image_padded_feat = torch.cat(
                 [image, image[-1:].repeat(image_padding_len, 1)],
@@ -884,14 +1066,315 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             all_image_out.append(image_padded_feat)
             all_image_size.append(image_size)
             all_image_valid_lens.append(image_ori_len)
+            all_image_attn_lens.append(image_attn_len)
 
+        cap_valid_lens_out = (
+            caption_valid_lens if caption_valid_lens is not None else all_cap_valid_lens
+        )
         return (
             torch.stack(all_image_out, dim=0),
             torch.stack(all_cap_feats_out, dim=0),
             all_image_size,
             all_image_valid_lens,
-            all_cap_valid_lens,
+            cap_valid_lens_out,
+            all_image_attn_lens,
+            all_cap_attn_lens,
+            (
+                torch.stack(all_cap_valid_masks, dim=0)
+                if caption_valid_mask is not None
+                else None
+            ),
         )
+
+    def _build_single_sample_freqs_cis(
+        self,
+        image: torch.Tensor,
+        cap_feat: torch.Tensor,
+        patch_size: int,
+        f_patch_size: int,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        device = image.device
+        cap_ori_len = int(cap_feat.size(0))
+        cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
+        cap_pos_ids = self.create_coordinate_grid(
+            size=(cap_ori_len + cap_padding_len, 1, 1),
+            start=(1, 0, 0),
+            device=device,
+        ).flatten(0, 2)
+
+        _, F, H, W = image.size()
+        pH = pW = patch_size
+        pF = f_patch_size
+        F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
+        image_ori_len = F_tokens * H_tokens * W_tokens
+        image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
+        image_ori_pos_ids = self.create_coordinate_grid(
+            size=(F_tokens, H_tokens, W_tokens),
+            start=(cap_ori_len + cap_padding_len + 1, 0, 0),
+            device=device,
+        ).flatten(0, 2)
+        image_padding_pos_ids = (
+            self.create_coordinate_grid(
+                size=(1, 1, 1),
+                start=(0, 0, 0),
+                device=device,
+            )
+            .flatten(0, 2)
+            .repeat(image_padding_len, 1)
+        )
+        image_pos_ids = torch.cat([image_ori_pos_ids, image_padding_pos_ids], dim=0)
+
+        return self.rotary_emb(cap_pos_ids), self.rotary_emb(image_pos_ids)
+
+    @staticmethod
+    def _pad_freqs_cis_to_length(
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor], target_len: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos, sin = freqs_cis
+        pad_len = target_len - cos.shape[0]
+        if pad_len < 0:
+            raise ValueError(
+                f"Cannot pad RoPE freqs of length {cos.shape[0]} to shorter target {target_len}"
+            )
+        if pad_len == 0:
+            return cos, sin
+        return (
+            torch.cat([cos, cos.new_zeros(pad_len, cos.shape[-1])], dim=0),
+            torch.cat([sin, sin.new_zeros(pad_len, sin.shape[-1])], dim=0),
+        )
+
+    def _build_batched_freqs_cis(
+        self,
+        images: list[torch.Tensor],
+        cap_feats: list[torch.Tensor],
+        patch_size: int,
+        f_patch_size: int,
+        image_target_len: int,
+        cap_target_len: int,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        cap_cos, cap_sin, image_cos, image_sin = [], [], [], []
+        for image, cap_feat in zip(images, cap_feats):
+            sample_cap_freqs, sample_image_freqs = self._build_single_sample_freqs_cis(
+                image,
+                cap_feat,
+                patch_size,
+                f_patch_size,
+            )
+            sample_cap_freqs = self._pad_freqs_cis_to_length(
+                sample_cap_freqs, cap_target_len
+            )
+            sample_image_freqs = self._pad_freqs_cis_to_length(
+                sample_image_freqs, image_target_len
+            )
+            cap_cos.append(sample_cap_freqs[0])
+            cap_sin.append(sample_cap_freqs[1])
+            image_cos.append(sample_image_freqs[0])
+            image_sin.append(sample_image_freqs[1])
+
+        return (
+            (torch.stack(cap_cos, dim=0), torch.stack(cap_sin, dim=0)),
+            (torch.stack(image_cos, dim=0), torch.stack(image_sin, dim=0)),
+        )
+
+    @staticmethod
+    def _device_cache_key(device: torch.device) -> tuple[str, int | None]:
+        device = torch.device(device)
+        return device.type, device.index
+
+    def _get_cached_batched_freqs_cis(
+        self,
+        images: list[torch.Tensor],
+        cap_feats: list[torch.Tensor],
+        patch_size: int,
+        f_patch_size: int,
+        image_target_len: int,
+        cap_target_len: int,
+        device: torch.device,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        cache_key = (
+            tuple(tuple(image.shape) for image in images),
+            tuple(tuple(cap_feat.shape) for cap_feat in cap_feats),
+            int(patch_size),
+            int(f_patch_size),
+            int(image_target_len),
+            int(cap_target_len),
+            self._device_cache_key(device),
+        )
+        cached = getattr(self, "_cached_batched_freqs_cis", None)
+        if cached is not None and cached[0] == cache_key:
+            return self._pin_for_active_capture(cached[1])
+
+        freqs_cis = self._build_batched_freqs_cis(
+            images,
+            cap_feats,
+            patch_size,
+            f_patch_size,
+            image_target_len=image_target_len,
+            cap_target_len=cap_target_len,
+        )
+        self._cached_batched_freqs_cis = (cache_key, freqs_cis)
+        return self._pin_for_active_capture(freqs_cis)
+
+    def _pin_for_active_capture(self, value):
+        """Keep cache values consumed under CUDA graph capture alive forever.
+
+        The single-slot shape-keyed caches below hold tensors that are pure
+        functions of their cache key. Capturing a second signature (e.g. the
+        next BCG caption bucket, whose static input buffers change every
+        ``data_ptr()``-keyed entry) replaces the slot and frees the old
+        tensors -- but a previously captured graph baked their device
+        addresses, so replaying it dereferences freed memory (observed as an
+        illegal memory access or a hang at the first replayed segment).
+        Pinning every value a capture consumes keeps those addresses alive;
+        contents stay correct because a value never changes for its key.
+        Growth is bounded by O(cache sites x captured signatures) small
+        tensors, and nothing is pinned outside graph capture.
+        """
+        if is_in_breakable_cuda_graph() or (
+            _is_cuda and torch.cuda.is_current_stream_capturing()
+        ):
+            pinned = getattr(self, "_bcg_pinned_cache_values", None)
+            if pinned is None:
+                pinned = []
+                self._bcg_pinned_cache_values = pinned
+            pinned.append(value)
+        return value
+
+    def _get_rope_cache(
+        self,
+        cache_attr: str,
+        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if freqs_cis is None or not _is_cuda:
+            return None, None
+
+        cos, sin = freqs_cis
+        if not (cos.is_cuda and sin.is_cuda):
+            return None, None
+
+        cache_key = (
+            cos.data_ptr(),
+            sin.data_ptr(),
+            tuple(cos.shape),
+            tuple(sin.shape),
+            cos.dtype,
+            sin.dtype,
+            self._device_cache_key(cos.device),
+        )
+        cached = getattr(self, cache_attr, None)
+        if cached is not None and cached[0] == cache_key:
+            return self._pin_for_active_capture(cached[1])
+
+        if cos.dim() == 3:
+            batch_size, seq_len = cos.shape[:2]
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
+            ).reshape(batch_size * seq_len, -1)
+            positions = torch.arange(
+                batch_size * seq_len, device=cos.device, dtype=torch.long
+            )
+        elif cos.dim() == 2:
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
+            )
+            positions = None
+        else:
+            return None, None
+
+        rope_cache = (cos_sin_cache, positions)
+        setattr(self, cache_attr, (cache_key, rope_cache))
+        return self._pin_for_active_capture(rope_cache)
+
+    def _get_attn_mask_and_meta(
+        self, cache_attr: str, lengths: list[int], target_len: int, device: torch.device
+    ) -> Tuple[Optional[torch.Tensor], Optional[dict]]:
+        length_key = tuple(int(length) for length in lengths)
+        if all(length == target_len for length in length_key):
+            return None, None
+
+        cache_key = (
+            length_key,
+            int(target_len),
+            self._device_cache_key(device),
+        )
+        cached = getattr(self, cache_attr, None)
+        if cached is not None and cached[0] == cache_key:
+            return self._pin_for_active_capture(cached[1])
+
+        positions = torch.arange(target_len, device=device).unsqueeze(0)
+        length_tensor = torch.as_tensor(
+            length_key, dtype=torch.long, device=device
+        ).unsqueeze(1)
+        mask = positions < length_tensor
+        meta = build_varlen_mask_meta_from_lengths(length_key, target_len, device)
+        result = (mask, meta)
+        setattr(self, cache_attr, (cache_key, result))
+        return self._pin_for_active_capture(result)
+
+    def _get_joint_attn_mask_and_meta(
+        self,
+        image_lengths: list[int],
+        image_target_len: int,
+        cap_lengths: list[int],
+        cap_target_len: int,
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Optional[dict]]:
+        image_length_key = tuple(int(length) for length in image_lengths)
+        cap_length_key = tuple(int(length) for length in cap_lengths)
+        if all(length == image_target_len for length in image_length_key) and all(
+            length == cap_target_len for length in cap_length_key
+        ):
+            return None, None
+
+        cache_key = (
+            image_length_key,
+            int(image_target_len),
+            cap_length_key,
+            int(cap_target_len),
+            self._device_cache_key(device),
+        )
+        cached = getattr(self, "_cached_joint_attn_mask_meta", None)
+        if cached is not None and cached[0] == cache_key:
+            return self._pin_for_active_capture(cached[1])
+
+        image_pos = torch.arange(image_target_len, device=device).unsqueeze(0)
+        cap_pos = torch.arange(cap_target_len, device=device).unsqueeze(0)
+        image_len = torch.as_tensor(
+            image_length_key, dtype=torch.long, device=device
+        ).unsqueeze(1)
+        cap_len = torch.as_tensor(
+            cap_length_key, dtype=torch.long, device=device
+        ).unsqueeze(1)
+        mask = torch.cat([image_pos < image_len, cap_pos < cap_len], dim=1)
+        valid_ranges = [
+            [
+                (0, image_length),
+                (image_target_len, image_target_len + cap_length),
+            ]
+            for image_length, cap_length in zip(
+                image_length_key, cap_length_key, strict=True
+            )
+        ]
+        meta = build_varlen_mask_meta_from_ranges(
+            valid_ranges,
+            image_target_len + cap_target_len,
+            device,
+        )
+        result = (mask, meta)
+        self._cached_joint_attn_mask_meta = (cache_key, result)
+        return self._pin_for_active_capture(result)
+
+    @staticmethod
+    def _has_padding(valid_lens: list[int], target_len: int) -> bool:
+        return any(int(length) < target_len for length in valid_lens)
 
     @staticmethod
     def _as_image_list(hidden_states) -> list[torch.Tensor]:
@@ -921,19 +1404,87 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         return cap_feats
 
     @staticmethod
+    def _caption_valid_mask_from_mask(
+        mask, *, batch_size: int, max_seq_len: int
+    ) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        if isinstance(mask, (list, tuple)):
+            if not mask:
+                return None
+            if len(mask) == 1:
+                return ZImageTransformer2DModel._caption_valid_mask_from_mask(
+                    mask[0], batch_size=batch_size, max_seq_len=max_seq_len
+                )
+            rows = []
+            for item in mask:
+                item_mask = ZImageTransformer2DModel._caption_valid_mask_from_mask(
+                    item, batch_size=1, max_seq_len=max_seq_len
+                )
+                if item_mask is None:
+                    return None
+                rows.append(item_mask[0])
+            return torch.stack(rows, dim=0) if len(rows) == batch_size else None
+        if not torch.is_tensor(mask):
+            return None
+
+        mask = mask.to(dtype=torch.bool)
+        if mask.ndim == 1:
+            if batch_size != 1:
+                return None
+            mask = mask[:max_seq_len].unsqueeze(0)
+        elif mask.ndim == 2 and mask.shape[0] == batch_size:
+            mask = mask[:, :max_seq_len]
+        elif mask.ndim == 2 and batch_size == 1 and mask.shape[0] == 1:
+            mask = mask[:, :max_seq_len]
+        else:
+            return None
+
+        return mask
+
+    @staticmethod
     def _replace_padding_with_token(
         tensor: torch.Tensor,
-        valid_lens: list[int],
+        valid_lens: list[int] | torch.Tensor,
         pad_token: torch.Tensor,
     ) -> torch.Tensor:
         """Replace padded token rows after each valid sequence length."""
+        if not torch.is_tensor(valid_lens) and all(
+            int(length) >= tensor.shape[1] for length in valid_lens
+        ):
+            return tensor
         positions = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
-        lengths = torch.tensor(valid_lens, device=tensor.device).unsqueeze(1)
+        if torch.is_tensor(valid_lens):
+            lengths = valid_lens.to(device=tensor.device, dtype=torch.long)
+        else:
+            lengths = torch.tensor(valid_lens, device=tensor.device)
+        if lengths.ndim == 0:
+            lengths = lengths.reshape(1)
+        lengths = lengths.unsqueeze(1)
         pad_mask = positions >= lengths
-        if pad_mask.any():
-            tensor = tensor.clone()
-            tensor[pad_mask] = pad_token.to(device=tensor.device, dtype=tensor.dtype)
+        tensor = tensor.clone()
+        tensor[pad_mask] = pad_token.to(device=tensor.device, dtype=tensor.dtype)
         return tensor
+
+    @staticmethod
+    def _replace_padding_with_token_mask(
+        tensor: torch.Tensor,
+        valid_mask: torch.Tensor,
+        pad_token: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace padded token rows using a fixed-shape tensor mask."""
+        seq_len = tensor.shape[1]
+        valid_mask = valid_mask.to(device=tensor.device, dtype=torch.bool)
+        if valid_mask.shape[1] > seq_len:
+            valid_mask = valid_mask[:, :seq_len]
+        elif valid_mask.shape[1] < seq_len:
+            valid_mask = torch.nn.functional.pad(
+                valid_mask,
+                (0, seq_len - valid_mask.shape[1]),
+                value=0,
+            )
+        pad_value = pad_token.to(device=tensor.device, dtype=tensor.dtype)
+        return torch.where(valid_mask.unsqueeze(-1), tensor, pad_value.view(1, 1, -1))
 
     def forward(
         self,
@@ -945,6 +1496,8 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         f_patch_size=1,
         freqs_cis=None,
         image_seq_len_target: int | None = None,
+        encoder_hidden_states_mask=None,
+        caption_valid_lens: torch.Tensor | None = None,
         **kwargs,
     ):
         assert patch_size in self.all_patch_size
@@ -952,9 +1505,17 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         x = self._as_image_list(hidden_states)
         cap_feats = self._as_caption_list(encoder_hidden_states)
+        input_images = x
+        input_cap_feats = cap_feats
+        caption_valid_mask = None
+        if kwargs.pop("_use_caption_valid_mask", False):
+            caption_valid_mask = self._caption_valid_mask_from_mask(
+                encoder_hidden_states_mask,
+                batch_size=len(cap_feats),
+                max_seq_len=max(cap_feat.shape[0] for cap_feat in cap_feats),
+            )
         timestep = 1000.0 - timestep
         t = timestep
-        device = x[0].device
         t = self.t_embedder(t)
         adaln_input = t.to(dtype=x[0].dtype)
         (
@@ -963,69 +1524,112 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             x_size,
             x_valid_lens,
             cap_valid_lens,
+            x_attn_lens,
+            cap_attn_lens,
+            cap_valid_mask,
         ) = self.patchify_and_embed(
             x,
             cap_feats,
             patch_size,
             f_patch_size,
             image_seq_len_target=image_seq_len_target,
+            caption_valid_lens=caption_valid_lens,
+            caption_valid_mask=caption_valid_mask,
         )
 
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
+        device = x.device
         x = self._replace_padding_with_token(x, x_valid_lens, self.x_pad_token)
+        if len(input_images) > 1 and get_sp_world_size() == 1:
+            freqs_cis = self._get_cached_batched_freqs_cis(
+                input_images,
+                input_cap_feats,
+                patch_size,
+                f_patch_size,
+                image_target_len=x.shape[1],
+                cap_target_len=cap_feats.shape[1],
+                device=device,
+            )
         x_freqs_cis = freqs_cis[1]
-
-        for layer_id, layer in enumerate(self.noise_refiner):
-            x = layer(x, x_freqs_cis, adaln_input)
-
-        cap_feats, _ = self.cap_embedder(cap_feats)
-        cap_feats = self._replace_padding_with_token(
-            cap_feats, cap_valid_lens, self.cap_pad_token
+        x_rope_cos_sin_cache, x_rope_positions = self._get_rope_cache(
+            "_cached_x_rope_cache", x_freqs_cis
+        )
+        x_attn_mask, x_attn_mask_meta = self._get_attn_mask_and_meta(
+            "_cached_x_attn_mask_meta", x_attn_lens, x.shape[1], device
         )
 
+        for layer_id, layer in enumerate(self.noise_refiner):
+            x = layer(
+                x,
+                x_freqs_cis,
+                adaln_input,
+                rope_cos_sin_cache=x_rope_cos_sin_cache,
+                rope_positions=x_rope_positions,
+                attn_mask=x_attn_mask,
+                attn_mask_meta=x_attn_mask_meta,
+            )
+
+        cap_feats, _ = self.cap_embedder(cap_feats)
+        if cap_valid_mask is not None:
+            cap_feats = self._replace_padding_with_token_mask(
+                cap_feats, cap_valid_mask, self.cap_pad_token
+            )
+        else:
+            cap_feats = self._replace_padding_with_token(
+                cap_feats, cap_valid_lens, self.cap_pad_token
+            )
+
         cap_freqs_cis = freqs_cis[0]
+        cap_rope_cos_sin_cache, cap_rope_positions = self._get_rope_cache(
+            "_cached_cap_rope_cache", cap_freqs_cis
+        )
+        cap_attn_mask, cap_attn_mask_meta = self._get_attn_mask_and_meta(
+            "_cached_cap_attn_mask_meta", cap_attn_lens, cap_feats.shape[1], device
+        )
 
         for layer_id, layer in enumerate(self.context_refiner):
             cap_feats = layer(
                 cap_feats,
                 cap_freqs_cis,
+                rope_cos_sin_cache=cap_rope_cos_sin_cache,
+                rope_positions=cap_rope_positions,
+                attn_mask=cap_attn_mask,
+                attn_mask_meta=cap_attn_mask_meta,
             )
 
         cap_seq_len = cap_feats.shape[1]
-        use_full_unified_sequence = (
-            get_sp_world_size() > 1 and get_ring_parallel_world_size() > 1
-        )
-        x_local_seq_len = x.shape[1]
-        if use_full_unified_sequence:
-            x = sequence_model_parallel_all_gather(x.contiguous(), dim=1)
-            x_freqs_cis = (
-                sequence_model_parallel_all_gather(x_freqs_cis[0].contiguous(), dim=0),
-                sequence_model_parallel_all_gather(x_freqs_cis[1].contiguous(), dim=0),
-            )
         unified = torch.cat([x, cap_feats], dim=1)
         unified_freqs_cis = (
-            torch.cat([x_freqs_cis[0], cap_freqs_cis[0]], dim=0),
-            torch.cat([x_freqs_cis[1], cap_freqs_cis[1]], dim=0),
+            torch.cat([x_freqs_cis[0], cap_freqs_cis[0]], dim=-2),
+            torch.cat([x_freqs_cis[1], cap_freqs_cis[1]], dim=-2),
         )
-        num_replicated_suffix = cap_seq_len if not use_full_unified_sequence else 0
+        unified_attn_mask, unified_attn_mask_meta = self._get_joint_attn_mask_and_meta(
+            x_attn_lens,
+            x.shape[1],
+            cap_attn_lens,
+            cap_seq_len,
+            device,
+        )
+        unified_rope_cos_sin_cache, unified_rope_positions = self._get_rope_cache(
+            "_cached_unified_rope_cache", unified_freqs_cis
+        )
+        num_replicated_suffix = cap_seq_len
 
         for layer in self.layers:
             unified = layer(
                 unified,
                 unified_freqs_cis,
                 adaln_input,
+                rope_cos_sin_cache=unified_rope_cos_sin_cache,
+                rope_positions=unified_rope_positions,
+                attn_mask=unified_attn_mask,
+                attn_mask_meta=unified_attn_mask_meta,
                 num_replicated_suffix=num_replicated_suffix,
-                skip_sequence_parallel_override=use_full_unified_sequence,
             )
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
         )
-        if use_full_unified_sequence:
-            sp_rank = get_sp_parallel_rank()
-            start = sp_rank * x_local_seq_len
-            end = start + x_local_seq_len
-            unified = unified[:, start:end]
         x = list(unified.unbind(dim=0))
         x = self.unpatchify(x, x_size, patch_size, f_patch_size)
 

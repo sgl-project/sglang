@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
 )
@@ -30,7 +31,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     configure_layerwise_offload_modules,
     get_layerwise_offload_component_names_for_pipeline,
     is_layerwise_offloaded_module,
+    is_resident_layerwise_module,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class _FakeStream:
@@ -87,6 +90,13 @@ class _NestedDummyModel(torch.nn.Module, LayerwiseOffloadableModuleMixin):
     def __init__(self) -> None:
         super().__init__()
         self.encoder = _DummyModel()
+
+
+class _NestedSameNamedBlocksModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.token_refiner = _DummyModel()
+        self.blocks = torch.nn.ModuleList([_DummyBlock()])
 
 
 class _SharedBuffer(torch.nn.Module):
@@ -152,18 +162,24 @@ class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         self.layerwise_offload_managers = [SimpleNamespace(enabled=enabled)]
 
 
+class _TestServerArgs(SimpleNamespace):
+    should_cpu_offload_component = ServerArgs.should_cpu_offload_component
+
+
 def _server_args(**kwargs):
     defaults = dict(
+        cpu_offload_components=None,
         use_fsdp_inference=False,
         dit_cpu_offload=False,
         text_encoder_cpu_offload=False,
         image_encoder_cpu_offload=False,
         vae_cpu_offload=False,
         dit_offload_prefetch_size=1,
+        dit_layerwise_resident_layers=0.0,
         pin_cpu_memory=False,
     )
     defaults.update(kwargs)
-    return SimpleNamespace(**defaults)
+    return _TestServerArgs(**defaults)
 
 
 def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
@@ -226,6 +242,31 @@ def test_layerwise_offload_uses_normal_tensors_under_inference_mode(monkeypatch)
 
     assert model.blocks[0].weight._version >= 0
     assert model.blocks[0].bias._version >= 0
+
+
+def test_layerwise_offload_does_not_capture_nested_same_named_layers(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _NestedSameNamedBlocksModel()
+    refiner_weight = model.token_refiner.blocks[0].weight.detach().clone()
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    managed_names = {
+        name for metadata in manager._weight_metadata.values() for name in metadata
+    }
+    assert managed_names
+    assert all(name.startswith("blocks.") for name in managed_names)
+    assert torch.equal(model.token_refiner.blocks[0].weight, refiner_weight)
 
 
 def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
@@ -294,6 +335,21 @@ def test_modelopt_fp8_adapter_keeps_layerwise_offload_enabled():
 
     assert server_args.dit_cpu_offload is False
     assert server_args.dit_layerwise_offload is True
+
+
+def test_modelopt_fp8_adapter_does_not_change_online_fp8_offload():
+    server_args = SimpleNamespace(
+        dit_cpu_offload=True,
+        dit_layerwise_offload=False,
+        quantization="fp8",
+    )
+
+    _ModelOptFp8OffloadAdapter._maybe_disable_incompatible_dit_offload_modes(
+        server_args=server_args,
+        quant_config=Fp8Config(),
+    )
+
+    assert server_args.dit_cpu_offload is True
 
 
 def test_layerwise_capability_selects_layerwise_strategy_for_any_component():
@@ -540,3 +596,221 @@ def test_layerwise_offload_aligns_contiguous_tensor_offsets(monkeypatch):
     assert restored_bias.data_ptr() % 32 == 0
     assert torch.equal(restored_weight, original_weight)
     assert torch.equal(restored_bias, original_bias)
+
+
+# ---------------------------------------------------------------------------
+# --dit-layerwise-resident-layers: keep N leading layers resident (retained
+# across denoise steps), streaming only the tail with the prefetch window.
+# ---------------------------------------------------------------------------
+class _MultiBlockModel(torch.nn.Module):
+    def __init__(self, n: int) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(n)])
+
+
+class _ResidentComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["blocks"]
+
+    def __init__(self, n: int) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(n)])
+
+
+class _AuxiliaryResidentComponent(_ResidentComponent):
+    layerwise_offload_dit_group_enabled = False
+
+
+def _patch_fake_device(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+
+def _resident_manager(model, *, num_layers, prefetch_size=1, resident_layers=0):
+    return LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=num_layers,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=prefetch_size,
+        resident_layers=resident_layers,
+    )
+
+
+def _arm_residency(manager):
+    """Mimic the first-layer pre-hook: arm the resident set, then pin it."""
+    manager._activate_residency()
+    manager.prepare_for_next_req(non_blocking=False)
+
+
+def test_resident_layers_stay_pinned_until_stage_teardown(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(4), num_layers=4, prefetch_size=1, resident_layers=2
+    )
+    # The resident set is armed on the first forward, not at construction.
+    assert manager._retained_layers == 0
+
+    _arm_residency(manager)
+    assert manager._retained_layers == 2
+    assert {0, 1} <= manager._gpu_layers
+
+    # A non-force release keeps the leading resident layers pinned across steps.
+    manager.release_layer(0)
+    manager.release_layer(1)
+    assert {0, 1} <= manager._gpu_layers
+
+    # force=True (teardown) overrides the retention.
+    manager.release_layer(0, force=True)
+    assert 0 not in manager._gpu_layers
+    manager.release_all()  # ends the denoise stage: residents go too
+    assert not manager._gpu_layers
+
+
+def test_resident_layers_off_by_default_streams_everything(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(4), num_layers=4, prefetch_size=1, resident_layers=0
+    )
+    _arm_residency(manager)
+
+    assert manager._retained_layers == 0
+    assert manager.holds_residents is False
+
+    manager.prefetch_layer(2, non_blocking=False)
+    manager.release_layer(2)  # no residents -> released like plain streaming
+    assert 2 not in manager._gpu_layers
+
+
+def test_prepare_for_next_req_repins_residents(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.release_all()
+    assert not manager._gpu_layers
+
+    # The next denoise re-pins the resident set (union of prefetch window + residents).
+    manager.prepare_for_next_req(non_blocking=False)
+    assert {0, 1, 2} <= manager._gpu_layers
+
+
+def test_holds_residents_reflects_configuration(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    resident = _resident_manager(_MultiBlockModel(3), num_layers=3, resident_layers=2)
+    streaming = _resident_manager(_MultiBlockModel(3), num_layers=3, resident_layers=0)
+    assert resident.holds_residents is True
+    assert streaming.holds_residents is False
+
+
+def test_is_resident_layerwise_module_detector():
+    class _Comp(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+        pass
+
+    comp = _Comp()
+    comp.layerwise_offload_managers = [SimpleNamespace(holds_residents=True)]
+    assert is_resident_layerwise_module(comp) is True
+
+    comp.layerwise_offload_managers = [SimpleNamespace(holds_residents=False)]
+    assert is_resident_layerwise_module(comp) is False
+
+
+def test_configure_resolves_resident_layers_absolute(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    comp = _ResidentComponent(8)
+    comp.configure_layerwise_offload(_server_args(dit_layerwise_resident_layers=3))
+    assert comp.layerwise_offload_managers[0].resident_layers == 3
+
+
+def test_configure_resolves_resident_layers_ratio(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    comp = _ResidentComponent(8)
+    comp.configure_layerwise_offload(_server_args(dit_layerwise_resident_layers=0.5))
+    # 0.5 * 8 = 4 leading layers resident
+    assert comp.layerwise_offload_managers[0].resident_layers == 4
+
+
+def test_auxiliary_layerwise_components_ignore_dit_tuning(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    comp = _AuxiliaryResidentComponent(8)
+    comp.configure_layerwise_offload(
+        _server_args(
+            dit_offload_prefetch_size=3,
+            dit_layerwise_resident_layers=0.5,
+        )
+    )
+
+    manager = comp.layerwise_offload_managers[0]
+    assert manager.prefetch_size == 1
+    assert manager.resident_layers == 0
+
+
+class _MixinBlock(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.arange(9, dtype=torch.float32).reshape(3, 3)
+        )
+        self.bias = torch.nn.Parameter(torch.arange(3, dtype=torch.float32))
+
+
+class _MixinModel(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["blocks"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_MixinBlock() for _ in range(3)])
+
+
+def _configure_mixin_model(monkeypatch) -> _MixinModel:
+    _patch_fake_device(monkeypatch)
+    model = _MixinModel()
+    model.configure_layerwise_offload(_server_args())
+    assert is_layerwise_offloaded_module(model)
+    return model
+
+
+def test_disable_offload_short_circuits_residency_release(monkeypatch):
+    """disable_offload() must make later layerwise calls no-ops.
+
+    Regression test: a ComponentResidencyManager strategy built while the
+    module was offloaded (the offload_during_compile window) keeps calling
+    release_all() on use-site switches. After disable_offload() removed the
+    hooks, those releases replaced restored weights with (1,) placeholders
+    that nothing ever swapped back in, crashing dual-DiT models (Wan2.2-A14B
+    boundary experts, Ideogram-4 paired towers) on the first real request.
+    """
+    model = _configure_mixin_model(monkeypatch)
+    model.disable_offload()
+
+    assert not is_layerwise_offloaded_module(model)
+    for name, param in model.named_parameters():
+        assert tuple(param.shape) != (1,), name
+
+    # The exact call path the residency strategy takes on use-site switches.
+    LayerwiseOffloadStrategy().exit(model)
+    model.prepare_for_next_req()
+    for name, param in model.named_parameters():
+        assert tuple(param.shape) != (1,), name
+
+
+def test_enable_offload_rearms_after_disable(monkeypatch):
+    model = _configure_mixin_model(monkeypatch)
+    # blocks[2] holds a placeholder right after configure; the real values are
+    # what _MixinBlock was constructed with.
+    original = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+
+    model.disable_offload()
+    assert not is_layerwise_offloaded_module(model)
+
+    model.enable_offload()
+    assert is_layerwise_offloaded_module(model)
+
+    manager = model.layerwise_offload_managers[0]
+    manager.release_layer(2)
+    assert tuple(model.blocks[2].weight.shape) == (1,)
+    manager.prefetch_layer(2, non_blocking=False)
+    assert torch.equal(model.blocks[2].weight.data, original)
