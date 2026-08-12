@@ -441,6 +441,26 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+
+        self.pcie_ipc_comm: Optional[Any] = None
+        # Only the tensor-parallel group issues the per-layer reductions these
+        # kernels target; other groups would just pin IPC buffers.
+        if (
+            envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.get()
+            and self.world_size > 1
+            and "tp" in self.unique_name
+        ):
+            try:
+                from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
+                    PcieIpcCommunicator,
+                )
+
+                # The IPC handshake needs the CUDA (NCCL) group, not the CPU one.
+                self.pcie_ipc_comm = PcieIpcCommunicator(
+                    group=self.device_group, device=self.device
+                )
+            except Exception as e:
+                logger.warning(f"Setup FlashInfer PCIe-IPC allreduce failed with {e}.")
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -888,6 +908,13 @@ class GroupCoordinator:
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
         if (
+            self.pcie_ipc_comm is not None
+            and not self.pcie_ipc_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
+        ):
+            return "pcie_ipc"
+        if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
@@ -952,6 +979,8 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "pcie_ipc":
+            return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
             with pynccl_comm.change_state(enable=True):
                 out = pynccl_comm.outplace_all_reduce(input_)

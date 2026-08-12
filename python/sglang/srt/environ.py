@@ -589,6 +589,16 @@ class Envs:
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
 
+    # FlashInfer PCIe-IPC all-reduce (switch-free intra-node hosts: no NVLink,
+    # no multicast). Shape coverage is decided by FlashInfer's own tuning table;
+    # an unsupported shape falls back to NCCL, so there is no size knob here.
+    SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Elements the IPC workspace is sized for. It cannot grow after construction,
+    # so 0 sizes it for one prefill chunk (chunked_prefill_size * hidden). Set it
+    # to cap the ~2 * world_size * max_numel * itemsize bytes per rank instead,
+    # at the cost of leaving reductions above the cap on NCCL.
+    SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
+
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
