@@ -20,7 +20,7 @@ SGLang keeps four identities separate:
 |---|---|---|
 | Content | SHA-256 of the media snapshot | Detect the same media bytes or image/tensor content. |
 | Artifact | Content digest + modality + processor fingerprint + per-media options | Reuse prompt-independent processor metadata and CPU artifacts. |
-| Feature | Hash of the processor output | Preserve the existing multimodal prefix/embedding-cache key. |
+| Feature | Artifact identity + processor-output hash | Bind prefix/embedding reuse to both processor inputs and output. |
 | Embedding | ViT output indexed by the feature hash | Skip vision encoding when every required TP rank has the entry. |
 
 The prompt is not part of the per-image artifact key. A new turn rebuilds prompt
@@ -40,11 +40,12 @@ change processor output are identical. SGLang therefore hashes:
   per-image options.
 
 The key encoder preserves Python types and rejects unsupported values instead
-of reducing them to a lossy string. The artifact stores the processor-output
-feature hash, so embedding and prefix caches continue to use the existing
-post-processor identity. Prompt text is intentionally excluded: every request
-rebuilds and validates its prompt tokens, image spans, grids, and offsets from
-the cached per-image metadata.
+of reducing them to a lossy string. The feature identity combines the complete
+artifact identity with the actual processor-output hash. This prevents equal
+feature bytes from being reused across different grid or processor contexts.
+Prompt text is intentionally excluded: every request rebuilds and validates its
+prompt tokens, image spans, grids, and offsets from the cached per-image
+metadata.
 
 Except for the explicit trusted mode below, a path, URL, caller object, mtime,
 or caller-provided digest is never accepted as proof that media is unchanged.
