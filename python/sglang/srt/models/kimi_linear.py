@@ -49,7 +49,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import is_xpu, make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 
@@ -103,7 +103,11 @@ class KimiMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        self.gate.e_score_correction_bias = nn.Parameter(torch.empty(num_experts))
+        # Keep the routing correction bias in fp32: the grouped-topk kernels
+        # Matches DeepseekV2.
+        self.gate.e_score_correction_bias = nn.Parameter(
+            torch.empty(num_experts, dtype=torch.float32)
+        )
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts,
@@ -550,7 +554,7 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = get_stream("alt")
+        self.alt_stream = None if is_xpu() else get_stream("alt")
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
