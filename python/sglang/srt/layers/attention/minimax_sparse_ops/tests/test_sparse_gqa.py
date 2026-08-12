@@ -13,6 +13,9 @@ import torch
 from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
+from sglang.kernels.ops.attention.minimax_sparse.page_table import (
+    build_page_table_snapshot,
+)
 
 DEVICE = "cuda"
 RTOL = 5e-3
@@ -119,6 +122,11 @@ def build_inputs(
                 base, base + max_kv_len, device=DEVICE
             ).to(torch.int32)
 
+    page_table = torch.empty_like(req_to_token)
+    build_page_table_snapshot(
+        page_table, req_to_token, slot_ids, seq_lens, 1, max_slots
+    )
+
     num_blocks_list = [(sl + block_size - 1) // block_size for sl in seq_lens_list]
     actual_topk = min(topk, min(num_blocks_list))
     topk_idx = torch.zeros(
@@ -139,7 +147,7 @@ def build_inputs(
         else None
     )
 
-    return q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_ids, topk_idx
+    return q, sink, k_cache, v_cache, req_to_token, seq_lens, page_table, topk_idx
 
 
 def _case(bs, nqh, nkh, hd, blk, tk, sink, seq_pat, paged=True):
@@ -208,7 +216,7 @@ def test_sparse_gqa_vs_reference(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat, 
     torch.manual_seed(42)
     seq_lens_list = make_seq_lens(seq_pat, bs, blk)
 
-    q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_ids, topk_idx = (
+    q, sink, k_cache, v_cache, req_to_token, seq_lens, page_table, topk_idx = (
         build_inputs(
             bs,
             nqh,
@@ -227,9 +235,8 @@ def test_sparse_gqa_vs_reference(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat, 
         sink,
         k_cache,
         v_cache,
-        req_to_token,
+        page_table,
         seq_lens,
-        slot_ids,
         blk,
         topk_idx,
     )
@@ -263,7 +270,7 @@ def test_sparse_gqa_topk_exceeds_blocks(
     torch.manual_seed(42)
     seq_lens_list = [blk] * bs
 
-    q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_ids, topk_idx = (
+    q, sink, k_cache, v_cache, req_to_token, seq_lens, page_table, topk_idx = (
         build_inputs(
             bs,
             nqh,
@@ -282,9 +289,8 @@ def test_sparse_gqa_topk_exceeds_blocks(
         sink,
         k_cache,
         v_cache,
-        req_to_token,
+        page_table,
         seq_lens,
-        slot_ids,
         blk,
         topk_idx,
     )
@@ -316,7 +322,7 @@ def test_sparse_gqa_deterministic(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat,
     torch.manual_seed(42)
     seq_lens_list = make_seq_lens(seq_pat, bs, blk)
 
-    q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_ids, topk_idx = (
+    q, sink, k_cache, v_cache, req_to_token, seq_lens, page_table, topk_idx = (
         build_inputs(
             bs,
             nqh,
@@ -335,9 +341,8 @@ def test_sparse_gqa_deterministic(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat,
         sink,
         k_cache,
         v_cache,
-        req_to_token,
+        page_table,
         seq_lens,
-        slot_ids,
         blk,
         topk_idx,
     )
@@ -346,9 +351,8 @@ def test_sparse_gqa_deterministic(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat,
         sink,
         k_cache,
         v_cache,
-        req_to_token,
+        page_table,
         seq_lens,
-        slot_ids,
         blk,
         topk_idx,
     )

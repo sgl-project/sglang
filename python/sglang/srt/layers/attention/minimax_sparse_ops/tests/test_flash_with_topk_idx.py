@@ -6,6 +6,9 @@ import torch
 from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
     flash_decode_with_topk_idx,
 )
+from sglang.kernels.ops.attention.minimax_sparse.page_table import (
+    build_page_table_snapshot,
+)
 from sglang.srt.environ import envs
 
 DEVICE = "cuda"
@@ -25,7 +28,6 @@ def pytorch_reference(
     v_cache,
     req_to_token,
     seq_lens,
-    slot_ids,
     block_size,
     topk,
     init_blocks,
@@ -136,12 +138,16 @@ def build_inputs(
         req_to_token[i, :max_kv_len] = torch.arange(
             base, base + max_kv_len, device=DEVICE
         )
+    page_table = torch.empty_like(req_to_token)
+    build_page_table_snapshot(
+        page_table, req_to_token, slot_ids, seq_lens, 1, max_slots
+    )
     sink = (
         torch.randn(num_q_heads, head_dim, dtype=dtype, device=DEVICE)
         if with_sink
         else None
     )
-    return q, sink, k_cache, v_cache, req_to_token, seq_lens, max_kv_len, slot_ids
+    return q, sink, k_cache, v_cache, req_to_token, seq_lens, max_kv_len, page_table
 
 
 def make_seq_lens(pattern, batch_size, block_size):
@@ -212,7 +218,7 @@ def test_flash_decode_with_topk_idx(
     torch.manual_seed(42)
     seq_lens, mkl = make_seq_lens(seq_pat, bs, blk)
 
-    q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, slot_ids = build_inputs(
+    q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, page_table = build_inputs(
         bs,
         nqh,
         nkh,
@@ -227,10 +233,9 @@ def test_flash_decode_with_topk_idx(
         sink,
         k_cache,
         v_cache,
-        req_to_token,
+        page_table,
         seq_lens_t,
         mkl,
-        slot_ids,
         blk,
         tk,
         ib,
@@ -244,7 +249,6 @@ def test_flash_decode_with_topk_idx(
         v_cache,
         req_to_token,
         seq_lens_t,
-        slot_ids,
         blk,
         tk,
         ib,
@@ -293,7 +297,7 @@ def test_flash_decode_score_only(
     torch.manual_seed(42)
     seq_lens, mkl = make_seq_lens(seq_pat, bs, blk)
 
-    q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, slot_ids = build_inputs(
+    q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, page_table = build_inputs(
         bs,
         nqh,
         nkh,
@@ -308,10 +312,9 @@ def test_flash_decode_score_only(
         sink,
         k_cache,
         v_cache,
-        req_to_token,
+        page_table,
         seq_lens_t,
         mkl,
-        slot_ids,
         blk,
         tk,
         ib,
@@ -326,7 +329,6 @@ def test_flash_decode_score_only(
         v_cache,
         req_to_token,
         seq_lens_t,
-        slot_ids,
         blk,
         tk,
         ib,
@@ -363,7 +365,7 @@ def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():
     bs, nqh, nkh, hd, blk, tk = 4, 8, 1, 128, 64, 32
     seq_lens, mkl = make_seq_lens("few_blocks", bs, blk)
 
-    q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, slot_ids = build_inputs(
+    q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, page_table = build_inputs(
         bs,
         nqh,
         nkh,
@@ -378,10 +380,9 @@ def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():
             sink,
             k_cache,
             v_cache,
-            req_to_token,
+            page_table,
             seq_lens_t,
             mkl,
-            slot_ids,
             blk,
             tk,
             0,
@@ -394,7 +395,6 @@ def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():
         v_cache,
         req_to_token,
         seq_lens_t,
-        slot_ids,
         blk,
         tk,
         0,
@@ -421,7 +421,7 @@ def test_flash_decode_dense_page_table_trivial_rows_skip_score_writes():
     bs, nqh, nkh, hd, blk, tk, page_size = 3, 4, 1, 128, 64, 32, 1
     seq_lens, mkl = make_seq_lens("few_blocks", bs, blk)
 
-    q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, slot_ids = build_inputs(
+    q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, page_table = build_inputs(
         bs,
         nqh,
         nkh,
@@ -435,10 +435,9 @@ def test_flash_decode_dense_page_table_trivial_rows_skip_score_writes():
         sink,
         k_cache,
         v_cache,
-        req_to_token,
+        page_table,
         seq_lens_t,
         mkl,
-        slot_ids,
         blk,
         tk,
         0,
@@ -453,7 +452,6 @@ def test_flash_decode_dense_page_table_trivial_rows_skip_score_writes():
         v_cache,
         req_to_token,
         seq_lens_t,
-        slot_ids,
         blk,
         tk,
         0,
@@ -482,7 +480,7 @@ def test_flash_decode_score_one_page_per_block(score_type):
     torch.manual_seed(43)
     bs, nqh, nkh, hd, blk, tk = 2, 1, 1, 128, 128, 4
     seq_lens_list = [513, 768]
-    q, _, k_cache, v_cache, _, seq_lens, _, slot_ids = build_inputs(
+    q, _, k_cache, v_cache, _, seq_lens, _, _ = build_inputs(
         bs,
         nqh,
         nkh,
@@ -523,7 +521,6 @@ def test_flash_decode_score_one_page_per_block(score_type):
         v_cache,
         req_to_token,
         seq_lens,
-        slot_ids,
         blk,
         tk,
         0,
