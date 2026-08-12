@@ -9,7 +9,9 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
+    # Runs up to ~3h in CI, so est_time is sized so the derived per-file
+    # timeout (derive_timeout_per_file) gives it 3h headroom.
+    est_time=7200,
     suite="nightly-acc-2-npu-a3",
     nightly=True,
 )
