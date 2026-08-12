@@ -212,32 +212,32 @@ def _tree_speculative_sampling_target_only_kernel(
     found_bonus = 0
 
     for vocab_start in range(0, VOCAB_SIZE, BLOCK_V):
-        vocab_offsets = vocab_start + tl.arange(0, BLOCK_V)
-        mask = vocab_offsets < VOCAB_SIZE
-        target = tl.load(
-            target_row + vocab_offsets * stride_tp_v,
-            mask=mask,
-            other=0.0,
-        )
-        draft = tl.load(
-            draft_row + vocab_offsets * stride_dp_v,
-            mask=mask & ~all_drafts_accept,
-            other=0.0,
-        )
-        residual = tl.where(
-            all_drafts_accept,
-            target,
-            tl.maximum(target - draft, 0.0),
-        )
-
-        positive = mask & (residual > 0.0)
-        block_last_valid = tl.max(
-            tl.where(positive, vocab_offsets, -1),
-            axis=0,
-        )
-        last_valid_token = tl.maximum(last_valid_token, block_last_valid)
-
         if found_bonus == 0:
+            vocab_offsets = vocab_start + tl.arange(0, BLOCK_V)
+            mask = vocab_offsets < VOCAB_SIZE
+            target = tl.load(
+                target_row + vocab_offsets * stride_tp_v,
+                mask=mask,
+                other=0.0,
+            )
+            draft = tl.load(
+                draft_row + vocab_offsets * stride_dp_v,
+                mask=mask & ~all_drafts_accept,
+                other=0.0,
+            )
+            residual = tl.where(
+                all_drafts_accept,
+                target,
+                tl.maximum(target - draft, 0.0),
+            )
+
+            positive = mask & (residual > 0.0)
+            block_last_valid = tl.max(
+                tl.where(positive, vocab_offsets, -1),
+                axis=0,
+            )
+            last_valid_token = tl.maximum(last_valid_token, block_last_valid)
+
             block_cdf = cumulative_sum + tl.cumsum(residual, axis=0)
             crosses_target = positive & (block_cdf > target_cdf)
             has_match = tl.max(crosses_target, axis=0)
@@ -246,7 +246,7 @@ def _tree_speculative_sampling_target_only_kernel(
                 bonus_token = vocab_start + match_idx
                 found_bonus = 1
 
-        cumulative_sum += tl.sum(residual)
+            cumulative_sum += tl.sum(residual)
 
     bonus_token = tl.where(
         (found_bonus == 0) & (last_valid_token >= 0),
