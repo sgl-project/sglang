@@ -9484,6 +9484,12 @@ class ServerArgs:
                                                   # prompts at this size
                 "dp_size": <dp_size>,             # number of SUB sockets
                                                   # to open
+                "load_endpoint_port_base": 5557 + <dp_size>,
+                                                  # base TCP port of the
+                                                  # dedicated load-snapshot
+                                                  # range (load rank r =
+                                                  # base + r); omitted if it
+                                                  # would overflow u16
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -9533,7 +9539,7 @@ class ServerArgs:
         if not host or not (0 < port < 65536):
             return None
 
-        return {
+        descriptor = {
             "publisher": cfg.publisher,
             "endpoint_host": host,
             "endpoint_port_base": port,
@@ -9541,6 +9547,36 @@ class ServerArgs:
             "block_size": page_size,
             "dp_size": self.dp_size,
         }
+        # Dedicated port range for runtime load snapshots, packed immediately
+        # after the KV-event range (load rank r binds load_endpoint_port_base +
+        # r). Load-aware routers connect there to read the engine's true queue
+        # depth / KV occupancy. Absent => the worker predates load publishing,
+        # or the range would overflow u16; the router then falls back to its
+        # own in-flight counter. Must agree with SchedulerLoadPublisher, which
+        # binds the load publisher at kv_base + dp_size.
+        load_port_base = port + self.dp_size
+        replay_overlaps = False
+        if cfg.replay_endpoint and cfg.replay_endpoint.startswith("tcp://"):
+            _, _, replay_tail = cfg.replay_endpoint.rpartition(":")
+            try:
+                replay_base = int(replay_tail)
+            except ValueError:
+                replay_base = None
+            if replay_base is not None:
+                # Replay ROUTER sockets bind replay_base + rank over the same
+                # rank space; if the two ranges overlap, SchedulerLoadPublisher
+                # declines to bind, so don't advertise the port.
+                replay_overlaps = (
+                    load_port_base < replay_base + self.dp_size
+                    and replay_base < load_port_base + self.dp_size
+                )
+        if (
+            self.dp_size >= 1
+            and load_port_base + self.dp_size - 1 < 65536
+            and not replay_overlaps
+        ):
+            descriptor["load_endpoint_port_base"] = load_port_base
+        return descriptor
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:

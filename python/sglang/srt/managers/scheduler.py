@@ -221,6 +221,9 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
 from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
+from sglang.srt.managers.scheduler_components.load_publisher import (
+    SchedulerLoadPublisher,
+)
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
@@ -643,6 +646,8 @@ class Scheduler(
         self.init_invariant_checker()
 
         self.init_kv_events_publisher()
+
+        self.init_load_publisher()
 
         self.init_load_inquirer()
 
@@ -2093,6 +2098,16 @@ class Scheduler(
             max_running_requests=self.max_running_requests,
             max_total_num_tokens=self.max_total_num_tokens,
             get_stats=lambda: self.metrics_reporter.stats,
+        )
+
+    def init_load_publisher(self) -> None:
+        # Load reporting for load-aware routers — a separate publisher on its
+        # own port range, independent of KV-cache events (rank gating and the
+        # no-op fallback live inside the component).
+        self.load_publisher = SchedulerLoadPublisher(
+            kv_events_config=get_observability().kv_events_config,
+            ps=self.ps,
+            dp_size=self.server_args.dp_size,
         )
 
     def init_load_inquirer(self) -> None:
@@ -3911,6 +3926,15 @@ class Scheduler(
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Router-facing load gauge on the dedicated load PUB socket, for
+        # cache-aware-zmq load-aware selection. Independent of the
+        # DP-balancing snapshot above so it works for single workers too.
+        # Sourced from the load inquirer (live scheduler counts, not the
+        # metrics-gated stats) and only evaluated when the throttle fires.
+        self.load_publisher.publish_load_stat(
+            self.load_inquirer.get_loads,
+            force=batch.forward_mode.is_extend(),
+        )
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
@@ -4059,6 +4083,10 @@ class Scheduler(
 
         # Publish the idle state so /get_loads and DP balancing do not see stale load.
         self.publish_load_snapshot(force=True)
+        # Same for the router-facing load socket: without this, a load-aware
+        # router keeps the last busy LoadStat until its freshness window
+        # expires and routes as if this idle worker were still loaded.
+        self.load_publisher.publish_load_stat(self.load_inquirer.get_loads, force=True)
 
         # sleep until next event
         self.maybe_sleep_on_idle()

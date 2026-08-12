@@ -104,6 +104,8 @@ class TestServerInfoKvEventsField(CustomTestCase):
                 "topic": "kv",
                 "block_size": 64,
                 "dp_size": 2,
+                # Load range packed immediately after the KV range: 5557 + dp_size.
+                "load_endpoint_port_base": 5559,
             },
         )
 
