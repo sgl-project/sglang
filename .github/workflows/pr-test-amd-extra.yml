@@ -37,7 +37,7 @@ on:
           - mi300
           - mi325
       rocm_version:
-        description: 'ROCm container variant (empty = Dockerfile default; rocm720 = ROCm 7.2.0)'
+        description: 'ROCm container variant (for example, rocm720 or rocm724)'
         required: false
         type: choice
         default: ''
@@ -72,7 +72,7 @@ on:
         type: string
         default: mi300
       rocm_version:
-        description: 'ROCm container variant (empty = Dockerfile default; rocm720 = ROCm 7.2.0)'
+        description: 'ROCm container variant (for example, rocm720 or rocm724)'
         required: false
         type: string
         default: ''
@@ -155,7 +155,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        # `rocm_version` (e.g. rocm720) selects an alternate ROCm container; empty uses the Dockerfile default.
+        # `rocm_version` selects the requested ROCm container; empty uses the Dockerfile default.
         run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
