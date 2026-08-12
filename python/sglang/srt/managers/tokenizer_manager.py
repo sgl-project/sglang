@@ -290,6 +290,7 @@ class _MMCacheRetryContext:
     request: GenerateReqInput
     lease_id: str
     routed_dp_rank: int
+    dispatched: bool = False
 
 
 def _can_omit_mm_features(obj: GenerateReqInput) -> bool:
@@ -1853,6 +1854,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
             dispatched = True
+            self._mark_mm_cache_lease_dispatched(tokenized_obj.rid)
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
@@ -1885,6 +1887,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             self._dispatch_to_scheduler(batch_req)
             dispatched = True
+            for tokenized_obj in tokenized_objs:
+                self._mark_mm_cache_lease_dispatched(tokenized_obj.rid)
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
@@ -2236,14 +2240,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if abort_all:
-            contexts = list(self._mm_cache_retry_contexts.values())
-            self._mm_cache_retry_contexts.clear()
-        else:
-            context = self._mm_cache_retry_contexts.pop(rid, None)
-            contexts = [context] if context is not None else []
-        for context in contexts:
-            self._release_mm_embedding_cache(context.lease_id, context.routed_dp_rank)
         if (
             not abort_all
             and self.server_args.tokenizer_worker_num == 1
@@ -3440,7 +3436,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        self._release_pending_mm_cache_lease(recv_obj.rid)
+        # The scheduler owns an admitted lease and releases it before sending
+        # this acknowledgement. Drop only the tokenizer retry context here.
+        getattr(self, "_mm_cache_retry_contexts", {}).pop(recv_obj.rid, None)
         # Two scheduler messages can race in handle_loop for the same rid: a
         # batch output that finishes it normally (deletes rid_to_state[rid])
         # and this abort echo. If the finish wins, the rid is already gone and
@@ -3707,9 +3705,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._release_pending_mm_cache_lease(rid)
 
     def _release_pending_mm_cache_lease(self, rid: str) -> None:
-        context = getattr(self, "_mm_cache_retry_contexts", {}).pop(rid, None)
+        contexts = getattr(self, "_mm_cache_retry_contexts", {})
+        context = contexts.get(rid)
+        if context is not None and context.dispatched:
+            return
+        context = contexts.pop(rid, None)
         if context is not None:
             self._release_mm_embedding_cache(context.lease_id, context.routed_dp_rank)
+
+    def _mark_mm_cache_lease_dispatched(self, rid: str) -> None:
+        context = getattr(self, "_mm_cache_retry_contexts", {}).get(rid)
+        if context is not None and not context.dispatched:
+            self._mm_cache_retry_contexts[rid] = dataclasses.replace(
+                context, dispatched=True
+            )
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

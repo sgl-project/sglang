@@ -262,16 +262,33 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
         )
 
-    def test_abort_releases_embedding_cache_lease(self):
+    def test_abort_ack_drops_embedding_cache_context(self):
         tm = _make_tokenizer_manager()
         rid = "abort_lease_rid"
         tm.rid_to_state[rid] = _make_req_state(rid)
-        tm._mm_cache_retry_contexts[rid] = Mock(lease_id="lease-1", routed_dp_rank=2)
+        tm._mm_cache_retry_contexts[rid] = Mock(
+            lease_id="lease-1", routed_dp_rank=2, dispatched=True
+        )
 
         tm._handle_abort_req(_make_abort_req(rid))
 
         self.assertNotIn(rid, tm._mm_cache_retry_contexts)
-        tm._release_mm_embedding_cache.assert_called_once_with("lease-1", 2)
+        tm._release_mm_embedding_cache.assert_not_called()
+
+    def test_abort_request_waits_for_scheduler_before_releasing_lease(self):
+        tm = _make_tokenizer_manager()
+        rid = "abort_pending_lease_rid"
+        tm.server_args.tokenizer_worker_num = 1
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        context = Mock(lease_id="lease-1", routed_dp_rank=2)
+        tm._mm_cache_retry_contexts[rid] = context
+        tm._dispatch_to_scheduler = Mock()
+
+        tm.abort_request(rid)
+
+        self.assertIs(tm._mm_cache_retry_contexts[rid], context)
+        tm._release_mm_embedding_cache.assert_not_called()
+        self.assertIsInstance(tm._dispatch_to_scheduler.call_args.args[0], AbortReq)
 
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
