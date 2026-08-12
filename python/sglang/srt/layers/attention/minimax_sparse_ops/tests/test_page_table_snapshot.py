@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.minimax_sparse.page_table import (
 from sglang.srt.layers.attention.minimax_sparse_backend import (
     MiniMaxSparseAttnBackend,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 def _row_from_pages(pages: list[int], page_size: int) -> torch.Tensor:
@@ -129,3 +130,88 @@ def test_backend_slices_max_batch_buffers_before_snapshot(monkeypatch):
     assert backend._active_page_table.shape == (2, 4)
     assert captured["page_table"].shape == (2, 4)
     assert backend._max_seqlen_k == 16
+
+
+def test_full_prefill_capture_preserves_page_table_backing_for_decode(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.minimax_sparse.page_table."
+        "build_page_table_snapshot",
+        lambda *args, **kwargs: None,
+    )
+
+    backend = object.__new__(MiniMaxSparseAttnBackend)
+    backend.is_npu = False
+    backend._msa_dec_meta = None
+    backend._active_page_table = None
+    backend._cuda_graph_page_table = None
+    backend._decode_cuda_graph_max_bs = 4
+    backend._msa_owns_decode = False
+    backend.req_to_token = torch.zeros((4, 16), dtype=torch.int32)
+    backend.kv_pool = SimpleNamespace(size=60)
+    backend.page_size = 4
+    backend.max_context_len = 16
+
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=2,
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+        seq_lens=torch.tensor([8, 8], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([8, 8], dtype=torch.int32),
+        extend_seq_lens_cpu=[1, 1],
+    )
+
+    backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+    captured_ptr = backend._active_page_table.data_ptr()
+    assert backend._cuda_graph_page_table.shape == (4, 4)
+
+    backend.init_cuda_graph_state(max_bs=4, max_num_tokens=4)
+    assert backend._cuda_graph_page_table.data_ptr() == captured_ptr
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="page-table replay requires CUDA"
+)
+def test_full_prefill_graph_replay_reads_updated_page_table():
+    page_size = 4
+    backend = object.__new__(MiniMaxSparseAttnBackend)
+    backend.is_npu = False
+    backend._msa_dec_meta = None
+    backend._active_page_table = None
+    backend._cuda_graph_page_table = None
+    backend._decode_cuda_graph_max_bs = 2
+    backend._msa_owns_decode = False
+    backend.req_to_token = torch.stack(
+        [
+            _row_from_pages([2, 7], page_size),
+            _row_from_pages([5, 1], page_size),
+        ]
+    )
+    backend.kv_pool = SimpleNamespace(size=32)
+    backend.page_size = page_size
+    backend.max_context_len = 8
+
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device="cuda"),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device="cuda"),
+        seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
+        extend_seq_lens_cpu=[8],
+    )
+    backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+    captured_ptr = backend._active_page_table.data_ptr()
+
+    replay_output = torch.empty((1, 2), dtype=torch.int32, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay_output.copy_(backend._active_page_table[:, :2])
+
+    forward_batch.req_pool_indices.fill_(1)
+    backend.init_forward_metadata_out_graph(forward_batch, in_capture=False)
+    assert backend._active_page_table.data_ptr() == captured_ptr
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        replay_output.cpu(), torch.tensor([[5, 1]], dtype=torch.int32)
+    )

@@ -113,6 +113,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.max_context_len = int(runner.model_config.context_len)
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
+        self._decode_cuda_graph_max_bs = int(
+            runner.server_args.cuda_graph_config.decode.max_bs or 0
+        )
         self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(runner.server_args)
         if self.fp8_attn_gemm:
             assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
@@ -326,15 +329,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
+        self._active_page_table = None
         if (
             not self.is_npu
             and in_capture
             and forward_batch.forward_mode == ForwardMode.EXTEND
         ):
-            raise ValueError(
-                "MiniMax sparse attention does not support Full prefill CUDA Graph."
+            # Full prefill capture runs before decode CUDA Graph initialization.
+            # Allocate the final backing now so decode initialization cannot replace
+            # an address already captured by the prefill graph.
+            self._ensure_cuda_graph_page_table(
+                max(forward_batch.batch_size, self._decode_cuda_graph_max_bs)
             )
-        self._active_page_table = None
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
         if self.is_npu:
@@ -521,8 +527,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 forward_batch.seq_lens.to(torch.int32)
             )
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def _ensure_cuda_graph_page_table(self, max_bs: int):
         if self.is_npu:
+            return
+        if (
+            self._cuda_graph_page_table is not None
+            and self._cuda_graph_page_table.shape[0] >= max_bs
+        ):
             return
         max_num_pages = (
             self.req_to_token.shape[1] + self.page_size - 1
@@ -532,6 +543,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.req_to_token.device,
         )
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        self._ensure_cuda_graph_page_table(max_bs)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
