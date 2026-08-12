@@ -11,6 +11,7 @@ from .compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
+    compress_forward_norm_rope_store,
     compress_norm_rope_store,
 )
 from .compress_old import fused_norm_rope_inplace
@@ -23,7 +24,7 @@ from .elementwise import (
     fused_rope_inplace,
 )
 from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
-from .gemm import linear_bf16_fp32
+from .gemm import linear_bf16_fp32, linear_kv_score
 from .moe import (
     hash_topk,
     mask_topk_ids,
@@ -39,6 +40,7 @@ __all__ = [
     "CompressorDecodePlan",
     "CompressorPrefillPlan",
     "compress_forward",
+    "compress_forward_norm_rope_store",
     "compress_norm_rope_store",
     "clear_unaccepted_c128_draft_states",
     "fused_norm_rope_inplace",
@@ -52,6 +54,7 @@ __all__ = [
     "sglang_per_token_group_quant_fp8_dsv4_wo_a",
     "make_name",
     "linear_bf16_fp32",
+    "linear_kv_score",
     "get_paged_mqa_logits_metadata",
     "triton_create_paged_compress_data",
     "topk_transform_512",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -104,6 +105,16 @@ _FORCE_CK_W8A8: bool = False
 def set_force_ck_w8a8(enabled: bool = True) -> None:
     global _FORCE_CK_W8A8
     _FORCE_CK_W8A8 = enabled
+
+
+# Ask the per-group quant kernel to write bpreshuffle's scale layout directly
+# instead of transposing its output afterwards. The post-kernel transpose moves
+# only a few hundred scale elements but costs a full kernel launch, and it fired
+# 213 times per decode step. Gated so both paths live in one binary and can be
+# A/B'd by env var alone; the two layouts were verified bit-identical.
+_NATIVE_BPRESHUFFLE_SCALE: bool = (
+    os.environ.get("SGLANG_OPT_NATIVE_BPRESHUFFLE_SCALE", "1") == "1"
+)
 
 
 def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -1134,12 +1145,21 @@ def aiter_w8a8_block_fp8_linear(
             x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
         materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+        # Ask the quant kernel for bpreshuffle's layout directly rather than
+        # transposing its output afterwards: the post-kernel copy moves a few
+        # hundred scale elements but costs a full kernel launch, and it ran 213
+        # times per decode step. transpose_scale only changes the order the kernel
+        # writes into the same [M, G] buffer, so logical indexing is restored by
+        # strides alone.
+        native_scale = materialize_bpreshuffle_scale and _NATIVE_BPRESHUFFLE_SCALE
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=False,
+            transpose_scale=native_scale,
         )
-        if materialize_bpreshuffle_scale:
+        if native_scale:
+            x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
+        elif materialize_bpreshuffle_scale:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
 
     if use_triton:

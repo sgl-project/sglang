@@ -1082,6 +1082,13 @@ class Envs:
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
     SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(False)
     SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
+    # HIP only: run the c4 decode compress and its norm + RoPE + fp8 store
+    # as a single kernel. The compressed row they hand between them has no
+    # other consumer, so the fused kernel keeps it in registers. Output is
+    # not bit-identical: the two-kernel chain rounds the compressed row to
+    # bf16 before the norm reads it and the fused kernel keeps it in fp32, so
+    # a small number of fp8 codes land differently. Set to 0 to go back.
+    SGLANG_OPT_FUSE_COMPRESS_NORM_ROPE = EnvBool(True)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
     SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)

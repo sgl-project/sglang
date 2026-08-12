@@ -75,11 +75,20 @@ struct C4Trait {
   static_assert(kHeadDim % kTileDim == 0);
 };
 
-template <typename Trait, bool kUsePDL, typename BufferFloat, typename InputFloat, typename OutFloat>
+// SrcFloat is only how kv_score arrives from the wkv_gate gemm; InputFloat stays
+// the compute dtype and the dtype of score_bias (ape). Splitting them lets that
+// gemm hand over bf16 and skip a widening pass, since this kernel widens on load.
+template <
+    typename Trait,
+    bool kUsePDL,
+    typename BufferFloat,
+    typename InputFloat,
+    typename SrcFloat,
+    typename OutFloat>
 SGL_DEVICE void c4_forward(
     const BufferFloat* kv_buf_0,  // overlap [4n - 4, 4n - 1]
     const BufferFloat* kv_buf_1,  // normal [4n + 0, 4n + 3]
-    const InputFloat* kv_src,     // ragged pointer at position = 4n + 3
+    const SrcFloat* kv_src,       // ragged pointer at position = 4n + 3
     OutFloat* kv_out,
     const InputFloat* score_bias,
     const bool should_overlap,
@@ -97,7 +106,7 @@ SGL_DEVICE void c4_forward(
     bias[i] = gmem_in.load(score_bias + i * Trait::kHeadDim);
   }
 
-  if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
+  if constexpr (std::is_same_v<BufferFloat, InputFloat> && std::is_same_v<SrcFloat, InputFloat>) {
     if (should_overlap) {
       const auto kv_start = kv_src - 7 * Trait::kElementSize;  // point to start
 #pragma unroll
@@ -127,7 +136,9 @@ SGL_DEVICE void c4_forward(
     }
   } else {  // mixed dtype
     using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
+    using StorageSrc = AlignedVector<SrcFloat, kTileElements>;
     const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
+    const auto gmem_src = tile::Memory<StorageSrc>::warp();
     const auto kv_start_0 = kv_src - 7 * Trait::kElementSize;  // point to start
 
 #pragma unroll
@@ -143,8 +154,13 @@ SGL_DEVICE void c4_forward(
         }
       } else if (should_overlap) {
         const auto base = kv_start_0 + i * Trait::kElementSize;
-        kv[i] = gmem_in.load(base);
-        score[i] = gmem_in.load(base + Trait::kScoreOffset);
+        const auto kv_tmp = gmem_src.load(base);
+        const auto score_tmp = gmem_src.load(base + Trait::kScoreOffset);
+#pragma unroll
+        for (int32_t j = 0; j < kTileElements; ++j) {
+          kv[i][j] = cast<InputFloat>(kv_tmp[j]);
+          score[i][j] = cast<InputFloat>(score_tmp[j]);
+        }
       } else {
         [[unlikely]];
         constexpr float kFloatNegInf = -FLT_MAX;
@@ -167,8 +183,13 @@ SGL_DEVICE void c4_forward(
         }
       } else {
         const auto base = kv_start + i * Trait::kElementSize + Trait::kOverlapOffset;
-        kv[i + 4] = gmem_in.load(base);
-        score[i + 4] = gmem_in.load(base + Trait::kScoreOffset);
+        const auto kv_tmp = gmem_src.load(base);
+        const auto score_tmp = gmem_src.load(base + Trait::kScoreOffset);
+#pragma unroll
+        for (int32_t j = 0; j < kTileElements; ++j) {
+          kv[i + 4][j] = cast<InputFloat>(kv_tmp[j]);
+          score[i + 4][j] = cast<InputFloat>(score_tmp[j]);
+        }
       }
     }
   }
@@ -253,7 +274,13 @@ SGL_DEVICE void c4_write_decode(BufferFloat* kv_buf, const InputFloat* kv_src) {
   }
 }
 
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+template <
+    int64_t kHeadDim,
+    typename BufferFloat,
+    typename InputFloat,
+    typename SrcFloat,
+    typename OutFloat,
+    bool kUsePDL>
 C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
@@ -266,7 +293,7 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   if (global_bid >= params.batch_size) return;
 
   const auto plan = params.plan_d[global_bid];
-  const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
+  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
@@ -278,15 +305,21 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   const auto kv_dst = kv_buffer + plan.write_loc * Trait::kElementSize;
 
   PDLWaitPrimary<kUsePDL>();
-  c4_write_decode<Trait, BufferFloat, InputFloat>(kv_dst, kv_src);
+  c4_write_decode<Trait, BufferFloat, SrcFloat>(kv_dst, kv_src);
   if (plan.seq_len % 4 == 0) {
     const auto need_overlap = plan.seq_len > 4;
-    c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
+    c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, SrcFloat, OutFloat>(
         kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, need_overlap, 8);
   }
 }
 
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+template <
+    int64_t kHeadDim,
+    typename BufferFloat,
+    typename InputFloat,
+    typename SrcFloat,
+    typename OutFloat,
+    bool kUsePDL>
 C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
@@ -299,7 +332,7 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   if (global_pid >= params.num_compress) return;
 
   const auto plan = params.plan_c[global_pid];
-  const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
+  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
   const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
@@ -312,15 +345,21 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
   const bool need_overlap = plan.seq_len > 4;
   PDLWaitPrimary<kUsePDL>();
-  c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
+  c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, SrcFloat, OutFloat>(
       kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, need_overlap, plan.buffer_len);
 }
 
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+template <
+    int64_t kHeadDim,
+    typename BufferFloat,
+    typename InputFloat,
+    typename SrcFloat,
+    typename OutFloat,
+    bool kUsePDL>
 WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
-  using StorageInput = AlignedVector<InputFloat, kTileElements>;
+  using StorageInput = AlignedVector<SrcFloat, kTileElements>;
 
   const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t global_wid = global_tid / kWarpThreads;      // warp id
@@ -332,7 +371,7 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   if (global_pid >= params.num_write) return;
 
   const auto plan = params.plan_w[global_pid];
-  const auto kv_input = static_cast<const InputFloat*>(params.kv_input) + split_offset;
+  const auto kv_input = static_cast<const SrcFloat*>(params.kv_input) + split_offset;
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   if (plan.is_invalid()) return;
 
@@ -348,7 +387,7 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
     data[i] = gmem_input.load(kv_src, i);
   }
 
-  if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
+  if constexpr (std::is_same_v<BufferFloat, SrcFloat>) {
     PDLTriggerSecondary<kUsePDL>();
 #pragma unroll
     for (int32_t i = 0; i < 4; ++i) {
@@ -374,11 +413,20 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   }
 }
 
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+template <
+    int64_t kHeadDim,
+    typename BufferFloat,
+    typename InputFloat,
+    typename SrcFloat,
+    typename OutFloat,
+    bool kUsePDL>
 struct FlashCompress4Kernel {
-  static constexpr auto decode_kernel = flash_c4_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_c_kernel = flash_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_w_kernel = write_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto decode_kernel =
+      flash_c4_decode<kHeadDim, BufferFloat, InputFloat, SrcFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_c_kernel =
+      flash_c4_prefill<kHeadDim, BufferFloat, InputFloat, SrcFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_w_kernel =
+      write_c4_prefill<kHeadDim, BufferFloat, InputFloat, SrcFloat, OutFloat, kUsePDL>;
   static constexpr uint32_t kBlockSize = 128;
   static constexpr uint32_t kTileDim = kTileElements * device::kWarpThreads;
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
@@ -402,7 +450,7 @@ struct FlashCompress4Kernel {
         .with_device(device_)
         .verify(kv_buffer);
     TensorMatcher({N, Trait::kElementSize})  // kv score input
-        .with_dtype<InputFloat>()
+        .with_dtype<SrcFloat>()
         .with_device(device_)
         .verify(kv_input);
     TensorMatcher({N, kHeadDim})  // kv compressed output
@@ -449,7 +497,7 @@ struct FlashCompress4Kernel {
         .with_device(device_)
         .verify(kv_buffer);
     TensorMatcher({N, Trait::kElementSize})  // kv score input (ragged)
-        .with_dtype<InputFloat>()
+        .with_dtype<SrcFloat>()
         .with_device(device_)
         .verify(kv_input);
     TensorMatcher({C, kHeadDim})  // kv compressed output (compact)

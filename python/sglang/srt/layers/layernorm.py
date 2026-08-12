@@ -288,8 +288,12 @@ def _forward_with_allreduce_fusion_quant_per_group(
         _use_aiter_bpreshuffle_gfx95 as use_bpreshuffle,
     )
     from sglang.srt.layers.quantization.fp8_utils import (
+        _NATIVE_BPRESHUFFLE_SCALE,
         materialize_bpreshuffle_fp8_scale,
+        view_aiter_fused_rms_transposed_fp8_scale,
     )
+
+    native_scale = use_bpreshuffle and _NATIVE_BPRESHUFFLE_SCALE
 
     if use_attn_tp_group:
         world_size = get_parallel().attn_tp_size
@@ -322,12 +326,16 @@ def _forward_with_allreduce_fusion_quant_per_group(
             return None
         bf16_out, residual_out = fused_result
         per_1x128_quant, fp8_dtype = _get_aiter_per_group_quant()
+        # Let the quant kernel write bpreshuffle's layout instead of transposing
+        # afterwards; the copy is a whole kernel launch for a few hundred elements.
         fp8_out, scale_out = per_1x128_quant(
             bf16_out,
             quant_dtype=fp8_dtype,
-            transpose_scale=False,
+            transpose_scale=native_scale,
         )
-        if use_bpreshuffle:
+        if native_scale:
+            scale_out = view_aiter_fused_rms_transposed_fp8_scale(scale_out)
+        elif use_bpreshuffle:
             scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
         return (fp8_out, scale_out), residual_out
 
@@ -360,9 +368,11 @@ def _forward_with_allreduce_fusion_quant_per_group(
     fp8_out, scale_out = per_1x128_quant(
         bf16_out,
         quant_dtype=fp8_dtype,
-        transpose_scale=False,
+        transpose_scale=native_scale,
     )
-    if use_bpreshuffle:
+    if native_scale:
+        scale_out = view_aiter_fused_rms_transposed_fp8_scale(scale_out)
+    elif use_bpreshuffle:
         scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
     return (bf16_out, fp8_out, scale_out), residual_out
 

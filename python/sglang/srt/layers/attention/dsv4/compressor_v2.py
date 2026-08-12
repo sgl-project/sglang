@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
+    compress_forward_norm_rope_store,
     compress_norm_rope_store,
 )
 from sglang.srt.environ import envs
@@ -174,6 +175,33 @@ class CompressorBackendMixin:
             assert kv_score_buffer.shape[-1] == last_dim
             kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
 
+        # The compressed row is a temporary that only the norm/rope store reads,
+        # so for the one shape that has a fused kernel it never reaches memory.
+        if (
+            _is_hip
+            and envs.SGLANG_OPT_FUSE_COMPRESS_NORM_ROPE.get()
+            and compress_ratio == 4
+            and head_dim in (128, 512)
+            and plan.is_decode
+            and not is_online
+            and not use_fp4_indexer
+        ):
+            compress_forward_norm_rope_store(
+                kv_score_buffer=kv_score_buffer,
+                kv_score_input=kv_score_input,
+                ape=ape.view(-1, head_dim),
+                plan=plan,
+                head_dim=head_dim,
+                norm_weight=norm.weight,
+                norm_eps=norm.variance_epsilon,
+                freq_cis=freqs_cis_cache,
+                out_loc=out_loc,
+                kvcache=kv_cache,
+                page_size=page_size,
+                bf16_store=bf16_store,
+            )
+            return
+
         # Step 1: compress_forward
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
@@ -221,7 +249,8 @@ class CompressorBackendMixin:
         if _is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get():
             self._forward_unified_hip(
                 token_to_kv_pool=token_to_kv_pool,
-                kv_score_input=kv_score_input,
+                # The triton compressor is not built per input dtype.
+                kv_score_input=kv_score_input.to(compressor.ape.dtype),
                 state_pool=state_pool,
                 compressor=compressor,
                 layer_id=layer_id,

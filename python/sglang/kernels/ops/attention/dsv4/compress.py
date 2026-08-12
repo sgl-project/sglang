@@ -73,15 +73,71 @@ def _jit_compress_norm_rope_module(
 
 
 @cache_once
+def _jit_fused_compress4_norm_rope_module(
+    head_dim: int,
+    dtype_buffer: torch.dtype,
+    dtype_in: torch.dtype,
+    dtype_src: torch.dtype,
+    dtype: torch.dtype,
+    page_size: int,
+    bf16_store: bool,
+) -> Module:
+    # dtype_in is what the compressor computes in and the dtype of `ape`;
+    # dtype_src is only how kv_score arrives from the wkv_gate gemm. Keeping them
+    # apart lets that gemm hand over bf16 and skip a widening pass, since the
+    # kernel widens on load anyway.
+    if head_dim == 128:
+        # Indexer variant: head_dim is fixed in the kernel, and the store is
+        # always fp8 (bf16_store is a flashmla-only option).
+        args = make_cpp_args(
+            dtype_buffer,
+            dtype_in,
+            dtype_src,
+            dtype,
+            page_size,
+            is_arch_support_pdl(),
+            (
+                INDEXER_K_CACHE_PRESHUFFLE_TILE
+                if aiter_can_use_preshuffle_paged_mqa()
+                else 0
+            ),
+        )
+        kernel_class = f"FusedCompress4NormRopeIndexerKernel<{args}>"
+    else:
+        args = make_cpp_args(
+            head_dim,
+            dtype_buffer,
+            dtype_in,
+            dtype_src,
+            dtype,
+            page_size,
+            is_arch_support_pdl(),
+            bf16_store,
+        )
+        kernel_class = f"FusedCompress4NormRopeKernel<{args}>"
+    return load_jit(
+        make_name(f"fused_compress4_norm_rope_{head_dim}"),
+        *args,
+        cuda_files=["deepseek_v4/fused_compress4_norm_rope.cuh"],
+        cuda_wrappers=[("decode", f"{kernel_class}::run_decode")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
 def _jit_compress_module(
     head_dim: int,
     dtype_buffer: torch.dtype,
     dtype_in: torch.dtype,
+    dtype_src: torch.dtype,
     dtype_out: torch.dtype,
     ratio: Literal[4, 128],
 ) -> Module:
+    # dtype_in is the compute dtype and the dtype of `ape`; dtype_src is only how
+    # kv_score arrives from the wkv_gate gemm. Keeping them apart lets that gemm
+    # hand over bf16 and skip a widening pass, since the kernel widens on load.
     args = make_cpp_args(
-        head_dim, dtype_buffer, dtype_in, dtype_out, is_arch_support_pdl()
+        head_dim, dtype_buffer, dtype_in, dtype_src, dtype_out, is_arch_support_pdl()
     )
     kernel_class = f"FlashCompress{ratio}Kernel<{args}>"
     return load_jit(
@@ -390,18 +446,34 @@ def compress_forward(
 ) -> torch.Tensor:
     if out is None:
         num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
-        out = kv_score_input.new_empty((num_q_tokens, head_dim))
+        # Follows `ape`, not `kv_score_input`: the latter is only a transport
+        # dtype and may arrive narrower than what the compressor computes in.
+        out = ape.new_empty((num_q_tokens, head_dim))
     assert plan.compress_ratio == compress_ratio
     if is_online:
         assert compress_ratio == 128 and head_dim == 512
+        # The online kernel is not templated on the input dtype.
+        kv_score_input = kv_score_input.to(ape.dtype)
         module = _jit_compress_128_online_module(512, kv_score_buffer.dtype)
     else:
         if _is_xpu:
+            # The XPU entry points are not templated on a source dtype, so a
+            # narrower transport still has to be widened before it is used as
+            # InputFloat.
+            kv_score_input = kv_score_input.to(ape.dtype)
             decode_fn, prefill_fn = _XPU_COMPRESS_FNS[compress_ratio]
         else:
-            dtype_in, dtype_out = kv_score_input.dtype, out.dtype
+            # These kernels take SrcFloat separately, so kv_score_input keeps
+            # its transport dtype and is widened on load inside the kernel.
+            # Materializing a wider copy first would only re-expand values the
+            # gemm already rounded, at the cost of a full-tensor pass.
             module = _jit_compress_module(
-                head_dim, kv_score_buffer.dtype, dtype_in, dtype_out, compress_ratio
+                head_dim,
+                kv_score_buffer.dtype,
+                ape.dtype,
+                kv_score_input.dtype,
+                out.dtype,
+                compress_ratio,
             )
 
     if _is_xpu:
@@ -411,6 +483,55 @@ def compress_forward(
 
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
+
+
+def compress_forward_norm_rope_store(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    *,
+    head_dim: int,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+    bf16_store: bool = False,
+) -> None:
+    """compress_forward + compress_norm_rope_store in a single launch.
+
+    Covers both c4 decode pairings: head_dim 512 (flashmla epilogue) and 128
+    (indexer epilogue). The compressed row they would otherwise write is a
+    temporary with no other consumer, so the fused kernel keeps it in registers
+    and the epilogue reads it from there. That also means the result is not
+    bit-identical to the two-kernel chain, which rounds that row to bf16 on the
+    way out: measured at up to ~1e-4 of fp8 codes differing, by one code.
+    """
+    assert plan.is_decode and plan.compress_ratio == 4 and head_dim in (128, 512)
+    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    module = _jit_fused_compress4_norm_rope_module(
+        head_dim,
+        kv_score_buffer.dtype,
+        ape.dtype,
+        kv_score_input.dtype,
+        norm_weight.dtype,
+        page_size,
+        bf16_store,
+    )
+    module.decode(
+        kv_score_buffer,
+        kv_score_input,
+        ape,
+        plan[1],
+        norm_weight,
+        norm_eps,
+        freq_cis,
+        out_loc,
+        kvcache,
+        plan.compress_ratio,
+    )
 
 
 def compress_norm_rope_store(

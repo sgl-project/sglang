@@ -9,6 +9,7 @@ from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 from sglang.kernels.ops.attention.dsv4 import (
     linear_bf16_fp32,
+    linear_kv_score,
     triton_create_paged_compress_data,
 )
 from sglang.kernels.ops.attention.dsv4.compress_old import (
@@ -421,7 +422,7 @@ class Compressor(BaseFusedOp):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = linear_kv_score(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
