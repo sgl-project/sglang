@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     split_seqs,
     tail_attn_meta,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
@@ -111,7 +112,7 @@ class Flux2FeedForward(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.linear_in" if prefix else "linear_in",
         )
-        self.act_fn = Flux2SwiGLU()
+        self.act_fn = SiluAndMul()
         self.linear_out = RowParallelLinear(
             inner_dim,
             dim_out,
@@ -443,7 +444,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             quant_config=quant_config,
             prefix=f"{prefix}.to_qkv_mlp_proj" if prefix else "to_qkv_mlp_proj",
         )
-        self.mlp_act_fn = Flux2SwiGLU()
+        self.mlp_act_fn = SiluAndMul()
 
         # QK Norm
         self.norm_q = RMSNorm(dim_head, eps=eps)
