@@ -100,12 +100,21 @@ class TestBpreshuffleProducerScaleNoCopy(CustomTestCase):
                 mat = materialize_bpreshuffle_fp8_scale(s_f)
                 self.assertEqual(mat.dim(), 2)
                 self.assertEqual(mat.shape[0], m)
-                self.assertEqual(mat.stride(), (1, m))  # bpreshuffle column-major
 
                 if not emit_transposed_bpreshuffle_scale(m, on_bpreshuffle_gfx95=True):
-                    # M == 1: the transposed emit is skipped by design.
+                    # M == 1: the transposed emit is skipped by design. At M == 1 the
+                    # [1, G] row-major and [G, 1] column-major byte orders coincide,
+                    # so materialize is a no-op that keeps the natural (G, 1) stride
+                    # (NOT the (1, M) column-major stride taken for M >= 2) while
+                    # sharing storage; the scale values must survive intact.
                     self.assertEqual(m, 1)
+                    self.assertEqual(mat.stride(), (s_f.shape[1], 1))  # (G, 1)
+                    self.assertTrue(torch.equal(mat, s_f))
                     continue
+
+                # M >= 2: materialize lands on the bpreshuffle (1, M) column-major
+                # stride.
+                self.assertEqual(mat.stride(), (1, m))
 
                 # Optimized path: same input, transpose_scale=True + no-copy view.
                 torch.manual_seed(m)

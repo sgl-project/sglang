@@ -204,8 +204,13 @@ class TestEmitTransposedBpreshuffleScaleGate(CustomTestCase):
 
     def test_m1_materialize_path_produces_correct_values_and_layout(self):
         # The path M == 1 actually takes: transpose_scale=False output relaid out
-        # by materialize. A single-token scale must survive with its values intact
-        # and the bpreshuffle (1, M) == (1, 1) column-major stride.
+        # by materialize. At M == 1 the [1, G] row-major and [G, 1] column-major
+        # byte orders coincide, so materialize (scale.t().contiguous().t()) is a
+        # no-op: the [G, 1] transpose is already contiguous for the singleton
+        # dimension, so the result keeps the natural (G, 1) stride -- NOT the
+        # (1, M) column-major stride materialize produces for M >= 2 -- and shares
+        # the input's storage. Values must survive; the downstream bpreshuffle GEMM
+        # consumes the same bytes either way.
         self.assertFalse(
             emit_transposed_bpreshuffle_scale(1, on_bpreshuffle_gfx95=True)
         )
@@ -213,7 +218,8 @@ class TestEmitTransposedBpreshuffleScaleGate(CustomTestCase):
         materialized = materialize_bpreshuffle_fp8_scale(scale)
         self.assertTrue(torch.equal(materialized, scale))
         self.assertEqual(materialized.shape, (1, 4))
-        self.assertEqual(materialized.stride(), (1, 1))
+        self.assertEqual(materialized.stride(), (scale.shape[1], 1))  # (G, 1)
+        self.assertEqual(materialized.data_ptr(), scale.data_ptr())  # no-op share
         self.assertTrue(materialized.t().is_contiguous())
 
 
