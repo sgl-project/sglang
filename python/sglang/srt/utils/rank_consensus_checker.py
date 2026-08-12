@@ -195,7 +195,7 @@ def _is_method_with_receiver(func: Any) -> bool:
 
 def _build_payload(
     tag: str,
-    selector: None | bool | list[str],
+    selector: bool | list[str],
     scope: dict[str, Any],
     skip_name: Optional[str] = None,
 ) -> str:
@@ -205,8 +205,6 @@ def _build_payload(
     to drop the receiver (``self`` / ``cls``) from method payloads; explicit
     ``list[str]`` selectors honor exactly what the user listed.
     """
-    if selector is None:
-        return f"<{tag}: no check>"
     if selector is True:
         # Whole scope is the payload. For the call checkpoint, the scope is
         # the arguments dict; for the return checkpoint, the caller wrapped
