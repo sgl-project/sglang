@@ -769,6 +769,27 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual(params["location"], "Mars")
         self.assertEqual(params["unit"], "celsius")
 
+    def test_non_finite_argument_never_emits_invalid_json(self):
+        """A 1e999 literal overflows to inf and json.dumps rendered it as
+        Infinity — parameters no JSON parser accepts, delivered as a
+        successful call. The call is skipped instead."""
+        text = "[get_weather(location='Tokyo', unit=1e999)]"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        for call in result.calls:
+            json.loads(call.parameters)
+        self.assertEqual(result.calls, [])
+
+    def test_unconvertible_argument_skips_only_that_call(self):
+        """A bytes argument is an ast.Constant, so it passed value
+        extraction and only failed later inside json.dumps, escaping to the
+        block-level handler and dropping every parseable sibling call."""
+        text = "[get_weather(location='Tokyo'), search(query=b'raw')]"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Tokyo"})
+
 
 class TestMistralDetector(unittest.TestCase):
     def setUp(self):
