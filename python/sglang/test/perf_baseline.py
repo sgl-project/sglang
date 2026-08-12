@@ -91,8 +91,7 @@ def check_output_throughput(
     else:
         provenance = f" ({baseline.recorded_from})" if baseline.recorded_from else ""
         header += (
-            f"Baseline{provenance}, "
-            f"tolerance {baseline.tolerance * 100:.0f}%.\n\n"
+            f"Baseline{provenance}, tolerance {baseline.tolerance * 100:.0f}%.\n\n"
         )
 
     rows = [
@@ -111,7 +110,9 @@ def check_output_throughput(
 
         if actual is None:
             regressions.append(f"bs={batch_size}: no measurement reported")
-            rows.append(f"| {batch_size} | n/a | {expected:.1f} | {floor:.1f} | MISSING |")
+            rows.append(
+                f"| {batch_size} | n/a | {expected:.1f} | {floor:.1f} | MISSING |"
+            )
             continue
 
         if floor is None:
