@@ -15,6 +15,8 @@ from torch.distributed.fsdp import FSDPModule
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -248,6 +250,13 @@ def _resolve_tp_shard_dim(
     owner = weight_loader.__self__
     if isinstance(owner, ReplicatedLinear):
         return True, None
+    if isinstance(owner, (MergedColumnParallelLinear, QKVParallelLinear)):
+        # These subclass ColumnParallelLinear but hold several logical matrices
+        # in one tensor -- [gate; up], or [q; k; v]. Each is sharded separately,
+        # so this rank's rows are one slice per segment, not one contiguous
+        # slice of the whole tensor. Reading a rank-local slice would take part
+        # of the first segment and none of the rest, with the right shape.
+        return False, None
     if isinstance(owner, ColumnParallelLinear):
         output_dim = actual_param.__dict__.get("output_dim")
         return output_dim is not None, output_dim
