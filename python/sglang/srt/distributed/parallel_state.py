@@ -908,19 +908,22 @@ class GroupCoordinator:
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
         if (
-            self.pcie_ipc_comm is not None
-            and not self.pcie_ipc_comm.disabled
-            and not should_use_pymscclpp_allreduce
-            and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
-        ):
-            return "pcie_ipc"
-        if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
             and self.ca_comm.should_custom_ar(input_)
         ):
             return "ca"
+        # After ``ca``: the PCIe-IPC kernels are for hosts where no fabric-specific
+        # backend applies. They do not probe for NVLink, so on a host that has it
+        # this ordering is what keeps the faster backend in front of them.
+        if (
+            self.pcie_ipc_comm is not None
+            and not self.pcie_ipc_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
+        ):
+            return "pcie_ipc"
         if (
             self.qr_comm is not None
             and not self.qr_comm.disabled
