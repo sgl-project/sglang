@@ -137,6 +137,10 @@ if _is_hip:
     except ImportError:
         _has_rocm_triton_gemma_rms_norm = False
 
+_FUSE_NORM_FP8_QUANT = envs.SGLANG_OPT_FUSE_NORM_FP8_QUANT.get()
+# Only decode-sized batches take the ptpc GEMM that consumes the fused quant.
+_FUSE_NORM_FP8_MAX_M = envs.SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M.get()
+
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
     # (the transformers backend path) to produce outputs that are numerically identical
@@ -1083,7 +1087,12 @@ class GemmaRMSNorm(BaseFusedOp):
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
                 return rocm_triton_gemma_fused_add_rmsnorm(
-                    x, residual, self.weight.data, self.variance_epsilon
+                    x,
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    emit_fp8=_FUSE_NORM_FP8_QUANT
+                    and x.numel() // x.shape[-1] <= _FUSE_NORM_FP8_MAX_M,
                 )
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 

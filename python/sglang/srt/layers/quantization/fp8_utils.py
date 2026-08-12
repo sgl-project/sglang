@@ -1127,6 +1127,11 @@ def aiter_w8a8_block_fp8_linear(
     if input_scale is None:
         ptpc_weight = getattr(weight, "_ptpc_weight", None)
         if ptpc_weight is not None and input_2d.shape[0] <= _MXFP8_DENSE_PTPC_DECODE_M:
+            # (fp8, scale) pre-quantized by the producing fused-add-RMSNorm
+            # kernel (SGLANG_OPT_FUSE_NORM_FP8_QUANT); skips per_token_quant_hip.
+            pre_quant = getattr(input, "_fp8_qinput", None)
+            if pre_quant is not None and pre_quant[0].shape[0] == input_2d.shape[0]:
+                input_2d = pre_quant
             out = apply_fp8_ptpc_linear(
                 input=input_2d,
                 weight=ptpc_weight,

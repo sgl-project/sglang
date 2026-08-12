@@ -703,6 +703,10 @@ class Envs:
     # dense linear through the rowwise-fp8 aiter GEMM above instead of the
     # block-fp8 GEMM (fast at large M). Takes precedence over the BF16 hybrid.
     SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M = EnvInt(0)
+    # Fuse the per-token fp8 quant of the ptpc decode path above into the
+    # producing Gemma fused-add-RMSNorm Triton kernel; the consumer GEMM picks
+    # the (fp8, scale) pair off the norm output instead of re-quantizing.
+    SGLANG_OPT_FUSE_NORM_FP8_QUANT = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
