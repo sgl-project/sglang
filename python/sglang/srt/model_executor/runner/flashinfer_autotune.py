@@ -171,16 +171,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
-    from flashinfer.autotuner import autotune
-
-    # flashinfer #3186/#3187: pin every TP rank to the same autotune tactic so their
-    # symm-mem scratch sizes match; divergent tactics deadlock ncclCommWindowRegister
-    # during CUDA-graph capture under --enable-symm-mem (e.g. Qwen3-235B TP=8).
-    # None on flashinfer < 0.6.16 -> guarded no-op below.
-    try:
-        from flashinfer.autotuner import set_autotune_process_group
-    except ImportError:
-        set_autotune_process_group = None
+    from flashinfer.autotuner import autotune, set_autotune_process_group
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
@@ -198,7 +189,10 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             autotune_cache,
         )
 
-    sync_autotune_group = set_autotune_process_group is not None and mr.ps.tp_size > 1
+    # flashinfer #3186/#3187: pin every TP rank to the same autotune tactic so their
+    # symm-mem scratch sizes match; divergent tactics deadlock ncclCommWindowRegister
+    # during CUDA-graph capture under --enable-symm-mem (e.g. Qwen3-235B TP=8).
+    sync_autotune_group = mr.ps.tp_size > 1
     try:
         if sync_autotune_group:
             set_autotune_process_group(mr.tp_group.cpu_group)

@@ -37,17 +37,12 @@ def _make_model_runner(tp_size):
 
 
 @contextlib.contextmanager
-def _patched_flashinfer(*, has_set_group):
-    """Inject a fake ``flashinfer.autotuner`` and stub torch cuda/stream calls.
-
-    ``has_set_group=False`` omits ``set_autotune_process_group`` so the context
-    manager's guarded import falls back to ``None`` (pre-0.6.16 flashinfer).
-    """
+def _patched_flashinfer():
+    """Inject a fake ``flashinfer.autotuner`` and stub torch cuda/stream calls."""
     autotuner = types.ModuleType("flashinfer.autotuner")
     autotuner.autotune = lambda *a, **k: contextlib.nullcontext()
     set_group = MagicMock(name="set_autotune_process_group")
-    if has_set_group:
-        autotuner.set_autotune_process_group = set_group
+    autotuner.set_autotune_process_group = set_group
 
     flashinfer = types.ModuleType("flashinfer")
     flashinfer.autotuner = autotuner
@@ -86,7 +81,7 @@ class TestFlashinferAutotuneTPSync(CustomTestCase):
     def test_tp_gt_1_sets_on_entry_and_resets_on_exit(self):
         ctx = self._ctx()
         mr = _make_model_runner(tp_size=8)
-        with _patched_flashinfer(has_set_group=True) as set_group:
+        with _patched_flashinfer() as set_group:
             with ctx(mr, run_lm_head=False):
                 # entry: called once with the gloo cpu_group sentinel
                 set_group.assert_called_once_with(mr.tp_group.cpu_group)
@@ -99,7 +94,7 @@ class TestFlashinferAutotuneTPSync(CustomTestCase):
     def test_tp_eq_1_never_syncs(self):
         ctx = self._ctx()
         mr = _make_model_runner(tp_size=1)
-        with _patched_flashinfer(has_set_group=True) as set_group:
+        with _patched_flashinfer() as set_group:
             with ctx(mr, run_lm_head=False):
                 pass
             set_group.assert_not_called()
@@ -107,7 +102,7 @@ class TestFlashinferAutotuneTPSync(CustomTestCase):
     def test_reset_runs_when_body_raises(self):
         ctx = self._ctx()
         mr = _make_model_runner(tp_size=4)
-        with _patched_flashinfer(has_set_group=True) as set_group:
+        with _patched_flashinfer() as set_group:
             with self.assertRaises(RuntimeError):
                 with ctx(mr, run_lm_head=False):
                     raise RuntimeError("boom")
@@ -117,16 +112,14 @@ class TestFlashinferAutotuneTPSync(CustomTestCase):
                 [call(mr.tp_group.cpu_group), call(None)],
             )
 
-    def test_missing_symbol_is_noop(self):
+    def test_body_runs_inside_the_sync(self):
         ctx = self._ctx()
         mr = _make_model_runner(tp_size=8)
         ran = []
-        with _patched_flashinfer(has_set_group=False) as set_group:
+        with _patched_flashinfer():
             with ctx(mr, run_lm_head=False):
                 ran.append(True)
-        # body executed and the (absent) symbol was never invoked
         self.assertEqual(ran, [True])
-        set_group.assert_not_called()
 
 
 if __name__ == "__main__":
