@@ -40,7 +40,9 @@ class LTX25PipelineConfig(LTX2PipelineConfig):
     `default_sigmas`.
     """
 
-    task_type: ModelTaskType = ModelTaskType.T2V
+    # Like LTX-2, one checkpoint drives both text-to-video and image-conditioned
+    # generation, so this must stay TI2V -- T2V rejects `--image-path` outright.
+    task_type: ModelTaskType = ModelTaskType.TI2V
 
     dit_config: LTX25Config = field(default_factory=LTX25Config)
     vae_config: LTX25VideoVAEConfig = field(default_factory=LTX25VideoVAEConfig)

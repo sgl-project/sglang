@@ -254,5 +254,79 @@ class TestLTX25PipelineConfig(unittest.TestCase):
         )
 
 
+class TestLTX25ImageConditioningCRF(unittest.TestCase):
+    """LTX-2.5 trained image conditioning at CRF 18; LTX-2 / 2.3 at 33.
+
+    Getting this wrong does not raise -- it just feeds the model conditioning
+    images from the wrong compression distribution.
+    """
+
+    def _crf_for(self, model_path):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+            LTX2ImageEncodingStage,
+        )
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        server_args = ServerArgs.from_kwargs(model_path=model_path, num_gpus=1)
+        return LTX2ImageEncodingStage._resolve_image_conditioning_crf(server_args)
+
+    def test_ltx_2_5_uses_crf_18(self):
+        self.assertEqual(self._crf_for("Lightricks/LTX-2.5-Diffusers"), 18)
+
+    def test_earlier_ltx_generations_use_crf_33(self):
+        self.assertEqual(self._crf_for("Lightricks/LTX-2"), 33)
+        self.assertEqual(self._crf_for("Lightricks/LTX-2.3"), 33)
+
+
+class TestLTX25DurationHead(unittest.TestCase):
+    """Frame counts must land on the VAE's causal temporal grid (8k + 1)."""
+
+    def _head(self):
+        import torch
+
+        from sglang.multimodal_gen.configs.models.adapter.ltx_2_duration_head import (
+            LTX2DurationHeadConfig,
+        )
+        from sglang.multimodal_gen.runtime.models.adapter.ltx_2_duration_head import (
+            LTX2DurationHead,
+        )
+
+        with torch.device("meta"):
+            return LTX2DurationHead(LTX2DurationHeadConfig())
+
+    def test_predicted_frames_land_on_the_temporal_grid(self):
+        from unittest import mock
+
+        import torch
+
+        head = self._head()
+        for seconds in (1.0, 2.7, 3.28125, 7.5, 19.9):
+            with mock.patch.object(
+                head, "forward", return_value=torch.tensor([seconds])
+            ):
+                n = head.predict_num_frames(
+                    frame_rate=24.0, temporal_compression_ratio=8
+                )
+            self.assertEqual((n - 1) % 8, 0, f"{n} frames is off-grid for {seconds}s")
+            self.assertGreaterEqual(n, 1)
+
+    def test_prediction_is_clamped_to_bounds(self):
+        from unittest import mock
+
+        import torch
+
+        head = self._head()
+        with mock.patch.object(head, "forward", return_value=torch.tensor([100.0])):
+            n = head.predict_num_frames(
+                frame_rate=24.0, temporal_compression_ratio=8, max_seconds=5.0
+            )
+        self.assertLessEqual(n / 24.0, 5.0)
+        self.assertEqual((n - 1) % 8, 0)
+
+    def test_requires_at_least_one_modality(self):
+        with self.assertRaises(ValueError):
+            self._head()(None, None)
+
+
 if __name__ == "__main__":
     unittest.main()

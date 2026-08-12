@@ -1,3 +1,4 @@
+import json
 import math
 import os
 
@@ -42,6 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     LTX2AVDecodingStage,
     LTX2AVDenoisingStage,
     LTX2AVLatentPreparationStage,
+    LTX2DurationStage,
     LTX2HalveResolutionStage,
     LTX2LoRASwitchStage,
     LTX2RefinementStage,
@@ -234,6 +236,11 @@ def _add_ltx2_front_stages(pipeline: ComposedPipelineBase):
             LTX2TextConnectorStage(connectors=pipeline.get_module("connectors")),
         ]
     )
+    # LTX-2.5 only. Must run before latent preparation, which derives shapes from
+    # `num_frames`. A no-op unless the request sets `auto_duration`.
+    duration_head = pipeline.get_module("duration_head", None)
+    if duration_head is not None:
+        pipeline.add_stage(LTX2DurationStage(duration_head=duration_head))
 
 
 def _add_ltx2_stage1_generation_stages(
@@ -327,6 +334,33 @@ class _BaseLTX2Pipeline(LoRAPipeline):
         "vocoder",
         "connectors",
     ]
+
+    def __init__(self, model_path, server_args, required_config_modules=None, **kwargs):
+        # The duration head ships from LTX-2.5 onward and is absent from LTX-2 /
+        # LTX-2.3 checkpoints, so it can only be required when the model
+        # actually declares it.
+        modules = list(required_config_modules or self._required_config_modules)
+        if "duration_head" not in modules and self._declares_duration_head(
+            model_path, server_args
+        ):
+            modules.append("duration_head")
+        super().__init__(
+            model_path, server_args, required_config_modules=modules, **kwargs
+        )
+
+    @staticmethod
+    def _declares_duration_head(model_path: str, server_args: ServerArgs) -> bool:
+        index_path = os.path.join(str(model_path), "model_index.json")
+        if not os.path.exists(index_path):
+            return False
+        try:
+            with open(index_path) as f:
+                model_index = json.load(f)
+        except (OSError, ValueError):
+            return False
+        entry = model_index.get("duration_head")
+        # model_index.json records absent optional components as [null, null].
+        return bool(entry) and entry[0] is not None
 
     def initialize_pipeline(self, server_args: ServerArgs):
         orig = self.get_module("scheduler")

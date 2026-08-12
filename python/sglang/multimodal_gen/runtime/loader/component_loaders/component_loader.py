@@ -403,7 +403,9 @@ class ComponentLoader(ABC):
         self, transformers_or_diffusers: str, component_name: str
     ) -> str:
         # NOTE(FlamingoPg): special for LTX-2 models
-        if component_name == "vocoder" or component_name == "connectors":
+        # `model_index.json` records these under an `ltx2` library that is not a
+        # real importable package; SGLang implements them natively.
+        if component_name in ("vocoder", "connectors", "duration_head"):
             transformers_or_diffusers = "diffusers"
 
         # NOTE(CloudRipple): special for MOVA models

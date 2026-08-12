@@ -7,6 +7,9 @@ from safetensors.torch import load_file as safetensors_load_file
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
     LTX2ConnectorConfig,
 )
+from sglang.multimodal_gen.configs.models.adapter.ltx_2_duration_head import (
+    LTX2DurationHeadConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -29,14 +32,25 @@ class AdapterLoader(ComponentLoader):
 
     This loader intentionally avoids FSDP sharding and just:
     1) Instantiates the module from `config.json`.
-    2) Loads a single safetensors state_dict.
+    2) Loads the safetensors state_dict (single-file or sharded).
     """
 
-    component_names = ["connectors"]
+    component_names = ["connectors", "duration_head"]
     expected_library = "diffusers"
 
+    # Each adapter carries its own arch config; `update_model_arch` then fills it
+    # straight from the component's `config.json`.
+    _CONFIG_CLASSES = {
+        "connectors": LTX2ConnectorConfig,
+        "duration_head": LTX2DurationHeadConfig,
+    }
+
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str = "connectors",
+        *args,
     ):
         config = get_diffusers_component_config(component_path=component_model_path)
 
@@ -50,24 +64,23 @@ class AdapterLoader(ComponentLoader):
         config.pop("_diffusers_version", None)
         config.pop("_name_or_path", None)
 
-        server_args.model_paths["connectors"] = component_model_path
+        server_args.model_paths[component_name] = component_model_path
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         target_device = get_local_torch_device()
         default_dtype = resolve_precision(
-            server_args, "connectors", precision_attr="dit_precision"
+            server_args, component_name, precision_attr="dit_precision"
         )
 
+        config_cls = self._CONFIG_CLASSES[component_name]
         with set_default_torch_dtype(default_dtype), skip_init_modules():
-            connector_cfg = LTX2ConnectorConfig()
-            connector_cfg.update_model_arch(config)
-            model = model_cls(connector_cfg).to(
-                device=target_device, dtype=default_dtype
-            )
+            adapter_cfg = config_cls()
+            adapter_cfg.update_model_arch(config)
+            model = model_cls(adapter_cfg).to(device=target_device, dtype=default_dtype)
 
         loaded = self._load_connector_state_dict(component_model_path)
-        mapping = connector_cfg.arch_config.param_names_mapping
+        mapping = adapter_cfg.arch_config.param_names_mapping
         loaded = {_remap_connector_key(k, mapping): v for k, v in loaded.items()}
 
         missing, unexpected = model.load_state_dict(loaded, strict=False)
@@ -77,10 +90,10 @@ class AdapterLoader(ComponentLoader):
         # embeddings, so fail loudly here instead.
         if missing or unexpected:
             raise ValueError(
-                f"Connector weights at '{component_model_path}' do not match the "
+                f"Adapter weights at '{component_model_path}' do not match the "
                 f"instantiated {cls_name}. Missing: {sorted(missing)}. "
                 f"Unexpected: {sorted(unexpected)}. This usually means the "
-                "connector config or its weight-name mapping is wrong."
+                "adapter config or its weight-name mapping is wrong."
             )
 
         return model

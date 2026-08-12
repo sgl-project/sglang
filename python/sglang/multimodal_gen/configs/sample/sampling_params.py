@@ -180,6 +180,12 @@ class SamplingParams:
     width: int | None = None
     fps: int = 24
 
+    # LTX-2.5 duration head. Only the LTX-2.5 pipeline acts on these; other
+    # models ignore them, so the CLI flag stays universally accepted.
+    auto_duration: bool = False
+    auto_duration_min_seconds: float = 1.0
+    auto_duration_max_seconds: float = 20.0
+
     # Resolution validation
     supported_resolutions: list[tuple[int, int]] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
@@ -880,6 +886,11 @@ class SamplingParams:
             return parser.add_argument(*name_or_flags, **kwargs)
 
         add_argument("--data-type", type=str, nargs="+")
+        # LTX-2.5 duration head: predict the shot length from the caption and
+        # override `--num-frames`. Ignored by checkpoints without the head.
+        add_argument("--auto-duration", action="store_true")
+        add_argument("--auto-duration-min-seconds", type=float)
+        add_argument("--auto-duration-max-seconds", type=float)
         add_argument(
             "--num-frames-round-down",
             action="store_true",

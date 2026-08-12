@@ -25,6 +25,10 @@ class LTX25SamplingParams(LTX2SamplingParams):
     fps: int = 24
 
     guidance_scale: float = 1.0
+
+    # `auto_duration` (on the base SamplingParams) makes the duration head
+    # predict the shot length the caption implies, overriding num_frames.
+    # Upstream expresses the same thing by omitting `num_frames` entirely.
     # Matches len(DISTILLED_SIGMA_VALUES); the schedule itself is pinned by the
     # pipeline config, so this only keeps the reported step count honest.
     num_inference_steps: int = 8

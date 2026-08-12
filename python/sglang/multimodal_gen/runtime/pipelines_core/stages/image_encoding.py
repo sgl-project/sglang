@@ -535,6 +535,23 @@ class LTX2ImageEncodingStage(PipelineStage):
 
     # -- image preprocessing ---------------------------------------------
 
+    # Conditioning images are re-compressed to match the compression the model
+    # was trained against. LTX-2 / 2.3 trained at CRF 33; LTX-2.5 at 18.
+    # Upstream keys this off the text-encoder generation
+    # (`resolve_default_image_crf`), which is the only signal that distinguishes
+    # them -- Gemma 3 for <= 2.3, Gemma 4 for 2.5.
+    _DEFAULT_IMAGE_CRF = 33
+    _LTX_2_5_IMAGE_CRF = 18
+    _GEMMA_4_MODEL_TYPES = ("gemma4_unified", "gemma4")
+
+    @classmethod
+    def _resolve_image_conditioning_crf(cls, server_args: ServerArgs) -> int:
+        text_encoder_configs = server_args.pipeline_config.text_encoder_configs
+        for encoder_config in text_encoder_configs:
+            if encoder_config.prefix in ("gemma_4_unified", "gemma_4"):
+                return cls._LTX_2_5_IMAGE_CRF
+        return cls._DEFAULT_IMAGE_CRF
+
     @staticmethod
     def _apply_video_codec_compression(
         img_array: np.ndarray, crf: int = 33
@@ -704,11 +721,12 @@ class LTX2ImageEncodingStage(PipelineStage):
         from sglang.multimodal_gen.runtime.utils.vision import load_image
 
         # 1. Load images, apply codec compression, resize for condition_image
+        crf = self._resolve_image_conditioning_crf(server_args)
         conditioned_imgs = []
         for image_path in image_paths:
             img = load_image(image_path)
             arr = np.array(img).astype(np.uint8)[..., :3]
-            arr = self._apply_video_codec_compression(arr, crf=33)
+            arr = self._apply_video_codec_compression(arr, crf=crf)
             conditioned_img = PIL.Image.fromarray(arr)
             conditioned_imgs.append(conditioned_img)
         batch.condition_image = [
