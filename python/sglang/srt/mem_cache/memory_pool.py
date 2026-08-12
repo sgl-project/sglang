@@ -306,8 +306,14 @@ class ReqToTokenPool:
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
             return None
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
+        if need_size > 0:
+            # Pop from the tail: O(need_size), unlike a prefix pop which is
+            # O(len(free_slots)).
+            select_index = self.free_slots[-need_size:]
+            del self.free_slots[-need_size:]
+        else:
+            # Handled separately: free_slots[-0:] is the entire list, not [].
+            select_index = []
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
@@ -1388,14 +1394,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             return mamba_next_track_idx
 
     def get_mamba_ping_pong_keep_idx(self, req: Req) -> int:
-        """Return the ping-pong index holding the most recent tracked state.
-
-        In lazy mode the valid state stays at next_track_idx (no eager swap).
-        In normal mode it is at the "other" index (swapped after each track).
-        """
-        if self.enable_mamba_extra_buffer_lazy:
-            return req.mamba_next_track_idx
-        return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+        """Return the ping-pong index holding the most recent tracked state."""
+        return req.mamba_last_track_idx
 
     def _alloc_ping_pong_buffer(self, req: Req):
         """Allocate the ping-pong track buffer for a new request.
@@ -1422,6 +1422,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         buf[:n] = slots
         req.mamba_ping_pong_track_buffer = buf
         req.mamba_next_track_idx = 0
+        req.mamba_last_track_idx = (
+            0
+            if self.enable_mamba_extra_buffer_lazy
+            else self.get_mamba_ping_pong_other_idx(0)
+        )
 
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
@@ -1442,8 +1447,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         Returns the old slot index (shape [1]) for cache insertion and
         replaces it with new_slot so the request can continue tracking.
-        In lazy mode the valid state is at next_track_idx; in normal mode
-        it is at the "other" index.
         """
         donate_idx = self.get_mamba_ping_pong_keep_idx(req)
         mamba_value_donated = (
@@ -1512,6 +1515,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             # tensor on the req side while the new pool slot leaks).
             req.mamba_ping_pong_track_buffer = None
             req.mamba_next_track_idx = None
+            req.mamba_last_track_idx = None
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
@@ -2298,6 +2302,13 @@ class MHATokenToKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_value_buffer(layer_id)
+
+    def get_v_head_dim(self):
+        # Every layer in this pool is full-attention, so the value head dim is
+        # uniform and known at construction. Mirrors HybridLinearKVPool's
+        # get_v_head_dim() so the TritonAttnBackend mambaish branch works when a
+        # mamba2 config is served by a plain MHA pool (no per-linear-layer split).
+        return self.v_head_dim
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -3869,7 +3880,11 @@ class HybridLinearKVPool(KVCache):
             )
 
     def get_v_head_dim(self):
-        return self.full_kv_pool.get_value_buffer(0).shape[-1]
+        # Use start_layer to handle pipeline parallelism where layer 0
+        # may not be present in this stage's buffer.
+        return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
+            -1
+        ]
 
     def set_mla_kv_buffer(
         self,
@@ -4991,4 +5006,6 @@ class MiniMaxSparseKVPool(KVCache):
         )
 
     def get_v_head_dim(self):
-        return self.main_pool.get_value_buffer(0).shape[-1]
+        # Use start_layer to handle pipeline parallelism where layer 0
+        # may not be present in this stage's buffer.
+        return self.main_pool.get_value_buffer(self.main_pool.start_layer).shape[-1]
