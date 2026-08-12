@@ -28,6 +28,7 @@ from sglang.srt.multimodal.cache import (
     CacheReservation,
     MediaSnapshot,
     build_artifact_key,
+    build_feature_hash,
     parse_content_hash,
     snapshot_media,
 )
@@ -545,12 +546,13 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     ) -> KimiK3ImageArtifact:
         item = MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
         item.set_pad_value()
+        feature_hash = build_feature_hash(artifact_key, item.hash)
         if not self.keep_mm_features_on_device and feature.device.type != "cpu":
             feature = feature.cpu()
         return KimiK3ImageArtifact(
             content_digest=content_digest,
             artifact_key=artifact_key,
-            feature_hash=item.hash,
+            feature_hash=feature_hash,
             original_size=original_size,
             resize_config=KimiK3ResizeConfig.from_dict(resize_config),
             grid_thw=grid_thw,
