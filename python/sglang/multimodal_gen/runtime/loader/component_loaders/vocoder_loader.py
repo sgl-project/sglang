@@ -1,6 +1,5 @@
 from safetensors.torch import load_file as safetensors_load_file
 
-from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -24,11 +23,6 @@ logger = init_logger(__name__)
 class VocoderLoader(ComponentLoader):
     component_names = ["vocoder"]
     expected_library = "diffusers"
-
-    def should_offload(
-        self, server_args: ServerArgs, model_config: ModelConfig | None = None
-    ):
-        return server_args.vae_cpu_offload
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
@@ -55,7 +49,7 @@ class VocoderLoader(ComponentLoader):
             else PRECISION_TO_TYPE["fp32"]
         )
 
-        should_offload = self.should_offload(server_args)
+        should_offload = server_args.should_cpu_offload_component(component_name)
         target_device = self.target_device(should_offload)
 
         with set_default_torch_dtype(vocoder_dtype), skip_init_modules():
