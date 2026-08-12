@@ -941,6 +941,9 @@ class Req(ReqDllmMixin):
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # End one prefill chunk at this Full-KV-derived boundary so the SWA
+        # window can be inserted into the unified radix tree.
+        self.swa_branching_seqlen: Optional[int] = None
         # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -1373,6 +1376,7 @@ class Req(ReqDllmMixin):
                 self.swa_host_hit_length,
                 self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
+                self.swa_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
@@ -1382,6 +1386,7 @@ class Req(ReqDllmMixin):
                 match_result.swa_host_hit_length,
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
+                match_result.swa_branching_seqlen,
             )
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
@@ -1693,6 +1698,7 @@ class Req(ReqDllmMixin):
         self.mamba_last_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.swa_branching_seqlen = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0

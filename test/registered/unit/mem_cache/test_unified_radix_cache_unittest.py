@@ -3736,6 +3736,72 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, len(leaf.key))
 
+    def test_swa_branching_seqlen_uses_deeper_full_hit(self):
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 1
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        window = self.cfg.sliding_window_size
+        prefix = self._make_seq(1, window)
+        tokens = prefix + self._make_seq(1000, window + 1)
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+
+        leaf = cache.resolve_node_handle(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).last_device_node
+        )
+        leaf.component_data[ComponentType.SWA].value = None
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertEqual(result.full_kv_hit_length, len(tokens))
+        self.assertEqual(result.swa_branching_seqlen, len(tokens))
+
+    def test_swa_branching_seqlen_uses_host_full_hit(self):
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 1
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        window = self.cfg.sliding_window_size
+        prefix = self._make_seq(1, window)
+        tokens = prefix + self._make_seq(1000, window + 1)
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+
+        leaf = cache.resolve_node_handle(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).last_device_node
+        )
+        parent = leaf.parent
+        self._backup_node(cache, leaf)
+        lock_result = cache.inc_lock_ref(parent.id)
+        try:
+            cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        finally:
+            cache.dec_lock_ref(parent.id, lock_result.to_dec_params())
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        cache.components[ComponentType.SWA].evict_component(
+            leaf, device_frees, host_frees, target=EvictLayer.HOST
+        )
+        cache._free_values(device_frees, host_frees)
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertEqual(result.full_kv_hit_length, len(tokens))
+        self.assertEqual(result.swa_branching_seqlen, len(tokens))
+
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")

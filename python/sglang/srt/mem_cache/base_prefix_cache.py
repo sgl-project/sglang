@@ -189,6 +189,9 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        swa_branching_seqlen: The deepest page-aligned Full-KV hit that can be
+                              materialized as an SWA branch by ending a prefill
+                              chunk at that position.
         full_kv_hit_length: Longest Full-KV prefix available on either device or
                             host, independent of other components.
     """
@@ -201,6 +204,7 @@ class MatchResult(NamedTuple):
     swa_host_hit_length: int = 0
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
+    swa_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
@@ -224,6 +228,7 @@ def zero_match_result(
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
+        swa_branching_seqlen=None,
         full_kv_hit_length=0,
     )
 

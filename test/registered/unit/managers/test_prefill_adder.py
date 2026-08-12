@@ -119,6 +119,15 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
 
+    def test_cap_chunk_at_swa_branch(self):
+        req = SimpleNamespace(prefix_indices=list(range(4)), swa_branching_seqlen=10)
+
+        self.assertEqual(PrefillAdder._cap_chunk_at_swa_branch(req, 8), 6)
+
+        req.prefix_indices = list(range(10))
+        self.assertEqual(PrefillAdder._cap_chunk_at_swa_branch(req, 8), 8)
+        self.assertIsNone(req.swa_branching_seqlen)
+
     def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),

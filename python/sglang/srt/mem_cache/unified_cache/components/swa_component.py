@@ -232,10 +232,20 @@ class SWAComponent(TreeComponent):
         best_value_len: int,
     ) -> MatchResult:
         ct = self.component_type
+        root = self.tree_core.root_node
+        swa_boundary_len = 0
+        node = result.best_match_node
+        while node is not root:
+            swa_boundary_len += len(node.key)
+            node = node.parent
+
+        page_size = self.tree_core.page_size
+        aligned_seqlen = (result.full_kv_hit_length // page_size) * page_size
+        branching_seqlen = aligned_seqlen if aligned_seqlen > swa_boundary_len else None
+
         n_swa = 0
         swa_host_hit = 0
         node = result.best_match_node
-        root = self.tree_core.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
             if cd.value is not None:
@@ -253,10 +263,10 @@ class SWAComponent(TreeComponent):
                 break
             node = node.parent
         if swa_host_hit > 0:
-            return result._replace(
-                swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit)
+            result = result._replace(
+                swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit),
             )
-        return result
+        return result._replace(swa_branching_seqlen=branching_seqlen)
 
     def update_component_on_insert_overlap(
         self,

@@ -63,6 +63,7 @@ class SessionSlot:
     mamba_last_track_idx: Any = None
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
+    swa_branching_seqlen: Any = None
 
     @property
     def is_holding_kv(self) -> bool:
@@ -87,6 +88,7 @@ class SessionSlot:
         self.mamba_last_track_idx = req.mamba_last_track_idx
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
+        self.swa_branching_seqlen = req.swa_branching_seqlen
 
         # Ownership has transferred to the slot. Null *all* of the req's
         # references so any later alloc()/free path that inspects the req
@@ -104,6 +106,7 @@ class SessionSlot:
         req.mamba_last_track_idx = None
         req.mamba_last_track_seqlen = None
         req.mamba_branching_seqlen = None
+        req.swa_branching_seqlen = None
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
@@ -119,6 +122,7 @@ class SessionSlot:
         req.mamba_last_track_idx = self.mamba_last_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
+        req.swa_branching_seqlen = self.swa_branching_seqlen
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
         # from the slot. During chunked prefill, a request may be rejected by
