@@ -98,5 +98,35 @@ def test_qknorm(batch_size: int, n_k: int, n_q: int, head_dim: int) -> None:
     triton.testing.assert_close(q_k_aot[1], q_k_jit[1], atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_qknorm_accepts_strided_views(head_dim: int) -> None:
+    """q and k may be views of one interleaved projection output.
+
+    A QKV projection whose weight keeps the checkpoint's per-head [q, k, v] row
+    order emits [rows, heads, 3, head_dim], and q/k are its views: contiguous on
+    the last axis only, with a 3*head_dim head stride. The kernel takes the head
+    stride as a symbol, so normalising those views has to match normalising
+    dense copies, bit for bit -- it is the same arithmetic on the same values.
+    """
+    rows, heads = 17, 8
+    torch.manual_seed(0)
+    qkv = torch.randn(rows, heads, 3, head_dim, device=DEVICE, dtype=DTYPE)
+    q, k = qkv[:, :, 0], qkv[:, :, 1]
+    assert q.stride(-2) == 3 * head_dim and q.stride(-1) == 1
+    v_before = qkv[:, :, 2].clone()
+
+    q_dense, k_dense = q.contiguous(), k.contiguous()
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+
+    sglang_jit_qknorm(q, k, q_weight, k_weight)
+    sglang_jit_qknorm(q_dense, k_dense, q_weight, k_weight)
+
+    assert torch.equal(q, q_dense)
+    assert torch.equal(k, k_dense)
+    # The rows between q and k belong to v; an over-wide write would land there.
+    assert torch.equal(qkv[:, :, 2], v_before)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

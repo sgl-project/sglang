@@ -19,9 +19,13 @@ namespace sglang {
 
 struct QKNormParams {
   void* __restrict__ q;
-  void* __restrict__ k;  // k is offset by (-num_qo_heads * head_dim) elements
+  void* __restrict__ k;  // k is offset by (-num_qo_heads * head_stride) elements
   int64_t q_stride;
   int64_t k_stride;
+  // Elements between consecutive heads. Equal to head_dim when q and k are their
+  // own tensors, larger when they are views into an interleaved [.., h, 3, d]
+  // projection output. Shared by q and k, which the matcher enforces.
+  int64_t head_stride;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
   float eps;
@@ -40,7 +44,8 @@ __global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
   using Storage = norm::StorageType<Float, kHeadDim>;
 
   static_assert(sizeof(Float) == 2, "Only support FP16/BF16");
-  const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] = params;
+  const auto& [q, k, q_stride, k_stride, head_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] =
+      params;
 
   const auto num_blks = gridDim.x;
   const auto num_workers = num_blks * kWarpsPerBlock;
@@ -55,8 +60,8 @@ __global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
     const int64_t token_id = idx / num_q_and_k_heads;
     const int64_t head_id = idx % num_q_and_k_heads;
     const auto load_q = head_id < num_qo_heads;
-    const auto input = load_q ? pointer::offset(q, 2 * (token_id * q_stride + head_id * kHeadDim))
-                              : pointer::offset(k, 2 * (token_id * k_stride + head_id * kHeadDim));
+    const auto input = load_q ? pointer::offset(q, 2 * (token_id * q_stride + head_id * head_stride))
+                              : pointer::offset(k, 2 * (token_id * k_stride + head_id * head_stride));
     const auto weight = load_q ? q_weight : k_weight;
     const auto input_vec = gmem.load(input);
     const auto weight_vec = gmem.load(weight);
@@ -77,7 +82,8 @@ __global__ void fused_qknorm_cta(const QKNormParams __grid_constant__ params) {
   constexpr auto kNumWarps = kNumThreads / kWarpThreads;
 
   static_assert(sizeof(Float) == 2, "Only support FP16/BF16");
-  const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] = params;
+  const auto& [q, k, q_stride, k_stride, head_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] =
+      params;
 
   const auto num_q_and_k_heads = num_qo_heads + num_kv_heads;
   const auto num_works = num_q_and_k_heads * num_tokens;
@@ -90,8 +96,8 @@ __global__ void fused_qknorm_cta(const QKNormParams __grid_constant__ params) {
     const int64_t token_id = idx / num_q_and_k_heads;
     const int64_t head_id = idx % num_q_and_k_heads;
     const auto load_q = head_id < num_qo_heads;
-    const auto input = load_q ? pointer::offset(q, 2 * (token_id * q_stride + head_id * kHeadDim))
-                              : pointer::offset(k, 2 * (token_id * k_stride + head_id * kHeadDim));
+    const auto input = load_q ? pointer::offset(q, 2 * (token_id * q_stride + head_id * head_stride))
+                              : pointer::offset(k, 2 * (token_id * k_stride + head_id * head_stride));
     const auto weight = load_q ? q_weight : k_weight;
     const auto input_vec = gmem.load(input);
     const auto weight_vec = gmem.load(weight);
@@ -123,17 +129,18 @@ struct QKNormKernelWarp {
     auto D = SymbolicSize{"head_dim"};
     auto Sq = SymbolicSize{"q_stride"};
     auto Sk = SymbolicSize{"k_stride"};
+    auto Sd = SymbolicSize{"head_stride"};
     auto device = SymbolicDevice{};
     D.set_value(kHeadDim);
     device.set_options<kDLCUDA>();
 
     TensorMatcher({N, Q, D})  // q input
-        .with_strides({Sq, D, 1})
+        .with_strides({Sq, Sd, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(q);
     TensorMatcher({N, K, D})  // k input
-        .with_strides({Sk, D, 1})
+        .with_strides({Sk, Sd, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(k);
@@ -146,13 +153,15 @@ struct QKNormKernelWarp {
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
     const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
+    const auto head_stride = static_cast<int64_t>(Sd.unwrap());
 
     // NOTE: we offset the k here to reduce computation cost in the kernel
     const auto params = QKNormParams{
         .q = q.data_ptr(),
-        .k = pointer::offset(k.data_ptr(), -2 * static_cast<int64_t>(num_qo_heads) * kHeadDim),
+        .k = pointer::offset(k.data_ptr(), -2 * static_cast<int64_t>(num_qo_heads) * head_stride),
         .q_stride = static_cast<int64_t>(Sq.unwrap()),
         .k_stride = static_cast<int64_t>(Sk.unwrap()),
+        .head_stride = head_stride,
         .num_qo_heads = num_qo_heads,
         .num_kv_heads = num_kv_heads,
         .eps = eps,
@@ -197,17 +206,18 @@ struct QKNormKernelCTA {
     auto D = SymbolicSize{"head_dim"};
     auto Sq = SymbolicSize{"q_stride"};
     auto Sk = SymbolicSize{"k_stride"};
+    auto Sd = SymbolicSize{"head_stride"};
     auto device = SymbolicDevice{};
     D.set_value(kHeadDim);
     device.set_options<kDLCUDA>();
 
     TensorMatcher({N, Q, D})  // q input
-        .with_strides({Sq, D, 1})
+        .with_strides({Sq, Sd, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(q);
     TensorMatcher({N, K, D})  // k input
-        .with_strides({Sk, D, 1})
+        .with_strides({Sk, Sd, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(k);
@@ -220,13 +230,15 @@ struct QKNormKernelCTA {
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
     const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
+    const auto head_stride = static_cast<int64_t>(Sd.unwrap());
 
     // NOTE: we offset the k here to reduce computation cost in the kernel
     const auto params = QKNormParams{
         .q = q.data_ptr(),
-        .k = pointer::offset(k.data_ptr(), -2 * static_cast<int64_t>(num_qo_heads) * kHeadDim),
+        .k = pointer::offset(k.data_ptr(), -2 * static_cast<int64_t>(num_qo_heads) * head_stride),
         .q_stride = static_cast<int64_t>(Sq.unwrap()),
         .k_stride = static_cast<int64_t>(Sk.unwrap()),
+        .head_stride = head_stride,
         .num_qo_heads = num_qo_heads,
         .num_kv_heads = num_kv_heads,
         .eps = eps,

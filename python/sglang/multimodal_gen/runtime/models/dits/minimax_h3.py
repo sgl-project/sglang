@@ -281,7 +281,9 @@ def _apply_qk_norm(
         and q.dtype == _BF16_DTYPE
         and q.dtype == k.dtype == q_norm.weight.dtype == k_norm.weight.dtype
         and q.stride(-1) == k.stride(-1) == 1
-        and q.stride(-2) == k.stride(-2) == head_dim
+        # The kernel takes the head stride as a symbol, but shares it between q
+        # and k, so they only have to agree -- interleaved views have 3*head_dim.
+        and q.stride(-2) == k.stride(-2)
         and q_norm.eps == k_norm.eps
         and not torch.compiler.is_compiling()
     ):
