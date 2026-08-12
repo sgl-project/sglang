@@ -732,6 +732,36 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
+        expanded_input_ids = None
+        if getattr(request_obj, "parse_expanded_mm_input_ids", False):
+            expanded_input_ids = input_text
+            input_text = []
+            index = 0
+            while index < len(expanded_input_ids):
+                if expanded_input_ids[index] != self.vision_start_token_id:
+                    input_text.append(expanded_input_ids[index])
+                    index += 1
+                    continue
+
+                end = index + 1
+                depth = 1
+                while depth:
+                    depth += expanded_input_ids[end] == self.vision_start_token_id
+                    depth -= expanded_input_ids[end] == self.vision_end_token_id
+                    end += 1
+
+                span = expanded_input_ids[index:end]
+                input_text.extend(
+                    [
+                        self.vision_start_token_id,
+                        self.VIDEO_TOKEN_ID,
+                        self.vision_end_token_id,
+                    ]
+                    if self.VIDEO_TOKEN_ID in span
+                    else span
+                )
+                index = end
+
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -798,7 +828,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         input_ids = input_ids.flatten()
         base_input_ids = getattr(base_output, "input_ids", None)
-        if (
+        if expanded_input_ids is not None:
+            input_ids_list = expanded_input_ids
+        elif (
             isinstance(base_input_ids, list)
             and len(base_input_ids) == input_ids.numel()
         ):
