@@ -68,6 +68,21 @@ def configure_aux_hidden_state_capture(
 
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     """Init attention kernel backend."""
+    from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import Mamba2AttnBackend
+
+    # SSM models use the Mamba backend, not attention.
+    if model_runner.model_config.attention_arch == AttentionArch.SSM:
+        mamba_backend = Mamba2AttnBackend(model_runner)
+        return AttentionBackends(
+            attn_backend=mamba_backend,
+            decode_attn_backend=None,
+            decode_attn_backend_group=[],
+            prefill_attention_backend_str="mamba2",
+            decode_attention_backend_str="mamba2",
+        )
+
+    server_args = model_runner.server_args
 
     # TODO: Refactor device-specific init branches into platform interface (separate PR).
     if model_runner.device in ("cuda", "musa"):
