@@ -11,14 +11,19 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import json
+import tempfile
 import unittest
 import uuid
 from http import HTTPStatus
+from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
 
+from sglang.srt.entrypoints.openai.chat_encoding import (
+    resolve_dsv4_reasoning_effort_profile,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
@@ -27,12 +32,29 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+_DSV4_PREVIEW_ENCODER = 'REASONING_EFFORT_MAX = "preview"\n'
+_DSV4_OFFICIAL_ENCODER = (
+    "REASONING_EFFORT_PROMPTS: Dict[str, str] = "
+    '{"low": "", "high": "h", "max": "m"}\n'
+    'DEFAULT_REASONING_EFFORT = "low"\n'
+)
+
+
+def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
+    model_dir = tempfile.TemporaryDirectory()
+    test_case.addCleanup(model_dir.cleanup)
+    encoder_path = Path(model_dir.name) / "encoding" / "encoding_dsv4.py"
+    encoder_path.parent.mkdir(parents=True)
+    encoder_path.write_text(source, encoding="utf-8")
+    return model_dir.name
 
 
 class _MockTokenizerManager:
@@ -41,15 +63,23 @@ class _MockTokenizerManager:
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
         self.server_args = Mock(
+            model_path="deepseek-ai/DeepSeek-V4-Flash",
+            revision=None,
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
             stream_response_default_include_usage=False,
             default_chat_template_kwargs=None,
         )
+        self.model_path = self.server_args.model_path
+        # The manager tracks the served name itself; a weight update rewrites it.
+        self.served_model_name = "test-model"
+        self._config_updates = []
+
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
+        mock_hf_config.to_dict.return_value = {}
         self.model_config.hf_config = mock_hf_config
 
         self.chat_template_name: Optional[str] = "llama-3"
@@ -79,6 +109,13 @@ class _MockTokenizerManager:
 
         self.generate_request = Mock(return_value=_mock_generate())
         self.create_abort_task = Mock()
+
+    def config_value(self, name: str):
+        """The manager's overlay accessor: no control-plane update recorded."""
+        for _source, fields in reversed(self._config_updates):
+            if name in fields:
+                return fields[name]
+        return getattr(self.server_args, name)
 
 
 class _MockTemplateManager:
@@ -118,6 +155,103 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    def test_parsers_follow_the_control_plane_overlay(self):
+        """Template detection records the parsers on the manager, not on its
+        ServerArgs — the instance keeps what the launcher passed."""
+        self.tm.server_args.tool_call_parser = "auto"
+        self.tm.server_args.reasoning_parser = "auto"
+        self.tm._config_updates.append(
+            (
+                "template-detection",
+                {"tool_call_parser": "qwen25", "reasoning_parser": None},
+            )
+        )
+
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+
+        self.assertEqual(chat.tool_call_parser, "qwen25")
+        self.assertIsNone(chat.reasoning_parser)
+        self.assertEqual(self.tm.server_args.tool_call_parser, "auto")
+
+    def test_the_xgrammar_gate_follows_the_overlay(self):
+        """A detected `reasoning_parser` must gate xgrammar, not the seed's "auto"."""
+        self.tm.server_args.reasoning_parser = "auto"
+        self.tm._config_updates.append(
+            ("template-detection", {"reasoning_parser": "qwen3"})
+        )
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.assertEqual(chat.reasoning_parser, "qwen3")
+        # the gate reads the same value the parser was built from
+        self.assertIsNotNone(chat.reasoning_parser)
+
+    def test_text_only_model_rejects_media_before_generation(self):
+        media_parts = {
+            "image_url": {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/image.png"},
+            },
+            "video_url": {
+                "type": "video_url",
+                "video_url": {"url": "https://example.com/video.mp4"},
+            },
+            "audio_url": {
+                "type": "audio_url",
+                "audio_url": {"url": "https://example.com/audio.wav"},
+            },
+        }
+
+        for media_type, media_part in media_parts.items():
+            with self.subTest(media_type=media_type):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe"},
+                                media_part,
+                            ],
+                        }
+                    ],
+                )
+                response = get_or_create_event_loop().run_until_complete(
+                    self.chat.handle_request(request, self.fastapi_request)
+                )
+                error = json.loads(response.body)
+                self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+                self.assertEqual(error["type"], "BadRequestError")
+                self.assertIn(media_type, error["message"])
+        self.tm.generate_request.assert_not_called()
+
+    def test_media_validation_does_not_reject_supported_content(self):
+        text_request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_reference", "name": "get_weather"}],
+                }
+            ],
+        )
+        self.assertIsNone(self.chat._validate_request(text_request))
+
+        self.tm.model_config.is_multimodal = True
+        multimodal_request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/image.png"},
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertIsNone(self.chat._validate_request(multimodal_request))
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
@@ -197,6 +331,29 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
         conv_mock.assert_not_called()
 
+    def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-kimi-k3-usage",
+                    "prompt_tokens": 2075,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "image_tokens": 2035,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertEqual(response.usage.prompt_tokens, 2072)
+        self.assertEqual(response.usage.total_tokens, 2073)
+        self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
+
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True
@@ -233,11 +390,39 @@ class ServingChatTestCase(unittest.TestCase):
                 [],
                 [],
                 None,
+                require_reasoning=True,
             )
 
             adapted, _ = self.chat._convert_to_internal_request(req)
 
         self.assertTrue(adapted.require_reasoning)
+
+    def test_process_messages_records_template_reasoning_state(self):
+        self.chat.default_chat_template_kwargs = {"thinking": True}
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=False
+        )
+        self.chat.reasoning_parser = "deepseek-v3"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        with patch.object(
+            self.chat, "_apply_conversation_template", return_value=rendered
+        ):
+            processed = self.chat._process_messages(request, is_multimodal=False)
+
+        self.assertTrue(processed.require_reasoning)
 
     def test_kimi_tool_call_respects_explicit_reasoning_disable(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
@@ -564,6 +749,260 @@ class ServingChatTestCase(unittest.TestCase):
                 parser.get_structure_constraint.call_args.kwargs["thinking_mode"]
             )
 
+    def test_kimi_k3_constraint_failure_keeps_native_stop_format(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+                "strict": True,
+            },
+        }
+
+        cases = (
+            (None, [TOOLS_CLOSE]),
+            ("USER_STOP", ["USER_STOP", TOOLS_CLOSE]),
+            (["USER_STOP"], ["USER_STOP", TOOLS_CLOSE]),
+            ([TOOLS_CLOSE], [TOOLS_CLOSE]),
+        )
+        for request_stop, expected in cases:
+            with (
+                self.subTest(request_stop=request_stop),
+                patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+                ) as parser_cls,
+            ):
+                parser = parser_cls.return_value
+                parser.detector.eot_token = TOOLS_CLOSE
+                parser.detector.parses_required_natively.return_value = False
+                parser.get_structure_constraint.return_value = None
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather in Paris?"}],
+                    tools=[tool],
+                    tool_choice="required",
+                    stop=request_stop,
+                )
+                original_stop = (
+                    list(request.stop)
+                    if isinstance(request.stop, list)
+                    else request.stop
+                )
+
+                result = self.chat._process_messages(request, is_multimodal=False)
+
+                self.assertEqual(result.stop, expected)
+                self.assertEqual(request.stop, original_stop)
+                self.assertIsNone(result.tool_call_constraint)
+
+    def test_kimi_k3_tool_call_stop_is_scoped_to_active_tools(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="none",
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=False)
+
+        self.assertIsNone(result.stop)
+
+    def test_kimi_k3_encoder_receives_wire_request_fields(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {"type": "object"},
+            },
+        }
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "developer",
+                    "content": "<|kimi_image_placeholder|>",
+                    "tools": [tool],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Explain <|kimi_image_placeholder|>",
+                        },
+                        {"type": "image_url", "image_url": {"url": "image-1"}},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "Inspect <|kimi_image_placeholder|>",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "inspect",
+                                "arguments": {
+                                    "source": "<|kimi_image_placeholder|>",
+                                    "nested": ["<|kimi_image_placeholder|>"],
+                                },
+                            },
+                        }
+                    ],
+                },
+            ],
+            tools=[tool],
+            tool_choice="required",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                    "strict": False,
+                },
+            },
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=True)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        rendered_messages = call.args[0]
+        self.assertEqual(rendered_messages[0]["role"], "system")
+        self.assertEqual(
+            rendered_messages[0]["content"], "<| kimi_image_placeholder |>"
+        )
+        self.assertNotIn("strict", rendered_messages[0]["tools"][0]["function"])
+        self.assertEqual(
+            rendered_messages[1]["content"][0]["text"],
+            "Explain <| kimi_image_placeholder |>",
+        )
+        self.assertEqual(
+            rendered_messages[2]["reasoning_content"],
+            "Inspect <| kimi_image_placeholder |>",
+        )
+        self.assertEqual(
+            rendered_messages[2]["tool_calls"][0]["function"]["arguments"],
+            {
+                "source": "<| kimi_image_placeholder |>",
+                "nested": ["<| kimi_image_placeholder |>"],
+            },
+        )
+        self.assertEqual(call.kwargs["image_prompts"], ["<|media_pad|>"])
+        self.assertEqual(call.kwargs["tool_choice"], "required")
+        self.assertNotIn("strict", call.kwargs["tools"][0]["function"])
+        self.assertEqual(
+            call.kwargs["response_format"]["json_schema"]["schema"],
+            {"type": "object"},
+        )
+        self.assertNotIn("schema_", call.kwargs["response_format"]["json_schema"])
+        self.assertEqual(result.prompt_ids, [7, 8, 9])
+        self.assertEqual(result.image_data[0].url, "image-1")
+
+    def test_kimi_k3_neutralizes_text_only_assistant_history(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Run it"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "Read <|kimi_image_placeholder|>",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": "not-json <|kimi_image_placeholder|>",
+                            },
+                        }
+                    ],
+                },
+            ],
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(messages[-1]["role"], "assistant")
+        self.assertEqual(
+            messages[-1]["reasoning_content"],
+            "Read <| kimi_image_placeholder |>",
+        )
+        self.assertEqual(
+            messages[-1]["tool_calls"][0]["function"]["arguments"],
+            "not-json <| kimi_image_placeholder |>",
+        )
+        self.assertNotIn("image_prompts", kwargs)
+
+    def test_message_tools_participate_in_validation_across_encodings(self):
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {"type": "object"},
+            },
+        }
+        messages = [
+            {"role": "system", "content": "", "tools": [tool]},
+            {"role": "user", "content": "Weather?"},
+        ]
+        for chat_encoding_spec in (None, "dsv4", "dsv32", "kimi_k3"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                automatic = ChatCompletionRequest(
+                    model="x", messages=messages, tool_choice=None
+                )
+                self.assertEqual(automatic.tool_choice, "auto")
+                self.assertIsNone(self.chat._validate_request(automatic))
+
+                required = ChatCompletionRequest(
+                    model="x", messages=messages, tool_choice="required"
+                )
+                self.assertIsNone(self.chat._validate_request(required))
+
+                duplicate = ChatCompletionRequest(
+                    model="x",
+                    messages=messages,
+                    tools=[tool],
+                    tool_choice="required",
+                )
+                self.assertEqual(
+                    self.chat._validate_request(duplicate),
+                    "Tool names must be unique across request and message tools.",
+                )
+
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""
         self.template_manager.chat_template_name = None
@@ -646,6 +1085,7 @@ class ServingChatTestCase(unittest.TestCase):
         """DeepSeek encoders should reject history tool call scalars as BadRequest."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
 
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
@@ -683,6 +1123,7 @@ class ServingChatTestCase(unittest.TestCase):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
 
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
@@ -1159,6 +1600,7 @@ class ServingChatTestCase(unittest.TestCase):
 
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["DeepseekV32ForCausalLM"]
+        mock_hf_config.to_dict.return_value = {}
         tm.model_config.hf_config = mock_hf_config
 
         # Case 1: No chat template + DeepSeek V3.2 arch -> should use dsv32 encoding
@@ -1180,6 +1622,10 @@ class ServingChatTestCase(unittest.TestCase):
         # Case 4: DeepseekV4 arch -> always dsv4, even with chat_template
         # (release ships a stale V3 jinja we deliberately override).
         mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        mock_hf_config.to_dict.return_value = {
+            "dsv4_reasoning_effort_profile": "preview"
+        }
+        tm.model_path = "deepseek-ai/DeepSeek-V4-Flash"
         tm.tokenizer.chat_template = "stale v3 jinja"
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
@@ -1187,6 +1633,19 @@ class ServingChatTestCase(unittest.TestCase):
         tm.tokenizer.chat_template = None
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
+
+    def test_kimi_k3_encoding_detection(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = ["KimiK3ForConditionalGeneration"]
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        self.assertEqual(serving_chat.chat_encoding_spec, "kimi_k3")
+
+        tm.model_config.hf_config.architectures = ["LlamaForCausalLM"]
+        tm.server_args.tool_call_parser = "kimi_k3"
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        self.assertEqual(serving_chat.chat_encoding_spec, "kimi_k3")
 
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
@@ -1337,6 +1796,135 @@ class ServingChatTestCase(unittest.TestCase):
             out.index("<｜User｜>"),
         )
         self.assertIn("<｜Assistant｜>", out)
+
+    def test_dsv4_reasoning_effort_profiles(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        messages = [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "Solve this."},
+        ]
+        absolute_maximum = (
+            "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+            "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+            "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+        )
+        beyond_maximum = (
+            "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+            "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+            "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+        )
+
+        def encode(profile, effort):
+            return encoding_dsv4.encode_messages(
+                messages,
+                thinking_mode="thinking",
+                reasoning_effort=effort,
+                reasoning_effort_profile=profile,
+            )
+
+        preview_high = encode("preview", "high")
+        preview_max = encode("preview", "max")
+        official_low = encode("official", "low")
+        official_high = encode("official", "high")
+        official_max = encode("official", "max")
+
+        self.assertNotIn("Reasoning Effort:", preview_high)
+        self.assertTrue(
+            preview_max.startswith(encoding_dsv4.bos_token + absolute_maximum)
+        )
+        self.assertNotIn("Reasoning Effort:", official_low)
+        self.assertEqual(
+            official_high,
+            encoding_dsv4.bos_token
+            + absolute_maximum
+            + official_low.removeprefix(encoding_dsv4.bos_token),
+        )
+        self.assertEqual(
+            official_max,
+            encoding_dsv4.bos_token
+            + beyond_maximum
+            + official_low.removeprefix(encoding_dsv4.bos_token),
+        )
+        self.assertEqual(encode("preview", None), preview_high)
+        self.assertEqual(encode("official", None), official_low)
+        self.assertEqual(len({official_low, official_high, official_max}), 3)
+
+        with self.assertRaises(ValueError):
+            encode("preview", "low")
+
+    def test_dsv4_reasoning_effort_profile_resolution(self):
+        resolve = resolve_dsv4_reasoning_effort_profile
+        preview_model_path = _create_dsv4_checkpoint(self, _DSV4_PREVIEW_ENCODER)
+        official_model_path = _create_dsv4_checkpoint(self, _DSV4_OFFICIAL_ENCODER)
+        inconclusive_model_path = _create_dsv4_checkpoint(
+            self, 'UNRELATED_METADATA = "value"\n'
+        )
+        self.assertEqual(resolve(model_path=preview_model_path), "preview")
+        self.assertEqual(resolve(model_path=official_model_path), "official")
+        self.assertEqual(resolve(model_path=inconclusive_model_path), "preview")
+
+        self.assertEqual(
+            resolve(model_path="renamed/model", override="official"), "official"
+        )
+        self.assertEqual(
+            resolve(model_path="renamed/model", override="preview"), "preview"
+        )
+        with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
+            resolve(model_path="renamed/model", override="auto")
+
+    def test_dsv4_reasoning_effort_profile_from_checkpoint(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        official_model_path = _create_dsv4_checkpoint(self, _DSV4_OFFICIAL_ENCODER)
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.model_config.hf_config.to_dict.return_value = {}
+        tm.model_config.hf_config.dspark_block_size = 5
+        tm.model_config.hf_config.dspark_markov_rank = 256
+        tm.model_path = official_model_path
+        tm.server_args.model_path = tm.model_path
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello"}],
+            reasoning_effort="max",
+        )
+        serving_chat._process_messages(request, is_multimodal=False)
+        prompt = tm.tokenizer.encode.call_args.args[0]
+        self.assertIn("Reasoning Effort: Beyond maximum", prompt)
+
+    def test_dsv4_reasoning_effort_profile_override_from_model_config(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.model_config.hf_config.to_dict.return_value = {
+            "dsv4_reasoning_effort_profile": "official"
+        }
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello"}],
+            reasoning_effort="max",
+        )
+
+        serving_chat._process_messages(request, is_multimodal=False)
+
+        prompt = tm.tokenizer.encode.call_args.args[0]
+        self.assertIn("Reasoning Effort: Beyond maximum", prompt)
+
+    def test_dsv4_invalid_profile_override_fails_at_construction(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.model_config.hf_config.to_dict.return_value = {
+            "dsv4_reasoning_effort_profile": "invalid"
+        }
+        with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
+            OpenAIServingChat(tm, TemplateManager())
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
@@ -2465,6 +3053,26 @@ class InklingReasoningEffortTest(unittest.TestCase):
                     get()
         finally:
             env.clear()
+
+    def test_thinking_disabled_maps_to_no_thinking_effort(self):
+        """Bug regression: Inkling is an always-on parser, so Anthropic
+        thinking={"type": "disabled"} was rejected outright even though effort
+        "none" (0.0) expresses exactly that."""
+        serving = object.__new__(OpenAIServingChat)
+        serving.reasoning_parser = "inkling"
+        serving.template_manager = Mock(reasoning_config=None)
+        serving._reasoning_detector = Mock(reasoning_default="always")
+        request = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        serving.apply_reasoning_enabled(request, False)
+        self.assertEqual(request.reasoning_effort, "none")
+
+        # Enabling leaves an effort set via output_config.effort alone.
+        request.reasoning_effort = "low"
+        serving.apply_reasoning_enabled(request, True)
+        self.assertEqual(request.reasoning_effort, "low")
 
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS

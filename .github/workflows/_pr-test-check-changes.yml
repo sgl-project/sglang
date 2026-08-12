@@ -79,10 +79,13 @@ jobs:
           filters: |
             main_package:
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/_pr-test-*.yml"
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(aot)/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
@@ -104,11 +107,12 @@ jobs:
               - "test/registered/kernels/**"
               # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the
               # base-b-kernel suites import it directly, so kernel edits must run them.
-              - "python/sglang/kernels/**"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(aot)/**"
             sgl_kernel:
               # Intentionally excludes ".github/workflows/pr-test-sgl-kernel.yml" —
               # see API-side detector below for rationale.
-              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+              - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
 
       - name: Determine full-parallel mode
         id: parallel-mode
