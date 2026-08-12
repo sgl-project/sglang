@@ -497,6 +497,11 @@ class ForwardFlags:
         "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
+        # LayerNorm sequence parallelism (layers/layernorm_sp.py): set at the
+        # first decoder layer of an SP forward, cleared at the exit gather. Read
+        # at depth by the participant linears and the LayerCommunicator. A bool
+        # (<=2 values) is torch.compile-safe as a plain slot.
+        "sp_active": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,
@@ -511,6 +516,7 @@ class ForwardFlags:
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
+            "sp_active",
         }
     )
 

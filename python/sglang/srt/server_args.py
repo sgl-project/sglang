@@ -1162,6 +1162,16 @@ class ServerArgs:
         "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
         NS("parallel"),
     ] = False
+    enable_layernorm_sp: A[
+        bool,
+        "Enable Megatron-style sequence parallelism (SP, arXiv:2205.05198) for the "
+        "LayerNorm/residual regions under pure tensor parallelism. The row-parallel "
+        "all-reduce is split into reduce-scatter + all-gather so LayerNorm runs on "
+        "sequence-sharded activations, cutting activation memory with no extra "
+        "communication volume. Prefill-only; Qwen3 dense; requires tp_size > 1 and "
+        "NVLink/NVSwitch.",
+        NS("parallel"),
+    ] = False
     disable_attn_tp_gather: A[
         bool,
         "Disable scheduler-side attn_tp_gather (the upstream SP path "
@@ -9002,6 +9012,18 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
+
+        if self.enable_layernorm_sp:
+            # Validated here rather than in the layers so an unsupported model
+            # fails loud instead of silently ignoring the flag.
+            from sglang.srt.layers.layernorm_sp import validate_layernorm_sp
+
+            validate_layernorm_sp(
+                architecture=self.get_model_config().hf_config.architectures[0],
+                tp_size=self.tp_size,
+                enable_dp_attention=self.enable_dp_attention,
+                speculative_algorithm=self.speculative_algorithm,
+            )
 
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"

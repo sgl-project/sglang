@@ -25,6 +25,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
@@ -468,6 +469,18 @@ class ColumnParallelLinear(LinearBase):
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
+
+        # Megatron SP "g": while the SP forward region is active, every
+        # column-parallel linear reached is a block participant (qkv / gate_up)
+        # whose input is this rank's sequence shard [M_pad/tp, K]. All-gather it
+        # back to the full sequence and matmul (fused when eligible), then narrow
+        # to the real token count. Participants have gather_output=False, so
+        # there is no output all-gather to reconcile. All SP logic lives in
+        # layers/layernorm_sp.py.
+        if layernorm_sp.is_sp_active() and self.tp_size > 1:
+            output = layernorm_sp.column_parallel_g_matmul(self, input_, bias)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
 
         # Matrix multiply.
         assert self.quant_method is not None
@@ -1592,6 +1605,25 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        # Megatron SP "g-bar": while the SP region is active, every row-parallel
+        # linear reached is a block participant (o_proj / down). Replace the
+        # all-reduce with a reduce-scatter along the sequence (token) dim -- fused
+        # with the GEMM when eligible -- leaving the output sequence-sharded for
+        # the next SP LayerNorm region. Fires regardless of reduce_results (o_proj
+        # / down are built reduce_results=False; under SP the LayerCommunicator
+        # only norms on the shard, so the linear owns the reduction). All SP logic
+        # lives in layers/layernorm_sp.py.
+        if (
+            layernorm_sp.is_sp_active()
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and output_tensor is None
+        ):
+            output = layernorm_sp.row_parallel_gbar_matmul(self, input_parallel, bias_)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:

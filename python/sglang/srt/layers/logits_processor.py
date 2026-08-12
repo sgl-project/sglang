@@ -25,6 +25,7 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -349,6 +350,30 @@ class LogitsProcessor(nn.Module):
         # DLLM / common dispatch so all three LM-head paths are skipped.
         if _autotune_run_lm_head is False:
             return LogitsProcessorOutput(next_token_logits=None)
+
+        # Megatron SP exit gather: the decoder loop left hidden_states
+        # sequence-sharded across the TP group. All-gather back to the full
+        # sequence (dropping padding) and clear the region flag before the LM head
+        # runs, so it does not participate. Runs right after the layer loop,
+        # model-agnostic; no-op when SP is inactive.
+        #
+        # The condition is recomputed from config + forward mode (runs_sp) instead
+        # of reading the sp_active flag, and the token count comes from input_ids:
+        # this code can sit outside the CUDA-graph-captured region, where the
+        # Python writes made inside it (prepare_attn's set_sp_active /
+        # set_sp_num_tokens) do not re-execute on replay and would read stale.
+        # Speculative aux capture is incompatible with SP (guarded off), so
+        # aux_hidden_states is never sharded.
+        if layernorm_sp.runs_sp(logits_metadata.forward_mode) and input_ids is not None:
+            num_tokens = input_ids.shape[0]
+            hidden_states = layernorm_sp.sp_exit_gather(
+                hidden_states, num_tokens=num_tokens
+            )
+            if hidden_states_before_norm is not None:
+                hidden_states_before_norm = layernorm_sp.sp_exit_gather(
+                    hidden_states_before_norm, num_tokens=num_tokens
+                )
+            layernorm_sp.set_sp_active(False)
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
