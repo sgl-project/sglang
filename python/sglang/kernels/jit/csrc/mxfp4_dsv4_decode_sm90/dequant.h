@@ -33,18 +33,6 @@ __device__ __forceinline__ uint64_t load_packed_e2m1x16(const void* address) {
   return value;
 }
 
-__device__ __forceinline__ uint8_t load_scale_e4m3_bits(const void* address) {
-  uint32_t value;
-  asm volatile("ld.global.nc.L1::evict_last.L2::128B.u8 %0, [%1];" : "=r"(value) : "l"(address));
-  return static_cast<uint8_t>(value);
-}
-
-__device__ __forceinline__ float e4m3_bits_to_float(uint8_t bits) {
-  __nv_fp8_e4m3 value;
-  value.__x = bits;
-  return static_cast<float>(value);
-}
-
 struct E2M1Bf16Lut {
   // The low and high bytes of the eight positive E2M1 magnitudes, split into
   // two four-byte PRMT sources.  Keeping the table in registers is much
@@ -113,11 +101,6 @@ __device__ __forceinline__ bf16x8 dequant_e2m1x8(uint32_t packed, const E2M1Bf16
   result_pairs[2] = __byte_perm(low_bytes_hi, high_bytes_hi, 0x5140) ^ e2m1_signs_0_1(packed);
   result_pairs[3] = __byte_perm(low_bytes_hi, high_bytes_hi, 0x7362) ^ e2m1_signs_2_3(packed);
   return result;
-}
-
-__device__ __forceinline__ bf16x8 dequant_e2m1x8(uint32_t packed, float scale) {
-  const E2M1Bf16Lut lut = make_e2m1_bf16_lut(scale);
-  return dequant_e2m1x8(packed, lut);
 }
 
 __device__ __forceinline__ bf16x16 dequant_e2m1x16(uint64_t packed, float scale) {

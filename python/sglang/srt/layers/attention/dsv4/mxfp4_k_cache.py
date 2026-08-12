@@ -39,9 +39,8 @@ MXFP4_BYTES_PER_TOKEN = (
 
 _E2M1_MAX = 6.0
 
-# Triton requires tl.arange ranges to be powers of two.  We always use
+# Triton requires tl.arange ranges to be powers of two; we always use
 # power-of-two tile sizes and mask to the actual group count (14).
-# ----------------------------------------------------------------
 _MAX_GROUPS = 16  # next power of two >= 14
 _NOPE_TILE = 512  # next power of two >= 448, used for output masking
 
@@ -164,12 +163,7 @@ def _e2m1_rne_scaled_torch(x: torch.Tensor, denominator: torch.Tensor) -> torch.
         + (magnitude >= denominator * 3.5).to(torch.uint8)
         + (magnitude > denominator * 5.0).to(torch.uint8)
     )
-    signed_code = code | (torch.signbit(x).to(torch.uint8) << 3)
-    return torch.where(
-        denominator > 0,
-        signed_code,
-        torch.zeros((), dtype=torch.uint8, device=x.device),
-    )
+    return code | (torch.signbit(x).to(torch.uint8) << 3)
 
 
 def _decode_e2m1_torch(code: torch.Tensor) -> torch.Tensor:
@@ -194,7 +188,7 @@ def _e2m1_rne_scaled_triton(x, denominator):
         + (magnitude > denominator * 5.0).to(tl.uint8)
     )
     sign = ((x.to(tl.uint32, bitcast=True) >> 31).to(tl.uint8)) << 3
-    return tl.where(denominator > 0.0, code | sign, 0).to(tl.uint8)
+    return (code | sign).to(tl.uint8)
 
 
 @triton.jit

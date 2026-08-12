@@ -1,5 +1,3 @@
-#include "combine.h"
-
 #include <math_constants.h>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>

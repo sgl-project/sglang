@@ -13,9 +13,9 @@ The kernel is a JIT adaptation of the FlashMLA-style split-KV sparse decode
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
@@ -118,8 +118,7 @@ def _get_scratch(b: int, s_q: int, h_q: int, device: torch.device, head_dim_v: i
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass
-class FlashMLASchedMeta:
+class FlashMLASchedMeta(msgspec.Struct):
     """Tile scheduler metadata for the DSV4 MXFP4 decode.
 
     Holds the split-K scheduler tensors across calls. A single instance is
@@ -127,8 +126,7 @@ class FlashMLASchedMeta:
     instance to let CUDA graphs replay the captured scheduler kernels.
     """
 
-    @dataclasses.dataclass
-    class Config:
+    class Config(msgspec.Struct):
         b: int
         s_q: int
         h_q: int

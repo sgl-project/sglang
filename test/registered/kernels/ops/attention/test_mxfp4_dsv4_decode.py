@@ -11,9 +11,9 @@ vs. profiling semantics, invalid-contract rejection, and CUDA-graph replay.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Callable, Optional
 
+import msgspec
 import pytest
 import torch
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -87,8 +87,7 @@ def _require_codec() -> tuple[Callable, Callable]:
     )
 
 
-@dataclass
-class _DecodeCase:
+class _DecodeCase(msgspec.Struct):
     q: torch.Tensor
     kv: torch.Tensor
     indices: torch.Tensor

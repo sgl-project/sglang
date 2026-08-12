@@ -844,7 +844,7 @@ void KernelTemplate<NUM_HEADS, IS_V32>::run(const SparseAttnDecodeParams& params
 }
 
 template <int NUM_HEADS, bool IS_V32>
-void run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel_impl(const SparseAttnDecodeParams& params) {
+void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl(const SparseAttnDecodeParams& params) {
   KernelTemplate<NUM_HEADS, IS_V32>::run(params);
 }
 

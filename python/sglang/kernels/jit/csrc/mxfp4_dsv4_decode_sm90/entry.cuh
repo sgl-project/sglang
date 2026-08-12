@@ -36,8 +36,8 @@ constexpr int kTopkBlockSize = 64;
 constexpr int kFixedOverheadNumBlocks = 5;
 
 // Explicit instantiations for the two supported query-head counts.
-template void run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel_impl<64>(const SparseAttnDecodeParams& params);
-template void run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel_impl<128>(const SparseAttnDecodeParams& params);
+template void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl<64>(const SparseAttnDecodeParams& params);
+template void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl<128>(const SparseAttnDecodeParams& params);
 
 namespace {
 
@@ -58,7 +58,7 @@ __device__ __forceinline__ int effective_length(const GetDecodeSchedMetaParams& 
   return primary;
 }
 
-__global__ void get_dsv4_nvfp4_decoding_sched_meta_kernel(__grid_constant__ const GetDecodeSchedMetaParams params) {
+__global__ void get_dsv4_mxfp4_decoding_sched_meta_kernel(__grid_constant__ const GetDecodeSchedMetaParams params) {
   if (threadIdx.x != 0) {
     return;
   }
@@ -135,16 +135,16 @@ __global__ void get_dsv4_nvfp4_decoding_sched_meta_kernel(__grid_constant__ cons
 
 }  // namespace
 
-void run_get_dsv4_nvfp4_decoding_sched_meta_kernel(const GetDecodeSchedMetaParams& params) {
-  get_dsv4_nvfp4_decoding_sched_meta_kernel<<<1, 1, 0, params.stream>>>(params);
+void run_get_dsv4_mxfp4_decoding_sched_meta_kernel(const GetDecodeSchedMetaParams& params) {
+  get_dsv4_mxfp4_decoding_sched_meta_kernel<<<1, 1, 0, params.stream>>>(params);
   KU_CHECK_KERNEL_LAUNCH();
 }
 
-void run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel(const SparseAttnDecodeParams& params) {
+void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel(const SparseAttnDecodeParams& params) {
   if (params.h_q == 64) {
-    run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel_impl<64>(params);
+    run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl<64>(params);
   } else if (params.h_q == 128) {
-    run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel_impl<128>(params);
+    run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl<128>(params);
   } else {
     KU_ASSERT(false, "DeepSeek V4 MXFP4 sparse decode supports 64 or 128 query heads");
   }
@@ -250,22 +250,23 @@ void mxfp4_dsv4_decode_dispatch(
   // every replay with the replayed (clamped) top-k lengths.
   GetDecodeSchedMetaParams sched_params = {};
   if (generate_sched_meta) {
-  sched_params.b = b;
-  sched_params.s_q = s_q;
-  sched_params.block_size_n = sm90::decode::sparse_mxfp4_dsv4::kTopkBlockSize;
-  sched_params.fixed_overhead_num_blocks =
-      sm90::decode::sparse_mxfp4_dsv4::kFixedOverheadNumBlocks;
-  sched_params.topk = topk;
-  sched_params.extra_topk = have_extra ? extra_topk : 0;
-  sched_params.topk_length = is_empty(topk_length) ? nullptr : static_cast<int*>(topk_length.data_ptr());
-  sched_params.extra_topk_length = is_empty(extra_topk_length) ? nullptr : static_cast<int*>(extra_topk_length.data_ptr());
-  sched_params.seqlens_k_ptr = nullptr;
-  sched_params.tile_scheduler_metadata_ptr =
-      reinterpret_cast<DecodingSchedMeta*>(tile_scheduler_metadata.data_ptr());
-  sched_params.num_splits_ptr = static_cast<int*>(num_splits.data_ptr());
+    sched_params.b = b;
+    sched_params.s_q = s_q;
+    sched_params.block_size_n = sm90::decode::sparse_mxfp4_dsv4::kTopkBlockSize;
+    sched_params.fixed_overhead_num_blocks =
+        sm90::decode::sparse_mxfp4_dsv4::kFixedOverheadNumBlocks;
+    sched_params.topk = topk;
+    sched_params.extra_topk = have_extra ? extra_topk : 0;
+    sched_params.topk_length =
+        is_empty(topk_length) ? nullptr : static_cast<int*>(topk_length.data_ptr());
+    sched_params.extra_topk_length =
+        is_empty(extra_topk_length) ? nullptr : static_cast<int*>(extra_topk_length.data_ptr());
+    sched_params.tile_scheduler_metadata_ptr =
+        reinterpret_cast<DecodingSchedMeta*>(tile_scheduler_metadata.data_ptr());
+    sched_params.num_splits_ptr = static_cast<int*>(num_splits.data_ptr());
     sched_params.num_sm_parts = num_sm_parts;
     sched_params.stream = stream;
-    sm90::decode::sparse_mxfp4_dsv4::run_get_dsv4_nvfp4_decoding_sched_meta_kernel(sched_params);
+    sm90::decode::sparse_mxfp4_dsv4::run_get_dsv4_mxfp4_decoding_sched_meta_kernel(sched_params);
   }
 
   const int num_blocks = static_cast<int>(k_cache.shape()[0]);
@@ -330,7 +331,7 @@ void mxfp4_dsv4_decode_dispatch(
   params.num_splits_ptr = static_cast<int*>(num_splits.data_ptr());
   params.num_sm_parts = num_sm_parts;
 
-  sm90::decode::sparse_mxfp4_dsv4::run_flash_splitkv_mla_nvfp4_dsv4_sparse_kernel(params);
+  sm90::decode::sparse_mxfp4_dsv4::run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel(params);
 
   CombineParams combine_params = {};
   combine_params.b = b;
