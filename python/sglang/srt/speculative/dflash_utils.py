@@ -584,7 +584,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"Got len(target_layer_ids)={len(parsed_target_layer_ids)}."
             )
 
-    mask_token = dflash_cfg.get("mask_token", None)
+    mask_token = dflash_cfg.get(
+        "mask_token", _cfg_get(draft_hf_config, "mask_token", None)
+    )
     if mask_token is None:
         mask_token = DEFAULT_DFLASH_MASK_TOKEN
     if not isinstance(mask_token, str) or not mask_token:
@@ -593,7 +595,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             f"got {mask_token!r}."
         )
 
-    mask_token_id = dflash_cfg.get("mask_token_id", None)
+    mask_token_id = dflash_cfg.get(
+        "mask_token_id", _cfg_get(draft_hf_config, "mask_token_id", None)
+    )
     if mask_token_id is not None:
         if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
             raise ValueError(
