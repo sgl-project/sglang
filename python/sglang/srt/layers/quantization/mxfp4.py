@@ -985,14 +985,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
             return
         elif use_intel_xpu_backend():
-            # sgl-kernel-xpu uses int8 as the storage dtype for packed E2M1
-            # bytes. This view preserves the checkpoint bit pattern.
-            layer.w13_weight = Parameter(
-                layer.w13_weight.view(torch.int8), requires_grad=False
-            )
-            layer.w2_weight = Parameter(
-                layer.w2_weight.view(torch.int8), requires_grad=False
-            )
             if layer.w13_weight_bias is not None:
                 layer.w13_weight_bias = Parameter(
                     layer.w13_weight_bias.float(), requires_grad=False
