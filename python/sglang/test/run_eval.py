@@ -249,9 +249,8 @@ def run_eval(args):
     )
 
     if args.eval_name == "mmlu":
-        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), which
-        # shifts scores off the local prompt/regex baseline -- a caller's
-        # threshold has to be re-baselined, not carried over.
+        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
+        # caller's threshold has to be measured against it, not inherited.
         # `simple_eval_mmlu` stays: the ascend eval imports its subject2category.
         return _run_sgl_eval("mmlu", args)
     elif args.eval_name == "math":
