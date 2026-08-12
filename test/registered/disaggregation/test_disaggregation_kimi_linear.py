@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=240, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=480, stage="base-c", runner_config="4-gpu-h100")
 
 KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
 SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
@@ -38,6 +38,7 @@ class TestKimiLinearHeterogeneousTPDisaggregation(PDDisaggregationServerBase):
     prefill_tp_size = 2
     decode_tp_size = 1
     decode_base_gpu_id = 2
+    reference_parallel_args = ["--tp-size", "2"]
     extra_prefill_args = SERVER_ARGS
     extra_decode_args = SERVER_ARGS
     extra_prefill_env = SERVER_ENV
@@ -72,7 +73,9 @@ class TestKimiLinearHeterogeneousTPDisaggregation(PDDisaggregationServerBase):
             self.model,
             self.lb_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--tp-size", "2", "--trust-remote-code"] + SERVER_ARGS,
+            other_args=self.reference_parallel_args
+            + ["--trust-remote-code"]
+            + SERVER_ARGS,
             env=SERVER_ENV,
         )
         try:
@@ -99,6 +102,14 @@ class TestKimiLinearHeterogeneousTPDisaggregation(PDDisaggregationServerBase):
         assert_process_healthy(self, "load balancer", self.process_lb, self.lb_url)
         assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+
+
+class TestKimiLinearPipelineDisaggregation(TestKimiLinearHeterogeneousTPDisaggregation):
+    prefill_tp_size = 1
+    decode_tp_size = 1
+    decode_base_gpu_id = 2
+    reference_parallel_args = ["--tp-size", "1", "--pp-size", "2"]
+    extra_prefill_args = SERVER_ARGS + ["--pp-size", "2"]
 
 
 if __name__ == "__main__":

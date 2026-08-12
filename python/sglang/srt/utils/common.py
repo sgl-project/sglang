@@ -86,7 +86,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -307,6 +307,13 @@ is_sm90_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
     )
 )
+
+
+# GB10 (DGX Spark and OEM equivalents). Not expressible via
+# _check_cuda_device_version, which only matches on the major.
+@lru_cache(maxsize=1)
+def is_sm121() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
 
 
 try:
@@ -844,6 +851,18 @@ def get_device_name(device_id: int = 0) -> str:
 
 
 @lru_cache(maxsize=1)
+def is_mnnvl_fabric_device() -> bool:
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
+    the device name: the GB200/GB300 superchips. Used to auto-select
+    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
+    v2 multinode, DCP fi_a2a)."""
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        return False
+    name = (torch.cuda.get_device_name(0) or "").upper()
+    return any(tag in name for tag in ("GB200", "GB300"))
+
+
+@lru_cache(maxsize=1)
 def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
 
@@ -1004,21 +1023,11 @@ def set_cuda_arch():
         )
 
 
-def mxfp_supported():
-    """
-    Returns whether the current platform supports MX types.
-    """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
-
-
 @lru_cache(maxsize=1)
 def is_gfx95_supported():
-    """
-    Returns whether the current platform supports MX types.
+    """Whether the device is an AMD gfx95 GPU (the MX-capable ROCm arch).
+
+    False on every non-HIP build, so callers do not need their own is_hip().
     """
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
@@ -1514,6 +1523,15 @@ def get_mm_http_session() -> requests.Session:
     return session
 
 
+# Raised by the loaders below when client-supplied media cannot be fetched or
+# decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+CLIENT_MEDIA_EXCEPTIONS = (
+    ValueError,
+    UnidentifiedImageError,
+    requests.exceptions.RequestException,
+)
+
+
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
@@ -1582,10 +1600,13 @@ def load_audio(
     import torch
     import torchaudio
 
-    if isinstance(source, bytes):
-        audio, original_sr = sf.read(BytesIO(source))
-    else:
-        audio, original_sr = sf.read(source)
+    try:
+        if isinstance(source, bytes):
+            audio, original_sr = sf.read(BytesIO(source))
+        else:
+            audio, original_sr = sf.read(source)
+    except sf.LibsndfileError as e:
+        raise ValueError(f"Could not decode audio: {e}") from e
 
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
@@ -1622,9 +1643,12 @@ class VideoData:
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
 
 
-def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+def is_jpeg_with_cuda(
+    image_bytes: bytes = b"", gpu_image_decode: GPUImageDecodeMode = True
+) -> bool:
     """
     Check three conditions:
     1. whether CUDA is available.
@@ -1638,10 +1662,19 @@ def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -
     return False
 
 
+@lru_cache(maxsize=16)
+def _warn_fancy_jpeg_fallback(error: str) -> None:
+    logger.warning(
+        "High-fidelity GPU JPEG decode is unavailable; falling back to PIL. "
+        "Install the Kimi-K3 serving image or NVIDIA nvImageCodec. Error: %s",
+        error,
+    )
+
+
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
-    gpu_image_decode: bool = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
     Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
@@ -1652,19 +1685,29 @@ def _load_image(
         image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
+            if gpu_image_decode == "nvjpeg_fancy":
+                from sglang.srt.utils.nvjpeg_decoder import (
+                    decode_jpeg_with_fancy_upsampling,
+                )
+
+                return decode_jpeg_with_fancy_upsampling(image_bytes)
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
         except Exception as e:
-            logger.warning(
-                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
-            )
+            if gpu_image_decode == "nvjpeg_fancy":
+                _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")
+            else:
+                logger.warning(
+                    "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
+                    e,
+                )
     return Image.open(BytesIO(image_bytes))
 
 
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
-    gpu_image_decode: bool = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
@@ -1785,7 +1828,13 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
     device = "cuda" if use_gpu else "cpu"
-    return VideoDecoderWrapper(source, device=device)
+    try:
+        return VideoDecoderWrapper(source, device=device)
+    except (ImportError, MemoryError):
+        raise  # missing backend / OOM is not a bad payload
+    except Exception as e:
+        # Broad on purpose: torchcodec raises RuntimeError, decord its own type.
+        raise ValueError(f"Could not decode video: {e}") from e
 
 
 def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:
@@ -1950,7 +1999,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.15.post1")
+        min_version: Minimum version required (e.g., "0.6.17")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -3478,14 +3527,17 @@ def dispose_tensor(x: torch.Tensor):
     interfering with torch.compile's memory tracking and graph recording.
     """
 
-    # Skip disposal during piecewise CUDA graph capture/replay: freeing the
-    # backing storage would invalidate addresses recorded in the graph.
-    # Local import avoids a circular dependency.
+    # Skip disposal under a captured prefill graph (piecewise or breakable):
+    # freeing the backing storage would invalidate addresses recorded in the
+    # graph. Local imports avoid a circular dependency.
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         is_in_tc_piecewise_cuda_graph,
     )
 
-    if is_in_tc_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return
 
     from sglang.srt.runtime_context import get_flags
@@ -3523,10 +3575,12 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
-    if server_args.enable_dp_attention:
-        assert server_args.dp_size > 1, "dp_size must be greater than 1"
-        if server_args.elastic_ep_backend is not None:
+    # elastic-EP scale-up rewrites dp_size on the published config
+    if get_parallel().enable_dp_attention:
+        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+        if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
             )
@@ -3534,10 +3588,10 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             if elastic_expanded_world_enabled():
                 return True
         if (
-            server_args.moe_dense_tp_size is None
+            get_parallel().moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not server_args.enable_dp_lm_head:
+        elif not get_parallel().enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
             return True
@@ -3553,8 +3607,8 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             return True
         else:
             return (
-                server_args.moe_dense_tp_size
-                > server_args.tp_size // server_args.dp_size
+                get_parallel().moe_dense_tp_size
+                > server_args.tp_size // get_parallel().dp_size
             )
     else:
         return False
@@ -3568,14 +3622,19 @@ def require_attn_tp_gather(server_args: ServerArgs):
     # and do not consume the upstream gathered_buffer. Without this, the
     # cuda graph runner pads num_tokens to attn_tp_size, which can cause
     # autotuners to pick suboptimal kernel variants at small batches.
-    if server_args.disable_attn_tp_gather:
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_parallel().disable_attn_tp_gather:
         return False
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
-        if server_args.enable_dp_attention:
-            return server_args.dp_size < server_args.tp_size
+    if (
+        not get_moe_a2a_backend().is_none()
+        or get_parallel().moe_dense_tp_size is not None
+    ):
+        if get_parallel().enable_dp_attention:
+            return get_parallel().dp_size < server_args.tp_size
         else:
             return True
     else:
@@ -3587,7 +3646,34 @@ def require_gathered_buffer(server_args: ServerArgs):
 
 
 def require_mlp_sync(server_args: ServerArgs):
-    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+    from sglang.srt.runtime_context import get_parallel
+
+    return get_parallel().enable_dp_attention or require_gathered_buffer(server_args)
+
+
+def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
+    alignment = 1
+    if server_args.enable_two_batch_overlap:
+        alignment *= 2
+    if require_gathered_buffer(server_args):
+        alignment *= get_parallel().attn_tp_size
+    if alignment % get_parallel().attn_cp_size != 0:
+        alignment *= get_parallel().attn_cp_size
+    return alignment
+
+
+def get_cuda_graph_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment(server_args))
+
+
+def get_eager_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    if not require_mlp_sync(server_args):
+        return max_batch_size
+
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+    max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
+    return ceil_align(max_batch_size, get_cp_padding_align_size())
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
@@ -4198,15 +4284,7 @@ class ConcurrentCounter:
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
-    if importlib.util.find_spec("triton_kernels") is None:
-        return False
-    try:
-        ragged_metadata_spec = importlib.util.find_spec(
-            "triton_kernels.tensor_details.ragged_tensor"
-        )
-    except ModuleNotFoundError:
-        return False
-    return ragged_metadata_spec is not None
+    return importlib.util.find_spec("triton_kernels") is not None
 
 
 def json_list_type(value):

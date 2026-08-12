@@ -57,7 +57,7 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
-      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 0."
+      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -288,15 +288,24 @@ else
 fi
 
 CACHE_HOST=/home/runner/sglang-data
-ENABLE_CACHE_HOST="${ENABLE_CACHE_HOST:-0}"
+if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
+  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
+  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
+  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *35x* ]]; then
+    ENABLE_CACHE_HOST="1"
+  else
+    ENABLE_CACHE_HOST="0"
+  fi
+fi
 case "${ENABLE_CACHE_HOST,,}" in
   1|true|yes|on|pvc|persistent)
-    if [[ ! -d "$CACHE_HOST" ]]; then
-      echo "Error: ENABLE_CACHE_HOST=1 but ${CACHE_HOST} does not exist." >&2
-      exit 1
+    if [[ -d "$CACHE_HOST" ]]; then
+      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    else
+      CACHE_VOLUME=""
+      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
     fi
-    CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-    echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
     ;;
   0|false|no|off|"")
     CACHE_VOLUME=""
@@ -332,8 +341,7 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
 docker exec ci_sglang mkdir -p \
   /sgl-data/hf-cache/hub \
   /sgl-data/pip-cache \
-  /sgl-data/miopen-cache \
-  /sgl-data/aiter-kernels
+  /sgl-data/miopen-cache
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
