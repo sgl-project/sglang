@@ -135,6 +135,16 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
             return next(self._inner_model.parameters()).device
         return torch.device("cpu")
 
+    def enable_tiling(self, *args, **kwargs):
+        # Proxy to the inner diffusers model, which already implements tiled
+        # decode; this wrapper just didn't forward the call before.
+        self._ensure_inner_model()
+        self._inner_model.enable_tiling(*args, **kwargs)
+
+    def disable_tiling(self):
+        self._ensure_inner_model()
+        self._inner_model.disable_tiling()
+
     def encode(self, x: torch.Tensor, **kwargs):
         self._ensure_inner_model()
         return self._inner_model.encode(x, **kwargs)
