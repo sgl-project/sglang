@@ -124,43 +124,43 @@ def minimax_sparse_prefill(
         idx_o = None
         topk_idx = cached_topk_idx
     else:
-      # Step 1: Flash attention with topk index (using index head)
-      idx_o, topk_idx = flash_prefill_with_topk_index(
-          q=idx_q,
-          k_cache=idx_k_cache,
-          v_cache=idx_v_cache,
-          sink=idx_sink,
-          req_to_token=req_to_token,
-          slot_ids=slot_ids,
-          cu_seqlens=cu_seqlens,
-          seq_lens=seq_lens,
-          prefix_lens=prefix_lens,
-          max_seqlen_q=max_seqlen_q,
-          max_seqlen_k=max_seqlen_k,
-          block_size_q=block_size_q,
-          block_size_k=block_size_k,
-          topk=topk,
-          init_blocks=init_blocks,
-          local_blocks=local_blocks,
-          sm_scale=idx_sm_scale,
-          score_type=score_type,
-          disable_index_value=disable_index_value,
-          cu_seqblocks_q=cu_seqblocks_q,
-          max_seqblock_q=max_seqblock_q,
-          all_seqblock_q=all_seqblock_q,
-          page_size=page_size,
-          q_scale=idx_q_scale,
-          k_scale=idx_k_scale,
-          v_scale=idx_v_scale,
-      )
-      # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
-      num_idx_heads = idx_q.shape[1]
-      num_kv_heads = k_cache.shape[1]
-      idx_group_size = num_idx_heads // num_kv_heads
-      if idx_group_size > 1:
-          topk_idx = topk_index_reduce(
-              topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
-          )
+        # Step 1: Flash attention with topk index (using index head)
+        idx_o, topk_idx = flash_prefill_with_topk_index(
+            q=idx_q,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            sink=idx_sink,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            block_size_q=block_size_q,
+            block_size_k=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
+            page_size=page_size,
+            q_scale=idx_q_scale,
+            k_scale=idx_k_scale,
+            v_scale=idx_v_scale,
+        )
+        # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
+        num_idx_heads = idx_q.shape[1]
+        num_kv_heads = k_cache.shape[1]
+        idx_group_size = num_idx_heads // num_kv_heads
+        if idx_group_size > 1:
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+            )
 
     # Reduced top-k cached by the caller for subsequent skip layers.
     reduced_topk_idx = topk_idx
@@ -315,6 +315,7 @@ def minimax_sparse_decode(
     idx_v_scale: Optional[float] = None,
     cached_topk_idx: Optional[torch.Tensor] = None,
     return_topk_idx: bool = False,
+    topk_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # PORT (alexsun07 dfd35ad2a8, decode half): index cache for DECODE. When
     # cached_topk_idx is given (a skip layer of an index-topk group), reuse the
@@ -328,32 +329,39 @@ def minimax_sparse_decode(
         topk_idx = cached_topk_idx
         _skip_reduce = True
     else:
-      _skip_reduce = False
-      # Step 1: Flash decode with topk index (using index head). When the dense main
-      # attention is used, the indexer emits the page table directly (fused
-      # transform) instead of block ids, plus the per-query effective KV length.
-      idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
-          q=idx_q,
-          sink=idx_sink,
-          k_cache=idx_k_cache,
-          v_cache=idx_v_cache,
-          req_to_token=req_to_token,
-          seq_lens=seq_lens,
-          max_seqlen=max_seqlen,
-          slot_ids=slot_ids,
-          block_size=block_size_k,
-          topk=topk,
-          init_blocks=init_blocks,
-          local_blocks=local_blocks,
-          sm_scale=idx_sm_scale,
-          score_type=score_type,
-          disable_index_value=disable_index_value,
-          use_dense_main_attn=dense_main_attn_fn is not None,
-          page_size=page_size,
-          q_scale=idx_q_scale,
-          k_scale=idx_k_scale,
-          v_scale=idx_v_scale,
-      )
+        _skip_reduce = False
+        # Step 1: Flash decode with topk index (using index head). When the dense main
+        # attention is used, the indexer emits the page table directly (fused
+        # transform) instead of block ids, plus the per-query effective KV length.
+        idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
+            q=idx_q,
+            sink=idx_sink,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen,
+            slot_ids=slot_ids,
+            block_size=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            use_dense_main_attn=dense_main_attn_fn is not None,
+            page_size=page_size,
+            q_scale=idx_q_scale,
+            k_scale=idx_k_scale,
+            v_scale=idx_v_scale,
+            # Only safe when no reduce step follows (idx heads == kv heads);
+            # otherwise the caller's buffer is the reduce output, not this one.
+            topk_out=(
+                topk_out
+                if (dense_main_attn_fn is None and idx_q.shape[1] == k_cache.shape[1])
+                else None
+            ),
+        )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
     idx_group_size = num_idx_heads // num_kv_heads

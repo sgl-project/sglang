@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
+    get_cu_seqblocks,
+)
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -12,9 +15,6 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_score_type,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
-    get_cu_seqblocks,
-)
 from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
     minimax_sparse_decode,
     minimax_sparse_prefill,
@@ -453,14 +453,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
             else:
                 prefix_lens = torch.zeros_like(seq_lens)
-            cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = (
-                get_cu_seqblocks(
-                    cu_seqlens,
-                    self._max_seqlen_q,
-                    self.block_size_q,
-                    self.block_size_k,
-                    forward_batch.extend_seq_lens_cpu,
-                )
+            cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
+                cu_seqlens,
+                self._max_seqlen_q,
+                self.block_size_q,
+                self.block_size_k,
+                forward_batch.extend_seq_lens_cpu,
             )
             self._prefill_meta = (
                 cu_seqlens,
@@ -758,10 +756,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_v_scale=layer.idx_v_scale_float,
             cached_topk_idx=_cached_topk,
             return_topk_idx=_want_topk,
+            topk_out=_topk_buf if _want_topk else None,
         )
         if _want_topk:
             idx_o, o, _reduced = result
-            _topk_buf.copy_(_reduced)
+            if _reduced.data_ptr() != _topk_buf.data_ptr():
+                _topk_buf.copy_(_reduced)
         else:
             idx_o, o = result
         return (
