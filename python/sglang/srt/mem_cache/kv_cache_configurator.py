@@ -114,6 +114,11 @@ def _should_enable_lazy_compaction() -> bool:
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
+def _pd_prefill_allocates_spec_verify_state() -> bool:
+    """Whether this worker allocates TARGET_VERIFY intermediate SSM state."""
+    return get_disagg().disaggregation_mode != "prefill"
+
+
 # base ratio of mamba pool size to max_running_requests. Under
 # SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
 # per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
@@ -1906,7 +1911,7 @@ class KVCacheConfigurator:
         # HybridReqToTokenPool therefore passes speculative_num_draft_tokens=None
         # and allocates no intermediate SSM state; keep the sizing charge aligned
         # with that actual pool allocation.
-        prefill_skips_spec_verify = get_disagg().disaggregation_mode == "prefill"
+        prefill_skips_spec_verify = not _pd_prefill_allocates_spec_verify_state()
         if has_spec_dec and not prefill_skips_spec_verify:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
