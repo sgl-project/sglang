@@ -1,14 +1,8 @@
 """Four-bit radix-select router for K3 routing on CDNA (ROCm).
 
-The ROCm counterpart to moe_route_radix: it replaces aiter's biased
-grouped_topk, whose cost is one round per selected expert, with a radix select
-whose cost follows the key width instead. Measured on MI355X at [8, 896] top-16:
-5.4us against aiter's 10.4us, and 3.3x at top-32 since only aiter's cost tracks
-topk.
-
-Dispatched from biased_grouped_topk_gpu's aiter branch for covered inputs;
-anything else falls back to aiter. Kernel notes live in
-jit/csrc/moe/route_radix4_hip.cuh.
+The ROCm counterpart to moe_route_radix, dispatched from
+biased_grouped_topk_gpu's aiter branch for covered inputs; anything else falls
+back to aiter. Kernel notes live in jit/csrc/moe/route_radix4_hip.cuh.
 """
 
 from __future__ import annotations
