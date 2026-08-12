@@ -198,6 +198,32 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_cancelled_singleflight_joiner_does_not_cancel_owner(self):
+        async def run():
+            cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def compute():
+                started.set()
+                await release.wait()
+                return b"artifact"
+
+            owner = asyncio.create_task(cache.get_or_compute("key", compute))
+            await started.wait()
+            joiner = asyncio.create_task(cache.get_or_compute("key", compute))
+            await asyncio.sleep(0)
+            joiner.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await joiner
+
+            release.set()
+            result = await owner
+            self.assertEqual(result.value, b"artifact")
+            self.assertEqual(cache.get("key"), b"artifact")
+
+        asyncio.run(run())
+
     def test_clear_does_not_repopulate_from_inflight_work(self):
         async def run():
             cache = MultimodalPreprocessCache[str, bytes](max_size_bytes=1024)
