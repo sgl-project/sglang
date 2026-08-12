@@ -801,6 +801,8 @@ class TboForwardBatchPreparer:
                 global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
+                # TBO children do not inherit the parent's MLP-sync state.
+                mlp_sync_prepared=False,
                 sampling_info=None,
                 # For logits and logprobs post processing, thus we do not care
                 temperature=None,

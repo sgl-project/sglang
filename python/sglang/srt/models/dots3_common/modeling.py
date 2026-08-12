@@ -120,7 +120,13 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_parallel,
+    get_spec,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -311,7 +317,7 @@ class Dots3MoE(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
@@ -377,7 +383,7 @@ class Dots3MoE(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
-                config.n_routed_experts + get_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -825,7 +831,7 @@ class Dots3AttentionMLA(nn.Module):
             base=self.rope_theta,
             rope_scaling=self.rope_scaling,
             is_neox_style=False,
-            device=get_server_args().device,
+            device=get_device().device,
         )
 
         # Optional NSA (Native Sparse Attention) indexer.
@@ -1518,7 +1524,9 @@ class Dots3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
-        self.speculative_algorithm = get_server_args().speculative_algorithm
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
         self.layer_id = layer_id
         self.self_attn = Dots3AttentionMLA(
             config=config,
@@ -1871,7 +1879,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

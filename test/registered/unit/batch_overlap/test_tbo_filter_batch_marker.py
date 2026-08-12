@@ -61,6 +61,7 @@ class TestTboFilterBatchMarker(CustomTestCase):
         child = _filter(parent, lo=0, hi=4)
         self.assertIsNone(child._original_batch_size)
         self.assertIsNone(child._original_num_tokens)
+        self.assertFalse(child.mlp_sync_prepared)
 
     def test_filter_batch_resets_plan_marker_on_children(self):
         child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
