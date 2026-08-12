@@ -1,4 +1,6 @@
+import concurrent.futures
 import sys
+import threading
 import unittest
 from types import SimpleNamespace
 from typing import cast
@@ -7,6 +9,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.model_loader.loader as loader_mod
+import sglang.srt.model_loader.utils as model_loader_utils
 import sglang.srt.model_loader.weight_utils as weight_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -110,6 +113,41 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
         marked.fill_(2)
         self.assertEqual(cloned.item(), 1)
 
+    def test_runai_streamed_tensor_is_consumed_before_buffer_reuse(self):
+        def consume_view(mark_as_runai: bool):
+            shared_buffer = torch.tensor([1], dtype=torch.int32)
+            view = shared_buffer[:]
+            if mark_as_runai:
+                setattr(view, weight_utils.RUNAI_STREAMER_TENSOR_ATTR, True)
+
+            release_worker = threading.Event()
+            observed = []
+            futures = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                # Keep the sole worker busy so an async consumer cannot read the
+                # zero-copy view until after the simulated streamer buffer reuse.
+                blocker = executor.submit(release_worker.wait)
+                model_loader_utils.maybe_executor_submit(
+                    executor=executor,
+                    futures=futures,
+                    use_async=model_loader_utils.should_async_load(view),
+                    func=lambda tensor: observed.append(tensor.item()),
+                    func_args=(view,),
+                )
+                shared_buffer.fill_(2)
+                release_worker.set()
+                blocker.result()
+                for future in futures:
+                    future.result()
+
+            return observed, len(futures)
+
+        # The control demonstrates the race: an async consumer observes the
+        # overwritten buffer rather than the value present when it was queued.
+        self.assertEqual(consume_view(mark_as_runai=False), ([2], 1))
+        # A RunAI-tagged view is consumed inline before the buffer is reused.
+        self.assertEqual(consume_view(mark_as_runai=True), ([1], 0))
+
     def test_deepseek_v4_streaming_dequant_fp8_wo_a_pairs_weight_and_scale(self):
         weight = torch.eye(128, dtype=torch.float32).to(torch.float8_e4m3fn)
         scale = torch.ones((1, 1), dtype=torch.float32)
@@ -182,6 +220,7 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
         remapper = SimpleNamespace(confidence_head=None)
         model = SimpleNamespace(
             config=SimpleNamespace(n_routed_experts=1),
+            num_fused_shared_experts=0,
             named_parameters=lambda: [
                 ("stages.0.self_attn.wo_a.weight", param),
             ],

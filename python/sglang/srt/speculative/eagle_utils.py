@@ -92,7 +92,10 @@ def _eagle_prefill_tail_tokens(
         for i, r in enumerate(batch.reqs):
             if r is batch.chunked_req:
                 tail_tokens = tail_tokens.clone()
-                tail_tokens[i] = next_prompt_token
+                # Keep the scalar as a kernel argument. Assigning a Python scalar
+                # through scalar indexing issues a pageable H2D copy and
+                # synchronizes the current CUDA stream before draft extend.
+                tail_tokens[i : i + 1].fill_(next_prompt_token)
                 break
     return tail_tokens
 
@@ -659,7 +662,6 @@ def eagle_sample(
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
-    from sglang.srt.runtime_context import get_server_args
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
@@ -746,7 +748,7 @@ def eagle_sample(
             chain_speculative_sampling_triton,
         )
 
-        use_rejection_sampling = get_server_args().speculative_use_rejection_sampling
+        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
@@ -919,9 +921,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
     # would OOB and free would leak KV. The row is widened to hold it in _init_pools
     # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
-    from sglang.srt.runtime_context import get_server_args
 
-    if page_size > 1 and (get_server_args().speculative_eagle_topk or 1) > 1:
+    if page_size > 1 and (get_spec().speculative_eagle_topk or 1) > 1:
         max_alloc_len = int(nxt_kv_lens_cpu.max())
         row_width = batch.req_to_token_pool.req_to_token.shape[1]
         assert max_alloc_len <= row_width, (
