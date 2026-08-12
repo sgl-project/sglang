@@ -580,10 +580,13 @@ class DeepseekV4AttnBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
-        # Per-(batch, compress_ratio) FlashMLASchedMeta for the MXFP4 fused
-        # decode kernel. Created lazily outside graph capture (the op allocates
-        # its scheduler tensors on first use), then reused across steps.
+        # Per-(batch, compress_ratio, index widths) FlashMLASchedMeta for the
+        # MXFP4 fused decode kernel. Created lazily outside graph capture (the
+        # op allocates its scheduler tensors on first use), then reused across
+        # steps. A separate dict is used during CUDA-graph capture so the
+        # scheduler generation runs inside the graph exactly once per key.
         self._mxfp4_sched_meta: dict = {}
+        self._mxfp4_sched_meta_capture: dict = {}
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
@@ -1902,10 +1905,15 @@ class DeepseekV4AttnBackend(
             extra_indices_3d.shape[-1] if have_extra else 0,
         )
         if torch.cuda.is_current_stream_capturing():
-            # During CUDA-graph capture the scheduler generation must run
-            # inside the graph (topk lengths are replayed device inputs); a
-            # cached metadata would freeze the warmup request's partition.
-            sched_meta = FlashMLASchedMeta()
+            # During capture the scheduler generation must run inside the
+            # graph (topk lengths are replayed device inputs) so it tracks
+            # replayed lengths; share one metadata per key so the generation
+            # kernel is captured once per (bs, ratio, widths) instead of once
+            # per layer (44x per decode step otherwise).
+            sched_meta = self._mxfp4_sched_meta_capture.get(key)
+            if sched_meta is None:
+                sched_meta = FlashMLASchedMeta()
+                self._mxfp4_sched_meta_capture[key] = sched_meta
         else:
             sched_meta = self._mxfp4_sched_meta.get(key)
             if sched_meta is None:
