@@ -580,6 +580,10 @@ class DeepseekV4AttnBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
+        # Per-(batch, compress_ratio) FlashMLASchedMeta for the MXFP4 fused
+        # decode kernel. Created lazily outside graph capture (the op allocates
+        # its scheduler tensors on first use), then reused across steps.
+        self._mxfp4_sched_meta: dict = {}
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
@@ -1632,8 +1636,8 @@ class DeepseekV4AttnBackend(
                         core_attn_metadata=core_attn_metadata,
                         attn_sink=attn_sink,
                     )
-                # Decode (or small extend): fused MXFP4 jit_kernel
-                return self._forward_mxfp4_decode(
+                # Decode (or small extend): fused MXFP4 FlashMLA-style kernel
+                return self._forward_mxfp4_decode_flashmla(
                     q=q,
                     forward_batch=forward_batch,
                     swa_k_cache=swa_k_cache,
@@ -1843,6 +1847,84 @@ class DeepseekV4AttnBackend(
             extra_page_size=extra_page_size,
         )
         return o.view(*q_orig_shape[:-1], -1)
+
+    def _forward_mxfp4_decode_flashmla(
+        self,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        compress_ratio: Literal[0, 4, 128],
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """MXFP4 decode via the fused FlashMLA-style kernel (per-request).
+
+        One call covers SWA + C4/C128 + attn_sink with a single online
+        softmax. Cache tensors are consumed in place: the SWA cache is a
+        tightly packed flat-slot pool (one 368-byte row per token, so
+        page_block_size=1), and the C4/C128 caches keep their physical
+        page layout.
+        """
+        from sgl_kernel.flash_mla import (
+            FlashMLASchedMeta,
+            flash_mla_with_kvcache_dsv4_mxfp4,
+        )
+        from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import MXFP4_BYTES_PER_TOKEN
+
+        assert q.ndim == 3 and q.shape[2] == 512, f"expect [bs, heads, 512], got {q.shape}"
+        bs, h_q, _ = q.shape
+        assert h_q in (64, 128)
+
+        swa_cache_4d = swa_k_cache.view(-1, 1, 1, MXFP4_BYTES_PER_TOKEN)
+        swa_indices_3d = swa_page_indices.unsqueeze(1).contiguous()
+        swa_lengths = swa_topk_lengths.contiguous()
+
+        have_extra = compress_ratio > 0 and extra_k_cache is not None
+        extra_cache_4d = extra_indices_3d = extra_lengths = None
+        if have_extra:
+            page_size = self.token_to_kv_pool.page_size // compress_ratio
+            extra_cache_4d = extra_k_cache.view(
+                extra_k_cache.shape[0], page_size, 1, MXFP4_BYTES_PER_TOKEN
+            )
+            extra_indices_3d = extra_indices.unsqueeze(1).contiguous()
+            extra_lengths = extra_topk_lengths.contiguous()
+
+        # The scheduler config includes the padded index widths, which differ
+        # between decode (128) and small extends (seq-dependent multiple of 64).
+        key = (
+            bs,
+            compress_ratio,
+            swa_indices_3d.shape[-1],
+            extra_indices_3d.shape[-1] if have_extra else 0,
+        )
+        if torch.cuda.is_current_stream_capturing():
+            # During CUDA-graph capture the scheduler generation must run
+            # inside the graph (topk lengths are replayed device inputs); a
+            # cached metadata would freeze the warmup request's partition.
+            sched_meta = FlashMLASchedMeta()
+        else:
+            sched_meta = self._mxfp4_sched_meta.get(key)
+            if sched_meta is None:
+                sched_meta = FlashMLASchedMeta()
+                self._mxfp4_sched_meta[key] = sched_meta
+
+        o, _ = flash_mla_with_kvcache_dsv4_mxfp4(
+            q=q.unsqueeze(1),
+            k_cache=swa_cache_4d,
+            indices=swa_indices_3d,
+            topk_length=swa_lengths,
+            attn_sink=attn_sink,
+            tile_scheduler_metadata=sched_meta,
+            softmax_scale=self.softmax_scale,
+            extra_k_cache=extra_cache_4d,
+            extra_indices_in_kvcache=extra_indices_3d,
+            extra_topk_length=extra_lengths,
+        )
+        return o.squeeze(1)
 
     def _forward_prefill_sparse(
         self,
