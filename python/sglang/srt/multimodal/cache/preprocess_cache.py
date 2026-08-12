@@ -315,7 +315,7 @@ class MultimodalPreprocessCache(Generic[K, V]):
                 self._inflight.pop(reservation.key, None)
 
     async def wait(self, reservation: CacheReservation[K, V]) -> V:
-        return await asyncio.wrap_future(reservation.future)
+        return await asyncio.shield(asyncio.wrap_future(reservation.future))
 
     def record_singleflight_joins(self, count: int) -> None:
         """Include external work coalesced around this cache in its metrics."""
