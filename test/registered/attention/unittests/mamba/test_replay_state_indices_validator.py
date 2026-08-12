@@ -1,19 +1,10 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
-# Keep this CPU-only contract test lightweight: importing the public sglang
-# package initializes unrelated frontend/runtime dependencies.
-sys.path.insert(
-    0,
-    str(
-        Path(__file__).resolve().parents[5] / "python/sglang/srt/layers/attention/mamba"
-    ),
+from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
+    validate_replay_state_indices_cpu,
 )
-from replay_state_indices_validator import validate_replay_state_indices_cpu
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

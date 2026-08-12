@@ -27,7 +27,8 @@ def _import_flashinfer_backend():
     except ImportError as error:
         raise RuntimeError(
             "MNNVL CuTe DSL fusion requires a FlashInfer build that ships "
-            "flashinfer.comm.mnnvl_cutedsl"
+            "flashinfer.comm.mnnvl_cutedsl and its dependencies, including "
+            "nvidia-cutlass-dsl and cuda-python"
         ) from error
     return (
         MNNVLCuteDSLAllReduceFusionWorkspace,
