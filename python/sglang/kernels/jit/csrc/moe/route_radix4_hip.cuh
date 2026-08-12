@@ -1,32 +1,17 @@
 /// Four-bit radix-select router for K3 routing on CDNA (gfx942/gfx950).
 ///
-/// aiter's grouped_topk_kernel spends one round per selected expert, each round
-/// rescanning every score from LDS and ending in a cross-lane max whose winner
-/// is written back as -INFINITY. At 896 experts and top-16 that fits ~0.72us per
-/// round, so the kernel scales with topk and lands near 11us. aiter does avoid
-/// that loop for DeepSeek, sorting the group scores to get a pivot and counting
-/// against it, but that path is gated on DeepSeek's exact shape (256 experts, 8
-/// groups, top-8, top-4 groups) and its innards are specialized to it, so K3
-/// falls to the generic loop.
+/// One block routes one token. Each thread keeps its slice of the 896 scores in
+/// registers, and the block narrows a pivot four key bits at a time: a round
+/// tallies the still-live keys into a 16-bin histogram, accumulates the counts
+/// from the top bin down, and keeps the bin the k-th key falls in. The round
+/// count therefore follows the key width rather than topk.
 ///
-/// The pivot idea is the right one; what does not carry over is finding the pivot
-/// by sorting, since 896 scores will not sort in registers the way 8 group scores
-/// do. So the pivot is approached four key bits at a time instead, which also
-/// means the round count follows the key width rather than topk. Three properties
-/// of the hardware shape the rest:
-///
-///   * A round's cost is dominated by the VALU->SALU->VALU trip that broadcasting
-///     a cross-lane count requires, and that trip costs the same whether the
-///     round resolves one bit or four. Hence a 16-bin histogram per round.
-///   * With the round count cut, a lone wave64 becomes issue-bound rather than
-///     latency-bound (one VALU op per 4 cycles with nothing to interleave), so
-///     the experts are spread over several waves on separate SIMDs.
-///   * What is left per round is the work that does not shrink with more waves.
-///     Transposing the bin totals into lanes turns the 16-step walk over the bins
-///     into a 4-step DPP prefix sum plus a ballot.
-///
-/// Measured on MI355X at [8, 896] top-16: 5.4us against aiter's 10.4us. The gap
-/// widens with topk (3.3x at top-32) since only aiter's cost tracks it.
+/// A round's cost is dominated by the vector->scalar->vector unit trip that
+/// broadcasting a cross-lane count requires, and that trip is the same price
+/// whether the round resolves one bit or four, hence 16 bins. What is left is
+/// the per-round work that does not shrink as the experts are spread over more
+/// waves; transposing the bin totals into lanes turns the 16-step walk over
+/// them into a 4-step DPP prefix sum plus a ballot.
 
 #pragma once
 
@@ -86,9 +71,8 @@ SGL_DEVICE void dpp_add_stage(uint32_t (&x)[N]) {
     x[j] += static_cast<uint32_t>(__builtin_amdgcn_update_dpp(0, static_cast<int>(x[j]), CTRL, RM, BM, false));
 }
 
-/// Leaves the wave totals in lane 63. Deliberately does not broadcast: a caller
-/// wanting 16 bin counts must reduce them to one scalar itself rather than
-/// paying a readlane per word.
+/// Leaves the wave totals in lane 63 instead of broadcasting them, so a caller
+/// reducing 16 bin counts pays no readlane per word.
 template <int N>
 SGL_DEVICE void wave_sum_dpp(uint32_t (&x)[N]) {
   dpp_add_stage<0x111, 0xf, 0xf>(x);  // row_shr:1
@@ -186,7 +170,8 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
 
     uint64_t h[NACC];
 #pragma unroll
-    for (int a = 0; a < NACC; ++a) h[a] = 0ull;
+    for (int a = 0; a < NACC; ++a)
+      h[a] = 0ull;
 #pragma unroll
     for (int i = 0; i < VPT; ++i) {
       // Variable 64-bit shift, so tallying needs no dynamic array index; one
@@ -211,7 +196,8 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     radix4::wave_sum_dpp(p);
     if (lane == WAVE - 1) {
 #pragma unroll
-      for (int j = 0; j < 8; ++j) s_hist[buf][wid][j] = p[j];
+      for (int j = 0; j < 8; ++j)
+        s_hist[buf][wid][j] = p[j];
     }
     __syncthreads();
 
@@ -288,7 +274,8 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     if (params.renormalize) {
       float sum = 0.0f;
 #pragma unroll
-      for (int k = 0; k < TOPK; ++k) sum += s_w[k];
+      for (int k = 0; k < TOPK; ++k)
+        sum += s_w[k];
       scale /= sum;
     }
     const size_t o = static_cast<size_t>(token) * params.stride_out + tid;
@@ -300,8 +287,8 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
 }  // namespace sglang
 
 struct RouteRadix4Kernel {
-  static void run(
-      const tvm::ffi::TensorView scores,
+  static void
+  run(const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView bias,
       const tvm::ffi::TensorView out_w,
       const tvm::ffi::TensorView out_i,
@@ -328,8 +315,7 @@ struct RouteRadix4Kernel {
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device_).verify(out_i);
 
     RuntimeCheck(
-        N_.unwrap() == sglang::kRadix4NumExperts && K_.unwrap() == sglang::kRadix4TopK &&
-            topk == sglang::kRadix4TopK,
+        N_.unwrap() == sglang::kRadix4NumExperts && K_.unwrap() == sglang::kRadix4TopK && topk == sglang::kRadix4TopK,
         "route_radix4 is specialized for N=896, K=16");
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
