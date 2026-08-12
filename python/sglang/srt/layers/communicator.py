@@ -601,10 +601,12 @@ class LayerCommunicator:
                         # the standalone per-token quant before
                         # fused_qkv_a_proj_with_mqa on the fused-AR path. Returns
                         # None when custom AR is ineligible -> fall back below.
-                        quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant(
-                            hidden_states,
-                            residual,
-                            use_attn_tp_group=False,
+                        quant_result = (
+                            self.input_layernorm.forward_with_allreduce_fusion_quant(
+                                hidden_states,
+                                residual,
+                                use_attn_tp_group=False,
+                            )
                         )
                     elif (
                         self.enable_fused_ar_quant
