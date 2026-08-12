@@ -72,6 +72,9 @@ uv pip install "sglang[diffusion]" --prerelease=allow
 
 For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
 
+NATTEN is an optional extra, worth installing only if you plan to use the
+[diffusion decoder](#4-6-diffusion-decoder) — see that section for why.
+
 ## 3. Model Deployment
 
 ### 3.1 Basic Configuration
@@ -272,6 +275,27 @@ sglang generate \
   --save-output
 ```
 
-It is a diffusion model in its own right and decodes far more slowly than the
-VAE decoder (minutes rather than seconds), so it is off by default — matching
-upstream, where `LTX2Pipeline` also decodes with the VAE.
+It is a diffusion model in its own right and decodes more slowly than the VAE
+decoder, so it is off by default — matching upstream, where `LTX2Pipeline` also
+decodes with the VAE.
+
+<Tip>
+**Install NATTEN for this decoder.** Its stages run 3D neighborhood attention,
+and SGLang uses NATTEN's fused `na3d` kernel for it when the package is present.
+NATTEN is *not* a dependency of `sglang[diffusion]`: without it the decoder
+falls back to a compiled FlexAttention block mask. The two agree to bf16
+rounding, but the fallback is roughly **5x slower** on the decoder's largest
+attention grid, and has to build the mask on top of that.
+
+NATTEN ships prebuilt wheels pinned to a specific torch and CUDA build, so
+install the one matching your environment rather than a bare version — check
+your combination at [natten.org](https://natten.org). For torch 2.11 / CUDA
+13.0, for example:
+
+```bash
+uv pip install natten==0.21.6+torch2110cu130 -f https://whl.natten.org/
+```
+
+Nothing else changes if you skip it: the decoder still produces the same video,
+just slower.
+</Tip>
