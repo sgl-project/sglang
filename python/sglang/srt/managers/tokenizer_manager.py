@@ -107,9 +107,11 @@ from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     is_health_check_generate_req,
 )
+from sglang.srt.mem_cache.multimodal_cache import MM_EMBEDDING_CACHE_IDENTITY_KEY
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.cache import build_mm_radix_cache_namespace
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -301,6 +303,34 @@ def _can_omit_mm_features(obj: GenerateReqInput) -> bool:
     until session state has an explicit lease-lifetime contract.
     """
     return obj.parallel_sample_num == 1 and obj.session_params is None
+
+
+def _namespace_mm_radix_cache(extra_key: Optional[str], mm_inputs) -> Optional[str]:
+    """Keep strong per-media identities in the prefix-cache key.
+
+    Processors without a strong identity retain the legacy behavior. An opted-in
+    processor must provide one identity for every item; mixing strong and legacy
+    items would make the request namespace incomplete, so fail closed instead.
+    """
+    items = getattr(mm_inputs, "mm_items", None)
+    if not items:
+        return extra_key
+    identities = [
+        item.model_specific_data.get(MM_EMBEDDING_CACHE_IDENTITY_KEY) for item in items
+    ]
+    if not any(identity is not None for identity in identities):
+        return extra_key
+    if any(identity is None for identity in identities):
+        raise ValueError(
+            "Multimodal radix-cache identities must cover every media item"
+        )
+    return build_mm_radix_cache_namespace(
+        extra_key,
+        [
+            (item.modality.name.lower(), identity)
+            for item, identity in zip(items, identities)
+        ],
+    )
 
 
 def _slice_streaming_output_meta_info(
@@ -1630,6 +1660,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
+        extra_key = _namespace_mm_radix_cache(obj.extra_key, mm_inputs)
+
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -1691,7 +1723,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
-                extra_key=obj.extra_key,
+                extra_key=extra_key,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,

@@ -479,7 +479,10 @@ _GENERAL_VIDEO_META_ATTRS = (
     "video_timestamps",
     "second_per_grid_ts",
 )
-_GENERAL_IMAGE_META_ATTRS = ("original_image_sizes",)
+_GENERAL_IMAGE_META_ATTRS = (
+    "original_image_sizes",
+    "mm_feature_identities",
+)
 # MiMo-VL audio-in-video fields; appended only when model_type is MiMo.
 _MIMO_VIDEO_AUDIO_META_ATTRS = (
     "video_audio_feature_lens",

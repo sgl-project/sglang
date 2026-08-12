@@ -273,8 +273,8 @@ def build_artifact_key(
     return _digest_bytes(_canonical_json(payload))
 
 
-def build_feature_hash(artifact_key: str, processor_output_hash: int) -> int:
-    """Namespace a processor-output hash by its complete artifact identity."""
+def build_feature_identity(artifact_key: str, processor_output_hash: int) -> str:
+    """Bind a processor output to its complete, prompt-independent artifact."""
     artifact_key = parse_content_hash(artifact_key)
     if (
         isinstance(processor_output_hash, bool)
@@ -287,15 +287,47 @@ def build_feature_hash(artifact_key: str, processor_output_hash: int) -> int:
         byteorder="big",
         signed=False,
     )
-    digest = _hash_parts(
+    return _hash_parts(
         b"multimodal-feature-v1",
         bytes.fromhex(artifact_key[len(CONTENT_HASH_PREFIX) :]),
         output_hash_bytes,
     )
+
+
+def build_feature_hash(artifact_key: str, processor_output_hash: int) -> int:
+    """Return the compact lookup key for a complete feature identity."""
+    digest = build_feature_identity(artifact_key, processor_output_hash)
     return int.from_bytes(
         bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :])[:8],
         byteorder="big",
         signed=False,
+    )
+
+
+def build_mm_radix_cache_namespace(
+    base_key: Optional[str], ordered_feature_identities: list[tuple[str, str]]
+) -> str:
+    """Namespace prefix KV by the ordered, full multimodal identities.
+
+    The legacy per-item pad token carries only 30 bits of an item's compact
+    hash. Keeping the full SHA-256 feature identities in the request's radix
+    namespace prevents a pad-token collision from reusing another request's
+    language-model KV.
+    """
+    if not ordered_feature_identities:
+        raise ValueError("multimodal radix namespace requires at least one identity")
+    identities = [
+        [modality, parse_content_hash(identity)]
+        for modality, identity in ordered_feature_identities
+    ]
+    return _digest_bytes(
+        _canonical_json(
+            {
+                "version": "multimodal-radix-v1",
+                "base_key": base_key,
+                "ordered_feature_identities": identities,
+            }
+        )
     )
 
 

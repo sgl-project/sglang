@@ -429,6 +429,7 @@ def test_kimi_k3_epd_trusted_metadata_hit_skips_media_read():
         artifact = EncoderPreprocessArtifact(
             content_digest=digest,
             artifact_key=key,
+            feature_identity="sha256:" + "11" * 32,
             feature_hash=17,
             grid_thw=(1, 2, 2),
             original_size=(8, 6),
@@ -460,6 +461,7 @@ def test_kimi_k3_epd_embedding_hit_skips_decode_processor_and_vit():
         artifact = EncoderPreprocessArtifact(
             content_digest=digest,
             artifact_key=key,
+            feature_identity="sha256:" + "22" * 32,
             feature_hash=23,
             grid_thw=(1, 2, 2),
             original_size=(8, 6),
@@ -467,7 +469,7 @@ def test_kimi_k3_epd_embedding_hit_skips_decode_processor_and_vit():
         embedding = torch.arange(4, dtype=torch.float32).reshape(1, 4)
         encoder.mm_preprocess_cache.put(key, artifact)
         encoder.mm_cache.set(
-            23, EmbeddingResult(embedding=embedding, identity=artifact.artifact_key)
+            23, EmbeddingResult(embedding=embedding, identity=artifact.feature_identity)
         )
         encoder._process_mm_items = AsyncMock(
             side_effect=AssertionError("embedding hit ran processor")
@@ -479,7 +481,10 @@ def test_kimi_k3_epd_embedding_hit_skips_decode_processor_and_vit():
 
         torch.testing.assert_close(grid, torch.tensor([[1, 2, 2]]))
         torch.testing.assert_close(output, embedding)
-        assert aux == {"original_image_sizes": [[8, 6]]}
+        assert aux == {
+            "original_image_sizes": [[8, 6]],
+            "mm_feature_identities": [artifact.feature_identity],
+        }
         encoder._process_mm_items.assert_not_awaited()
     finally:
         encoder.io_executor.shutdown()
@@ -492,6 +497,7 @@ def test_kimi_k3_epd_coalesces_concurrent_encoder_misses():
         artifact = EncoderPreprocessArtifact(
             content_digest=digest,
             artifact_key="shared-key",
+            feature_identity="sha256:" + "33" * 32,
             feature_hash=29,
             grid_thw=(1, 2, 2),
             original_size=(8, 6),
@@ -531,7 +537,10 @@ def test_kimi_k3_epd_coalesces_concurrent_encoder_misses():
             for grid, output, aux in outputs:
                 torch.testing.assert_close(grid, torch.tensor([[1, 2, 2]]))
                 torch.testing.assert_close(output, embedding)
-                assert aux == {"original_image_sizes": [[8, 6]]}
+                assert aux == {
+                    "original_image_sizes": [[8, 6]],
+                    "mm_feature_identities": [artifact.feature_identity],
+                }
         finally:
             encoder.io_executor.shutdown()
 
@@ -545,6 +554,7 @@ def test_kimi_k3_epd_flush_invalidates_inflight_encoder_work():
         artifact = EncoderPreprocessArtifact(
             content_digest=digest,
             artifact_key="inflight-key",
+            feature_identity="sha256:" + "44" * 32,
             feature_hash=31,
             grid_thw=(1, 2, 2),
             original_size=(8, 6),
@@ -586,6 +596,7 @@ def test_kimi_k3_epd_global_cache_preprocesses_only_metadata_misses():
     hit = EncoderPreprocessArtifact(
         content_digest="sha256:" + "11" * 32,
         artifact_key="hit-key",
+        feature_identity="sha256:" + "55" * 32,
         feature_hash=11,
         grid_thw=(1, 2, 2),
         original_size=(8, 6),
@@ -593,6 +604,7 @@ def test_kimi_k3_epd_global_cache_preprocesses_only_metadata_misses():
     miss = EncoderPreprocessArtifact(
         content_digest="sha256:" + "22" * 32,
         artifact_key="miss-key",
+        feature_identity="sha256:" + "66" * 32,
         feature_hash=22,
         grid_thw=(1, 4, 4),
         original_size=(16, 12),
@@ -625,7 +637,10 @@ def test_kimi_k3_epd_global_cache_preprocesses_only_metadata_misses():
     assert ctx.prepared_index_map == {1: 0}
     assert ctx.str_mm_hashes == ["11", "22"]
     assert ctx.grid_thw.tolist() == [[1, 2, 2], [1, 4, 4]]
-    assert ctx.aux_data == {"original_image_sizes": [[8, 6], [16, 12]]}
+    assert ctx.aux_data == {
+        "original_image_sizes": [[8, 6], [16, 12]],
+        "mm_feature_identities": [hit.feature_identity, miss.feature_identity],
+    }
 
 
 def test_kimi_k3_epd_global_cache_coalesces_concurrent_metadata_misses():
@@ -636,6 +651,7 @@ def test_kimi_k3_epd_global_cache_coalesces_concurrent_metadata_misses():
         artifact = EncoderPreprocessArtifact(
             content_digest=digest,
             artifact_key="global-key",
+            feature_identity="sha256:" + "77" * 32,
             feature_hash=41,
             grid_thw=(1, 2, 2),
             original_size=(8, 6),
@@ -722,7 +738,7 @@ def test_epd_receiver_keeps_content_hash_aligned_with_image():
     ]
 
 
-def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():
+def test_kimi_k3_epd_aggregates_image_metadata_in_part_order():
     first = EmbeddingData(
         req_id="request",
         num_parts=2,
@@ -731,6 +747,7 @@ def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():
         modality=Modality.IMAGE,
         embedding=torch.ones(3, 4),
         original_image_sizes=[[1536, 1024]],
+        mm_feature_identities=["sha256:" + "11" * 32],
     )
     second = EmbeddingData(
         req_id="request",
@@ -740,6 +757,7 @@ def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():
         modality=Modality.IMAGE,
         embedding=torch.ones(2, 4),
         original_image_sizes=[[1024, 1536]],
+        mm_feature_identities=["sha256:" + "22" * 32],
     )
 
     combined = MultiModalEmbeddingData.from_embedding_data(first, model_type="kimi_k3")
@@ -749,6 +767,10 @@ def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():
     assert combined.get_mm_extra_meta()["original_image_sizes"] == [
         [1536, 1024],
         [1024, 1536],
+    ]
+    assert combined.get_mm_extra_meta()["mm_feature_identities"] == [
+        "sha256:" + "11" * 32,
+        "sha256:" + "22" * 32,
     ]
 
 

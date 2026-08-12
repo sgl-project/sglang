@@ -20,6 +20,8 @@ from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
     build_artifact_key,
     build_feature_hash,
+    build_feature_identity,
+    build_mm_radix_cache_namespace,
     build_processor_fingerprint,
     estimate_cache_size_bytes,
     parse_content_hash,
@@ -250,9 +252,39 @@ class TestMediaIdentity(unittest.TestCase):
         )
         self.assertNotEqual(build_feature_hash(first, 1), build_feature_hash(second, 1))
         self.assertNotEqual(build_feature_hash(first, 1), build_feature_hash(first, 2))
+        self.assertNotEqual(
+            build_feature_identity(first, 1), build_feature_identity(second, 1)
+        )
+        self.assertNotEqual(
+            build_feature_identity(first, 1), build_feature_identity(first, 2)
+        )
+        self.assertEqual(
+            build_feature_hash(first, 1),
+            int(build_feature_identity(first, 1)[7:23], 16),
+        )
         self.assertIsInstance(build_feature_hash(first, 1 << 128), int)
         with self.assertRaises(ValueError):
             build_feature_hash(first, -1)
+
+    def test_radix_namespace_uses_full_ordered_artifact_identities(self):
+        first = "sha256:" + "01" * 32
+        second = "sha256:" + "02" * 32
+        self.assertNotEqual(
+            build_mm_radix_cache_namespace(None, [("image", first)]),
+            build_mm_radix_cache_namespace(None, [("image", second)]),
+        )
+        self.assertNotEqual(
+            build_mm_radix_cache_namespace(
+                "caller", [("image", first), ("image", second)]
+            ),
+            build_mm_radix_cache_namespace(
+                "caller", [("image", second), ("image", first)]
+            ),
+        )
+        self.assertNotEqual(
+            build_mm_radix_cache_namespace(None, [("image", first)]),
+            build_mm_radix_cache_namespace("caller", [("image", first)]),
+        )
 
 
 class TestMultimodalPreprocessCache(unittest.TestCase):

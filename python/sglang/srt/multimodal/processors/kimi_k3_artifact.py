@@ -57,6 +57,7 @@ class KimiK3ImageArtifact:
 
     content_digest: str
     artifact_key: str
+    feature_identity: str
     feature_hash: int
     original_size: tuple[int, int]
     resize_config: KimiK3ResizeConfig

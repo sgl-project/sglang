@@ -29,6 +29,7 @@ class EncoderPreprocessArtifact:
 
     content_digest: str
     artifact_key: str
+    feature_identity: str
     feature_hash: int
     grid_thw: tuple[int, ...]
     original_size: tuple[int, int]

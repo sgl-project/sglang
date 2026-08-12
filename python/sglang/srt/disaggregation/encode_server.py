@@ -66,6 +66,7 @@ from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
     build_artifact_key,
     build_feature_hash,
+    build_feature_identity,
     build_processor_fingerprint,
     parse_content_hash,
     snapshot_media,
@@ -1398,7 +1399,10 @@ class MMEncoder:
                 aux_data={
                     "original_image_sizes": [
                         list(artifact.original_size) for artifact in cached_artifacts
-                    ]
+                    ],
+                    "mm_feature_identities": [
+                        artifact.feature_identity for artifact in cached_artifacts
+                    ],
                 },
                 str_mm_hashes=str_mm_hashes,
                 source_mm_items=list(mm_items),
@@ -1468,20 +1472,23 @@ class MMEncoder:
         artifacts = []
         for index, (lookup, item) in enumerate(zip(lookups, model_items)):
             item.set_pad_value()
+            feature_identity = build_feature_identity(lookup.artifact_key, item.hash)
             feature_hash = build_feature_hash(lookup.artifact_key, item.hash)
-            if (
-                lookup.artifact is not None
-                and lookup.artifact.feature_hash != feature_hash
+            if lookup.artifact is not None and (
+                lookup.artifact.feature_identity != feature_identity
+                or lookup.artifact.feature_hash != feature_hash
             ):
                 self.mm_preprocess_cache.pop(lookup.artifact_key)
                 raise InternalError(
-                    "K3 encoder feature hash changed for identical artifact "
+                    "K3 encoder feature identity or hash changed for identical artifact "
                     f"{lookup.artifact_key}: "
-                    f"{lookup.artifact.feature_hash} != {feature_hash}"
+                    f"{(lookup.artifact.feature_identity, lookup.artifact.feature_hash)} "
+                    f"!= {(feature_identity, feature_hash)}"
                 )
             artifact = EncoderPreprocessArtifact(
                 content_digest=lookup.content_digest,
                 artifact_key=lookup.artifact_key,
+                feature_identity=feature_identity,
                 feature_hash=feature_hash,
                 grid_thw=tuple(int(value) for value in grid_thw[index]),
                 original_size=tuple(int(value) for value in original_sizes[index]),
@@ -1522,6 +1529,9 @@ class MMEncoder:
         ctx.get_feature_fn = get_feature_fn
         ctx.mm_feature = mm_feature
         ctx.aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
+        ctx.aux_data["mm_feature_identities"] = [
+            artifact.feature_identity for artifact in artifacts
+        ]
 
     async def _encode_global_cache_indices(
         self, ctx: GlobalCacheEncodeContext, indices: List[int]
@@ -2378,7 +2388,7 @@ class MMEncoder:
                     continue
                 cached = self.mm_cache.get_single(artifact.feature_hash)
                 if cached is not None and self.mm_cache.matches_identity(
-                    cached, artifact.artifact_key
+                    cached, artifact.feature_identity
                 ):
                     embeddings[index] = cached.embedding
 
@@ -2456,7 +2466,10 @@ class MMEncoder:
         aux_data = {
             "original_image_sizes": [
                 list(artifact.original_size) for artifact in resolved_artifacts
-            ]
+            ],
+            "mm_feature_identities": [
+                artifact.feature_identity for artifact in resolved_artifacts
+            ],
         }
 
         if encoder_metrics_collector is not None and log_metrics:
@@ -2531,17 +2544,26 @@ class MMEncoder:
                 item = model_items[position]
                 lookup = lookups[request_index]
                 prior = artifacts[request_index]
+                feature_identity = build_feature_identity(
+                    lookup.artifact_key, item.hash
+                )
                 feature_hash = build_feature_hash(lookup.artifact_key, item.hash)
-                if prior is not None and prior.feature_hash != feature_hash:
+                if prior is not None and (
+                    prior.feature_identity != feature_identity
+                    or prior.feature_hash != feature_hash
+                ):
                     self.mm_preprocess_cache.pop(lookup.artifact_key)
                     raise InternalError(
-                        "K3 encoder feature hash changed for identical artifact "
+                        "K3 encoder feature identity or hash changed for identical "
+                        "artifact "
                         f"{lookup.artifact_key}: "
-                        f"{prior.feature_hash} != {feature_hash}"
+                        f"{(prior.feature_identity, prior.feature_hash)} != "
+                        f"{(feature_identity, feature_hash)}"
                     )
                 artifact = EncoderPreprocessArtifact(
                     content_digest=lookup.content_digest,
                     artifact_key=lookup.artifact_key,
+                    feature_identity=feature_identity,
                     feature_hash=feature_hash,
                     grid_thw=tuple(int(value) for value in grid_thw[position]),
                     original_size=tuple(
@@ -2565,7 +2587,7 @@ class MMEncoder:
                     self.mm_cache.set(
                         artifact.feature_hash,
                         EmbeddingResult(
-                            embedding=embedding, identity=artifact.artifact_key
+                            embedding=embedding, identity=artifact.feature_identity
                         ),
                     )
             return owner_results
@@ -3183,7 +3205,10 @@ class MMEncoder:
                     request_aux = {
                         "original_image_sizes": aux_data["original_image_sizes"][
                             offset : offset + count
-                        ]
+                        ],
+                        "mm_feature_identities": aux_data["mm_feature_identities"][
+                            offset : offset + count
+                        ],
                     }
                     if self.rank == 0:
                         self.embedding_to_send[req["req_id"]] = EmbeddingData(

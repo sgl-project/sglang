@@ -43,9 +43,15 @@ The key encoder preserves Python types and rejects unsupported values instead
 of reducing them to a lossy string. The feature identity combines the complete
 artifact identity with the actual processor-output hash. This prevents equal
 feature bytes from being reused across different grid or processor contexts.
-The embedding cache also stores and verifies the full artifact identity beside
-its compact integer lookup key, so a compact-key collision is treated as a
-miss rather than returning another artifact's embedding.
+The embedding cache also stores and verifies a full feature identity beside its
+compact integer lookup key. The feature identity binds the complete artifact
+identity to the processor-output hash, so a compact-key collision is treated as
+a miss rather than returning another artifact's embedding.
+Kimi-K3 requests also namespace the Radix prefix cache by the ordered full
+feature identities. This prevents the legacy 30-bit multimodal pad sentinel
+from turning a collision into incorrect language-model KV reuse. Requests with
+different media therefore do not share a Radix namespace; repeated turns with
+the same ordered media still do.
 Prompt text is intentionally excluded: every request rebuilds and validates its
 prompt tokens, image spans, grids, and offsets from the cached per-image
 metadata.

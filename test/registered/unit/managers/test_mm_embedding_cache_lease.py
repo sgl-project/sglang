@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.managers import mm_schedule
@@ -14,7 +15,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.tokenizer_manager import _can_omit_mm_features
+from sglang.srt.managers.tokenizer_manager import (
+    _can_omit_mm_features,
+    _namespace_mm_radix_cache,
+)
 from sglang.srt.mem_cache.multimodal_cache import (
     MM_EMBEDDING_CACHE_IDENTITY_KEY,
     MM_EMBEDDING_CACHE_LEASE_ID_KEY,
@@ -100,6 +104,13 @@ def test_acquire_rejects_a_matching_64_bit_hash_with_a_different_identity():
     assert output.lease_id is None
 
 
+def test_identityless_acquire_rejects_a_matching_strong_identity():
+    cache = MultiModalStaticCache(max_size=1024)
+    cache.set(11, _embedding(11, identity="artifact-a"))
+
+    assert cache.acquire_many("lease", [11], 10, [None]) == [False]
+
+
 def test_scheduler_lookup_rejects_a_hash_collision_after_feature_materialization():
     cache = MultiModalStaticCache(max_size=1024)
     cache.set(11, _embedding(11, identity="artifact-a"))
@@ -137,6 +148,45 @@ def test_cache_replaces_an_unpinned_hash_collision_with_the_new_identity():
     replacement = cache.get_single(11)
     assert replacement.identity == "artifact-b"
     assert replacement.embedding.item() == 22
+
+
+def test_cache_replaces_a_strong_identity_with_an_identityless_entry():
+    cache = MultiModalStaticCache(max_size=1024)
+    cache.set(11, _embedding(11, identity="artifact-a"))
+
+    assert cache.set(11, _embedding(22))
+    replacement = cache.get_single(11)
+    assert replacement.identity is None
+    assert replacement.embedding.item() == 22
+
+
+def test_radix_namespace_prevents_a_30_bit_pad_collision():
+    first_hash = 11
+    second_hash = first_hash + (1 << 30)
+    first_identity = "sha256:" + "01" * 32
+    second_identity = "sha256:" + "02" * 32
+    first = _featureless_item(first_hash, "lease", identity=first_identity)
+    second = _featureless_item(second_hash, "lease", identity=second_identity)
+
+    first.set_hash(first_hash)
+    second.set_hash(second_hash)
+    assert first.pad_value == second.pad_value
+    assert _namespace_mm_radix_cache(
+        None, SimpleNamespace(mm_items=[first])
+    ) != _namespace_mm_radix_cache(None, SimpleNamespace(mm_items=[second]))
+
+
+def test_radix_namespace_fails_closed_on_partial_strong_identities():
+    strong = _featureless_item(11, "lease", identity="sha256:" + "01" * 32)
+    legacy = _featureless_item(22, "lease")
+
+    with pytest.raises(ValueError, match="cover every media item"):
+        _namespace_mm_radix_cache("caller", SimpleNamespace(mm_items=[strong, legacy]))
+
+    assert (
+        _namespace_mm_radix_cache("caller", SimpleNamespace(mm_items=[legacy]))
+        == "caller"
+    )
 
 
 def test_scheduler_admits_then_request_release_drops_lease():

@@ -151,10 +151,7 @@ class MultiModalStaticCache(MultimodalCache):
             self._reap_expired_leases_locked()
             if mm_hash in self.mm_cache:
                 existing = self.mm_cache[mm_hash]
-                if (
-                    embedding.identity is not None
-                    and existing.identity != embedding.identity
-                ):
+                if existing.identity != embedding.identity:
                     if self._pin_counts.get(mm_hash, 0):
                         return False
                     self.mm_cache.pop(mm_hash)
@@ -190,7 +187,7 @@ class MultiModalStaticCache(MultimodalCache):
     def matches_identity(
         embedding: EmbeddingResult, expected_identity: Optional[str]
     ) -> bool:
-        return expected_identity is None or embedding.identity == expected_identity
+        return embedding.identity == expected_identity
 
     def acquire_many(
         self,

@@ -21,7 +21,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
-from sglang.srt.mem_cache.multimodal_cache import MM_EMBEDDING_CACHE_LEASE_ID_KEY
+from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_IDENTITY_KEY,
+    MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+)
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.models.kimi_k25 import (
     KimiK25ForConditionalGeneration,
@@ -676,6 +679,10 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
         embeddings,
         img_grid_thw=torch.tensor([[1, 2, 6], [1, 2, 4]]),
         original_image_sizes=[[1536, 1024], [1024, 1536]],
+        mm_feature_identities=[
+            "sha256:" + "11" * 32,
+            "sha256:" + "22" * 32,
+        ],
     )
 
     assert output.input_ids == [
@@ -695,6 +702,10 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
         3,
     ]
     assert [item.offsets for item in output.mm_items] == [[(3, 5)], [(10, 11)]]
+    assert [
+        item.model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY]
+        for item in output.mm_items
+    ] == ["sha256:" + "11" * 32, "sha256:" + "22" * 32]
     torch.testing.assert_close(
         output.mm_items[0].precomputed_embeddings, embeddings[Modality.IMAGE][:3]
     )
@@ -707,6 +718,7 @@ def _cached_k3_artifact(content_digest, artifact_key, value=1):
     return KimiK3ImageArtifact(
         content_digest=content_digest,
         artifact_key=artifact_key,
+        feature_identity="sha256:" + "34" * 32,
         feature_hash=123,
         original_size=(1536, 1024),
         resize_config=KimiK3ResizeConfig(
@@ -932,7 +944,7 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
 
     processor._run_artifact_batch = prepare
     try:
-        with pytest.raises(ValueError, match="feature hash changed"):
+        with pytest.raises(ValueError, match="feature identity or hash changed"):
             asyncio.run(
                 processor.prepare_media_artifacts(
                     [image], SimpleNamespace(mm_content_hashes=None)

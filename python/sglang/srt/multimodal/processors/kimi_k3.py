@@ -35,6 +35,7 @@ from sglang.srt.multimodal.cache import (
     PreprocessCacheLookup,
     build_artifact_key,
     build_feature_hash,
+    build_feature_identity,
     parse_content_hash,
     snapshot_media,
 )
@@ -557,12 +558,14 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     ) -> KimiK3ImageArtifact:
         item = MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
         item.set_pad_value()
+        feature_identity = build_feature_identity(artifact_key, item.hash)
         feature_hash = build_feature_hash(artifact_key, item.hash)
         if not self.keep_mm_features_on_device and feature.device.type != "cpu":
             feature = feature.cpu()
         return KimiK3ImageArtifact(
             content_digest=content_digest,
             artifact_key=artifact_key,
+            feature_identity=feature_identity,
             feature_hash=feature_hash,
             original_size=original_size,
             resize_config=KimiK3ResizeConfig.from_dict(resize_config),
@@ -779,10 +782,13 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             owner_artifacts = await self._run_artifact_batch(owner_entries)
             for reservation, artifact in zip(owners, owner_artifacts):
                 old = previous_metadata.get(reservation.key)
-                if old is not None and old.feature_hash != artifact.feature_hash:
+                if old is not None and (
+                    old.feature_identity != artifact.feature_identity
+                    or old.feature_hash != artifact.feature_hash
+                ):
                     raise ValueError(
-                        "Kimi-K3 cached artifact feature hash changed for identical "
-                        f"identity {reservation.key}"
+                        "Kimi-K3 cached artifact feature identity or hash changed "
+                        f"for identical identity {reservation.key}"
                     )
                 self.mm_preprocess_cache.fulfill(
                     reservation,
@@ -865,7 +871,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             ),
             feature_identities=tuple(
                 (
-                    lookup.cached_artifact.artifact_key
+                    lookup.cached_artifact.feature_identity
                     if lookup.cached_artifact is not None
                     else None
                 )
@@ -922,7 +928,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 model_specific_data[MM_EMBEDDING_CACHE_LEASE_ID_KEY] = (
                     embedding_lease_id
                 )
-            model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY] = artifact.artifact_key
+            model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY] = (
+                artifact.feature_identity
+            )
             item = MultimodalDataItem(
                 modality=Modality.IMAGE,
                 feature=None if featureless else artifact.feature,
@@ -1068,4 +1076,13 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             start = output.input_ids.index(self.mm_tokens.image_token_id, search_start)
             item.offsets = [(start, start + count - 1)]
             search_start = start + count
+
+        feature_identities = kwargs.get("mm_feature_identities")
+        if feature_identities is not None:
+            if len(feature_identities) != len(output.mm_items):
+                raise ValueError(
+                    "Expected one feature identity for each K3 encoder grid."
+                )
+            for item, identity in zip(output.mm_items, feature_identities):
+                item.model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY] = identity
         return output
