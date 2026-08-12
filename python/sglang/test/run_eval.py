@@ -250,6 +250,14 @@ def run_eval(args):
     )
 
     if args.eval_name == "mmlu":
+        if getattr(args, "api", None) == "sgl_eval":
+            # Opt-in only. The ~95 existing mmlu callers (quant, attention
+            # backends, EP/MoE, spec decoding) are accuracy sanity checks whose
+            # thresholds were measured against the local zero-shot prompt and
+            # the `Answer: [A-D]` regex in simple_eval_common. sgl-eval brings
+            # NeMo-Skills' own mcq prompt and eval_mcq grader, which shifts
+            # scores a few points, so each caller has to opt in and re-baseline.
+            return _run_sgl_eval("mmlu", args)
         from sglang.test.simple_eval_mmlu import MMLUEval
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
