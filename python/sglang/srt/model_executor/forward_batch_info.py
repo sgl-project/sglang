@@ -1091,7 +1091,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             return
 
-        seq_positions = seq_positions.view(batch_size, -1)
         mrope_deltas = [
             (
                 torch.zeros(1, dtype=torch.int64)
@@ -1101,9 +1100,50 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             for i in range(batch_size)
         ]
         mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-        next_input_positions = (
-            (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+        ragged_layout = getattr(
+            getattr(batch, "spec_info", None), "ragged_verify_layout", None
         )
+        if ragged_layout is not None:
+            flat_positions = seq_positions.to(dtype=torch.int64).flatten()
+            if flat_positions.numel() != ragged_layout.graph_num_tokens:
+                raise ValueError(
+                    "Speculative mRoPE positions must match the ragged CUDA Graph "
+                    f"tier: got {flat_positions.numel()} positions for "
+                    f"graph_num_tokens={ragged_layout.graph_num_tokens}."
+                )
+
+            # Expand each request's scalar mRoPE delta over its actual compact
+            # verify length. CUDA Graph tiers can contain ghost tokens after the
+            # real ragged stream, so append a zero-delta pseudo request whose
+            # repeat count fills the fixed graph shape. Passing output_size keeps
+            # repeat_interleave capture-safe without reading the dynamic sum on
+            # the host.
+            verify_lens = ragged_layout.verify_lens.to(
+                device=device, dtype=torch.int64
+            )
+            ghost_len = verify_lens.new_full(
+                (1,), ragged_layout.graph_num_tokens
+            ) - verify_lens.sum().reshape(1)
+            repeat_counts = torch.cat((verify_lens, ghost_len))
+            delta_values = torch.cat(
+                (mrope_delta_tensor.flatten(), mrope_delta_tensor.new_zeros(1))
+            )
+            per_token_delta = torch.repeat_interleave(
+                delta_values,
+                repeat_counts,
+                output_size=ragged_layout.graph_num_tokens,
+            )
+            next_input_positions = (
+                (flat_positions + per_token_delta).unsqueeze(0).repeat(3, 1)
+            )
+        else:
+            seq_positions = seq_positions.view(batch_size, -1)
+            next_input_positions = (
+                (seq_positions + mrope_delta_tensor)
+                .flatten()
+                .unsqueeze(0)
+                .repeat(3, 1)
+            )
 
         self.mrope_positions = next_input_positions
 

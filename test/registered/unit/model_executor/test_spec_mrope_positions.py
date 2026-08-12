@@ -75,6 +75,80 @@ class TestSpecMropePositions(CustomTestCase):
         expected = expected_1d.unsqueeze(0).repeat(3, 1)
         torch.testing.assert_close(forward_batch.mrope_positions, expected)
 
+    def test_multimodal_ragged_deltas_follow_request_lengths(self):
+        batch_size = 3
+        positions = torch.tensor([4, 5, 10, 20, 21, 22], dtype=torch.int64)
+        forward_batch = _forward_batch(batch_size)
+        ragged_layout = SimpleNamespace(
+            verify_lens=torch.tensor([2, 1, 3], dtype=torch.int32),
+            graph_num_tokens=6,
+        )
+        batch = SimpleNamespace(
+            multimodal_inputs=[
+                SimpleNamespace(mrope_position_delta=torch.tensor([[2]])),
+                None,
+                SimpleNamespace(mrope_position_delta=torch.tensor([[7]])),
+            ],
+            spec_info=SimpleNamespace(ragged_verify_layout=ragged_layout),
+        )
+        model_runner = SimpleNamespace(device=torch.device("cpu"))
+
+        forward_batch.compute_spec_mrope_positions(
+            model_runner, batch, seq_positions=positions
+        )
+
+        expected_1d = torch.tensor([6, 7, 10, 27, 28, 29], dtype=torch.int64)
+        expected = expected_1d.unsqueeze(0).repeat(3, 1)
+        torch.testing.assert_close(forward_batch.mrope_positions, expected)
+
+    def test_multimodal_ragged_graph_padding_uses_zero_delta(self):
+        batch_size = 2
+        positions = torch.tensor([4, 5, 10, 0, 0], dtype=torch.int64)
+        forward_batch = _forward_batch(batch_size)
+        ragged_layout = SimpleNamespace(
+            verify_lens=torch.tensor([2, 1], dtype=torch.int32),
+            graph_num_tokens=5,
+        )
+        batch = SimpleNamespace(
+            multimodal_inputs=[
+                SimpleNamespace(mrope_position_delta=torch.tensor([[2]])),
+                SimpleNamespace(mrope_position_delta=torch.tensor([[7]])),
+            ],
+            spec_info=SimpleNamespace(ragged_verify_layout=ragged_layout),
+        )
+        model_runner = SimpleNamespace(device=torch.device("cpu"))
+
+        forward_batch.compute_spec_mrope_positions(
+            model_runner, batch, seq_positions=positions
+        )
+
+        expected_1d = torch.tensor([6, 7, 17, 0, 0], dtype=torch.int64)
+        expected = expected_1d.unsqueeze(0).repeat(3, 1)
+        torch.testing.assert_close(forward_batch.mrope_positions, expected)
+
+    def test_multimodal_ragged_positions_must_match_graph_tier(self):
+        batch_size = 2
+        forward_batch = _forward_batch(batch_size)
+        ragged_layout = SimpleNamespace(
+            verify_lens=torch.tensor([2, 1], dtype=torch.int32),
+            graph_num_tokens=5,
+        )
+        batch = SimpleNamespace(
+            multimodal_inputs=[
+                SimpleNamespace(mrope_position_delta=torch.tensor([[2]])),
+                None,
+            ],
+            spec_info=SimpleNamespace(ragged_verify_layout=ragged_layout),
+        )
+        model_runner = SimpleNamespace(device=torch.device("cpu"))
+
+        with self.assertRaisesRegex(ValueError, "graph_num_tokens=5"):
+            forward_batch.compute_spec_mrope_positions(
+                model_runner,
+                batch,
+                seq_positions=torch.tensor([4, 5, 10], dtype=torch.int64),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
