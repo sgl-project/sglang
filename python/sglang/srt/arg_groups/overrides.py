@@ -1899,11 +1899,17 @@ def _deepseek_v4_sm120_moe(view: Any) -> dict:
 
 
 @_register_for("MuseGlimmerForConditionalGeneration", "MuseGlimmerForCausalLM")
-def _muse_glimmer_fp4_gemm_runner_overrides(server_args: Any, hf_config: Any) -> dict:
+def _muse_glimmer_gemm_runner_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides: Dict[str, Any] = {}
+    if is_sm100_supported() and server_args.fp8_gemm_runner_backend == "auto":
+        overrides["fp8_gemm_runner_backend"] = "flashinfer_cute_dsl"
+        logger.info(
+            "Use flashinfer_cute_dsl as FP8 GEMM runner backend on SM100 for Muse Glimmer"
+        )
     if is_sm120_supported() and server_args.fp4_gemm_runner_backend == "auto":
+        overrides["fp4_gemm_runner_backend"] = "marlin"
         logger.info("Use marlin as FP4 GEMM runner backend on SM120 for Muse Glimmer")
-        return {"fp4_gemm_runner_backend": "marlin"}
-    return {}
+    return overrides
 
 
 @register_post_process

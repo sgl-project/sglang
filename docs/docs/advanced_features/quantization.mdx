@@ -242,6 +242,11 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
       <td>FlashInfer CUTLASS groupwise FP8 GEMM</td>
     </tr>
     <tr>
+      <td><code>flashinfer_cute_dsl</code></td>
+      <td>SM100</td>
+      <td>FlashInfer CuTe DSL MXFP8 dense GEMM</td>
+    </tr>
+    <tr>
       <td><code>flashinfer_deepgemm</code></td>
       <td>SM90</td>
       <td>Uses swapAB optimization for small M dimensions in decoding</td>
@@ -266,7 +271,7 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
 
 **`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM120); 4) AITER (AMD); 5) Triton (fallback).
 
-**MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
+**MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M. Use `flashinfer_cute_dsl` to explicitly select FlashInfer's `mm_mxfp8` CuTe DSL backend on SM100.
 
 ### `--fp4-gemm-backend` (NVFP4 GEMM)
 

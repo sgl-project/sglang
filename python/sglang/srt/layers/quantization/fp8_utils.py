@@ -276,6 +276,7 @@ class Fp8GemmRunnerBackend(Enum):
     AUTO = "auto"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTE_DSL = "flashinfer_cute_dsl"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
@@ -290,6 +291,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_flashinfer_cutlass(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_cute_dsl(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER_CUTE_DSL
 
     def is_flashinfer_deepgemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM
@@ -312,6 +316,7 @@ class Mxfp8DenseGemmBackend(Enum):
     `Fp8GemmRunnerBackend`."""
 
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTE_DSL = "flashinfer_cute_dsl"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     DEEP_GEMM = "deep_gemm"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
@@ -319,6 +324,9 @@ class Mxfp8DenseGemmBackend(Enum):
 
     def is_flashinfer_cutlass(self) -> bool:
         return self == Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_cute_dsl(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.FLASHINFER_CUTE_DSL
 
     def is_flashinfer_trtllm(self) -> bool:
         return self == Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
@@ -533,6 +541,14 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
             )
         return Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
 
+    if backend.is_flashinfer_cute_dsl():
+        if not (_is_sm100_supported and is_flashinfer_available()):
+            raise RuntimeError(
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=flashinfer_cute_dsl, "
+                "but that kernel requires SM100/SM103 GPUs and FlashInfer."
+            )
+        return Mxfp8DenseGemmBackend.FLASHINFER_CUTE_DSL
+
     if backend.is_deep_gemm():
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise RuntimeError(
@@ -568,6 +584,8 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return _deepgemm_w8a8_mxfp8_linear_with_fallback
     elif backend.is_flashinfer_trtllm():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="trtllm")
+    elif backend.is_flashinfer_cute_dsl():
+        return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
     elif backend.is_flashinfer_cutlass():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
     elif backend.is_unsupported():
@@ -655,6 +673,12 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
                 "FlashInfer CUTLASS FP8 GEMM requires Blackwell GPUs and FlashInfer."
             )
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+
+    elif backend.is_flashinfer_cute_dsl():
+        raise RuntimeError(
+            "--fp8-gemm-backend=flashinfer_cute_dsl only supports MXFP8 "
+            "dense linear layers (flashinfer.mm_mxfp8), not blockwise FP8 GEMM."
+        )
 
     elif backend.is_flashinfer_deepgemm():
         if not (is_sm90_supported() and is_flashinfer_available()):
@@ -1217,7 +1241,7 @@ def flashinfer_mxfp8_blockscaled_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
-    backend: str = "cutlass",
+    backend: str = "auto",
 ) -> torch.Tensor:
     """MXFP8 dense linear via FlashInfer mm_mxfp8. `weight_scale` must be the layout
     the backend expects, prepared at load time."""
@@ -1235,7 +1259,10 @@ def flashinfer_mxfp8_blockscaled_linear(
 
     if input_scale is None:
         q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
-            input_2d, is_sf_swizzled_layout=True, alignment=32
+            input_2d,
+            is_sf_swizzled_layout=True,
+            alignment=32,
+            backend="cute-dsl",
         )
     else:
         q_input = input_2d
@@ -1251,8 +1278,11 @@ def flashinfer_mxfp8_blockscaled_linear(
     # CuTe-DSL swap-AB/split-K kernels (both consume the same swizzled
     # 1D scales).
     # CuTe-DSL has no mm_mxfp8 kernel on SM120, so the swap is SM100-only there.
-    if backend == "cutlass" and q_input.shape[0] <= 64 and _is_sm100_supported:
-        backend = "cute-dsl"
+    if backend == "auto":
+        if q_input.shape[0] <= 64 and _is_sm100_supported:
+            backend = "cute-dsl"
+        else:
+            backend = "cutlass"
 
     if backend == "trtllm":
         weight_scale_t = weight_scale.view(-1)
