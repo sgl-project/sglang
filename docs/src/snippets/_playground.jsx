@@ -629,7 +629,7 @@ export const Playground = ({ config }) => {
             "--moe-a2a-backend", "--moe-runner-backend",
           ]);
           // Backend options may carry their own env (e.g. the FlashInfer MXFP4
-          // cubin-pool path): strip every backend option's env keys, then
+          // backend-specific path): strip every backend option's env keys, then
           // re-add the selected option's.
           const backendEnvKeys = [];
           for (const o of (fc.backend?.options || [])) {
