@@ -43,7 +43,6 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
     ResponseTextConfig,
-    ResponseUsage,
 )
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.response_format_text_json_schema_config import (
@@ -232,6 +231,7 @@ class StructuresResponseFormat(BaseModel):
     begin: str
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
     end: str
+
 
 # NOTE(dark): keep this for backward compatibility
 class LegacyStructuralTagResponseFormat(BaseModel):
@@ -1730,14 +1730,6 @@ class ResponsesRequest(BaseModel):
         if self.repetition_penalty is not None:
             params["repetition_penalty"] = self.repetition_penalty
 
-        if self.text and self.text.format:
-            if self.text.format.type == "json_schema":
-                params["json_schema"] = convert_json_schema_to_str(
-                    self.text.format.schema_
-                )
-            elif self.text.format.type == "json_object":
-                params["json_schema"] = '{"type": "object"}'
-
         # Apply any additional default parameters
         for key, value in default_params.items():
             if key not in params or params[key] is None:
@@ -1791,10 +1783,10 @@ class ResponsesResponse(BaseModel):
     output: List[
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
-    status:  Literal[
+    status: Literal[
         "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
     ]
-    usage: Optional[ResponseUsage] = None
+    usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
     tool_choice: Union[str, Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
@@ -1852,7 +1844,7 @@ class ResponsesResponse(BaseModel):
             Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
         ],
         status: str,
-        usage: Optional[ResponseUsage],
+        usage: Optional[UsageInfo],
     ) -> ResponsesResponse:
         """Create a response from a request."""
 
@@ -1941,7 +1933,7 @@ class RequestResponseMetadata(BaseModel):
     """Metadata for request/response tracking."""
 
     request_id: str
-    final_usage_info: Optional[ResponseUsage] = None
+    final_usage_info: Optional[UsageInfo] = None
 
 
 @dataclass

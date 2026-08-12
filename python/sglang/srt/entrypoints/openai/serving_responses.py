@@ -21,7 +21,6 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseReasoningItem,
-    ResponseUsage,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
@@ -37,7 +36,6 @@ from openai.types.responses.response_reasoning_summary_part_added_event import (
 from openai.types.responses.response_reasoning_summary_part_done_event import (
     Part as ResponseReasoningSummaryDonePart,
 )
-from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 from openai_harmony import Message as OpenAIMessage
 
 from sglang.srt.entrypoints.context import (
@@ -61,11 +59,13 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
     MessageProcessingResult,
+    PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
     Tool,
     ToolChoice,
+    UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
@@ -462,8 +462,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         session_id=request.session_id,
                         extra_key=self._compute_extra_key(request),
                         # background+stream streams on this connection, so don't detach.
-                        background = request.background and not request.stream,
-                        require_reasoning = require_reasoning,
+                        background=request.background and not request.stream,
+                        require_reasoning=require_reasoning,
                         bootstrap_host=request.bootstrap_host,
                         bootstrap_port=request.bootstrap_port,
                         bootstrap_room=request.bootstrap_room,
@@ -472,12 +472,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                         priority=request.priority,
                         routing_key=self.extract_routing_key(raw_request),
                         custom_labels=self.extract_custom_labels(raw_request),
-                        return_logprob=should_return_logprobs,
-                        logprob_start_len=-1,
-                        top_logprobs_num=(
-                            request.top_logprobs if should_return_logprobs else 0
-                        ),
-                        return_text_in_logprobs=True,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -731,16 +725,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
 
-        usage = ResponseUsage(
-            input_tokens=num_prompt_tokens,
-            output_tokens=num_generated_tokens,
+        usage = UsageInfo(
+            prompt_tokens=num_prompt_tokens,
+            completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
-            output_tokens_details=OutputTokensDetails(
-                reasoning_tokens=num_reasoning_tokens
-            ),
+            reasoning_tokens=num_reasoning_tokens,
         )
         if self.enable_prompt_tokens_details:
-            usage.input_tokens_details = InputTokensDetails(
+            usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=num_cached_tokens
             )
         request_metadata.final_usage_info = usage
@@ -807,11 +799,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             if mode in ("thinking", "enable_thinking"):
                 return effort != "none"
             if mode in ("explicit_thinking", "explicit_enable_thinking"):
-                toggle = mode.replace("explicit_", "")
-                return (
-                    request.chat_template_kwargs is not None
-                    and request.chat_template_kwargs.get(toggle) is True
-                )
+                return False
             return False
         if config.special_case == "always":
             return True
@@ -821,15 +809,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             return False
         if effort == "none":
             return False
-        if config.default_enabled:
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get(config.toggle_param) is not False
-            )
-        return (
-            request.chat_template_kwargs is not None
-            and request.chat_template_kwargs.get(config.toggle_param) is True
-        )
 
     def _make_response_output_items(
         self,
@@ -2317,7 +2296,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     sequence_number=-1,
                                 )
                             )
-
                     reasoning_state["text"] += reasoning_chunk
                     if wants_summary:
                         yield _send_event(
@@ -2525,16 +2503,14 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         final_output_items = list(emitted_items)
 
-        usage = ResponseUsage(
-            input_tokens=prompt_tokens,
-            output_tokens=completion_tokens,
+        usage = UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
             total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
-            output_tokens_details=OutputTokensDetails(
-                reasoning_tokens=reasoning_tokens_meta
-            ),
+            reasoning_tokens=reasoning_tokens_meta,
         )
         if self.enable_prompt_tokens_details:
-            usage.input_tokens_details = InputTokensDetails(
+            usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=cached_tokens
             )
         request_metadata.final_usage_info = usage
