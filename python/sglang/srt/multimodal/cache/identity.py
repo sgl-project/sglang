@@ -115,22 +115,16 @@ def _read_media_bytes(media: str | bytes) -> bytes:
     if isinstance(media, bytes):
         return bytes(media)
 
-    from sglang.srt.utils import get_image_bytes
+    from sglang.srt.utils import get_image_bytes, image_extension_names
 
     if media.startswith("file://"):
         media = unquote(urlparse(media).path)
     elif media.startswith(("http://", "https://", "data:")):
         return get_image_bytes(media)
-    # ``load_image`` accepts relative local paths by extension. Preserve that
-    # public input contract while still snapshotting the file exactly once.
-    try:
-        if Path(media).is_file():
-            return Path(media).read_bytes()
-    except OSError:
-        # A raw base64 payload can exceed the platform filename limit. It is
-        # media data, not an invalid local path, so let the normal decoder
-        # validate it below.
-        pass
+    # ``load_image`` accepts relative local paths only by image extension.
+    # Match that contract instead of probing arbitrary base64 as a filename.
+    if media.lower().endswith(image_extension_names) and Path(media).is_file():
+        return Path(media).read_bytes()
     return get_image_bytes(media)
 
 
