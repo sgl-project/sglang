@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import dataclasses
+import gc
 import logging
 import multiprocessing as mp
 import os
@@ -93,6 +94,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
@@ -105,6 +107,7 @@ from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     is_cuda,
+    is_mnnvl_fabric_device,
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
@@ -172,10 +175,12 @@ def init_tokenizer_manager(
             "tool-call parser",
         ),
     ):
-        if getattr(server_args, attr) != "auto":
+        if tokenizer_manager.config_value(attr) != "auto":
             continue
         if suggested is not None:
-            server_args.override(source="template-detection", **{attr: suggested})
+            tokenizer_manager.record_config_updates(
+                "template-detection", **{attr: suggested}
+            )
             logger.info(
                 f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
             )
@@ -184,7 +189,9 @@ def init_tokenizer_manager(
                 f"--{attr.replace('_', '-')}=auto specified but could not detect "
                 f"{label} from chat template. Disabling {label}."
             )
-            server_args.override(source="template-detection", **{attr: None})
+            tokenizer_manager.record_config_updates(
+                "template-detection", **{attr: None}
+            )
 
     return tokenizer_manager, template_manager
 
@@ -209,6 +216,10 @@ class Engine(EngineScoreMixin, EngineBase):
     init_tokenizer_manager_func: Callable = staticmethod(init_tokenizer_manager)
     run_scheduler_process_func: Callable = staticmethod(run_scheduler_process)
     run_detokenizer_process_func: Callable = staticmethod(run_detokenizer_process)
+
+    # Backend-specific launch handle: the Ray engine schedules its actors onto a
+    # placement group. Not config — a live cluster object.
+    _placement_group = None
 
     def __init__(self, **kwargs):
         """
@@ -261,6 +272,7 @@ class Engine(EngineScoreMixin, EngineBase):
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
             run_scheduler_process_func=self.run_scheduler_process_func,
             run_detokenizer_process_func=self.run_detokenizer_process_func,
+            placement_group=self._placement_group,
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
@@ -822,6 +834,8 @@ class Engine(EngineScoreMixin, EngineBase):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
+        *,
+        placement_group=None,
     ) -> Tuple[SchedulerInitResult, Optional[List]]:
         """Launch scheduler processes using multiprocessing.
         Override in subclasses for different backends (e.g. Ray).
@@ -989,6 +1003,35 @@ class Engine(EngineScoreMixin, EngineBase):
 
         return processes, names
 
+    @staticmethod
+    def _set_startup_time(
+        tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter],
+        scheduler_init_result: SchedulerInitResult,
+        startup_tic: float,
+    ) -> None:
+        startup_time = build_engine_startup_time(
+            (
+                info.get("startup_time")
+                for info in scheduler_init_result.scheduler_infos
+            ),
+            tokenizer_e2e=time.perf_counter() - startup_tic,
+        )
+        tokenizer_manager.set_startup_time(startup_time)
+        cuda_graph_timings = ", ".join(
+            f"{phase}={duration:.2f}"
+            for phase, duration in startup_time["cuda_graph"].items()
+        )
+        logger.info(
+            "Engine startup timings (s): load_weight=%.2f, "
+            "kv_cache_allocation=%.2f, scheduler_e2e=%.2f, "
+            "cuda_graph={%s}, tokenizer_e2e=%.2f",
+            startup_time["load_weight"],
+            startup_time["kv_cache_allocation"],
+            startup_time["scheduler_e2e"],
+            cuda_graph_timings,
+            startup_time["tokenizer_e2e"],
+        )
+
     @classmethod
     def _launch_subprocesses(
         cls,
@@ -997,6 +1040,7 @@ class Engine(EngineScoreMixin, EngineBase):
         run_scheduler_process_func: Callable,
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
+        placement_group=None,
     ) -> Tuple[
         TokenizerManager,
         TemplateManager,
@@ -1009,6 +1053,8 @@ class Engine(EngineScoreMixin, EngineBase):
         Returns:
             Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog, weight_cache_daemon_procs).
         """
+        startup_tic = time.perf_counter()
+
         # Configure global environment
         configure_logger(server_args)
         _set_envs_and_config(server_args)
@@ -1018,7 +1064,6 @@ class Engine(EngineScoreMixin, EngineBase):
         load_plugins()
 
         server_args.check_server_args()
-        _set_gc(server_args)
 
         # Allocate ports for inter-process communications
         if port_args is None:
@@ -1056,8 +1101,13 @@ class Engine(EngineScoreMixin, EngineBase):
             weight_cache_daemon_procs = cls._launch_weight_cache_daemons(server_args)
 
         # Launch scheduler processes
+        # Passed only when there is one: this hook is an override point, and a
+        # subclass written against the three-argument signature must keep working.
+        launch_kwargs = (
+            {"placement_group": placement_group} if placement_group is not None else {}
+        )
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func
+            server_args, port_args, run_scheduler_process_func, **launch_kwargs
         )
         scheduler_init_result.engine_info_bootstrap_server = (
             engine_info_bootstrap_server
@@ -1141,24 +1191,32 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 
-        # Wait for the model to finish loading
-        scheduler_init_result.wait_for_ready()
+        startup_complete = False
+        try:
+            # Wait for the model to finish loading
+            scheduler_init_result.wait_for_ready()
 
-        # Get back some info from scheduler to tokenizer_manager
-        tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][
-            "max_req_input_len"
-        ]
+            cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
 
-        # Set up subprocess liveness watchdog to detect crashes
-        # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
-        processes = list(scheduler_procs or [])
-        names = [f"scheduler_{i}" for i in range(len(processes))]
-        processes.extend(detoken_procs)
-        names.extend(detoken_names)
-        subprocess_watchdog = SubprocessWatchdog(
-            processes=processes, process_names=names
-        )
-        subprocess_watchdog.start()
+            # Get back some info from scheduler to tokenizer_manager
+            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
+                0
+            ]["max_req_input_len"]
+
+            # Set up subprocess liveness watchdog to detect crashes
+            # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
+            processes = list(scheduler_procs or [])
+            names = [f"scheduler_{i}" for i in range(len(processes))]
+            processes.extend(detoken_procs)
+            names.extend(detoken_names)
+            subprocess_watchdog = SubprocessWatchdog(
+                processes=processes, process_names=names
+            )
+            subprocess_watchdog.start()
+            startup_complete = True
+        finally:
+            if not startup_complete and isinstance(tokenizer_manager, TokenizerManager):
+                tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
         return (
             tokenizer_manager,
@@ -1173,26 +1231,30 @@ class Engine(EngineScoreMixin, EngineBase):
         """Shutdown the engine; block until the scheduler subprocess releases
         its GPU context so the caller can immediately reallocate on the same
         device."""
-        if (
-            self.tokenizer_manager is not None
-            and self.tokenizer_manager._subprocess_watchdog is not None
-        ):
-            self.tokenizer_manager._subprocess_watchdog.stop()
+        try:
+            if (
+                self.tokenizer_manager is not None
+                and self.tokenizer_manager._subprocess_watchdog is not None
+            ):
+                self.tokenizer_manager._subprocess_watchdog.stop()
 
-        send_to_rpc = getattr(self, "send_to_rpc", None)
-        if send_to_rpc is not None:
-            send_to_rpc.close(linger=0)
-            self.send_to_rpc = None
+            send_to_rpc = getattr(self, "send_to_rpc", None)
+            if send_to_rpc is not None:
+                send_to_rpc.close(linger=0)
+                self.send_to_rpc = None
 
-        # Gracefully stop weight cache daemons *before* the blanket
-        # kill_process_tree below, so their SIGTERM handlers can unlink the
-        # .sock/.ready files instead of being SIGKILLed and leaving stale state.
-        daemon_procs = getattr(self, "_weight_cache_daemon_procs", None)
-        if daemon_procs:
-            self._terminate_weight_cache_daemons(daemon_procs)
-            self._weight_cache_daemon_procs = []
+            # Gracefully stop weight cache daemons *before* the blanket
+            # kill_process_tree below, so their SIGTERM handlers can unlink the
+            # .sock/.ready files instead of being SIGKILLed and leaving stale state.
+            daemon_procs = getattr(self, "_weight_cache_daemon_procs", None)
+            if daemon_procs:
+                self._terminate_weight_cache_daemons(daemon_procs)
+                self._weight_cache_daemon_procs = []
 
-        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+            kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+        finally:
+            if isinstance(self.tokenizer_manager, TokenizerManager):
+                self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
     def __enter__(self):
         return self
@@ -1275,6 +1337,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     dataclasses.asdict(self.tokenizer_manager.server_args)
                 ),
                 **self._scheduler_init_result.scheduler_infos[0],
+                "startup_time": self.tokenizer_manager.startup_time,
                 "internal_states": internal_states,
                 "version": __version__,
             }
@@ -1537,6 +1600,12 @@ class Engine(EngineScoreMixin, EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
+    # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
+    # cuMem-based buffers and MNNVL transport. Default them on (user-set
+    # values win; the symm-mem override below only fires when unset).
+    if server_args.nnodes > 1 and is_mnnvl_fabric_device():
+        os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
+        os.environ.setdefault("NCCL_MNNVL_ENABLE", "1")
     if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
         os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if (
@@ -1592,7 +1661,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.5",
+                "0.4.6.post1",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
@@ -1627,12 +1696,37 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set mp start method
     mp.set_start_method("spawn", force=True)
 
-
-def _set_gc(server_args: ServerArgs):
+    # Set gc threshold
     if gc_threshold := server_args.gc_threshold:
-        import gc
-
         gc.set_threshold(*gc_threshold)
+
+    _log_legacy_kernel_cache_dirs()
+
+
+def _log_legacy_kernel_cache_dirs():
+    """Note the pre-SGLANG_CACHE_DIR cache dirs without touching them: other
+    frameworks on the box may still be using them."""
+    # TODO(shuwang21): drop once SGLANG_CACHE_DIR has been the default for a
+    # few releases.
+    legacy_dirs = [
+        d
+        for d in (
+            os.path.expanduser("~/.triton"),
+            os.path.expanduser("~/.cache/flashinfer"),
+            os.path.expanduser("~/.cache/deep_gemm"),
+        )
+        if os.path.isdir(d)
+    ]
+    if not legacy_dirs:
+        return
+    logger.info(
+        "Compiled-kernel caches now live under SGLANG_CACHE_DIR (%s). These "
+        "older directories are no longer used by sglang, but may still be "
+        "used by other frameworks on this machine, so they were left alone: "
+        "%s. Remove them yourself if nothing else needs them.",
+        envs.SGLANG_CACHE_DIR.get(),
+        ", ".join(legacy_dirs),
+    )
 
 
 def _scheduler_died_error(rank: int, proc) -> RuntimeError:

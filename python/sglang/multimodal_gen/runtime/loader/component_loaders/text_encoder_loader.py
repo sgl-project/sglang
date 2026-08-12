@@ -80,8 +80,14 @@ class TextEncoderLoader(ComponentLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
-    def should_offload(self, server_args, model_config: ModelConfig | None = None):
-        should_offload = server_args.text_encoder_cpu_offload
+    def should_offload(
+        self,
+        server_args,
+        model_config: ModelConfig | None = None,
+        component_name: str | None = None,
+    ):
+        component_name = component_name or "text_encoder"
+        should_offload = server_args.should_cpu_offload_component(component_name)
         if not should_offload:
             return False
         # _fsdp_shard_conditions is in arch_config, not directly on model_config
@@ -369,6 +375,7 @@ class TextEncoderLoader(ComponentLoader):
             server_args,
             encoder_dtype,
             cpu_offload_flag=cpu_offload_flag,
+            component_name=component_name,
         )
 
     @staticmethod
@@ -400,13 +407,16 @@ class TextEncoderLoader(ComponentLoader):
         server_args: ServerArgs,
         dtype: str = "fp16",
         cpu_offload_flag: bool | None = None,
+        component_name: str = "text_encoder",
     ):
         # Determine CPU offload behavior and target device
 
         local_torch_device = get_local_torch_device()
 
         if not current_platform.is_cpu():
-            fsdp_cpu_offload = self.should_offload(server_args, model_config)
+            fsdp_cpu_offload = self.should_offload(
+                server_args, model_config, component_name
+            )
             should_offload = (
                 cpu_offload_flag if cpu_offload_flag is not None else fsdp_cpu_offload
             )
