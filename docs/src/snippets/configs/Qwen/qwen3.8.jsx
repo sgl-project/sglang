@@ -405,19 +405,19 @@ export const config = {
     },
     {
       // GB300 / FP8, low-latency — TP16 across 4 nodes, narrow EP, NEXTN with
-      // ReplaySSM, MNNVL AllReduce fusion. --max-mamba-cache-size 80 is
+      // ReplaySSM, CuteDSL AllReduce fusion. --max-mamba-cache-size 80 is
       // 16 concurrent requests x the 5 GDN state slots extra_buffer budgets each;
       // retune the two together.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "multi-4" },
       verified: true,
       env: [
+        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--flashinfer-allreduce-fusion-backend mnnvl",
         "--kv-cache-dtype fp8_e4m3",
         "--attention-backend trtllm_mha",
         "--moe-runner-backend flashinfer_trtllm",
@@ -483,12 +483,13 @@ export const config = {
     },
     {
       // GB300 / NVFP4, low-latency — TP8 narrow EP across 2 nodes, NEXTN 3+1 with
-      // ReplaySSM, MNNVL AllReduce fusion. --fp4-gemm-backend and
+      // ReplaySSM, CuteDSL AllReduce fusion. --fp4-gemm-backend and
       // --moe-runner-backend are real overrides: auto picks the CuTe DSL FP4
       // kernels on SM100 and never enables the TRT-LLM fused NVFP4 MoE path.
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
       env: [
+        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -497,7 +498,6 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--flashinfer-allreduce-fusion-backend mnnvl",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_cutlass",
         "--kv-cache-dtype fp8_e4m3",
@@ -580,13 +580,13 @@ export const config = {
       // The sizing is derived, not measured.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "multi-8" },
       env: [
+        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 32",
-        "--flashinfer-allreduce-fusion-backend mnnvl",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm NEXTN",
         "--speculative-eagle-topk 1",
@@ -666,19 +666,20 @@ export const config = {
       ],
     },
     {
-      // B300 / NVFP4 — single node, TP8, NEXTN with ReplaySSM and the MNNVL
+      // B300 / NVFP4 — single node, TP8, NEXTN with ReplaySSM and the CuteDSL
       // AllReduce fusion. BF16 KV: the only NVFP4 cell serving KV at model
       // precision. --mamba-ssm-dtype bfloat16 is load-bearing — the SM100
       // flashinfer GDN decode default is gated on it, and without it decode falls
       // back to Triton.
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--flashinfer-allreduce-fusion-backend mnnvl",
         "--moe-runner-backend flashinfer_trtllm",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
@@ -818,13 +819,13 @@ export const config = {
       // DeepEP v2 a2a rules DSpark out under DP-attention.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "dspark", nodes: "multi-4" },
       env: [
+        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--flashinfer-allreduce-fusion-backend mnnvl",
         "--kv-cache-dtype fp8_e4m3",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm DSPARK",
@@ -843,6 +844,7 @@ export const config = {
       // model in place of NEXTN.
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "multi-2" },
       env: [
+        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -851,7 +853,6 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--flashinfer-allreduce-fusion-backend mnnvl",
         "--quantization modelopt_fp4",
         "--fp4-gemm-backend flashinfer_cutlass",
         "--kv-cache-dtype fp8_e4m3",
@@ -878,13 +879,13 @@ export const config = {
       // of NEXTN.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "dspark", nodes: "multi-8" },
       env: [
+        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 32",
-        "--flashinfer-allreduce-fusion-backend mnnvl",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm DSPARK",
         "--speculative-draft-model-path RadixArk/Qwen3.8-2.4T-A95B-DSpark",
@@ -902,17 +903,17 @@ export const config = {
       // draft needs its own weights and KV, so mem-fraction drops to 0.80 and
       // --context-length trims the native window to buy that room back.
       // SGLANG_ENABLE_MOE_DEFERRED_FINALIZE defers the MoE finalize so it fuses
-      // into the MNNVL AllReduce workspace.
+      // into the CuteDSL AllReduce workspace.
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
       verified: true,
       env: [
         "SGLANG_ENABLE_MOE_DEFERRED_FINALIZE=1",
+        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--flashinfer-allreduce-fusion-backend mnnvl",
         "--context-length 200000",
         "--preferred-sampling-params '{\"top_k\": 20}'",
         "--attention-backend trtllm_mha",

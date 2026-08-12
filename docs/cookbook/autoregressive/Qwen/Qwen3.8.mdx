@@ -193,9 +193,9 @@ For NVFP4 with NEXTN, use the 3/1/4 settings on both roles so the prefill worker
 
 ### AllReduce fusion
 
-The four cells running one flat TP group — GB300 FP8 Low Latency, GB300 NVFP4 Low Latency, GB300 BF16, B300 NVFP4 — set `--flashinfer-allreduce-fusion-backend mnnvl`. This fuses AllReduce + Residual + RMSNorm with the MoE finalize. It is worth 6–13% over the legacy path in the measured configurations.
+The four cells running one flat TP group — GB300 FP8 Low Latency, GB300 NVFP4 Low Latency, GB300 BF16, B300 NVFP4 — set `SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION`, the Qwen3.5 CuteDSL path whose single workspace fuses AllReduce + Residual + RMSNorm with the MoE finalize. Worth 6–13% over the legacy path. Don't pass `--flashinfer-allreduce-fusion-backend` alongside it — the env suppresses the flag with a warning.
 
-The other cells on this page do not use it: the fusion needs DP-attention off and the built-in TP MoE, so the wide-EP tiers are out, and the pipelined cells put their cross-node traffic on IB rather than NVLink. The three GB300 cells also carry `NCCL_NVLS_ENABLE=1`, because SGLang forces NVLS collectives off when that variable is unset.
+Nothing else can use it: the fusion needs DP-attention off and the built-in TP MoE, so the wide-EP tiers are out, and the pipelined cells put their cross-node traffic on IB rather than NVLink. The three GB300 cells also carry `NCCL_NVLS_ENABLE=1`, because SGLang forces NVLS collectives off when that variable is unset.
 
 ### AMD
 
