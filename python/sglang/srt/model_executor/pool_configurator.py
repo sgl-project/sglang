@@ -79,16 +79,10 @@ logger = logging.getLogger(__name__)
 def _eagle_draft_layers(kvc: KVCacheConfigurator) -> int:
     """Effective EAGLE/STANDALONE draft layer count for KV budgeting, 0 if none.
 
-    Counterpart to _dflash_draft_cell_size for the EAGLE family, which is priced by layer
-    count rather than as a flat additive term (the draft reuses the target's attention
-    config). Under DCP the target pool is sharded while the draft pool spans the
-    allocator's widened virtual location space, so the draft term is replicated across DCP
-    ranks -- the same rule _dflash_draft_cell_size applies.
-
-    Returns 0 when the draft depth is unknown, matching upstream: the caller then skips the
-    scaling entirely. We deliberately do NOT substitute a guessed depth -- that would turn a
-    loud failure into a quiet under-allocation that only surfaces as an OOM at the first
-    large prefill, far from its cause.
+    Under DCP the target pool is sharded but the draft pool spans the allocator's widened
+    virtual location space, so the draft term is replicated across ranks (same rule as
+    _dflash_draft_cell_size). Returns 0 rather than a guessed depth when unknown, so the
+    caller skips scaling instead of silently under-allocating.
     """
     if kvc.is_draft_worker or not (
         kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
@@ -431,11 +425,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
-            # NB: the RAW depth here, not _eagle_draft_layers(). banded_depths compares draft
-            # depth indices against mtp_local_layer_ids -- a structural property of the draft
-            # model. Feeding it a DCP-replicated depth would miscount the bands. DCP
-            # replication is a memory-budget factor and is applied to the resulting layer
-            # COUNTS below, where it belongs.
+            # RAW depth: banded_depths is structural; DCP replication applies below.
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
                 draft_layers = int(draft_layers)
@@ -451,12 +441,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                             if i < draft_layers
                         ]
                     )
-                # Under DCP the target pool is sharded but the draft pool spans
-                # the allocator's widened virtual location space, so both draft
-                # terms are replicated across DCP ranks. Same rule as the
-                # DefaultPoolConfigurator EAGLE branch and
-                # _dflash_draft_cell_size_per_token; _draft_cell_size below
-                # already carries the factor for the DFLASH term.
                 dcp = get_parallel().attn_dcp_size
                 self._draft_swa_full_layers_num = banded_depths * dcp
                 self._draft_full_layers_num = (draft_layers - banded_depths) * dcp

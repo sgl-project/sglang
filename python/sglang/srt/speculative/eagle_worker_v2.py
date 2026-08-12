@@ -371,13 +371,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             from sglang.srt.layers.dcp import draft_forward_guard
 
-            # Draft graphs must be CAPTURED under the same DCP-disabled state
-            # they will REPLAY under (draft forwards run inside
-            # draft_forward_guard): a capture with dcp_enabled == True bakes
-            # DCP-branch metadata/block-tables into the graph while replay-prep
-            # takes the non-DCP branch -> capture/replay divergence -> IMA
-            # (graph x DCP x EAGLE-family only; DFlash's non-MLA draft has no
-            # DCP branches).
+            # Capture must match replay: a DCP-enabled capture + non-DCP replay -> IMA.
             with draft_forward_guard(True):
                 self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                     self.target_worker.device
@@ -527,22 +521,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         from sglang.srt.layers.dcp import draft_forward_guard
 
-        # The chain path runs OUTSIDE ModelRunner.forward, so it never saw the
-        # runner's draft_forward_guard: with DCP on, the multi-step backend's
-        # decode-mode DCP branches (metadata init here in eager; replay-prep
-        # inside execute() for graphs) built dcp-granular metadata against the
-        # draft's UNSHARDED replicated pool, and the guarded forward then
-        # consumed it -- every chain token after the first degenerated (the
-        # EAGLE3 accept-length deficit under DCP). Guard the whole draft run;
-        # runner.forward nests the same override, which is save/restore and
-        # therefore a no-op inside this scope.
-        draft_guard_ctx = (
-            draft_forward_guard(True)
-            if envs.SGLANG_DCP_DRAFT_CHAIN_GUARD.get()
-            else contextlib.nullcontext()
-        )
-
-        with canary_outside_ctx, draft_guard_ctx:
+        # Runs outside ModelRunner.forward; unconditional to match graph capture.
+        with canary_outside_ctx, draft_forward_guard(True):
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (

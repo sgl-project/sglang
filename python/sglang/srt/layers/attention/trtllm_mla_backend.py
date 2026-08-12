@@ -72,6 +72,7 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
@@ -462,21 +463,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        # Nothing to redo. The base class declares this abstract because some
-        # backends cache metadata derived from the tree mask / positions, which
-        # are only correct after draft. This family does not: the tree-mask
-        # buffer is written in place by build_tree_kernel_efficient (see
-        # VerifyMask), and the verify metadata this backend builds
-        # (block_kv_indices, seq_lens_k, and under DCP global_seq_lens_k) is a
-        # function of the draft token COUNT, which is fixed at config time --
-        # not of the sampled draft tokens.
-        #
-        # Required for the EAGLE family: run_eagle_verify calls this
-        # unconditionally, so without the override the base raises
-        # NotImplementedError the first time an EAGLE/EAGLE3 verify batch runs
-        # on tokenspeed_mla/cutedsl_mla. DFlash never reaches it. Matches the
-        # trtllm_mha and triton backends, which are also no-ops.
-        pass
+        """No-op: this family caches no tree-mask- or position-derived metadata.
+
+        Its verify metadata is a function of the draft token COUNT (fixed at config
+        time), not of the sampled tokens. run_eagle_verify calls this unconditionally,
+        so the override is required or the base raises NotImplementedError. Same as
+        trtllm_mha / triton.
+        """
 
     def _init_cuda_graph_metadata(
         self,
