@@ -749,15 +749,7 @@ class SamplingParams:
                     pipeline_config.vae_config.use_temporal_scaling_frames
                 )
                 num_frames = self.num_frames
-                # Only sequence parallelism splits latent frames across ranks, so
-                # it alone dictates the alignment. `sp_degree` is what is left of
-                # `num_gpus` after TP, DP and CFG parallel, all of which replicate
-                # the frame axis rather than split it. Aligning to `num_gpus`
-                # instead padded the clip for parallelism that does not shard it:
-                # 49 frames under CFG parallel became 57, which both wastes the
-                # extra latent frame and makes the same seed produce a different
-                # sample than a single GPU.
-                num_gpus = getattr(server_args, "sp_degree", None) or 1
+                num_gpus = server_args.num_gpus
                 temporal_scale_factor = (
                     pipeline_config.vae_config.arch_config.temporal_compression_ratio
                 )
@@ -769,8 +761,8 @@ class SamplingParams:
                 else:
                     orig_latent_num_frames = num_frames
 
-                if orig_latent_num_frames % num_gpus != 0:
-                    # Adjust latent frames to be divisible by the SP degree
+                if orig_latent_num_frames % server_args.num_gpus != 0:
+                    # Adjust latent frames to be divisible by number of GPUs
                     if self.num_frames_round_down:
                         # Ensure we have at least 1 batch per GPU
                         new_latent_num_frames = (
@@ -790,10 +782,10 @@ class SamplingParams:
                         new_num_frames = new_latent_num_frames
 
                     logger.info(
-                        "Adjusting number of frames from %s to %s based on sequence parallel degree (%s)",
+                        "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
                         self.num_frames,
                         new_num_frames,
-                        num_gpus,
+                        server_args.num_gpus,
                     )
                     self.num_frames = new_num_frames
 
