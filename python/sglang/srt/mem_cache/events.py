@@ -52,9 +52,7 @@ class KVCacheEventMixin:
 
             elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
                 tail_metadata = (
-                    tail.metadata
-                    if isinstance(tail, BlockStoredWithMetadata)
-                    else None
+                    tail.metadata if isinstance(tail, BlockStoredWithMetadata) else None
                 )
                 event_metadata = (
                     event.metadata

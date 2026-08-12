@@ -34,6 +34,8 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    BlockStoredMetadata,
+    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -67,14 +69,21 @@ class TestKVCacheEventQueue(unittest.TestCase):
         block_size: int = 2,
         medium: StorageMedium = StorageMedium.GPU,
         lora_id: int | None = None,
+        cache_salt: str | None = None,
     ) -> BlockStored:
-        return BlockStored(
+        event_args = dict(
             block_hashes=[block_hash],
             parent_block_hash=parent_block_hash,
             token_ids=[block_hash, block_hash + 1][:block_size],
             block_size=block_size,
             lora_id=lora_id,
             medium=medium,
+        )
+        if cache_salt is None:
+            return BlockStored(**event_args)
+        return BlockStoredWithMetadata(
+            **event_args,
+            metadata=BlockStoredMetadata(cache_salt=cache_salt),
         )
 
     def test_enqueue_coalesces_compatible_stores(self):
@@ -131,6 +140,11 @@ class TestKVCacheEventQueue(unittest.TestCase):
         queue._enqueue_kv_event(
             BlockRemoved(block_hashes=[2], medium=StorageMedium.CPU)
         )
+        self.assertEqual(len(queue.take_events()), 2)
+
+        queue = _KVCacheEventQueue()
+        queue._enqueue_kv_event(self._store(1, None, cache_salt="tenant-a"))
+        queue._enqueue_kv_event(self._store(2, 1, cache_salt="tenant-b"))
         self.assertEqual(len(queue.take_events()), 2)
 
 
@@ -735,26 +749,21 @@ class TestRadixCache(unittest.TestCase):
         stored = [event for event in events if isinstance(event, BlockStored)]
         removed = [event for event in events if isinstance(event, BlockRemoved)]
 
-        self.assertEqual(len(stored), 2)
-        self.assertTrue(
-            all(event.metadata.cache_salt == "tenant-a" for event in stored)
-        )
-        self.assertEqual(stored[1].parent_block_hash, stored[0].block_hashes[0])
-        self.assertEqual(
-            removed[0].block_hashes,
-            [event.block_hashes[0] for event in stored],
-        )
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].metadata.cache_salt, "tenant-a")
+        self.assertEqual(stored[0].parent_block_hash, None)
+        self.assertEqual(len(stored[0].block_hashes), 2)
+        self.assertEqual(removed[0].block_hashes, stored[0].block_hashes)
 
         unsalted = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
         unsalted.insert(InsertParams(key=RadixKey(tokens), value=None))
         unsalted_hashes = [
-            event.block_hashes[0]
+            block_hash
             for event in unsalted.take_events()
             if isinstance(event, BlockStored)
+            for block_hash in event.block_hashes
         ]
-        self.assertNotEqual(
-            unsalted_hashes, [event.block_hashes[0] for event in stored]
-        )
+        self.assertNotEqual(unsalted_hashes, stored[0].block_hashes)
 
     def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
         cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
