@@ -24,7 +24,10 @@ fi
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
+# In-network mirror of rocm/sgl-dev, populated by the nightly release workflow.
+# Set AMD_CI_DOCKER_REGISTRY_MIRROR to retarget it, or to the empty string to
+# pull straight from Docker Hub, without editing this script.
+LOCAL_DOCKER_REGISTRY="${AMD_CI_DOCKER_REGISTRY_MIRROR-10.44.14.109:5000}"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -59,6 +62,8 @@ while [[ $# -gt 0 ]]; do
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
       echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
+      echo "  AMD_CI_DOCKER_REGISTRY_MIRROR=HOST:PORT"
+      echo "      In-network registry to pull rocm/sgl-dev from before falling back to Docker Hub. Defaults to ${LOCAL_DOCKER_REGISTRY:-<none>}. Set to the empty string to always use Docker Hub."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -273,18 +278,30 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  # Try the local docker registry first (avoids Docker Hub rate limits and is
-  # faster on the LAN); if that fails for any reason, fall back to the
-  # public registry with exponential-backoff retries. Capture stderr so the
-  # real failure reason (TLS handshake, 404, connection refused, etc.) is
-  # visible in the job log instead of being silently swallowed.
-  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+  if [[ -n "$(docker images -q "${IMAGE}" 2>/dev/null)" ]]; then
+    # find_latest_image prefers this runner's own image store, and every tag it
+    # returns carries the date it was published, so a pull here could only
+    # re-check a manifest that cannot have moved.
+    echo "Reusing image already present on this runner: ${IMAGE}"
   else
-    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-    retry_with_backoff 6 docker pull "${IMAGE}"
+    pulled_from_mirror=0
+    if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
+      # Try the in-network mirror first: it avoids Docker Hub rate limits and is
+      # faster on the LAN. Capture stderr so the real failure reason (TLS
+      # handshake, 404, connection refused, etc.) is visible in the job log
+      # instead of being silently swallowed.
+      if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+        echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+        docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+        pulled_from_mirror=1
+      else
+        echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+        printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+      fi
+    fi
+    if (( pulled_from_mirror == 0 )); then
+      retry_with_backoff 6 docker pull "${IMAGE}"
+    fi
   fi
 fi
 
