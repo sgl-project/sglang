@@ -507,9 +507,10 @@ class ServerArgs:
         str,
         Arg(
             help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
-            "tokenizers library, and 'fastokens' uses the fastokens library "
-            "for faster tokenization. Requires the fastokens package to be installed.",
-            choices=["huggingface", "fastokens"],
+            "tokenizers library; 'fastokens' and 'gigatoken' use those libraries "
+            "for faster tokenization, and require the corresponding package to be "
+            "installed (pip install 'sglang[fastokens]' / 'sglang[gigatoken]').",
+            choices=["huggingface", "fastokens", "gigatoken"],
         ),
         NS("serving"),
     ] = "huggingface"

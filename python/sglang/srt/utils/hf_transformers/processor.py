@@ -25,6 +25,7 @@ from transformers import (
 )
 
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
+from sglang.srt.tokenizer.gigatoken_tokenizer import accelerate_with_gigatoken
 from sglang.srt.utils import logger
 
 from .common import (
@@ -381,4 +382,8 @@ def get_processor(
     _fix_special_tokens_pattern(tokenizer)
     _fix_added_tokens_encoding(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
+    if tokenizer_backend == "gigatoken":
+        # In place, so `processor.tokenizer` (which the multimodal processors
+        # call directly) is the accelerated object too.
+        accelerate_with_gigatoken(tokenizer)
     return processor

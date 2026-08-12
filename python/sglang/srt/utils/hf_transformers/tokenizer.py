@@ -26,6 +26,7 @@ from transformers import (
 )
 
 from sglang.srt.connector import create_remote_connector
+from sglang.srt.tokenizer.gigatoken_tokenizer import accelerate_with_gigatoken
 from sglang.srt.utils import is_remote_url, logger
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
@@ -417,7 +418,9 @@ def _fix_special_tokens_pattern(tokenizer):
         tokenizer.special_tokens_pattern = "none"
 
 
-def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
+def _apply_post_load_fixes(
+    tokenizer, tokenizer_name, revision, tokenizer_backend="huggingface"
+):
     """Apply all post-load patches and return the final tokenizer."""
     _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
     _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
@@ -431,7 +434,12 @@ def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
     patch_mistral_common_tokenizer(tokenizer)
     _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
-    return patch_tokenizer(tokenizer)
+    tokenizer = patch_tokenizer(tokenizer)
+    # Last, so gigatoken's overrides sit above every fixup applied here and the
+    # affix discovery reads the tokenizer in its final configuration.
+    if tokenizer_backend == "gigatoken":
+        tokenizer = accelerate_with_gigatoken(tokenizer)
+    return tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +507,10 @@ def get_tokenizer(
         tokenizer = build_gguf_tokenizer(tokenizer_name)
         _fix_special_tokens_pattern(tokenizer)
         attach_additional_stop_token_ids(tokenizer)
-        return patch_tokenizer(tokenizer)
+        tokenizer = patch_tokenizer(tokenizer)
+        if tokenizer_backend == "gigatoken":
+            tokenizer = accelerate_with_gigatoken(tokenizer)
+        return tokenizer
 
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 
@@ -543,7 +554,12 @@ def get_tokenizer(
                     tokenizer_name, *args, **common_kwargs
                 )
 
-        return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        return _apply_post_load_fixes(
+            tokenizer,
+            tokenizer_name,
+            tokenizer_revision,
+            tokenizer_backend=tokenizer_backend,
+        )
     except Exception as e:
         if tokenizer_backend == "fastokens":
             raise RuntimeError(
@@ -551,6 +567,13 @@ def get_tokenizer(
                 f"This model's tokenizer may not be supported by fastokens — "
                 f"see https://github.com/crusoecloud/fastokens. "
                 f"Re-run without --tokenizer-backend=fastokens to use the default backend."
+            ) from e
+        if tokenizer_backend == "gigatoken":
+            raise RuntimeError(
+                f"gigatoken failed to load tokenizer for {tokenizer_name!r}. "
+                f"This model's tokenizer may not be supported by gigatoken — "
+                f"see https://github.com/marcelroed/gigatoken. "
+                f"Re-run without --tokenizer-backend=gigatoken to use the default backend."
             ) from e
         raise
 
