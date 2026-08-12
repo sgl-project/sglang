@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from sglang.srt.layers.moe.dwdp.vmm import (
+from cuda.bindings import driver as cuda
+
+from sglang.srt.cuda_vmm_utils import (
+    VmmReservation,
     align_up,
-    create_local_handle,
-    get_allocation_granularity,
-    map_handle,
-    release_handle,
+    check_drv,
+    get_device_granularity,
+    make_device_allocation_prop,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,7 +33,8 @@ class PagePool:
         page_size: Optional[int] = None,
     ):
         self._device_id = device_id
-        self._granularity = granularity or get_allocation_granularity(device_id)
+        self._granularity = granularity or get_device_granularity(device_id)
+        self._prop = make_device_allocation_prop(device_id, handle_types=None)
 
         if page_size is None:
             self._page_size = self.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
@@ -49,8 +52,15 @@ class PagePool:
         for slot_idx, num_pages in enumerate(self._slot_pages):
             handles = []
             for _ in range(num_pages):
-                h = create_local_handle(self._page_size, device_id)
-                handles.append(h)
+                reservation = VmmReservation(
+                    self._page_size,
+                    self._prop,
+                    device_id,
+                    alignment=self._granularity,
+                )
+                handle = reservation.map(0, self._page_size, retain_handle=True)
+                reservation.close(release_handles=False)
+                handles.append(int(handle))
             self._page_handles.append(handles)
             logger.debug(
                 f"PagePool slot {slot_idx}: {num_pages} pages × {self._page_size} B"
@@ -78,21 +88,21 @@ class PagePool:
     def map_pages(
         self,
         slot: int,
-        va_start: int,
+        reservation: VmmReservation,
+        offset: int,
         size: int,
         page_offset: int = 0,
-    ) -> List[Tuple[int, int]]:
-        # does NOT call set_access; caller must set access on the whole composite VA
+    ) -> None:
         aligned_size = align_up(size, self._page_size)
         num_pages_needed = aligned_size // self._page_size
 
-        mappings = []
         for i in range(num_pages_needed):
-            va = va_start + i * self._page_size
             handle = self._page_handles[slot][page_offset + i]
-            map_handle(va, self._page_size, handle, offset=0)
-            mappings.append((va, self._page_size))
-        return mappings
+            reservation.map_existing(
+                offset + i * self._page_size,
+                self._page_size,
+                handle,
+            )
 
     def release(self) -> None:
         if self._released:
@@ -100,7 +110,7 @@ class PagePool:
         self._released = True
         for handles in self._page_handles:
             for h in handles:
-                release_handle(h)
+                check_drv(cuda.cuMemRelease(h), "cuMemRelease")
         self._page_handles = [[], []]
 
 

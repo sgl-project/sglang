@@ -334,6 +334,8 @@ class Envs:
     SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # NaN-fill the unified memory pool at boot (debug repro switch).
+    SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
@@ -364,6 +366,8 @@ class Envs:
     SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
+    SGLANG_TRACE_ASYNC = EnvBool(False)
+    SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     # Disable lazy compaction in the unified memory pool allocator and
     # fall back to the per-free eager compaction. Used for production
@@ -427,6 +431,7 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
@@ -647,6 +652,8 @@ class Envs:
     # Number of decode steps between periodic mx.clear_cache() calls.
     # Set to 0 to disable cache clearing entirely.
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
+    # MLX buffer-cache cap in GB.
+    SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
@@ -841,6 +848,14 @@ class Envs:
     # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+
+    # HiSparse
+    # Kill-switch for the shared-index (IndexShare) swap-in prefetch
+    # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
+    SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Timing probe: run the swap-in fully but skip the host->device KV bytes,
+    # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
+    SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
 
     # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to an unpacked SiTU
     # cubin pool (cubins + flat ABI headers + overlay/; distributed as a
@@ -1239,7 +1254,7 @@ class Envs:
 
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
 
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
