@@ -597,6 +597,14 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
+            if (
+                not obj.lora_name
+                or not obj.lora_name.strip()
+                or not obj.lora_path
+                or not obj.lora_path.strip()
+            ):
+                raise ValueError("Both 'lora_name' and 'lora_path' must be provided.")
+
             assert (
                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
@@ -674,6 +682,9 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
+
+            if not obj.lora_name or not obj.lora_name.strip():
+                raise ValueError("'lora_name' must be provided.")
 
             assert (
                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
