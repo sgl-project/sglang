@@ -120,6 +120,8 @@ def _make_tokenizer_manager() -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
+    tm._mm_cache_retry_contexts = {}
+    tm._release_mm_embedding_cache = MagicMock()
     tm.enable_metrics = False
     tm.enable_trace = False
     tm.enable_lora = False
@@ -259,6 +261,17 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
         self.assertEqual(
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
         )
+
+    def test_abort_releases_embedding_cache_lease(self):
+        tm = _make_tokenizer_manager()
+        rid = "abort_lease_rid"
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        tm._mm_cache_retry_contexts[rid] = Mock(lease_id="lease-1", routed_dp_rank=2)
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertNotIn(rid, tm._mm_cache_retry_contexts)
+        tm._release_mm_embedding_cache.assert_called_once_with("lease-1", 2)
 
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
@@ -480,6 +493,20 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj.rid = ["p1", "already_gone"]
         tm._discard_pending_req_states(obj)  # must not raise
         self.assertNotIn("p1", tm.rid_to_state)
+
+    def test_discard_releases_embedding_cache_lease(self):
+        tm = _make_tokenizer_manager()
+        rid = "discard_lease_rid"
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        tm._mm_cache_retry_contexts[rid] = Mock(lease_id="lease-2", routed_dp_rank=3)
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+
+        tm._discard_pending_req_states(obj)
+
+        self.assertNotIn(rid, tm._mm_cache_retry_contexts)
+        tm._release_mm_embedding_cache.assert_called_once_with("lease-2", 3)
 
 
 class TestParallelStreamTaskCleanup(CustomTestCase):

@@ -3440,6 +3440,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
+        self._release_pending_mm_cache_lease(recv_obj.rid)
         # Two scheduler messages can race in handle_loop for the same rid: a
         # batch output that finishes it normally (deletes rid_to_state[rid])
         # and this abort echo. If the finish wins, the rid is already gone and
@@ -3691,7 +3692,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats.set_created_time(created_time)
 
     def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
+        """Drop request state and cache leases created before dispatch.
 
         Safe to call after a partial/failed dispatch: only entries still present
         are removed, and the scheduler-response path looks up state with
@@ -3703,6 +3704,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             rids = obj.rid
         for rid in rids:
             self.rid_to_state.pop(rid, None)
+            self._release_pending_mm_cache_lease(rid)
+
+    def _release_pending_mm_cache_lease(self, rid: str) -> None:
+        context = getattr(self, "_mm_cache_retry_contexts", {}).pop(rid, None)
+        if context is not None:
+            self._release_mm_embedding_cache(context.lease_id, context.routed_dp_rank)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
