@@ -1530,9 +1530,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
-                    if self.visual is None or self.config.encoder_only:
-                        # The half this replica does not serve.
-                        continue
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 param = params_dict[name]
@@ -1755,7 +1752,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
-                    elif self.visual is not None and not self.config.encoder_only:
+                    else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
@@ -1783,10 +1780,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = (
             not self.language_model_only and "mrope_section" in rope_config
         )
-
-        # From the config, not the tower: an EPD replica has no tower but the
-        # encoder still sends deepstack features for it to consume.
-        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
@@ -1903,8 +1896,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
-                    if self.visual is None or self.config.encoder_only:
-                        # The half this replica does not serve.
+                    if ("visual" in name and self.visual is None) or (
+                        "visual" not in name and self.config.encoder_only
+                    ):
+                        # The half this replica does not serve. Keep warning for
+                        # everything else, so a real language-side miss is visible.
                         continue
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
@@ -1948,10 +1944,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = (
             not self.language_model_only and "mrope_section" in rope_config
         )
-
-        # From the config, not the tower: an EPD replica has no tower but the
-        # encoder still sends deepstack features for it to consume.
-        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
 
         self.num_fused_shared_experts = 0
         if _use_aiter and not _disable_shared_experts_fusion():
@@ -2294,7 +2286,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
-                    elif self.visual is not None and not self.config.encoder_only:
+                    elif not (
+                        ("visual" in name and self.visual is None)
+                        or ("visual" not in name and self.config.encoder_only)
+                    ):
+                        # The half this replica does not serve stays quiet; a real
+                        # language-side miss still warns.
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 

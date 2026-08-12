@@ -151,7 +151,13 @@ class KimiVLForConditionalGeneration(nn.Module):
             )
         )
 
-        self.multi_modal_projector = KimiVLMultiModalProjector(config=config)
+        # The encoder sends post-projector embeddings, so a replica without a
+        # tower has no use for the projector either.
+        self.multi_modal_projector = (
+            KimiVLMultiModalProjector(config=config)
+            if self.vision_tower is not None
+            else None
+        )
         self.quant_config = quant_config
 
         self.language_model = None

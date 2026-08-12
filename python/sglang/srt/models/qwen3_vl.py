@@ -54,6 +54,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    items_are_precomputed,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -1596,9 +1597,7 @@ def _require_vision(model, items=None) -> None:
     encoder already embedded need no local tower, so they always pass."""
     if getattr(model, "visual", None) is not None:
         return
-    if items and all(
-        getattr(item, "precomputed_embeddings", None) is not None for item in items
-    ):
+    if items_are_precomputed(items):
         return
     raise RuntimeError(
         "This server has no local vision tower (--language-only, or a checkpoint "

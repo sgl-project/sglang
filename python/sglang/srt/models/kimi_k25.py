@@ -679,8 +679,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 prefix="vision_tower",
             )
         )
-        # Create mm projector
-        self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+        # Create mm projector. The encoder sends post-projector embeddings, so a
+        # replica without a tower has no use for it either.
+        self.mm_projector = (
+            K2VLMultiModalProjector(config.vision_config)
+            if self.vision_tower is not None
+            else None
+        )
 
         self.language_model = None
         if not config.encoder_only:
@@ -700,7 +705,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
             target_dtype = self.language_model.dtype
             if self.vision_tower is not None:
                 self.vision_tower = self.vision_tower.to(dtype=target_dtype)
-            self.mm_projector = self.mm_projector.to(dtype=target_dtype)
+            if self.mm_projector is not None:
+                self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
     @property
     def model(self):

@@ -3011,12 +3011,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # shard work across ranks image-wise via the DP runner.
         self.use_data_parallel = True
 
+        has_local_vision_tower = getattr(config, "has_local_vision_tower", True)
         self.vision_tower = (
-            None
-            if not getattr(config, "has_local_vision_tower", True)
-            else KimiK3VisionTower(config.vision_config)
+            KimiK3VisionTower(config.vision_config) if has_local_vision_tower else None
         )
-        self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
+        # The encoder sends post-projector embeddings, so a replica without a
+        # tower has no use for the projector either.
+        self.mm_projector = (
+            KimiK3MultiModalProjector(config.vision_config)
+            if has_local_vision_tower
+            else None
+        )
 
         self.language_model = None
         if not config.encoder_only:

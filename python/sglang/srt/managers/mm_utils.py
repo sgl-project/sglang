@@ -368,13 +368,25 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 _VISION_TOWER_ATTRS = ("visual", "vision_tower", "vision_model", "vision_encoder")
 
 
-def _require_local_encoder(multimodal_model, items, modality) -> None:
-    """Reaching an embedder means nobody precomputed these items.
+def items_are_precomputed(items) -> bool:
+    """True when an encoder already embedded every one of *items*.
 
-    A server started with --language-only has no tower to run one on, so say
-    that instead of dereferencing None somewhere inside the model.
+    The embedding path short-circuits on this in several places; keep the test
+    in one spot so a caller cannot guard the wrong side of the short-circuit.
     """
-    if multimodal_model is None:
+    return bool(items) and all(
+        getattr(item, "precomputed_embeddings", None) is not None for item in items
+    )
+
+
+def _require_local_encoder(multimodal_model, items, modality) -> None:
+    """Last-resort invariant: an embedder is about to run with no tower to run it on.
+
+    Requests are rejected earlier, in the tokenizer, so reaching this means the
+    dispatch logic let something through -- say so instead of dereferencing None
+    somewhere inside the model.
+    """
+    if multimodal_model is None or items_are_precomputed(items):
         return
     towers = [
         getattr(multimodal_model, name)
@@ -545,9 +557,7 @@ def _embed_mm_inputs_with_split(
     non_precomputed_req_indices = []
     for idx, mm_input in enumerate(mm_inputs_list):
         items = [item for item in mm_input.mm_items if item is not None]
-        if items and all(
-            getattr(item, "precomputed_embeddings", None) is not None for item in items
-        ):
+        if items_are_precomputed(items):
             precomputed_req_indices.append(idx)
         else:
             non_precomputed_req_indices.append(idx)

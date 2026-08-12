@@ -159,6 +159,19 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _require_local_vision_tower(model_config) -> None:
+    """Reject rather than fall back to a tower --language-only never built."""
+    if getattr(model_config.hf_config, "has_local_vision_tower", True):
+        return
+    raise fastapi.HTTPException(
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        detail=(
+            "This server has no local vision tower (--language-only). "
+            "Multimodal inputs must be embedded by an encoder replica."
+        ),
+    )
+
+
 def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_inputs):
     """Do not silently turn a failed EPD request into local vision work."""
     if (
@@ -1065,6 +1078,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 if mm_inputs is None:
                     if self.server_args.language_only:
+                        _require_local_vision_tower(self.model_config)
                         logger.warning(
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
@@ -1084,6 +1098,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
+                _require_local_vision_tower(self.model_config)
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
                     audio_data=obj.audio_data,

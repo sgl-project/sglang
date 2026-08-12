@@ -7576,7 +7576,17 @@ class ServerArgs:
 
         if self.language_only:
             architectures = self.get_model_config().hf_config.architectures or []
-            if not any(a in TOWER_SKIPPING_ARCHITECTURES for a in architectures):
+            if any(a in TOWER_SKIPPING_ARCHITECTURES for a in architectures):
+                # No tower means no local encode to fall back on: multimodal
+                # inputs must arrive already embedded, or be rejected.
+                if self.enable_adaptive_dispatch_to_encoder:
+                    raise ValueError(
+                        "--enable-adaptive-dispatch-to-encoder processes some "
+                        "requests with the local vision tower, which "
+                        "--language-only does not build on "
+                        f"{architectures}. Drop one of the two flags."
+                    )
+            else:
                 logger.info(
                     "%s keeps its vision tower under --language-only; only the "
                     "architectures that implement the skip free that memory.",
@@ -7613,7 +7623,9 @@ class ServerArgs:
                     model_arch,
                     self.tp_size,
                 )
-        if (self.encoder_only or self.language_only) and model_arch not in [
+        # Only the encoder side needs per-arch support: consuming an encoder's
+        # embeddings is arch-agnostic, and --language-only no longer implies EPD.
+        if self.encoder_only and model_arch not in [
             "Qwen2VLForConditionalGeneration",
             "Qwen3VLForConditionalGeneration",
             "Qwen2_5_VLForConditionalGeneration",
