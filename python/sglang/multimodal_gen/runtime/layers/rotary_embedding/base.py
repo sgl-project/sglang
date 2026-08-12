@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.diffusion.triton.rotary import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -15,6 +14,8 @@ from .utils import (
 )
 
 if current_platform.is_npu():
+    import torch_npu
+
     from sglang.kernels.ops.diffusion.triton.npu_fallback import (
         NPU_ROTARY_MUL_MAX_HEAD_SIZE,
         NPU_ROTARY_MUL_MAX_NUM_HEADS,
@@ -144,7 +145,7 @@ class RotaryEmbedding(CustomOp):
             )
 
         if cos is not None and sin is not None:
-            batch_size, num_heads = query.shape[0], query.shape[2]
+            num_heads = query.shape[2]
 
             can_use_npu_rotary_mul = (
                 self.is_neox_style
@@ -153,43 +154,48 @@ class RotaryEmbedding(CustomOp):
                 and self.rotary_dim < NPU_ROTARY_MUL_MAX_HEAD_SIZE
             )
             if can_use_npu_rotary_mul:
-                # torch_npu.npu_rotary_mul path: only reachable inside
-                # apply_rotary_embedding_native (npu_fallback.py) when
-                # x.dim()==3, cos.dim()==3, heads/
-                # rotary_dim under its size limits, and interleaved=False.
-                # We replicate that same size gate here because if we called 
-                # through with
-                # interleaved=False and the gate failed on the other side,
-                # apply_rotary_embedding_native silently falls back to its
-                #  generic path — which would silently
-                # compute the wrong (GPT-J) rotation for neox-style data.
-                # cos/sin are [seq_len, rotary_dim // 2], shared across the
-                # batch, so they're explicitly repeated to
-                # match the flattened [batch * seq_len, ...] rows the
-                # kernel expects.
-                total_tokens = batch_size * seq_len
-                q_rot = query[..., : self.rotary_dim].reshape(
-                    total_tokens, num_heads, self.rotary_dim
-                )
+                # torch_npu.npu_rotary_mul, called directly on the natural
+                # BSND [batch, seq, heads, rotary_dim] layout instead of
+                # flattening to [batch*seq, heads, rotary_dim]: cos/sin get
+                # a batch dim of 1 and a heads dim of 1 and broadcast
+                # against query/key's real batch and heads dims — the
+                # documented "1S1D" pattern for BSND inputs — so no
+                # expand+reshape copy of cos/sin across the batch is
+                # needed (the previous version paid for that copy every
+                # call). heads/rotary_dim must stay under the same size
+                # limits apply_rotary_embedding_native's own gate uses;
+                # replicated here because if we called through with
+                # interleaved=False and that gate failed on the other
+                # side, apply_rotary_embedding_native would silently fall
+                # back to its always-interleaved generic path — wrong for
+                # neox-style data.
+                #
+                # EXPERIMENTAL: this batch/heads broadcast behavior is not
+                # independently verified on real hardware beyond the
+                # already-profiled single-batch case — validate
+                # numerically against the previous implementation (git
+                # history) before trusting it for real generations.
+                q_rot = query[..., : self.rotary_dim]
                 q_pass = query[..., self.rotary_dim :]
-                k_rot = key[..., : self.rotary_dim].reshape(
-                    total_tokens, num_heads, self.rotary_dim
-                )
+                k_rot = key[..., : self.rotary_dim]
                 k_pass = key[..., self.rotary_dim :]
 
-                cos_b = cos.unsqueeze(0).expand(batch_size, -1, -1).reshape(
-                    total_tokens, -1
-                )
-                sin_b = sin.unsqueeze(0).expand(batch_size, -1, -1).reshape(
-                    total_tokens, -1
-                )
+                cos_prepared = cos.reshape(1, seq_len, 1, -1).to(query.dtype)
+                sin_prepared = sin.reshape(1, seq_len, 1, -1).to(query.dtype)
+                if cos_prepared.size(-1) * 2 == self.rotary_dim:
+                    cos_prepared = torch.cat(
+                        (cos_prepared, cos_prepared), dim=-1
+                    )
+                    sin_prepared = torch.cat(
+                        (sin_prepared, sin_prepared), dim=-1
+                    )
 
-                q_rotated = apply_rotary_embedding(
-                    q_rot, cos_b, sin_b, interleaved=False
-                ).view(batch_size, seq_len, num_heads, self.rotary_dim)
-                k_rotated = apply_rotary_embedding(
-                    k_rot, cos_b, sin_b, interleaved=False
-                ).view(batch_size, seq_len, num_heads, self.rotary_dim)
+                q_rotated = torch_npu.npu_rotary_mul(
+                    q_rot, cos_prepared, sin_prepared
+                )
+                k_rotated = torch_npu.npu_rotary_mul(
+                    k_rot, cos_prepared, sin_prepared
+                )
                 return (
                     torch.cat((q_rotated, q_pass), dim=-1),
                     torch.cat((k_rotated, k_pass), dim=-1),
