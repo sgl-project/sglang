@@ -740,7 +740,7 @@ def test_kimi_k3_cached_artifact_is_composed_per_prompt():
 
 def test_kimi_k3_cached_deferred_artifact_has_model_contract():
     processor = object.__new__(KimiK3ImageProcessor)
-    processor.keep_mm_features_on_device = False
+    processor.mm_feature_transport = "cpu"
     feature = torch.zeros((3, 2, 2), dtype=torch.uint8)
 
     artifact = processor._make_artifact(
