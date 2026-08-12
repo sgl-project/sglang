@@ -98,30 +98,38 @@ def rank_consensus(func=None, *, same_params=None, same_results=None, **kwargs):
             descriptor_type = None
         sig = inspect.signature(raw_func)
 
+        # When calling class method or object method with "same_params=True",
+        # skip the first "cls" or "self", as the text format for that
+        # may include memory addresses, which are considered divergence.
+        skip_name: Optional[str] = None
+        if _is_method_with_receiver(func) and len(sig.parameters) > 0:
+            skip_name = next(iter(sig.parameters))
+
         @functools.wraps(raw_func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            # Bind once and apply defaults so that name-based selectors work
-            # regardless of whether the caller passed positionally or by kw.
-            bound = sig.bind(*args, **kwargs)
-            bound.apply_defaults()
-            arguments = dict(bound.arguments)
-
-            # When calling class method or object method with "same_params=True",
-            # skip the first "cls" or "self", as the text format for that
-            # may include memory addresses, which are considered divergence.
-            skip_name: Optional[str] = None
-            if _is_method_with_receiver(func) and len(sig.parameters) > 0:
-                skip_name = next(iter(sig.parameters))
-            payload = _build_payload("call", params_selector, arguments, skip_name)
-            assert_same("%s called params=%s", raw_func.__name__, payload)
+            params_payload = "<no check>"
+            if params_selector is not None:
+                # Bind once and apply defaults so that name-based selectors work
+                # regardless of whether the caller passed positionally or by kw.
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                arguments = dict(bound.arguments)
+                params_payload = _build_payload(
+                    "call", params_selector, arguments, skip_name
+                )
+            assert_same("%s called params=%s", raw_func.__name__, params_payload)
 
             result = raw_func(*args, **kwargs)
 
-            result_scope = {"result": result, **arguments}
-            payload = _build_payload(
-                "return", results_selector, result_scope, skip_name
-            )
-            assert_same("%s returns result=%s", raw_func.__name__, payload)
+            result_payload = "<no check>"
+            if results_selector is not None:
+                result_scope = {"result": result}
+                result_payload = _build_payload(
+                    "return",
+                    results_selector,
+                    result_scope,
+                )
+            assert_same("%s returns result=%s", raw_func.__name__, result_payload)
             return result
 
         # Re-wrap into the original descriptor type so class-body access
