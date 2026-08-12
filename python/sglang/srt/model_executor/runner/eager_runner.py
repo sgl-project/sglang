@@ -301,8 +301,6 @@ class EagerRunner(BaseRunner):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
-            if cp_v2_active:
-                prepare_cp_forward(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         if not cp_v2_active:
