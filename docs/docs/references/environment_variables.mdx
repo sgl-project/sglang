@@ -80,7 +80,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CACHE_DIR</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cache directory for model weights and other data</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cache directory for model weights and other data. Also the default root for compiled-kernel caches: Triton, Inductor, FlashInfer, the CUDA driver and DeepGEMM are pointed under it unless their own env vars (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`, `FLASHINFER_WORKSPACE_BASE`, `CUDA_CACHE_PATH`, `SGLANG_DG_CACHE_DIR`) are set explicitly</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>~/.cache/sglang</code></td>
     </tr>
 <tr>
@@ -275,7 +275,7 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DG_CACHE_DIR`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Directory for caching compiled DeepGEMM kernels</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`~/.cache/deep_gemm`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`{SGLANG_CACHE_DIR}/deep_gemm`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DG_USE_NVRTC</code></td>
@@ -354,7 +354,7 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_MOE_DEFERRED_FINALIZE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Defer the MoE finalize step to overlap it with other work.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PATCH_TOKENIZER</code></td>
@@ -761,7 +761,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer TRTLLM NVFP4 per-token activation scaling; ignores checkpoint activation FP32 scale by treating it as <code>1</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer TRTLLM NVFP4 per-token activation scaling for serialized <code>modelopt_fp4</code> checkpoints; checkpoint FP32 activation scales are treated as <code>1</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
@@ -791,7 +791,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FP4_IGNORED_LAYERS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A comma-separated list of layer names to keep out of FP4 online quantization, including <code>nvfp4_online</code>. For example: <code>model.layers.40,model.layers.41</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A comma-separated list of layer names to keep out of online FP4 conversion for <code>modelopt_fp4</code> or <code>nvfp4_online</code>. For example: <code>model.layers.40,model.layers.41</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
     <tr>
@@ -1052,6 +1052,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Config BatchSpanProcessor.max_export_batch_size if tracing is enabled</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`64`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_TRACE_ASYNC`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable async tracing: span creation is offloaded to a dedicated exporter process via ZMQ, reducing OTel overhead on the inference hot path</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of buffered trace operations before an automatic flush to the exporter process</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`100`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PROFILE_V2</code></td>

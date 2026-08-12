@@ -16,15 +16,21 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import asyncio
 import concurrent.futures
 import io
+import sys
+import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
 import requests
+import torch
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.utils import common
+from sglang.srt.utils.nvjpeg_decoder import _NvJpegDecoderPool
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -43,6 +49,13 @@ def _png_bytes(mode: str = "RGB", size=(8, 8)) -> bytes:
     img = Image.fromarray(arr, "RGB").convert(mode)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _jpeg_bytes(size=(8, 8)) -> bytes:
+    arr = (np.random.RandomState(0).rand(size[1], size[0], 3) * 255).astype("uint8")
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGB").save(buf, format="JPEG", quality=90, subsampling=2)
     return buf.getvalue()
 
 
@@ -120,6 +133,91 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "unexpected loader bug"):
                 _StubProcessor._load_single_item(b"image", Modality.IMAGE)
+
+    def test_high_fidelity_gpu_jpeg_decoder_is_selected(self):
+        data = _jpeg_bytes()
+        expected = torch.zeros((3, 8, 8), dtype=torch.uint8)
+        with (
+            patch.object(common, "is_cuda", return_value=True),
+            patch(
+                "sglang.srt.utils.nvjpeg_decoder.decode_jpeg_with_fancy_upsampling",
+                return_value=expected,
+            ) as decode,
+        ):
+            image, _ = common.load_image(data, gpu_image_decode="nvjpeg_fancy")
+
+        self.assertIs(image, expected)
+        decode.assert_called_once_with(data)
+
+    def test_high_fidelity_gpu_jpeg_decoder_falls_back_to_pil(self):
+        data = _jpeg_bytes()
+        common._warn_fancy_jpeg_fallback.cache_clear()
+        with (
+            patch.object(common, "is_cuda", return_value=True),
+            patch(
+                "sglang.srt.utils.nvjpeg_decoder.decode_jpeg_with_fancy_upsampling",
+                side_effect=ImportError("nvImageCodec is unavailable"),
+            ),
+        ):
+            image, _ = common.load_image(data, gpu_image_decode="nvjpeg_fancy")
+
+        self.assertIsInstance(image, Image.Image)
+        reference = Image.open(io.BytesIO(data))
+        np.testing.assert_array_equal(np.asarray(image), np.asarray(reference))
+
+    def test_high_fidelity_decoder_uses_fancy_planar_rgb_and_reuses_pool(self):
+        expected = torch.zeros((3, 8, 8), dtype=torch.uint8)
+        fake_format = object()
+
+        class FakeImage:
+            def to_dlpack(self, *, cuda_stream):
+                self.cuda_stream = cuda_stream
+                return object()
+
+        class FakeDecoder:
+            instances = []
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.instances.append(self)
+
+            def decode(self, data, *, params, cuda_stream):
+                self.call = (data, params, cuda_stream)
+                return FakeImage()
+
+        class FakeDecodeParams:
+            def __init__(self, *, sample_format, apply_exif_orientation):
+                self.sample_format = sample_format
+                self.apply_exif_orientation = apply_exif_orientation
+
+        fake_codec = SimpleNamespace(
+            DecodeParams=FakeDecodeParams,
+            Decoder=FakeDecoder,
+            SampleFormat=SimpleNamespace(P_RGB=fake_format),
+        )
+        nvidia = types.ModuleType("nvidia")
+        nvidia.nvimgcodec = fake_codec
+
+        with (
+            patch.dict(sys.modules, {"nvidia": nvidia}),
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                return_value=SimpleNamespace(cuda_stream=7),
+            ),
+            patch.object(torch, "from_dlpack", return_value=expected),
+        ):
+            pool = _NvJpegDecoderPool(device_id=2)
+            self.assertIs(pool.decode(b"jpeg"), expected)
+            self.assertIs(pool.decode(b"jpeg"), expected)
+
+        self.assertEqual(len(FakeDecoder.instances), 1)
+        decoder = FakeDecoder.instances[0]
+        self.assertEqual(decoder.kwargs["device_id"], 2)
+        self.assertEqual(decoder.kwargs["max_num_cpu_threads"], 1)
+        self.assertIn(":fancy_upsampling=1", decoder.kwargs["options"])
+        self.assertIs(pool._decode_params.sample_format, fake_format)
+        self.assertFalse(pool._decode_params.apply_exif_orientation)
 
 
 if __name__ == "__main__":
