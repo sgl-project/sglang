@@ -242,6 +242,50 @@ class Mamba2StateShape:
             conv_shard_groups=conv_shard_groups,
         )
 
+    @staticmethod
+    def create_mamba1(
+        *,
+        tp_world_size: int,
+        intermediate_size: int,
+        state_size: int,
+        conv_kernel: int,
+    ) -> "Mamba2StateShape":
+        """State shape for a Mamba-1 (selective-scan) mixer, e.g. Falcon-Mamba.
+
+        Two things differ from Mamba-2 (:meth:`create`):
+
+        - The causal conv is applied over ``intermediate_size`` ONLY. In Mamba-1
+          the ``B``/``C`` selection matrices are produced by ``x_proj`` *after*
+          the conv, so (unlike Mamba-2) they are not part of the conv input and
+          ``conv_dim == intermediate_size``.
+        - The SSM ``A`` matrix / state is full-rank per channel with shape
+          ``(intermediate_size, state_size)``. We express this on the Mamba-2
+          head layout as ``num_heads = intermediate_size`` and ``head_dim = 1``
+          (``n_groups`` implicitly 1, ``B``/``C`` shared across channels) so the
+          shared Mamba2 attention backend, memory pool, and
+          ``selective_state_update`` kernel drive it unchanged.
+        """
+        assert intermediate_size % tp_world_size == 0, (
+            f"Mamba-1 intermediate_size ({intermediate_size}) must be divisible "
+            f"by tp_world_size ({tp_world_size})"
+        )
+        conv_dim = intermediate_size
+        conv_state_shape = (divide(conv_dim, tp_world_size), conv_kernel - 1)
+        # (num_heads // tp, head_dim, state_size) with head_dim == 1.
+        temporal_state_shape = (divide(intermediate_size, tp_world_size), 1, state_size)
+        return Mamba2StateShape(
+            conv=[conv_state_shape],
+            temporal=temporal_state_shape,
+            intermediate_size=intermediate_size,
+            conv_dim=conv_dim,
+            ssm_state_size=state_size,
+            num_heads=intermediate_size,
+            head_dim=1,
+            state_size=state_size,
+            conv_kernel=conv_kernel,
+            num_k_heads_per_tp=1,
+        )
+
 
 @dataclass(kw_only=True, frozen=True)
 class Mamba2CacheParams(BaseLinearStateParams):
