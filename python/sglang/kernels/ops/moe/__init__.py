@@ -169,3 +169,20 @@ register_kernel(
         target="sglang.kernels.ops.moe.pack_topk_ids:PackTopkIds.triton",
     )
 )
+
+# Single-CTA align for tiny batches: covers the corner the AOT/JIT
+# moe_align_block_size small-batch path leaves out (num_experts > 64), and is
+# selected by the moe_runner call site on numel <= SMALL_NUMEL_LIMIT.
+register_kernel(
+    KernelSpec(
+        op="moe.moe_align_small_numel",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.moe_align_small_numel:moe_align_small_numel",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True,
+            description="align/sort expert token ids into block-padded buffers",
+        ),
+        description="MoE align-block-size, single-launch triton variant.",
+    )
+)
