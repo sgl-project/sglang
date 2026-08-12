@@ -208,6 +208,19 @@ def _maybe_dequantize_fp8(
 
 
 # TODO(PY): add compile option
+def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
+    """Let FSDP2 unshard around forward passes that bypass ``__call__``.
+
+    FSDP2 only unshards around the wrapped module's own ``forward``. Parameters
+    the shard conditions did not match stay in the catch-all root group, whose
+    hook therefore never fires for a model driven through a custom method, and
+    the first op mixing them with a plain tensor fails. Models declare those
+    entry points in ``_fsdp_forward_methods``.
+    """
+    for name in model._fsdp_forward_methods:
+        register_fsdp_forward_method(model, name)
+
+
 def maybe_load_fsdp_model(
     model_cls: type[nn.Module],
     init_params: dict[str, Any],
@@ -316,8 +329,7 @@ def maybe_load_fsdp_model(
             fsdp_shard_conditions=getattr(model, "_fsdp_shard_conditions", None),
             pin_cpu_memory=pin_cpu_memory,
         )
-        if callable(getattr(model, "refine_prompt_embeds", None)):
-            register_fsdp_forward_method(model, "refine_prompt_embeds")
+        register_fsdp_entrypoints(model)
 
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
 
