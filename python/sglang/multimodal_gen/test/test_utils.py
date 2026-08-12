@@ -39,7 +39,7 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "eccf85dcebaaded92df8b0fce3064ebea910c6d4"
+SGL_TEST_FILES_CI_DATA_REVISION = "cc3f27fd2d1b4d8e1a7d5eec1247a215a502b9c1"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
@@ -202,6 +202,9 @@ DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"
 DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST = "Efficient-Large-Model/SANA-WM_bidirectional"
 DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST = (
     "Efficient-Large-Model/SANA-WM_streaming"
+)
+DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST = (
+    "Efficient-Large-Model/SANA-Video_2B_480p_diffusers"
 )
 
 
@@ -914,12 +917,11 @@ def get_clip_model() -> tuple[Any, Any]:
             if "RobertaProcessing" not in str(e):
                 raise
             logger.warning(
-                "Fast CLIP processor failed (%s), retrying with use_fast=False", e
+                "CLIP processor failed (%s), retrying with compatibility shim", e
             )
             processor = _load_clip_processor_with_roberta_processing_compat(
                 CLIPProcessor,
                 CLIP_MODEL_NAME,
-                use_fast=False,
             )
         model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
 
