@@ -311,5 +311,68 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         )
 
 
+class TestPDPrefillSpecVerifySizing(unittest.TestCase):
+    """PD Prefill skips TARGET_VERIFY and does not allocate intermediate SSM.
+
+    The memory solver must not reserve that absent buffer; otherwise
+    max-running-requests silently reduces the device KV pool even though it
+    cannot create the corresponding allocation on a Prefill-only worker.
+    """
+
+    @staticmethod
+    def _rest_memory(disaggregation_mode: str):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.configs.mamba_utils import (
+            Mamba2CacheParams,
+            Mamba2StateDType,
+            Mamba2StateShape,
+        )
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        shape = Mamba2StateShape(
+            conv=[(4096, 3)],
+            temporal=(64, 128, 128),
+            intermediate_size=0,
+            conv_dim=0,
+            ssm_state_size=0,
+            num_heads=0,
+            head_dim=0,
+            state_size=0,
+            conv_kernel=0,
+            num_k_heads_per_tp=8,
+        )
+        params = Mamba2CacheParams(
+            shape=shape,
+            dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
+            layers=[0],
+        )
+        fake = SimpleNamespace(
+            mambaish_config=SimpleNamespace(mamba2_cache_params=params),
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            hybrid_gdn_config=None,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(), num_hidden_layers=1
+            ),
+            ps=SimpleNamespace(attn_dp_size=1, pp_size=1),
+            server_args=SimpleNamespace(),
+        )
+        with rc.get_context().override_server_args(
+            disaggregation_mode=disaggregation_mode,
+            disable_radix_cache=False,
+            disable_overlap_schedule=True,
+            mamba_radix_cache_strategy="extra_buffer",
+            max_mamba_cache_size=768,
+            max_running_requests=64,
+            mamba_full_memory_ratio=0.5,
+            speculative_num_draft_tokens=4,
+            enable_linear_replayssm_spec=False,
+        ):
+            return KVCacheConfigurator._handle_max_mamba_cache(fake, 100.0)
+
+    def test_pd_prefill_does_not_reserve_absent_verify_state(self):
+        prefill_rest = self._rest_memory("prefill")
+        aggregate_rest = self._rest_memory("null")
+        self.assertGreater(prefill_rest, aggregate_rest)
+
 if __name__ == "__main__":
     unittest.main()

@@ -1902,7 +1902,12 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
-        if has_spec_dec:
+        # A disaggregated Prefill worker never executes TARGET_VERIFY. Its
+        # HybridReqToTokenPool therefore passes speculative_num_draft_tokens=None
+        # and allocates no intermediate SSM state; keep the sizing charge aligned
+        # with that actual pool allocation.
+        prefill_skips_spec_verify = get_disagg().disaggregation_mode == "prefill"
+        if has_spec_dec and not prefill_skips_spec_verify:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
 
@@ -1916,7 +1921,7 @@ class KVCacheConfigurator:
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
             # (no intermediate_ssm allocated).
-            if has_spec_dec and not replayssm_active:
+            if has_spec_dec and not replayssm_active and not prefill_skips_spec_verify:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
