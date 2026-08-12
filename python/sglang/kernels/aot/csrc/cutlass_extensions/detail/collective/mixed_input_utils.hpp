@@ -21,6 +21,11 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_conversion.h"
 
+// MXFP4A8: adds NumericArrayConverter<float_e4m3_t, float_e2m1_t, N> so that the
+// DirectConvert path can losslessly upcast MXFP4 weights to e4m3 for fp8xfp8 GMMA.
+// This only ADDS a specialization; the int4b_t->e4m3 path is untouched.
+#include "cutlass_extensions/detail/collective/mxfp4_numeric_conversion.hpp"
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::collective::detail {

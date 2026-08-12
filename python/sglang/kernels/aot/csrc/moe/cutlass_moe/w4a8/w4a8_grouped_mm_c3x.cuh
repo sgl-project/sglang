@@ -38,7 +38,7 @@ namespace {
 
 // Type definitions
 using MmaType = cutlass::float_e4m3_t;     // FP8 e4m3 type
-using QuantType = cutlass::int4b_t;        // 4-bit integer type
+using QuantType = cutlass::int4b_t;        // 4-bit integer type (default, int4a8)
 using ElementAccumulator = float;          // Accumulator type
 using ElementScale = cutlass::bfloat16_t;  // Scale type
 using ElementC = cutlass::bfloat16_t;      // Output type
@@ -70,11 +70,22 @@ static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<QuantType>::value;
 static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
-template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule>
+template <
+    typename TileShape,
+    typename ClusterShape,
+    typename KernelSchedule,
+    typename EpilogueSchedule,
+    // MXFP4A8: the 4-bit weight element type. Defaults to int4b_t so all existing
+    // int4a8 instantiations are byte-identical; pass cutlass::float_e2m1_t for mxfp4a8.
+    typename QuantTypeB = QuantType,
+    // K-wise quant group size. int4a8 uses 128; mxfp4a8 (E8M0 block) uses 32.
+    int GroupSizeK = 128>
 struct cutlass_3x_w4a8_group_gemm {
-  static constexpr int GroupSize = 128;
+  static constexpr int GroupSize = GroupSizeK;
   static constexpr int PackedScalesNum = get<2>(TileShape{}) / GroupSize;
   using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
+  // Alignment for the 4-bit weight operand (int4b_t / float_e2m1_t are both 4-bit).
+  static constexpr int AlignmentQuantB = 128 / cutlass::sizeof_bits<QuantTypeB>::value;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
@@ -95,9 +106,9 @@ struct cutlass_3x_w4a8_group_gemm {
   using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilderMixedInput<
       ArchTag,
       OperatorClass,
-      cute::tuple<QuantType, ElementScalePacked>,
+      cute::tuple<QuantTypeB, ElementScalePacked>,
       LayoutB_Transpose*,
-      AlignmentB,
+      AlignmentQuantB,
       MmaType,
       LayoutA_Transpose*,
       AlignmentA,
@@ -107,6 +118,9 @@ struct cutlass_3x_w4a8_group_gemm {
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       KernelSchedule>::CollectiveOp;
+
+  // Expose the weight quant type so the caller can cast device pointers correctly.
+  using ElementQuantB = QuantTypeB;
 
   // Define the final kernel and GEMM operation types
   using GemmKernelScaleOnly =
@@ -165,7 +179,14 @@ void cutlass_w4a8_group_gemm_caller(
     torch::Tensor const& b_strides,
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
-    int64_t chunk_size) {
+    int64_t chunk_size,
+    // MXFP4A8: optional per-token+per-block activation scale (N-indexed, bf16
+    // [total_m, K/act_group]) and its per-expert stride array. When provided the
+    // mainloop's EnableActBlockScale path is fed; for int4a8 these stay nullopt
+    // so the aggregate leaves ptr_AS/dAS default-null and the kernel is byte-identical.
+    std::optional<torch::Tensor> act_block_scales = std::nullopt,
+    std::optional<torch::Tensor> as_strides = std::nullopt,
+    int64_t act_scale_group = 0) {
   //   using Gemm = cutlass_3x_w4a8_group_gemm<TileShape, ClusterShape, KernelSchedule, EpilogueSchedule>;
   using Args = typename Gemm::GemmScaleOnly::Arguments;
 
@@ -204,6 +225,13 @@ void cutlass_w4a8_group_gemm_caller(
   torch::Tensor out_ptrs = torch::empty(num_experts, options_int);
   torch::Tensor a_scales_ptrs = torch::empty(num_experts, options_int);
   torch::Tensor b_scales_ptrs = torch::empty(num_experts, options_int);
+  // MXFP4A8: per-expert activation block-scale pointer array (only used when
+  // act_block_scales is provided; int4a8 leaves this empty).
+  torch::Tensor as_scales_ptrs;
+  bool use_act_block_scale = act_block_scales.has_value() && as_strides.has_value();
+  if (use_act_block_scale) {
+    as_scales_ptrs = torch::empty(num_experts, options_int);
+  }
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = a_tensors.device().index();
@@ -235,12 +263,21 @@ void cutlass_w4a8_group_gemm_caller(
       b_tensors,
       d_tensors,
       a_scales,
-      b_scales);
+      b_scales,
+      use_act_block_scale ? std::optional<torch::Tensor>(as_scales_ptrs) : std::nullopt,
+      use_act_block_scale ? act_block_scales : std::nullopt,
+      use_act_block_scale ? act_scale_group : 0,
+      // Weight-scale group size for this instantiation (int4a8=128, mxfp4a8=32),
+      // so the per-expert weight-scale pointer advances by n*k/GroupSize.
+      static_cast<int64_t>(Gemm::GroupSize),
+      // MXFP4A8: per-expert act-scale stride tensor [E,2] so get_group_starts can
+      // advance the act-scale pointer by the PADDED (16B-aligned) cumsum.
+      use_act_block_scale ? as_strides : std::nullopt);
 
   arguments = Args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {num_experts, problem_sizes_as_shapes, nullptr},
-      {static_cast<const QuantType**>(b_ptrs.data_ptr()),
+      {static_cast<const typename Gemm::ElementQuantB**>(b_ptrs.data_ptr()),
        static_cast<typename Gemm::StrideB*>(b_strides.data_ptr()),
        static_cast<const MmaType**>(a_ptrs.data_ptr()),
        static_cast<typename Gemm::StrideA*>(a_strides.data_ptr()),
@@ -253,6 +290,14 @@ void cutlass_w4a8_group_gemm_caller(
        static_cast<ElementD**>(out_ptrs.data_ptr()),
        static_cast<typename Gemm::StrideD*>(d_strides.data_ptr())},
       hw_info};
+
+  // MXFP4A8: feed the activation block-scale into the mainloop's optional path.
+  // These members default to nullptr, so the int4a8 path is unaffected.
+  if (use_act_block_scale) {
+    arguments.mainloop.ptr_AS =
+        static_cast<const typename Gemm::ElementScalePacked**>(as_scales_ptrs.data_ptr());
+    arguments.mainloop.dAS = static_cast<typename Gemm::StrideS*>(as_strides->data_ptr());
+  }
 
   // Instantiate and run GEMM
   typename Gemm::GemmScaleOnly gemm;
@@ -272,7 +317,13 @@ void cutlass_w4a8_group_gemm_caller(
 
   status = gemm.run(stream);
   if (status != cutlass::Status::kSuccess) {
-    TORCH_CHECK(false, "GEMM execution failed");
+    cudaError_t ce = cudaGetLastError();
+    TORCH_CHECK(
+        false,
+        "GEMM execution failed: status=",
+        cutlassGetStatusString(status),
+        " cuda=",
+        cudaGetErrorString(ce));
   }
 }
 
