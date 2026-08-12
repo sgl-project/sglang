@@ -95,7 +95,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Recommended generation:** `temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`, `presence_penalty=0.0`, `repetition_penalty=1.0`. Raising `presence_penalty` toward 2 curbs runaway repetition at some risk of language mixing. For agentic work Qwen suggests allowing 262,144 tokens of reasoning and 131,072 for the final response.
 
-**Resources:** Each precision is its own repo — [BF16](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) · [FP8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8) · [NVFP4, NVIDIA Blackwell (RadixArk)](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-NVFP4) · [MXFP4, AMD CDNA4 (Qwen)](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4). Speculative-decoding draft model: [`RadixArk/Qwen3.8-Max-DSpark`](https://huggingface.co/RadixArk/Qwen3.8-Max-DSpark) (see [3.3](#3-3-dspark-and-replayssm-speculative-decoding)).
+**Resources:** Each precision is its own repo — [BF16](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) · [FP8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8) · [NVFP4, NVIDIA Blackwell (RadixArk)](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-NVFP4) · [MXFP4, AMD CDNA4 (Qwen)](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4). Speculative-decoding draft model: [`RadixArk/Qwen3.8-2.4T-A95B-DSpark`](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-DSpark) (see [3.3](#3-3-dspark-and-replayssm-speculative-decoding)).
 
 ## 2. Configuration Tips
 
@@ -295,7 +295,7 @@ We trained a **DSpark** draft model for Qwen3.8 with SpecForge. Turn it on with 
 
 ```bash Command
 --speculative-algorithm DSPARK \
---speculative-draft-model-path RadixArk/Qwen3.8-Max-DSpark
+--speculative-draft-model-path RadixArk/Qwen3.8-2.4T-A95B-DSpark
 ```
 
 **ReplaySSM is a separate opt-in.** `--enable-linear-replayssm-spec` defaults off and DSpark does not turn it on, so add it with the **ReplaySSM (spec)** row in the flag-select list. With it on (see [Configuration Tips](#2-configuration-tips) above for how it works), the verify kernel stores each draft step's raw inputs instead of snapshotting the full K×V GDN state, and a single fold kernel replays the accepted prefix from the last committed checkpoint. It's a pure side channel behind a ring buffer — the verify output is bitwise unchanged — so there's no accuracy tradeoff, only a memory one.
