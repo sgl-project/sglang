@@ -47,6 +47,12 @@ pub struct RouterConfig {
     pub queue_timeout_secs: u64,
     /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
+    /// Per-worker stream slot capacity for power-of-two HTTP admission.
+    /// `0` (default) disables worker-slot-aware admission and preserves prior
+    /// immediate-dispatch behavior. When set, power-of-two HTTP requests wait
+    /// centrally until some healthy worker has `load < worker_stream_slots`.
+    #[serde(default)]
+    pub worker_stream_slots: usize,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
     pub circuit_breaker: CircuitBreakerConfig,
@@ -529,6 +535,7 @@ impl Default for RouterConfig {
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
+            worker_stream_slots: 0,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),

@@ -353,6 +353,12 @@ struct CliArgs {
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 
+    /// Per-worker stream slot capacity for power-of-two HTTP admission.
+    /// `0` disables (default, preserves immediate dispatch). When set, power-of-two
+    /// HTTP requests wait centrally until a healthy worker has a free stream slot.
+    #[arg(long, default_value_t = 0, help_heading = "Rate Limiting")]
+    worker_stream_slots: usize,
+
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
@@ -1017,6 +1023,7 @@ impl CliArgs {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .worker_stream_slots(self.worker_stream_slots)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
                 max_retries: self.retry_max_retries,

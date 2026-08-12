@@ -217,12 +217,7 @@ impl WorkerManager {
 
         match req.send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) => json
-                    .get("aggregate")
-                    .and_then(|a| a.get("total_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as isize)
-                    .unwrap_or(-1),
+                Ok(json) => extract_load_from_json(&json).unwrap_or(-1),
                 _ => -1,
             },
             _ => -1,
@@ -264,6 +259,45 @@ impl WorkerManager {
             Err(e) => EngineMetricsResult::Err(format!("Failed to aggregate metrics: {}", e)),
         }
     }
+}
+
+/// Extract a comparable worker load from a `/v1/loads` JSON body.
+///
+/// Prefers the current SGLang schema (`loads[].num_total_tokens`, summed across
+/// DP ranks). Falls back to `loads[].num_running_reqs`, then the legacy
+/// `aggregate.total_tokens` field for backward compatibility.
+pub(crate) fn extract_load_from_json(json: &Value) -> Option<isize> {
+    if let Some(loads) = json.get("loads").and_then(|v| v.as_array()) {
+        if !loads.is_empty() {
+            let mut token_sum = 0i64;
+            let mut tokens_found = 0usize;
+            let mut running_sum = 0i64;
+            let mut running_found = 0usize;
+
+            for item in loads {
+                if let Some(n) = item.get("num_total_tokens").and_then(|v| v.as_i64()) {
+                    token_sum += n;
+                    tokens_found += 1;
+                }
+                if let Some(n) = item.get("num_running_reqs").and_then(|v| v.as_i64()) {
+                    running_sum += n;
+                    running_found += 1;
+                }
+            }
+
+            if tokens_found > 0 {
+                return Some(token_sum as isize);
+            }
+            if running_found > 0 {
+                return Some(running_sum as isize);
+            }
+        }
+    }
+
+    json.get("aggregate")
+        .and_then(|a| a.get("total_tokens"))
+        .and_then(|v| v.as_i64())
+        .map(|n| n as isize)
 }
 
 /// Load monitoring service that periodically fetches worker loads
@@ -390,5 +424,59 @@ impl Drop for LoadMonitor {
                 handle.abort();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod load_schema_tests {
+    use serde_json::json;
+
+    use super::extract_load_from_json;
+
+    #[test]
+    fn parses_current_v1_loads_num_total_tokens() {
+        let body = json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "version": "0.0.0",
+            "loads": [
+                {"dp_rank": 0, "num_running_reqs": 2, "num_total_tokens": 100},
+                {"dp_rank": 1, "num_running_reqs": 1, "num_total_tokens": 50}
+            ]
+        });
+        assert_eq!(extract_load_from_json(&body), Some(150));
+    }
+
+    #[test]
+    fn falls_back_to_num_running_reqs_when_tokens_missing() {
+        let body = json!({
+            "loads": [
+                {"dp_rank": 0, "num_running_reqs": 3},
+                {"dp_rank": 1, "num_running_reqs": 4}
+            ]
+        });
+        assert_eq!(extract_load_from_json(&body), Some(7));
+    }
+
+    #[test]
+    fn keeps_legacy_aggregate_total_tokens() {
+        let body = json!({
+            "aggregate": {"total_tokens": 42},
+            "loads": []
+        });
+        assert_eq!(extract_load_from_json(&body), Some(42));
+    }
+
+    #[test]
+    fn prefers_current_schema_over_legacy_aggregate() {
+        let body = json!({
+            "aggregate": {"total_tokens": 999},
+            "loads": [{"dp_rank": 0, "num_total_tokens": 11}]
+        });
+        assert_eq!(extract_load_from_json(&body), Some(11));
+    }
+
+    #[test]
+    fn returns_none_for_unrecognized_payload() {
+        assert_eq!(extract_load_from_json(&json!({"foo": 1})), None);
     }
 }

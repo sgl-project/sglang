@@ -234,6 +234,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Per-worker stream slots for power-of-two HTTP capacity admission (`0` = disabled).
+    pub fn worker_stream_slots(mut self, slots: usize) -> Self {
+        self.config.worker_stream_slots = slots;
+        self
+    }
+
     // ==================== Security & CORS ====================
 
     pub fn api_key<S: Into<String>>(mut self, key: S) -> Self {

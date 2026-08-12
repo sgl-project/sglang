@@ -210,3 +210,29 @@ async fn test_guard_with_empty_body() {
 
     assert_eq!(worker.load(), 0);
 }
+
+#[tokio::test]
+async fn test_guard_notifies_capacity_on_drop_including_cancel() {
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+
+    let worker = create_test_worker();
+    let notify = Arc::new(Notify::new());
+    let notified = notify.notified();
+    tokio::pin!(notified);
+
+    {
+        let guard = WorkerLoadGuard::with_notify(worker.clone(), None, Some(Arc::clone(&notify)));
+        assert_eq!(worker.load(), 1);
+        let response = AttachedBody::wrap_response(Response::new(Body::empty()), guard);
+        // Drop without consuming the body — models client cancel / early abort.
+        drop(response);
+    }
+
+    // Drop must both release load and wake capacity waiters.
+    assert_eq!(worker.load(), 0);
+    tokio::time::timeout(std::time::Duration::from_millis(200), notified)
+        .await
+        .expect("capacity notify should fire when streaming guard is dropped");
+}

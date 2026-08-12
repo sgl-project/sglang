@@ -15,8 +15,8 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        is_retryable_status, AdmissionError, AttachedBody, CapacityGate, ConnectionMode,
+        RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -51,6 +51,8 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
+    /// Opt-in worker-slot admission for power-of-two HTTP routing.
+    capacity_gate: Option<Arc<CapacityGate>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -62,6 +64,7 @@ impl std::fmt::Debug for Router {
             .field("dp_aware", &self.dp_aware)
             .field("enable_igw", &self.enable_igw)
             .field("retry_config", &self.retry_config)
+            .field("capacity_gate", &self.capacity_gate.is_some())
             .finish()
     }
 }
@@ -76,6 +79,7 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
+            capacity_gate: ctx.capacity_gate.clone(),
         })
     }
 
@@ -279,6 +283,43 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let policy_name = policy.name();
+
+        // Worker-slot-aware central admission for power-of-two HTTP only.
+        // Keeps requests off backend waiting queues when every live worker is
+        // already at its configured stream-slot capacity.
+        if policy_name == "power_of_two" {
+            if let Some(gate) = &self.capacity_gate {
+                match gate
+                    .wait_for_capacity_refreshing(
+                        self.worker_registry.as_ref(),
+                        model_id,
+                        self.enable_igw,
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(AdmissionError::Timeout) => {
+                        return error::create_error(
+                            StatusCode::REQUEST_TIMEOUT,
+                            "worker_slot_queue_timeout",
+                            "Timed out waiting for a free worker stream slot",
+                        );
+                    }
+                    Err(AdmissionError::NoWorkers) | Err(AdmissionError::Cancelled) => {
+                        return error::service_unavailable(
+                            "no_available_workers",
+                            "No available workers (all circuits open or unhealthy)",
+                        );
+                    }
+                }
+            }
+        }
+
         let worker = match self
             .select_worker_for_model(model_id, Some(text), headers)
             .await
@@ -292,14 +333,15 @@ impl Router {
             }
         };
 
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+        // Track load for the full upstream response lifetime (including streaming).
+        // power_of_two only joins when worker-slot admission is enabled so the
+        // default worker_stream_slots=0 path stays behavior-compatible.
+        let track_power_of_two = policy_name == "power_of_two" && self.capacity_gate.is_some();
+        let load_guard = (["cache_aware", "manual"].contains(&policy_name) || track_power_of_two)
+            .then(|| {
+                let notify = self.capacity_gate.as_ref().map(|g| g.notifier());
+                WorkerLoadGuard::with_notify(worker.clone(), headers, notify)
+            });
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -880,6 +922,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             enable_igw: false,
+            capacity_gate: None,
         }
     }
 

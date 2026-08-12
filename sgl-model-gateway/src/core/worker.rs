@@ -1147,10 +1147,20 @@ impl Worker for DPAwareWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
+    /// Optional capacity-gate notifier woken when this stream slot is released.
+    capacity_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
+        Self::with_notify(worker, headers, None)
+    }
+
+    pub fn with_notify(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        capacity_notify: Option<Arc<tokio::sync::Notify>>,
+    ) -> Self {
         use crate::routers::header_utils::extract_routing_key;
 
         worker.increment_load();
@@ -1164,6 +1174,7 @@ impl WorkerLoadGuard {
         Self {
             worker,
             routing_key,
+            capacity_notify,
         }
     }
 }
@@ -1173,6 +1184,9 @@ impl Drop for WorkerLoadGuard {
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
             self.worker.worker_routing_key_load().decrement(key);
+        }
+        if let Some(notify) = self.capacity_notify.take() {
+            notify.notify_waiters();
         }
     }
 }

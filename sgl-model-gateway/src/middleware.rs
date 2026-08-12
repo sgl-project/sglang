@@ -460,7 +460,13 @@ impl QueueProcessor {
     }
 }
 
-/// State for the concurrency limiter
+/// State for the concurrency limiter.
+///
+/// This remains a process-global TokenBucket admission path for
+/// `max_concurrent_requests`. Worker-slot-aware central admission for
+/// power-of-two HTTP routing lives in [`crate::core::CapacityGate`] and is
+/// wired from the HTTP router when `worker_stream_slots > 0`. Other policies
+/// and non-streaming endpoints keep this global limiter behavior unchanged.
 pub struct ConcurrencyLimiter {
     pub queue_tx: Option<mpsc::Sender<QueuedRequest>>,
 }

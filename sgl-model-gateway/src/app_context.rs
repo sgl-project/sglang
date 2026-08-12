@@ -13,7 +13,9 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
+    core::{
+        steps::WorkflowEngines, CapacityGate, JobQueue, LoadMonitor, WorkerRegistry, WorkerService,
+    },
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -59,6 +61,8 @@ pub struct AppContext {
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
+    /// Opt-in worker-slot-aware admission for power-of-two HTTP routing.
+    pub capacity_gate: Option<Arc<CapacityGate>>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -87,6 +91,7 @@ pub struct AppContextBuilder {
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
     mcp_manager: Option<Arc<OnceLock<Arc<McpManager>>>>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
+    capacity_gate: Option<Arc<CapacityGate>>,
 }
 
 impl AppContext {
@@ -127,7 +132,13 @@ impl AppContextBuilder {
             workflow_engines: None,
             mcp_manager: None,
             wasm_manager: None,
+            capacity_gate: None,
         }
+    }
+
+    pub fn capacity_gate(mut self, capacity_gate: Option<Arc<CapacityGate>>) -> Self {
+        self.capacity_gate = capacity_gate;
+        self
     }
 
     pub fn client(mut self, client: Client) -> Self {
@@ -245,6 +256,14 @@ impl AppContextBuilder {
             router_config.clone(),
         ));
 
+        let capacity_gate = self
+            .capacity_gate
+            .or_else(|| maybe_capacity_gate(&router_config));
+        // Always attach so discovery wakeups work for builder-injected gates too.
+        if let Some(ref gate) = capacity_gate {
+            gate.attach_registry(worker_registry.clone());
+        }
+
         Ok(AppContext {
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
@@ -281,6 +300,7 @@ impl AppContextBuilder {
             wasm_manager: self.wasm_manager,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
+            capacity_gate,
         })
     }
 
@@ -388,7 +408,19 @@ impl AppContextBuilder {
         };
         self
     }
+}
 
+fn maybe_capacity_gate(config: &RouterConfig) -> Option<Arc<CapacityGate>> {
+    if config.worker_stream_slots == 0 {
+        return None;
+    }
+    Some(Arc::new(CapacityGate::new(
+        config.worker_stream_slots,
+        Duration::from_secs(config.queue_timeout_secs.max(1)),
+    )))
+}
+
+impl AppContextBuilder {
     /// Create reasoning parser factory for gRPC mode or IGW mode
     fn with_reasoning_parser_factory(mut self) -> Self {
         // Initialize reasoning parser factory

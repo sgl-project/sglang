@@ -201,6 +201,8 @@ pub struct WorkerRegistry {
     /// When None, the registry works independently without mesh synchronization
     /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
     mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
+    /// Optional capacity-gate notifier woken on worker registration.
+    capacity_notify: Arc<RwLock<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 impl WorkerRegistry {
@@ -214,7 +216,13 @@ impl WorkerRegistry {
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
             mesh_sync: Arc::new(RwLock::new(None)),
+            capacity_notify: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Set capacity-gate notifier (woken when workers are registered).
+    pub fn set_capacity_notify(&self, notify: Option<Arc<tokio::sync::Notify>>) {
+        *self.capacity_notify.write().unwrap() = notify;
     }
 
     /// Rebuild the hash ring for a model based on current workers in the model index
@@ -291,6 +299,10 @@ impl WorkerRegistry {
                 worker.is_healthy(),
                 0.0, // TODO: Get actual load
             );
+        }
+
+        if let Some(notify) = self.capacity_notify.read().unwrap().as_ref() {
+            notify.notify_waiters();
         }
 
         worker_id

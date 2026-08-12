@@ -941,6 +941,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         info!("Rate limiting is disabled (max_concurrent_requests = -1)");
     }
 
+    if let Some(ref gate) = app_context.capacity_gate {
+        info!(
+            "Worker-slot admission enabled for power-of-two HTTP (worker_stream_slots={}, queue_timeout={}s)",
+            gate.slots_per_worker(),
+            config.router_config.queue_timeout_secs
+        );
+    } else {
+        debug!("Worker-slot admission disabled (worker_stream_slots = 0)");
+    }
+
     match processor {
         Some(proc) => {
             spawn(proc.run());

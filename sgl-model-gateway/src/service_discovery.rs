@@ -883,6 +883,7 @@ mod tests {
                 router_config,
             )),
             inflight_tracker: InFlightRequestTracker::new(),
+            capacity_gate: None,
         })
     }
 
