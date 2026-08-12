@@ -6,6 +6,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Collection,
     List,
     Optional,
 )
@@ -104,11 +105,18 @@ class SchedulerOutputStreamer:
         self,
         reqs: List[Req],
         return_logprob: bool,
-        skip_req: Optional[Req] = None,
+        skip_reqs: Collection[Req] = (),
     ):
-        """Stream the output to detokenizer."""
+        """Stream the output to detokenizer.
+
+        ``skip_reqs`` holds the requests whose prefill did not finish this batch
+        (middle chunks): they appended no new token, so streaming them would
+        emit a duplicate. It is a collection rather than a single request
+        because a batch can carry several mid-prefill requests at once — DLLM
+        already does, and concurrent chunked prefill does in general.
+        """
         if self.is_generation:
-            self._stream_output_generation(reqs, return_logprob, skip_req)
+            self._stream_output_generation(reqs, return_logprob, skip_reqs)
         else:  # embedding or reward model
             self._stream_output_embedding(reqs)
 
@@ -130,20 +138,23 @@ class SchedulerOutputStreamer:
         self,
         reqs: List[Req],
         return_logprob: bool,
-        skip_req: Optional[Req] = None,
+        skip_reqs: Collection[Req] = (),
         is_idle_batch: bool = False,
     ):
+        # Identity membership, matching the previous `is not skip_req` checks:
+        # Req defines no __eq__/__hash__, so `in` compares by identity.
+        skipped = set(skip_reqs)
         return_hidden_states = any(
-            req.return_hidden_states for req in reqs if req is not skip_req
+            req.return_hidden_states for req in reqs if req not in skipped
         )
         return_routed_experts = any(
-            req.return_routed_experts for req in reqs if req is not skip_req
+            req.return_routed_experts for req in reqs if req not in skipped
         )
         return_indexer_topk = any(
-            req.return_indexer_topk for req in reqs if req is not skip_req
+            req.return_indexer_topk for req in reqs if req not in skipped
         )
         return_sampling_mask = any(
-            req.return_sampling_mask for req in reqs if req is not skip_req
+            req.return_sampling_mask for req in reqs if req not in skipped
         )
 
         acc = _GenerationStreamAccumulator(
@@ -160,7 +171,7 @@ class SchedulerOutputStreamer:
             rust_server_mode=self.rust_server is not None,
         )
         for req in reqs:
-            if req is skip_req:
+            if req in skipped:
                 continue
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice

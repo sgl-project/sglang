@@ -195,7 +195,10 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        skip_stream_req = None
+        # Requests whose prefill did not finish in this batch. A batch can hold
+        # several of them (DLLM stages many at once; concurrent chunked prefill
+        # does so in general), so this is a list rather than a single request.
+        skip_stream_reqs: List[Req] = []
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
@@ -307,10 +310,10 @@ class SchedulerBatchResultProcessor:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
+                    # This request did not finish prefill, so it appended no new
+                    # token: streaming it would emit a duplicate. Collect every
+                    # such request — a batch may contain more than one.
+                    skip_stream_reqs.append(req)
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob:
@@ -364,7 +367,7 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
+            batch.reqs, batch.return_logprob, skip_stream_reqs
         )
 
         can_run_cuda_graph = result.can_run_cuda_graph
