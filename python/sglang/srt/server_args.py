@@ -9809,6 +9809,18 @@ class ServerArgs:
         return self.expert_balancedness_report_mode in ("prometheus", "both")
 
 
+def compute_world_size(server_args: ServerArgs) -> int:
+    """The gpu count the whole server occupies, across every data-parallel
+    replica. Distinct from ``get_parallel().world_size``, which is the live
+    process group: without dp attention each replica has a group of its own,
+    so no scheduler in it can see past its own ``tp_size * pp_size``."""
+    return (
+        (1 if server_args.enable_dp_attention else server_args.dp_size)
+        * server_args.tp_size
+        * server_args.pp_size
+    )
+
+
 def m3_fp8_attn_gemm_enabled(args) -> bool:
     """Whether MiniMax-M3 attention GEMMs run in fp8 (no opt-in flag; active
     whenever possible): fp8_e4m3 main + index KV caches, fp8-cast q, fp8
