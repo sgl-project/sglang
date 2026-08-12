@@ -12,6 +12,7 @@ import fnmatch
 import gc
 import glob
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -96,6 +97,25 @@ from sglang.srt.model_loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.srt.utils.common import is_cuda_alike
+
+
+def _call_load_weights(load_weights, weights, *, is_full_load: bool):
+    try:
+        supports_is_full_load = (
+            "is_full_load" in inspect.signature(load_weights).parameters
+        )
+    except (TypeError, ValueError):
+        supports_is_full_load = False
+
+    if supports_is_full_load:
+        return load_weights(weights, is_full_load=is_full_load)
+    return load_weights(weights)
+
+
+def load_model_weights(model, weights, *, is_full_load: bool = True):
+    """Load weights, forwarding partial-load context to models that accept it."""
+    return _call_load_weights(model.load_weights, weights, is_full_load=is_full_load)
+
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -831,7 +851,9 @@ class DefaultModelLoader(BaseModelLoader):
         return model.eval()
 
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(
+        model, weights, target_device, *, is_full_load: bool = True
+    ):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -870,12 +892,12 @@ class DefaultModelLoader(BaseModelLoader):
                 FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
                 FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
             ):
-                model.load_weights(weights)
+                load_model_weights(model, weights, is_full_load=is_full_load)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
-            model.load_weights(weights)
+            load_model_weights(model, weights, is_full_load=is_full_load)
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -1051,27 +1073,43 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             return func
         return types.MethodType(func, obj)
 
-    def load_weights_and_postprocess(self, model, weights, target_device):
+    def load_weights_and_postprocess(
+        self, model, weights, target_device, *, is_full_load: bool = True
+    ):
         """
         Initial load: Load BF16 → Record state → Apply FP8 quantization.
-        Called ONCE during model initialization.
+        Online reload: Reuse the installed fast-path proxy.
         """
+        if QuantizedRLModelLoader.is_reload_scenario(model):
+            load_model_weights(model, weights, is_full_load=is_full_load)
+            return
+
         logger.info("[QuantizedRL] Initial load with FP8 quantization")
 
         original_load_weights = model.load_weights
 
-        def load_weights_proxy(weights):
+        def load_weights_proxy(weights, *, is_full_load: bool = True):
             if QuantizedRLModelLoader.is_reload_scenario(model):
                 logger.info("[QuantizedRL] Using fast path reload in load_weights")
                 QuantizedRLModelLoader.rebinding_and_load_weights(
-                    model, original_load_weights, weights
+                    model,
+                    lambda update: _call_load_weights(
+                        original_load_weights,
+                        update,
+                        is_full_load=is_full_load,
+                    ),
+                    weights,
                 )
             else:
-                original_load_weights(weights)
+                return _call_load_weights(
+                    original_load_weights,
+                    weights,
+                    is_full_load=is_full_load,
+                )
 
         model.load_weights = load_weights_proxy
 
-        model.load_weights(weights)
+        load_model_weights(model, weights, is_full_load=is_full_load)
         original_weights = dict(model.named_parameters())
 
         # Record pre-quantization state (shape/stride) for torch.as_strided reset

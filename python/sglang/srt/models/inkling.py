@@ -1910,7 +1910,9 @@ class InklingForConditionalGenerationMTP(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], *, is_full_load: bool = True
+    ) -> Set[str]:
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -2016,7 +2018,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
                 loaded_params.add(name)
 
         unloaded = sorted(set(params_dict) - loaded_params)
-        if unloaded:
+        if is_full_load and unloaded:
             msg = (
                 f"MTP draft (idx {self.draft_model_idx}): {len(unloaded)} unloaded "
                 f"weights (loaded {len(loaded_params)}/{len(params_dict)}); an unloaded "
