@@ -1,0 +1,210 @@
+---
+title: Ling-3.0-flash
+description: "Deploy Ling-3.0-flash with SGLang — a 124B hybrid KDA + MLA MoE in BF16, FP8, INT4, or MXFP4 on Hopper and Blackwell GPUs."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+```bash Command
+docker pull lmsysorg/sglang:dev-Ling-3.0-flash
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Accordion>
+
+Pick your hardware + recipe to generate the launch command. Three serving strategies are covered:
+
+- **Low-Latency** — fastest reply for a single user. Pick for chat. These recipes run NEXTN speculative decoding.
+- **High-Throughput** — most tokens per second across many users. Best for batch jobs. These recipes turn speculative decoding off, since at saturation the draft/verify overhead outweighs the speedup.
+- **HiCache + Mooncake** — writes reusable prefixes to Mooncake L3 storage. Start the Mooncake services in §3.3 before launching the generated server command.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/inclusionAI/ling-3.0-flash.jsx";
+import { benchmarks } from "/src/snippets/configs/inclusionAI/ling-3.0-flash-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the documented matrix**. The Deploy panel above only emits the curated recipe combinations on this page; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+Ling-3.0-flash is a hybrid-attention Mixture-of-Experts (MoE) language model from the BailingMoeV3 family. It interleaves Kimi Delta Attention (KDA) linear-attention layers with gated Multi-head Latent Attention (MLA) full-attention layers, on top of a fine-grained MoE feed-forward network. This keeps per-token inference cost close to a small model — **124B total parameters with only 5.1B active** — while retaining large-model capacity.
+
+It is a hybrid-reasoning model with thinking enabled by default, and it supports structured tool calling. Native context length is 256K.
+
+**Available Models:**
+
+- **BF16**: [inclusionAI/Ling-3.0-flash](https://huggingface.co/inclusionAI/Ling-3.0-flash) — 124B total / 5.1B active
+- **FP8** (blockwise E4M3): [inclusionAI/Ling-3.0-flash-fp8](https://huggingface.co/inclusionAI/Ling-3.0-flash-fp8)
+- **INT4** (compressed-tensors W4A16): [inclusionAI/Ling-3.0-flash-int4](https://huggingface.co/inclusionAI/Ling-3.0-flash-int4)
+- **MXFP4**: [inclusionAI/Ling-3.0-flash-fp4](https://huggingface.co/inclusionAI/Ling-3.0-flash-fp4)
+
+**License:** MIT
+
+**Resources:** [HuggingFace](https://huggingface.co/inclusionAI/Ling-3.0-flash).
+
+## 2. Configuration Tips
+
+- BF16 tensor parallelism follows the GPU: `--tp 4` on 141 GB-class cards (H20-3e, H200) and 4-GPU Blackwell nodes (B200, GB300); `--tp 8` on 80 GB cards (H100, H800).
+- The FP8 recipes pair `--tp` with a matching `--ep-size` (`--tp 4 --ep-size 4` on 4-GPU nodes, `--tp 8 --ep-size 8` on H100/H800). The checkpoint uses blockwise (128×128) E4M3 expert weights, so a pure tensor-parallel shard must satisfy `(768 / TP) % 128 == 0` — only TP2 qualifies; expert parallelism splits experts whole instead of by column, which lifts that restriction and uses the full node. SGLang detects the quantization format from the checkpoint's `quantization_config`, so no explicit quantization flag is needed.
+- INT4 uses compressed-tensors W4A16 experts. With the default MoE runner, SGLang selects Marlin on H200 and the graph-compatible Triton implementation on Blackwell; do not force a backend in the launch command.
+- MXFP4 uses the native FlashInfer runner on H200 and B200. The checkpoint mixes MXFP4 routed experts with block-FP8 dense and shared projections; on B200, `--fp8-gemm-backend triton` avoids an unsupported FlashInfer FP8 tactic while the routed experts remain native MXFP4.
+- `--reasoning-parser ling3` and `--tool-call-parser ling3` enable Ling-3.0-specific reasoning and structured tool-call parsing; toggle them in the **Parsers** card of the [Playground](#playground).
+- Both the chat template and the `ling3` reasoning parser default to thinking on. A single request can turn it off with `"chat_template_kwargs": {"enable_thinking": false}` (see §3.1).
+- The BF16/FP8 recipes use `--mem-fraction-static 0.8`; INT4/MXFP4 use `0.85`. These values reserve the headroom used by the validated graph-enabled runs.
+- The checkpoint ships a built-in MTP layer (`num_nextn_predict_layers: 1`); enable it with `--speculative-algorithm NEXTN` — no separate draft model is needed. The Low-Latency recipes have it on; toggle it in the **Speculative Decoding** card of the [Playground](#playground).
+- Native context is 256K; SGLang reads it from the checkpoint's `max_position_embeddings`, so no `--context-length` flag is needed.
+- The **HiCache** card in the [Playground](#playground) exposes the validated Mooncake L3 path. It adds the hybrid-KDA scheduler and prefix-key settings together; see §3.3 for the required services.
+
+## 3. Advanced Usage
+
+### 3.1 Reasoning
+
+Ling-3.0-flash thinks by default. With `--reasoning-parser ling3` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)), the chain-of-thought is returned in `message.reasoning_content` and the final answer in `message.content`:
+
+<Accordion title="Thinking-mode request">
+
+```bash Command
+curl -s http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inclusionAI/Ling-3.0-flash",
+    "messages": [{"role": "user", "content": "What is 15% of 240?"}]
+  }'
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```json Output
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "15% of 240 = **36**",
+        "reasoning_content": "The user is asking a simple percentage calculation: 15% of 240. This is straightforward: 0.15 × 240 = 36.",
+        "tool_calls": null
+      },
+      "finish_reason": "stop"
+    }
+  ]
+}
+```
+
+</Accordion>
+
+<Note>
+Thinking is controlled by the chat template's `enable_thinking` kwarg and is on by default. Disable it per request with `"chat_template_kwargs": {"enable_thinking": false}`.
+</Note>
+
+### 3.2 Tool Calling
+
+With `--tool-call-parser ling3` (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)), structured calls are parsed into `message.tool_calls` and `finish_reason` is `tool_calls`:
+
+<Accordion title="Tool-calling request">
+
+```bash Command
+curl -s http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inclusionAI/Ling-3.0-flash",
+    "messages": [{"role": "user", "content": "Search for the latest news about AI"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "search",
+        "description": "Search for information on the internet",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "description": "The search query"}
+          },
+          "required": ["query"]
+        }
+      }
+    }],
+    "tool_choice": "auto"
+  }'
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```json Output
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "The user wants me to search for the latest news about AI. I'll use the search tool with a query about the latest AI news.",
+        "tool_calls": [
+          {
+            "id": "call_0822dd418aa34254aa5b19e1",
+            "index": 0,
+            "type": "function",
+            "function": { "name": "search", "arguments": "{\"query\": \"latest news about AI 2025\"}" }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ]
+}
+```
+
+</Accordion>
+
+For more API examples, see the [SGLang Basic Usage Guide](/docs/basic_usage/send_request).
+
+### 3.3 HiCache with Mooncake
+
+The HiCache recipes use Mooncake as L3 prefix storage. Start the metadata server, master, and storage client before you launch SGLang. The following command runs all three services from the same image in a separate container:
+
+```bash Command
+docker run --rm --network host --ipc=host \
+  lmsysorg/sglang:dev-Ling-3.0-flash \
+  bash -lc '
+    python3 -m mooncake.http_metadata_server --port 8290 &
+    mooncake_master --port 50171 --metrics_port 9024 &
+    exec mooncake_client \
+      --host=127.0.0.1 \
+      --port=50172 \
+      --master_server_address=127.0.0.1:50171 \
+      --metadata_server=http://127.0.0.1:8290/metadata \
+      --protocol=tcp \
+      --device_names= \
+      --global_segment_size=4294967296 \
+      --enable_http_server=true \
+      --http_port=8291
+  '
+```
+
+Then select **HiCache + Mooncake** in Deployment, or enable **HiCache** in the Playground. Docker commands use host networking so the SGLang container can reach these localhost services. You can change the master and metadata endpoints in the **Env** dialog.
+
+This validated setup uses TCP, so `MOONCAKE_DEVICE=` and the client's `--device_names=` are intentionally empty. Set both to your actual device list only when you configure an RDMA deployment.
+
+<Note>
+With the default `chunked_prefill_size` of 8192, a cold request writes through only when its uncached extend length fits in one chunk. A longer cold first request skips write-through for that influx; a repeat with the same prefix can hit the device radix cache and proceed normally.
+</Note>
+
+<Warning>
+For this hybrid KDA model, use the Mooncake L3 recipe shown here. Host-memory L2 eviction is not exposed because the KDA cache path is not currently compatible with it. Track the limitation in [issue #33713](https://github.com/sgl-project/sglang/issues/33713).
+</Warning>
+
+For storage sizing and backend details, see [HiCache best practices](/docs/advanced_features/hicache_best_practices).

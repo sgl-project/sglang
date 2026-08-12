@@ -38,6 +38,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Tuple,
     Type,
     Union,
 )
@@ -52,7 +53,11 @@ from pydantic import PlainValidator
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    ReturnHiddenStatesMode,
+    get_return_hidden_states_mode,
+)
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
@@ -211,12 +216,16 @@ class GenerateReqInput:
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
     # the nested per-position [logprob, token_id, text] lists.
     return_flat_raw_top_logprobs: bool = False
+    # Base64-encode the flat arrays. Requires return_flat_raw_top_logprobs.
+    return_flat_raw_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
     # Whether to return hidden states
-    return_hidden_states: Union[List[bool], bool] = False
+    return_hidden_states: Union[
+        List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
+    ] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # Absolute start position for returned routings; response covers
@@ -253,6 +262,11 @@ class GenerateReqInput:
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
+    # Deprecated alias for `routed_dp_rank`, still accepted because
+    # sgl-model-gateway's dp-aware mode injects this spelling into every
+    # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
+    # entrypoints and Engine.generate() accept it as well.
+    data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
@@ -267,6 +281,9 @@ class GenerateReqInput:
     background: bool = False
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
+    # Per-request thinking budget. Requires strict thinking so the runtime can
+    # enforce the limit rather than silently treating it as metadata.
+    max_thinking_tokens: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -347,6 +364,18 @@ class GenerateReqInput:
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        if self.data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.routed_dp_rank is None:
+                self.routed_dp_rank = self.data_parallel_rank
+            self.data_parallel_rank = None
+
         self._validate_inputs()
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
@@ -380,6 +409,13 @@ class GenerateReqInput:
                 "return_flat_raw_top_logprobs does not support multi-item "
                 "scoring: delimiter-sparse top logprob rows have no contiguous "
                 "position mapping."
+            )
+        if (
+            self.return_flat_raw_top_logprobs_b64
+            and not self.return_flat_raw_top_logprobs
+        ):
+            raise ValueError(
+                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
             )
 
     def _determine_batch_size(self):
@@ -471,6 +507,7 @@ class GenerateReqInput:
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
+        self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
@@ -634,6 +671,22 @@ class GenerateReqInput:
                 "Cannot use list token_ids_logprob with parallel_sample_num > 1"
             )
 
+    def _normalize_return_hidden_states(self, num):
+        """Normalize and validate per-request hidden-state return modes."""
+        if isinstance(self.return_hidden_states, list):
+            if len(self.return_hidden_states) != self.batch_size:
+                raise ValueError(
+                    "The length of return_hidden_states should be equal to the batch size."
+                )
+            for mode in self.return_hidden_states:
+                get_return_hidden_states_mode(mode)
+            self.return_hidden_states = (
+                self.return_hidden_states * self.parallel_sample_num
+            )
+        else:
+            get_return_hidden_states_mode(self.return_hidden_states)
+            self.return_hidden_states = [self.return_hidden_states] * num
+
     def _normalize_custom_logit_processor(self, num):
         """Normalize custom logit processor for batch processing."""
         if self.custom_logit_processor is None:
@@ -737,6 +790,7 @@ class GenerateReqInput:
             return_sampling_mask=self.return_sampling_mask[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
+            return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
@@ -779,6 +833,8 @@ class GenerateReqInput:
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
+            require_reasoning=self.require_reasoning,
+            max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
@@ -821,9 +877,13 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     stream: bool
     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
     return_sampling_mask: bool = False
+    # Assemble prompt top logprobs as flat arrays scheduler-side (see
+    # GenerateReqInput.return_flat_raw_top_logprobs). The b64 flag stays
+    # tokenizer-manager-side: the scheduler ships arrays either way.
+    return_flat_raw_top_logprobs: bool = False
 
     # Whether to return hidden states
-    return_hidden_states: bool = False
+    return_hidden_states: ReturnHiddenStatesMode = False
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
@@ -1111,6 +1171,7 @@ class EmbeddingReqInput:
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
+                priority=self.priority,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
                 multi_item_delimiter_indices=(
@@ -1138,6 +1199,7 @@ class EmbeddingReqInput:
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
+                priority=self.priority,
                 dimensions=self.dimensions,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
@@ -1217,6 +1279,39 @@ OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
 CachedTokensDetails = Dict[str, Union[int, str]]
 # Serialized form of BaseFinishReason.to_json() — all values are primitives.
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
+
+
+def build_flat_input_top_logprobs_arrays(
+    input_top_logprobs_val: List[Optional[List[float]]],
+    input_top_logprobs_idx: List[Optional[List[int]]],
+    top_logprobs_num: int,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Convert nested per-position prompt top logprob rows into the flat
+    arrays of the `return_flat_raw_top_logprobs` response format.
+
+    Returns (float32 values [rows, k], int32 token ids [rows, k],
+    null_prefix). The leading null rows are counted into null_prefix and
+    excluded from the arrays. Raises ValueError when the rows are not
+    representable by (shape, null_prefix): interior nulls or ragged k,
+    e.g. multi-item scoring.
+    """
+    num_rows = len(input_top_logprobs_val)
+    null_prefix = 0
+    while null_prefix < num_rows and not input_top_logprobs_val[null_prefix]:
+        null_prefix += 1
+    val_rows = input_top_logprobs_val[null_prefix:]
+    idx_rows = input_top_logprobs_idx[null_prefix:]
+    k = len(val_rows[0]) if val_rows else top_logprobs_num
+    for offset, row in enumerate(val_rows):
+        if row is None or len(row) != k:
+            raise ValueError(
+                "return_flat_raw_top_logprobs requires rectangular top logprob "
+                f"rows with nulls only in the leading prefix; row {null_prefix + offset} "
+                f"has {None if row is None else len(row)} entries (expected {k})."
+            )
+    val_arr = np.asarray(val_rows, dtype=np.float32).reshape(len(val_rows), k)
+    idx_arr = np.asarray(idx_rows, dtype=np.int32).reshape(len(idx_rows), k)
+    return val_arr, idx_arr, null_prefix
 
 
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
@@ -1309,6 +1404,15 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
+    # Scheduler-side flat assembly of prompt top logprobs for requests with
+    # return_flat_raw_top_logprobs: float32 / int32 [rows, k] arrays plus the
+    # leading-null count (see build_flat_input_top_logprobs_arrays). For such
+    # requests the nested input_top_logprobs_val/idx entry is empty. None when
+    # no request in the batch uses the flat format.
+    input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1390,6 +1494,12 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
+
+    # Detokenizer pass-through for the scheduler-side flat prompt top logprob
+    # arrays; see BatchTokenIDOutput.input_top_logprobs_val_flat.
+    input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
@@ -2049,7 +2159,10 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     # The PEFT adapter_config.json, already JSON — a tighter type would only add
     # decode strictness with no benefit.
     config_dict: Dict[str, Any]
-    serialized_tensors: str
+    # One serialized copy of the adapter tensors per TP rank; each rank
+    # deserializes only its own copy. Same normalization conventions as
+    # UpdateWeightsFromTensorReqInput.serialized_named_tensors.
+    serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, int]] = None
     lora_id: Optional[str] = None
@@ -2159,7 +2272,10 @@ def unwrap_from_pickle(obj: Optional[object]) -> Optional[object]:
         return None
     if _USE_PICKLE_IPC:
         return obj
-    assert isinstance(obj, PickleWrapper)
+    if not isinstance(obj, PickleWrapper):
+        # Already materialized: the embedded Rust server attaches in-process
+        # objects (native-MM `mm_inputs`) without a pickle hop.
+        return obj
     return pickle.loads(obj.data)
 
 

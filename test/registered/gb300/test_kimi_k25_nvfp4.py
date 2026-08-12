@@ -6,9 +6,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(
-    est_time=7200, suite="nightly-4-gpu-gb300-kimi-k25-nvfp4", nightly=True
-)
+register_cuda_ci(est_time=7200, stage="nightly", runner_config="4-gpu-gb300")
 
 MODEL_PATH = "nvidia/Kimi-K2.5-NVFP4"
 DRAFT_MODEL_PATH = "lightseekorg/kimi-k2.5-eagle3-mla"
@@ -69,7 +67,7 @@ class TestKimiK25Nvfp4(unittest.TestCase):
                 dataset="mmmu-pro", baseline_accuracy=0.69, repeat=1, max_tokens=32768
             ),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gb300",
+                result_dir="performance_results_gb300",
             ),
         )
 

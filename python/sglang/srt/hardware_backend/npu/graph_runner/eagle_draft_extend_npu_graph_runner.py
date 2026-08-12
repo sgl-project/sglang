@@ -36,7 +36,7 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
 
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config
-        if not (is_deepseek_dsa(hf_config) and is_deepseek_v4(hf_config)):
+        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
                 self.bs - self.raw_bs
             )

@@ -234,7 +234,15 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             device=device,
         )
 
-        if len(flat_eff_h) == 0 or len(image_token_indices) == 0:
+        frame_count = len(flat_eff_h)
+        image_token_count = len(image_token_indices)
+        if frame_count != image_token_count:
+            raise ValueError(
+                "Moss-VL vision metadata must map one-to-one to image tokens: "
+                f"found {frame_count} frame(s) and {image_token_count} token(s)"
+            )
+
+        if frame_count == 0:
             rope_deltas = (
                 position_ids.max(dim=0).values.max(dim=-1).values
                 + 1
@@ -242,18 +250,11 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             )
             return vision_pos_ids, position_ids, rope_deltas
 
-        num_matches = min(len(flat_eff_h), len(image_token_indices))
-        flat_eff_h = torch.tensor(
-            flat_eff_h[:num_matches], device=device, dtype=torch.long
-        )
-        flat_eff_w = torch.tensor(
-            flat_eff_w[:num_matches], device=device, dtype=torch.long
-        )
-        flat_vis_starts = torch.tensor(
-            flat_vis_starts[:num_matches], device=device, dtype=torch.long
-        )
+        flat_eff_h = torch.tensor(flat_eff_h, device=device, dtype=torch.long)
+        flat_eff_w = torch.tensor(flat_eff_w, device=device, dtype=torch.long)
+        flat_vis_starts = torch.tensor(flat_vis_starts, device=device, dtype=torch.long)
 
-        target_indices = image_token_indices[:num_matches]
+        target_indices = image_token_indices
         batch_rows = target_indices[:, 0]
         text_cols = target_indices[:, 1]
 
