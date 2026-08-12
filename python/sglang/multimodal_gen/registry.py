@@ -91,6 +91,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
+    SanaVideoPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
@@ -161,6 +164,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
@@ -1068,6 +1072,20 @@ def _register_configs():
         ],
     )
 
+    # SANA-Video (register before generic SANA to avoid detector overlap).
+    register_configs(
+        sampling_param_cls=SanaVideoSamplingParams,
+        pipeline_config_cls=SanaVideoPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
+            )
+        ],
+    )
+
     # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
     # per-request inside the pipeline from ``num_frames`` and ``image_path``.
     # Both Nano (16B) and Super (64B) share the same pipeline; arch dimensions
@@ -1102,6 +1120,8 @@ def _register_configs():
                 "sana" in hf_id.lower()
                 and "sana-wm" not in hf_id.lower()
                 and "sana_wm" not in hf_id.lower()
+                and "sana-video" not in hf_id.lower()
+                and "sana_video" not in hf_id.lower()
             )
         ],
     )
