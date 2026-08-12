@@ -85,7 +85,7 @@ void atomicadd_f32x4_with_policy_and_pred(void* global_addr, const float4 &data,
         "setp.eq.u32 p, %6, 1;\n\t"
         "@p red.relaxed.gpu.global.add.L2::cache_hint.v4.f32 [%4], {%0, %1, %2, %3}, %5; \n\t"
         "}"
-        : 
+        :
         : "f"(data.x), "f"(data.y), "f"(data.z), "f"(data.w),
           "l"((int64_t)global_addr), "l"(cache_policy), "r"(pred)
     );

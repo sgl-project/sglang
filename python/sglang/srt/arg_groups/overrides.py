@@ -1918,11 +1918,19 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
             )
     if view.device == "npu":
         kv_cache_dtype = "bfloat16"
-    if kv_cache_dtype == "fp4_e2m1" and view.fp4_kv_cache_recipe != "mxfp4":
-        raise ValueError(
-            "DeepSeek V4 with fp4_e2m1 KV cache currently supports only "
-            "--fp4-kv-cache-recipe=mxfp4."
-        )
+    if kv_cache_dtype == "fp4_e2m1":
+        if view.fp4_kv_cache_recipe != "mxfp4":
+            raise ValueError(
+                "DeepSeek V4 with fp4_e2m1 KV cache currently supports only "
+                "--fp4-kv-cache-recipe=mxfp4."
+            )
+        if is_cuda():
+            major, _ = get_device_capability()
+            if major != 9:
+                raise ValueError(
+                    "DeepSeek V4 MXFP4 KV cache (--kv-cache-dtype fp4_e2m1) "
+                    f"requires an SM90 (Hopper) GPU, got SM{major}."
+                )
     assert kv_cache_dtype in [
         "fp8_e4m3",
         "bfloat16",

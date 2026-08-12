@@ -37,9 +37,9 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     if (my_num_splits == 1) {
         return;
     }
-    
+
     FLASH_DEVICE_ASSERT(my_num_splits <= MAX_SPLITS);
-    
+
     Tensor gLseAccum = make_tensor(
         make_gmem_ptr((float*)params.lse_accum + start_split_idx*params.stride_lse_accum_split + s_q_idx*params.stride_lse_accum_s_q + h_block_idx*BLOCK_SIZE_M),
         Shape<Int<MAX_SPLITS>, Int<BLOCK_SIZE_M>>{},
@@ -50,7 +50,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
         Shape<Int<BLOCK_SIZE_M>>{},
         Stride<_1>{}
     );
-    
+
     __shared__ float smem_buf[BLOCK_SIZE_M][MAX_SPLITS];
 
     // Wait for the previous kernel (the MLA kernel) to finish
@@ -96,7 +96,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
         float global_lse = (sum_lse == 0.f || sum_lse == -INFINITY) ? INFINITY : log2f(sum_lse) + max_lse;
         if (lane_idx == 0)
             gLse(warp_idx) = global_lse / (float)M_LOG2E;
-        
+
         if (params.attn_sink != nullptr) {
             int q_head_idx = h_block_idx*BLOCK_SIZE_M + warp_idx;
             float attn_sink = __ldg(params.attn_sink + q_head_idx);
@@ -141,7 +141,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
             }
             // }
         }
-        
+
         const int h_q_idx = h_block_idx*BLOCK_SIZE_M + warp_idx;
         ElementT* o_ptr = (ElementT*)params.out + batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + h_q_idx*params.stride_o_h_q;
 

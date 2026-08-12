@@ -21,7 +21,7 @@ public:
     template<typename... Args>
     explicit KUException(const char *name, const char* file, const int line, Args&&... args) {
         std::ostringstream oss;
-        
+
         oss << name << " error (" << file << ":" << line << "): ";
         (oss << ... << args);
         message = oss.str();
@@ -93,7 +93,7 @@ static inline CUtensorMap make_tensor_map(
 ) {
     int dim = size.size();
     KU_ASSERT(dim >= 1);
-    
+
     std::vector<uint32_t> element_strides;
     if (element_strides_.empty()) {
         for (int i = 0; i < dim; ++i)

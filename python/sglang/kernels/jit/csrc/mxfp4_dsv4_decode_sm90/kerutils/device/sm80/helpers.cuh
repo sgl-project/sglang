@@ -23,7 +23,7 @@ do { \
 } while (0)
 #endif
 
-// Construct a `float2` from a single `float` by duplicating the value 
+// Construct a `float2` from a single `float` by duplicating the value
 CUTE_DEVICE
 float2 float2float2(const float &x) {
     return float2 {x, x};

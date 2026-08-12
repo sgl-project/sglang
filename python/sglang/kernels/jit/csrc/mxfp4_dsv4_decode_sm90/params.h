@@ -28,7 +28,7 @@ struct DenseAttnDecodeParams { // TODO Change name to DenseAttnDecodeParams
     int q_head_per_hk;  // The number of q_head(s) per KV head, = h_q / h_k
     bool is_causal;
     float scale_softmax, scale_softmax_log2;
-    
+
     void *__restrict__ q_ptr;
     void *__restrict__ k_ptr;
     void *__restrict__ o_ptr;
@@ -76,12 +76,12 @@ struct SparseAttnDecodeParams {
 
     float* __restrict__ lse;    // [b, s_q, h_q]
     cutlass::bfloat16_t* __restrict__ out;   // [b, s_q, h_q, d_v]
-    
+
     int extra_num_blocks, extra_page_block_size, extra_topk;
     cutlass::bfloat16_t* __restrict__ extra_kv;  // [extra_num_blocks, extra_page_block_size, d_qk]
     int* __restrict__ extra_indices;   // [b, s_q, extra_topk]
     int* __restrict__ extra_topk_length;  // [b], may be nullptr
-    
+
     int stride_q_b, stride_q_s_q, stride_q_h_q;
     int stride_kv_block, stride_kv_row;
     int stride_indices_b, stride_indices_s_q;
@@ -89,9 +89,9 @@ struct SparseAttnDecodeParams {
     int stride_o_b, stride_o_s_q, stride_o_h_q;
     int stride_extra_kv_block, stride_extra_kv_row;
     int stride_extra_indices_b, stride_extra_indices_s_q;
-    
+
     cudaStream_t stream;
-    
+
     // SplitKV-related parameters
     float* __restrict__ lse_accum;  // [num_splits, s_q, h_q]
     float* __restrict__ o_accum;    // [num_splits, s_q, h_q, d_v]

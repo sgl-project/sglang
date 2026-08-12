@@ -61,7 +61,7 @@ struct RingBufferState {
     __device__ __forceinline__
     void update() {
         cur_block_idx += 1;
-    }    
+    }
 
     template<uint32_t NUM_STAGES>
     __device__ __forceinline__
