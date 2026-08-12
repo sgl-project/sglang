@@ -941,8 +941,8 @@ class Req(ReqDllmMixin):
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
-        # End one prefill chunk at this Full-KV-derived boundary so the SWA
-        # window can be inserted into the unified radix tree.
+        # Full-KV-derived boundary whose SWA window should be inserted after
+        # the current prefill pass.
         self.swa_branching_seqlen: Optional[int] = None
         # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
         self.mamba_cow_src_index: Optional[torch.Tensor] = None

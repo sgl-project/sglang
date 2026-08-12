@@ -970,8 +970,8 @@ class PrefillAdder:
         )
         if req.dllm_incomplete_ids and cand_extend_input_len > _rem_tokens:
             return AddReqResult.NO_TOKEN
+        truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
-        truncated = cand_extend_input_len > new_len
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
 
