@@ -11,15 +11,17 @@ logger = logging.getLogger("LoRAFormatAdapter")
 
 
 class LoRAFormat(str, Enum):
-    """Supported external LoRA formats before normalization."""
+    """Supported external adapter formats before normalization."""
 
-    STANDARD = "standard"
-    NON_DIFFUSERS_SD = "non-diffusers-sd"
-    QWEN_IMAGE_STANDARD = "qwen-image-standard"
-    XLABS_FLUX = "xlabs-ai"
-    KOHYA_FLUX = "kohya-flux"
-    WAN = "wan"
-    AI_TOOLKIT_FLUX = "ai-toolkit-flux"
+    UNDEFINED = "undefined"
+    LORA_STANDARD = "lora.standard"
+    LORA_NON_DIFFUSERS_SD = "lora.non-diffusers-sd"
+    LORA_QWEN_IMAGE_STANDARD = "lora.qwen-image-standard"
+    LORA_XLABS_FLUX = "lora.xlabs-ai"
+    LORA_KOHYA_FLUX = "lora.kohya-flux"
+    LORA_WAN = "lora.wan"
+    LORA_AI_TOOLKIT_FLUX = "lora.ai-toolkit-flux"
+    LOKR_STANDARD = "lokr.standard "
 
 
 def _sample_keys(keys: Iterable[str], k: int = 20) -> list[str]:
@@ -74,8 +76,13 @@ def _looks_like_non_diffusers_sd(state_dict: Mapping[str, torch.Tensor]) -> bool
     if not state_dict:
         return False
     keys = state_dict.keys()
-    return all(
-        k.startswith(("lora_unet_", "lora_te_", "lora_te1_", "lora_te2_")) for k in keys
+    return (
+        all(
+            k.startswith(("lora_unet_", "lora_te_", "lora_te1_", "lora_te2_"))
+            for k in keys
+        )
+        or _has_substring_key(keys, ".lora.down")
+        or _has_substring_key(keys, ".lora_up")
     )
 
 
@@ -131,38 +138,61 @@ def _looks_like_ai_toolkit_flux_lora(state_dict: Mapping[str, torch.Tensor]) -> 
     return (has_double_blocks or has_single_blocks) and has_lora_ab
 
 
+def _looks_like_lokr(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """Detect LoKr (Low-Rank Kronecker) format from LyCORIS/ai-toolkit.
+
+    Key patterns: layers.X.attention.to_q.lokr_w1, layers.X.attention.to_q.lokr_w2
+    Also supports decomposed form: lokr_w1_a, lokr_w1_b, lokr_w2_a, lokr_w2_b
+    """
+    keys = list(state_dict.keys())
+    if not keys:
+        return False
+
+    # Check for lokr_w1/lokr_w2 keys (full matrix form)
+    has_lokr_w1 = _has_substring_key(keys, ".lokr_w1")
+    has_lokr_w2 = _has_substring_key(keys, ".lokr_w2")
+
+    # Check for decomposed form (lokr_w1_a, lokr_w1_b, lokr_w2_a, lokr_w2_b)
+    has_lokr_decomposed = _has_substring_key(keys, ".lokr_w1_a") or _has_substring_key(
+        keys, ".lokr_w2_a"
+    )
+
+    return (has_lokr_w1 and has_lokr_w2) or has_lokr_decomposed
+
+
 def detect_lora_format_from_state_dict(
     state_dict: Mapping[str, torch.Tensor],
 ) -> LoRAFormat:
     """Classify LoRA format by key patterns only."""
     keys = list(state_dict.keys())
     if not keys:
-        return LoRAFormat.STANDARD
+        return LoRAFormat.LORA_STANDARD
+
+    if _looks_like_lokr(state_dict):
+        return LoRAFormat.LOKR_STANDARD
 
     if _looks_like_ai_toolkit_flux_lora(state_dict):
-        return LoRAFormat.AI_TOOLKIT_FLUX
+        return LoRAFormat.LORA_AI_TOOLKIT_FLUX
 
     if _has_substring_key(keys, ".lora_A") or _has_substring_key(keys, ".lora_B"):
-        return LoRAFormat.STANDARD
+        return LoRAFormat.LORA_STANDARD
 
     if any(_looks_like_xlabs_flux_key(k) for k in keys):
-        return LoRAFormat.XLABS_FLUX
+        return LoRAFormat.LORA_XLABS_FLUX
+
     if _looks_like_kohya_flux(state_dict):
-        return LoRAFormat.KOHYA_FLUX
+        return LoRAFormat.LORA_KOHYA_FLUX
 
     if _looks_like_wan_lora(state_dict):
-        return LoRAFormat.WAN
+        return LoRAFormat.LORA_WAN
 
     if _looks_like_qwen_image(state_dict):
-        return LoRAFormat.STANDARD
+        return LoRAFormat.LORA_STANDARD
 
     if _looks_like_non_diffusers_sd(state_dict):
-        return LoRAFormat.NON_DIFFUSERS_SD
+        return LoRAFormat.LORA_NON_DIFFUSERS_SD
 
-    if _has_substring_key(keys, ".lora.down") or _has_substring_key(keys, ".lora_up"):
-        return LoRAFormat.NON_DIFFUSERS_SD
-
-    return LoRAFormat.STANDARD
+    return LoRAFormat.LORA_STANDARD
 
 
 def _convert_qwen_image_standard(
@@ -493,27 +523,27 @@ def convert_lora_state_dict_by_format(
     log: logging.Logger,
 ) -> Dict[str, torch.Tensor]:
     """Normalize a raw LoRA state_dict into A/B + .weight naming."""
-    if fmt == LoRAFormat.QWEN_IMAGE_STANDARD:
+    if fmt == LoRAFormat.LORA_QWEN_IMAGE_STANDARD:
         return _convert_qwen_image_standard(state_dict, log)
 
-    if fmt == LoRAFormat.AI_TOOLKIT_FLUX:
+    if fmt == LoRAFormat.LORA_AI_TOOLKIT_FLUX:
         return _convert_ai_toolkit_flux_lora(state_dict, log)
 
-    if fmt == LoRAFormat.XLABS_FLUX:
+    if fmt == LoRAFormat.LORA_XLABS_FLUX:
         converted = _convert_xlabs_ai_via_diffusers(state_dict, log)
         return _convert_non_diffusers_sd_simple(converted, log)
 
-    if fmt == LoRAFormat.KOHYA_FLUX:
+    if fmt == LoRAFormat.LORA_KOHYA_FLUX:
         converted = _convert_kohya_flux_via_diffusers(state_dict, log)
         return _convert_non_diffusers_sd_simple(converted, log)
 
-    if fmt == LoRAFormat.WAN:
+    if fmt == LoRAFormat.LORA_WAN:
         maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
         if maybe is None:
             maybe = dict(state_dict)
         return _convert_non_diffusers_sd_simple(maybe, log)
 
-    if fmt == LoRAFormat.STANDARD:
+    if fmt == LoRAFormat.LORA_STANDARD:
         maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
         if maybe is None:
             maybe = dict(state_dict)
@@ -523,7 +553,7 @@ def convert_lora_state_dict_by_format(
 
         return maybe
 
-    if fmt == LoRAFormat.NON_DIFFUSERS_SD:
+    if fmt == LoRAFormat.LORA_NON_DIFFUSERS_SD:
         maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
         if maybe is None:
             maybe = dict(state_dict)
