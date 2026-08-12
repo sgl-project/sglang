@@ -1405,6 +1405,18 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
+                # Only one request may be left mid-prefill per pass: the scheduler
+                # tracks a single `chunked_req` (see the `assert self.chunked_req is
+                # None` before it adopts `new_chunked_req`), so a second would be
+                # partially prefilled and then dropped, losing its progress. Without
+                # a long-prefill cap this is implicit -- the first such request
+                # exhausts `rem_chunk_tokens` and `budget_state()` ends the pass --
+                # but the cap deliberately leaves budget behind, so refuse here
+                # instead. The request keeps its place in the waiting queue and is
+                # admitted on a later pass.
+                if self.new_chunked_req is not None or has_chunked_req:
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 

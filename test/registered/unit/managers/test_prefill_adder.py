@@ -1034,6 +1034,62 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder._apply_long_prefill_cap(0), 0)
         self.assertEqual(adder._apply_long_prefill_cap(-128), -128)
 
+    def test_long_prefill_cap_admits_only_one_chunked_req_per_pass(self):
+        # The scheduler tracks a single chunked_req (`assert self.chunked_req is
+        # None` before adopting new_chunked_req), so at most one request may be
+        # left mid-prefill per pass -- a second would be partially prefilled and
+        # then dropped, losing its progress. Without the cap this is implicit (the
+        # first long request exhausts the budget and ends the pass); the cap leaves
+        # budget behind, so the limit has to be enforced explicitly.
+        adder = self._long_prefill_adder(threshold=2048)
+
+        first = self._long_prefill_req("long-0", extend_input_len=500_000)
+        self.assertEqual(
+            adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        self.assertIs(adder.new_chunked_req, first)
+
+        second = self._long_prefill_req("long-1", extend_input_len=500_000)
+        result = adder.add_one_req(
+            second, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertNotIn(second, adder.can_run_list)
+        self.assertIs(adder.new_chunked_req, first)  # not overwritten
+
+    def test_long_prefill_cap_refuses_long_req_behind_inflight_chunk(self):
+        # Same invariant from the other direction: a chunked_req is already in
+        # flight (has_chunked_req=True), so a newly arriving long request must not
+        # start a second chunked prefill even though the cap left budget free.
+        adder = self._long_prefill_adder(threshold=2048)
+        adder.add_chunked_req(self._long_prefill_req("inflight", 500_000))
+
+        newcomer = self._long_prefill_req("newlong", extend_input_len=500_000)
+        result = adder.add_one_req(
+            newcomer, has_chunked_req=True, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertNotIn(newcomer, adder.can_run_list)
+        self.assertIsNone(adder.new_chunked_req)
+
+    def test_short_req_still_admitted_behind_inflight_chunk(self):
+        # The guard above must not block the feature: a request that fits under the
+        # cap is not chunked, so it can still join the batch alongside an in-flight
+        # long prefill. This is the fairness behaviour the flag exists for.
+        adder = self._long_prefill_adder(threshold=2048)
+        adder.add_chunked_req(self._long_prefill_req("inflight", 500_000))
+
+        short = self._long_prefill_req("short", extend_input_len=1024)
+        result = adder.add_one_req(
+            short, has_chunked_req=True, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertIn(short, adder.can_run_list)
+
     def test_long_prefill_cap_composes_with_swa_cap(self):
         # Both caps bound the same value; the tighter one must win so neither
         # the SWA pool reservation nor the fairness cap can be exceeded.
