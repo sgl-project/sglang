@@ -181,9 +181,19 @@ def msa_sparse_prefill_main(
         # view is NON-contiguous and fmha_sm100's sparse path would .contiguous()
         # it — copying the ENTIRE per-layer pool. Gather only the pages this
         # batch references into a compact HND buffer instead (single fused
-        # read+write over batch KV) and hand MSA the identity page table.
-        k_paged, v_paged = gather_kv_hnd(k_cache, v_cache, kv_indices, P)
-        kv_indices = torch.arange(k_paged.shape[0], dtype=torch.int32, device=q.device)
+        # read+write over batch KV).
+        #
+        # Radix-cache prefix sharing can repeat the same physical page across
+        # requests in kv_indices, so with heavy sharing the packed table can
+        # exceed the pool's unique page count. Dedup first: gather each unique
+        # page once and hand MSA the inverse mapping as the page table (any
+        # valid table works — identity is not required). This bounds the
+        # compact buffer by min(batch pages, pool pages).
+        unique_pages, inverse = torch.unique(kv_indices, return_inverse=True)
+        k_paged, v_paged = gather_kv_hnd(
+            k_cache, v_cache, unique_pages.to(torch.int32), P
+        )
+        kv_indices = inverse.to(torch.int32)
 
     # topk_idx [Hkv, total_q, topk] -> kv_block_indexes [total_q, Hkv, topk].
     kv_block_indexes = topk_idx.permute(1, 0, 2).contiguous().to(torch.int32)

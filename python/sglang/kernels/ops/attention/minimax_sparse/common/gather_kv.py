@@ -84,6 +84,10 @@ def gather_kv_hnd(
     itemsize = k_cache.element_size()
     assert (D * itemsize) % 4 == 0, f"head_dim*itemsize={D * itemsize} not 4B-aligned"
     DW = (D * itemsize) // 4
+    # tl.arange(0, DW) in the kernel requires a power-of-two extent. DW is 64
+    # (bf16) or 32 (fp8_e4m3) for the D=128 caches MSA supports; reject other
+    # head dims here instead of failing inside Triton compilation.
+    assert DW & (DW - 1) == 0, f"head_dim*itemsize/4={DW} must be a power of two"
 
     n_pages = page_ids.numel()
     k_out = torch.empty((n_pages, H, P, D), dtype=k_cache.dtype, device=k_cache.device)
