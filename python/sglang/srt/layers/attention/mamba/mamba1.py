@@ -320,21 +320,31 @@ class MambaMixer1(nn.Module):
         seq_lens_cpu = mixed.extend_seq_lens_cpu if mixed is not None else None
         if seq_lens_cpu is None:
             seq_lens_cpu = (query_start_loc[1:] - query_start_loc[:-1]).cpu().tolist()
-        # Causal conv over intermediate channels; updates conv_state in place.
+        # The causal-conv kernel needs input, weights and the conv-state cache in
+        # one dtype. The cache dtype (SGLANG_MAMBA_CONV_DTYPE) is independent of
+        # the model dtype, so cast the conv inputs to it and the result back.
+        act_dtype = x.dtype
+        conv_dtype = conv_state.dtype
         ccfn = causal_conv1d_fn_triton if use_triton_causal_conv else causal_conv1d_fn
-        conv_out = ccfn(
-            x.transpose(0, 1),  # (dim, tokens)
-            conv_weights,
-            self.conv1d.bias,
-            activation=self.activation,
-            conv_states=conv_state,
-            has_initial_state=has_initial,
-            cache_indices=state_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=seq_lens_cpu,
-        ).transpose(0, 1)[
-            : x.shape[0]
-        ]  # (tokens, dim)
+        conv_out = (
+            ccfn(
+                x.transpose(0, 1).to(conv_dtype),  # (dim, tokens)
+                conv_weights.to(conv_dtype),
+                (
+                    self.conv1d.bias.to(conv_dtype)
+                    if self.conv1d.bias is not None
+                    else None
+                ),
+                activation=self.activation,
+                conv_states=conv_state,
+                has_initial_state=has_initial,
+                cache_indices=state_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=seq_lens_cpu,
+            )
+            .transpose(0, 1)[: x.shape[0]]
+            .to(act_dtype)
+        )  # (tokens, dim)
 
         dt, B, C = self._ssm_params(conv_out)
 
@@ -405,19 +415,23 @@ class MambaMixer1(nn.Module):
         state_indices,
         use_triton_causal_conv,
     ):
+        # Match the conv-state cache dtype (see _forward_prefill), then cast the
+        # result back to the activation dtype before the x_proj matmul.
+        act_dtype = x.dtype
+        conv_dtype = conv_state.dtype
         ccu = (
             causal_conv1d_update_triton
             if use_triton_causal_conv
             else causal_conv1d_update
         )
         conv_out = ccu(
-            x,
+            x.to(conv_dtype),
             conv_state,
-            conv_weights,
-            self.conv1d.bias,
+            conv_weights.to(conv_dtype),
+            self.conv1d.bias.to(conv_dtype) if self.conv1d.bias is not None else None,
             self.activation,
             conv_state_indices=state_indices,
-        )
+        ).to(act_dtype)
 
         dt, B, C = self._ssm_params(conv_out)
 

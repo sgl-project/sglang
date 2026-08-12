@@ -104,13 +104,17 @@ class AttentionArch(IntEnum):
     SSM = auto()  # State Space Models (Mamba, Mamba2)
 
 
+# Pure Mamba-1 (selective-scan) archs; same mixer/state layout, differing only
+# in cosmetic details handled in their model files.
+PURE_MAMBA1_ARCHITECTURES = (
+    "FalconMambaForCausalLM",
+    "MambaForCausalLM",
+)
+
 # Pure state-space (SSM) causal-LMs: no attention, so no num_attention_heads /
 # head_dim in their HF config. Used for head-dim derivation and attention-arch
 # detection below.
-PURE_SSM_ARCHITECTURES = (
-    "Mamba2ForCausalLM",
-    "FalconMambaForCausalLM",
-)
+PURE_SSM_ARCHITECTURES = ("Mamba2ForCausalLM",) + PURE_MAMBA1_ARCHITECTURES
 
 
 class ModelImpl(str, Enum):
@@ -1197,12 +1201,16 @@ class ModelConfig:
                 self.hf_text_config.full_attention_layer_ids = []
                 # hybrid_arch.py keys off this flag.
                 self.hf_text_config._is_pure_mamba2 = True
-            elif "FalconMambaForCausalLM" in self.hf_config.architectures:
-                # Falcon-Mamba is a pure Mamba-1 (selective-scan) SSM.
+            elif any(
+                arch in self.hf_config.architectures
+                for arch in PURE_MAMBA1_ARCHITECTURES
+            ):
+                # Pure Mamba-1 (selective-scan) SSMs (Falcon-Mamba, state-spaces
+                # Mamba); the model file handles cosmetic differences.
                 self.attention_arch = AttentionArch.SSM
                 self.hf_text_config.full_attention_layer_ids = []
                 # hybrid_arch.py keys off this flag.
-                self.hf_text_config._is_pure_falcon_mamba = True
+                self.hf_text_config._is_pure_mamba1 = True
             else:
                 self.attention_arch = AttentionArch.MHA
 
