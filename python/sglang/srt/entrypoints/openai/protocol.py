@@ -51,6 +51,7 @@ from openai.types.responses.response_format_text_json_schema_config import (
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     field_serializer,
@@ -68,6 +69,19 @@ except:
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_bool_seed(value: Any) -> Any:
+    if isinstance(value, bool):
+        raise ValueError("seed must be a signed 64-bit integer")
+    return value
+
+
+_SamplingSeed = Annotated[
+    int,
+    BeforeValidator(_reject_bool_seed),
+    Field(ge=-(1 << 63), le=(1 << 63) - 1),
+]
 
 DEFAULT_MODEL_NAME = "default"
 
@@ -336,7 +350,7 @@ class CompletionRequest(BaseModel):
     max_tokens: int = 16
     n: int = 1
     presence_penalty: float = 0.0
-    seed: Optional[int] = None
+    seed: Optional[_SamplingSeed] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -768,7 +782,7 @@ class ChatCompletionRequest(BaseModel):
     n: int = 1
     presence_penalty: float = 0.0
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
-    seed: Optional[int] = None
+    seed: Optional[_SamplingSeed] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None

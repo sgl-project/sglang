@@ -37,6 +37,9 @@ CustomParamValue = Union[
 ]
 
 _SAMPLING_EPS = 1e-6
+_SAMPLING_SEED_MIN = -(1 << 63)
+_SAMPLING_SEED_MAX = (1 << 63) - 1
+_DETERMINISTIC_DEFAULT_SEED = 42
 TOP_K_ALL = 1 << 30
 
 logger = logging.getLogger(__name__)
@@ -149,6 +152,14 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        if self.sampling_seed is not None and (
+            type(self.sampling_seed) is not int
+            or not _SAMPLING_SEED_MIN <= self.sampling_seed <= _SAMPLING_SEED_MAX
+        ):
+            raise ValueError(
+                "sampling_seed must be a signed 64-bit integer, got "
+                f"{self.sampling_seed}."
+            )
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."
@@ -208,6 +219,19 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(
                 "Only one of json_schema, regex, ebnf, or structural_tag can be set."
             )
+
+    def sampling_seed_for_sample(
+        self, sample_index: int, *, deterministic: bool
+    ) -> Optional[int]:
+        seed = self.sampling_seed
+        if seed is None:
+            if not deterministic:
+                return None
+            seed = _DETERMINISTIC_DEFAULT_SEED
+
+        return ((seed + sample_index - _SAMPLING_SEED_MIN) % (1 << 64)) + (
+            _SAMPLING_SEED_MIN
+        )
 
     def normalize(self, tokenizer):
         # Process stop strings

@@ -24,7 +24,7 @@ use super::super::guard::AbortGuard;
 use super::super::submit::submit;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, indexed_egress_stream, openai_error,
-    streaming_error, submit_generation, unix_seconds_u32,
+    sampling_for_choice, streaming_error, submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{
@@ -159,7 +159,11 @@ async fn completions(
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
-                sampling_params: sampling.clone(),
+                sampling_params: sampling_for_choice(
+                    &sampling,
+                    sample_index,
+                    state.server_args.enable_deterministic_inference,
+                ),
                 stream,
                 return_logprob: request.logprobs.is_some(),
                 logprob_start_len: if echo && request.logprobs.is_some() {
@@ -714,6 +718,7 @@ fn append_top_logprobs(
 
 #[cfg(test)]
 mod tests {
+    use super::super::sampling_for_choice;
     use super::super::test_utils::{chunk, senders, submitted};
     use super::{
         ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
@@ -721,6 +726,7 @@ mod tests {
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::ChunkExtras;
+    use crate::message::SamplingParams;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
@@ -743,6 +749,22 @@ mod tests {
         assert!(matches!(request.prompt, Prompt::StringArray(_)));
         assert_eq!(request.n, Some(2));
         assert!(request.stream_options.unwrap().continuous_usage_stats);
+    }
+
+    #[test]
+    fn completion_choice_seeds_reset_for_each_prompt() {
+        let sampling = SamplingParams {
+            sampling_seed: Some(17),
+            ..Default::default()
+        };
+        let seeds: Vec<_> = (0..2)
+            .flat_map(|_| 0..3)
+            .map(|sample_index| sampling_for_choice(&sampling, sample_index, true).sampling_seed)
+            .collect();
+        assert_eq!(
+            seeds,
+            [Some(17), Some(18), Some(19), Some(17), Some(18), Some(19)]
+        );
     }
 
     #[test]

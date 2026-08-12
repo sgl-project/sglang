@@ -34,7 +34,7 @@ use super::tools::{
 };
 use super::{
     AppState, ChatFormatter, collect_output, contains_media, indexed_egress_stream, openai_error,
-    streaming_error, submit_generation, unix_seconds_u32,
+    sampling_for_choice, streaming_error, submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
@@ -180,7 +180,11 @@ async fn chat_completions(
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
             skip_special_tokens: true,
-            sampling_params: sampling.clone(),
+            sampling_params: sampling_for_choice(
+                &sampling,
+                index,
+                state.server_args.enable_deterministic_inference,
+            ),
             stream,
             return_logprob: want_logprobs,
             logprob_start_len: -1,
@@ -833,6 +837,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 
 #[cfg(test)]
 mod tests {
+    use super::super::sampling_for_choice;
     use super::super::test_utils::{chat_submitted, chunk, senders};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
@@ -840,6 +845,7 @@ mod tests {
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::ChunkExtras;
+    use crate::message::SamplingParams;
     use crate::runtime::DefaultSamplingParams;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
@@ -851,6 +857,18 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn chat_choices_receive_sequential_seeds() {
+        let sampling = SamplingParams {
+            sampling_seed: Some(17),
+            ..Default::default()
+        };
+        let seeds: Vec<_> = (0..3)
+            .map(|index| sampling_for_choice(&sampling, index, true).sampling_seed)
+            .collect();
+        assert_eq!(seeds, [Some(17), Some(18), Some(19)]);
     }
 
     /// Python `to_sampling_params` priority: user value > model generation

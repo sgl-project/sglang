@@ -105,6 +105,19 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp = self._make()
         sp.verify(self.VOCAB_SIZE)
 
+    def test_sampling_seed_signed_int64_boundaries_are_valid(self):
+        for seed in (-(2**63), 2**63 - 1):
+            with self.subTest(seed=seed):
+                self._make(sampling_seed=seed).verify(self.VOCAB_SIZE)
+
+    def test_sampling_seed_rejects_invalid_values(self):
+        for seed in (-(2**63) - 1, 2**63, True, 1.5, "1"):
+            with self.subTest(seed=seed):
+                with self.assertRaisesRegex(
+                    ValueError, "sampling_seed must be a signed 64-bit integer"
+                ):
+                    self._make(sampling_seed=seed).verify(self.VOCAB_SIZE)
+
     def test_negative_temperature_raises(self):
         """Test that verify() rejects negative temperature (must be >= 0)."""
         sp = self._make(temperature=-0.5)
