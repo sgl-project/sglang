@@ -54,6 +54,19 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
+if current_platform.is_cuda():
+    try:
+        from sglang.kernels.ops.diffusion.triton.wan_causal_cache import (
+            cat_pad_channels_last_3d,
+            dup_up3d_add,
+        )
+    except ImportError:  # pragma: no cover
+        cat_pad_channels_last_3d = None
+        dup_up3d_add = None
+else:
+    cat_pad_channels_last_3d = None
+    dup_up3d_add = None
+
 CACHE_T = 2
 
 is_first_frame = contextvars.ContextVar("is_first_frame", default=False)
@@ -80,6 +93,72 @@ def match_conv3d_input_format(x: torch.Tensor, weight: torch.Tensor) -> torch.Te
     if x.dim() == 5 and _conv3d_weight_is_channels_last_3d(weight):
         return x.contiguous(memory_format=torch.channels_last_3d)
     return x
+
+
+def _cache_payload(cache) -> torch.Tensor | None:
+    """Tensor payload of a feature-cache entry (``None`` for empty slots and
+    for the ``"Rep"`` marker)."""
+    return cache if isinstance(cache, torch.Tensor) else None
+
+
+def _fused_conv_cache_supported(conv: nn.Module, x: torch.Tensor) -> bool:
+    return (
+        cat_pad_channels_last_3d is not None
+        and type(conv) is WanCausalConv3d
+        and x.dim() == 5
+        and x.is_cuda
+        and current_platform.is_amp_supported()
+        and _conv3d_weight_is_channels_last_3d(conv.weight)
+        and not torch.compiler.is_compiling()
+    )
+
+
+def _run_cached_causal_conv(
+    conv: nn.Module,
+    x: torch.Tensor,
+    cache_list: list,
+    idx: int,
+) -> torch.Tensor:
+    """Run one causal conv, consuming and refreshing its feature-cache slot.
+
+    Fast path (bit-exact with the aten chain, pure data movement plus zero
+    fill): build the conv input (cache frames + hidden state + padding)
+    directly in channels_last_3d with one kernel, and take the next cache
+    entry as one compact copy of that input's unpadded tail instead of the
+    per-chunk clone/cat bookkeeping (the compact copy holds exactly the
+    reference cache values, so fused and fallback chunks can interleave).
+    Falls back to the original op chain whenever the fused kernel does not
+    support the request.
+    """
+    cache = cache_list[idx]
+    is_rep = isinstance(cache, str)  # "Rep" marker from WanResample
+    payload = None if is_rep else _cache_payload(cache)
+    if _fused_conv_cache_supported(conv, x) and (
+        payload is None or (payload.device == x.device and payload.dtype == x.dtype)
+    ):
+        # The same kernel pass emits the conv input and the compact
+        # next-chunk cache (so the conv-input buffer is freed after the conv
+        # instead of being pinned until the next chunk).
+        pair = cat_pad_channels_last_3d(x, payload, conv._padding, keep_cache_t=CACHE_T)
+        if pair is not None:
+            inp, cache_list[idx] = pair
+            return nn.Conv3d.forward(conv, inp)
+    # Original aten path (bit-identical bookkeeping).
+    cache_x = x[:, :, -CACHE_T:, :, :].clone()
+    if cache_x.shape[2] < 2 and payload is not None:
+        # cache last frame of last two chunk
+        cache_x = torch.cat(
+            [payload[:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x],
+            dim=2,
+        )
+    elif cache_x.shape[2] < 2 and is_rep:
+        cache_x = torch.cat(
+            [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
+            dim=2,
+        )
+    out = conv(x) if payload is None else conv(x, payload)
+    cache_list[idx] = cache_x
+    return out
 
 
 class AvgDown3D(nn.Module):
@@ -218,6 +297,17 @@ class WanCausalConv3d(nn.Conv3d):
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
+        if (
+            any(padding)
+            and _fused_conv_cache_supported(self, x)
+            and (
+                cache_x is None
+                or (cache_x.device == x.device and cache_x.dtype == x.dtype)
+            )
+        ):
+            inp = cat_pad_channels_last_3d(x, cache_x, padding)
+            if inp is not None:
+                return super().forward(inp)
         x = causal_conv3d_cat_pad(x, cache_x, padding)
         x = (
             x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
@@ -281,36 +371,7 @@ def resample_forward(self, x):
                 _feat_cache[idx] = "Rep"
                 _feat_idx += 1
             else:
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if (
-                    cache_x.shape[2] < 2
-                    and _feat_cache[idx] is not None
-                    and _feat_cache[idx] != "Rep"
-                ):
-                    # cache last frame of last two chunk
-                    cache_x = torch.cat(
-                        [
-                            _feat_cache[idx][:, :, -1, :, :]
-                            .unsqueeze(2)
-                            .to(cache_x.device),
-                            cache_x,
-                        ],
-                        dim=2,
-                    )
-                if (
-                    cache_x.shape[2] < 2
-                    and _feat_cache[idx] is not None
-                    and _feat_cache[idx] == "Rep"
-                ):
-                    cache_x = torch.cat(
-                        [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
-                        dim=2,
-                    )
-                if _feat_cache[idx] == "Rep":
-                    x = self.time_conv(x)
-                else:
-                    x = self.time_conv(x, _feat_cache[idx])
-                _feat_cache[idx] = cache_x
+                x = _run_cached_causal_conv(self.time_conv, x, _feat_cache, idx)
                 _feat_idx += 1
 
                 x = x.reshape(b, 2, c, t, h, w)
@@ -360,18 +421,7 @@ def residual_block_forward(self, x):
     _feat_idx = feat_idx.get()
     if _feat_cache is not None:
         idx = _feat_idx
-        cache_x = x[:, :, -CACHE_T:, :, :].clone()
-        if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-            cache_x = torch.cat(
-                [
-                    _feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                    cache_x,
-                ],
-                dim=2,
-            )
-
-        x = self.conv1(x, _feat_cache[idx])
-        _feat_cache[idx] = cache_x
+        x = _run_cached_causal_conv(self.conv1, x, _feat_cache, idx)
         _feat_idx += 1
         feat_cache.set(_feat_cache)
         feat_idx.set(_feat_idx)
@@ -389,18 +439,7 @@ def residual_block_forward(self, x):
     _feat_idx = feat_idx.get()
     if _feat_cache is not None:
         idx = _feat_idx
-        cache_x = x[:, :, -CACHE_T:, :, :].clone()
-        if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-            cache_x = torch.cat(
-                [
-                    _feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                    cache_x,
-                ],
-                dim=2,
-            )
-
-        x = self.conv2(x, _feat_cache[idx])
-        _feat_cache[idx] = cache_x
+        x = _run_cached_causal_conv(self.conv2, x, _feat_cache, idx)
         _feat_idx += 1
         feat_cache.set(_feat_cache)
         feat_idx.set(_feat_idx)
@@ -478,7 +517,28 @@ def residual_up_block_forward(self, x):
         x = self.upsampler(x)
 
     if self.avg_shortcut is not None:
-        x = x + self.avg_shortcut(x_copy)
+        shortcut = self.avg_shortcut
+        if (
+            dup_up3d_add is not None
+            and type(shortcut) is DupUp3D
+            and x.is_cuda
+            and x_copy.is_cuda
+            and x.dtype == x_copy.dtype
+            and not torch.compiler.is_compiling()
+        ):
+            # Bit-exact single-pass ``main + DupUp3D(src)`` (data movement
+            # plus one same-order fp32-accumulated add).
+            fused = dup_up3d_add(
+                x,
+                x_copy,
+                shortcut.factor_t,
+                shortcut.factor_s,
+                shortcut.repeats,
+                bool(first_chunk.get()),
+            )
+            if fused is not None:
+                return fused
+        x = x + shortcut(x_copy)
 
     return x
 
@@ -958,20 +1018,7 @@ class WanEncoder3d(nn.Module):
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:
             idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_in(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_in, x, _feat_cache, idx)
             _feat_idx += 1
             feat_cache.set(_feat_cache)
             feat_idx.set(_feat_idx)
@@ -995,20 +1042,7 @@ class WanEncoder3d(nn.Module):
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:
             idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_out(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_out, x, _feat_cache, idx)
             _feat_idx += 1
             feat_cache.set(_feat_cache)
             feat_idx.set(_feat_idx)
@@ -1316,20 +1350,7 @@ class WanDecoder3d(nn.Module):
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:
             idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_in(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_in, x, _feat_cache, idx)
             _feat_idx += 1
             feat_cache.set(_feat_cache)
             feat_idx.set(_feat_idx)
@@ -1350,20 +1371,7 @@ class WanDecoder3d(nn.Module):
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:
             idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_out(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_out, x, _feat_cache, idx)
             _feat_idx += 1
             feat_cache.set(_feat_cache)
             feat_idx.set(_feat_idx)

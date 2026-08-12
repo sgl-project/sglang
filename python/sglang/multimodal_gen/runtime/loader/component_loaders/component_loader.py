@@ -113,9 +113,12 @@ class ComponentLoader(ABC):
         return {}
 
     def should_raise_customized_load_error(
-        self, _server_args: ServerArgs, _component_name: str
+        self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        return False
+        native_only_components = getattr(
+            server_args.pipeline_config, "native_only_components", ()
+        )
+        return component_name in native_only_components
 
     @staticmethod
     def _is_component_set_as_layerwise_load(
@@ -419,6 +422,9 @@ class ComponentLoader(ABC):
         ):
             transformers_or_diffusers = "diffusers"
 
+        if transformers_or_diffusers.startswith("lingbot_video"):
+            transformers_or_diffusers = "diffusers"
+
         return transformers_or_diffusers
 
     @classmethod
@@ -474,7 +480,9 @@ class ImageProcessorLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
-        return AutoImageProcessor.from_pretrained(component_model_path, use_fast=True)
+        return AutoImageProcessor.from_pretrained(
+            component_model_path, backend="torchvision"
+        )
 
 
 class AutoProcessorLoader(ComponentLoader):

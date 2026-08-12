@@ -9,6 +9,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 namespace device::compress {
 
 struct alignas(16) PrefillPlan {
@@ -35,3 +37,5 @@ static_assert(alignof(PrefillPlan) == sizeof(PrefillPlan));
 static_assert(sizeof(PrefillPlan) == kPrefillPlanDim * sizeof(PrefillPlanTensorDtype));
 
 }  // namespace host::compress
+
+}  // namespace sglang
