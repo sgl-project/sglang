@@ -840,9 +840,12 @@ def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
         },
     }
 
-    with patch(
-        "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
-        return_value=(torch.full((1, 3), 2.0), torch.tensor([[1, 1, 1]])),
+    with (
+        patch("sglang.srt.models.kimi_k3.configured_tp_size", return_value=1),
+        patch(
+            "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+            return_value=(torch.full((1, 3), 2.0), torch.tensor([[1, 1, 1]])),
+        ),
     ):
         output = model.get_image_feature([eager, deferred])
 
