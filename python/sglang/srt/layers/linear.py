@@ -25,6 +25,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
@@ -39,7 +40,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -491,6 +492,14 @@ class ColumnParallelLinear(LinearBase):
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
+
+        # Megatron SP "g": the input is this rank's [M_pad/tp, K] sequence shard;
+        # all-gather to the full sequence and matmul. Participants (qkv/gate_up)
+        # have gather_output=False, so there is no output all-gather to reconcile.
+        if get_forward().sp_active and self.tp_size > 1:
+            output = layernorm_sp.column_parallel_g_matmul(self, input_, bias)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
 
         # Matrix multiply.
         assert self.quant_method is not None
@@ -1621,6 +1630,21 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        # Megatron SP "g-bar": reduce-scatter along the token dim instead of
+        # all-reduce, leaving the output sharded for the next SP LayerNorm region.
+        # Fires regardless of reduce_results: o_proj / down are built
+        # reduce_results=False, so under SP the linear owns the reduction.
+        if (
+            get_forward().sp_active
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and output_tensor is None
+        ):
+            output = layernorm_sp.row_parallel_gbar_matmul(self, input_parallel, bias_)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:

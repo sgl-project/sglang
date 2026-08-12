@@ -1124,6 +1124,15 @@ class ServerArgs:
         "Shard dense MLP weights across the attention TP group under DP attention.",
         NS("parallel"),
     ] = False
+    enable_layernorm_sp: A[
+        bool,
+        "Enable Megatron-style sequence parallelism (arXiv:2205.05198) for the "
+        "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
+        "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
+        "sequence-sharded activations with no extra communication volume. "
+        "Prefill only; Qwen3 dense; requires tp_size > 1 and NVLink/NVSwitch.",
+        NS("parallel"),
+    ] = False
     disable_attn_tp_gather: A[
         bool,
         "Disable scheduler-side attn_tp_gather (the upstream SP path "
