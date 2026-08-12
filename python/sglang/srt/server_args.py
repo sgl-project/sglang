@@ -6911,13 +6911,25 @@ class ServerArgs:
                     "(chunked_prefill_size, or the decode cuda-graph batch size)"
                 )
 
+    def _moe_tokens_per_forward(self, per_rank_tokens: int) -> int:
+        """Tokens the MoE sees in one forward, given a per-DP-rank token count.
+
+        DP attention gathers every DP rank's batch before the MoE, and
+        chunked_prefill_size was already divided by dp_size above. An a2a
+        backend with preallocated buffers must be sized for the gathered sum,
+        otherwise dispatch/combine silently truncate to the buffer capacity.
+        """
+        if resolved_view(self).enable_dp_attention:
+            return per_rank_tokens * self.dp_size
+        return per_rank_tokens
+
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""
-        return self.chunked_prefill_size
+        return self._moe_tokens_per_forward(self.chunked_prefill_size)
 
     def _required_pplx_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through pplx in one forward."""
-        required = self.chunked_prefill_size
+        required = self._moe_tokens_per_forward(self.chunked_prefill_size)
         if self.cuda_graph_max_bs_decode is not None:
             required = max(required, self.cuda_graph_max_bs_decode)
         return required
