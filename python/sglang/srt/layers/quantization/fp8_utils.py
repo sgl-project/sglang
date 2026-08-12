@@ -332,6 +332,9 @@ class Mxfp8DenseGemmBackend(Enum):
     def is_flashinfer_trtllm(self) -> bool:
         return self == Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
 
+    def is_flashinfer(self) -> bool:
+        return self.value.startswith("flashinfer_")
+
     def is_deep_gemm(self) -> bool:
         return self == Mxfp8DenseGemmBackend.DEEP_GEMM
 

@@ -99,35 +99,16 @@ def should_run_flashinfer_autotune(
     )
 
     from sglang.srt.layers.quantization.fp8_utils import (
-        get_fp8_gemm_runner_backend,
+        flashinfer_per_tensor_fp8_supported,
         resolve_mxfp8_dense_gemm_backend,
     )
-    from sglang.srt.utils import is_sm100_supported, is_sm120_supported
 
-    model_uses_modelopt_fp8 = model_quantization in (
-        "modelopt",
-        "modelopt_fp8",
-        "modelopt_mixed",
-    )
-    fp8_gemm_backend = get_fp8_gemm_runner_backend()
-    mxfp8_dense_backend = (
-        resolve_mxfp8_dense_gemm_backend() if model_quantization == "mxfp8" else None
-    )
-    mxfp8_dense_needs_autotune = mxfp8_dense_backend is not None and (
-        mxfp8_dense_backend.is_flashinfer_cutlass()
-        or mxfp8_dense_backend.is_flashinfer_cutedsl()
-        or mxfp8_dense_backend.is_flashinfer_trtllm()
-    )
-    modelopt_fp8_needs_autotune = model_uses_modelopt_fp8 and (
-        fp8_gemm_backend.is_flashinfer_cutlass()
-        or fp8_gemm_backend.is_flashinfer_cutedsl()
-        or fp8_gemm_backend.is_flashinfer_trtllm()
-        or (
-            fp8_gemm_backend.is_auto()
-            and (is_sm100_supported() or is_sm120_supported())
-        )
-    )
-    fp8_gemm_needs_autotune = mxfp8_dense_needs_autotune or modelopt_fp8_needs_autotune
+    if model_quantization == "mxfp8":
+        fp8_gemm_needs_autotune = resolve_mxfp8_dense_gemm_backend().is_flashinfer()
+    elif model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
+        fp8_gemm_needs_autotune = flashinfer_per_tensor_fp8_supported()
+    else:
+        fp8_gemm_needs_autotune = False
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
         return False
