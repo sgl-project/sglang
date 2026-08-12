@@ -12,6 +12,11 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_score_type,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.minimax_sparse_ops.indexcache import (
+    indexcache_enabled,
+    indexcache_layer_positions,
+    indexcache_should_reuse,
+)
 from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
     minimax_sparse_decode,
     minimax_sparse_prefill,
@@ -135,15 +140,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ).lower()
         # Execution-order position of each sparse layer (0,1,2,... over the sorted
         # sparse layer ids); a layer is a cadence layer iff pos % stride == 0.
-        self._sparse_layer_pos = {
-            lid: i for i, lid in enumerate(sorted(self.sparse_layer_ids))
-        }
+        self._sparse_layer_pos = indexcache_layer_positions(self.sparse_layer_ids)
         # Per-forward cache of the last computed index state
         # (idx_o, main_topk_idx, real_seq_lens); reset every forward in
         # init_forward_metadata_out_graph. Reused within a single forward only,
         # so it is CUDA-graph safe (cadence layers run before reuse layers).
         self._indexcache_state = None
-        if self.indexcache_stride and self.indexcache_stride > 1:
+        if indexcache_enabled(self.indexcache_stride):
             logger.warning(
                 "[MiniMaxSparse] IndexCache ENABLED: stride=%d mode=%r "
                 "(decode indexer reused on %d of every %d sparse layers; "
@@ -555,12 +558,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # last cached selection. All sparse layers of a forward run in order
         # (cadence before reuse), so within-forward reuse is CUDA-graph safe.
         stride = self.indexcache_stride
-        indexcache_on = bool(stride and stride > 1)
+        indexcache_on = indexcache_enabled(stride)
         pos = self._sparse_layer_pos.get(layer.layer_id, 0)
-        is_reuse = (
-            indexcache_on
-            and (pos % stride != 0)
-            and (self._indexcache_state is not None)
+        is_reuse = indexcache_should_reuse(
+            pos, stride, self._indexcache_state is not None
         )
         # "full" mode reuses the cached idx_o; if this layer needs a real idx_o
         # (index value enabled) but the cadence layer had none, recompute instead
