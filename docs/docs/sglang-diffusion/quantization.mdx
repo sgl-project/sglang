@@ -2,7 +2,7 @@
 title: "Quantization"
 tag: "approx"
 metatags:
-    description: "SGLang-Diffusion supports quantized transformer checkpoints. In most cases, keep the base model and the quantized transformer override separate."
+    description: "Configure transformer weight quantization and Quant-VideoGen causal KV-cache quantization in SGLang-Diffusion."
 ---
 
 SGLang-Diffusion supports quantized transformer checkpoints. In most cases, keep
@@ -17,6 +17,7 @@ Use these paths:
 - `--transformer-weights-path`: quantized transformer weights provided as a single safetensors file, a sharded safetensors directory, a local path, or a Hugging Face repo ID
 - `--quantization`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
+- `--kv-cache-quant`: compress completed causal KV-cache chunks for supported realtime models
 
 Recommended example for pre-quantized checkpoints:
 
@@ -100,6 +101,14 @@ backend.
       <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> still use the weights-path flow</td>
     </tr>
     <tr>
+      <td><code>qvg-kv</code></td>
+      <td>Unquantized model with runtime causal KV-cache compression</td>
+      <td><code>--kv-cache-quant &#123;int4,int2&#125;</code></td>
+      <td>LingBot World realtime causal path</td>
+      <td><code>quant-videogen</code></td>
+      <td>CUDA only; compresses completed cache chunks rather than model weights; lossy and disabled by default</td>
+    </tr>
+    <tr>
       <td><code>nunchaku-svdq</code></td>
       <td>Pre-quantized Nunchaku transformer weights, usually named <code>svdq-&#123;int4\|fp4&#125;_r&#123;rank&#125;-...</code></td>
       <td><code>--transformer-weights-path</code></td>
@@ -117,6 +126,102 @@ backend.
     </tr>
   </tbody>
 </table>
+
+## Causal KV-Cache Quantization
+
+Quant-VideoGen KV-cache quantization targets long-running autoregressive video
+sessions, where the causal self-attention cache can become comparable to the
+model weights. It does not change or quantize the checkpoint weights.
+
+See [Realtime and Causal Video Models](./realtime_models) for the session
+lifecycle, supported pipelines, and the distinction between realtime and
+request-based causal generation.
+
+Install the optional dependency without allowing its stale Torch requirement to
+replace SGLang's pinned Torch version, then enable int4 compression when serving
+a supported LingBot World realtime pipeline:
+
+```bash
+pip install "sglang[diffusion,diffusion-qvg]"
+pip install --no-deps quant-videogen==0.1.0
+
+sglang serve \
+  --model-path robbyant/lingbot-world-fast-diffusers \
+  --pipeline-class-name LingBotWorldCausalDMDPipeline \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --kv-cache-quant int4 \
+  --dit-cpu-offload false \
+  --text-encoder-cpu-offload false
+```
+
+### Storage Policy
+
+The current chunk is rewritten at every denoising step, so it remains in BF16.
+The newest `--kv-cache-quant-keep-recent` completed chunks also remain in BF16.
+Older completed chunks are stable and are packed once with Progressive Residual
+Quantization (PRQ); their dense BF16 tensors are then released.
+
+When a transformer layer runs attention, its packed visible chunks are
+dequantized and concatenated with the recent BF16 chunks. This creates one
+layer's dense attention view at a time instead of keeping dense windows
+resident for every transformer layer.
+
+### How PRQ Works
+
+For each K or V vector, PRQ uses k-means to select a centroid, then quantizes
+the remaining error:
+
+```text
+x = centroid_1 + residual_1
+residual_1 = centroid_2 + residual_2
+...
+x_hat = centroid_1 + centroid_2 + ... + dequantize(low_bit_residual)
+```
+
+Each additional stage applies another centroid lookup to the previous stage's
+residual. SGLang's default uses one stage, 128 centroids, and an int4 or int2
+block-quantized residual. More stages or centroids can reduce reconstruction
+error but add codebook storage and packing work.
+
+PRQ is the compression algorithm; selecting older completed chunks is the
+runtime storage policy that makes it practical. Stable chunks are compressed
+once, while mutable and recent chunks avoid repeated packing and retain higher
+precision.
+
+### Quality And Performance
+
+<Warning>
+KV-cache quantization is lossy. Disabling it uses the original dense BF16 cache
+and is bit-exact with the unmodified path. Enabling int4 or int2 reconstructs an
+approximation of K and V, so fixed-seed generated frames are not expected to be
+pixel-identical to BF16.
+</Warning>
+
+In the initial LingBot measurements, int4 used about 47% of the dense resident
+KV-cache memory for a 24-frame window and added about 18% per-chunk latency.
+Int2 used about 37% of the dense resident KV-cache memory but introduces more
+quantization error. These measurements are configuration-specific; benchmark
+memory, latency, temporal consistency, identity stability, and motion quality
+on the intended session length. Start with int4 unless capacity requires int2.
+
+The current implementation is limited to the LingBot realtime
+sliding-window-and-sink path, including Ulysses sequence sharding. It does not
+support LongLive2 pinned sinks, global sinks, or dynamically growing caches.
+
+### Tuning Options
+
+| Option | Default | Effect |
+| --- | ---: | --- |
+| `--kv-cache-quant {off,int4,int2}` | `off` | Enables QVG KV-cache compression and selects residual precision. |
+| `--kv-cache-quant-stages` | `1` | Number of progressive centroid-residual stages. |
+| `--kv-cache-quant-centroids` | `128` | Number of k-means centroids per stage. |
+| `--kv-cache-quant-block-size` | `64` | Block size used to quantize the final residual. |
+| `--kv-cache-quant-iters` | `2` | K-means iterations used while packing a chunk. |
+| `--kv-cache-quant-asymmetric` | disabled | Uses asymmetric residual quantization. |
+| `--kv-cache-quant-keep-recent` | `1` | Number of newest completed chunks retained in BF16. |
+| `--kv-cache-quant-sink {0,1}` | `1` | Whether to quantize completed sink chunks. |
+| `--kv-cache-quant-sink-keep` | `0` | Number of leading sink chunks retained in BF16. |
 
 ## Online Quantization
 

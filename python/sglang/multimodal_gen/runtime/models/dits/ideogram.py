@@ -8,11 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
+    fused_gate_rmsnorm_active,
     fused_rmsnorm_scale,
     fused_rmsnorm_tanh_residual,
     mark_fused_gate_rmsnorm_site,
 )
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_layer
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_world_size,
@@ -45,6 +47,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 OUTPUT_IMAGE_INDICATOR = 2
 LLM_TOKEN_INDICATOR = 3
@@ -394,7 +397,7 @@ class Ideogram4TransformerBlock(nn.Module):
             adaln_input
         ).chunk(4, dim=-1)
         enable_fused = (
-            self._sgl_fused_gate_rmsnorm_enabled and not torch.compiler.is_compiling()
+            fused_gate_rmsnorm_active(self) and not torch.compiler.is_compiling()
         )
         attn_out = self.attention(
             _norm_scale(x, scale_msa, self.attention_norm1, enable_fused),
@@ -496,11 +499,12 @@ class Ideogram4FinalLayer(nn.Module):
 class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["Ideogram4TransformerBlock"]
     layer_names = ["layers"]
-    _fsdp_shard_conditions = Ideogram4DiTConfig().arch_config._fsdp_shard_conditions
-    _compile_conditions = Ideogram4DiTConfig().arch_config._compile_conditions
-    _supported_attention_backends = (
-        Ideogram4DiTConfig().arch_config._supported_attention_backends
-    )
+    _fsdp_shard_conditions = [is_layer]
+    _compile_conditions = [is_layer]
+    _supported_attention_backends = {
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.TORCH_SDPA,
+    }
     param_names_mapping = Ideogram4DiTConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = {}
 
@@ -512,9 +516,8 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         **kwargs,
     ) -> None:
         super().__init__(config, hf_config, **kwargs)
-        cfg = config.arch_config
+        cfg = self.config
         use_weight_only_fp8_linears = config.use_weight_only_fp8_linears
-        self._supported_attention_backends = cfg._supported_attention_backends
         hidden_size = cfg.num_attention_heads * cfg.attention_head_dim
         self.hidden_size = hidden_size
         self.num_attention_heads = cfg.num_attention_heads
@@ -585,7 +588,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     def post_load_weights(self) -> None:
         if not self.rotary_emb.inv_freq.is_meta:
             return
-        cfg = self.config.arch_config
+        cfg = self.config
         inv_freq = 1.0 / (
             cfg.rope_theta
             ** (
