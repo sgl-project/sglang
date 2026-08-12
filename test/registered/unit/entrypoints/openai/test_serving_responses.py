@@ -1169,7 +1169,6 @@ class StreamingLogprobsAcceptedTestCase(CustomTestCase):
         # logprobs-rejection text. If the rejection were re-added, this would
         # return a 400 whose message starts with "logprobs are not supported".
         import orjson
-
         from fastapi.responses import ORJSONResponse
 
         serving = make_serving()
