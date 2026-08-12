@@ -189,6 +189,7 @@ class LoRAInfo:
     tp_rank: int = 0
     hidden_size: int = 0
     lora_use_virtual_experts: bool = False
+    marlin_intermediate_size: int = 0
 
 
 @dataclass
@@ -336,7 +337,24 @@ def _add_lora_gate_up_delta(
     # Gated: A has 2*r rows (gate + up). Non-gated: A has 1*r rows (w1 only).
     is_gated = gate_up_a.shape[2] > r
     if is_gated:
+        assert gate_up_dim % 2 == 0, f"Invalid gated MoE output size {gate_up_dim}"
+        assert (
+            gate_up_b.shape[2] % 2 == 0
+        ), f"Invalid gate/up LoRA output size {gate_up_b.shape[2]}"
         inter_size = gate_up_b.shape[2] // 2
+        physical_inter_size = lora_info.marlin_intermediate_size or inter_size
+        assert gate_up_dim == 2 * physical_inter_size, (
+            "Gate/up output does not match its physical intermediate size: "
+            f"output={gate_up_dim}, intermediate={physical_inter_size}"
+        )
+        assert inter_size <= physical_inter_size, (
+            "Gate/up LoRA output is wider than the Marlin intermediate: "
+            f"lora={inter_size}, marlin={physical_inter_size}"
+        )
+        if lora_info.lora_use_virtual_experts and inter_size != physical_inter_size:
+            raise NotImplementedError(
+                "Virtual-expert MoE LoRA does not support padded Marlin outputs"
+            )
         lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
         lora_b_stacked = [
             gate_up_b[:, :, :inter_size, :],
@@ -390,6 +408,11 @@ def _add_lora_gate_up_delta(
             expand_num_stages=2,
             expand_split_k=1,
             fully_sharded=lora_info.fully_sharded,
+            output_slice_stride=(
+                lora_info.marlin_intermediate_size
+                if is_gated and lora_info.marlin_intermediate_size
+                else 0
+            ),
         )
 
 
@@ -417,6 +440,13 @@ def _add_lora_down_delta(
 
     down_lora_a = lora_info.down_lora_a_weights
     down_lora_b = lora_info.down_lora_b_weights
+    if lora_info.marlin_intermediate_size:
+        logical_intermediate_size = down_lora_a.shape[-1]
+        assert logical_intermediate_size <= intermediate_input.shape[-1], (
+            "Down LoRA input is wider than the Marlin activation: "
+            f"lora={logical_intermediate_size}, activation={intermediate_input.shape[-1]}"
+        )
+        intermediate_input = intermediate_input[:, :logical_intermediate_size]
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         down_lora_b = down_lora_b.expand(-1, lora_info.num_experts, -1, -1)
 

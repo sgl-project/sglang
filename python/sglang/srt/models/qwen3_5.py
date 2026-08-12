@@ -1369,6 +1369,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         "o_proj",
         "out_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
         "gate_up_proj",
         "down_proj",
         "lm_head",
@@ -1394,6 +1395,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             key_dim = config.linear_key_head_dim * config.linear_num_key_heads
             value_dim = config.linear_value_head_dim * config.linear_num_value_heads
             return config.hidden_size, key_dim * 2 + value_dim * 2
+        elif module_name == "in_proj_ba":
+            # b + a projections: one scalar per linear-attention value head each
+            return config.hidden_size, config.linear_num_value_heads * 2
         elif module_name == "gate_up_proj":
             # MoE: shared expert uses shared_expert_intermediate_size
             # Dense: regular MLP uses intermediate_size
@@ -1646,9 +1650,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         # model's own GemmaRMSNorm gamma. Preserve the sam/dev native-final-norm
         # diagnostic path for the ordinary (non-deferred) case.
         trace_final_norm = os.getenv("SGLANG_TRACE_QWEN35_FINAL_NORM", "0") == "1"
-        use_native_final_norm = (
-            os.getenv("SGLANG_QWEN35_NATIVE_FINAL_NORM", "0") == "1"
-        )
+        use_native_final_norm = os.getenv("SGLANG_QWEN35_NATIVE_FINAL_NORM", "0") == "1"
         is_deferred_finalize = False
         if self.flashinfer_mnnvl_cutedsl_fusion is not None:
             from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (

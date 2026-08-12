@@ -1862,6 +1862,11 @@ class ServerArgs:
         NS("exec.graph"),
     ] = False
     disable_cuda_graph: A[bool, Arg(no_cli=True), NS("exec.graph")] = False
+    disable_draft_cuda_graph: A[
+        bool,
+        "Disable cuda graph for draft model in speculative decoding.",
+        NS("exec.graph"),
+    ] = False
     disable_cuda_graph_padding: A[
         bool,
         "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
@@ -2875,6 +2880,10 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
         ),
         NS("lora"),
+    ] = False
+    lora_no_cpu_backup: A[
+        bool,
+        "Release each LoRA adapter's CPU weight copy right after it is installed into the GPU memory pool. Saves host memory for very large adapters, but makes re-installation impossible: adapter eviction from the memory pool is rejected with an error, so every loaded adapter must keep its pool slot (no swapping).",
     ] = False
     lora_drain_wait_threshold: A[
         float,

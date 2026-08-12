@@ -778,6 +778,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             )
             input_parallel = splitted_input[tp_rank].contiguous()
 
+        if hasattr(self.base_layer, "lora_input_transform"):
+            input_parallel = self.base_layer.lora_input_transform(input_parallel)
+
         bias_ = (
             None
             if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
@@ -947,6 +950,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     ):
         # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
+        for name, parameter in base_layer.named_parameters(recurse=False):
+            self.register_parameter(name, parameter)
 
         lora_backend.is_moe_lora = True
 
@@ -971,9 +976,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             base_layer, "intermediate_size_per_partition", None
         )
         self._uses_interleaved_gate_up = (
-            getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
+            base_layer.moe_runner_config.gemm1_alpha is not None
+            and base_layer.moe_runner_config.gate_up_interleaved
         )
-
         # Initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
@@ -1027,27 +1032,36 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
 
         if runner_backend.is_marlin():
-            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-                CompressedTensorsFusedMoEMethod,
-            )
-            from sglang.srt.layers.quantization.modelopt_quant import (
-                ModelOptNvFp4FusedMoEMethod,
-            )
-
-            assert isinstance(
-                base_layer.quant_method,
-                (CompressedTensorsFusedMoEMethod, ModelOptNvFp4FusedMoEMethod),
-            ), (
-                f"Marlin MoE backend requires a quant method exposing "
-                f"get_marlin_quant_info, got {type(base_layer.quant_method).__name__}"
-            )
-            self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
+            self._refresh_quant_info()
         elif runner_backend.is_triton():
             assert base_layer.quant_method is not None, "Quant method must be set"
-            self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+            self._refresh_quant_info()
         else:
             raise NotImplementedError(
                 f"LoRA MoE not supported for backend {runner_backend}"
+            )
+
+    def _clear_base_layer_parameter_references(self) -> None:
+        for name in tuple(self._parameters):
+            delattr(self, name)
+        self._quant_info = None
+
+    def _sync_base_layer_parameters(self) -> None:
+        self._clear_base_layer_parameter_references()
+        for name, parameter in self.base_layer.named_parameters(recurse=False):
+            self.register_parameter(name, parameter)
+
+    def _refresh_quant_info(self) -> None:
+        if self._lora_runner_backend.is_experimental_sgl_trtllm():
+            return
+        if self._lora_runner_backend.is_marlin():
+            self._quant_info = self.base_layer.quant_method.get_marlin_quant_info(
+                self.base_layer
+            )
+        else:
+            assert self._lora_runner_backend.is_triton()
+            self._quant_info = self.base_layer.quant_method.get_triton_quant_info(
+                self.base_layer
             )
 
     def set_lora_info(
@@ -1110,6 +1124,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
+            marlin_intermediate_size=(
+                self._quant_info.w2_qweight.shape[1] * 16
+                if self._lora_runner_backend.is_marlin()
+                else 0
+            ),
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):

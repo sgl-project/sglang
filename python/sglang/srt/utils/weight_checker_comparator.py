@@ -102,6 +102,161 @@ class Fp8BlockComparable(ComparableWeight):
         return block_quant_dequant(self.w_q, s, block_size, dtype=dtype)
 
 
+class Nvfp4TrtllmMoeComparable(ComparableWeight):
+    """ModelOpt NVFP4 fused-MoE expert weights in the FlashInfer TRT-LLM layout.
+
+    process_weights_after_loading row-shuffles the packed E2M1 weights and
+    swizzles the E4M3 block scales in place; this comparable inverts those
+    layout transforms (per expert) and compares in dequantized space, so two
+    different (qweight, block_scale, weight_scale_2) factorizations of the
+    same logical weights are equal within quantization ULP tolerance.
+    """
+
+    # E2M1 magnitudes by nibble & 0x7; the top nibble bit is the sign.
+    _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+    # Grid spacing at each magnitude: 0.5 below 2, 1 in [2, 4), 2 in [4, 6].
+    _E2M1_SPACING = (0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 2.0, 2.0)
+
+    _is_w13 = True
+    # (shape, is_scale) -> inverse layout indices, shared across instances.
+    _inverse_indices_cache: dict = {}
+
+    def __init__(
+        self, w_q: torch.Tensor, w_scale: torch.Tensor, w_scale_2: torch.Tensor
+    ):
+        self.w_q = w_q
+        self.w_scale = w_scale
+        self.w_scale_2 = w_scale_2
+
+    def __repr__(self) -> str:
+        return (
+            f"nvfp4_trtllm(shape={tuple(self.w_q.shape)} "
+            f"scale2_shape={tuple(self.w_scale_2.shape)} w13={self._is_w13})"
+        )
+
+    def _forward_weight_perm(self, expert_2d: torch.Tensor) -> torch.Tensor:
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
+        cache: dict = {}
+        if self._is_w13:
+            return _maybe_get_cached_w3_w1_permute_indices(
+                cache, expert_2d, 128, is_gated_act_gemm=True
+            )
+        return get_w2_permute_indices_with_cache(cache, expert_2d, 128)
+
+    def _forward_scale_transform(self, expert_2d: torch.Tensor) -> torch.Tensor:
+        from flashinfer import nvfp4_block_scale_interleave
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
+        cache: dict = {}
+        if self._is_w13:
+            perm = _maybe_get_cached_w3_w1_permute_indices(
+                cache, expert_2d, 128, num_elts_per_sf=16, is_gated_act_gemm=True
+            )
+        else:
+            perm = get_w2_permute_indices_with_cache(
+                cache, expert_2d, 128, num_elts_per_sf=16
+            )
+        return nvfp4_block_scale_interleave(
+            expert_2d[perm.to(expert_2d.device)].contiguous()
+        )
+
+    def _inverse_indices(self, shape, is_scale: bool, device) -> torch.Tensor:
+        """out_flat[p] == in_flat[idx[p]] for the forward layout transform,
+        recovered by tracing byte planes of the flattened position index."""
+        key = (self._is_w13, tuple(shape), is_scale)
+        cached = self._inverse_indices_cache.get(key)
+        if cached is not None:
+            return cached
+        numel = 1
+        for d in shape:
+            numel *= d
+        assert numel < 1 << 32, f"position tracing needs numel < 2^32, got {numel}"
+        positions = torch.arange(numel, device=device, dtype=torch.int64)
+        traced = torch.zeros(numel, device=device, dtype=torch.int64)
+        for shift in range(0, 32, 8):
+            plane = ((positions >> shift) & 0xFF).to(torch.uint8).reshape(shape)
+            if is_scale:
+                out_plane = self._forward_scale_transform(plane)
+            else:
+                out_plane = plane[self._forward_weight_perm(plane).to(device)]
+            traced |= out_plane.reshape(-1).to(torch.int64) << shift
+        self._inverse_indices_cache[key] = traced
+        return traced
+
+    def _unshuffle(self, shuffled_2d: torch.Tensor, is_scale: bool) -> torch.Tensor:
+        src = self._inverse_indices(shuffled_2d.shape, is_scale, shuffled_2d.device)
+        flat = shuffled_2d.reshape(-1)
+        linear = torch.empty_like(flat)
+        linear[src] = flat
+        return linear.reshape(shuffled_2d.shape)
+
+    def _expert_scale_2(self, expert_idx: int, num_rows: int) -> torch.Tensor:
+        """Per-row fp32 weight_scale_2 column; gated w13 keeps one scale per
+        gate/up half."""
+        s2 = self.w_scale_2[expert_idx].float()
+        if s2.numel() == 1:
+            return s2.reshape(1).expand(num_rows)
+        assert s2.numel() == 2 and num_rows % 2 == 0, (s2.shape, num_rows)
+        half = num_rows // 2
+        return torch.cat([s2[0].expand(half), s2[1].expand(half)])
+
+    def _dequant_expert(self, expert_idx: int):
+        # Snapshot-side tensors live on CPU; everything is moved to cuda for
+        # the unshuffle/dequant, so the LUTs must be cuda too.
+        device = "cuda"
+        lut = torch.tensor(
+            [*self._E2M1_VALUES, *(-v for v in self._E2M1_VALUES)],
+            dtype=torch.float32,
+            device=device,
+        )
+        spacing_lut = torch.tensor(
+            self._E2M1_SPACING * 2, dtype=torch.float32, device=device
+        )
+        q = self._unshuffle(self.w_q[expert_idx].view(torch.uint8).cuda(), False)
+        s = self._unshuffle(
+            self.w_scale[expert_idx].view(torch.uint8).cuda(), True
+        ).view(torch.float8_e4m3fn)
+
+        low, high = (q & 0x0F).to(torch.long), (q >> 4).to(torch.long)
+        vals = torch.stack((lut[low], lut[high]), dim=-1).reshape(q.shape[0], -1)
+        spacing = torch.stack((spacing_lut[low], spacing_lut[high]), dim=-1).reshape(
+            q.shape[0], -1
+        )
+
+        num_rows = q.shape[0]
+        scale_2_col = (
+            self._expert_scale_2(expert_idx, num_rows).to(device="cuda").unsqueeze(-1)
+        )
+        scale = s.float().repeat_interleave(16, dim=-1) * scale_2_col
+        # Tolerance floors the block scale at the smallest E4M3 subnormal:
+        # quantizers legitimately differ on whether a tiny block flushes to a
+        # zero scale or clamps to the subnormal grid.
+        tol_scale = (
+            s.float().clamp(min=2.0**-9).repeat_interleave(16, dim=-1) * scale_2_col
+        )
+        return vals * scale, spacing * tol_scale
+
+    def iter_chunks(self):
+        for expert_idx in range(self.w_q.shape[0]):
+            yield self._dequant_expert(expert_idx)
+
+    def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        return torch.stack(
+            [self._dequant_expert(i)[0].to(dtype) for i in range(self.w_q.shape[0])]
+        )
+
+
+class Nvfp4TrtllmW2Comparable(Nvfp4TrtllmMoeComparable):
+    _is_w13 = False
+
+
 class RawComparable(ComparableWeight):
     """Bitwise equal compare on raw tensor."""
 
@@ -163,7 +318,7 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         return Fp8BlockComparable
     if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
         if getattr(quant_method, "enable_flashinfer_trtllm_moe", False):
-            return None
+            return Nvfp4TrtllmMoeComparable
         raise NotImplementedError(
             f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
         )

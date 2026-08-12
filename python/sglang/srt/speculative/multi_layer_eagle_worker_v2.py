@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
@@ -910,6 +910,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
+    def iter_runners(self) -> List[Tuple[str, ModelRunner]]:
+        return [(f"draft_step_{i}", r) for i, r in enumerate(self.draft_runner_list)]
+
     def __init__(
         self,
         server_args: ServerArgs,

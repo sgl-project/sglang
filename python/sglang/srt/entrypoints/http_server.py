@@ -116,6 +116,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
+    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -123,10 +124,12 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -663,10 +666,9 @@ async def health_generate(request: Request) -> Response:
     # Diagnostic only: allow an external E2E driver to establish a balanced
     # DP16 batch instead of letting the router's singleton health request
     # create the [1, 0, ..., 0] idle-rank case first.
-    if (
-        os.getenv("SGLANG_DIAG_BYPASS_HEALTH_GENERATE", "0") == "1"
-        and request.url.path in ("/health", "/health_generate")
-    ):
+    if os.getenv(
+        "SGLANG_DIAG_BYPASS_HEALTH_GENERATE", "0"
+    ) == "1" and request.url.path in ("/health", "/health_generate"):
         return Response(status_code=200)
 
     if (
@@ -1379,6 +1381,36 @@ async def update_weights_from_tensor(
     )
 
 
+@app.post("/begin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def begin_weight_update(
+    obj: Annotated[BeginWeightUpdateReqInput, Body()], request: Request
+):
+    """Open a weight-update session so in-place-quantized weights become loadable."""
+    success, message = await _global_state.tokenizer_manager.begin_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/end_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def end_weight_update(
+    obj: Annotated[EndWeightUpdateReqInput, Body()], request: Request
+):
+    """Close the weight-update session and finalize quantized weights."""
+    success, message = await _global_state.tokenizer_manager.end_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
@@ -1542,6 +1574,18 @@ async def load_lora_adapter_from_tensors(
 ):
     """Load a new LoRA adapter from tensors without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
+        obj, request
+    )
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/load_lora_adapter_from_distributed", methods=["POST"])
+async def load_lora_adapter_from_distributed(
+    obj: Annotated[LoadLoRAAdapterFromDistributedReqInput, Body()], request: Request
+):
+    """Load a new LoRA adapter broadcast over a process group without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter_from_distributed(
         obj, request
     )
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST

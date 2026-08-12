@@ -368,5 +368,111 @@ class TestLoRALoadFromTensor(CustomTestCase):
         cls.engine.shutdown()
 
 
+class TestLoRANoCpuBackup(CustomTestCase):
+    """--lora-no-cpu-backup: CPU copies are released after pool install and
+    the adapter still serves correctly, including the RL unload/reload
+    version-replacement pattern."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = sgl.Engine(
+            model_path=MODEL_PATH,
+            enable_lora=True,
+            max_lora_rank=64,
+            lora_target_modules=["all"],
+            mem_fraction_static=0.6,
+            log_level="error",
+            lora_no_cpu_backup=True,
+        )
+        lora_adapter = snapshot_download(
+            repo_id=LORA_REPO,
+            allow_patterns=["adapter_model.safetensors", "adapter_config.json"],
+        )
+        cls.lora_tensors = load_file(
+            os.path.join(lora_adapter, "adapter_model.safetensors")
+        )
+        with open(os.path.join(lora_adapter, "adapter_config.json"), "r") as f:
+            cls.lora_config_dict = json.load(f)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.engine.shutdown()
+
+    def _generate_with_lora(self, lora_name):
+        output = self.engine.generate(
+            prompt=[TEST_PROMPT],
+            sampling_params={"max_new_tokens": MAX_NEW_TOKENS, "temperature": 0.0},
+            lora_path=[lora_name],
+        )
+        return output[0]["text"]
+
+    def test_no_cpu_backup_generation_and_replacement(self):
+        result = self.engine.load_lora_adapter_from_tensors(
+            lora_name="alice_v1",
+            tensors=self.lora_tensors,
+            config_dict=self.lora_config_dict,
+        )
+        self.assertTrue(result.success, f"Load failed: {result.error_message}")
+
+        # First use installs into the pool and releases the CPU copies.
+        self.assertEqual(
+            self._generate_with_lora("alice_v1")[: len(EXPECTED_OUTPUT)],
+            EXPECTED_OUTPUT,
+            "Output with LoRA does not match after no-cpu-backup install",
+        )
+        # Second use must hit the already-installed pool slot; a re-install
+        # attempt would trip the weights_released assertion in the scheduler.
+        self.assertEqual(
+            self._generate_with_lora("alice_v1")[: len(EXPECTED_OUTPUT)],
+            EXPECTED_OUTPUT,
+            "Output with LoRA changed between uses of the installed adapter",
+        )
+
+        # RL version-replacement pattern: unload the released adapter, load a
+        # replacement under a new name, and serve with it.
+        result = self.engine.unload_lora_adapter("alice_v1")
+        self.assertTrue(result.success, f"Unload failed: {result.error_message}")
+        result = self.engine.load_lora_adapter_from_tensors(
+            lora_name="alice_v2",
+            tensors=self.lora_tensors,
+            config_dict=self.lora_config_dict,
+        )
+        self.assertTrue(result.success, f"Reload failed: {result.error_message}")
+        self.assertEqual(
+            self._generate_with_lora("alice_v2")[: len(EXPECTED_OUTPUT)],
+            EXPECTED_OUTPUT,
+            "Output with replacement LoRA version does not match",
+        )
+
+    def test_adapter_release_cpu_weights_semantics(self):
+        from transformers import AutoConfig
+
+        from sglang.srt.configs.load_config import LoadConfig
+        from sglang.srt.lora.lora import LoRAAdapter
+        from sglang.srt.lora.lora_config import LoRAConfig
+
+        config = LoRAConfig.from_dict(self.lora_config_dict)
+        adapter = LoRAAdapter(
+            uid="release-test",
+            config=config,
+            base_hf_config=AutoConfig.from_pretrained(MODEL_PATH),
+            load_config=LoadConfig(),
+            lora_backend=object(),
+        )
+        adapter.load_weights_from_tensors_chunk(self.lora_tensors)
+        self.assertTrue(any(layer.weights for layer in adapter.layers))
+        self.assertFalse(adapter.weights_released)
+
+        # No 3D gate_up lora_A in this dense adapter: detection yields None
+        # and must stay stable across the release.
+        self.assertIsNone(adapter.scan_shared_outer_gate_up())
+        adapter.release_cpu_weights()
+        self.assertTrue(adapter.weights_released)
+        self.assertTrue(all(not layer.weights for layer in adapter.layers))
+        self.assertTrue(all(not layer.pinned_weights for layer in adapter.layers))
+        self.assertFalse(adapter.embedding_layers)
+        self.assertIsNone(adapter.scan_shared_outer_gate_up())
+
+
 if __name__ == "__main__":
     unittest.main()

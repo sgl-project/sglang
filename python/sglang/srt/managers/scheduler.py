@@ -115,6 +115,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -126,6 +127,7 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EndWeightUpdateReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -140,6 +142,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
+    LoadLoRAAdapterFromDistributedReqInput,
+    LoadLoRAAdapterFromDistributedReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -771,6 +775,7 @@ class Scheduler(
                     self.ipc_channels.recv_from_tokenizer,
                     self.ipc_channels.recv_from_rpc,
                 ],
+                can_empty_cache=lambda: not self._engine_paused,
             )
         else:
             self.idle_sleeper = None
@@ -1533,6 +1538,14 @@ class Scheduler(
                     self.send_weights_to_remote_instance,
                 ),
                 (
+                    BeginWeightUpdateReqInput,
+                    self.weight_updater.begin_weight_update,
+                ),
+                (
+                    EndWeightUpdateReqInput,
+                    self.weight_updater.end_weight_update,
+                ),
+                (
                     UpdateWeightsFromDistributedReqInput,
                     self.weight_updater.update_weights_from_distributed,
                 ),
@@ -1575,6 +1588,10 @@ class Scheduler(
                 (
                     LoadLoRAAdapterFromTensorsReqInput,
                     self.load_lora_adapter_from_tensors,
+                ),
+                (
+                    LoadLoRAAdapterFromDistributedReqInput,
+                    self.load_lora_adapter_from_distributed,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -3999,7 +4016,7 @@ class Scheduler(
         # sleep until next event
         self.maybe_sleep_on_idle()
 
-    def is_fully_idle(self, for_health_check=False) -> bool:
+    def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -4016,7 +4033,8 @@ class Scheduler(
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        idle &= len(self.waiting_queue) == 0
+        if not ignore_waiting:
+            idle &= len(self.waiting_queue) == 0
 
         if (
             for_health_check
@@ -4169,7 +4187,7 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle():
+        if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -4702,6 +4720,14 @@ class Scheduler(
         """In-place loading a new lora adapter from serialized tensors."""
 
         result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+        return result
+
+    def load_lora_adapter_from_distributed(
+        self, recv_req: LoadLoRAAdapterFromDistributedReqInput
+    ) -> LoadLoRAAdapterFromDistributedReqOutput:
+        """In-place loading a new lora adapter broadcast over a process group."""
+
+        result = self.tp_worker.load_lora_adapter_from_distributed(recv_req)
         return result
 
     def unload_lora_adapter(

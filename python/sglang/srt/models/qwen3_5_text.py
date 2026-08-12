@@ -100,6 +100,14 @@ class Qwen3_5ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        # Without this forward the LoRA memory pool falls back to the generic
+        # hidden-dim rule, which sizes qkv_proj without the output-gate rows.
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return module_name.startswith("model.layers.")
+
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         """Forward model-owned warmup to the text backbone."""
         self.model.prepare_before_cuda_graph_capture(model_runner)

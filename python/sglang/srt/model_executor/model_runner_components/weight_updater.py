@@ -219,6 +219,75 @@ class WeightUpdater:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
+    def load_weights(self: WeightUpdater, weights) -> None:
+        """Load an in-memory list of (name, tensor) weights into this runner's model."""
+        self.get_model().load_weights(weights)
+
+    def receive_weights_from_distributed(
+        self: WeightUpdater,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
+        """Receive one weight broadcast from the training engine over this runner's
+        `_model_update_group` and return the named tensors WITHOUT loading them.
+
+        Only the runner that joined the group (the target / main model) can receive;
+        the caller loads the result into each runner it wants updated. Speculative
+        draft runners never join the group, so they are fed from here.
+        """
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        if load_format == "flattened_bucket":
+            return self._receive_bucketed_weights_from_distributed(
+                names, dtypes, shapes, group_name
+            )
+
+        weights = []
+        handles = []
+        for name, dtype, shape in zip(names, dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+            handles.append(
+                torch.distributed.broadcast(
+                    weight,
+                    src=0,
+                    group=self._model_update_group[group_name],
+                    async_op=True,
+                )
+            )
+            weights.append((name, weight))
+        for handle in handles:
+            handle.wait()
+        return weights
+
+    def _receive_bucketed_weights_from_distributed(
+        self: WeightUpdater, names, dtypes, shapes, group_name
+    ):
+        named_tensors = []
+        for name, dtype, shape in zip(names, dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            named_tensors.append(
+                (name, torch.empty(shape, dtype=target_dtype, device=self.device))
+            )
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        flattened_tensor = bucket.get_flattened_tensor()
+        torch.distributed.broadcast(
+            flattened_tensor,
+            src=0,
+            group=self._model_update_group[group_name],
+        )
+        return bucket.reconstruct_tensors()
+
     def update_weights_from_distributed(
         self: WeightUpdater,
         names,
@@ -227,86 +296,19 @@ class WeightUpdater:
         group_name,
         load_format: Optional[str] = None,
     ):
-        """
-        Update specific parameter in the model weights online
-        through `_model_update_group` process group.
-
-        Args:
-            name: the name of the parameter to be updated.
-            dtype: the data type of the parameter to be updated.
-            shape: the shape of the parameter to be updated.
-        """
+        """Receive and load one weight broadcast into this runner's model."""
         self._assert_weight_cache_inactive("update_weights_from_distributed")
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
             return False, error
 
-        assert group_name in self._model_update_group, (
-            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
-            "Please call `init_weights_update_group` first."
-        )
-
-        if load_format == "flattened_bucket":
-            return self._update_bucketed_weights_from_distributed(
-                names, dtypes, shapes, group_name
-            )
         try:
-            weights = []
-            handles = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
-                    )
-                )
-                weights.append((name, weight))
-            for handle in handles:
-                handle.wait()
-
-            self.get_model().load_weights(weights)
+            weights = self.receive_weights_from_distributed(
+                names, dtypes, shapes, group_name, load_format
+            )
+            self.load_weights(weights)
             return True, "Succeeded to update parameter online."
 
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
-
-    def _update_bucketed_weights_from_distributed(
-        self: WeightUpdater, names, dtypes, shapes, group_name
-    ):
-        try:
-            named_tensors = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                named_tensors.append(
-                    (
-                        name,
-                        torch.empty(shape, dtype=target_dtype, device=self.device),
-                    )
-                )
-            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-            flattened_tensor = bucket.get_flattened_tensor()
-            torch.distributed.broadcast(
-                flattened_tensor,
-                src=0,
-                group=self._model_update_group[group_name],
-            )
-            reconstructed_tensors = bucket.reconstruct_tensors()
-            self.get_model().load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "

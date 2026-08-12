@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 from sglang.kernels.ops.elementwise.elementwise import (
     fused_gate_sigmoid_mul,
     fused_gate_sigmoid_mul_add,
@@ -317,6 +318,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
+        self._router_fp32 = envs.SGLANG_MOE_ROUTER_FP32.get() and _is_cuda
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
@@ -354,10 +356,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_deepep_v2()
-        ):
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_deepep_v2():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -471,6 +470,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return shared_output
 
+    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # router_logits: (num_tokens, n_experts)
+        if self._router_fp32:
+            # Keep the GEMM output in fp32, matching Megatron's
+            # --moe-router-dtype fp32; see SGLANG_MOE_ROUTER_FP32.
+            return linear_bf16_fp32(hidden_states, self.gate.weight)
+        router_logits, _ = self.gate(hidden_states)
+        return router_logits
+
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         trace_e2e = os.getenv("SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E", "0") == "1"
 
@@ -496,8 +504,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         shared_output = None
         if hidden_states.shape[0] > 0:
-            # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = self._router_logits(hidden_states)
             if enable_dual_stream:
                 shared_output = shared_expert_on_independent_stream(
                     hidden_states.clone(), self._forward_shared_experts
@@ -547,8 +554,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         *,
         defer_finalize: bool = False,
     ):
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self._router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
@@ -655,10 +661,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
 
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_deepep_v2()
-        ):
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_deepep_v2():
             return self._forward_deepep(hidden_states, forward_batch)
 
         use_fused_gate = (

@@ -15,11 +15,11 @@
 
 import asyncio
 from collections import OrderedDict
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import msgspec
-from msgspec.structs import fields
+from msgspec.structs import fields, replace
 
 from sglang.srt.utils import ConcurrentCounter
 from sglang.srt.utils.aio_rwlock import RWLock
@@ -122,6 +122,48 @@ class LoRARegistry:
             del self._registry[lora_name]
 
         return lora_ref.lora_id
+
+    async def get_lora_id(self, lora_name: str) -> Optional[str]:
+        """Return the ``lora_id`` of a registered adapter, or ``None``."""
+        async with self._registry_lock.reader_lock:
+            lora_ref = self._registry.get(lora_name, None)
+            return lora_ref.lora_id if lora_ref is not None else None
+
+    async def register_or_reuse(
+        self, lora_ref: LoRARef, upsert: bool = False
+    ) -> Tuple[LoRARef, bool]:
+        """Resolve which identity a load request should use.
+
+        Returns ``(ref, reused)``. With ``upsert`` and a same-name adapter
+        already registered, the returned ref adopts the existing ``lora_id``
+        (``reused=True``) so the backend refreshes that adapter in place;
+        otherwise ``lora_ref`` is returned unchanged (``reused=False``).
+        Nothing is registered here: the caller commits the resolved ref with
+        ``register`` / ``refresh`` once the backend load succeeded, keeping
+        failed loads invisible to the registry.
+        """
+        if not upsert:
+            return lora_ref, False
+        async with self._registry_lock.reader_lock:
+            existing = self._registry.get(lora_ref.lora_name, None)
+        if existing is None:
+            return lora_ref, False
+        return replace(lora_ref, lora_id=existing.lora_id), True
+
+    async def refresh(self, lora_ref: LoRARef):
+        """Replace a registered adapter's ref after a successful upsert.
+
+        Keeps the id (asserted) while adopting the new path/pinned metadata,
+        and counts as a use for LRU ordering.
+        """
+        async with self._registry_lock.writer_lock:
+            existing = self._registry.get(lora_ref.lora_name, None)
+            assert existing is not None and existing.lora_id == lora_ref.lora_id, (
+                f"refresh() must target a registered adapter with the same lora_id; "
+                f"got {lora_ref}, registered: {existing}"
+            )
+            self._registry[lora_ref.lora_name] = lora_ref
+            self._registry.move_to_end(lora_ref.lora_name)
 
     async def acquire(self, lora_name: Union[str, List[str]]) -> Union[str, List[str]]:
         """

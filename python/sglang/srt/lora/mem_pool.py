@@ -47,6 +47,18 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 logger = logging.getLogger(__name__)
 
 
+def _has_shared_experts(config) -> bool:
+    shared_intermediate_size = (
+        getattr(config, "shared_expert_intermediate_size", 0) or 0
+    )
+    num_shared_experts = (
+        getattr(config, "n_shared_experts", None)
+        or getattr(config, "num_shared_experts", 0)
+        or 0
+    )
+    return shared_intermediate_size > 0 or num_shared_experts > 0
+
+
 class EmptySlot:
     """
     Singleton class to represent an empty slot in the memory pool.
@@ -128,6 +140,26 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
         return False
 
 
+def _set_expert_weight(
+    weight_buffers: Dict[str, Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]]],
+    cache_key_buffers: Dict[str, Optional[Union[str, Dict[int, str]]]],
+    target_module: str,
+    expert_id: int,
+    weight: torch.Tensor,
+    cache_key: str,
+) -> None:
+    if weight_buffers[target_module] is None:
+        weight_buffers[target_module] = {}
+        cache_key_buffers[target_module] = {}
+
+    target_weights = weight_buffers[target_module]
+    target_cache_keys = cache_key_buffers[target_module]
+    assert isinstance(target_weights, dict)
+    assert isinstance(target_cache_keys, dict)
+    target_weights[expert_id] = weight
+    target_cache_keys[expert_id] = cache_key
+
+
 class LoRAMemoryPool:
     """Class for memory pool management of lora modules"""
 
@@ -147,6 +179,7 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        lora_no_cpu_backup: bool = False,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -160,6 +193,7 @@ class LoRAMemoryPool:
         self.experts_shared_outer_loras: bool = experts_shared_outer_loras
         self.strict_loading: bool = strict_loading
         self.enable_lora_overlap_loading: bool = enable_lora_overlap_loading
+        self.lora_no_cpu_backup: bool = lora_no_cpu_backup
         self.pin_memory_available: bool = is_pin_memory_available()
 
         # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
@@ -571,10 +605,7 @@ class LoRAMemoryPool:
             cfg = base_model.config
             if hasattr(cfg, "get_text_config"):
                 cfg = cfg.get_text_config()
-            has_shared_experts = (
-                hasattr(cfg, "shared_expert_intermediate_size")
-                and cfg.shared_expert_intermediate_size > 0
-            ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
+            has_shared_experts = _has_shared_experts(cfg)
             has_moe = self._has_moe_module(base_model)
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
@@ -792,6 +823,15 @@ class LoRAMemoryPool:
             # Select victim using eviction policy
             victim_uid = self.eviction_policy.select_victim(candidates_to_use)
 
+            if victim_uid is not None and self.lora_no_cpu_backup:
+                raise RuntimeError(
+                    f"Refusing to evict LoRA adapter '{victim_uid}': "
+                    "--lora-no-cpu-backup releases CPU weights after "
+                    "installation, so an evicted adapter could never be "
+                    "reloaded. Increase --max-loras-per-batch or disable "
+                    "--lora-no-cpu-backup."
+                )
+
             # Evict the selected victim
             victim_buffer_id = self.uid_to_buffer_id[victim_uid]
             self.uid_to_buffer_id.pop(victim_uid)
@@ -820,6 +860,8 @@ class LoRAMemoryPool:
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                if self.lora_no_cpu_backup and lora_adapter is not None:
+                    lora_adapter.release_cpu_weights()
 
     def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
         """Make an evicted slot safe for graph-captured base-model replay."""
@@ -875,6 +917,11 @@ class LoRAMemoryPool:
             return
 
         assert lora_adapter is not None
+        assert not lora_adapter.weights_released, (
+            f"LoRA adapter '{uid}' CPU weights were already released "
+            "(--lora-no-cpu-backup); it cannot be installed into the memory "
+            "pool again."
+        )
         lora_rank = lora_adapter.config.r
 
         # Pre-validate weight names against target modules across all layers
@@ -976,19 +1023,25 @@ class LoRAMemoryPool:
                 elif expert_match:
                     # Per-expert MoE weight — 2D tensors, one per expert
                     target_module = target_module + "_moe"
-                    if temp_A_buffer[target_module] is None:
-                        temp_A_buffer[target_module] = {}
-                        temp_B_buffer[target_module] = {}
-                        temp_A_cache_keys[target_module] = {}
-                        temp_B_cache_keys[target_module] = {}
-
                     expert_id = int(expert_match.group(1))
                     if "lora_A" in name:
-                        temp_A_buffer[target_module][expert_id] = weights
-                        temp_A_cache_keys[target_module][expert_id] = name
+                        _set_expert_weight(
+                            temp_A_buffer,
+                            temp_A_cache_keys,
+                            target_module,
+                            expert_id,
+                            weights,
+                            name,
+                        )
                     else:
-                        temp_B_buffer[target_module][expert_id] = weights
-                        temp_B_cache_keys[target_module][expert_id] = name
+                        _set_expert_weight(
+                            temp_B_buffer,
+                            temp_B_cache_keys,
+                            target_module,
+                            expert_id,
+                            weights,
+                            name,
+                        )
                 elif "experts" in name and weights.dim() == 3:
                     # Shared outer MoE weight — 3D tensor [expert_dim, rank, hidden]
                     target_module = target_module + "_moe"

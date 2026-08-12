@@ -216,14 +216,19 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         fused Triton kernel (TritonRunnerCoreWithLoRA) regardless of which
         dense LoRA backend is selected.
         """
-        base = moe_layer.base_layer
-        top_k = base.top_k
-        qinfo = moe_layer._quant_info
-        E, N, _ = qinfo.w13_weight.shape
-        hidden_dim = qinfo.w2_weight.shape[1]
-        device = qinfo.w13_weight.device
+        config = moe_layer.base_layer.moe_runner_config
+        assert config.top_k is not None
+        assert config.hidden_size is not None
+        assert config.intermediate_size_per_partition is not None
+        assert config.num_experts is not None
+
+        top_k = config.top_k
+        hidden_dim = config.hidden_size
+        intermediate_dim = config.intermediate_size_per_partition
+        gate_up_dim = intermediate_dim * (2 if config.is_gated else 1)
+        device = self.device
         dtype = compute_dtype
-        num_experts = base.num_experts
+        num_experts = config.num_experts
 
         block_size_m = 64
         max_num_tokens_padded = max_bs * top_k + num_experts * (block_size_m - 1)
@@ -234,10 +239,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         self.moe_cg_buffers = {
             "intermediate_cache1": torch.empty(
-                (max_bs, top_k, N), device=device, dtype=dtype
+                (max_bs, top_k, gate_up_dim), device=device, dtype=dtype
             ),
             "intermediate_cache2": torch.empty(
-                (max_bs * top_k, N // 2), device=device, dtype=dtype
+                (max_bs * top_k, intermediate_dim), device=device, dtype=dtype
             ),
             "intermediate_cache3": torch.empty(
                 (max_bs, top_k, hidden_dim), device=device, dtype=dtype

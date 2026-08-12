@@ -267,6 +267,18 @@ class TestPostprocessTensors(CustomTestCase):
             [("weird.cos_sin_cache.foo.bar", False, RawComparable(t))],
         )
 
+    def test_skip_set_marks_quantized_entry_not_compared(self):
+        qweight, sf_fp32, _ = _build_fp8_quant_pair()
+        raw = {"x.weight": qweight, "x.weight_scale_inv": sf_fp32}
+        quantized_set = {
+            "x.weight": QuantizedWeight(Fp8BlockComparable, "x.weight_scale_inv")
+        }
+        ref = Fp8BlockComparable(qweight, sf_fp32)
+        _assert_entries_close(
+            _build_check_entries(raw, {"x.weight"}, quantized_set),
+            [("x.weight", False, ref)],
+        )
+
     # --- fp8 quant pair (real dequant on real fp8 tensors) ---
 
     def test_fp8_quant_pair_yields_lazy_pair(self):

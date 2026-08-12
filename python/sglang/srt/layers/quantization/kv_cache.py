@@ -65,7 +65,7 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             # If we find a single kv_scale in the checkpoint, we remap
             # kv_scale to k_scale during weight loading, and duplicate
             # k_scale to v_scale here
-            assert layer.k_scale > 0.0
+            assert layer.k_scale > 0.0, f"{layer.k_scale=} {layer.v_scale=}"
             scale_to_duplicate = max(layer.k_scale, layer.v_scale)
             k_scale = scale_to_duplicate.to("cpu").tolist()
             v_scale = scale_to_duplicate.to("cpu").tolist()

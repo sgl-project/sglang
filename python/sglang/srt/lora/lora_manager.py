@@ -16,7 +16,6 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-import re
 from typing import Dict, Iterable, List, Optional
 
 import torch
@@ -101,6 +100,7 @@ class LoRAManager:
         self.lora_strict_loading: bool = getattr(
             server_args, "lora_strict_loading", False
         )
+        self.lora_no_cpu_backup: bool = server_args.lora_no_cpu_backup
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -267,9 +267,19 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
-    def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
+    def validate_new_adapter(
+        self,
+        lora_config: LoRAConfig,
+        lora_ref: LoRARef,
+        is_update: bool = False,
+        old_ref: Optional[LoRARef] = None,
+    ):
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
+
+        For an in-place refresh (``is_update``), pass the currently-loaded ref as
+        ``old_ref`` so checks that count loaded adapters exclude the adapter's
+        own current state.
         """
         if lora_config.lora_added_tokens_size > 0:
             raise ValueError(
@@ -281,18 +291,19 @@ class LoRAManager:
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
-        # Check if this LoRA adapter is already loaded
-        for existing_lora_ref in self.lora_refs.values():
-            if lora_ref.lora_name == existing_lora_ref.lora_name:
-                raise ValueError(
-                    f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
-                )
+        # Reject duplicates unless refreshing an existing adapter in place.
+        if not is_update:
+            for existing_lora_ref in self.lora_refs.values():
+                if lora_ref.lora_name == existing_lora_ref.lora_name:
+                    raise ValueError(
+                        f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+                    )
 
-            if lora_ref.lora_path == existing_lora_ref.lora_path:
-                logger.warning(
-                    f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
-                    f"but another copy is being loaded with name: {lora_ref.lora_name}"
-                )
+                if lora_ref.lora_path == existing_lora_ref.lora_path:
+                    logger.warning(
+                        f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
+                        f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                    )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
@@ -305,7 +316,13 @@ class LoRAManager:
             )
 
         # Ensure pinned LoRA adapters does not exceed maximal limit or cause starvation.
-        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
+        # On an in-place refresh the adapter's own pin is already counted in
+        # num_pinned_loras; refreshing occupies no additional pinned slot, so
+        # exclude it or a pinned adapter at the limit could never be refreshed.
+        num_other_pinned_loras = self.num_pinned_loras
+        if is_update and old_ref is not None:
+            num_other_pinned_loras -= int(bool(old_ref.pinned))
+        if lora_ref.pinned and num_other_pinned_loras >= self.max_loras_per_batch - 1:
             raise ValueError(
                 f"Failed to load LoRA adapter {lora_ref.lora_name} as a pinned adapter. It is not allowed to pin all slots "
                 "in the LoRA memory pool to avoid starvation for unpinned adapters and base models. Please increase your "
@@ -594,6 +611,17 @@ class LoRAManager:
         # LoRA adapter weights cached in CPU memory, indexed by LoRA ID.
         self.loras: Dict[str, LoRAAdapter] = {}
 
+        self.pending_tensor_loras: Dict[
+            str,
+            tuple[
+                LoRARef,
+                LoRAConfig,
+                LoRAAdapter,
+                Dict,
+                Optional[Dict],
+            ],
+        ] = {}
+
         # Mapping from LoRA ID to LoRARef object.
         self.lora_refs: Dict[str, LoRARef] = {}
 
@@ -621,27 +649,18 @@ class LoRAManager:
         """
         shared_outer: Optional[bool] = None
         for adapter_id, adapter in self.loras.items():
-            for layer in adapter.layers:
-                for name, weight in layer.weights.items():
-                    if "gate_up_proj" not in name or "lora_A" not in name:
-                        continue
-                    if weight.dim() == 3:
-                        is_shared = weight.shape[0] == 1
-                    elif re.search(r"(?:shared_)?experts\.\d+\.", name):
-                        # Per-expert adapters keep numbered 2D expert weights;
-                        # they must count against the layout agreement too.
-                        is_shared = False
-                    else:
-                        continue
-                    if shared_outer is None:
-                        shared_outer = is_shared
-                    elif shared_outer != is_shared:
-                        raise RuntimeError(
-                            "Mixed shared-outer LoRA formats detected across "
-                            f"loaded adapters (conflict in adapter '{adapter_id}'). "
-                            "All MoE adapters must either all use shared outer "
-                            "experts (expert_dim=1) or all use per-expert weights."
-                        )
+            is_shared = adapter.scan_shared_outer_gate_up()
+            if is_shared is None:
+                continue
+            if shared_outer is None:
+                shared_outer = is_shared
+            elif shared_outer != is_shared:
+                raise RuntimeError(
+                    "Mixed shared-outer LoRA formats detected across "
+                    f"loaded adapters (conflict in adapter '{adapter_id}'). "
+                    "All MoE adapters must either all use shared outer "
+                    "experts (expert_dim=1) or all use per-expert weights."
+                )
         return bool(shared_outer) if shared_outer is not None else False
 
     def init_lora_shapes(
@@ -786,16 +805,25 @@ class LoRAManager:
         """
         Load the weights of a LoRA adapter from tensors to CPU memory.
         """
+        self.loras[lora_ref.lora_id] = self._create_lora_adapter_from_tensors(
+            lora_ref, self.configs[lora_ref.lora_id], tensors
+        )
+
+    def _create_lora_adapter_from_tensors(
+        self, lora_ref: LoRARef, config: LoRAConfig, tensors: Dict[str, torch.Tensor]
+    ) -> LoRAAdapter:
+        """Build and initialize a LoRAAdapter without touching served state,
+        so callers can stage it and commit only after every fallible step."""
         lora_adapter = LoRAAdapter(
             lora_ref.lora_id,
-            self.configs[lora_ref.lora_id],
+            config,
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
             base_model=self.base_model,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
-        self.loras[lora_ref.lora_id] = lora_adapter
+        return lora_adapter
 
     def load_lora_adapter_from_tensors(
         self,
@@ -803,10 +831,20 @@ class LoRAManager:
         tensors: Dict[str, torch.Tensor],
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
+        *,
+        upsert: bool = False,
+        is_first_chunk: bool = True,
+        is_last_chunk: bool = True,
     ) -> LoRAUpdateOutput:
         logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
         result = self._load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
+            upsert=upsert,
+            is_first_chunk=is_first_chunk,
+            is_last_chunk=is_last_chunk,
         )
         logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
         return result
@@ -817,35 +855,152 @@ class LoRAManager:
         tensors: Dict[str, torch.Tensor],
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
+        *,
+        upsert: bool = False,
+        is_first_chunk: bool = True,
+        is_last_chunk: bool = True,
     ) -> LoRAUpdateOutput:
         """
-        Load a single LoRA adapter from tensors and config dict.
+        Load one chunk of a LoRA adapter from tensors and config dict.
+
+        Chunks of one adapter arrive in order under a single pending transfer;
+        served state mutates only once the last chunk lands. With ``upsert``,
+        an already-loaded adapter has its weights refreshed in place (reusing
+        its lora_id); otherwise the adapter must not be loaded yet.
         """
         assert (
             lora_ref.lora_name is not None and lora_ref.lora_path is not None
         ), "LoRARef must have both lora_name and lora_path set for loading."
-        assert (
-            lora_ref.lora_id not in self.loras
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        is_update = upsert and (lora_ref.lora_id in self.loras)
+        if not is_update and is_first_chunk:
+            assert (
+                lora_ref.lora_id not in self.loras
+            ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
+        uid = lora_ref.lora_id
+        old_config = self.configs.get(uid)
+        old_lora = self.loras.get(uid)
+        old_ref = self.lora_refs.get(uid)
+
+        # Stage every fallible step before mutating served state: a failed
+        # request must not leave a live adapter with new metadata over old
+        # weights (or leak unreachable entries on a fresh insert).
         try:
-            new_adapter = LoRAConfig.from_dict(
-                config_dict,
-                added_tokens_config,
-                base_vocab_size=self.base_hf_config.vocab_size,
-            )
-            self.validate_new_adapter(new_adapter, lora_ref)
-            self.configs[lora_ref.lora_id] = new_adapter
+            if is_first_chunk:
+                assert uid not in self.pending_tensor_loras, (
+                    f"LoRA adapter with ID {uid} already has a "
+                    "pending tensor transfer"
+                )
+                new_config = LoRAConfig.from_dict(
+                    config_dict,
+                    added_tokens_config,
+                    base_vocab_size=self.base_hf_config.vocab_size,
+                )
+                self.validate_new_adapter(
+                    new_config, lora_ref, is_update=is_update, old_ref=old_ref
+                )
+                new_lora = LoRAAdapter(
+                    uid,
+                    new_config,
+                    self.base_hf_config,
+                    self.load_config,
+                    self.lora_backend,
+                    base_model=self.base_model,
+                )
+                self.pending_tensor_loras[uid] = (
+                    lora_ref,
+                    new_config,
+                    new_lora,
+                    config_dict,
+                    added_tokens_config,
+                )
+            else:
+                assert (
+                    uid in self.pending_tensor_loras
+                ), f"LoRA adapter with ID {uid} has no pending tensor transfer"
 
-            self.load_lora_weights_from_tensors(lora_ref, tensors)
+            (
+                pending_ref,
+                new_config,
+                new_lora,
+                expected_config,
+                expected_added_tokens,
+            ) = self.pending_tensor_loras[uid]
+            assert (
+                config_dict == expected_config
+            ), "LoRA config changed between tensor chunks"
+            assert (
+                added_tokens_config == expected_added_tokens
+            ), "LoRA added-token config changed between tensor chunks"
+            new_lora.load_weights_from_tensors_chunk(tensors)
 
-            self.lora_refs[lora_ref.lora_id] = lora_ref
-            self.num_pinned_loras += int(lora_ref.pinned)
+            if not is_last_chunk:
+                return self.create_lora_update_result(success=True)
+
+            new_lora.finalize_weights_from_tensors()
+            del self.pending_tensor_loras[uid]
+            lora_ref = pending_ref
         except Exception as e:
+            self.pending_tensor_loras.pop(lora_ref.lora_id, None)
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),
             )
+
+        self.configs[uid] = new_config
+        self.loras[uid] = new_lora
+
+        if (
+            is_update
+            and getattr(self, "memory_pool", None) is not None
+            and uid in self.memory_pool.uid_to_buffer_id
+        ):
+            buffer_id = self.memory_pool.uid_to_buffer_id[uid]
+            try:
+                # The served buffer slot is rewritten in place. Wait for
+                # already-launched kernels first: under overlap scheduling /
+                # CUDA-graph replay a forward pass can still be executing on
+                # another stream, and it must not read a half-rewritten slot.
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                self.memory_pool.load_lora_weight_to_buffer(
+                    uid,
+                    buffer_id,
+                    new_lora,
+                    self.lora_modules,
+                    self.embed_tokens_module,
+                    self.lm_head_module,
+                )
+            except Exception as e:
+                # Roll back so the adapter keeps serving its previous weights
+                # instead of a torn half-old/half-new buffer.
+                self.configs[uid] = old_config
+                self.loras[uid] = old_lora
+                try:
+                    self.memory_pool.load_lora_weight_to_buffer(
+                        uid,
+                        buffer_id,
+                        old_lora,
+                        self.lora_modules,
+                        self.embed_tokens_module,
+                        self.lm_head_module,
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Failed to restore previous weights for LoRA adapter "
+                        f"{lora_ref.lora_name} (buffer slot {buffer_id}) after a "
+                        "failed upsert; the served buffer may be corrupted."
+                    )
+                return self.create_lora_update_result(
+                    success=False,
+                    error_message=str(e),
+                )
+
+        self.lora_refs[uid] = lora_ref
+        # An upsert may change ``pinned``; track the delta against the replaced
+        # ref so the counter stays consistent with lora_refs.
+        old_pinned = int(bool(old_ref.pinned)) if is_update else 0
+        self.num_pinned_loras += int(bool(lora_ref.pinned)) - old_pinned
 
         return self.create_lora_update_result(success=True)
 
@@ -866,6 +1021,7 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            lora_no_cpu_backup=self.lora_no_cpu_backup,
         )
 
         # Initializing memory pool with base model
@@ -885,6 +1041,8 @@ class LoRAManager:
 
         self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
         self.lm_head_module: Optional[BaseLayerWithLoRA] = None
+        # One MoE layer's worth of warning is enough; the condition is model-wide.
+        warned_one_sided_moe_targets = False
 
         # When tie_word_embeddings=True, lm_head is the same Python object as
         # embed_tokens. PyTorch's named_modules() deduplicates by object identity,
@@ -976,9 +1134,36 @@ class LoRAManager:
                 )
                 continue
 
-            if isinstance(module, (FusedMoE, InklingBatchDenseMLP)) and all(
-                x in self.target_modules for x in ["gate_up_proj", "down_proj"]
-            ):
+            if isinstance(module, (FusedMoE, InklingBatchDenseMLP)):
+                expert_projections = ("gate_up_proj", "down_proj")
+                missing = [
+                    x for x in expert_projections if x not in self.target_modules
+                ]
+                if len(missing) == 1 and not warned_one_sided_moe_targets:
+                    warned_one_sided_moe_targets = True
+                    # The MoE-LoRA hooks inject a delta after gate_up and after
+                    # down together, so wrapping for only one of them is not
+                    # implemented and the layer stays unwrapped. Adapters that only
+                    # train the dense/shared MLP still work, but one that carries
+                    # expert weights for the targeted projection has them loaded
+                    # into the pool and never applied. Warn once -- silently
+                    # dropping part of an adapter reads as a serving/training
+                    # mismatch with no symptom.
+                    present = next(x for x in expert_projections if x != missing[0])
+                    logger.warning(
+                        "LoRA target modules include %r but not %r, so MoE expert layers "
+                        "(e.g. %s) get no adapter at all: expert LoRA needs both projections. "
+                        "Any %r expert weights in a loaded adapter will be ignored. Add %r to "
+                        "the target modules to enable expert LoRA -- an adapter that does not "
+                        "train it keeps zero-filled buffers and contributes no delta.",
+                        present,
+                        missing[0],
+                        module_name,
+                        present,
+                        missing[0],
+                    )
+                if missing:
+                    continue
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     # FusedMoE submodules outside the decoder layer hierarchy

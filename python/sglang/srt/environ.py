@@ -1354,6 +1354,12 @@ class Envs:
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
+    # Compute the MoE router GEMM with an fp32 output instead of rounding the
+    # logits to bf16. Megatron trains these models with --moe-router-dtype fp32,
+    # and a bf16 rounding step is large enough (~0.25 absolute on these logits)
+    # to reorder near-tied experts, which changes the expert set for a
+    # noticeable fraction of tokens; RL runs need the two sides to route alike.
+    SGLANG_MOE_ROUTER_FP32 = EnvBool(False)
     # Qwen3.5 experimental integration for FlashInfer's MNNVL CuTe DSL
     # AllReduce-fusion backend. One switch enables deferred MoE finalize and
     # ordinary AR + residual + RMSNorm in decode and prefill.

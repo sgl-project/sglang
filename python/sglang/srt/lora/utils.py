@@ -164,7 +164,9 @@ def get_default_hidden_dim(
         moe_freq = getattr(config, "moe_layer_freq", 1)
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
             moe_inter = getattr(config, "moe_intermediate_size", None)
-            n_shared = getattr(config, "n_shared_experts", None)
+            n_shared = getattr(config, "n_shared_experts", None) or getattr(
+                config, "num_shared_experts", None
+            )
             if moe_inter is not None and n_shared is not None:
                 inter = moe_inter * n_shared
         return config.hidden_size, inter * 2
@@ -174,7 +176,9 @@ def get_default_hidden_dim(
         moe_freq = getattr(config, "moe_layer_freq", 1)
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
             moe_inter = getattr(config, "moe_intermediate_size", None)
-            n_shared = getattr(config, "n_shared_experts", None)
+            n_shared = getattr(config, "n_shared_experts", None) or getattr(
+                config, "num_shared_experts", None
+            )
             if moe_inter is not None and n_shared is not None:
                 inter = moe_inter * n_shared
         return inter, config.hidden_size
@@ -216,12 +220,18 @@ def get_default_hidden_dim(
         moe_inter = (
             getattr(config, "moe_intermediate_size", None) or config.intermediate_size
         )
-        return config.hidden_size, moe_inter * 2
+        moe_hidden = (
+            getattr(config, "routed_expert_hidden_size", None) or config.hidden_size
+        )
+        return moe_hidden, moe_inter * 2
     elif module_name == "down_proj_moe":
         moe_inter = (
             getattr(config, "moe_intermediate_size", None) or config.intermediate_size
         )
-        return moe_inter, config.hidden_size
+        moe_hidden = (
+            getattr(config, "routed_expert_hidden_size", None) or config.hidden_size
+        )
+        return moe_inter, moe_hidden
     elif module_name == "embed_tokens":
         # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
         # if contain extra tokens will be added; otherwise is 0.
@@ -261,6 +271,8 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "in_proj_b": "in_proj_ba",
+        "in_proj_a": "in_proj_ba",
         "out_proj": "out_proj",
         "embed_tokens": "embed_tokens",
         "vocab_emb": "embed_tokens",
@@ -299,6 +311,7 @@ def get_stacked_multiply(
     stacked_rank = {
         "qkv_proj": 3,
         "in_proj_qkvz": 4,  # GDN packed input projection
+        "in_proj_ba": 2,  # GDN packed b/a input projection
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
         "gate_up_proj_shared_moe": 2,
@@ -378,6 +391,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
         "up_proj",
         "gate_up_proj",
         "down_proj",

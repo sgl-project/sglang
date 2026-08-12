@@ -92,6 +92,14 @@ class LoRAAdapter(nn.Module):
         self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
         self.pinned_added_tokens_embeddings: Dict[str, torch.Tensor] = {}
 
+        # --lora-no-cpu-backup: set once the CPU weight copies have been
+        # released after memory-pool installation. A released adapter can
+        # never be (re)installed into a pool slot.
+        self.weights_released: bool = False
+        # Shared-outer detection result cached before release so
+        # LoRAManager._detect_shared_outer_loras keeps working afterwards.
+        self.shared_outer_gate_up: Optional[bool] = None
+
     @staticmethod
     def _build_moe_gated_map(base_model: torch.nn.Module) -> Dict[int, bool]:
         """Map layer_id -> moe_runner_config.is_gated for FusedMoE base layers.
@@ -156,9 +164,14 @@ class LoRAAdapter(nn.Module):
         self._normalize_weights()
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
+        self.load_weights_from_tensors_chunk(tensors)
+        self.finalize_weights_from_tensors()
+
+    def load_weights_from_tensors_chunk(self, tensors: Dict[str, torch.Tensor]):
         for name, tensor in tensors.items():
             self._process_weight(name, tensor)
 
+    def finalize_weights_from_tensors(self):
         self._normalize_weights()
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
@@ -210,6 +223,8 @@ class LoRAAdapter(nn.Module):
             self._normalize_in_proj(layer.weights)
             # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers
             self._normalize_in_proj_qkvz(layer.weights)
+            # Stack in_proj_b + in_proj_a → in_proj_ba for GDN layers
+            self._normalize_in_proj_ba(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
@@ -450,6 +465,25 @@ class LoRAAdapter(nn.Module):
                 weights.pop(k_name)
                 weights.pop(v_name)
                 weights.pop(z_name)
+            elif "in_proj_qkv." in weight_name:
+                # 2-way split (Megatron-Bridge adapter export): in_proj_qkv
+                # covers the q|k|v rows and in_proj_z the z rows, with one
+                # shared lora_A. The stacked buffer expects one A block per
+                # slice, so repeat the qkv A block 3x (q, k, v) before
+                # appending the z block; B rows concatenate directly.
+                z_name = weight_name.replace("in_proj_qkv.", "in_proj_z.")
+                if z_name not in weights:
+                    continue
+                qkvz_name = weight_name.replace("in_proj_qkv.", "in_proj_qkvz.")
+                cat_dim = weights[weight_name].dim() - 2
+                qkv_w = weights[weight_name]
+                if "lora_A" in weight_name:
+                    repeat_dims = [1] * qkv_w.dim()
+                    repeat_dims[cat_dim] = 3
+                    qkv_w = qkv_w.repeat(*repeat_dims)
+                weights[qkvz_name] = torch.cat((qkv_w, weights[z_name]), cat_dim)
+                weights.pop(weight_name)
+                weights.pop(z_name)
             elif "in_proj_qkvz" in weight_name and "lora_A" in weight_name:
                 # Already-merged adapter: replicate the shared A across the 4
                 # stacked slots the buffer expects (q, k, v, z).
@@ -458,6 +492,45 @@ class LoRAAdapter(nn.Module):
                 repeat_dims[ndim - 2] = 4
                 weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
             # else (in_proj_qkvz lora_B, or unrelated): no-op.
+
+    def _normalize_in_proj_ba(self, weights: Dict[str, torch.Tensor]):
+        """Normalize in_proj_ba weights for GDN (GatedDeltaNet) layers like
+        Qwen3.5.
+
+        Two adapter formats are handled:
+
+        1. Split: ``in_proj_b + in_proj_a`` (HF checkpoint naming, also the
+           Megatron-Bridge adapter export) are present as separate weights →
+           concatenate them into ``in_proj_ba`` (B rows b|a; A blocks b, a).
+
+        2. Already-merged: the adapter has a single ``in_proj_ba`` weight
+           (PEFT trained against SGLang's fused Linear). The stacked buffer
+           expects two per-slice ``A`` blocks, so repeat ``lora_A`` 2x along
+           the rank dim. ``lora_B`` is already full-output-dim and matches
+           the buffer directly.
+        """
+        for weight_name in list(weights.keys()):
+            # NB: match with the trailing dot so the merged "in_proj_ba."
+            # names don't take the split branch.
+            if "in_proj_b." in weight_name:
+                a_name = weight_name.replace("in_proj_b.", "in_proj_a.")
+                if a_name not in weights:
+                    continue
+                ba_name = weight_name.replace("in_proj_b.", "in_proj_ba.")
+                cat_dim = weights[weight_name].dim() - 2
+                weights[ba_name] = torch.cat(
+                    (weights[weight_name], weights[a_name]), cat_dim
+                )
+                weights.pop(weight_name)
+                weights.pop(a_name)
+            elif "in_proj_ba" in weight_name and "lora_A" in weight_name:
+                # Already-merged adapter: replicate the shared A across the 2
+                # stacked slots the buffer expects (b, a).
+                ndim = weights[weight_name].dim()
+                repeat_dims = [1] * ndim
+                repeat_dims[ndim - 2] = 2
+                weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
+            # else (in_proj_ba lora_B, or unrelated): no-op.
 
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
@@ -526,6 +599,49 @@ class LoRAAdapter(nn.Module):
             weights.pop(q_a_name)
             if kv_a_name in weights:
                 weights.pop(kv_a_name)
+
+    def scan_shared_outer_gate_up(self) -> Optional[bool]:
+        """Return whether the adapter's gate_up lora_A is shared-outer
+        (3D expert_dim=1 -> True), per-expert (numbered 2D expert weights ->
+        False), or None if the adapter has no gate_up lora_A. Cached here so
+        LoRAManager._detect_shared_outer_loras still works after the CPU weight
+        copies are freed under --lora-no-cpu-backup."""
+        if self.weights_released:
+            return self.shared_outer_gate_up
+        result: Optional[bool] = None
+        for layer in self.layers:
+            for name, weight in layer.weights.items():
+                if "gate_up_proj" not in name or "lora_A" not in name:
+                    continue
+                if weight.dim() == 3:
+                    is_shared = weight.shape[0] == 1
+                elif re.search(r"(?:shared_)?experts\.\d+\.", name):
+                    # Per-expert adapters keep numbered 2D expert weights;
+                    # they must count against the layout agreement too.
+                    is_shared = False
+                else:
+                    continue
+                if result is None:
+                    result = is_shared
+                elif result != is_shared:
+                    raise RuntimeError(
+                        "Mixed shared-outer LoRA formats within a single "
+                        "adapter's gate_up lora_A weights."
+                    )
+        return result
+
+    def release_cpu_weights(self):
+        """Free the CPU weight copies after memory-pool installation
+        (--lora-no-cpu-backup). The adapter cannot be installed again."""
+        self.shared_outer_gate_up = self.scan_shared_outer_gate_up()
+        for layer in self.layers:
+            layer.weights.clear()
+            layer.pinned_weights.clear()
+        self.embedding_layers.clear()
+        self.pinned_embedding_layers.clear()
+        self.added_tokens_embeddings.clear()
+        self.pinned_added_tokens_embeddings.clear()
+        self.weights_released = True
 
     def pin_weights_in_cpu(self):
         for layer in self.layers:

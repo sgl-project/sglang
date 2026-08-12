@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -84,6 +84,7 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -168,6 +169,11 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.model_executor.runner_utils import make_war_read_done_event
+from sglang.srt.model_loader.loader import (
+    post_load_weights,
+    postprocess_weight,
+    restore_weight,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -1223,11 +1229,82 @@ class ModelRunner:
         return self.lora_manager.load_lora_adapter(lora_ref)
 
     def load_lora_adapter_from_tensors(
-        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
+        self,
+        lora_ref: LoRARef,
+        tensors,
+        config_dict,
+        added_tokens_config=None,
+        *,
+        upsert: bool = False,
+        is_first_chunk: bool = True,
+        is_last_chunk: bool = True,
     ):
-        return self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
+        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
+        result = self.lora_manager.load_lora_adapter_from_tensors(
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
+            upsert=upsert,
+            is_first_chunk=is_first_chunk,
+            is_last_chunk=is_last_chunk,
         )
+        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
+        return result
+
+    def load_lora_adapter_from_distributed(
+        self,
+        lora_ref: LoRARef,
+        names,
+        dtypes,
+        shapes,
+        config_dict,
+        group_name,
+        added_tokens_config=None,
+        upsert: bool = False,
+    ):
+        """Load a new lora adapter whose weights are broadcast over the
+        `_model_update_group` process group (no CUDA IPC).
+        """
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        logger.info(f"LoRA adapter loading from distributed starts: {lora_ref}.")
+        try:
+            tensors = {}
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        weight,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                tensors[name] = weight
+            for handle in handles:
+                handle.wait()
+        except Exception as e:
+            error_msg = f"Failed to receive LoRA adapter weights from distributed: {e}."
+            logger.error(error_msg)
+            return LoRAUpdateOutput(success=False, error_message=error_msg)
+
+        result = self.lora_manager.load_lora_adapter_from_tensors(
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
+            upsert=upsert,
+        )
+        logger.info(f"LoRA adapter loading from distributed completes: {lora_ref}.")
+        return result
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
@@ -1776,9 +1853,29 @@ class ModelRunner:
             forward_batch.token_ids_logprobs,
         )
 
-    def check_weights(self, action: str, allow_quant_error: bool = False):
+    def begin_weight_update(self) -> None:
+        """Begin a weight-update session: restore in-place-packed weights to a
+        loadable state (no-op for schemes that don't repack)."""
+        restore_weight(self.model, torch.device(self.device))
+
+    def end_weight_update(self, run_post_load: bool) -> None:
+        """End the weight-update session: optionally run model.post_load_weights
+        (when load_weights was bypassed this session, e.g. P2P/RDMA), then finalize
+        quantized weights into kernel layout."""
+        if run_post_load:
+            post_load_weights(self.model)
+        postprocess_weight(self.model, torch.device(self.device))
+
+    def check_weights(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+    ):
         return self._weight_checker.handle(
-            action=action, allow_quant_error=allow_quant_error
+            action=action,
+            allow_quant_error=allow_quant_error,
+            skip_tensor_list=skip_tensor_list,
         )
 
     def _expand_eplb_metadata_for_scale(

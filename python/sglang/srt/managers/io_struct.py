@@ -1689,6 +1689,9 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # Which model runners to update: "target" (target model only), "draft" (draft
+    # worker(s) only), or "all" (default).
+    selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
@@ -1715,8 +1718,9 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Optional: Determine whether to disable updating the draft model
-    disable_draft_model: Optional[bool] = None
+    # Which model runners to update: "target" (target model only), "draft" (draft
+    # worker(s) only), or "all" (default).
+    selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
@@ -1864,15 +1868,44 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Open a weight-update session: unpack in-place-quantized weights on the
+    selected runners so fresh weights can be loaded into them."""
+
+    selector: Literal["target", "draft", "all"] = "all"
+
+
+class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class EndWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Close the weight-update session opened by BeginWeightUpdateReqInput."""
+
+
+class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False
+    # Substrings of tensor names to exclude from reset/compare/checksum.
+    skip_tensor_list: Optional[List[str]] = None
+    # Which model runners to update: "target" (target model only), "draft" (draft
+    # worker(s) only), or "all" (default).
+    selector: Literal["target", "draft", "all"] = "all"
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
 # sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
 # name and re-serialized to JSON, so it must stay a {field: value} map.
 class ParallelismInfo(msgspec.Struct, kw_only=True):
+    # Which runner this describes: "target", or a draft role such as "draft" /
+    # "draft_step_0". One entry per runner the checksum covers.
+    role: str
     tp_rank: int
     tp_size: int
     dp_rank: int
@@ -1886,7 +1919,10 @@ class ParallelismInfo(msgspec.Struct, kw_only=True):
 class ChecksumInfo(msgspec.Struct, kw_only=True):
     checksums: Dict[str, str]
     per_gpu_checksum: str
-    parallelism_info: ParallelismInfo
+    # One entry per role the checksum covers: the target model plus, under
+    # speculative decoding, each draft runner. All roles on a rank share the GPU
+    # rank; consumers key off it to merge the shards.
+    parallelism_info: List[ParallelismInfo]
 
 
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
@@ -2152,11 +2188,18 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     # One serialized copy of the adapter tensors per TP rank; each rank
     # deserializes only its own copy. Same normalization conventions as
     # UpdateWeightsFromTensorReqInput.serialized_named_tensors.
-    serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
+    serialized_named_tensors: Annotated[Optional[List[bytes]], Base64Bytes()] = None
+    # Whole-adapter transport: one payload deserialized identically by every
+    # rank. Exactly one of the two transports must be set.
+    serialized_tensors: Optional[str] = None
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, int]] = None
     lora_id: Optional[str] = None
     load_format: Optional[str] = None
+    # If already loaded, refresh weights in place instead of failing.
+    upsert: bool = False
+    is_first_chunk: bool = True
+    is_last_chunk: bool = True
     expected_checksums: Optional[Dict[str, str]] = None
 
     def to_ref(self) -> LoRARef:
@@ -2164,6 +2207,28 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
             lora_id=self.lora_id,
             lora_name=self.lora_name,
             lora_path="__tensor__",
+            pinned=self.pinned,
+        )
+
+
+class LoadLoRAAdapterFromDistributedReqInput(BaseReq, kw_only=True):
+    lora_name: str
+    config_dict: Dict[str, Any]
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    group_name: str = "weight_update_group"
+    pinned: bool = False
+    added_tokens_config: Optional[Dict[str, Any]] = None
+    lora_id: Optional[str] = None
+    # If already loaded, refresh weights in place instead of failing.
+    upsert: bool = False
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path="__distributed__",
             pinned=self.pinned,
         )
 
@@ -2176,7 +2241,7 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
     LoadLoRAAdapterFromTensorsReqOutput
-) = LoRAUpdateOutput
+) = LoadLoRAAdapterFromDistributedReqOutput = LoRAUpdateOutput
 
 
 class BlockReqType(Enum):

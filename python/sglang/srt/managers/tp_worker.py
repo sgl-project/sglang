@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -28,14 +29,13 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -68,6 +68,79 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
+
+_EXPERT_LORA_PATTERN = re.compile(r"\.experts\.(\d+)\.")
+
+
+def _validate_lora_tensor_checksums(
+    tensors: dict[str, torch.Tensor],
+    expected_checksums: dict[str, str],
+    *,
+    tp_rank: int,
+) -> None:
+    import hashlib
+
+    actual_checksums = {
+        name: hashlib.sha256(
+            tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        ).hexdigest()
+        for name, tensor in tensors.items()
+    }
+    expected_names = set(expected_checksums)
+    actual_names = set(actual_checksums)
+    mismatches = sorted(
+        name
+        for name in expected_names & actual_names
+        if expected_checksums[name] != actual_checksums[name]
+    )
+    missing = sorted(expected_names - actual_names)
+    extra = sorted(actual_names - expected_names)
+    if mismatches or missing or extra:
+        raise RuntimeError(
+            f"[LORA-CHECK] rank{tp_rank} adapter sync mismatch: "
+            f"value_diff={mismatches[:5]}, missing={missing[:5]}, extra={extra[:5]}"
+        )
+    logger.info(
+        "[LORA-CHECK] rank%d adapter sync OK: %d tensors match (sha256)",
+        tp_rank,
+        len(expected_checksums),
+    )
+
+
+def _filter_lora_experts_for_ep_rank(
+    tensors: dict[str, torch.Tensor],
+    *,
+    num_experts: int,
+    ep_rank: int,
+    ep_size: int,
+) -> dict[str, torch.Tensor]:
+    assert num_experts % ep_size == 0, (
+        f"LoRA expert filtering requires an even EP split, got "
+        f"{num_experts} experts across {ep_size} ranks"
+    )
+    num_local_experts = num_experts // ep_size
+    first_expert = ep_rank * num_local_experts
+    last_expert = first_expert + num_local_experts
+
+    def is_local(name: str) -> bool:
+        match = _EXPERT_LORA_PATTERN.search(name)
+        return match is None or first_expert <= int(match.group(1)) < last_expert
+
+    return {name: tensor for name, tensor in tensors.items() if is_local(name)}
+
+
+def _get_num_experts(hf_config) -> int:
+    if hasattr(hf_config, "num_experts") and hf_config.num_experts is not None:
+        return hf_config.num_experts
+    if (
+        hasattr(hf_config, "n_routed_experts")
+        and hf_config.n_routed_experts is not None
+    ):
+        return hf_config.n_routed_experts
+    raise AttributeError(
+        "Cannot filter expert LoRA tensors because the model config has neither "
+        "num_experts nor n_routed_experts"
+    )
 
 
 class BaseTpWorker(ABC):
@@ -181,36 +254,6 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        success, message = (
-            self.model_runner.weight_updater.update_weights_from_distributed(
-                recv_req.names,
-                recv_req.dtypes,
-                recv_req.shapes,
-                recv_req.group_name,
-                recv_req.load_format,
-            )
-        )
-        return success, message
-
-    def _deserialize_own_rank(self, serialized_named_tensors):
-        """Each rank deserializes only its own payload (index ps.tp_rank);
-        deserializing another rank's copy would break producer-side CUDA-IPC
-        refcounting."""
-        monkey_patch_torch_reductions()
-        return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[self.ps.tp_rank]
-        )
-
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        success, message = self.model_runner.weight_updater.update_weights_from_tensor(
-            named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
-            load_format=recv_req.load_format,
-        )
-        return success, message
-
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""
         success, message = self.model_runner.weight_updater.update_weights_from_ipc(
@@ -232,12 +275,32 @@ class BaseTpWorker(ABC):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
 
+    def _deserialize_own_rank(self, serialized_named_tensors):
+        """Each rank deserializes only its own payload (index ps.tp_rank);
+        deserializing another rank's copy would break producer-side CUDA-IPC
+        refcounting."""
+        monkey_patch_torch_reductions()
+        return MultiprocessingSerializer.deserialize(
+            serialized_named_tensors[self.ps.tp_rank]
+        )
+
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ):
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
         # and slice_lora_b_weights methods (see lora/layers.py and mem_pool.py).
-        data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        if (recv_req.serialized_named_tensors is None) == (
+            recv_req.serialized_tensors is None
+        ):
+            raise ValueError(
+                "Exactly one of serialized_named_tensors / serialized_tensors "
+                "must be set"
+            )
+        if recv_req.serialized_named_tensors is not None:
+            data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        else:
+            monkey_patch_torch_reductions()
+            data = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
         if recv_req.load_format == "flattened_bucket":
             bucket = FlattenedTensorBucket(
                 flattened_tensor=data["flattened_tensor"],
@@ -247,41 +310,45 @@ class BaseTpWorker(ABC):
         else:
             tensors = data
         if recv_req.expected_checksums is not None:
-            import hashlib
-
-            exp = recv_req.expected_checksums
-            mismatch, missing = [], []
-            for name, want in exp.items():
-                if name not in tensors:
-                    missing.append(name)
-                    continue
-                got = hashlib.sha256(
-                    tensors[name]
-                    .detach()
-                    .cpu()
-                    .contiguous()
-                    .flatten()
-                    .view(torch.uint8)
-                    .numpy()
-                    .tobytes()
-                ).hexdigest()
-                if got != want:
-                    mismatch.append(name)
-            extra = [n for n in tensors if n not in exp]
-            if mismatch or missing or extra:
-                raise RuntimeError(
-                    f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
-                    f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
-                    f"{len(extra)} extra {extra[:5]}"
-                )
-            logger.info(
-                f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+            _validate_lora_tensor_checksums(
+                tensors,
+                recv_req.expected_checksums,
+                tp_rank=self.ps.tp_rank,
+            )
+        if self.ps.moe_ep_size > 1 and any(
+            _EXPERT_LORA_PATTERN.search(name) for name in tensors
+        ):
+            tensors = _filter_lora_experts_for_ep_rank(
+                tensors,
+                num_experts=_get_num_experts(
+                    self.model_runner.model_config.hf_text_config
+                ),
+                ep_rank=self.ps.moe_ep_rank,
+                ep_size=self.ps.moe_ep_size,
             )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
             recv_req.config_dict,
             recv_req.added_tokens_config,
+            upsert=recv_req.upsert,
+            is_first_chunk=recv_req.is_first_chunk,
+            is_last_chunk=recv_req.is_last_chunk,
+        )
+        return result
+
+    def load_lora_adapter_from_distributed(
+        self, recv_req: LoadLoRAAdapterFromDistributedReqInput
+    ):
+        result = self.model_runner.load_lora_adapter_from_distributed(
+            recv_req.to_ref(),
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.config_dict,
+            recv_req.group_name,
+            recv_req.added_tokens_config,
+            upsert=recv_req.upsert,
         )
         return result
 
@@ -505,6 +572,11 @@ class TpModelWorker(BaseTpWorker):
     @property
     def model_runner(self) -> ModelRunner:
         return self._model_runner
+
+    def iter_runners(self) -> List[Tuple[str, ModelRunner]]:
+        """(role, runner) pairs this worker owns for weight ops. The target worker
+        owns one runner and uses the empty role so its checksum keys stay unprefixed."""
+        return [("", self._model_runner)]
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter

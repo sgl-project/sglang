@@ -2244,8 +2244,65 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+    # Params process_weights_after_loading mutates in place (backend shuffle /
+    # swizzle / pad / scale collapse). A weight-update session must reset them
+    # to checkpoint-format shapes before fresh weights are loaded.
+    _RESTORABLE_PARAM_NAMES = (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale",
+        "w2_weight_scale",
+        "w13_weight_scale_2",
+        "w2_weight_scale_2",
+    )
+
+    # Calibration constants an RL trainer never re-sends (input scales) plus
+    # params re-derived by every post-load pass (alphas, quant scales): the RL
+    # weight checker must neither poison nor bitwise-compare them.
+    _RL_CHECK_EXEMPT_PARAM_NAMES = (
+        "w13_input_scale",
+        "w2_input_scale",
+        "g1_alphas",
+        "g1_alphas_up",
+        "g2_alphas",
+        "g1_scale_c",
+        "w13_input_scale_quant",
+        "w2_input_scale_quant",
+        "gemm1_clamp_limit",
+        "gemm1_alpha",
+        "gemm1_beta",
+    )
+
+    def _flag_rl_check_exempt_params(self, layer: torch.nn.Module) -> None:
+        for name in self._RL_CHECK_EXEMPT_PARAM_NAMES:
+            param = getattr(layer, name, None)
+            if isinstance(param, torch.nn.Parameter):
+                param._skip_weight_check = True
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Reset weights/scales to their checkpoint-format shapes so the
+        weight loader can write into them again; contents are garbage until
+        the subsequent full load, and process_weights_after_loading re-derives
+        the kernel layout afterwards."""
+        pristine = getattr(layer, "_pristine_param_metas", None)
+        if pristine is None:
+            return
+        for name, (shape, dtype) in pristine.items():
+            param = getattr(layer, name)
+            if tuple(param.shape) != shape or param.dtype != dtype:
+                param.data = torch.empty(shape, dtype=dtype, device=param.device)
+        layer.intermediate_size_per_partition = layer._pristine_intermediate_size
+        layer._w13_deinterleaved = False
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
+        if not hasattr(layer, "_pristine_param_metas"):
+            layer._pristine_param_metas = {
+                name: (tuple(param.shape), param.dtype)
+                for name in self._RESTORABLE_PARAM_NAMES
+                if (param := getattr(layer, name, None)) is not None
+            }
+            layer._pristine_intermediate_size = layer.intermediate_size_per_partition
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
@@ -2290,6 +2347,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_weight_scale_2.contiguous(),
             )
             prepare_moe_nvfp4_layer_for_marlin(layer)
+            self._flag_rl_check_exempt_params(layer)
             return
 
         # Calculate input scales based on strategy
@@ -2554,6 +2612,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     ),
                     requires_grad=False,
                 )
+
+        self._flag_rl_check_exempt_params(layer)
 
     @property
     def load_up_proj_weight_first(self) -> bool:
