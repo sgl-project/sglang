@@ -175,6 +175,29 @@ def _validate_custom_placement_group(pg: PlacementGroup, world_size: int) -> Non
         )
 
 
+def get_scheduler_actor_name(
+    *,
+    pg: PlacementGroup,
+    bundle_idx: int,
+    rank0_node_ip: str,
+    dp_rank: int,
+    pp_rank: int,
+    tp_rank: int,
+) -> str:
+    """Return the Ray actor name RayEngine gives a SchedulerActor.
+
+    The name is fully determined by the placement group, the bundle index and
+    the actor's ranks, so a caller that supplied the placement group can rebuild
+    it and ``ray.get_actor()`` the schedulers instead of scanning
+    ``list_named_actors``.
+    """
+    return (
+        f"sglang_scheduler_node{rank0_node_ip}"
+        f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
+        f"_pg{pg.id.hex()[:8]}_bundle{bundle_idx}"
+    )
+
+
 def _create_scheduler_actor(
     pg: PlacementGroup,
     bundle_idx: int,
@@ -203,10 +226,13 @@ def _create_scheduler_actor(
     return SchedulerActor.options(
         num_cpus=0,
         num_gpus=1,
-        name=(
-            f"sglang_scheduler_node{rank0_node_ip}"
-            f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
-            f"_pg{pg.id.hex()[:8]}_bundle{bundle_idx}"
+        name=get_scheduler_actor_name(
+            pg=pg,
+            bundle_idx=bundle_idx,
+            rank0_node_ip=rank0_node_ip,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
+            tp_rank=tp_rank,
         ),
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=pg,
