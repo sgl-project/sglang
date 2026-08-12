@@ -136,6 +136,14 @@ def _run_sgl_eval(eval_name, args) -> dict:
         cmd += ["--model", args.model]
     if getattr(args, "num_examples", None) is not None:
         cmd += ["--num-examples", str(args.num_examples)]
+    if getattr(args, "top_p", None) is not None:
+        cmd += ["--top-p", str(args.top_p)]
+    # sgl-eval leaves the seed unset by default; a caller that samples
+    # (temperature > 0) has to pin it to get a reproducible run.
+    if getattr(args, "seed", None) is not None:
+        cmd += ["--seed", str(args.seed)]
+    if getattr(args, "repeat", None) is not None:
+        cmd += ["--n-repeats", str(args.repeat)]
     # Bound generation length so long-reasoning models don't stall the eval.
     if getattr(args, "max_tokens", None) is not None:
         cmd += ["--max-tokens", str(args.max_tokens)]
@@ -301,6 +309,11 @@ def run_eval(args):
             args.num_threads,
             response_answer_regex=getattr(args, "response_answer_regex", None),
         )
+    elif args.eval_name == "mmmu_pro_vision":
+        # MMMU-Pro's `vision` config: question and options are rendered into one
+        # screenshot. sgl-eval owns the dataset, prompt and grader for it -- there
+        # is no simple_eval implementation to fall back to.
+        return _run_sgl_eval("mmmu_pro_vision", args)
     elif args.eval_name == "aime25":
         from sglang.test.simple_eval_aime25 import AIME25Eval
 
