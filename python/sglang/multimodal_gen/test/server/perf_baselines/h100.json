@@ -1229,12 +1229,12 @@
         },
         "wan2_2_ti2v_5b": {
             "stages_ms": {
-                "InputValidationStage": 380.0,
+                "InputValidationStage": 706.07,
                 "TextEncodingStage": 328.44,
                 "LatentPreparationStage": 0.13,
                 "TimestepPreparationStage": 2.32,
                 "DenoisingStage": 15171.58,
-                "DecodingStage": 1527.14
+                "DecodingStage": 1100.28
             },
             "denoise_step_ms": {
                 "0": 183.83,

@@ -413,8 +413,8 @@ class Platform:
         return CpuArchEnum.UNSPECIFIED
 
     @classmethod
-    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
-        """Whether to enable DIT layerwise offload by default on the current platform."""
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
         return True
 
     @classmethod
