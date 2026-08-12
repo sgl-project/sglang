@@ -1974,7 +1974,7 @@ class ServerArgs:
     ] = False
     enable_torch_symm_mem: A[
         bool,
-        "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
+        "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. On CUDA, only supports device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8. On Intel XPU, runs a one-shot all-reduce over IPC-mapped peer buffers for payloads up to SGLANG_XPU_SYMM_MEM_MAX_BYTES (world size up to 8, single node) and falls back to oneCCL otherwise.",
         NS("exec.comm"),
     ] = False
     enable_scattered_sconv: A[

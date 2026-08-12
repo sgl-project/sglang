@@ -418,6 +418,9 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.torch_symm_mem import (
             TorchSymmMemCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.xpu_symm_mem import (
+            XpuSymmMemCommunicator,
+        )
         from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
         self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
@@ -479,9 +482,16 @@ class GroupCoordinator:
         elif self.world_size > 1 and is_hip():
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
-        self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
+        self.torch_symm_mem_comm: Optional[
+            Union[TorchSymmMemCommunicator, XpuSymmMemCommunicator]
+        ] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
-            self.torch_symm_mem_comm = TorchSymmMemCommunicator(
+            # XPU has no multimem / one-shot / two-shot symm_mem ops, so it
+            # needs its own communicator with the same call contract.
+            symm_mem_cls = (
+                XpuSymmMemCommunicator if _is_xpu else TorchSymmMemCommunicator
+            )
+            self.torch_symm_mem_comm = symm_mem_cls(
                 group=self.cpu_group,
                 device=self.device,
             )
@@ -662,7 +672,8 @@ class GroupCoordinator:
             # an opaque call and does not decompose it into _c10d_functional primitives
             # (which invoke sycl_event.wait() and break XPU graph capture).
             # Keeps the operation in-place; the all-reduce is performed by
-            # _all_reduce_in_place, which for XPU falls through to
+            # _all_reduce_in_place, which for XPU takes the symmetric-memory
+            # one-shot path for eligible payloads and otherwise falls through to
             # torch.distributed.all_reduce on self.device_group (the same group
             # used by xpu_communicator).
             inplace_all_reduce(input_, group_name=self.unique_name)
