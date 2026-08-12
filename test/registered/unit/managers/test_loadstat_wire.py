@@ -138,6 +138,7 @@ class TestLoadPublisherGating(CustomTestCase):
             "inproc://kv",
             "tcp://somehost",
             "tcp://*:*",
+            "tcp://somehost:-100",
         ):
             with self.subTest(endpoint=endpoint):
                 pub, zmq_pub = self._build(
@@ -146,9 +147,10 @@ class TestLoadPublisherGating(CustomTestCase):
                 self.assertFalse(pub.enable)
                 zmq_pub.assert_not_called()
 
-    def test_disabled_paths_clear_enable(self):
-        # enable must be False on every bail-out, or publish_load_stat keeps
-        # computing the (non-trivial) load snapshot for a null sink.
+    def test_disabled_paths_leave_the_publisher_unbound(self):
+        # Every bail-out must leave `publisher` None (surfaced as
+        # enable == False) so publish_load_stat returns before computing
+        # the (non-trivial) load snapshot.
         for label, config in (
             ("no config", None),
             ("null publisher", '{"publisher": "null"}'),
@@ -208,26 +210,47 @@ class TestLoadPublisherGating(CustomTestCase):
         pub.publish_load_stat(provider, force=True)
         provider.assert_not_called()
 
-    def test_forced_publishes_respect_the_wall_clock_floor(self):
-        # force=True fires per extend batch and per idle-loop iteration (which
-        # busy-spins without --sleep-on-idle); the wall-clock floor is what
-        # bounds the snapshot + send rate on those paths.
-        pub, _ = self._build()
-        provider = MagicMock(
+    @staticmethod
+    def _provider(running):
+        return MagicMock(
             return_value=SimpleNamespace(
-                num_running_reqs=1,
+                num_running_reqs=running,
                 num_waiting_reqs=2,
                 num_used_tokens=3,
                 max_total_num_tokens=4,
             )
         )
-        pub.publish_load_stat(provider, force=True)
-        pub.publish_load_stat(provider, force=True)  # within the floor: dropped
-        self.assertEqual(provider.call_count, 1)
-        pub._last_publish_ts = 0.0  # simulate the floor elapsing
-        pub.publish_load_stat(provider, force=True)
-        self.assertEqual(provider.call_count, 2)
-        self.assertEqual(pub.publisher.publish.call_count, 2)
+
+    def test_unchanged_stat_is_deduped_to_the_heartbeat(self):
+        # force=True fires per idle-loop iteration (which busy-spins without
+        # --sleep-on-idle); an unchanged gauge must go out once per heartbeat,
+        # not per iteration. time is patched so the test cannot race the
+        # wall clock.
+        pub, _ = self._build()
+        provider = self._provider(running=1)
+        with patch(
+            "sglang.srt.managers.scheduler_components.load_publisher.time"
+        ) as fake_time:
+            fake_time.monotonic.return_value = 100.0
+            pub.publish_load_stat(provider, force=True)  # first: publishes
+            pub.publish_load_stat(provider, force=True)  # unchanged: deduped
+            self.assertEqual(pub.publisher.publish.call_count, 1)
+            fake_time.monotonic.return_value = 101.5  # heartbeat elapsed
+            pub.publish_load_stat(provider, force=True)
+            self.assertEqual(pub.publisher.publish.call_count, 2)
+
+    def test_changed_stat_publishes_immediately(self):
+        # The busy->idle (and idle->busy) transition must never be delayed:
+        # a changed gauge bypasses the heartbeat dedup even when the last
+        # send was a moment ago.
+        pub, _ = self._build()
+        with patch(
+            "sglang.srt.managers.scheduler_components.load_publisher.time"
+        ) as fake_time:
+            fake_time.monotonic.return_value = 100.0
+            pub.publish_load_stat(self._provider(running=7), force=True)
+            pub.publish_load_stat(self._provider(running=0), force=True)
+            self.assertEqual(pub.publisher.publish.call_count, 2)
 
 
 if __name__ == "__main__":

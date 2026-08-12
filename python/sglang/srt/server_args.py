@@ -9484,15 +9484,17 @@ class ServerArgs:
                                                   # prompts at this size
                 "dp_size": <dp_size>,             # number of SUB sockets
                                                   # to open
-                "load_endpoint_port_base": 5557 + <dp_size>,
+                "load_endpoint_port_base": <derived>,
                                                   # base TCP port of the
                                                   # dedicated load-snapshot
                                                   # range (load rank r =
-                                                  # base + r), packed after
-                                                  # the KV-event (and, when
-                                                  # configured, replay)
-                                                  # range; omitted if no
-                                                  # legal range exists
+                                                  # base + r). Normally kv
+                                                  # base + dp_size, bumped
+                                                  # past an overlapping
+                                                  # replay range — consumers
+                                                  # MUST read this key, not
+                                                  # re-derive it; omitted if
+                                                  # no legal range exists
                 "load_topic": "load",             # ZMQ topic prefix on the
                                                   # load-socket SUB filter;
                                                   # present iff

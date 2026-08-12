@@ -23,11 +23,14 @@ The transport (`ZmqEventPublisher`), config parsing, and rank/port
 derivation are borrowed from `sglang.srt.disaggregation.kv_events`; the
 load wire format and publishing cadence live here. The port itself comes
 from `derive_load_port_base` — the same function `/server_info` advertises
-with — which packs the load range after the KV-event range (skipping the
-replay ROUTER range when one is configured). Operators must leave that
-derived range free on the host: in particular, two workers sharing a host
-need a `2 * dp_size` gap between their KV-event port bases, or one
-worker's load socket lands on the other's KV-event port.
+with — which packs the load range after the KV-event range, bumping past
+the replay ROUTER range when the two overlap (with the conventional
+replay = kv + 1 they always do). Operators must leave the derived range
+free on the host: a worker's ZMQ footprint spans
+`[kv_base, load_base + dp_size)` — `2 * dp_size` ports without a replay
+endpoint, `2 * dp_size + 1` with the conventional adjacent one — so
+co-hosted workers need their KV port bases spaced at least that far
+apart, or one worker's load socket lands on the other's KV-event port.
 
 Other prior art, considered and not reused: `/v1/loads` serves the same
 snapshot over HTTP, but polling it routes through the HTTP-plane event
@@ -68,12 +71,13 @@ logger = logging.getLogger(__name__)
 # is wasteful.
 LOAD_PUBLISH_INTERVAL = 5
 
-# Wall-clock floor between publishes, applied even to forced ones. Bounds
-# the cost of hot force paths — per-batch publishes under prefill-heavy
-# load, and the idle loop (`on_idle` forces a publish every iteration,
-# which busy-spins when --sleep-on-idle is off) — while staying far fresher
-# than any router's staleness window.
-LOAD_PUBLISH_MIN_INTERVAL_S = 0.05
+# Re-send an *unchanged* stat at most once per this many seconds. A changed
+# stat always publishes immediately — busy->idle and idle->busy transitions
+# are never delayed — while the heartbeat keeps the gauge fresh for
+# subscribers with staleness windows and bounds the send rate on paths that
+# force-publish an unchanged gauge in a tight loop (`on_idle` fires every
+# event-loop iteration, which busy-spins when --sleep-on-idle is off).
+LOAD_PUBLISH_HEARTBEAT_S = 1.0
 
 # Re-warn about publish failures every this many consecutive failures, so a
 # permanent failure (e.g. a renamed field) keeps a live breadcrumb instead of
@@ -133,6 +137,9 @@ class SchedulerLoadPublisher:
         # snapshot computation entirely.
         self.publisher: Optional[ZmqEventPublisher] = None
         self._publish_counter = 0
+        # The four counts of the last stat actually sent, and when — drives
+        # the changed-immediately / unchanged-on-heartbeat dedup.
+        self._last_counts: Optional[tuple] = None
         self._last_publish_ts = 0.0
         # Consecutive publish failures, reset on success (drives the
         # periodic warn).
@@ -194,14 +201,16 @@ class SchedulerLoadPublisher:
         self, load_provider: Callable[[], LoadSnapshot], force: bool = False
     ) -> None:
         """Publish a load snapshot, throttled to [`LOAD_PUBLISH_INTERVAL`]
-        calls unless `force`, and to [`LOAD_PUBLISH_MIN_INTERVAL_S`] seconds
-        always.
+        calls unless `force`; an unchanged stat is re-sent at most once per
+        [`LOAD_PUBLISH_HEARTBEAT_S`] while a changed one always goes out
+        immediately.
 
         `load_provider` returns a live [`LoadSnapshot`] read directly from
         scheduler state (`SchedulerLoadInquirer.get_loads`) — used instead of
         metrics stats, whose values are only populated under
-        `--enable-metrics`. Invoked only after the throttles pass, so the
-        snapshot is computed only when actually publishing.
+        `--enable-metrics`. Invoked only after the counter throttle passes
+        (on the hot forced paths the scheduler hands in a snapshot it
+        already computed for the DP-balancing sink, so this is cheap).
 
         Best-effort: a failure here must never crash the scheduler loop —
         routers fall back to their own in-flight counter. Failures re-warn
@@ -213,22 +222,34 @@ class SchedulerLoadPublisher:
         self._publish_counter += 1
         if not force and self._publish_counter < LOAD_PUBLISH_INTERVAL:
             return
-        now = time.monotonic()
-        if now - self._last_publish_ts < LOAD_PUBLISH_MIN_INTERVAL_S:
-            return
-        self._publish_counter = 0
-        self._last_publish_ts = now
 
         try:
             load = load_provider()
+            counts = (
+                load.num_running_reqs,
+                load.num_waiting_reqs,
+                load.num_used_tokens,
+                load.max_total_num_tokens,
+            )
+            now = time.monotonic()
+            if (
+                counts == self._last_counts
+                and now - self._last_publish_ts < LOAD_PUBLISH_HEARTBEAT_S
+            ):
+                return
+            self._publish_counter = 0
             self.publisher.publish(
                 LoadStat(
-                    num_running_reqs=load.num_running_reqs,
-                    num_waiting_reqs=load.num_waiting_reqs,
-                    num_tokens=load.num_used_tokens,
-                    max_total_num_tokens=load.max_total_num_tokens,
+                    num_running_reqs=counts[0],
+                    num_waiting_reqs=counts[1],
+                    num_tokens=counts[2],
+                    max_total_num_tokens=counts[3],
                 )
             )
+            # Recorded only after a successful hand-off so a failed publish
+            # retries instead of being deduped away.
+            self._last_counts = counts
+            self._last_publish_ts = now
             self._fail_count = 0
         except Exception:
             if self._fail_count % LOAD_PUBLISH_FAIL_WARN_EVERY == 0:

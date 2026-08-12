@@ -102,12 +102,13 @@ def derive_load_port_base(
     config, or None when no legal range exists.
 
     The load range is `dp_size` ports packed right after the KV-event range
-    `[kv_port, kv_port + dp_size)`; when a tcp replay endpoint is configured,
-    its ROUTER range `[replay_port, replay_port + dp_size)` is skipped over
-    (under the inherited convention replay = kv + 1, the first candidate
-    always lands on it). Returns None when the endpoint carries no parsable
-    tcp port (ipc://, inproc://, missing/non-integer port) or the range
-    would exceed the u16 port space.
+    `[kv_port, kv_port + dp_size)`; a tcp replay ROUTER range
+    `[replay_port, replay_port + dp_size)` is bumped past only when it
+    overlaps that candidate (under the inherited convention replay = kv + 1
+    it always does; a non-adjacent replay leaves the packing unchanged).
+    Returns None when the endpoint carries no legal tcp port (ipc://,
+    inproc://, missing/non-integer port, or a port outside 1..65535) or the
+    range would exceed the u16 port space.
 
     This is the single source of truth for the load port: called by both
     `SchedulerLoadPublisher` (which binds the range) and
@@ -115,10 +116,13 @@ def derive_load_port_base(
     /server_info), so the bind and the advertisement cannot drift.
     """
     kv_base = parse_tcp_port(endpoint)
-    if kv_base is None or dp_size < 1:
+    if kv_base is None or not (0 < kv_base <= 65535) or dp_size < 1:
         return None
     load_base = kv_base + dp_size
     replay_base = parse_tcp_port(replay_endpoint)
+    if replay_base is not None and not (0 < replay_base <= 65535):
+        # A replay port no ROUTER socket can legally bind constrains nothing.
+        replay_base = None
     if (
         replay_base is not None
         and load_base < replay_base + dp_size

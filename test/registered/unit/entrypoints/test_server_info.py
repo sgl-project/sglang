@@ -110,6 +110,44 @@ class TestServerInfoKvEventsField(CustomTestCase):
             },
         )
 
+    def test_load_port_skips_an_overlapping_replay_range(self):
+        # Conventional replay = kv + 1: the load range must be advertised
+        # past the replay ROUTER range (5558 + dp_size), matching where
+        # SchedulerLoadPublisher actually binds — both sides derive it via
+        # derive_load_port_base.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
+                '"replay_endpoint": "tcp://*:5558"}'
+            ),
+            page_size=64,
+            dp_size=2,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["load_endpoint_port_base"], 5560)
+        self.assertEqual(info["kv_events"]["load_topic"], "load")
+
+    def test_load_keys_omitted_when_no_load_range_fits(self):
+        # kv base 65535 leaves no u16 room for a load range: the kv_events
+        # descriptor must still be served, with only the load keys omitted,
+        # so routers fall back to their in-flight counter for load.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:65535"}',
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertEqual(info["kv_events"]["endpoint_port_base"], 65535)
+        self.assertNotIn("load_endpoint_port_base", info["kv_events"])
+        self.assertNotIn("load_topic", info["kv_events"])
+
     def test_kv_events_descriptor_carries_specific_host_and_topic(self):
         args = ServerArgs(
             model_path="dummy",

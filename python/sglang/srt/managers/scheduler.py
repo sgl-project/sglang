@@ -3936,9 +3936,9 @@ class Scheduler(
         # cache-aware-zmq load-aware selection. Independent of the
         # DP-balancing snapshot above so it works for single workers too.
         # Sourced from the load inquirer (live scheduler counts, not the
-        # metrics-gated stats) and only evaluated when the throttles fire;
-        # reuses the snapshot the DP-balancing publisher just computed
-        # instead of walking the queues a second time.
+        # metrics-gated stats); reuses the snapshot the DP-balancing
+        # publisher just computed instead of walking the queues a second
+        # time, and dedups unchanged gauges internally.
         self.load_publisher.publish_load_stat(
             (
                 (lambda: snapshot)
@@ -4098,8 +4098,10 @@ class Scheduler(
         # Same for the router-facing load socket: without this, a load-aware
         # router keeps the last busy LoadStat until its freshness window
         # expires and routes as if this idle worker were still loaded. The
-        # publisher's wall-clock floor caps the send rate while the idle
-        # loop spins; the snapshot is shared with the write above.
+        # busy->idle transition publishes immediately (the gauge changed);
+        # once idle the unchanged gauge is deduped to a slow heartbeat, so
+        # a spinning idle loop costs one send per heartbeat. The snapshot
+        # is shared with the write above.
         self.load_publisher.publish_load_stat(
             (
                 (lambda: snapshot)
