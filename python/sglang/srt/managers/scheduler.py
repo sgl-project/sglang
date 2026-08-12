@@ -623,6 +623,10 @@ class Scheduler(
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
 
+        # Raise the mid-prefill capacity when the per-request prefill ceiling
+        # is enabled (needs dllm_config and disaggregation_mode to be set).
+        self.init_chunked_prefill_concurrency()
+
         # Init overlap schedule
         self.init_overlap()
 
@@ -1188,7 +1192,8 @@ class Scheduler(
         self.chunked_reqs: List[Req] = []
         self._pending_chunked_abort_reqs: List[Req] = []
         # Upper bound on how many requests may be mid-prefill at once. Raised
-        # above 1 only when the per-request prefill cap is enabled.
+        # above 1 only when the per-request prefill cap is enabled (see
+        # init_chunked_prefill_concurrency).
         self.max_concurrent_chunked_reqs = 1
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -1207,6 +1212,41 @@ class Scheduler(
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
+
+    def init_chunked_prefill_concurrency(self):
+        """Raise the mid-prefill capacity when the per-request ceiling is on.
+
+        With long_prefill_token_threshold F > 0, one pass hands at most F
+        prompt tokens to any single request, so up to
+        chunked_prefill_size // F requests can be mid-prefill at once
+        instead of one long prompt monopolizing the prefill budget.
+
+        Concurrency stays at 1 where the single-slot invariant is still
+        load-bearing: disagg prefill (the mixin shares this state and its KV
+        transfer bookkeeping assumes one in-flight chunk), PP > 1 (microbatch
+        accounting), and dLLM (the staging queue owns its mid-prefill
+        requests). Speculative decoding needs no gate: DSpark/EAGLE track
+        per-request state and never read the slot count.
+        """
+        threshold = get_schedule().long_prefill_token_threshold
+        if (
+            threshold <= 0
+            or self.chunked_prefill_size is None
+            or self.disaggregation_mode == DisaggregationMode.PREFILL
+            or self.ps.pp_size > 1
+            or self.dllm_config is not None
+        ):
+            return
+        self.max_concurrent_chunked_reqs = max(
+            1, self.chunked_prefill_size // threshold
+        )
+        if self.max_concurrent_chunked_reqs > 1:
+            logger.info(
+                f"Concurrent chunked prefill enabled: up to "
+                f"{self.max_concurrent_chunked_reqs} requests mid-prefill "
+                f"(chunked_prefill_size={self.chunked_prefill_size}, "
+                f"long_prefill_token_threshold={threshold})."
+            )
 
     def init_metrics_reporter(
         self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
@@ -3333,6 +3373,8 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            long_prefill_token_threshold=get_schedule().long_prefill_token_threshold,
+            max_concurrent_chunked_reqs=self.max_concurrent_chunked_reqs,
         )
 
         # Re-admit the requests carried over from earlier passes, oldest first,
@@ -3428,6 +3470,10 @@ class Scheduler(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.mamba_pool_idx = None
+                if res == AddReqResult.SKIP:
+                    # Only the mid-prefill capacity is full; later waiting
+                    # requests may still fit and must keep being considered.
+                    continue
                 break
 
         if mamba_allocator is not None:

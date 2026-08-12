@@ -803,6 +803,11 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    long_prefill_token_threshold: A[
+        int,
+        "For chunked prefill, the maximum number of prompt tokens a single request may prefill in one scheduled pass. Requests with a longer remaining prompt are prefilled in chunks of at most this size, so up to chunked_prefill_size // threshold requests can be mid-prefill concurrently instead of one long prompt monopolizing the prefill budget. 0 (default) disables the cap: a single request may consume the whole chunked_prefill_size budget. Mirrors vLLM's --long-prefill-token-threshold.",
+        NS("schedule"),
+    ] = 0
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -3659,6 +3664,7 @@ class ServerArgs:
         self._handle_kv4_compatibility()
         self._handle_mxfp8_kv_cache_compatibility()
         self._handle_page_size()
+        self._handle_long_prefill_token_threshold()
         self._handle_amd_specifics()
         self._handle_nccl_pre_warm()
         self._handle_grammar_backend()
@@ -6111,6 +6117,20 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _page_size_default)
+
+    def _handle_long_prefill_token_threshold(self):
+        if self.long_prefill_token_threshold < 0:
+            raise ValueError(
+                "--long-prefill-token-threshold must be >= 0, got "
+                f"{self.long_prefill_token_threshold}."
+            )
+        if self.long_prefill_token_threshold > 0 and (
+            self.chunked_prefill_size is None or self.chunked_prefill_size <= 0
+        ):
+            raise ValueError(
+                "--long-prefill-token-threshold requires chunked prefill to be "
+                "enabled (chunked_prefill_size > 0)."
+            )
 
     def _handle_amd_specifics(self):
         if is_hip():
