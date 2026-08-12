@@ -119,6 +119,10 @@ def _read_media_bytes(media: str | bytes) -> bytes:
 
     if media.startswith("file://"):
         media = unquote(urlparse(media).path)
+    # ``load_image`` accepts relative local paths by extension. Preserve that
+    # public input contract while still snapshotting the file exactly once.
+    if Path(media).is_file():
+        return Path(media).read_bytes()
     return get_image_bytes(media)
 
 
