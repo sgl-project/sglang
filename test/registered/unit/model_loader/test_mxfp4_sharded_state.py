@@ -20,6 +20,7 @@ import sglang.srt.layers.quantization.mxfp4 as mxfp4_module  # noqa: E402
 import sglang.srt.model_loader.loader as loader_module  # noqa: E402
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod  # noqa: E402
 from sglang.srt.model_loader.loader import ShardedStateLoader  # noqa: E402
+from sglang.srt.utils.offloader import OffloaderV1  # noqa: E402
 
 _RUNTIME_STATE_NAMES = (
     "w13_weight",
@@ -40,25 +41,25 @@ def _new_method():
 
 
 class _TinyMxfp4Layer(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, method, initialize_to_zero=False):
         super().__init__()
-        for name, shape, value in (
-            ("w13_weight", (1, 4, 3), 17),
-            ("w13_weight_scale", (1, 4, 2), 113),
-            ("w2_weight", (1, 3, 2), 18),
-            ("w2_weight_scale", (1, 3, 2), 114),
+        self.num_local_experts = 1
+        method.create_weights(
+            self,
+            num_experts=1,
+            hidden_size=64,
+            intermediate_size_per_partition=64,
+            params_dtype=torch.bfloat16,
+        )
+        for name, value in (
+            ("w13_weight", 17),
+            ("w13_weight_scale", 113),
+            ("w2_weight", 18),
+            ("w2_weight_scale", 114),
+            ("w13_weight_bias", 3),
+            ("w2_weight_bias", 4),
         ):
-            parameter = torch.nn.Parameter(
-                torch.full(shape, value, dtype=torch.uint8), requires_grad=False
-            )
-            parameter.test_marker = name
-            self.register_parameter(name, parameter)
-        self.w13_weight_bias = torch.nn.Parameter(
-            torch.full((1, 4), 3, dtype=torch.bfloat16), requires_grad=False
-        )
-        self.w2_weight_bias = torch.nn.Parameter(
-            torch.full((1, 3), 4, dtype=torch.bfloat16), requires_grad=False
-        )
+            getattr(self, name).data.fill_(0 if initialize_to_zero else value)
 
 
 class _WrappedTensor:
@@ -78,18 +79,44 @@ def _fake_swizzle(weight, scale, _num_warps):
     return wrap(weight), object(), wrap(scale)
 
 
+def _runtime_tensors(method):
+    return {
+        "w13_weight": method.w13_weight_triton_tensor,
+        "w13_weight_scale": method.w13_precision_config.b_mx_scale,
+        "w2_weight": method.w2_weight_triton_tensor,
+        "w2_weight_scale": method.w2_precision_config.b_mx_scale,
+    }
+
+
 class TestMxfp4ShardedState(CustomTestCase):
-    def test_runtime_weight_and_scale_round_trip(self):
+    def test_runtime_parameters_are_not_cpu_offloaded(self):
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.empty(1, device="meta"), requires_grad=False
+        )
+        layer.weight._sglang_keep_on_device = True
+
+        offloader = OffloaderV1(cpu_offload_max_bytes=layer.weight.nbytes)
+        self.assertIs(offloader.maybe_offload_to_cpu(layer), layer)
+        self.assertEqual(layer.weight.device.type, "meta")
+        self.assertEqual(offloader._cpu_offload_bytes, 0)
+
+    def test_runtime_weight_and_scale_sharded_round_trip(self):
         triton_kernels = ModuleType("triton_kernels")
         triton_kernels.__path__ = []
         triton_matmul = ModuleType("triton_kernels.matmul")
         triton_matmul.FlexCtx = SimpleNamespace
         triton_matmul.PrecisionConfig = SimpleNamespace
 
-        layer = _TinyMxfp4Layer()
-        method = _new_method()
-        original_parameters = {
-            name: getattr(layer, name) for name in _RUNTIME_STATE_NAMES
+        source_method = _new_method()
+        destination_method = _new_method()
+        source = _TinyMxfp4Layer(source_method)
+        destination = _TinyMxfp4Layer(destination_method, initialize_to_zero=True)
+        source_original_parameters = {
+            name: getattr(source, name) for name in _RUNTIME_STATE_NAMES
+        }
+        destination_original_parameters = {
+            name: getattr(destination, name) for name in _RUNTIME_STATE_NAMES
         }
 
         with patch.dict(
@@ -105,43 +132,76 @@ class TestMxfp4ShardedState(CustomTestCase):
         ), patch.object(
             torch.cuda, "empty_cache"
         ):
-            method.process_weights_after_loading(layer)
+            source_method.process_weights_after_loading(source)
+            destination_method.process_weights_after_loading(destination)
 
-        runtime_tensors = {
-            "w13_weight": method.w13_weight_triton_tensor,
-            "w13_weight_scale": method.w13_precision_config.b_mx_scale,
-            "w2_weight": method.w2_weight_triton_tensor,
-            "w2_weight_scale": method.w2_precision_config.b_mx_scale,
-        }
-        state = layer.state_dict()
-        for value, name in enumerate(_RUNTIME_STATE_NAMES, start=1):
-            parameter = getattr(layer, name)
-            runtime_tensor = runtime_tensors[name]
-            self.assertIs(parameter, original_parameters[name])
-            self.assertEqual(parameter.test_marker, name)
-            self.assertIn(name, state)
-            self.assertFalse(parameter.is_contiguous())
-            self.assertIs(runtime_tensor.storage.data, parameter)
-            self.assertEqual(
-                runtime_tensor.storage.data.data_ptr(), parameter.data_ptr()
-            )
+        source_runtime_tensors = _runtime_tensors(source_method)
+        destination_runtime_tensors = _runtime_tensors(destination_method)
+        source_state = source.state_dict()
+        destination_state = destination.state_dict()
+        for layer, original_parameters, runtime_tensors, state in (
+            (
+                source,
+                source_original_parameters,
+                source_runtime_tensors,
+                source_state,
+            ),
+            (
+                destination,
+                destination_original_parameters,
+                destination_runtime_tensors,
+                destination_state,
+            ),
+        ):
+            for name in _RUNTIME_STATE_NAMES:
+                self.assertIn(name, state)
+                parameter = getattr(layer, name)
+                runtime_tensor = runtime_tensors[name]
+                self.assertIs(parameter, original_parameters[name])
+                self.assertTrue(parameter._sglang_keep_on_device)
+                self.assertFalse(parameter.is_contiguous())
+                self.assertIs(runtime_tensor.storage.data, parameter)
+                self.assertEqual(
+                    runtime_tensor.storage.data.data_ptr(), parameter.data_ptr()
+                )
 
-            # This is the copy performed by ShardedStateLoader.load_model.
-            incoming = torch.full_like(state[name], value)
-            state[name].copy_(incoming)
-            self.assertTrue(torch.equal(runtime_tensor.storage.data, incoming))
+        for name in _RUNTIME_STATE_NAMES:
+            self.assertFalse(torch.equal(source_state[name], destination_state[name]))
 
         with tempfile.TemporaryDirectory() as output_dir, patch.object(
             loader_module, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
         ):
-            ShardedStateLoader.save_model(layer, output_dir)
+            ShardedStateLoader.save_model(source, output_dir)
             checkpoint = f"{output_dir}/model-rank-0-part-0.safetensors"
             with safe_open(checkpoint, framework="pt") as handle:
-                self.assertEqual(set(handle.keys()), set(state))
-                for name, expected in state.items():
-                    self.assertTrue(
-                        torch.equal(handle.get_tensor(name), expected), name
-                    )
+                self.assertEqual(set(handle.keys()), set(source_state))
+                missing = destination_state.copy()
+                for name in handle.keys():  # noqa: SIM118
+                    saved_tensor = handle.get_tensor(name)
+                    self.assertTrue(torch.equal(saved_tensor, source_state[name]), name)
+                    # This is the copy performed by ShardedStateLoader.load_model.
+                    missing.pop(name).copy_(saved_tensor)
+                self.assertFalse(missing)
+
+        for name in source_state:
+            self.assertTrue(
+                torch.equal(destination_state[name], source_state[name]),
+                name,
+            )
+        for name in _RUNTIME_STATE_NAMES:
+            destination_parameter = getattr(destination, name)
+            destination_runtime_tensor = destination_runtime_tensors[name]
+            self.assertFalse(destination_parameter.is_contiguous())
+            self.assertIs(
+                destination_runtime_tensor.storage.data, destination_parameter
+            )
+            self.assertTrue(
+                torch.equal(
+                    destination_runtime_tensor.storage.data,
+                    source_runtime_tensors[name].storage.data,
+                ),
+                name,
+            )
 
 
 if __name__ == "__main__":

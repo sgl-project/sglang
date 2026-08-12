@@ -27,6 +27,11 @@ _SubmoduleAccessor = Callable[[torch.nn.Module], torch.nn.Module]
 _WhitelistParamNamesCreator = Callable[[torch.nn.Module], List[str]]
 
 
+def _must_keep_on_device(param: torch.Tensor) -> bool:
+    """Return whether a non-module kernel wrapper retains this parameter."""
+    return bool(getattr(param, "_sglang_keep_on_device", False))
+
+
 class BaseOffloader(ABC):
     def wrap_modules(
         self,
@@ -116,6 +121,8 @@ class OffloaderV1(BaseOffloader):
                 # we use per-parameter offloading
                 # one module might have some parameters offloaded and some not
                 break
+            if _must_keep_on_device(p):
+                continue
 
             # `torch.empty_like` does not support `pin_memory` argument
             cpu_data = torch.empty_strided(
@@ -300,6 +307,7 @@ class _ModuleOffloader(ABC):
         self._param_offloaders = {
             name: _BaseParamOffloader.create(mode, module=module, param_name=name)
             for name in whitelist_param_names
+            if not _must_keep_on_device(param_dict[name])
         }
 
     def post_init(self):
