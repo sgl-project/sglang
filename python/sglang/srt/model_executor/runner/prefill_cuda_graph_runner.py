@@ -50,7 +50,6 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
@@ -119,6 +118,7 @@ from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_cuda,
     is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -249,11 +249,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
-    # DSA forces use_mha=False in BCG capture/replay, so the sparse path
-    # serves any prefix and the MHA-prefix ban does not apply. Class
-    # default keeps __new__-built test instances on the ban.
-    dsa_sparse_prefill_forced: bool = False
-
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # --- model flags ----------------------------------------------
@@ -330,20 +325,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             source=self.buffers,
         )
 
-        self.dsa_sparse_prefill_forced = is_deepseek_dsa(
-            self.model_runner.model_config.hf_config
-        )
-
         self.attention_layers = self.model_runner.attention_layers
         self.mha_companion_layers = self.model_runner.mha_companion_layers
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
-        )
-        # Archs on the MLA-BCG allowlist pin the absorbed MLA path inside
-        # capture/replay (attention_backend_handler), so the MHA companion is
-        # never captured and the MHA-prefix restrictions below don't apply.
-        self.mla_pinned_under_bcg = (
-            self.model_runner.model_config.is_mla_breakable_cuda_graph_supported
         )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
@@ -1058,16 +1043,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if replace_embeds is not None:
             return False
-        # A prefix forces the MHA companion path, whose captured state is
-        # frozen prefix-free; DSA models are exempt (capture/replay force
-        # the sparse path, which takes any prefix via device metadata), as
-        # are archs on the MLA-BCG allowlist (they pin the absorbed MLA path
-        # inside capture/replay, so the MHA companion is never captured).
+        # Off CUDA, BCG takes the MHA companion, whose prefix path is uncapturable.
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
-            and not self.dsa_sparse_prefill_forced
-            and not self.mla_pinned_under_bcg
+            and not is_cuda()
             and prefix_lens is not None
             and any(prefix_lens)
         ):
@@ -1577,7 +1557,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and self.has_mha_companion_layers
-            and not self.mla_pinned_under_bcg
+            and not is_cuda()
         ):
             self._restore_mha_capture_state(static_forward_batch)
 
