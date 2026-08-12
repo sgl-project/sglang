@@ -426,7 +426,7 @@ class ServerArgsAutoTuner:
         components = self._filter_high_memory_resident_components(components)
         if self._should_auto_enable_dit_layerwise_offload():
             components.insert(0, LAYERWISE_OFFLOAD_DIT_GROUP)
-            self._set_default_wan_dit_offload_prefetch_size()
+            self._set_default_dit_offload_prefetch_size()
         return components
 
     def _filter_high_memory_resident_components(
@@ -465,52 +465,30 @@ class ServerArgsAutoTuner:
 
     def _should_auto_enable_dit_layerwise_offload(self) -> bool:
         args = self.server_args
-
-        # only for wan for now
-        if not self._is_wan_pipeline_config():
-            return False
-        if not self._deployment_config().auto_dit_layerwise_offload:
+        deployment_config = self._deployment_config()
+        if args.performance_mode not in deployment_config.dit_layerwise_offload_modes:
             return False
 
         if (
             args.pipeline_config.dmd_denoising_steps is not None
-            or not current_platform.enable_dit_layerwise_offload_for_wan_by_default()
+            or not current_platform.enable_dit_layerwise_offload_by_default()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.is_arg_explicitly_set("dit_cpu_offload")
         ):
             return False
 
-        # memory mode is memory-first: keep the broad Wan DiT layerwise policy
-        # unless a guard above says it conflicts with another placement path
-        if args.performance_mode == "memory":
-            return True
+        return True
 
-        # auto mode is performance-first: profiling only showed clear wins for
-        # Wan2.2 A14B, where coarse DiT CPU offload creates large step spikes
-        return (
-            args.performance_mode == "auto" and self._is_wan2_2_a14b_pipeline_config()
-        )
-
-    def _is_wan2_2_a14b_pipeline_config(self) -> bool:
-        config_name = self.server_args.pipeline_config.__class__.__name__
-        return config_name.startswith("Wan2_2_") and "A14B" in config_name
-
-    def _set_default_wan_dit_offload_prefetch_size(self) -> None:
+    def _set_default_dit_offload_prefetch_size(self) -> None:
         args = self.server_args
+        prefetch_size = self._deployment_config().auto_dit_offload_prefetch_size
         if (
             args.performance_mode == "auto"
-            and self._is_wan2_2_a14b_pipeline_config()
+            and prefetch_size is not None
             and not args.is_arg_explicitly_set("dit_offload_prefetch_size")
         ):
-            # p2 was the fastest stable default in the Wan2.2 A14B sweep
-            args.dit_offload_prefetch_size = 2
-
-    def _is_wan_pipeline_config(self) -> bool:
-        return any(
-            cls.__module__.endswith(".wan")
-            for cls in self.server_args.pipeline_config.__class__.mro()
-        )
+            args.dit_offload_prefetch_size = prefetch_size
 
     def _auto_uses_dit_offload(self) -> bool:
         args = self.server_args
