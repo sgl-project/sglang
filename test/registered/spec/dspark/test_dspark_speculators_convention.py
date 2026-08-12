@@ -75,14 +75,18 @@ class TestDsparkSpeculatorsConventionDetection(CustomTestCase):
 
 
 def _speculators_hf_config(
-    *, block_size: int, speculative_tokens: int, default_method: str = "greedy"
+    *,
+    block_size: int,
+    speculative_tokens: int,
+    default_method: str = "greedy",
+    **overrides,
 ) -> SimpleNamespace:
     # Matches the real structure of RedHatAI/GLM-5.2-speculator.dspark's
     # config.json (verified directly against the checkpoint on the Hub):
     # block_size is the full anchor+gamma block width, while
     # speculators_config.proposal_methods[i].speculative_tokens is the
     # authoritative gamma (real draft token count).
-    return SimpleNamespace(
+    fields = dict(
         architectures=["Qwen3DSparkModel"],
         block_size=block_size,
         markov_rank=256,
@@ -101,6 +105,8 @@ def _speculators_hf_config(
             ],
         },
     )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
 
 
 class TestSpeculatorsProposalGamma(CustomTestCase):
@@ -255,6 +261,65 @@ class TestDraftCaptureWidth(CustomTestCase):
                     spec_algorithm=SpeculativeAlgorithm.DSPARK,
                     is_draft_worker=True,
                 )
+
+
+class TestSampleFromAnchorIsAuthoritative(CustomTestCase):
+    """`speculators_model_type` alone does not determine the block layout.
+
+    Real speculators checkpoints ship both conventions: the trainer records the
+    choice in `sample_from_anchor`, and the block geometry
+    (block_size vs speculative_tokens) encodes the same fact independently.
+    """
+
+    def test_dense_speculators_checkpoint_not_flagged(self):
+        # Ground truth: /data/suzhan/models/qwen3_6_35b_a3b_dspark_test --
+        # speculators-trained but sample_from_anchor=True and
+        # block_size == speculative_tokens == 16, i.e. the dense DeepSpec
+        # layout. Flagging it would read a 17th slot that does not exist.
+        config = parse_dspark_draft_config(
+            draft_hf_config=_speculators_hf_config(
+                block_size=16, speculative_tokens=16, sample_from_anchor=True
+            )
+        )
+        self.assertFalse(config.speculators_convention)
+        self.assertEqual(config.gamma, 16)
+
+    def test_bonus_anchor_speculators_checkpoint_flagged(self):
+        # The 1+N case: sample_from_anchor=False and block_size == tokens + 1.
+        config = parse_dspark_draft_config(
+            draft_hf_config=_speculators_hf_config(
+                block_size=16, speculative_tokens=15, sample_from_anchor=False
+            )
+        )
+        self.assertTrue(config.speculators_convention)
+        self.assertEqual(config.gamma, 15)
+
+    def test_sample_from_anchor_overrides_model_type_heuristic(self):
+        # Both configs below are speculators_model_type="dspark"; only
+        # sample_from_anchor separates them.
+        dense = parse_dspark_draft_config(
+            draft_hf_config=_speculators_hf_config(
+                block_size=8, speculative_tokens=8, sample_from_anchor=True
+            )
+        )
+        bonus = parse_dspark_draft_config(
+            draft_hf_config=_speculators_hf_config(
+                block_size=8, speculative_tokens=7, sample_from_anchor=False
+            )
+        )
+        self.assertNotEqual(
+            dense.speculators_convention, bonus.speculators_convention
+        )
+
+    def test_geometry_disagreeing_with_flag_fails_fast(self):
+        # sample_from_anchor says dense, geometry says 1+N. Silently picking
+        # either one misreads every draft slot, so this must raise.
+        with self.assertRaises(ValueError):
+            parse_dspark_draft_config(
+                draft_hf_config=_speculators_hf_config(
+                    block_size=16, speculative_tokens=15, sample_from_anchor=True
+                )
+            )
 
 
 if __name__ == "__main__":

@@ -341,11 +341,52 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     # dspark_draft.py's DraftBlockProposer and DsparkDraftSampler (see
     # `bonus_anchor` there) -- this function only resolves the config-level
     # facts (the flag, and the correct gamma to use for such checkpoints).
+    # Which of the two conventions a given speculators checkpoint uses is NOT
+    # implied by it being a speculators checkpoint: the trainer writes the
+    # choice into `sample_from_anchor`, and both values occur in the wild.
+    #   sample_from_anchor=False -> the anchor is a separate conditioning token
+    #                               -> gamma + 1 slots  (speculators_convention)
+    #   sample_from_anchor=True  -> the anchor is itself a trained prediction
+    #                               -> gamma slots      (DeepSpec layout)
+    # Keying off `speculators_model_type` alone (as this did originally) reads
+    # every dense speculators checkpoint one slot too wide, which is the exact
+    # mirror of the bug this flag was added to fix, so trust the explicit field
+    # first and fall back to the model-type heuristic only when it is absent.
     speculators_model_type = _cfg_get(draft_hf_config, "speculators_model_type", None)
-    speculators_convention = (
+    is_speculators_dspark = (
         isinstance(speculators_model_type, str)
         and speculators_model_type.lower() == "dspark"
     )
+    sample_from_anchor = _cfg_get(draft_hf_config, "sample_from_anchor", None)
+    if isinstance(sample_from_anchor, bool):
+        speculators_convention = not sample_from_anchor
+    else:
+        speculators_convention = is_speculators_dspark
+
+    # Cross-check against the block geometry, which encodes the same fact
+    # independently: a 1+N checkpoint ships block_size == speculative_tokens + 1
+    # (the extra slot is the anchor), a dense one ships them equal. Disagreement
+    # means one of the two fields is wrong, and guessing costs 2-3x acceptance,
+    # so fail loudly instead.
+    declared_block_size = _cfg_get(draft_hf_config, "block_size", None)
+    declared_tokens = _resolve_speculators_proposal_gamma(draft_hf_config)
+    if (
+        isinstance(sample_from_anchor, bool)
+        and declared_block_size is not None
+        and declared_tokens is not None
+    ):
+        geometry_convention = int(declared_block_size) == int(declared_tokens) + 1
+        if geometry_convention != speculators_convention:
+            raise ValueError(
+                "DSpark draft config is self-inconsistent: sample_from_anchor="
+                f"{sample_from_anchor} implies a "
+                f"{'gamma + 1' if speculators_convention else 'gamma'}-slot block, "
+                f"but block_size={int(declared_block_size)} vs "
+                f"speculative_tokens={int(declared_tokens)} implies a "
+                f"{'gamma + 1' if geometry_convention else 'gamma'}-slot block. "
+                "Fix the checkpoint config; running either way silently "
+                "misreads every draft slot."
+            )
 
     # speculators checkpoints ship their authoritative draft length as
     # speculators_config.proposal_methods[i].speculative_tokens, not as
