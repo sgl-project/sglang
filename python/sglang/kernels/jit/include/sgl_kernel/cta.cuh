@@ -6,6 +6,8 @@
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
 
+namespace sglang {
+
 namespace device::cta {
 
 /**
@@ -38,3 +40,5 @@ SGL_DEVICE void reduce_max(T value, float* smem, float min_value = 0.0f) {
 }
 
 }  // namespace device::cta
+
+}  // namespace sglang
