@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 template <typename T>
 __global__ void clamp_position_kernel(T* __restrict__ dst, const T* __restrict__ seq_lens, size_t n) {
@@ -51,4 +51,4 @@ struct ClampPosition {
   }
 };
 
-}  // namespace
+}  // namespace sglang
