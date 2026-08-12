@@ -550,7 +550,7 @@ def flash_prefill_with_topk_index(
         DISABLE_INDEX_VALUE=disable_index_value,
         IS_FP8=is_fp8,
         PAGE_SIZE=page_size,
-        ONE_PAGE_PER_BLOCK=page_size == block_size_k,
+        ONE_PAGE_PER_BLOCK=page_size == block_size_k == BLOCK_SIZE_K,
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         num_warps=num_warps,
