@@ -292,6 +292,16 @@ class _MMCacheRetryContext:
     routed_dp_rank: int
 
 
+def _can_omit_mm_features(obj: GenerateReqInput) -> bool:
+    """Whether scheduler-owned embeddings can replace request features.
+
+    Legacy continual sessions retain ``MultimodalInputs`` across turns, while
+    an embedding lease is owned by one request. Keep their features materialized
+    until session state has an explicit lease-lifetime contract.
+    """
+    return obj.parallel_sample_num == 1 and obj.session_params is None
+
+
 def _slice_streaming_output_meta_info(
     meta_info: Dict[Any, Any],
     last_output_offset: int,
@@ -1079,7 +1089,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if (
                 allow_mm_cache_lease
                 and isinstance(obj, GenerateReqInput)
-                and obj.parallel_sample_num == 1
+                and _can_omit_mm_features(obj)
                 and obj.image_data
                 and not self.server_args.language_only
             ):

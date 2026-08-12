@@ -11,6 +11,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.tokenizer_manager import _can_omit_mm_features
 from sglang.srt.mem_cache.multimodal_cache import (
     MM_EMBEDDING_CACHE_LEASE_ID_KEY,
     EmbeddingResult,
@@ -130,3 +131,13 @@ def test_non_owner_pipeline_stage_never_omits_features():
 
     assert output.hit_mask == [False]
     assert output.lease_id is None
+
+
+def test_continual_session_keeps_features_for_later_turns():
+    regular = SimpleNamespace(parallel_sample_num=1, session_params=None)
+    continual = SimpleNamespace(
+        parallel_sample_num=1, session_params=SimpleNamespace(id="session")
+    )
+
+    assert _can_omit_mm_features(regular)
+    assert not _can_omit_mm_features(continual)
