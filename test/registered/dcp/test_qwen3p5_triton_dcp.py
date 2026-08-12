@@ -20,7 +20,7 @@ register_amd_ci(
     suite="nightly-amd-accuracy-8-gpu-mi35x-qwen35-triton-dcp",
     nightly=True,
 )
-register_cuda_ci(est_time=4800, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=4800, stage="nightly", runner_config="4-gpu-b200")
 
 QWEN35_MODEL_PATH = os.environ.get("QWEN3_5_MODEL_PATH", "Qwen/Qwen3.5-397B-A17B-FP8")
 SERVER_LAUNCH_TIMEOUT = 4800

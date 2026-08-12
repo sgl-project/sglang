@@ -36,7 +36,10 @@ from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.srt.utils.common import safe_pickle_loads
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -1674,32 +1677,14 @@ class MMReceiverBase(ABC):
         if getattr(server_args, "tokenizer_backend", None) is not None:
             extra_kwargs["tokenizer_backend"] = server_args.tokenizer_backend
 
-        _processor = None
-        try:
-            _processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
-                **extra_kwargs,
-            )
-        except ValueError as e:
-            error_message = str(e)
-            if "does not have a slow version" in error_message:
-                logger.info(
-                    f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
-                )
-                _processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    use_fast=True,
-                    **extra_kwargs,
-                )
-            else:
-                raise e
+        _processor = get_processor(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            image_processor_backend=resolve_image_processor_backend(server_args),
+            **extra_kwargs,
+        )
 
         enable_adaptive_dispatch_to_encoder = (
             server_args.enable_adaptive_dispatch_to_encoder

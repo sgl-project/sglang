@@ -244,9 +244,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_dcp_rank, 3)
         self.assertEqual(info.dst_state_layer_ids, [[4], [4, 5]])
         self.assertEqual(info.dst_kv_layer_ids, [2, 7])
-        self.assertIsNotNone(info.staging)
-        self.assertEqual(info.staging.base_ptr, staging_ptr)
-        self.assertEqual(info.staging.total_size, 1048576)
+        self.assertEqual(info.staging_base_ptr, staging_ptr)
+        self.assertEqual(info.staging_total_size, 1048576)
 
     def test_from_zmq_allows_missing_state_and_staging_fields(self):
         msg = [
@@ -272,7 +271,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_kv_item_lens, [256])
         self.assertEqual(info.dst_dcp_size, 1)
         self.assertEqual(info.dst_dcp_rank, 0)
-        self.assertIsNone(info.staging)
+        self.assertEqual(info.staging_base_ptr, 0)
+        self.assertEqual(info.staging_total_size, 0)
 
 
 class TestNixlTransferStatus(CustomTestCase):
@@ -452,7 +452,8 @@ class TestNixlTransferWorker(CustomTestCase):
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
                 gpu_id=0,
-                staging=None,
+                staging_base_ptr=0,
+                staging_total_size=0,
                 kv_xfer_segments=None,
                 dst_homogeneous_mem_kind="VRAM",
                 # Non-DCP peer. Without this the worker raises AttributeError
@@ -936,7 +937,8 @@ class TestNixlStaging(CustomTestCase):
             decode_tp_rank=0,
             dst_kv_item_len=128,
             dst_kv_item_lens=[],
-            staging=SimpleNamespace(base_ptr=0x8000, total_size=4096),
+            staging_base_ptr=0x8000,
+            staging_total_size=4096,
         )
         calls = []
         mgr.send_kvcache_staged = (
