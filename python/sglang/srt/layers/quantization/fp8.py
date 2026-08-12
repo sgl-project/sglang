@@ -1655,14 +1655,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-                if use_intel_xpu_backend():
-                    layer.w13_weight_scale_inv.data = (
-                        layer.w13_weight_scale_inv.data.view(torch.uint8)
-                    )
-                    layer.w2_weight_scale_inv.data = (
-                        layer.w2_weight_scale_inv.data.view(torch.uint8)
-                    )
-
                 if get_moe_a2a_backend().is_megamoe():
                     from sglang.srt.layers.moe.mega_moe import (
                         build_mega_moe_experts_weights,
