@@ -2,6 +2,7 @@
 """Unit tests for Cosmos3 config, weight mapping, and sampling params."""
 
 import importlib.util
+import json
 import types
 import unittest
 from unittest import mock
@@ -12,9 +13,14 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     _build_cosmos3_param_names_mapping,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
-from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.configs.sample.cosmos3 import (
+    COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
+    Cosmos3SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.registry import (
+    _PIPELINE_REGISTRY,
+    _discover_and_register_pipelines,
     _get_config_info,
     get_non_diffusers_pipeline_name,
 )
@@ -48,6 +54,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3ImagePreprocessStage,
     Cosmos3LatentPreparationStage,
     Cosmos3TimestepPreparationStage,
+    Cosmos3TokenizationStage,
+    _inject_caption_metadata,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     EMBODIMENT_TO_DOMAIN_ID,
@@ -224,6 +232,42 @@ class TestCosmos3ParamNamesMapping(unittest.TestCase):
         self.assertNotIn("language_model", key)
 
 
+class TestCosmos3DenseParamNamesMapping(unittest.TestCase):
+    """Dense (squared-ReLU) checkpoints ship no gate_proj; up/down_proj must
+    pass through unmerged."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fn = staticmethod(
+            get_param_names_mapping(_build_cosmos3_param_names_mapping(gated_mlp=False))
+        )
+
+    def test_und_mlp_up_proj_unmerged(self):
+        key, idx, _ = _apply(self.fn, "layers.1.mlp.up_proj.weight")
+        self.assertEqual(key, "language_model.layers.1.mlp.up_proj.weight")
+        self.assertIsNone(idx)
+
+    def test_und_mlp_down_proj_unmerged(self):
+        key, idx, _ = _apply(self.fn, "layers.1.mlp.down_proj.weight")
+        self.assertEqual(key, "language_model.layers.1.mlp.down_proj.weight")
+        self.assertIsNone(idx)
+
+    def test_gen_mlp_up_proj_unmerged(self):
+        key, idx, _ = _apply(self.fn, "layers.2.mlp_moe_gen.up_proj.weight")
+        self.assertEqual(key, "gen_layers.2.mlp.up_proj.weight")
+        self.assertIsNone(idx)
+
+    def test_gen_mlp_down_proj_unmerged(self):
+        key, idx, _ = _apply(self.fn, "layers.2.mlp_moe_gen.down_proj.weight")
+        self.assertEqual(key, "gen_layers.2.mlp.down_proj.weight")
+        self.assertIsNone(idx)
+
+    def test_qkv_merge_still_applies(self):
+        key, idx, total = _apply(self.fn, "layers.0.self_attn.to_q.weight")
+        self.assertEqual(key, "language_model.layers.0.self_attn.to_qkv.weight")
+        self.assertEqual((idx, total), (0, 3))
+
+
 class TestCosmos3AdjustNumFrames(unittest.TestCase):
     """Verify VAE-aligned frame rounding in Cosmos3Config."""
 
@@ -306,28 +350,99 @@ class TestCosmos3SchedulerConfig(unittest.TestCase):
     def test_per_mode_flow_shift_defaults(self):
         stage = self._stage()
         self.assertEqual(
-            stage._default_flow_shift_for_mode(self._batch(data_type=DataType.IMAGE)),
+            stage._default_flow_shift_for_mode(
+                self._batch(data_type=DataType.IMAGE), is_edge=False
+            ),
             3.0,
         )
         self.assertEqual(
             stage._default_flow_shift_for_mode(
-                self._batch(preprocessed_image=torch.empty(1))
+                self._batch(preprocessed_image=torch.empty(1)), is_edge=False
             ),
             10.0,
         )
         self.assertEqual(
             stage._default_flow_shift_for_mode(
-                self._batch(preprocessed_video=torch.empty(1))
+                self._batch(preprocessed_video=torch.empty(1)), is_edge=False
             ),
             10.0,
         )
-        self.assertEqual(stage._default_flow_shift_for_mode(self._batch()), 10.0)
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(self._batch(), is_edge=False), 10.0
+        )
         self.assertEqual(
             stage._default_flow_shift_for_mode(
-                self._batch(sp_kwargs={"action_mode": "policy"})
+                self._batch(sp_kwargs={"action_mode": "policy"}), is_edge=False
             ),
             10.0,
         )
+
+    def test_edge_flow_shift_default(self):
+        stage = self._stage()
+        # Edge uses 3.0 for T2I and every video mode (T2V/I2V/V2V); action stays high.
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(self._batch(), is_edge=True), 3.0
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(data_type=DataType.IMAGE), is_edge=True
+            ),
+            3.0,
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(preprocessed_image=torch.empty(1)), is_edge=True
+            ),
+            3.0,
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(preprocessed_video=torch.empty(1)), is_edge=True
+            ),
+            3.0,
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(sp_kwargs={"action_mode": "policy"}), is_edge=True
+            ),
+            10.0,
+        )
+
+
+class TestCosmos3EdgeSamplingDefaults(unittest.TestCase):
+    """Edge variant fills its own resolution/guidance defaults; base is untouched."""
+
+    def test_edge_t2v_defaults(self):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=81)
+        sp._resolve_variant_defaults(is_edge=True)
+        self.assertEqual((sp.width, sp.height), (832, 480))
+        self.assertEqual(sp.guidance_scale, 5.0)
+
+    def test_edge_t2i_defaults(self):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=1)
+        sp._resolve_variant_defaults(is_edge=True)
+        self.assertEqual((sp.width, sp.height), (640, 640))
+        self.assertEqual(sp.guidance_scale, 7.0)
+
+    def test_edge_restricts_supported_resolutions(self):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=1)
+        sp._resolve_variant_defaults(is_edge=True)
+        self.assertEqual(sp.supported_resolutions, COSMOS3_EDGE_SUPPORTED_RESOLUTIONS)
+        # Base high-res sizes are excluded so they trip the "unsupported" warning.
+        self.assertNotIn((1280, 720), sp.supported_resolutions)
+        self.assertNotIn((1024, 1024), sp.supported_resolutions)
+
+    def test_non_edge_defers_resolution_to_base(self):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=81)
+        sp._resolve_variant_defaults(is_edge=False)
+        self.assertIsNone(sp.width)
+        self.assertIsNone(sp.height)
+        self.assertEqual(sp.guidance_scale, 4.0)
+
+    def test_explicit_resolution_preserved_for_edge(self):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=81, width=1024, height=576)
+        sp._resolve_variant_defaults(is_edge=True)
+        self.assertEqual((sp.width, sp.height), (1024, 576))
 
 
 class TestCosmos3SamplingParamsDataType(unittest.TestCase):
@@ -525,6 +640,7 @@ class TestCosmos3ModelResolution(unittest.TestCase):
             "nvidia/Cosmos3-Super",
             "nvidia/Cosmos3-Super-Text2Image",
             "nvidia/Cosmos3-Super-Image2Video",
+            "nvidia/Cosmos3-Edge",
         ):
             with self.subTest(model_path=model_path):
                 self.assertIsNone(get_non_diffusers_pipeline_name(model_path))
@@ -532,6 +648,31 @@ class TestCosmos3ModelResolution(unittest.TestCase):
                 self.assertIsNotNone(config_info)
                 self.assertIs(config_info.sampling_param_cls, Cosmos3SamplingParams)
                 self.assertIs(config_info.pipeline_config_cls, Cosmos3Config)
+
+    def test_class_name_detection_matches_legacy_and_new(self):
+        """Unregistered checkpoints resolve via ``_class_name``: both the legacy
+        ``Cosmos3OmniDiffusersPipeline`` and the current ``Cosmos3OmniPipeline``
+        map to the native Cosmos3 config."""
+        for idx, class_name in enumerate(
+            ("Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline")
+        ):
+            model_path = f"acme/mystery-ckpt-{idx}"
+            with self.subTest(class_name=class_name):
+                with mock.patch(
+                    "sglang.multimodal_gen.registry.maybe_download_model_index",
+                    return_value={"_class_name": class_name},
+                ):
+                    config_info = _get_config_info(model_path)
+                self.assertIsNotNone(config_info)
+                self.assertIs(config_info.pipeline_config_cls, Cosmos3Config)
+
+    def test_legacy_and_new_pipeline_names_both_registered(self):
+        """Both ``_class_name`` spellings resolve to a native pipeline class so
+        old (Nano/Super) and new (Edge) checkpoints load."""
+        _discover_and_register_pipelines()
+        for pipeline_name in ("Cosmos3OmniPipeline", "Cosmos3OmniDiffusersPipeline"):
+            with self.subTest(pipeline_name=pipeline_name):
+                self.assertIn(pipeline_name, _PIPELINE_REGISTRY)
 
 
 class TestCosmos3OpenAIProtocol(unittest.TestCase):
@@ -928,6 +1069,131 @@ class TestCosmos3ModalitySamplingParams(unittest.TestCase):
             "action",
         ):
             self.assertIsNone(getattr(sp, field))
+
+
+class TestCosmos3CaptionMetadata(unittest.TestCase):
+    """Structured captions get generation metadata; prose prompts opt out."""
+
+    def test_video_caption_gets_resolution_duration_and_fps(self):
+        prompt = json.dumps({"temporal_caption": "a cone melts"})
+        caption = json.loads(
+            _inject_caption_metadata(
+                prompt, num_frames=189, fps=24.0, height=480, width=832
+            )
+        )
+        self.assertEqual(caption["resolution"], {"H": 480, "W": 832})
+        # Whole seconds, matching the caption format the model was trained on.
+        self.assertEqual(caption["duration"], "7s")
+        self.assertEqual(caption["fps"], 24.0)
+        self.assertEqual(caption["temporal_caption"], "a cone melts")
+
+    def test_image_caption_drops_temporal_fields(self):
+        prompt = json.dumps({"subjects": ["hands"], "duration": "5s", "fps": 24.0})
+        caption = json.loads(
+            _inject_caption_metadata(
+                prompt, num_frames=1, fps=24.0, height=768, width=768
+            )
+        )
+        self.assertEqual(caption["resolution"], {"H": 768, "W": 768})
+        self.assertNotIn("duration", caption)
+        self.assertNotIn("fps", caption)
+        self.assertEqual(caption["subjects"], ["hands"])
+
+    def test_request_resolution_overrides_caption(self):
+        prompt = json.dumps({"resolution": {"H": 111, "W": 222}})
+        caption = json.loads(
+            _inject_caption_metadata(
+                prompt, num_frames=1, fps=24.0, height=640, width=640
+            )
+        )
+        self.assertEqual(caption["resolution"], {"H": 640, "W": 640})
+
+    def test_unrelated_caption_fields_are_preserved(self):
+        prompt = json.dumps({"aspect_ratio": "1,1", "subjects": ["a vase"]})
+        caption = json.loads(
+            _inject_caption_metadata(
+                prompt, num_frames=1, fps=24.0, height=640, width=640
+            )
+        )
+        self.assertEqual(caption["aspect_ratio"], "1,1")
+        self.assertEqual(caption["subjects"], ["a vase"])
+
+    def test_zero_fps_does_not_divide_by_zero(self):
+        prompt = json.dumps({"temporal_caption": "a cone melts"})
+        caption = json.loads(
+            _inject_caption_metadata(
+                prompt, num_frames=81, fps=0.0, height=480, width=832
+            )
+        )
+        self.assertEqual(caption["duration"], "0s")
+
+    def test_non_structured_prompts_are_declined(self):
+        for prompt in (
+            "A curious raccoon in a field of sunflowers.",
+            json.dumps(["not", "an", "object"]),
+            json.dumps("a bare string"),
+            "",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(
+                    _inject_caption_metadata(
+                        prompt, num_frames=81, fps=24.0, height=480, width=832
+                    )
+                )
+
+
+class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
+    """A structured caption must not also get the prose duration suffix."""
+
+    def _run_prompt_stage(self, prompt: str, use_duration_template: bool) -> str:
+        """Drive Cosmos3TokenizationStage.forward far enough to see the prompt."""
+        seen = {}
+
+        def fake_tokenize(prompt_text, *args, **kwargs):
+            seen.setdefault("prompt", prompt_text)
+            return (
+                torch.zeros(1, 4, dtype=torch.long),
+                torch.ones(1, 4, dtype=torch.long),
+                4,
+            )
+
+        stage = Cosmos3TokenizationStage.__new__(Cosmos3TokenizationStage)
+        batch = types.SimpleNamespace(
+            prompt=prompt,
+            negative_prompt="bad",
+            max_sequence_length=512,
+            use_duration_template=use_duration_template,
+            use_system_prompt=False,
+            fps=24.0,
+            num_frames=189,
+            height=480,
+            width=832,
+            data_type=DataType.VIDEO,
+            sampling_params=types.SimpleNamespace(action_mode=None),
+            extra={},
+        )
+        server_args = types.SimpleNamespace(
+            pipeline_config=types.SimpleNamespace(
+                use_duration_template=True, use_system_prompt=False
+            )
+        )
+        with (
+            mock.patch.object(stage, "_tokenize_prompt", fake_tokenize),
+            mock.patch.object(stage, "log_info"),
+        ):
+            stage.forward(batch, server_args)
+        return seen["prompt"]
+
+    def test_structured_caption_stays_valid_json(self):
+        prompt = json.dumps({"temporal_caption": "a cone melts"})
+        final = self._run_prompt_stage(prompt, use_duration_template=True)
+        caption = json.loads(final)  # would raise if the suffix were appended
+        self.assertEqual(caption["duration"], "7s")
+        self.assertNotIn("seconds long", final)
+
+    def test_prose_prompt_still_gets_the_duration_suffix(self):
+        final = self._run_prompt_stage("A curious raccoon.", use_duration_template=True)
+        self.assertIn("seconds long", final)
 
 
 if __name__ == "__main__":

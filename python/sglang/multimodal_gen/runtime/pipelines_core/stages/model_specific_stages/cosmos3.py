@@ -79,6 +79,35 @@ COSMOS3_I2V_FLOW_SHIFT = 10.0
 COSMOS3_T2V_FLOW_SHIFT = 10.0
 COSMOS3_V2V_FLOW_SHIFT = 10.0
 COSMOS3_ACTION_FLOW_SHIFT = 10.0
+# Edge uses a single low flow-shift for every video mode (t2v/i2v/v2v).
+COSMOS3_EDGE_VIDEO_FLOW_SHIFT = 3.0
+
+
+def _inject_caption_metadata(
+    prompt: str, num_frames: int, fps: float, height: int, width: int
+) -> str | None:
+    """Add the generation metadata that Cosmos3's structured captions carry.
+
+    Training captions always ship ``resolution``, plus ``duration``/``fps`` for
+    video, so a JSON caption without them is out of distribution. Returns
+    ``None`` when the prompt is not a JSON object; those prompts carry the same
+    metadata as trailing prose via the duration template instead.
+    """
+    try:
+        caption = json.loads(prompt)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(caption, dict):
+        return None
+
+    caption["resolution"] = {"H": int(height), "W": int(width)}
+    if num_frames > 1:
+        caption["duration"] = f"{int(num_frames / fps) if fps > 0 else 0}s"
+        caption["fps"] = float(fps)
+    else:
+        caption.pop("duration", None)
+        caption.pop("fps", None)
+    return json.dumps(caption)
 
 
 def _resize_crop_pil(
@@ -327,6 +356,15 @@ class Cosmos3TokenizationStage(PipelineStage):
             use_system_prompt = False
             use_duration_template = False
             self.log_info(f"Action prompt: {prompt}")
+        else:
+            structured_caption = _inject_caption_metadata(
+                prompt, num_frames, fps, batch.height, batch.width
+            )
+            if structured_caption is not None:
+                # The metadata is already in the caption; appending the prose
+                # template too would state the duration twice.
+                prompt = structured_caption
+                use_duration_template = False
 
         # Apply duration template if enabled (no temporal concept for T2I).
         if use_duration_template and not is_image_gen and num_frames > 1:
@@ -680,15 +718,14 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         super().__init__()
         self.scheduler = scheduler
 
-    def _default_flow_shift_for_mode(self, batch: Req) -> float | None:
-        """Resolve the per-mode default flow_shift for the request.
-
-        Matches cosmos-framework's built-in per-mode sample defaults.
-        """
+    def _default_flow_shift_for_mode(self, batch: Req, is_edge: bool) -> float | None:
+        """Resolve the per-mode default flow_shift for the request."""
         if getattr(batch.sampling_params, "action_mode", None) is not None:
             return COSMOS3_ACTION_FLOW_SHIFT
         if batch.data_type == DataType.IMAGE:
             return COSMOS3_T2I_FLOW_SHIFT
+        if is_edge:
+            return COSMOS3_EDGE_VIDEO_FLOW_SHIFT
         if batch.preprocessed_image is not None:
             return COSMOS3_I2V_FLOW_SHIFT
         if batch.preprocessed_video is not None:
@@ -698,12 +735,32 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
         device = get_local_torch_device()
+
+        pipeline_config = server_args.pipeline_config
+        distilled_sigmas = pipeline_config.distilled_sigmas
+        if distilled_sigmas is not None:
+            # Distilled checkpoints carry an explicit fixed-step sigma schedule
+            # with the shift already baked in; drive the scheduler from it
+            # directly (step count == len(sigmas), num_inference_steps ignored).
+            # Reset shift so set_timesteps does not re-shift the baked-in sigmas.
+            if hasattr(self.scheduler, "set_shift"):
+                self.scheduler.set_shift(1.0)
+            self.scheduler.set_timesteps(sigmas=distilled_sigmas, device=device)
+            batch.timesteps = self.scheduler.timesteps
+            self.log_info(
+                f"Prepared {len(batch.timesteps)} distilled timesteps "
+                f"(sigmas={distilled_sigmas})"
+            )
+            return batch
+
         num_inference_steps = batch.num_inference_steps
         flow_shift = getattr(batch, "flow_shift", None)
         if flow_shift is None:
-            flow_shift = server_args.pipeline_config.flow_shift
+            flow_shift = pipeline_config.flow_shift
         if flow_shift is None:
-            flow_shift = self._default_flow_shift_for_mode(batch)
+            flow_shift = self._default_flow_shift_for_mode(
+                batch, bool(pipeline_config.is_edge)
+            )
         if flow_shift is not None and hasattr(self.scheduler, "set_shift"):
             self.scheduler.set_shift(float(flow_shift))
 
@@ -742,6 +799,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         self.scheduler = scheduler
         self.server_args = server_args
         self._logged_parallel_config = False
+        self._logged_cfg_split = False
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -917,6 +975,13 @@ class Cosmos3DenoisingStage(PipelineStage):
         timesteps = batch.timesteps
         guidance_scale = batch.guidance_scale
 
+        # Seed the scheduler's stochastic (SDE) noise from the request seed so it
+        # is identical on every sequence-parallel rank; otherwise each rank draws
+        # its own noise and the sharded latents diverge at the shard boundary.
+        generator = batch.generator
+        if generator is None and batch.seed is not None:
+            generator = torch.Generator(device=latents.device).manual_seed(batch.seed)
+
         cond_text_ids = batch.extra["cond_text_ids"]
         cond_text_mask = batch.extra["cond_text_mask"]
         uncond_text_ids = batch.extra["uncond_text_ids"]
@@ -1036,7 +1101,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         action_start_frame_offset=action_start_frame_offset,
                     )
                 else:
-                    noise_pred = self._predict_noise_cfg_batched(
+                    noise_pred = self._predict_noise_cfg(
                         latents=latents,
                         timestep=timestep,
                         cond_text_ids=cond_text_ids,
@@ -1047,10 +1112,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                         fps=fps,
                         guidance_scale=effective_scale,
                         noisy_frame_mask=velocity_mask,
-                        max_text_seq_len=max(
-                            batch.extra["cond_text_seq_len"],
-                            batch.extra["uncond_text_seq_len"],
-                        ),
+                        cond_text_seq_len=batch.extra["cond_text_seq_len"],
+                        uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
                         current_timestep=i,
                         sound_latents=sound_latents,
                         action_latents=action_latents,
@@ -1102,6 +1165,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 noise_pred,
                 t,
                 latents,
+                generator=generator,
                 return_dict=False,
             )[0]
 
@@ -1154,6 +1218,87 @@ class Cosmos3DenoisingStage(PipelineStage):
             batch.audio_latents = sound_latents
         self.log_info("Denoising complete")
         return batch
+
+    def _predict_noise_cfg(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        cond_text_ids: torch.Tensor,
+        cond_text_mask: torch.Tensor,
+        uncond_text_ids: torch.Tensor,
+        uncond_text_mask: torch.Tensor,
+        video_shape: tuple[int, int, int],
+        fps: float,
+        guidance_scale: float,
+        cond_text_seq_len: int,
+        uncond_text_seq_len: int,
+        **kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Run CFG, batching the two branches only when that is lossless.
+
+        A batched forward needs one shared text length, so the shorter prompt
+        gets right-padded. Those pad positions carry all-zero UND K/V, and the
+        GEN cross-attention runs unmasked over the full text K/V — a zero key
+        scores logit 0 and still takes softmax mass while contributing nothing,
+        which weakens the padded branch's conditioning. Fall back to one
+        forward per branch, each trimmed to its own length, whenever the
+        prompts differ in length.
+        """
+        if cond_text_seq_len == uncond_text_seq_len:
+            return self._predict_noise_cfg_batched(
+                latents=latents,
+                timestep=timestep,
+                cond_text_ids=cond_text_ids,
+                cond_text_mask=cond_text_mask,
+                uncond_text_ids=uncond_text_ids,
+                uncond_text_mask=uncond_text_mask,
+                video_shape=video_shape,
+                fps=fps,
+                guidance_scale=guidance_scale,
+                max_text_seq_len=cond_text_seq_len,
+                **kwargs,
+            )
+
+        if not self._logged_cfg_split and not self._current_batch_is_warmup:
+            self._logged_cfg_split = True
+            self.log_info(
+                "Prompt and negative prompt tokenize to different lengths "
+                f"({cond_text_seq_len} vs {uncond_text_seq_len}); running the "
+                "CFG branches in separate forwards to keep padding out of the "
+                "cross-attention"
+            )
+
+        cond = self._run_transformer(
+            latents=latents,
+            timestep=timestep,
+            text_ids=cond_text_ids,
+            text_mask=cond_text_mask,
+            video_shape=video_shape,
+            fps=fps,
+            cache_key="cond",
+            max_text_seq_len=cond_text_seq_len,
+            **kwargs,
+        )
+        uncond = self._run_transformer(
+            latents=latents,
+            timestep=timestep,
+            text_ids=uncond_text_ids,
+            text_mask=uncond_text_mask,
+            video_shape=video_shape,
+            fps=fps,
+            cache_key="uncond",
+            max_text_seq_len=uncond_text_seq_len,
+            **kwargs,
+        )
+
+        def _cfg_combine(
+            cond_pred: torch.Tensor, uncond_pred: torch.Tensor
+        ) -> torch.Tensor:
+            return uncond_pred + guidance_scale * (cond_pred - uncond_pred)
+
+        if isinstance(cond, tuple):
+            return tuple(_cfg_combine(c, u) for c, u in zip(cond, uncond, strict=True))
+        return _cfg_combine(cond, uncond)
 
     def _predict_noise_cfg_batched(
         self,
