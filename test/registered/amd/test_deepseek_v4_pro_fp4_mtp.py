@@ -15,6 +15,7 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.perf_baseline import ThroughputBaseline, check_output_throughput
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -37,6 +38,17 @@ FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_tr
 
 GSM8K_ACCURACY_THRESHOLD = 0.92
 AVG_SPEC_ACCEPT_LENGTH_THRESHOLD = 2.8
+
+_BASELINE_SOURCE = "median of 11 MI35x nightly runs, 2026-07-30..2026-08-11"
+
+# Single-request decode speed (tok/s) from test_b_bs_1_speed, one baseline per
+# SGLANG_HACK_FLASHMLA_BACKEND the nightly job runs. Accept length already has
+# its own threshold above; this catches a decode slowdown that leaves
+# speculation acceptance intact.
+BS_1_SPEED_BASELINES = {
+    "unified_kv_triton": ThroughputBaseline({1: 128.8}, recorded_from=_BASELINE_SOURCE),
+    "triton": ThroughputBaseline({1: 157.6}, recorded_from=_BASELINE_SOURCE),
+}
 
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
@@ -144,13 +156,23 @@ class TestDeepseekV4ProFp4MTP(CustomTestCase):
 
         print(f"{acc_length=:.2f} {speed=:.2f}")
 
+        check = check_output_throughput(
+            [{"batch_size": 1, "output_throughput": speed}],
+            BS_1_SPEED_BASELINES.get(FLASHMLA_BACKEND),
+            f"deepseek-v4-pro-fp4 MTP bs=1 decode ({FLASHMLA_BACKEND})",
+        )
+        print(check.markdown)
+
         if is_in_ci():
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-v4-pro-fp4 MTP, {FLASHMLA_BACKEND})\n"
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
+                f"\n{check.markdown}"
             )
             self.assertGreater(acc_length, AVG_SPEC_ACCEPT_LENGTH_THRESHOLD)
+            if not check.ok:
+                self.fail(check.failure_message())
 
 
 if __name__ == "__main__":
