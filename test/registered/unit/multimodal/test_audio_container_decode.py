@@ -15,6 +15,7 @@ import soundfile
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.audio_from_video import (
+    _append_resampled_frames,
     decode_audio_container,
     extract_audio_from_video_bytes,
     is_audio_container,
@@ -175,6 +176,67 @@ class TestAudioContainerDecode(CustomTestCase):
         with patch("sglang.srt.utils.common._BACKEND", "torchcodec"):
             waveform = load_audio(self.mp4, sr=16000)
         self.assertGreater(len(waveform), 0)
+
+    def test_mp4_duration_cap_rejects_before_concatenation(self):
+        with (
+            patch(
+                "sglang.srt.multimodal.audio_from_video.np.concatenate"
+            ) as concatenate,
+            self.assertRaisesRegex(ValueError, "maximum allowed decode duration"),
+        ):
+            load_audio(self.mp4, sr=16000, max_duration_s=0.01)
+        concatenate.assert_not_called()
+
+    def test_mp4_byte_cap_rejects_before_concatenation(self):
+        with (
+            patch(
+                "sglang.srt.multimodal.audio_from_video.np.concatenate"
+            ) as concatenate,
+            self.assertRaisesRegex(ValueError, "maximum allowed decoded size"),
+        ):
+            load_audio(
+                self.mp4,
+                sr=16000,
+                max_duration_s=0,
+                max_decode_bytes=1024,
+            )
+        concatenate.assert_not_called()
+
+    def test_mp4_exact_pcm_bound_is_accepted_at_eof(self):
+        baseline = decode_audio_container(
+            self.mp4,
+            target_sr=8000,
+            mono=True,
+            max_duration_s=0,
+            max_decode_bytes=0,
+        )
+        waveform = decode_audio_container(
+            self.mp4,
+            target_sr=8000,
+            mono=True,
+            max_duration_s=len(baseline) / 8000,
+            max_decode_bytes=baseline.nbytes,
+        )
+        np.testing.assert_array_equal(waveform, baseline)
+
+    def test_oversized_resampled_frame_rejects_before_numpy_projection(self):
+        class Frame:
+            samples = 1024
+            layout = type("Layout", (), {"channels": (object(),)})()
+
+            def to_ndarray(self):
+                raise AssertionError("oversized PCM must reject before projection")
+
+        with self.assertRaisesRegex(ValueError, "maximum allowed decoded size"):
+            _append_resampled_frames(
+                [],
+                [Frame()],
+                mono=True,
+                max_samples=None,
+                max_decode_bytes=1024,
+                sample_count=0,
+                decoded_bytes=0,
+            )
 
     def test_wav_keeps_existing_decoder_path(self):
         """Ordinary WAV must not be redirected to the container decoder."""

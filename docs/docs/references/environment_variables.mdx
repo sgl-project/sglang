@@ -88,6 +88,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>16</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MAX_AUDIO_DECODE_DURATION_S</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum accepted decoded duration in seconds from one compressed audio input. Fractional seconds are supported. Finite values less than or equal to <code>0</code> disable the operator limit; model-specific lower duration limits still apply. Invalid and non-finite values emit a warning and use the default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>600</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MAX_AUDIO_DECODE_BYTES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum application-visible projected or accumulated PCM bytes from one compressed audio input. SoundFile and TorchCodec request at most the cap plus one logical output interleaved sample frame to prove end-of-file at the exact boundary. Finite integer values less than or equal to <code>0</code> disable the limit. Invalid values emit a warning and use the default. This does not limit encoded input bytes, decoder/resampler-owned native frames, TorchCodec returned-tensor backing storage, filter buffers, library scratch space, or aggregate memory across concurrent decodes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>268435456</code> (256 MiB)</td>
+    </tr>
 </tbody>
 </table>
 

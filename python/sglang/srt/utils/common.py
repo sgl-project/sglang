@@ -1532,11 +1532,345 @@ CLIENT_MEDIA_EXCEPTIONS = (
 )
 
 
+class _AudioDecodeLimitError(ValueError):
+    """Audio exceeds a configured decode limit."""
+
+
+def _audio_too_long(duration_s: float, max_duration_s: float) -> _AudioDecodeLimitError:
+    return _AudioDecodeLimitError(
+        f"Audio exceeds the maximum allowed decode duration of "
+        f"{max_duration_s}s (input is at least {float(duration_s):.1f}s). Set "
+        f"SGLANG_MAX_AUDIO_DECODE_DURATION_S to change this limit."
+    )
+
+
+def _audio_too_large(
+    decoded_bytes: int, max_decode_bytes: int
+) -> _AudioDecodeLimitError:
+    return _AudioDecodeLimitError(
+        f"Audio exceeds the maximum allowed decoded size of {max_decode_bytes} "
+        f"bytes (input requires at least {decoded_bytes} bytes). Set "
+        f"SGLANG_MAX_AUDIO_DECODE_BYTES to change this limit."
+    )
+
+
+def _audio_decode_duration_limit(
+    max_duration_s: Optional[float],
+) -> Optional[float]:
+    if max_duration_s is None:
+        max_duration_s = envs.SGLANG_MAX_AUDIO_DECODE_DURATION_S.get()
+    try:
+        max_duration_s = float(max_duration_s)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "Maximum audio decode duration must be a finite number, got "
+            f"{max_duration_s!r}."
+        ) from error
+    if not math.isfinite(max_duration_s):
+        raise ValueError(
+            "Maximum audio decode duration must be a finite number, got "
+            f"{max_duration_s!r}."
+        )
+    return max_duration_s if max_duration_s > 0 else None
+
+
+def _audio_decode_byte_limit(max_decode_bytes: Optional[int]) -> Optional[int]:
+    if max_decode_bytes is None:
+        max_decode_bytes = envs.SGLANG_MAX_AUDIO_DECODE_BYTES.get()
+    if isinstance(max_decode_bytes, int):
+        parsed_value = max_decode_bytes
+    elif isinstance(max_decode_bytes, str):
+        try:
+            parsed_value = int(max_decode_bytes)
+        except ValueError as error:
+            raise ValueError(
+                "Maximum decoded audio bytes must be a finite integer, got "
+                f"{max_decode_bytes!r}."
+            ) from error
+    else:
+        try:
+            numeric_value = float(max_decode_bytes)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "Maximum decoded audio bytes must be a finite integer, got "
+                f"{max_decode_bytes!r}."
+            ) from error
+        if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+            raise ValueError(
+                "Maximum decoded audio bytes must be a finite integer, got "
+                f"{max_decode_bytes!r}."
+            )
+        parsed_value = int(numeric_value)
+    return parsed_value if parsed_value > 0 else None
+
+
+def _validate_audio_count(value: Optional[int], name: str, *, allow_zero: bool) -> int:
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(
+            f"{name} must be a {qualifier} integer, got {value}."
+        ) from error
+    minimum = 0 if allow_zero else 1
+    if (
+        not math.isfinite(numeric_value)
+        or not numeric_value.is_integer()
+        or numeric_value < minimum
+    ):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be a {qualifier} integer, got {value}.")
+    return int(numeric_value)
+
+
+def _validate_audio_sample_rate(sample_rate: Optional[int], name: str) -> int:
+    return _validate_audio_count(sample_rate, name, allow_zero=False)
+
+
+def _audio_duration_frame_count(
+    duration_s: float, sample_rate: int, *, round_up: bool = False
+) -> int:
+    duration_s = float(duration_s)
+    if not math.isfinite(duration_s) or duration_s < 0:
+        raise ValueError(
+            f"Audio duration must be a non-negative finite number, got {duration_s}."
+        )
+    sample_rate = _validate_audio_sample_rate(sample_rate, "Audio sample rate")
+    numerator, denominator = duration_s.as_integer_ratio()
+    frame_numerator = numerator * sample_rate
+    if round_up:
+        return (frame_numerator + denominator - 1) // denominator
+    return frame_numerator // denominator
+
+
+def _audio_resampled_frame_count(
+    frame_count: int, original_sr: int, target_sr: int
+) -> int:
+    frame_count = _validate_audio_count(
+        frame_count, "Audio frame count", allow_zero=True
+    )
+    original_sr = _validate_audio_sample_rate(original_sr, "Original sample rate")
+    target_sr = _validate_audio_sample_rate(target_sr, "Target sample rate")
+    return (frame_count * target_sr + original_sr - 1) // original_sr
+
+
+def _check_audio_pcm_size(
+    frame_count: int,
+    channels: int,
+    bytes_per_sample: int,
+    max_decode_bytes: Optional[int],
+) -> int:
+    frame_count = _validate_audio_count(
+        frame_count, "Audio frame count", allow_zero=True
+    )
+    channels = _validate_audio_count(channels, "Audio channel count", allow_zero=False)
+    bytes_per_sample = _validate_audio_count(
+        bytes_per_sample, "Audio sample size", allow_zero=False
+    )
+    decoded_bytes = frame_count * channels * bytes_per_sample
+    byte_cap = _audio_decode_byte_limit(max_decode_bytes)
+    if byte_cap is not None and decoded_bytes > byte_cap:
+        raise _audio_too_large(decoded_bytes, byte_cap)
+    return decoded_bytes
+
+
+def _check_audio_resample_size(
+    frame_count: int,
+    channels: int,
+    bytes_per_sample: int,
+    original_sr: int,
+    target_sr: int,
+    max_decode_bytes: Optional[int],
+) -> int:
+    output_frames = _audio_resampled_frame_count(frame_count, original_sr, target_sr)
+    _check_audio_pcm_size(output_frames, channels, bytes_per_sample, max_decode_bytes)
+    return output_frames
+
+
+def _decode_audio_with_torchcodec(
+    source,
+    *,
+    sample_rate: Optional[int] = None,
+    num_channels: Optional[int] = None,
+    max_duration_s: Optional[float] = None,
+    max_decode_bytes: Optional[int] = None,
+):
+    duration_cap = _audio_decode_duration_limit(max_duration_s)
+    byte_cap = _audio_decode_byte_limit(max_decode_bytes)
+
+    from torchcodec.decoders import AudioDecoder
+
+    decoder_kwargs = {}
+    if sample_rate is not None:
+        decoder_kwargs["sample_rate"] = _validate_audio_sample_rate(
+            sample_rate, "Requested sample rate"
+        )
+    if num_channels is not None:
+        decoder_kwargs["num_channels"] = _validate_audio_count(
+            num_channels, "Requested channel count", allow_zero=False
+        )
+    decoder = AudioDecoder(source, **decoder_kwargs)
+
+    if duration_cap is None and byte_cap is None:
+        return decoder.get_all_samples()
+
+    metadata = decoder.metadata
+    decoded_sr = _validate_audio_sample_rate(
+        (
+            sample_rate
+            if sample_rate is not None
+            else getattr(metadata, "sample_rate", None)
+        ),
+        "Decoded sample rate",
+    )
+    decoded_channels = _validate_audio_count(
+        (
+            num_channels
+            if num_channels is not None
+            else getattr(metadata, "num_channels", None)
+        ),
+        "Decoded channel count",
+        allow_zero=False,
+    )
+    bytes_per_frame = decoded_channels * np.dtype(np.float32).itemsize
+
+    metadata_duration_s = getattr(metadata, "duration_seconds", None)
+    if metadata_duration_s is not None:
+        try:
+            metadata_duration_s = float(metadata_duration_s)
+        except (TypeError, ValueError, OverflowError):
+            metadata_duration_s = None
+        if metadata_duration_s is not None and (
+            not math.isfinite(metadata_duration_s) or metadata_duration_s < 0
+        ):
+            metadata_duration_s = None
+
+    metadata_frames = None
+    if metadata_duration_s is not None:
+        # Metadata is only a fast-reject hint. Use a lower bound here because
+        # floating duration values can sit just above an exact frame boundary;
+        # the requested-range output below is the authoritative check.
+        metadata_frames = _audio_duration_frame_count(metadata_duration_s, decoded_sr)
+        if duration_cap is not None:
+            duration_frame_limit = _audio_duration_frame_count(duration_cap, decoded_sr)
+            if metadata_frames > duration_frame_limit:
+                raise _audio_too_long(metadata_frames / decoded_sr, duration_cap)
+        metadata_bytes = metadata_frames * bytes_per_frame
+        if byte_cap is not None and metadata_bytes > byte_cap:
+            raise _audio_too_large(metadata_bytes, byte_cap)
+
+    allowed_frame_limit = None
+    byte_frame_limit = None
+    if duration_cap is not None:
+        allowed_frame_limit = _audio_duration_frame_count(duration_cap, decoded_sr)
+    if byte_cap is not None:
+        byte_frame_limit = byte_cap // bytes_per_frame
+        if byte_frame_limit == 0:
+            raise _audio_too_large(bytes_per_frame, byte_cap)
+        if allowed_frame_limit is None or byte_frame_limit < allowed_frame_limit:
+            allowed_frame_limit = byte_frame_limit
+
+    assert allowed_frame_limit is not None
+    # Decode one frame beyond the active boundary. An exact-size result is only
+    # accepted when the decoder reaches EOF instead of silently truncating at
+    # potentially inaccurate container metadata.
+    decode_frame_limit = allowed_frame_limit + 1
+    samples = decoder.get_samples_played_in_range(
+        0.0, stop_seconds=decode_frame_limit / decoded_sr
+    )
+    actual_sr = _validate_audio_sample_rate(samples.sample_rate, "Decoded sample rate")
+    if actual_sr != decoded_sr:
+        raise ValueError(
+            f"Decoded sample rate changed from {decoded_sr} to {actual_sr}."
+        )
+    actual_frames = samples.data.shape[-1]
+    duration_s = actual_frames / actual_sr
+    if duration_cap is not None and duration_s > duration_cap:
+        raise _audio_too_long(duration_s, duration_cap)
+    actual_bytes = samples.data.numel() * samples.data.element_size()
+    if byte_cap is not None and actual_bytes > byte_cap:
+        raise _audio_too_large(actual_bytes, byte_cap)
+    return samples
+
+
+def _decode_audio_with_soundfile(
+    source: str | bytes,
+    *,
+    max_duration_s: Optional[float] = None,
+    max_decode_bytes: Optional[int] = None,
+    dtype: Optional[str] = None,
+) -> tuple[np.ndarray, int]:
+    import soundfile as sf
+
+    duration_cap = _audio_decode_duration_limit(max_duration_s)
+    byte_cap = _audio_decode_byte_limit(max_decode_bytes)
+    audio_input = BytesIO(source) if isinstance(source, bytes) else source
+    read_kwargs = {"dtype": dtype} if dtype is not None else {}
+    decode_dtype = np.dtype(dtype if dtype is not None else "float64")
+    try:
+        with sf.SoundFile(audio_input) as audio_file:
+            original_sr = _validate_audio_sample_rate(
+                audio_file.samplerate, "Audio file sample rate"
+            )
+            channels = _validate_audio_count(
+                audio_file.channels, "Audio file channel count", allow_zero=False
+            )
+            frames = _validate_audio_count(
+                audio_file.frames, "Audio file frame count", allow_zero=True
+            )
+            duration_frame_limit = (
+                _audio_duration_frame_count(duration_cap, original_sr)
+                if duration_cap is not None
+                else None
+            )
+            if duration_frame_limit is not None and frames > duration_frame_limit:
+                raise _audio_too_long(frames / original_sr, duration_cap)
+            decoded_bytes = frames * channels * decode_dtype.itemsize
+            if byte_cap is not None and decoded_bytes > byte_cap:
+                raise _audio_too_large(decoded_bytes, byte_cap)
+            if byte_cap is not None and channels * decode_dtype.itemsize > byte_cap:
+                raise _audio_too_large(channels * decode_dtype.itemsize, byte_cap)
+
+            if duration_cap is None and byte_cap is None:
+                audio = audio_file.read(**read_kwargs)
+            else:
+                byte_frame_limit = (
+                    byte_cap // (channels * decode_dtype.itemsize)
+                    if byte_cap is not None
+                    else None
+                )
+                limits = [
+                    limit
+                    for limit in (duration_frame_limit, byte_frame_limit)
+                    if limit is not None
+                ]
+                # One additional frame is the EOF proof for an exact-boundary
+                # input. The temporary overshoot is at most one PCM frame.
+                audio = audio_file.read(frames=min(limits) + 1, **read_kwargs)
+            if duration_frame_limit is not None and len(audio) > duration_frame_limit:
+                raise _audio_too_long(len(audio) / original_sr, duration_cap)
+            if byte_cap is not None and audio.nbytes > byte_cap:
+                raise _audio_too_large(audio.nbytes, byte_cap)
+    except sf.LibsndfileError as error:
+        raise ValueError(f"Could not decode audio: {error}") from error
+    return audio, original_sr
+
+
 def load_audio(
-    audio_file: str, sr: Optional[int] = None, mono: bool = True
+    audio_file: str | bytes,
+    sr: Optional[int] = None,
+    mono: bool = True,
+    max_duration_s: Optional[float] = None,
+    max_decode_bytes: Optional[int] = None,
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
+    else:
+        sr = _validate_audio_sample_rate(sr, "Sample rate")
+    # A small compressed payload can expand into hours or gigabytes of PCM.
+    # The limits compose, and <= 0 disables either one independently.
+    duration_cap = _audio_decode_duration_limit(max_duration_s)
+    byte_cap = _audio_decode_byte_limit(max_decode_bytes)
 
     # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
@@ -1573,45 +1907,56 @@ def load_audio(
             source,
             target_sr=sr,
             mono=mono,
+            max_duration_s=duration_cap if duration_cap is not None else 0.0,
+            max_decode_bytes=byte_cap if byte_cap is not None else 0,
         )
 
     if _BACKEND == "torchcodec":
-        from torchcodec.decoders import AudioDecoder
-
         try:
-            decoder = AudioDecoder(
+            samples = _decode_audio_with_torchcodec(
                 source,
                 sample_rate=sr,
                 num_channels=1 if mono else None,
+                max_duration_s=duration_cap if duration_cap is not None else 0.0,
+                max_decode_bytes=byte_cap if byte_cap is not None else 0,
             )
-            samples = decoder.get_all_samples()
+        except _AudioDecodeLimitError:
+            raise
+        except Exception as e:
+            # torchcodec's bytes-buffer IO can fail on WAV files that carry
+            # large trailing metadata chunks. Fall back to soundfile, which
+            # reads the PCM payload directly.
+            logger.warning(
+                f"torchcodec decode failed ({e}); falling back to soundfile + torchaudio."
+            )
+        else:
             if mono:
                 return samples.data.squeeze(0).numpy()
             return samples.data.T.numpy()
-        except Exception as e:
-            # torchcodec's bytes-buffer IO can fail on WAV files that carry
-            # large trailing metadata chunks. Fall back to soundfile, which reads the PCM payload directly.
-            logger.warning(
-                f"torchcodec AudioDecoder failed ({e}); falling back to soundfile + torchaudio."
-            )
 
     # Fallback: soundfile + torchaudio (ARM / no FFmpeg / torchcodec failure)
-    import soundfile as sf
     import torch
     import torchaudio
 
-    try:
-        if isinstance(source, bytes):
-            audio, original_sr = sf.read(BytesIO(source))
-        else:
-            audio, original_sr = sf.read(source)
-    except sf.LibsndfileError as e:
-        raise ValueError(f"Could not decode audio: {e}") from e
+    audio, original_sr = _decode_audio_with_soundfile(
+        source,
+        max_duration_s=duration_cap if duration_cap is not None else 0.0,
+        max_decode_bytes=byte_cap if byte_cap is not None else 0,
+    )
 
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
 
     if original_sr != sr:
+        channels = 1 if audio.ndim == 1 else audio.shape[1]
+        _check_audio_resample_size(
+            len(audio),
+            channels,
+            np.dtype(np.float32).itemsize,
+            original_sr,
+            sr,
+            byte_cap if byte_cap is not None else 0,
+        )
         audio_tensor = torch.from_numpy(audio).float()
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
@@ -1624,6 +1969,12 @@ def load_audio(
             audio = audio_tensor.squeeze(0).numpy()
         else:
             audio = audio_tensor.T.numpy()
+        _check_audio_pcm_size(
+            len(audio),
+            1 if audio.ndim == 1 else audio.shape[1],
+            audio.dtype.itemsize,
+            byte_cap if byte_cap is not None else 0,
+        )
 
     return audio
 

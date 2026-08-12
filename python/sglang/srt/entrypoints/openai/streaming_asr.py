@@ -3,7 +3,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, Optional
 
 import soundfile as sf
 from fastapi import Request
@@ -13,6 +13,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.utils.common import _decode_audio_with_soundfile
 
 logger = logging.getLogger(__name__)
 
@@ -96,29 +97,39 @@ class StreamingASRState:
         return self._record_emit(" ".join(all_words[common_count:]))
 
 
-def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
+def _encode_wav_prefix(data, sample_rate: int) -> bytes:
+    output = io.BytesIO()
+    try:
+        sf.write(output, data, sample_rate, format="WAV")
+        return output.getvalue()
+    finally:
+        output.close()
+
+
+def iter_audio_chunks(
+    audio_data: bytes, chunk_size_sec: float
+) -> Iterator[tuple[bytes, bool]]:
+    """Yield cumulative WAV prefixes without retaining prior encodings."""
     if not audio_data:
         raise ValueError("audio_data is empty")
     if chunk_size_sec <= 0:
         raise ValueError(f"chunk_size_sec must be positive, got {chunk_size_sec}")
-    audio_file = io.BytesIO(audio_data)
-    try:
-        data, sample_rate = sf.read(audio_file, dtype="float32")
-    except sf.LibsndfileError as e:
-        raise ValueError(f"failed to decode audio: {e}") from e
+    data, sample_rate = _decode_audio_with_soundfile(audio_data, dtype="float32")
     if len(data.shape) > 1:
         data = data.mean(axis=1)
     chunk_size_samples = int(chunk_size_sec * sample_rate)
+    if chunk_size_samples <= 0:
+        raise ValueError(
+            f"chunk_size_sec is smaller than one sample at {sample_rate} Hz"
+        )
     total_samples = len(data)
-    chunks = []
     for end in range(
         chunk_size_samples, total_samples + chunk_size_samples, chunk_size_samples
     ):
         end = min(end, total_samples)
-        buf = io.BytesIO()
-        sf.write(buf, data[:end], sample_rate, format="WAV")
-        chunks.append(buf.getvalue())
-    return chunks
+        # Yield the helper result directly so the suspended generator frame does
+        # not retain the prior encoded prefix while the consumer processes it.
+        yield _encode_wav_prefix(data[:end], sample_rate), end == total_samples
 
 
 def normalize_whitespace(text: str) -> str:
