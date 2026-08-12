@@ -62,6 +62,12 @@ class TestEagle3MultiLoRA(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                # Canonical EAGLE3 sglang config, as in
+                # test/registered/core/test_basic_sanity_eagle3.py: the draft
+                # checkpoint is fp16, and bf16 + flashinfer cutlass RMSNorm
+                # hits a dtype mismatch on the draft's input_layernorm.
+                "--dtype=float16",
+                "--attention-backend=triton",
                 "--speculative-algorithm=EAGLE3",
                 f"--speculative-draft-model-path={DEFAULT_DRAFT_MODEL_EAGLE3}",
                 "--speculative-num-steps=5",
