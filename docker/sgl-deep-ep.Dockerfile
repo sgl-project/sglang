@@ -8,7 +8,7 @@ ARG CUDA_TAG=cu130
 ARG CUDA_VERSION=13.0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PYTHON_TAG=cp312-cp312
-ARG TORCH_VERSION=2.11.0
+ARG TORCH_VERSION=2.13.0
 
 ENV CUDA_HOME=/usr/local/cuda
 ENV GDRCOPY_HOME=/usr/local
@@ -19,7 +19,7 @@ ENV PYTHON_BIN=/opt/python/${PYTHON_TAG}/bin/python
 # These mirror the build and RDMA dependencies used by ci_install_deepep.sh.
 # The image builds only GDRCopy's user-space library: the host owns gdrdrv and
 # passes /dev/gdrdrv through at runtime.
-RUN yum install -y --nogpgcheck \
+RUN yum install -y --nogpgcheck --enablerepo=powertools \
         cmake \
         curl \
         gcc \
@@ -54,6 +54,7 @@ RUN set -eux; \
 RUN git clone --depth 1 --branch "v${GDRCOPY_VERSION}" \
         https://github.com/NVIDIA/gdrcopy.git /opt/gdrcopy \
     && make -C /opt/gdrcopy CUDA="${CUDA_HOME}" prefix=/usr/local lib_install \
+    && printf '%s\n' /usr/local/lib > /etc/ld.so.conf.d/gdrcopy.conf \
     && ldconfig \
     && test -f /usr/local/include/gdrapi.h \
     && ldconfig -p | grep -q libgdrapi
@@ -72,4 +73,5 @@ RUN --mount=type=cache,id=sgl-deep-ep-pip-${CUDA_TAG}-${PYTHON_TAG}-${ARCHITECTU
         packaging \
         setuptools \
         wheel; \
-    "${PYTHON_BIN}" -c 'import torch; assert torch.__version__.startswith("2.11.0"); print(torch.__version__, torch.version.cuda)'
+    TORCH_VERSION="${TORCH_VERSION}" "${PYTHON_BIN}" -c \
+        'import os, torch; assert torch.__version__.startswith(os.environ["TORCH_VERSION"]); print(torch.__version__, torch.version.cuda)'

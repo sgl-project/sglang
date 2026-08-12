@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 constexpr int kFixupBlockSize = 256;
 
@@ -172,4 +172,4 @@ void fixup_zero_kv_rows(
   }
 }
 
-}  // namespace
+}  // namespace sglang

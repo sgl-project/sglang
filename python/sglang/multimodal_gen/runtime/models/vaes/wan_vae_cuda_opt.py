@@ -3,20 +3,19 @@
 
 Fuses every decoder ``WanRMS_norm -> SiLU`` chain into one Triton kernel on
 the channels_last_3d layout. Wrappers are installed once at VAE load and
-dispatch on a request-scoped :class:`VaeFastPathGate` (published as
-``_sgl_vae_fast_path_gate``): ``quality == "high"`` runs the fused kernel
-(not bitwise-identical to aten, hence gated), the ``"lossless"`` default
-runs the original module path bit-for-bit. Install is all-or-nothing and
-fail-closed.
+dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality == "high"``
+runs the fused kernel (not bitwise-identical to aten, hence gated), the
+``"lossless"`` default runs the original module path bit-for-bit. Install is
+all-or-nothing and fail-closed.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
-    GATE_ATTR,
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
+    register_vae_fast_path_gate,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -133,7 +132,7 @@ def maybe_optimize_wan_vae(vae: nn.Module) -> nn.Module:
     n_norm = _install_norm_silu(decoder, gate)
     if n_norm is None:
         return vae
-    setattr(vae, GATE_ATTR, gate)
+    register_vae_fast_path_gate(vae, gate)
     logger.info(
         "Wan VAE: installed quality-gated fast path (%d RMSNorm+SiLU fusions).",
         n_norm,
