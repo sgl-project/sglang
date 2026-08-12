@@ -12,6 +12,18 @@ and video support is planned. Other VLMs continue to use their existing cache
 paths.
 </Note>
 
+## Recommended usage
+
+- Start Kimi-K3 normally. The 256 MiB CPU preprocess cache is enabled
+  automatically; no request changes are required.
+- If the client already hashes immutable image bytes, send that SHA-256 as
+  `content_hash` (OpenAI API) or `mm_content_hashes` (Native Engine API).
+  SGLang verifies it against the image by default.
+- Use `--trust-mm-content-hashes` only when avoiding the repeated path/URL read
+  matters and the caller guarantees that each hash names exactly those bytes.
+  A stale trusted hash can reuse the wrong image artifact and change model
+  output. Do not use legacy `mm_hashes` for media identity.
+
 ## What is cached
 
 SGLang keeps four identities separate:
