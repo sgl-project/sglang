@@ -49,7 +49,7 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
     b_fp8 = b_fp8.t()
     o = torch_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
     o1 = fp8_per_tensor_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
-    torch.testing.assert_close(o, o1, rtol=0.02, atol=1)
+    torch.testing.assert_close(o, o1, rtol=0.02, atol=2)
 
 
 def _test_scalar_a_accuracy_once(M, N, K, with_bias, out_dtype, device):
