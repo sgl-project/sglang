@@ -1452,12 +1452,17 @@ class Pi05CoreModel(nn.Module):
         )
         self._offload_prefix_image_encoder_after_embed()
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_full_attention = bool(prefix_full_attention_hint)
-        if prefix_full_attention:
+        prefix_full_attention = (
+            bool(prefix_full_attention_hint)
+            if prefix_full_attention_hint is not None
+            else None
+        )
+        if prefix_full_attention is True:
             attention_mask = None
         else:
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-            prefix_full_attention = bool(prefix_att_2d_masks.all().item())
+            if prefix_full_attention is None:
+                prefix_full_attention = bool(prefix_att_2d_masks.all().item())
             attention_mask = self.prepare_attention_masks_4d(
                 prefix_att_2d_masks,
                 full_attention=prefix_full_attention,
@@ -1506,7 +1511,12 @@ class Pi05CoreModel(nn.Module):
                 [prefix_pad_2d_masks, suffix_att_2d_masks],
                 dim=2,
             )
-            attention_mask = self.prepare_attention_masks_4d(full_att_2d_masks)
+            # This branch already proves the mask is not full attention. Passing
+            # the static hint avoids a tensor ``.item()`` during CUDA capture.
+            attention_mask = self.prepare_attention_masks_4d(
+                full_att_2d_masks,
+                full_attention=False,
+            )
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = (
             prefix_offsets

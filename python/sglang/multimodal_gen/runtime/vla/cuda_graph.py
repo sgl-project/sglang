@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -46,6 +47,7 @@ class VLADenoiseGraphSignature:
     action_dim: int
     dtype: str
     parallel_layout: str
+    full_attention: bool
 
 
 @dataclass
@@ -57,6 +59,106 @@ class _CapturedDenoiseGraph:
     static_output: torch.Tensor
     current_context_id: int | None = None
     current_context_digest: str | None = None
+
+
+@dataclass(frozen=True)
+class VLAGraphCacheInfo:
+    size: int
+    max_entries: int
+    hits: int
+    misses: int
+    captures: int
+    evictions: int
+    failures: int
+    evict_on_miss: bool
+
+
+class _BoundedCaptureCache:
+    """Small LRU that owns CUDA graph executables and their static buffers."""
+
+    def __init__(self, name: str, max_entries: int, *, evict_on_miss: bool = True):
+        self.name = name
+        self.max_entries = max(0, int(max_entries))
+        self.evict_on_miss = evict_on_miss
+        self.entries: OrderedDict[Any, Any] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+        self.captures = 0
+        self.evictions = 0
+        self.failures = 0
+
+    @staticmethod
+    def _release(entry: Any) -> None:
+        reset = getattr(entry.graph, "reset", None)
+        if callable(reset):
+            reset()
+
+    def get(self, signature: Any) -> Any | None:
+        entry = self.entries.get(signature)
+        if entry is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        self.entries.move_to_end(signature)
+        return entry
+
+    def put(self, signature: Any, entry: Any) -> bool:
+        if self.max_entries == 0:
+            self._release(entry)
+            return False
+        if signature not in self.entries and not self.can_admit(signature):
+            self._release(entry)
+            return False
+        previous = self.entries.pop(signature, None)
+        if previous is not None:
+            self._release(previous)
+        self.entries[signature] = entry
+        self.captures += 1
+
+        while len(self.entries) > self.max_entries:
+            evicted_signature, evicted = self.entries.popitem(last=False)
+            self._release(evicted)
+            self.evictions += 1
+            logger.info(
+                "Evicted VLA %s CUDA graph for signature %s (entries=%d/%d)",
+                self.name,
+                evicted_signature,
+                len(self.entries),
+                self.max_entries,
+            )
+        return True
+
+    def can_admit(self, signature: Any) -> bool:
+        return (
+            signature in self.entries
+            or len(self.entries) < self.max_entries
+            or self.evict_on_miss
+        )
+
+    def discard(self, signature: Any) -> None:
+        entry = self.entries.pop(signature, None)
+        if entry is not None:
+            self._release(entry)
+
+    def mark_failure(self) -> None:
+        self.failures += 1
+
+    def clear(self) -> None:
+        for entry in self.entries.values():
+            self._release(entry)
+        self.entries.clear()
+
+    def info(self) -> VLAGraphCacheInfo:
+        return VLAGraphCacheInfo(
+            size=len(self.entries),
+            max_entries=self.max_entries,
+            hits=self.hits,
+            misses=self.misses,
+            captures=self.captures,
+            evictions=self.evictions,
+            failures=self.failures,
+            evict_on_miss=self.evict_on_miss,
+        )
 
 
 def _clone_past_key_values(past_key_values: Any) -> Any:
@@ -95,13 +197,30 @@ def _copy_prefix_context_(dst: PrefixContext, src: PrefixContext) -> None:
 class VLAPrefixGraphRunner:
     """Full CUDA graph runner for VLA prefix encoding shape buckets."""
 
-    def __init__(self, enabled: bool = True, max_entries: int = 1):
-        self.max_entries = max(0, max_entries)
+    def __init__(
+        self,
+        enabled: bool = True,
+        max_entries: int = 1,
+        *,
+        evict_on_miss: bool = False,
+    ):
+        self._cache = _BoundedCaptureCache(
+            "prefix", max_entries, evict_on_miss=evict_on_miss
+        )
+        self.max_entries = self._cache.max_entries
         self.enabled = enabled and self.max_entries > 0
-        self._captured: dict[VLAPrefixGraphSignature, _CapturedPrefixGraph] = {}
+        # Keep this alias for lightweight runtime diagnostics and compatibility.
+        self._captured = self._cache.entries
         self._disabled_signatures: set[VLAPrefixGraphSignature] = set()
         self._capture_stream: torch.cuda.Stream | None = None
         self._graph_pool: Any = None
+
+    def cache_info(self) -> VLAGraphCacheInfo:
+        return self._cache.info()
+
+    def clear(self) -> None:
+        self._cache.clear()
+        self._disabled_signatures.clear()
 
     def _capture(
         self,
@@ -140,11 +259,11 @@ class VLAPrefixGraphRunner:
             static_inputs=static_inputs,
             static_output=static_output,
         )
-        self._captured[signature] = captured
         logger.info(
-            "Captured VLA prefix CUDA graph: batch=%d inputs=%s",
+            "Captured VLA prefix CUDA graph: batch=%d inputs=%s (capacity=%d)",
             signature.batch_size,
             signature.input_shapes,
+            self.max_entries,
         )
         return captured
 
@@ -162,12 +281,13 @@ class VLAPrefixGraphRunner:
         ):
             return step_fn(inputs)
 
-        captured = self._captured.get(signature)
-        if captured is None and len(self._captured) >= self.max_entries:
+        captured = self._cache.get(signature)
+        if captured is None and not self._cache.can_admit(signature):
             return step_fn(inputs)
         try:
             if captured is None:
                 captured = self._capture(signature, step_fn, inputs)
+                self._cache.put(signature, captured)
             else:
                 for static_input, current_input in zip(
                     captured.static_inputs, inputs, strict=True
@@ -180,7 +300,8 @@ class VLAPrefixGraphRunner:
             return captured.static_output
         except Exception:
             self._disabled_signatures.add(signature)
-            self._captured.pop(signature, None)
+            self._cache.discard(signature)
+            self._cache.mark_failure()
             logger.warning(
                 "VLA prefix CUDA graph disabled for signature %s",
                 signature,
@@ -196,12 +317,21 @@ class VLADenoiseGraphRunner:
     diffusion BCG and does not capture prefix encoding or token decode.
     """
 
-    def __init__(self, enabled: bool = True):
-        self.enabled = enabled
-        self._captured: dict[VLADenoiseGraphSignature, _CapturedDenoiseGraph] = {}
+    def __init__(self, enabled: bool = True, max_entries: int = 16):
+        self._cache = _BoundedCaptureCache("action-denoise", max_entries)
+        self.max_entries = self._cache.max_entries
+        self.enabled = enabled and self.max_entries > 0
+        self._captured = self._cache.entries
         self._disabled_signatures: set[VLADenoiseGraphSignature] = set()
         self._capture_stream: torch.cuda.Stream | None = None
         self._graph_pool: Any = None
+
+    def cache_info(self) -> VLAGraphCacheInfo:
+        return self._cache.info()
+
+    def clear(self) -> None:
+        self._cache.clear()
+        self._disabled_signatures.clear()
 
     def _sync_context_if_needed(
         self,
@@ -279,15 +409,16 @@ class VLADenoiseGraphRunner:
             current_context_id=id(prefix_context.past_key_values),
             current_context_digest=prefix_context.cache_key_digest,
         )
-        self._captured[signature] = captured
         logger.info(
             "Captured VLA denoise CUDA graph: batch=%d prefix=%d action=%dx%d "
-            "dtype=%s",
+            "dtype=%s full_attention=%s (capacity=%d)",
             signature.batch_size,
             signature.prefix_len,
             signature.action_horizon,
             signature.action_dim,
             signature.dtype,
+            signature.full_attention,
+            self.max_entries,
         )
         return captured
 
@@ -305,12 +436,13 @@ class VLADenoiseGraphRunner:
         if x_t.device.type != "cuda":
             return step_fn(prefix_context, x_t, timestep)
 
-        captured = self._captured.get(signature)
+        captured = self._cache.get(signature)
         try:
             if captured is None:
                 captured = self._capture(
                     signature, step_fn, prefix_context, x_t, timestep
                 )
+                self._cache.put(signature, captured)
                 captured.graph.replay()
             else:
                 self._sync_context_if_needed(captured, prefix_context)
@@ -320,7 +452,8 @@ class VLADenoiseGraphRunner:
             return captured.static_output
         except Exception:
             self._disabled_signatures.add(signature)
-            self._captured.pop(signature, None)
+            self._cache.discard(signature)
+            self._cache.mark_failure()
             logger.warning(
                 "VLA denoise CUDA graph disabled for signature %s",
                 signature,

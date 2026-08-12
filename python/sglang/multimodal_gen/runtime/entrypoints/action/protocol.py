@@ -199,6 +199,40 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
         "policy_family",
         type(pipeline_config).__name__.removesuffix("PipelineConfig").lower(),
     )
+    prefix_graph_max_entries = getattr(
+        pipeline_config, "prefix_cuda_graph_max_entries", 0
+    )
+    action_graph_max_entries = getattr(
+        pipeline_config, "action_cuda_graph_max_entries", 0
+    )
+    prefix_graph_offload = any(
+        (
+            getattr(pipeline_config, "offload_prefix_image_encoder", False),
+            getattr(pipeline_config, "offload_prefix_image_encoder_after_embed", False),
+            getattr(pipeline_config, "offload_prefix_token_embedding", False),
+            getattr(pipeline_config, "offload_prefix_language_layers", False),
+            getattr(
+                pipeline_config, "offload_prefix_language_layers_after_prefix", False
+            ),
+            getattr(
+                pipeline_config,
+                "offload_prefix_language_layer_count_after_prefix",
+                0,
+            )
+            > 0,
+            getattr(pipeline_config, "empty_cache_after_prefix", False),
+        )
+    )
+    prefix_graph_enabled = bool(
+        getattr(pipeline_config, "enable_prefix_cuda_graph", False)
+        and prefix_graph_max_entries > 0
+        and not prefix_graph_offload
+    )
+    action_graph_enabled = bool(
+        getattr(pipeline_config, "enable_action_cuda_graph", False)
+        and action_graph_max_entries > 0
+        and not getattr(pipeline_config, "offload_action_expert_after_denoise", False)
+    )
     return {
         "object": "action.metadata",
         "model": server_args.served_model_name,
@@ -219,6 +253,15 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
         "runtime": {
             "materialize_dtype": pipeline_config.materialize_dtype,
             "enable_autocast": pipeline_config.enable_autocast,
+            "cuda_graph": {
+                "prefix_enabled": prefix_graph_enabled,
+                "prefix_max_entries": prefix_graph_max_entries,
+                "action_enabled": action_graph_enabled,
+                "action_max_entries": action_graph_max_entries,
+                "prompt_token_buckets": list(
+                    getattr(pipeline_config, "prompt_token_buckets", ())
+                ),
+            },
             "parallelism": {
                 "num_gpus": server_args.num_gpus,
                 "tp_size": server_args.tp_size,
@@ -236,11 +279,13 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
             "prefix_cache": (
                 "auto" if pipeline_config.enable_global_prefix_cache else False
             ),
-            "cuda_graph": "auto" if pipeline_config.enable_action_cuda_graph else False,
+            "cuda_graph": (
+                "auto" if prefix_graph_enabled or action_graph_enabled else False
+            ),
         },
         "capabilities": {
             "exact_prefix_cache": True,
-            "cuda_graph": pipeline_config.enable_action_cuda_graph,
+            "cuda_graph": prefix_graph_enabled or action_graph_enabled,
             "realtime_websocket": True,
             "openpi_websocket": True,
             "batch_inputs": False,

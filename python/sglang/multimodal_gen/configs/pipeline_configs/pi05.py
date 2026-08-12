@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
@@ -47,8 +48,13 @@ class Pi05PipelineConfig(PipelineConfig):
 
     enable_global_prefix_cache: bool = False
     enable_prefix_cuda_graph: bool = True
+    # Bucket prompt tokens so common serving lengths reuse the same prefix and
+    # action CUDA graphs. Opt in explicitly because padding can change floating
+    # point reduction order even though padded tokens remain attention-masked.
+    prompt_token_buckets: tuple[int, ...] = ()
     prefix_cuda_graph_max_entries: int = 1
     enable_action_cuda_graph: bool = True
+    action_cuda_graph_max_entries: int = 16
     prefix_cache_max_entries: int = 1
     prefix_cache_layout_version: str = "pi05-prefix-v1"
     offload_prefix_image_encoder: bool = False
@@ -85,6 +91,48 @@ class Pi05PipelineConfig(PipelineConfig):
             ),
         }
     )
+
+    def __post_init__(self) -> None:
+        self._normalize_and_validate_cuda_graph_config()
+
+    def _normalize_and_validate_cuda_graph_config(self) -> None:
+        try:
+            buckets = tuple(int(bucket) for bucket in self.prompt_token_buckets)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("prompt_token_buckets must contain integers") from exc
+        if any(bucket <= 0 for bucket in buckets):
+            raise ValueError("prompt_token_buckets must contain positive lengths")
+        if tuple(sorted(set(buckets))) != buckets:
+            raise ValueError(
+                "prompt_token_buckets must be strictly increasing and unique"
+            )
+        if buckets and buckets[-1] > self.max_token_len:
+            raise ValueError(
+                "prompt_token_buckets cannot exceed max_token_len "
+                f"({self.max_token_len}), got {buckets[-1]}"
+            )
+        if self.prefix_cuda_graph_max_entries < 0:
+            raise ValueError("prefix_cuda_graph_max_entries must be non-negative")
+        if self.action_cuda_graph_max_entries < 0:
+            raise ValueError("action_cuda_graph_max_entries must be non-negative")
+        self.prompt_token_buckets = buckets
+
+    def check_pipeline_config(self) -> None:
+        super().check_pipeline_config()
+        # JSON/CLI overrides are applied after dataclass construction.
+        self._normalize_and_validate_cuda_graph_config()
+
+    def update_pipeline_config(self, source_pipeline_dict: dict[str, Any]) -> None:
+        # PipelineConfig treats tuples of ModelConfig specially. ``all`` is
+        # vacuously true for our default empty bucket tuple, so handle this
+        # variable-length scalar tuple outside the generic updater.
+        source_pipeline_dict = dict(source_pipeline_dict)
+        missing = object()
+        buckets = source_pipeline_dict.pop("prompt_token_buckets", missing)
+        super().update_pipeline_config(source_pipeline_dict)
+        if buckets is not missing:
+            self.prompt_token_buckets = buckets
+            self._normalize_and_validate_cuda_graph_config()
 
     def supports_dynamic_batching(self):
         return True
