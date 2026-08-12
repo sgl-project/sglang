@@ -20,8 +20,12 @@ from sglang.kernels.ops.attention.dsv4.index_buf_accessor import SetKAndS
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+    sparse_mla_q8kv8_prefill_fwd,
+)
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+    SparsePrefillChunkCache,
     SparsePrefillWorkspace,
     use_dsv4_q8kv8_sparse_prefill,
 )
@@ -65,14 +69,26 @@ class _TokenToKVPool:
         swa_key_buffer: torch.Tensor,
         full_to_swa_index_mapping: torch.Tensor,
         page_size: int,
+        extra_key_buffer: torch.Tensor | None = None,
     ):
         self._swa_key_buffer = swa_key_buffer
+        self._extra_key_buffer = (
+            extra_key_buffer if extra_key_buffer is not None else swa_key_buffer
+        )
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
         self.swa_window_size = page_size
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
         _ = layer_id
         return self._swa_key_buffer
+
+    def get_extra_key_page_size(self, layer_id: int) -> int:
+        _ = layer_id
+        return self.swa_window_size
+
+    def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor:
+        _ = layer_id
+        return self._extra_key_buffer
 
 
 def _sm90_available() -> bool:
@@ -173,8 +189,15 @@ def _make_sparse_prefill_case(
         seed=3,
         device=device,
     )
+    extra_k_cache = _make_v4_paged_kv_cache(
+        total_slots=total_slots,
+        page_size=page_size,
+        seed=7,
+        device=device,
+    )
     token_to_kv_pool = _TokenToKVPool(
         swa_key_buffer=quant_k_cache,
+        extra_key_buffer=extra_k_cache,
         full_to_swa_index_mapping=torch.arange(
             total_slots, dtype=torch.int64, device=device
         ),
@@ -197,6 +220,113 @@ def _make_sparse_prefill_case(
     attn_sink = torch.zeros(local_heads, dtype=torch.float32, device=device)
     core_attn_metadata = SimpleNamespace()
     return backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata
+
+
+def _populate_compress_metadata(
+    core_attn_metadata: SimpleNamespace,
+    *,
+    compress_ratio: int,
+    device: torch.device,
+) -> None:
+    if compress_ratio == 4:
+        core_attn_metadata.page_table = torch.zeros(
+            (2, 4), dtype=torch.int32, device=device
+        )
+        core_attn_metadata.c4_sparse_raw_indices = torch.zeros(
+            (16, 1), dtype=torch.int32, device=device
+        )
+    elif compress_ratio == 128:
+        core_attn_metadata.c128_page_indices = torch.zeros(
+            (16, 1), dtype=torch.int32, device=device
+        )
+
+
+@contextmanager
+def _patched_compressed_sparse_cache_paths(compress_ratio: int):
+    if compress_ratio == 0:
+        yield
+        return
+
+    old_ensure_c4 = SparsePrefillChunkCache.ensure_c4
+    old_ensure_c128 = SparsePrefillChunkCache.ensure_c128
+    old_combine_c4_layer = SparsePrefillChunkCache.combine_c4_layer
+
+    def _with_compressed_prefix(cache: SparsePrefillChunkCache, n_compressed: int):
+        shifted_swa = torch.where(
+            cache.c0_combined_indices >= 0,
+            cache.c0_combined_indices + n_compressed,
+            cache.c0_combined_indices,
+        )
+        n_prefix = min(n_compressed, shifted_swa.shape[1])
+        if n_prefix > 0:
+            shifted_swa[:, :n_prefix] = torch.arange(
+                n_prefix, dtype=shifted_swa.dtype, device=shifted_swa.device
+            )
+        combined_lens = torch.clamp(
+            cache.c0_combined_lens + n_prefix,
+            max=shifted_swa.shape[1],
+        )
+        return shifted_swa, combined_lens
+
+    def fake_ensure_c128(self, c128_page_indices):
+        _ = c128_page_indices
+        n_compressed = 8
+        self.c128_flat_token_ids = torch.arange(
+            n_compressed, dtype=torch.int64, device=self.swa_token_ids.device
+        )
+        self.c128_combined_indices, self.c128_combined_lens = _with_compressed_prefix(
+            self, n_compressed
+        )
+
+    def fake_ensure_c4(self, page_table, extra_page_size):
+        _ = page_table, extra_page_size
+        n_compressed = 8
+        self.c4_flat_token_ids = torch.arange(
+            n_compressed, dtype=torch.int64, device=self.swa_token_ids.device
+        )
+
+    def fake_combine_c4_layer(self, c4_sparse_raw_indices):
+        _ = c4_sparse_raw_indices
+        return _with_compressed_prefix(self, self.c4_flat_token_ids.shape[0])
+
+    SparsePrefillChunkCache.ensure_c128 = fake_ensure_c128
+    SparsePrefillChunkCache.ensure_c4 = fake_ensure_c4
+    SparsePrefillChunkCache.combine_c4_layer = fake_combine_c4_layer
+    try:
+        yield
+    finally:
+        SparsePrefillChunkCache.ensure_c4 = old_ensure_c4
+        SparsePrefillChunkCache.ensure_c128 = old_ensure_c128
+        SparsePrefillChunkCache.combine_c4_layer = old_combine_c4_layer
+
+
+def _make_q8kv8_kernel_args(
+    *,
+    device: torch.device,
+    s_q: int = 4,
+    h_q: int = 64,
+    d_qk: int = 512,
+    s_kv: int = 256,
+    h_kv: int = 1,
+    topk: int = 128,
+):
+    q = (torch.randn(s_q, h_q, d_qk, device=device) * 0.05).to(torch.float8_e4m3fn)
+    kv = (torch.randn(s_kv, h_kv, d_qk, device=device) * 0.05).to(torch.float8_e4m3fn)
+    indices = torch.randint(
+        0, s_kv, (s_q, h_kv, topk), dtype=torch.int32, device=device
+    )
+    topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device)
+    return {
+        "q": q.contiguous(),
+        "kv": kv.contiguous(),
+        "indices": indices.contiguous(),
+        "sm_scale": 512**-0.5,
+        "q_scale": torch.ones((), dtype=torch.float32, device=device),
+        "kv_scale": torch.ones((), dtype=torch.float32, device=device),
+        "d_v": 512,
+        "attn_sink": torch.zeros(h_q, dtype=torch.float32, device=device),
+        "topk_length": topk_length,
+    }
 
 
 @contextmanager
@@ -267,7 +397,8 @@ def _patched_sparse_kernels(
     flash_mla_mod.flash_mla_sparse_fwd = fake_flash_mla_sparse_fwd
     sgl_kernel_pkg.flash_mla = flash_mla_mod
 
-    q8_mod = types.ModuleType("sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90")
+    q8_module_name = "sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90"
+    q8_mod = types.ModuleType(q8_module_name)
     q8_mod.sparse_mla_q8kv8_prefill_fwd = fake_sparse_mla_q8kv8_prefill_fwd
 
     old_modules = {
@@ -275,12 +406,12 @@ def _patched_sparse_kernels(
         for name in (
             "sgl_kernel",
             "sgl_kernel.flash_mla",
-            "sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90",
+            q8_module_name,
         )
     }
     sys.modules["sgl_kernel"] = sgl_kernel_pkg
     sys.modules["sgl_kernel.flash_mla"] = flash_mla_mod
-    sys.modules["sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90"] = q8_mod
+    sys.modules[q8_module_name] = q8_mod
     try:
         yield
     finally:
@@ -292,21 +423,31 @@ def _patched_sparse_kernels(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path():
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
+    compress_ratio: int,
+):
     from sglang.kernels.ops.attention.dsv4.dequant_k_cache import fp8_dtype
 
     device = torch.device("cuda")
     backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata = (
         _make_sparse_prefill_case(device, local_heads=16)
     )
+    _populate_compress_metadata(
+        core_attn_metadata,
+        compress_ratio=compress_ratio,
+        device=device,
+    )
 
     bf16_capture = _Capture()
     q8_capture = _Capture()
-    with _patched_sparse_kernels(bf16_capture, q8_capture):
+    with _patched_sparse_kernels(
+        bf16_capture, q8_capture
+    ), _patched_compressed_sparse_cache_paths(compress_ratio):
         bf16_out = backend._forward_prefill_sparse(
             q=q,
             layer_id=0,
-            compress_ratio=0,
+            compress_ratio=compress_ratio,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
             core_attn_metadata=core_attn_metadata,
@@ -316,7 +457,7 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path():
         q8_out = backend._forward_prefill_sparse_q8kv8(
             q=q,
             layer_id=0,
-            compress_ratio=0,
+            compress_ratio=compress_ratio,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
             core_attn_metadata=core_attn_metadata,
@@ -373,6 +514,75 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path():
     assert q8_call["kv_scale"].item() == pytest.approx(1.0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_q8kv8_sparse_prefill_rejects_topk_64_before_cuda_launch():
+    args = _make_q8kv8_kernel_args(device=torch.device("cuda"), topk=64)
+
+    with pytest.raises(ValueError, match="positive multiple of 128"):
+        sparse_mla_q8kv8_prefill_fwd(**args)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize(
+    ("mutate", "error_match"),
+    [
+        (
+            lambda args: args.update(q=args["q"].float()),
+            "q must be torch.float8_e4m3fn",
+        ),
+        (
+            lambda args: args.update(kv=args["kv"].float()),
+            "kv must be torch.float8_e4m3fn",
+        ),
+        (
+            lambda args: args.update(
+                q=torch.empty(
+                    args["q"].shape[0],
+                    args["q"].shape[1],
+                    args["q"].shape[2] + 1,
+                    dtype=args["q"].dtype,
+                    device=args["q"].device,
+                )[:, :, : args["q"].shape[2]]
+            ),
+            "q must be contiguous",
+        ),
+        (
+            lambda args: args.update(
+                q_scale=torch.ones(2, dtype=torch.float32, device=args["q"].device)
+            ),
+            "q_scale must be a scalar tensor",
+        ),
+        (
+            lambda args: args.update(
+                kv_scale=torch.ones((), dtype=torch.float16, device=args["q"].device)
+            ),
+            "kv_scale must be float32",
+        ),
+    ],
+)
+def test_q8kv8_sparse_prefill_rejects_invalid_tensor_contracts(
+    mutate,
+    error_match: str,
+):
+    args = _make_q8kv8_kernel_args(device=torch.device("cuda"), topk=128)
+    mutate(args)
+
+    with pytest.raises(ValueError, match=error_match):
+        sparse_mla_q8kv8_prefill_fwd(**args)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("bad_length", [-1, 129])
+def test_q8kv8_sparse_prefill_rejects_invalid_topk_length_bounds(
+    bad_length: int,
+):
+    args = _make_q8kv8_kernel_args(device=torch.device("cuda"), topk=128)
+    args["topk_length"][0] = bad_length
+
+    with pytest.raises(ValueError, match="0 <= topk_length <= topk"):
+        sparse_mla_q8kv8_prefill_fwd(**args)
+
+
 @pytest.mark.skipif(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
@@ -427,3 +637,41 @@ def test_q8kv8_sparse_prefill_real_kernel_matches_bf16_sparse_path():
         atol=2.5e-1,
         rtol=3.0e-1,
     )
+
+
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
+def test_q8kv8_sparse_prefill_real_kernel_repeated_launch_stable():
+    args = _make_q8kv8_kernel_args(
+        device=torch.device("cuda"),
+        s_q=512,
+        h_q=64,
+        d_qk=512,
+        s_kv=1024,
+        h_kv=1,
+        topk=256,
+    )
+
+    baseline = None
+    for _ in range(10):
+        out, max_logits, lse = sparse_mla_q8kv8_prefill_fwd(**args)
+        torch.cuda.synchronize()
+
+        assert out.shape == (512, 64, 512)
+        assert max_logits.shape == (512, 64)
+        assert lse.shape == (512, 64)
+        assert torch.isfinite(out.float()).all()
+        assert torch.isfinite(max_logits).all()
+        assert torch.isfinite(lse).all()
+
+        current = out.float().detach().clone()
+        if baseline is None:
+            baseline = current
+        else:
+            torch.testing.assert_close(
+                current,
+                baseline,
+                atol=1e-2,
+                rtol=1e-2,
+            )

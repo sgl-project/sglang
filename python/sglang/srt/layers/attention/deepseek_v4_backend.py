@@ -47,7 +47,6 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadBoundary,
 )
-from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -65,7 +64,6 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillWorkspace,
     use_dsv4_q8kv8_sparse_prefill,
 )
-from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -2011,7 +2009,8 @@ class DeepseekV4AttnBackend(
         flashmla_sparse_q8``; ``SGLANG_DSV4_Q8KV8_PREFILL`` remains as a debug
         override for focused runtime validation.
         """
-        from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
             sparse_mla_q8kv8_prefill_fwd,
         )
 
