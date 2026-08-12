@@ -1,21 +1,14 @@
-"""One-sided fixed-shape gather over torch symmetric memory.
-
-Each rank stores its row into every peer's buffer, then waits on a barrier. No
-communicator takes part, so unlike an all-gather this needs no ordering against
-the forward's collectives.
-"""
+"""One-sided fixed-shape gather over torch symmetric memory."""
 
 import logging
+import time
 from typing import Optional
 
 import torch
 
 logger = logging.getLogger(__name__)
 
-# A stuck peer raises instead of spinning forever.
 _BARRIER_TIMEOUT_MS = 10_000
-# A peer's stores for round N+1 land before its barrier(N+1) returns, so one
-# region would be overwritten while a slower rank still reads round N.
 _NUM_SLOTS = 2
 
 
@@ -34,8 +27,9 @@ class SymmMemGather:
     ):
         from torch._C._distributed_c10d import _SymmetricMemory
 
-        # Outside inference mode on purpose: a region created inside it is an
-        # inference tensor and rejects the in-place peer stores below.
+        if width != 7 or dtype != torch.int64:
+            raise ValueError("symmetric DP metadata gather requires 7 int64 fields")
+
         with torch.inference_mode(False):
             region = _SymmetricMemory.empty_strided_p2p(
                 (_NUM_SLOTS * world_size * width,),
@@ -49,15 +43,16 @@ class SymmMemGather:
         self._world_size = world_size
         self._width = width
         self._slot = 0
-        # Private stream: this exchange depends only on peer stores, never on
-        # the forward, so it must not inherit the schedule stream's WAR fence.
         self._stream = torch.cuda.Stream(device=device)
         self._staging = torch.zeros(width, dtype=dtype, device=device)
         self._host_in = torch.zeros(width, dtype=dtype).pin_memory()
         self._host_out = torch.zeros(world_size, width, dtype=dtype).pin_memory()
+        self._host_ready = torch.empty((), dtype=torch.uint32).pin_memory()
+        self._ready = torch.empty((), dtype=torch.uint32, device=device)
+        self._row_snapshot = torch.empty(world_size, width, dtype=dtype, device=device)
+        self._generation = 0
+        self._slot_generations = [None] * _NUM_SLOTS
         rank = self._handle.rank
-        # A peer row is a tensor view of that peer's memory; writing it is a
-        # store that never blocks on the peer.
         self._peer_rows = [
             [
                 self._handle.get_buffer(peer, (_NUM_SLOTS, world_size, width), dtype)[
@@ -67,6 +62,58 @@ class SymmMemGather:
             ]
             for slot in range(_NUM_SLOTS)
         ]
+
+        def allocate_control_region():
+            with torch.inference_mode(False):
+                control = _SymmetricMemory.empty_strided_p2p(
+                    (_NUM_SLOTS * world_size,),
+                    [1],
+                    torch.uint32,
+                    device,
+                    group_name,
+                ).view(_NUM_SLOTS, world_size)
+                control.zero_()
+            torch.cuda.current_stream(device).synchronize()
+            return control, _SymmetricMemory.rendezvous(control)
+
+        # The ready marker publishes a complete row; the ack protects slot reuse.
+        self._marker_region, self._marker_handle = allocate_control_region()
+        self._ack_region, self._ack_handle = allocate_control_region()
+        self._peer_row_ptrs = [
+            torch.tensor(
+                [row.data_ptr() for row in self._peer_rows[slot]],
+                dtype=torch.uint64,
+                device=device,
+            )
+            for slot in range(_NUM_SLOTS)
+        ]
+        self._peer_marker_ptrs = [
+            torch.tensor(
+                [
+                    self._marker_handle.get_buffer(
+                        peer, (_NUM_SLOTS, world_size), torch.uint32
+                    )[slot, rank].data_ptr()
+                    for peer in range(world_size)
+                ],
+                dtype=torch.uint64,
+                device=device,
+            )
+            for slot in range(_NUM_SLOTS)
+        ]
+        self._peer_ack_ptrs = [
+            torch.tensor(
+                [
+                    self._ack_handle.get_buffer(
+                        peer, (_NUM_SLOTS, world_size), torch.uint32
+                    )[slot, rank].data_ptr()
+                    for peer in range(world_size)
+                ],
+                dtype=torch.uint64,
+                device=device,
+            )
+            for slot in range(_NUM_SLOTS)
+        ]
+        torch.cuda.current_stream(device).synchronize()
         logger.info(
             "Symmetric-memory DP gather active: world=%d width=%d slots=%d",
             world_size,
@@ -78,15 +125,66 @@ class SymmMemGather:
         """Host row in, (world_size, width) host rows out."""
         slot = self._slot
         self._slot = (slot + 1) % _NUM_SLOTS
+        previous_generation = self._slot_generations[slot]
+        if previous_generation is not None:
+            self._wait_for_acks(slot, previous_generation)
+
         self._host_in.copy_(local_row_cpu)
         with torch.cuda.stream(self._stream):
             self._staging.copy_(self._host_in, non_blocking=True)
-            for row in self._peer_rows[slot]:
-                row.copy_(self._staging)
-            self._handle.barrier(0, _BARRIER_TIMEOUT_MS)
-            self._host_out.copy_(self._region[slot], non_blocking=True)
-        self._stream.synchronize()
-        return self._host_out
+            from sglang.srt.distributed.device_communicators.symm_mem_marker import (
+                copy_row_and_publish,
+            )
+
+            self._generation = self._generation % 0xFFFFFFFF + 1
+            self._slot_generations[slot] = self._generation
+            copy_row_and_publish(
+                self._peer_row_ptrs[slot],
+                self._peer_marker_ptrs[slot],
+                self._staging,
+                self._generation,
+            )
+
+        from sglang.srt.distributed.device_communicators.symm_mem_marker import (
+            publish_value,
+            snapshot_rows_acquire,
+        )
+
+        deadline = time.monotonic() + _BARRIER_TIMEOUT_MS / 1000
+        while True:
+            with torch.cuda.stream(self._stream):
+                snapshot_rows_acquire(
+                    self._region[slot],
+                    self._marker_region[slot],
+                    self._row_snapshot,
+                    self._ready,
+                    self._generation,
+                )
+                self._host_ready.copy_(self._ready, non_blocking=True)
+                self._host_out.copy_(self._row_snapshot, non_blocking=True)
+            self._stream.synchronize()
+            if self._host_ready.item() != 0:
+                with torch.cuda.stream(self._stream):
+                    publish_value(self._peer_ack_ptrs[slot], self._generation)
+                return self._host_out
+            if time.monotonic() >= deadline:
+                raise TimeoutError("symmetric-memory completion marker timeout")
+
+    def _wait_for_acks(self, slot: int, generation: int):
+        from sglang.srt.distributed.device_communicators.symm_mem_marker import (
+            all_values_acquire,
+        )
+
+        deadline = time.monotonic() + _BARRIER_TIMEOUT_MS / 1000
+        while True:
+            with torch.cuda.stream(self._stream):
+                all_values_acquire(self._ack_region[slot], self._ready, generation)
+                self._host_ready.copy_(self._ready, non_blocking=True)
+            self._stream.synchronize()
+            if self._host_ready.item() != 0:
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError("symmetric-memory acknowledgement timeout")
 
 
 def maybe_create_symm_mem_gather(
