@@ -21,7 +21,12 @@ from transformers import AutoProcessor
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.encoder_preprocessing import (
+    EncoderPreprocessOutput,
+    invoke_encoder_preprocessor,
+)
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
@@ -29,6 +34,7 @@ from sglang.srt.utils import (
     load_image,
     load_video,
 )
+from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +117,8 @@ class EncoderPreprocessor:
 
         use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         self.use_image_processor_gpu = (
-            use_image_processor_gpu and not server_args.disable_fast_image_processor
+            use_image_processor_gpu
+            and resolve_image_processor_backend(server_args) != "pil"
         )
 
         self._load_mm_processor(server_args)
@@ -142,12 +149,18 @@ class EncoderPreprocessor:
     def _load_mm_processor(self, server_args: ServerArgs):
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
+        image_processor_backend = resolve_image_processor_backend(server_args)
+        image_processor_kwargs = (
+            {}
+            if image_processor_backend == "auto"
+            else {"backend": image_processor_backend}
+        )
         try:
             self.image_processor = AutoImageProcessor.from_pretrained(
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
+                **image_processor_kwargs,
             )
         except Exception as e:
             logger.warning(f"Failed to load image processor: {e}")
@@ -158,7 +171,6 @@ class EncoderPreprocessor:
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
             )
         except Exception as e:
             logger.warning(f"Failed to load video processor: {e}")
@@ -169,7 +181,6 @@ class EncoderPreprocessor:
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
             )
             if not hasattr(_audio_proc, "feature_extractor"):
                 logger.warning(
@@ -450,12 +461,31 @@ class EncoderPreprocessor:
         if not (self.image_processor or model_preprocessor):
             raise ValueError("No image processor available")
         images = await self._flatten_and_load_images(mm_items)
-        if model_preprocessor:
-            return model_preprocessor(images, Modality.IMAGE, self.vision_config)
-        image_config = self.vision_config.get("image", {})
-        original_image_sizes = [_get_original_image_size(item) for item in images]
         if self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
+        original_image_sizes = [_get_original_image_size(item) for item in images]
+        if model_preprocessor:
+            processor_output = invoke_encoder_preprocessor(
+                model_preprocessor,
+                images,
+                Modality.IMAGE,
+                self.vision_config,
+                image_processor=self.image_processor,
+                use_gpu_preprocessing=self.use_image_processor_gpu,
+            )
+            if (
+                isinstance(processor_output, EncoderPreprocessOutput)
+                and processor_output.materialize_local_items is not None
+            ):
+                parallel = get_parallel()
+                await asyncio.get_running_loop().run_in_executor(
+                    self.preproc_executor,
+                    processor_output.materialize_for_rank,
+                    parallel.attn_tp_rank,
+                    parallel.attn_tp_size,
+                )
+            return processor_output
+        image_config = self.vision_config.get("image", {})
         processor_input = await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,
             functools.partial(self.image_processor, images=images, **image_config),

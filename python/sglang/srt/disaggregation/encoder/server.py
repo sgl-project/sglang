@@ -52,6 +52,9 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
 from sglang.srt.model_loader import get_model
+from sglang.srt.multimodal.encoder_preprocessing import (
+    get_encoder_preprocessed_items,
+)
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.runtime_context import get_disagg, get_exec, get_mm, publish
 from sglang.srt.server_args import ServerArgs
@@ -524,13 +527,18 @@ class MMEncoder:
         self._embedding_dims = self._infer_embedding_dims()
 
         if get_mm().enable_mm_global_cache:
-            from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
+            from sglang.srt.mem_cache.embedding_cache_controller import (
                 EmbeddingCacheController,
             )
+            from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
 
+            embedding_store = EmbeddingStoreFactory.create_backend(
+                get_mm().mm_global_cache_backend,
+            )
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
+                embedding_store=embedding_store,
                 hidden_dims=self._embedding_dims,
                 tp_group=get_tp_group().cpu_group,
                 all_rank_get=False,
@@ -757,9 +765,24 @@ class MMEncoder:
         return slices
 
     def _calculate_hashes_from_features(
-        self, mm_feature, grid_thw: List, modality: Modality
+        self, mm_feature, grid_thw: List, modality: Modality, mm_inputs=None
     ) -> List[int]:
         """CPU Task: Compute hashes based on processed feature patches."""
+        preprocessed_items = (
+            get_encoder_preprocessed_items(mm_inputs) if mm_inputs is not None else None
+        )
+        if preprocessed_items is not None:
+            if len(preprocessed_items) != len(grid_thw):
+                raise ValueError(
+                    "Encoder preprocess item/grid mismatch: "
+                    f"{len(preprocessed_items)} items != {len(grid_thw)} grids"
+                )
+            hashes = []
+            for item in preprocessed_items:
+                item.set_pad_value()
+                hashes.append(item.hash)
+            return hashes
+
         hashes = []
         if modality == Modality.AUDIO and isinstance(mm_feature, list):
             for feature in mm_feature:
@@ -814,9 +837,27 @@ class MMEncoder:
         indices: List[int],
         modality: Modality,
     ) -> List[MultimodalDataItem]:
-        """Build model inputs, keeping one logical K3 image per item."""
+        """Build the model-facing items selected for one encoder forward.
+
+        Model preprocessors can preserve an item-wise representation with
+        ``EncoderPreprocessOutput``. This avoids concatenating and re-slicing
+        features before encoder-DP knows which rank owns each item. Legacy
+        processor outputs retain their aggregate tensor behavior.
+        """
         mm_inputs = preprocess_result.mm_inputs
         grid_thw = preprocess_result.grid_thw
+        preprocessed_items = get_encoder_preprocessed_items(mm_inputs)
+        if preprocessed_items is not None:
+            if len(preprocessed_items) != len(grid_thw):
+                raise ValueError(
+                    "Encoder preprocess item/grid mismatch: "
+                    f"{len(preprocessed_items)} items != {len(grid_thw)} grids"
+                )
+            selected = [preprocessed_items[index] for index in indices]
+            if any(item.modality != modality for item in selected):
+                raise ValueError("Encoder preprocess output contains wrong modality")
+            return selected
+
         split_kimi_k3_images = (
             self.model_type == "kimi_k3" and modality == Modality.IMAGE
         )
@@ -949,7 +990,7 @@ class MMEncoder:
             if self.rank == 0:
                 if mm_hashes is None:
                     mm_hashes = self._calculate_hashes_from_features(
-                        mm_feature, grid_thw, modality
+                        mm_feature, grid_thw, modality, mm_inputs
                     )
                 # Embedding stores use string cache keys.
                 str_mm_hashes = [str(h) for h in mm_hashes]
