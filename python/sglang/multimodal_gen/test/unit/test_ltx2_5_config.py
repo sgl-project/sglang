@@ -240,17 +240,47 @@ class TestLTX25PipelineConfig(unittest.TestCase):
         self.assertFalse(is_ltx23_native_variant(config.vae_config.arch_config))
 
     def test_registry_resolves_ltx_variants_apart(self):
-        from sglang.multimodal_gen.registry import get_model_info
+        # `_get_config_info` rather than `get_model_info`: the latter also reads
+        # `model_index.json` from the Hub to pick the pipeline class, which
+        # makes it network-dependent and, offline, silently resolves to the
+        # generic diffusers config. What matters here is the path-to-config
+        # mapping, and that is pure string matching.
+        from sglang.multimodal_gen.registry import _get_config_info
 
         self.assertIs(
-            get_model_info("Lightricks/LTX-2.5-Diffusers").pipeline_config_cls,
+            _get_config_info("Lightricks/LTX-2.5-Diffusers").pipeline_config_cls,
             LTX25PipelineConfig,
         )
-        # The LTX-2 detector matches any "ltx-2" substring, so it must exclude
-        # both point releases.
         self.assertIs(
-            get_model_info("Lightricks/LTX-2").pipeline_config_cls,
+            _get_config_info("Lightricks/LTX-2").pipeline_config_cls,
             LTX2PipelineConfig,
+        )
+        self.assertEqual(
+            _get_config_info("Lightricks/LTX-2.3").pipeline_config_cls.__name__,
+            "LTX23PipelineConfig",
+        )
+
+    def test_derived_repos_keep_the_point_releases_apart(self):
+        """Forks and local copies resolve by longest registered path stem.
+
+        Resolution tries exact match, then the longest registered path that is
+        a substring of the request, and only then the detectors. So a derived
+        repo lands on the right config as long as it keeps the registered stem
+        -- `LTX-2.5-Diffusers` is longer than `LTX-2` and wins.
+        """
+        from sglang.multimodal_gen.registry import _get_config_info
+
+        self.assertIs(
+            _get_config_info("myorg/LTX-2.5-Diffusers-fp8").pipeline_config_cls,
+            LTX25PipelineConfig,
+        )
+        self.assertIs(
+            _get_config_info("myorg/LTX-2-custom").pipeline_config_cls,
+            LTX2PipelineConfig,
+        )
+        self.assertEqual(
+            _get_config_info("myorg/LTX-2.3-tuned").pipeline_config_cls.__name__,
+            "LTX23PipelineConfig",
         )
 
 
@@ -261,21 +291,30 @@ class TestLTX25ImageConditioningCRF(unittest.TestCase):
     images from the wrong compression distribution.
     """
 
-    def _crf_for(self, model_path):
+    def _crf_for_config(self, pipeline_config):
+        """CRF for an already-resolved pipeline config.
+
+        Driving this from a model path would route through `ServerArgs`, which
+        reads `model_index.json` from the Hub; offline that falls back to the
+        generic config and the assertion becomes meaningless. The resolver only
+        reads `pipeline_config.text_encoder_configs`, so hand it the config
+        directly.
+        """
+        from types import SimpleNamespace
+
         from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
             LTX2ImageEncodingStage,
         )
-        from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-        server_args = ServerArgs.from_kwargs(model_path=model_path, num_gpus=1)
-        return LTX2ImageEncodingStage._resolve_image_conditioning_crf(server_args)
+        return LTX2ImageEncodingStage._resolve_image_conditioning_crf(
+            SimpleNamespace(pipeline_config=pipeline_config)
+        )
 
     def test_ltx_2_5_uses_crf_18(self):
-        self.assertEqual(self._crf_for("Lightricks/LTX-2.5-Diffusers"), 18)
+        self.assertEqual(self._crf_for_config(LTX25PipelineConfig()), 18)
 
     def test_earlier_ltx_generations_use_crf_33(self):
-        self.assertEqual(self._crf_for("Lightricks/LTX-2"), 33)
-        self.assertEqual(self._crf_for("Lightricks/LTX-2.3"), 33)
+        self.assertEqual(self._crf_for_config(LTX2PipelineConfig()), 33)
 
 
 class TestLTX25DurationHead(unittest.TestCase):
