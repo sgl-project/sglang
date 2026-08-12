@@ -434,7 +434,23 @@ def get_available_gpu_memory(
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
         else:
-            free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+            free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info(gpu_id)
+            if is_hip():
+                # ROCm/KFD accounting can be corrupted so that mem_get_info()
+                # reports MORE free than physically exists: registering the same
+                # GPU buffer as an RDMA MR (ibv_reg_mr / PeerDirect) across
+                # multiple NICs makes KFD under-count used memory by one buffer
+                # per extra NIC, inflating "free" (and underflowing "used").
+                # Downstream KV-pool sizing then over-allocates and OOMs.
+                # Cap free at a physically-sound upper bound: total minus what
+                # this process has actually allocated via torch. This clamps the
+                # inflated value without affecting a healthy driver, where
+                # free <= total - allocated already holds.
+                used_memory = float(torch.cuda.memory_allocated(gpu_id))
+                free_gpu_memory = min(
+                    float(free_gpu_memory),
+                    max(0.0, float(total_gpu_memory) - used_memory),
+                )
 
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
