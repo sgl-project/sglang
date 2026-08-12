@@ -726,6 +726,37 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             elif reservation.owner:
                 owners.append(reservation)
 
+        if owners:
+            owner_task = self.mm_preprocess_cache.create_background_task(
+                self._fulfill_artifact_reservations(
+                    owners,
+                    first_index_by_key,
+                    snapshots,
+                    previous_metadata,
+                    resolved_by_key,
+                )
+            )
+            # The cache owns this shared work. Cancelling the request that won
+            # a reservation must not fail another request already joining it.
+            await asyncio.shield(owner_task)
+
+        for key, reservation in zip(unique_keys, reservations):
+            if isinstance(reservation, CacheReservation) and not reservation.owner:
+                resolved_by_key[key] = await self.mm_preprocess_cache.wait(reservation)
+
+        for index in range(image_count):
+            if artifacts[index] is None:
+                artifacts[index] = resolved_by_key[keys[index]]
+        return artifacts
+
+    async def _fulfill_artifact_reservations(
+        self,
+        owners: list[CacheReservation[str, KimiK3ImageArtifact]],
+        first_index_by_key: dict[str, int],
+        snapshots: list[Optional[MediaSnapshot]],
+        previous_metadata: dict[str, KimiK3ImageArtifact],
+        resolved_by_key: dict[str, KimiK3ImageArtifact],
+    ) -> None:
         try:
             owner_entries = []
             for reservation in owners:
@@ -735,9 +766,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                     self.io_executor.submit(self._decode_media_snapshot, snapshot)
                 )
                 owner_entries.append((snapshot.content_digest, reservation.key, image))
-            owner_artifacts = (
-                await self._run_artifact_batch(owner_entries) if owner_entries else []
-            )
+            owner_artifacts = await self._run_artifact_batch(owner_entries)
             for reservation, artifact in zip(owners, owner_artifacts):
                 old = previous_metadata.get(reservation.key)
                 if old is not None and old.feature_hash != artifact.feature_hash:
@@ -756,15 +785,6 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 if not reservation.future.done():
                     self.mm_preprocess_cache.fail(reservation, error)
             raise
-
-        for key, reservation in zip(unique_keys, reservations):
-            if isinstance(reservation, CacheReservation) and not reservation.owner:
-                resolved_by_key[key] = await self.mm_preprocess_cache.wait(reservation)
-
-        for index in range(image_count):
-            if artifacts[index] is None:
-                artifacts[index] = resolved_by_key[keys[index]]
-        return artifacts
 
     def compose_request(
         self,

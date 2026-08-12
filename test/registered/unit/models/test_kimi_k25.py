@@ -983,6 +983,56 @@ def test_kimi_k3_partial_hits_deduplicate_misses_and_preserve_order():
     assert artifacts[1] is artifacts[2]
 
 
+def test_kimi_k3_cancelled_artifact_owner_does_not_fail_joiner():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.processor_fingerprint = "processor"
+    processor.trust_mm_content_hashes = False
+    processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
+    processor.mm_processor_executor = None
+    processor.io_executor = ThreadPoolExecutor(max_workers=2)
+    processor._preprocess_metrics_callback = None
+    image = Image.new("RGB", (2, 2), color=(1, 2, 3))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prepare(entries):
+        started.set()
+        await release.wait()
+        return [
+            _cached_k3_artifact(digest, key, image.getpixel((0, 0))[0])
+            for digest, key, image in entries
+        ]
+
+    processor._run_artifact_batch = prepare
+
+    async def run():
+        owner = asyncio.create_task(
+            processor.prepare_media_artifacts(
+                [image], SimpleNamespace(mm_content_hashes=None)
+            )
+        )
+        await started.wait()
+        joiner = asyncio.create_task(
+            processor.prepare_media_artifacts(
+                [image], SimpleNamespace(mm_content_hashes=None)
+            )
+        )
+        await asyncio.sleep(0)
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+
+        release.set()
+        artifacts = await joiner
+        assert len(artifacts) == 1
+        assert artifacts[0].feature[0, 0].item() == 1
+
+    try:
+        asyncio.run(run())
+    finally:
+        processor.io_executor.shutdown()
+
+
 def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     from sglang.srt.multimodal.kimi_k3_image_processing import (
         DEFERRED_PREPROCESSING_KEY,
