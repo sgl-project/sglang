@@ -598,6 +598,8 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 grid_thw=grid_thw,
                 feature=feature,
                 deferred=KimiK3DeferredConfig(
+                    backend="gpu",
+                    feature_layout="chw",
                     image_mean=tuple(processor._image_mean),
                     image_std=tuple(processor._image_std),
                     transparent_bg_config=processor._transparent_bg_config,
