@@ -203,11 +203,12 @@ class MambaForCausalLM(nn.Module):
 
         for name, loaded_weight in weights:
             # Remap checkpoint names to SGLang modules: backbone.* -> model.*,
-            # embeddings -> embed_tokens, norm_f -> norm. Keep A_log as-is
-            # (the mixer computes A = -exp(A_log)).
+            # embeddings./embedding. (plural -hf / singular raw) -> embed_tokens.,
+            # norm_f -> norm. Keep A_log as-is (the mixer computes A = -exp(A_log)).
             if name.startswith("backbone."):
                 name = "model." + name[len("backbone.") :]
             name = name.replace("embeddings.", "embed_tokens.")
+            name = name.replace("embedding.", "embed_tokens.")
             name = name.replace("norm_f.", "norm.")
 
             if name not in params_dict:
