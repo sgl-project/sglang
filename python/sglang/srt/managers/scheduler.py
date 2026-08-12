@@ -1412,7 +1412,7 @@ class Scheduler(
             )
 
         # Init mm receiver for EPD disaggregation mode
-        if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
+        if get_disagg().encoder_client and get_disagg().encoder_transfer_backend in [
             "zmq_to_scheduler",
             "mooncake",
         ]:

@@ -144,7 +144,7 @@ class KimiVLForConditionalGeneration(nn.Module):
         # No local tower: an encoder sends features already embedded.
         self.vision_tower = (
             None
-            if getattr(config, "language_model_only", False)
+            if not getattr(config, "has_local_vision_tower", True)
             else MoonVitPretrainedModel(
                 config.vision_config,
                 prefix=add_prefix("vision_tower", prefix),
@@ -259,7 +259,7 @@ class KimiVLForConditionalGeneration(nn.Module):
             is_vision_weight = ("vision" in name) or ("multi_modal_projector" in name)
             if self.config.encoder_only and not is_vision_weight:
                 continue
-            if self.config.language_only and is_vision_weight:
+            if self.vision_tower is None and is_vision_weight:
                 continue
 
             if "rotary_emb.inv_freq" in name:

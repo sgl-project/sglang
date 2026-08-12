@@ -535,10 +535,11 @@ class ModelConfig:
 
         self.hf_config.encoder_only = encoder_only
         self.hf_config.language_only = language_only
-        # Either the operator asked for the language half only, or the checkpoint
-        # declares itself text-only (hf_transformers/processor.py). Both mean the
-        # same thing to the model: no vision tower.
-        self.hf_config.language_model_only = language_only or self.is_lm_only
+        # Two different questions. language_model_only is the checkpoint saying it
+        # never processes images, and drives the model's forward pipeline. Whether
+        # a tower exists *here* is separate: an EPD language replica has none but
+        # still consumes image features an encoder computed for it.
+        self.hf_config.has_local_vision_tower = not (language_only or self.is_lm_only)
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(

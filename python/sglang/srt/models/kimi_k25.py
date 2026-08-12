@@ -670,7 +670,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # No local tower: an encoder sends features already embedded.
         self.vision_tower = (
             None
-            if getattr(config, "language_model_only", False)
+            if not getattr(config, "has_local_vision_tower", True)
             else MoonViT3dPretrainedModel(
                 config.vision_config,
                 use_data_parallel=self.use_data_parallel,
@@ -870,7 +870,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         vision_params = (
             None
-            if self.config.language_only
+            if self.vision_tower is None
             else dict(self.named_parameters(remove_duplicate=False))
         )
 

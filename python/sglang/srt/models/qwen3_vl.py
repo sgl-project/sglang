@@ -1241,7 +1241,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         self.language_model_only = getattr(config, "language_model_only", False)
-        if self.language_model_only:
+        # Absent here does not mean absent everywhere: an EPD language replica
+        # has no tower but still receives features from the encoder server.
+        if not getattr(config, "has_local_vision_tower", True):
             self.visual = None
         else:
             self.visual = Qwen3VLMoeVisionModel(
@@ -1595,18 +1597,15 @@ def _require_vision(model, items=None) -> None:
     A server without a local tower can still serve items an encoder already
     embedded for it, so precomputed items are always allowed.
     """
-    if (
-        not getattr(model, "language_model_only", False)
-        or getattr(model, "visual", None) is not None
-    ):
+    if getattr(model, "visual", None) is not None:
         return
     if items and all(
         getattr(item, "precomputed_embeddings", None) is not None for item in items
     ):
         return
     raise RuntimeError(
-        "This server has no vision encoder (--language-only, or the checkpoint "
-        "declares language_model_only=True) and no encoder supplied embeddings "
+        "This server has no local vision tower (--language-only, or a checkpoint "
+        "declaring language_model_only=True) and no encoder supplied embeddings "
         "for these multimodal inputs."
     )
 

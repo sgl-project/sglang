@@ -940,7 +940,9 @@ class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config, quant_config=quant_config, prefix=prefix)
-        self.language_model_only = bool(config.language_model_only)
+        # Muse takes no part in encoder disaggregation, so "no local tower"
+        # and "never processes images" are the same statement here.
+        self.language_model_only = not getattr(config, "has_local_vision_tower", True)
         if self.language_model_only:
             self.builds_vision_tower = False
             self.vision_tower = None

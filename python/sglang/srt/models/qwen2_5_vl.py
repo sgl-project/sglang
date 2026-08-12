@@ -646,7 +646,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             self.lm_head = None
 
         # No local tower: an encoder sends features already embedded.
-        if getattr(config, "language_model_only", False):
+        if not getattr(config, "has_local_vision_tower", True):
             self.visual = None
         else:
             self.visual = Qwen2_5_VisionTransformer(

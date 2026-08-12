@@ -3014,7 +3014,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # No local tower: an encoder sends features already embedded.
         self.vision_tower = (
             None
-            if getattr(config, "language_model_only", False)
+            if not getattr(config, "has_local_vision_tower", True)
             else KimiK3VisionTower(config.vision_config)
         )
         self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
@@ -3042,7 +3042,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             self.language_model.post_load_weights()
 
     def precompile_kernels_after_loading(self) -> None:
-        if self.config.language_only:
+        if self.vision_tower is None:
             return
         if self.vision_tower.precompile_fused_rope():
             logger.info("Precompiled dynamic-token fused K3 vision RoPE kernel")
@@ -3309,7 +3309,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
         vision_params = (
             None
-            if self.config.language_only
+            if self.vision_tower is None
             else dict(self.named_parameters(remove_duplicate=False))
         )
 

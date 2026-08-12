@@ -39,6 +39,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
     LoRAPathAction,
+    print_deprecated_warning,
 )
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
@@ -317,6 +318,21 @@ RETRACTION_POLICY_CHOICES = ["length", "priority"]
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
+
+# Architectures whose __init__ honors has_local_vision_tower and skips building
+# the tower. Others fall back to skipping only the weight load.
+TOWER_SKIPPING_ARCHITECTURES = (
+    "DotsVLMForCausalLM",
+    "KimiK25ForConditionalGeneration",
+    "KimiK3ForConditionalGeneration",
+    "KimiVLForConditionalGeneration",
+    "MuseGlimmerForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration",
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+)
 
 ENCODER_TRANSFER_BACKEND_CHOICES = [
     "auto",
@@ -3107,13 +3123,16 @@ class ServerArgs:
     ] = False
     language_only: A[
         bool,
-        "Serve the language half of a VLM only: the vision tower is never built "
-        "and its weights are never loaded, freeing that memory for KV cache. "
-        "Image features must come from an encoder server, registered either up "
-        "front with --encoder-urls or dynamically via the EncoderBootstrapServer; "
-        "multimodal requests are rejected while no encoder is available.",
+        "Serve the language half of a VLM only: on models that support it the "
+        "vision tower is not built at all, freeing that memory for KV cache. "
+        "This says nothing about where image features come from -- name an "
+        "encoder with --encoder-urls to receive them from an encoder server. "
+        "Without one, multimodal requests are rejected.",
         NS("disagg"),
     ] = False
+    # Derived in __post_init__: this replica consumes image features from
+    # encoder servers. Not a flag -- naming an encoder is what opts you in.
+    encoder_client: A[bool, Arg(help="", no_cli=True), NS("disagg")] = False
     encoder_transfer_backend: A[
         str,
         Arg(
@@ -3503,6 +3522,17 @@ class ServerArgs:
         "The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
         NS("observability"),
     ] = None
+
+    @classmethod
+    def _remap_legacy_kwargs(cls, kwargs: dict) -> dict:
+        """Accept flags the CLI still takes as deprecated aliases."""
+        if kwargs.pop("language_model_only", False):
+            print_deprecated_warning(
+                "'language_model_only' is deprecated and will be removed in a "
+                "future release. Use 'language_only' instead."
+            )
+            kwargs["language_only"] = True
+        return kwargs
 
     def __post_init__(self):
         """
@@ -7535,6 +7565,12 @@ class ServerArgs:
             return False
 
     def _handle_encoder_disaggregation(self):
+        if self.language_only and self.enable_adaptive_dispatch_to_encoder:
+            raise ValueError(
+                "--enable-adaptive-dispatch-to-encoder processes single-image "
+                "requests locally, which --language-only leaves no vision tower "
+                "for. Drop one of the two."
+            )
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
                 "--enable-prefix-mm-cache requires --encoder-only to be enabled"
@@ -7546,12 +7582,21 @@ class ServerArgs:
                 "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
             )
 
-        if self.language_only and len(self.encoder_urls) == 0:
-            logger.info(
-                "--language-only is set without --encoder-urls. Encoders are "
-                "expected to register dynamically via the "
-                "EncoderBootstrapServer."
-            )
+        if self.language_only:
+            arch = self.get_model_config().hf_config.architectures[0]
+            if arch not in TOWER_SKIPPING_ARCHITECTURES:
+                logger.warning(
+                    "%s does not implement the --language-only tower skip; its "
+                    "vision weights are left unloaded but the tower is still "
+                    "built and still holds memory.",
+                    arch,
+                )
+
+        # Naming an encoder is what turns this into the language side of encoder
+        # disaggregation; --language-only alone just drops the local tower.
+        # Encoders may still join later via the EncoderBootstrapServer, but at
+        # least one has to be known up front for the machinery to start.
+        self.encoder_client = self.language_only and len(self.encoder_urls) > 0
 
         # Validate IB devices when mooncake backend is used
         if (
@@ -7569,17 +7614,14 @@ class ServerArgs:
             self.encoder_transfer_backend = resolve_encoder_transfer_backend(
                 self.encoder_transfer_backend, model_arch, self.tp_size
             )
-            if self.encoder_only or self.language_only:
+            if self.encoder_only or self.encoder_client:
                 logger.info(
                     "Encoder transfer backend auto-resolved to %s for %s at TP%d.",
                     self.encoder_transfer_backend,
                     model_arch,
                     self.tp_size,
                 )
-        takes_part_in_epd = self.encoder_only or (
-            self.language_only and len(self.encoder_urls) > 0
-        )
-        if takes_part_in_epd and model_arch not in [
+        if (self.encoder_only or self.encoder_client) and model_arch not in [
             "Qwen2VLForConditionalGeneration",
             "Qwen3VLForConditionalGeneration",
             "Qwen2_5_VLForConditionalGeneration",

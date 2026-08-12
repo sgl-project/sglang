@@ -67,7 +67,7 @@ class DotsVLMForCausalLM(nn.Module):
         # No local tower: an encoder sends features already embedded.
         self.vision_tower = (
             None
-            if getattr(config, "language_model_only", False)
+            if not getattr(config, "has_local_vision_tower", True)
             else DotsVisionTransformer(config.vision_config)
         )
 
@@ -118,7 +118,7 @@ class DotsVLMForCausalLM(nn.Module):
                 language_weights.append((name, loaded_weight))
 
         # Load vision tower weights
-        if not self.config.language_only:
+        if self.vision_tower is not None:
             vision_state_dict = dict(vision_weights)
             params_dict = dict(self.named_parameters(remove_duplicate=False))
             for name, loaded_weight in vision_state_dict.items():
