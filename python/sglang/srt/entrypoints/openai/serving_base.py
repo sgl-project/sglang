@@ -148,18 +148,40 @@ class OpenAIServingBase(ABC):
 
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
 
-    def _compute_extra_key(self, request: OpenAIServingRequest) -> Optional[str]:
-        """Compute the final extra_key by concatenating cache_salt and extra_key if both are provided."""
-        parts = []
-        for key in ["cache_salt", "extra_key"]:
+    def _compute_extra_key(
+        self, request: OpenAIServingRequest
+    ) -> Optional[Union[List[str], str]]:
+        """Combine cache_salt and extra_key for scalar and batched requests."""
+
+        def validate_key(key: str) -> Optional[Union[List[str], str]]:
             value = getattr(request, key, None)
-            if value:
-                if not isinstance(value, str):
-                    raise TypeError(
-                        f"Value of {key} must be a string, but got {type(value).__name__}"
-                    )
-                parts.append(value)
-        return "".join(parts) if parts else None
+            if value is None or value == "":
+                return None
+            if isinstance(value, str) or (
+                isinstance(value, list) and all(isinstance(item, str) for item in value)
+            ):
+                return value
+            raise TypeError(
+                f"Value of {key} must be a string or a list of strings, "
+                f"but got {type(value).__name__}"
+            )
+
+        cache_salt = validate_key("cache_salt")
+        extra_key = validate_key("extra_key")
+
+        if cache_salt is None:
+            return extra_key
+        if extra_key is None:
+            return cache_salt
+        if isinstance(cache_salt, str) and isinstance(extra_key, str):
+            return cache_salt + extra_key
+        if isinstance(cache_salt, str):
+            return [cache_salt + value for value in extra_key]
+        if isinstance(extra_key, str):
+            return [value + extra_key for value in cache_salt]
+        if len(cache_salt) != len(extra_key):
+            raise ValueError("cache_salt and extra_key lists must have the same length")
+        return [salt + key for salt, key in zip(cache_salt, extra_key)]
 
     @abstractmethod
     def _convert_to_internal_request(
