@@ -7,6 +7,8 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.jit.utils import get_jit_cuda_arch
+
 
 @triton.jit
 def _qk_rmsnorm_native_kernel(
@@ -149,7 +151,13 @@ def zimage_qk_rmsnorm_native(
         return None
     nheads = x.shape[2]
     n_rows = x.shape[0] * x.shape[1] * nheads
-    rows_per_prog = 8
+    arch = get_jit_cuda_arch()
+    is_sm103 = arch.major == 10 and arch.minor == 3
+    # The production Z-Image shape is launch-bound on B300. Grouping more rows
+    # while using one warp group reduces latency without changing the launch
+    # tuned for other architectures.
+    rows_per_prog = 16 if is_sm103 else 8
+    num_warps = 4 if is_sm103 else 8
     y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     grid = (triton.cdiv(n_rows, rows_per_prog),)
     with torch.get_device_module().device(x.device):
@@ -163,7 +171,7 @@ def zimage_qk_rmsnorm_native(
             head_dim,
             eps,
             rows_per_prog=rows_per_prog,
-            num_warps=8,
+            num_warps=num_warps,
         )
     return y
 
