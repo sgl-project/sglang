@@ -1,0 +1,88 @@
+name: PR Test (Windows ARM64 build)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "python/**"
+      - "rust/Cargo.lock"
+      - "rust/Cargo.toml"
+      - "rust/sglang-mm/**"
+      - "scripts/ci/utils/verify_windows_arm64_wheel.py"
+      - ".github/workflows/release-pypi.yml"
+      - ".github/workflows/pr-test-windows-arm64.yml"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "python/**"
+      - "rust/Cargo.lock"
+      - "rust/Cargo.toml"
+      - "rust/sglang-mm/**"
+      - "scripts/ci/utils/verify_windows_arm64_wheel.py"
+      - ".github/workflows/release-pypi.yml"
+      - ".github/workflows/pr-test-windows-arm64.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: windows-arm64-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheel:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # CPython 3.10 does not publish a native Windows ARM64 distribution.
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: arm64
+
+      - name: Verify native toolchain
+        shell: pwsh
+        run: |
+          python -c "import platform, sysconfig; assert platform.machine().lower() == 'arm64'; assert sysconfig.get_platform() == 'win-arm64'"
+          rustc -vV
+          cargo --version
+          clang --version
+
+      - name: Install Python build frontend
+        run: python -m pip install build
+
+      - name: Build Windows ARM64 wheel
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath`) do set "VS_PATH=%%i"
+          if not defined VS_PATH (
+            echo Visual Studio ARM64 build tools were not found.
+            exit /b 1
+          )
+          set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvarsall.bat" arm64
+          copy /Y README.md python\README.md
+          copy /Y LICENSE python\LICENSE
+          python -m build --wheel --outdir dist python
+
+      - name: Verify wheel contents
+        run: python scripts/ci/utils/verify_windows_arm64_wheel.py dist
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: sglang-wheel-python${{ matrix.python-version }}-windows-arm64
+          path: dist/*.whl
