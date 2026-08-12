@@ -266,9 +266,7 @@ def test_prefill_multibatch(mode: str, src_dtype: torch.dtype) -> None:
         ctx = make_paged_context(bs=bs, compress_ratio=RATIO, head_dim=HEAD_DIM)
 
     seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend(seq_extend)
-    kv_in_cpu, ape_cpu = _make_inputs(
-        num_q, ctx.head_dim, seed=99, src_dtype=src_dtype
-    )
+    kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=99, src_dtype=src_dtype)
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
     out = _run_prefill(
         ctx,

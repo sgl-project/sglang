@@ -306,9 +306,7 @@ def test_paged_buffer_intermediate(src_dtype: torch.dtype) -> None:
     )
     seq_len = 1024  # 4 swa_pages
     seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend([(seq_len, seq_len)])
-    kv_in_cpu, ape_cpu = _make_inputs(
-        num_q, ctx.head_dim, seed=42, src_dtype=src_dtype
-    )
+    kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=42, src_dtype=src_dtype)
 
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
     _run_prefill(
@@ -356,9 +354,7 @@ def test_prefill_multibatch(mode: str, src_dtype: torch.dtype) -> None:
         ctx = make_paged_context(bs=bs, compress_ratio=RATIO, head_dim=HEAD_DIM)
 
     seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend(seq_extend)
-    kv_in_cpu, ape_cpu = _make_inputs(
-        num_q, ctx.head_dim, seed=99, src_dtype=src_dtype
-    )
+    kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=99, src_dtype=src_dtype)
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
     out = _run_prefill(
         ctx,

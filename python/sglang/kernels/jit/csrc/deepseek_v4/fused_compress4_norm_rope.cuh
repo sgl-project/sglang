@@ -80,7 +80,6 @@ SGL_DEVICE float wave_reduce_max(float value) {
 
 #define FUSED_C4_KERNEL __global__ __launch_bounds__(kFusedBlockSize, 4)
 
-
 struct FusedCompress4NormRopeParams {
   void* __restrict__ kv_buffer;
   const void* __restrict__ kv_input;
@@ -417,15 +416,8 @@ struct FusedCompress4NormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes =
       kBf16Store ? (kHeadDim * 2 * kPageSize) : host::div_ceil(584 * kPageSize, 576) * 576;
-  static constexpr auto kernel = flash_c4_decode_norm_rope<
-      kHeadDim,
-      BufferFloat,
-      InputFloat,
-      SrcFloat,
-      DType,
-      kLogPageSize,
-      kUsePDL,
-      kBf16Store>;
+  static constexpr auto kernel =
+      flash_c4_decode_norm_rope<kHeadDim, BufferFloat, InputFloat, SrcFloat, DType, kLogPageSize, kUsePDL, kBf16Store>;
   using Trait = FusedC4Trait<kHeadDim, 2>;
 
   static_assert(kHeadDim == 512, "fused c4 epilogue is defined for flashmla head_dim=512");
@@ -515,8 +507,7 @@ template <
     int32_t kPageBits,
     bool kUsePDL,
     int32_t kPreshuffleSize>
-FUSED_C4_KERNEL void flash_c4_decode_norm_rope_indexer(
-    const __grid_constant__ FusedCompress4NormRopeParams params) {
+FUSED_C4_KERNEL void flash_c4_decode_norm_rope_indexer(const __grid_constant__ FusedCompress4NormRopeParams params) {
   using namespace device;
 
   constexpr int64_t kHeadDim = 128;
@@ -703,8 +694,8 @@ template <
     int32_t kPageBits,
     bool kUsePDL,
     int32_t kPreshuffleSize>
-FUSED_C4_KERNEL void flash_c4_decode_norm_rope_indexer_w64(
-    const __grid_constant__ FusedCompress4NormRopeParams params) {
+FUSED_C4_KERNEL void
+flash_c4_decode_norm_rope_indexer_w64(const __grid_constant__ FusedCompress4NormRopeParams params) {
   using namespace device;
 
   constexpr int64_t kHeadDim = 128;

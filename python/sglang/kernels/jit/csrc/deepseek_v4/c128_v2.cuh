@@ -95,9 +95,7 @@ struct Compress128PrefillParams {
 /// -- so each pointer carries its own storage type and is reconciled here rather
 /// than forcing the producer to pre-convert.
 template <typename Dst, uint32_t kTileElements, typename Src>
-SGL_DEVICE device::AlignedVector<Dst, kTileElements> c128_load(
-    const Src* src,
-    const uint32_t lane_id) {
+SGL_DEVICE device::AlignedVector<Dst, kTileElements> c128_load(const Src* src, const uint32_t lane_id) {
   using namespace device;
 
   using StorageSrc = AlignedVector<Src, kTileElements>;
@@ -334,8 +332,7 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
     c128_write_decode<Trait, BufferFloat, SrcFloat>(kv_dst, kv_src);
   }
   if (plan.write_loc % 128 == 127) {
-    c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, SrcFloat, OutFloat>(
-        kv_buf, kv_src, kv_out, score_bias, 128);
+    c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, SrcFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, 128);
   }
 }
 

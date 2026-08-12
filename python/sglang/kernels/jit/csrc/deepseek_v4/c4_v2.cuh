@@ -421,8 +421,7 @@ template <
     typename OutFloat,
     bool kUsePDL>
 struct FlashCompress4Kernel {
-  static constexpr auto decode_kernel =
-      flash_c4_decode<kHeadDim, BufferFloat, InputFloat, SrcFloat, OutFloat, kUsePDL>;
+  static constexpr auto decode_kernel = flash_c4_decode<kHeadDim, BufferFloat, InputFloat, SrcFloat, OutFloat, kUsePDL>;
   static constexpr auto prefill_c_kernel =
       flash_c4_prefill<kHeadDim, BufferFloat, InputFloat, SrcFloat, OutFloat, kUsePDL>;
   static constexpr auto prefill_w_kernel =

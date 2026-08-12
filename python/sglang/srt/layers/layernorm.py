@@ -285,10 +285,12 @@ def _forward_with_allreduce_fusion_quant_per_group(
         tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
     )
     from sglang.srt.layers.quantization.fp8_utils import (
+        _NATIVE_BPRESHUFFLE_SCALE,
+    )
+    from sglang.srt.layers.quantization.fp8_utils import (
         _use_aiter_bpreshuffle_gfx95 as use_bpreshuffle,
     )
     from sglang.srt.layers.quantization.fp8_utils import (
-        _NATIVE_BPRESHUFFLE_SCALE,
         materialize_bpreshuffle_fp8_scale,
         view_aiter_fused_rms_transposed_fp8_scale,
     )

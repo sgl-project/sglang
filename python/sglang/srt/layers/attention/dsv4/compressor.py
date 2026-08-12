@@ -8,7 +8,6 @@ import torch.nn as nn
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 from sglang.kernels.ops.attention.dsv4 import (
-    linear_bf16_fp32,
     linear_kv_score,
     triton_create_paged_compress_data,
 )
