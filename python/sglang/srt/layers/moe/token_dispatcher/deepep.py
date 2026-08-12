@@ -261,6 +261,7 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        router_topk: int = 0,
     ):
         state = cls._state()
         if state.buffer is not None:
@@ -289,6 +290,7 @@ class DeepEPBuffer:
                 deepep_mode,
                 num_max_dispatch_tokens_per_rank,
                 num_experts,
+                router_topk,
             )
             return state.buffer
 
@@ -386,6 +388,7 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int,
         num_experts: int,
+        router_topk: int = 0,
     ):
         """Construct a DeepEP V2 `ElasticBuffer` for opt-in V2 usage.
 
@@ -437,11 +440,14 @@ class DeepEPBuffer:
                 chunk or 8192,
                 max_prefill or 16384,
             )
-        # `num_topk` is not known at buffer-construction time in SGLang
-        # (the router choice is per-forward). DeepEP V2 accepts
-        # `num_topk=0` and falls back to a group-size-based conservative
-        # hint, so we pass 0 here and let V2 compute the ceiling.
-        num_topk = 0
+        # Use the model's real top-k: it is fixed per model and known at
+        # dispatcher construction (`router_topk`). Passing 0 is NOT a
+        # proportional fallback — DeepEP V2 pins the token layout to its
+        # top-32 ceiling (csrc/elastic/buffer.hpp: `num_topk = num_topk ==
+        # 0 ? 32 : num_topk`), which oversizes the top-k-dependent buffer
+        # regions 4x for a top-8 model and scales with num_ranks. 0 remains
+        # the conservative ceiling only when a caller cannot provide it.
+        num_topk = router_topk if router_topk > 0 else 0
         # Low-latency mode still requires `num_experts % group.size() ==
         # 0`. The normal mode works with `num_experts == -1`.
         if deepep_mode.enable_low_latency():
@@ -949,6 +955,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            self.router_topk,
         )
 
 
@@ -1155,6 +1162,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            self.router_topk,
         )
 
 
