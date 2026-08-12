@@ -367,6 +367,57 @@ def _forward_with_allreduce_fusion_quant_per_group(
     return (bf16_out, fp8_out, scale_out), residual_out
 
 
+def _forward_with_allreduce_fusion_quant(
+    norm_module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    use_attn_tp_group: bool = True,
+):
+    """Fused AR + RMSNorm + per-TOKEN FP8 quant (ROCm/aiter, whole-row scale).
+
+    Returns ``((fp8, scale), residual)`` on success, or ``None`` when no fused
+    quant path is available (caller must fall back to the plain fused
+    AR+RMSNorm + a separate per-token quant).
+
+    Unlike the per-group variant, the per-token scale is ``[m, 1]`` over the
+    whole hidden row, which is what ``gemm_a8w8_bpreshuffle`` (per-channel fp8
+    linear) consumes. Uses the aiter ``custom_fused_ar_rms_quant`` kernel.
+    """
+    if residual is None or not _use_aiter:
+        return None
+
+    from sglang.srt.distributed import (
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant,
+    )
+    from sglang.srt.layers.quantization.fp8_utils import (
+        _use_aiter_bpreshuffle_gfx95 as use_bpreshuffle,
+    )
+    from sglang.srt.layers.quantization.fp8_utils import (
+        materialize_bpreshuffle_fp8_scale,
+    )
+
+    if use_attn_tp_group:
+        world_size = get_parallel().attn_tp_size
+    else:
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
+        else:
+            world_size = get_parallel().moe_tp_size
+    if world_size <= 1:
+        return None
+
+    result = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+        x, residual, weight, norm_module.variance_epsilon
+    )
+    if result is None:
+        return None
+    fp8_out, residual_out, scale_out = result
+    if use_bpreshuffle:
+        scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
+    return (fp8_out, scale_out), residual_out
+
+
 def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
     """Return the per-tensor static FP8 activation scale of ``linear`` if it is
     an FP8 linear using static per-tensor activation scaling that can consume a
@@ -853,6 +904,21 @@ class RMSNorm(BaseFusedOp):
         """
         return _forward_with_allreduce_fusion_quant_per_group(
             self, x, residual, self.weight, group_size, use_attn_tp_group, keep_bf16
+        )
+
+    def forward_with_allreduce_fusion_quant(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        use_attn_tp_group: bool = True,
+    ):
+        """Fused AR + RMSNorm + per-token FP8 quant (ROCm/aiter).
+
+        Returns ``((fp8, scale), residual)`` or ``None`` (caller falls back to
+        the plain fused AR+RMSNorm + separate quant).
+        """
+        return _forward_with_allreduce_fusion_quant(
+            self, x, residual, self.weight, use_attn_tp_group
         )
 
     def forward_with_per_tensor_quant_fusion(

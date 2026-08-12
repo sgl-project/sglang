@@ -2219,7 +2219,12 @@ class DeepseekV2AttentionMLA(
                 and not self.is_packed_weight
                 and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
             )
-        if self._use_min_latency_fused_a_gemm:
+        # hidden_states may be a pre-quantized (fp8, x_scale) tuple when the
+        # per-token activation quant was folded into input_layernorm
+        # (quant_format="fp8_per_token"). The fused-a-gemm fast path reads the
+        # weight directly and cannot consume the tuple, so route the tuple
+        # through the standard proj, whose apply_fp8_linear has a tuple fast path.
+        if self._use_min_latency_fused_a_gemm and not isinstance(hidden_states, tuple):
             return linear_with_fused_a_gemm(
                 self.fused_qkv_a_proj_with_mqa,
                 hidden_states,
@@ -2233,7 +2238,12 @@ class DeepseekV2AttentionMLA(
                 self._q_b_proj_verified_shape
                 and fused_a_gemm_weight_eligible(self.q_b_proj)
             )
-        if self._use_min_latency_q_b_gemm:
+        # q_lora may be a pre-quantized (fp8, x_scale) tuple when the per-token
+        # activation quant was folded into the upstream fused q/kv RMSNorm
+        # (see forward_absorb_prepare). The fused-a-gemm fast path reads the
+        # weight directly and cannot consume the tuple, so route the tuple
+        # through the standard proj, whose apply_fp8_linear has a tuple fast path.
+        if self._use_min_latency_q_b_gemm and not isinstance(q_lora, tuple):
             q = linear_with_fused_a_gemm(
                 self.q_b_proj, q_lora, backend=self.fused_a_gemm_backend
             )
@@ -2418,7 +2428,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             weight_scale = getattr(proj, "weight_scale", None)
             if weight_scale is None:
                 return "fp8_pending"
-            return "fp8" if _is_block_scale_fp8(proj) else ""
+            # Block-scale fp8 -> fused RMSNorm + group-128 quant ("fp8").
+            # Per-channel fp8 -> fused RMSNorm + per-token quant
+            # ("fp8_per_token"): folds the entry-proj activation quant into
+            # input_layernorm so the standalone per-token quant before
+            # fused_qkv_a_proj_with_mqa is eliminated.
+            return "fp8" if _is_block_scale_fp8(proj) else "fp8_per_token"
         return ""
 
     def _resolve_gfx95_quant_format(self) -> str:

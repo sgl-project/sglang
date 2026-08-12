@@ -71,6 +71,12 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
+# Whether the aiter fused q/kv RMSNorm can emit q as a per-token fp8 tuple
+# (folds the q_b_proj activation quant into the norm). Set inside the _use_aiter
+# block below; default False so the plain path is used otherwise.
+_has_fused_qk_pertoken_fp8 = False
+fused_qk_rmsnorm_q_pertoken_fp8 = None
+
 if _use_aiter:
     # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
     # `aiter.ops.fused_qk_norm_rope_cache_quant` to a private `_fused_qk_rmsnorm`
@@ -100,10 +106,38 @@ if _use_aiter:
             )
             return q_out, k_out
 
+        def fused_qk_rmsnorm_q_pertoken_fp8(q, q_weight, q_eps, k, k_weight, k_eps):
+            # Fold the q_b_proj per-token fp8 activation quant INTO the fused
+            # q/kv RMSNorm: q is emitted as (fp8, x_scale[m,1]) ready for the
+            # tuned gemm_a8w8_bpreshuffle, eliminating the standalone per-token
+            # quant launch before q_b_proj. k (kv_a) stays bf16 (it feeds the
+            # absorbed w_kc/w_vc BMMs, not a bpreshuffle GEMM).
+            q_q = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+            q_s = torch.empty((q.shape[0], 1), dtype=torch.float32, device=q.device)
+            k_out = torch.empty_like(k)
+            _aiter_fused_qk_rmsnorm_unified(
+                q_out_quantized=q_q,
+                q_out_scale=q_s,
+                k_out=k_out,
+                q=q,
+                q_weight=q_weight,
+                q_epsilon=q_eps,
+                k=k,
+                k_weight=k_weight,
+                k_epsilon=k_eps,
+                quant_type=_AiterQuantType.per_Token,
+            )
+            return (q_q, q_s), k_out
+
+        _has_fused_qk_pertoken_fp8 = True
+
     except ImportError:
         from aiter.ops.fused_qk_norm_rope_cache_quant import (
             fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
         )
+
+        fused_qk_rmsnorm_q_pertoken_fp8 = None
+        _has_fused_qk_pertoken_fp8 = False
 
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
@@ -370,6 +404,27 @@ class DeepseekMLARocmForwardMixin:
                     )
                     if _use_aiter_bpreshuffle_gfx95:
                         q = materialize_bpreshuffle_fp8_scale_tuple(q)
+            elif (
+                _use_aiter
+                and _has_fused_qk_pertoken_fp8
+                and not self.use_dsa
+                and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+            ):
+                # Per-channel fp8 q_b_proj: fold its per-token activation quant
+                # into the fused q/kv RMSNorm. q becomes a (fp8, x_scale[m,1])
+                # tuple consumed directly by gemm_a8w8_bpreshuffle in
+                # apply_fp8_linear, removing the standalone per-token quant
+                # before q_b_proj. Per-token scale needs no bpreshuffle
+                # materialize (mirrors the non-tuple per-channel path in
+                # apply_fp8_linear). Block-scale fp8 is handled above.
+                q, k_nope = fused_qk_rmsnorm_q_pertoken_fp8(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    k_nope,
+                    self.kv_a_layernorm.weight,
+                    self.kv_a_layernorm.variance_epsilon,
+                )
             elif _use_aiter:
                 q, k_nope = fused_qk_rmsnorm_bf16(
                     q,

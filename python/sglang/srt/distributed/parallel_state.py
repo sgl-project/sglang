@@ -909,6 +909,45 @@ class GroupCoordinator:
         except Exception:
             return None
 
+    def fused_allreduce_rmsnorm_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Fused all-reduce + RMSNorm + per-TOKEN FP8 quant (ROCm/aiter).
+
+        Whole-row per-token scale ``[m, 1]`` (via aiter
+        ``custom_fused_ar_rms_quant``), NOT the wavefront-limited per-group
+        variant. Returns ``(fp8_output, residual_out, per_token_scale)`` or
+        ``None`` when the custom all-reduce communicator cannot service the
+        request (caller must fall back to the plain fused AR+RMSNorm + separate
+        quant path).
+        """
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_quant"):
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            total_bytes = input_.numel() * input_.element_size()
+            use_1stage_ar = total_bytes <= 128 * 1024
+
+        try:
+            return ca_comm.custom_fused_ar_rms_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+            )
+        except Exception:
+            return None
+
     def _resolve_outplace_all_reduce_method(
         self,
         input_: torch.Tensor,

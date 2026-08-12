@@ -42,11 +42,37 @@ _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
 )
 
+_fused_rmsnorm_pertoken_fp8 = None
+_has_rmsnorm_pertoken_fp8 = False
+
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+
+    # Per-channel fp8 prefill projs (q_b_proj / kv_b_proj) want a per-token
+    # whole-row activation scale [m, 1]. Fold that quant into the preceding
+    # single-tensor RMSNorm so the standalone per-token quant before the proj is
+    # eliminated; the (fp8, scale) tuple is consumed by apply_fp8_linear's tuple
+    # fast path -> gemm_a8w8_bpreshuffle.
+    try:
+        from aiter.ops.rmsnorm import rmsnorm2d_fwd_with_dynamicquant
+
+        def _fused_rmsnorm_pertoken_fp8(x, weight, eps):
+            out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+            yscale = torch.empty(
+                (x.shape[0], 1), dtype=torch.float32, device=x.device
+            )
+            rmsnorm2d_fwd_with_dynamicquant(
+                out, x, yscale, weight, eps, group_size=0  # group_size=0 -> per-token
+            )
+            return out, yscale
+
+        _has_rmsnorm_pertoken_fp8 = True
+    except ImportError:
+        _fused_rmsnorm_pertoken_fp8 = None
+        _has_rmsnorm_pertoken_fp8 = False
 
 
 class DeepseekMHARocmForwardMixin:
@@ -136,6 +162,24 @@ class DeepseekMHARocmForwardMixin:
                 if _use_aiter_bpreshuffle_gfx95:
                     q = materialize_bpreshuffle_fp8_scale_tuple(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            elif (
+                _use_aiter_gfx95
+                and _has_rmsnorm_pertoken_fp8
+                and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+            ):
+                # Per-channel fp8 q_b_proj (prefill): fold the per-token fp8
+                # activation quant into q_a_layernorm. q becomes (fp8, scale[m,1])
+                # consumed by apply_fp8_linear's tuple path -> gemm_a8w8_bpreshuffle,
+                # removing the standalone per-token quant before q_b_proj.
+                # Block-scale fp8 is handled above.
+                q_tuple = _fused_rmsnorm_pertoken_fp8(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                )
+                q = self.q_b_proj(q_tuple)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
             else:
                 q = self.q_a_layernorm(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -149,6 +193,10 @@ class DeepseekMHARocmForwardMixin:
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
+
+        # Pre-quantized (fp8, scale) tuple for kv_b_proj when the kv_a norm folds
+        # the per-token quant (block-scale or per-channel fp8); None otherwise.
+        kv_a_quanted = None
 
         if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
@@ -166,6 +214,23 @@ class DeepseekMHARocmForwardMixin:
             )
             if _use_aiter_bpreshuffle_gfx95:
                 kv_a_quanted = materialize_bpreshuffle_fp8_scale_tuple(kv_a_quanted)
+        elif (
+            _use_aiter_gfx95
+            and _has_rmsnorm_pertoken_fp8
+            and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn
+        ):
+            # Per-channel fp8 kv_b_proj (prefill): fold the per-token fp8 quant
+            # into kv_a_layernorm. kv_a_quanted=(fp8, scale[m,1]) feeds kv_b_proj
+            # via apply_fp8_linear's tuple path (removing the standalone per-token
+            # quant). kv_a (bf16) is still needed for the KV-cache write
+            # (_set_mla_kv_buffer) and the mha_one_shot refetch, so normalize it
+            # separately in bf16 as before.
+            kv_a_quanted = _fused_rmsnorm_pertoken_fp8(
+                kv_a,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.variance_epsilon,
+            )
+            kv_a = self.kv_a_layernorm(kv_a)
         else:
             kv_a = self.kv_a_layernorm(kv_a)
 
@@ -241,7 +306,8 @@ class DeepseekMHARocmForwardMixin:
                 )
             )[0]
         else:
-            if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
+            if kv_a_quanted is not None:
+                # block-scale or per-channel fp8: consume the pre-quantized tuple
                 kv = self.kv_b_proj(kv_a_quanted)[0]
             else:
                 kv = self.kv_b_proj(kv_a)[0]

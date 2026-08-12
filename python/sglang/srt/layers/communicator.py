@@ -586,6 +586,27 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     quant_result = None
                     if (
+                        _use_aiter
+                        and quant_format == "fp8_per_token"
+                        and hasattr(
+                            self.input_layernorm,
+                            "forward_with_allreduce_fusion_quant",
+                        )
+                    ):
+                        # Fold the entry-proj per-token fp8 quant INTO the fused
+                        # AR+RMSNorm kernel (custom_fused_ar_rms_quant, per-token
+                        # whole-row scale [m, 1] — NOT the wavefront-limited
+                        # per-group variant). Emits (fp8, scale) consumed directly
+                        # by gemm_a8w8_bpreshuffle in apply_fp8_linear, removing
+                        # the standalone per-token quant before
+                        # fused_qkv_a_proj_with_mqa on the fused-AR path. Returns
+                        # None when custom AR is ineligible -> fall back below.
+                        quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant(
+                            hidden_states,
+                            residual,
+                            use_attn_tp_group=False,
+                        )
+                    elif (
                         self.enable_fused_ar_quant
                         and _use_aiter
                         and hasattr(
