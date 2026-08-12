@@ -48,7 +48,6 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
 
     def test_async_h2d_is_dispatched_per_component_from_copy_helper(self):
         pool = MambaPoolHost.__new__(MambaPoolHost)
-        pool.ascend_mamba_async_enabled = True
         host = torch.empty(4, 3, 1, 2, 4)
         device_layers = torch.empty(3, 5, 2, 4)
         host_indices = torch.tensor([1, 3])
@@ -59,6 +58,10 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
             memory_pool_host,
             "transfer_state_per_layer_direct_pf_lf",
             transfer_op,
+        ), patch.object(
+            memory_pool_host,
+            "_ascend_hicache_mamba_io_mode",
+            return_value="async",
         ):
             pool._copy_tensor_pf_lf(
                 src=host,
@@ -68,20 +71,18 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
                 layer_id=2,
                 num_layers=3,
                 io_backend="kernel_ascend",
-                device_layers=device_layers,
             )
 
         transfer_op.assert_called_once_with(
-            device_states=[device_layers],
-            host_states=[host],
-            device_indices=device_indices,
-            host_indices=host_indices,
+            src=host,
+            dst=device_layers[2],
+            src_indices=host_indices,
+            dst_indices=device_indices,
             layer_id=2,
         )
 
     def test_async_d2h_is_dispatched_per_component_from_copy_helper(self):
         pool = MambaPoolHost.__new__(MambaPoolHost)
-        pool.ascend_mamba_async_enabled = True
         device_layers = torch.empty(3, 5, 2, 4)
         host = torch.empty(4, 3, 1, 2, 4)
         device_indices = torch.tensor([0, 4])
@@ -92,6 +93,10 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
             memory_pool_host,
             "transfer_state_all_layer_direct_lf_pf",
             transfer_op,
+        ), patch.object(
+            memory_pool_host,
+            "_ascend_hicache_mamba_io_mode",
+            return_value="async",
         ):
             pool._copy_tensor_all_layers_lf_pf(
                 src_layers=device_layers,
@@ -112,25 +117,36 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
 
     def test_sync_h2d_torch_fallback_is_preserved(self):
         pool = MambaPoolHost.__new__(MambaPoolHost)
-        pool.ascend_mamba_async_enabled = False
         host = torch.arange(4 * 3 * 1 * 2, dtype=torch.float32).reshape(4, 3, 1, 2)
         device_layers = torch.zeros(3, 5, 2)
         host_indices = torch.tensor([1, 3])
         device_indices = torch.tensor([0, 4])
 
-        pool._copy_tensor_pf_lf(
-            src=host,
-            dst=device_layers[2],
-            src_indices=host_indices,
-            dst_indices=device_indices,
-            layer_id=2,
-            num_layers=3,
-            io_backend="kernel_ascend",
-            device_layers=device_layers,
-        )
+        with patch.object(
+            memory_pool_host,
+            "_ascend_hicache_mamba_io_mode",
+            return_value="sync",
+        ):
+            pool._copy_tensor_pf_lf(
+                src=host,
+                dst=device_layers[2],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=2,
+                num_layers=3,
+                io_backend="kernel_ascend",
+            )
 
         torch.testing.assert_close(
             device_layers[2, device_indices], host[host_indices, 2, 0]
+        )
+
+    def test_copy_helpers_keep_static_signatures(self):
+        self.assertIsInstance(
+            MambaPoolHost.__dict__["_copy_tensor_pf_lf"], staticmethod
+        )
+        self.assertIsInstance(
+            MambaPoolHost.__dict__["_copy_tensor_all_layers_lf_pf"], staticmethod
         )
 
     def test_conv_only_load_skips_empty_temporal_component(self):
@@ -160,7 +176,7 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
         pool._copy_tensor_pf_lf.assert_called_once()
         call = pool._copy_tensor_pf_lf.call_args.kwargs
         self.assertIs(call["src"], pool.conv_buffer[0])
-        self.assertIs(call["device_layers"], device_pool.mamba_cache.conv[0])
+        self.assertIs(call["dst"], device_pool.mamba_cache.conv[0][1])
 
 
 if __name__ == "__main__":

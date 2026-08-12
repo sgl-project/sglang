@@ -185,13 +185,11 @@ class MambaPoolHost(HostKVCache):
         self.clear()
 
     def _configure_ascend_mamba_io(self) -> None:
-        self.ascend_mamba_io_mode = "sync"
-        self.ascend_mamba_async_enabled = False
         if not _is_npu:
             return
 
-        self.ascend_mamba_io_mode = _ascend_hicache_mamba_io_mode()
-        if self.ascend_mamba_io_mode == "sync":
+        mode = _ascend_hicache_mamba_io_mode()
+        if mode == "sync":
             logger.info(
                 "Ascend HiCache Mamba state transfer mode: sync torch fallback."
             )
@@ -214,7 +212,6 @@ class MambaPoolHost(HostKVCache):
                 "from sgl-kernel-npu."
             )
 
-        self.ascend_mamba_async_enabled = True
         logger.info("Ascend HiCache Mamba state transfer mode: native async.")
 
     def init_kv_buffer(self):
@@ -400,8 +397,8 @@ class MambaPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
+    @staticmethod
     def _copy_tensor_pf_lf(
-        self,
         src: torch.Tensor,
         dst: torch.Tensor,
         src_indices: torch.Tensor,
@@ -409,7 +406,6 @@ class MambaPoolHost(HostKVCache):
         layer_id: int,
         num_layers: int,
         io_backend: str,
-        device_layers: Optional[torch.Tensor] = None,
     ) -> None:
         if src_indices.numel() == 0:
             return
@@ -439,17 +435,12 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            if self.ascend_mamba_async_enabled:
-                if device_layers is None:
-                    raise ValueError(
-                        "Ascend async Mamba H2D transfer requires the complete "
-                        "layer-first device tensor."
-                    )
+            if _ascend_hicache_mamba_io_mode() == "async":
                 transfer_state_per_layer_direct_pf_lf(
-                    device_states=[device_layers],
-                    host_states=[src],
-                    device_indices=dst_indices,
-                    host_indices=src_indices,
+                    src=src,
+                    dst=dst,
+                    src_indices=src_indices,
+                    dst_indices=dst_indices,
                     layer_id=layer_id,
                 )
             else:
@@ -465,8 +456,8 @@ class MambaPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
+    @staticmethod
     def _copy_tensor_all_layers_lf_pf(
-        self,
         src_layers: torch.Tensor,
         dst: torch.Tensor,
         src_indices: torch.Tensor,
@@ -506,7 +497,7 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            if self.ascend_mamba_async_enabled:
+            if _ascend_hicache_mamba_io_mode() == "async":
                 transfer_state_all_layer_direct_lf_pf(
                     device_states=[src_layers],
                     host_states=[dst],
@@ -549,7 +540,6 @@ class MambaPoolHost(HostKVCache):
                     layer_id=layer_id,
                     num_layers=self.num_mamba_layers,
                     io_backend=io_backend,
-                    device_layers=device_pool.mamba_cache.temporal,
                 )
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor_pf_lf(
@@ -560,7 +550,6 @@ class MambaPoolHost(HostKVCache):
                     layer_id=layer_id,
                     num_layers=self.num_mamba_layers,
                     io_backend=io_backend,
-                    device_layers=device_pool.mamba_cache.conv[conv_idx],
                 )
         else:
             self._copy_tensor(
