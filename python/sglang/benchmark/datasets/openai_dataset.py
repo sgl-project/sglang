@@ -3,8 +3,8 @@ from argparse import Namespace
 from dataclasses import dataclass
 from typing import List, Optional
 
-import numpy as np
-from transformers import PreTrainedTokenizerBase
+import numpy as npƒ
+from transformers import PreTrainedTokenizerBaseƒ
 
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 
@@ -85,7 +85,7 @@ def sample_openai_requests(
         # This includes the messages but not the tools
         prompt_len = len(
             tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
+                messages, tokenize=True, add_generation_prompt=True, return_dict=False
             )
         )
 
