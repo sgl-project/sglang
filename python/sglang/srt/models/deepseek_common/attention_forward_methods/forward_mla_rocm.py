@@ -30,9 +30,6 @@ from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.layers.quantization.fp8_utils import (
-    materialize_bpreshuffle_fp8_scale_tuple,
-)
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
@@ -230,12 +227,8 @@ def rocm_absorb_v_bmm(
                 _bmm_buf,
                 group_size=128,
                 dtype_quant=torch.float8_e4m3fn,
-                transpose_scale=False,
+                transpose_scale=_use_aiter_bpreshuffle_gfx95,
             )
-            if _use_aiter_bpreshuffle_gfx95:
-                attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
-                    attn_bmm_output
-                )
         else:
             attn_bmm_output = _bmm_buf.flatten(1, 2)
     elif attn.o_proj.weight.dtype == torch.uint8:
@@ -247,10 +240,8 @@ def rocm_absorb_v_bmm(
             attn_bmm_output,
             group_size=128,
             dtype_quant=torch.float8_e4m3fn,
-            transpose_scale=False,
+            transpose_scale=_use_aiter_bpreshuffle_gfx95,
         )
-        if _use_aiter_bpreshuffle_gfx95:
-            attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(attn_bmm_output)
     else:
         attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
@@ -349,10 +340,8 @@ class DeepseekMLARocmForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
-                        transpose_scale=False,
+                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
                     )
-                    if _use_aiter_bpreshuffle_gfx95:
-                        q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
                     q = q_quanted
                 else:
                     q, _, k_nope, _ = fused_rms_fp8_group_quant(
@@ -366,10 +355,8 @@ class DeepseekMLARocmForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=False,
-                        transpose_scale=False,
+                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
                     )
-                    if _use_aiter_bpreshuffle_gfx95:
-                        q = materialize_bpreshuffle_fp8_scale_tuple(q)
             elif _use_aiter:
                 q, k_nope = fused_qk_rmsnorm_bf16(
                     q,
