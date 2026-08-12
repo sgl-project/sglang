@@ -914,6 +914,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if header_value is not None and header_value.lower() in ("1", "true"):
                 request.return_output_ids = True
 
+        if raw_request is not None and not request.sglext_ids_framed:
+            header_value = raw_request.headers.get("x-sglext-ids-framed")
+            if header_value is not None and header_value.lower() in ("1", "true"):
+                request.sglext_ids_framed = True
+
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
             if request.chat_template_kwargs
@@ -1702,23 +1707,45 @@ class OpenAIServingChat(OpenAIServingBase):
                     list(output_ids.get(i, [])) for i in range(request.n)
                 ]
 
-            if (
-                sglext_routed is not None
-                or sglext_details is not None
-                or sglext_input_ids is not None
-                or sglext_output_ids is not None
-            ):
+            sglext_full = SglExt(
+                routed_experts=sglext_routed,
+                cached_tokens_details=sglext_details,
+                input_ids=sglext_input_ids,
+                output_ids=sglext_output_ids,
+            )
+            sglext_non_ids, sglext_ids = sglext_full.split_ids()
+
+            if request.sglext_ids_framed:
+                # Emit token ids as their own named SSE event, separate from
+                # the other sglext fields, so they can be identified at the
+                # SSE framing level (by event name, no JSON parsing) and
+                # handled independently in transit. Non-id sglext fields keep
+                # the same plain data-chunk shape as the unframed path.
+                if sglext_non_ids is not None:
+                    sglext_chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[],
+                        model=request.model,
+                        sglext=sglext_non_ids,
+                    )
+                    yield f"data: {sglext_chunk.model_dump_json()}\n\n"
+                if sglext_ids is not None:
+                    sglext_ids_chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[],
+                        model=request.model,
+                        sglext=sglext_ids,
+                    )
+                    yield f"event: sglext_ids\ndata: {sglext_ids_chunk.model_dump_json()}\n\n"
+            elif sglext_non_ids is not None or sglext_ids is not None:
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
                     choices=[],  # sglext is at response level
                     model=request.model,
-                    sglext=SglExt(
-                        routed_experts=sglext_routed,
-                        cached_tokens_details=sglext_details,
-                        input_ids=sglext_input_ids,
-                        output_ids=sglext_output_ids,
-                    ),
+                    sglext=sglext_full,
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
 

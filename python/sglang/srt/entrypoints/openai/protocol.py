@@ -415,6 +415,24 @@ class SglExt(BaseModel):
     input_ids: Optional[List[int]] = None
     output_ids: Optional[List[List[int]]] = None
 
+    def split_ids(self) -> Tuple[Optional[SglExt], Optional[SglExt]]:
+        """Partition set fields into ``(non_ids, ids)``; each is None if empty.
+
+        Used when sglext_ids_framed is set: the id fields are emitted in their
+        own named SSE event, and all other fields ride in the plain sglext chunk.
+        """
+        non_ids: Dict[str, Any] = {}
+        ids: Dict[str, Any] = {}
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            (ids if name in ("input_ids", "output_ids") else non_ids)[name] = value
+        return (
+            type(self)(**non_ids) if non_ids else None,
+            type(self)(**ids) if ids else None,
+        )
+
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
@@ -782,6 +800,8 @@ class ChatCompletionRequest(BaseModel):
     return_meta_info: bool = False
     return_input_ids: bool = False
     return_output_ids: bool = False
+    # Streaming only: emit the sglext token ids as a separate named SSE event.
+    sglext_ids_framed: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

@@ -2281,10 +2281,11 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(response.sglext.input_ids, [1, 2, 3])
         self.assertEqual(response.sglext.output_ids, [[5, 6, 7]])
 
-    def test_ids_header_enables_flag(self):
+    def test_ids_headers_enable_flags(self):
         self.fastapi_request.headers = {
             "x-sglext-return-input-ids": "1",
             "x-sglext-return-output-ids": "1",
+            "x-sglext-ids-framed": "1",
         }
         req = ChatCompletionRequest(
             model="x",
@@ -2309,11 +2310,20 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertTrue(processed_request.return_input_ids)
         self.assertTrue(processed_request.return_output_ids)
+        self.assertTrue(processed_request.sglext_ids_framed)
 
-    def _run_output_ids_stream(self, chunk_output_ids, incremental):
+    def _run_output_ids_stream(
+        self,
+        chunk_output_ids,
+        incremental,
+        framed=False,
+        return_raw=False,
+        cached_tokens_details=None,
+    ):
         """Stream chunks whose output_ids follow incremental (delta) or
         non-incremental (full accumulated list) semantics; return the parsed
-        sglext chunks."""
+        sglext chunks (or the raw chunk strings if return_raw, for asserting
+        on SSE framing)."""
         self.tm.server_args.incremental_streaming_output = incremental
 
         async def _mock_generate():
@@ -2328,6 +2338,7 @@ class ServingChatTestCase(unittest.TestCase):
                         "prompt_tokens": 3,
                         "completion_tokens": 1 + i,
                         "cached_tokens": 0,
+                        "cached_tokens_details": cached_tokens_details,
                         "finish_reason": (
                             {"type": "stop", "matched": None} if finished else None
                         ),
@@ -2346,6 +2357,8 @@ class ServingChatTestCase(unittest.TestCase):
             stream=True,
             return_input_ids=True,
             return_output_ids=True,
+            sglext_ids_framed=framed,
+            return_cached_tokens_details=cached_tokens_details is not None,
         )
 
         with patch(
@@ -2360,6 +2373,8 @@ class ServingChatTestCase(unittest.TestCase):
             )
             chunks = self._run_chat_stream(adapted_request, req)
 
+        if return_raw:
+            return chunks
         return [c for c in self._parse_chunks(chunks) if "sglext" in c]
 
     def test_streaming_output_ids_incremental_accumulates_deltas(self):
@@ -2379,6 +2394,54 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(sglext_chunks), 1)
         self.assertEqual(sglext_chunks[0]["sglext"]["input_ids"], [1, 2, 3])
         self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
+
+    _SGLEXT_IDS_EVENT_PREFIX = "event: sglext_ids\ndata: "
+
+    def test_streaming_framed_ids_emits_named_event(self):
+        raw = self._run_output_ids_stream(
+            [[5, 6], [5, 6, 7]], incremental=False, framed=True, return_raw=True
+        )
+
+        named = [c for c in raw if c.startswith(self._SGLEXT_IDS_EVENT_PREFIX)]
+        self.assertEqual(len(named), 1)
+        payload = json.loads(named[0][len(self._SGLEXT_IDS_EVENT_PREFIX) :])
+        self.assertEqual(payload["choices"], [])
+        # The named event carries ONLY the id fields.
+        self.assertEqual(set(payload["sglext"]), {"input_ids", "output_ids"})
+        self.assertEqual(payload["sglext"]["input_ids"], [1, 2, 3])
+        self.assertEqual(payload["sglext"]["output_ids"], [[5, 6, 7]])
+        # All requested sglext fields were ids, so no plain sglext chunk.
+        self.assertEqual([c for c in self._parse_chunks(raw) if "sglext" in c], [])
+
+    def test_streaming_framed_splits_non_id_fields_into_plain_chunk(self):
+        raw = self._run_output_ids_stream(
+            [[5, 6], [5, 6, 7]],
+            incremental=False,
+            framed=True,
+            return_raw=True,
+            cached_tokens_details={"device": 2, "host": 1},
+        )
+
+        named = [c for c in raw if c.startswith(self._SGLEXT_IDS_EVENT_PREFIX)]
+        self.assertEqual(len(named), 1)
+        named_payload = json.loads(named[0][len(self._SGLEXT_IDS_EVENT_PREFIX) :])
+        self.assertEqual(set(named_payload["sglext"]), {"input_ids", "output_ids"})
+
+        plain_sglext = [c for c in self._parse_chunks(raw) if "sglext" in c]
+        self.assertEqual(len(plain_sglext), 1)
+        self.assertEqual(
+            plain_sglext[0]["sglext"]["cached_tokens_details"],
+            {"device": 2, "host": 1},
+        )
+        self.assertNotIn("input_ids", plain_sglext[0]["sglext"])
+        self.assertNotIn("output_ids", plain_sglext[0]["sglext"])
+        # The plain non-id chunk precedes the named ids event.
+        plain_raw_idx = next(
+            i
+            for i, c in enumerate(raw)
+            if c.startswith("data: ") and "cached_tokens_details" in c
+        )
+        self.assertLess(plain_raw_idx, raw.index(named[0]))
 
     def _run_output_ids_stream_with_graceful_abort(
         self, normal_chunks, abort_output_ids, incremental
