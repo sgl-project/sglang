@@ -813,7 +813,12 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
+        # 9 partitions: 2 parametrized + one per standalone file. run_suite.py
+        # assigns partitions >= (total - len(STANDALONE_FILES)) to standalone
+        # files and exits 1 when total < that count, so this list and
+        # --total-partitions below must grow with STANDALONE_FILES["2-gpu"]
+        # in python/sglang/multimodal_gen/test/server/gpu_cases.py.
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -910,7 +915,7 @@ jobs:
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 3 \
+              --total-partitions 9 \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
           # Post-test diagnostics
