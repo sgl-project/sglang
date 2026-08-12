@@ -600,6 +600,19 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Onion model/data tooling. The onion-ai-data package provides oniond.
+RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
+    OS="$(. /etc/os-release && echo "${ID}")" \
+    && VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "https://mirrors.ivolces.com/extra-tools/${OS}/GPG-KEY-system" \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.ivolces.com/extra-tools/${OS} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/volctools.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends onion-ai-data \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
 # =============================================================================
 # Python packages and tools (before source copy for better caching)
 # =============================================================================
@@ -874,6 +887,19 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
     && python3 -m pip config set global.break-system-packages true \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Install Onion model/data tooling. The onion-ai-data package provides oniond.
+RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
+    OS="$(. /etc/os-release && echo "${ID}")" \
+    && VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "https://mirrors.ivolces.com/extra-tools/${OS}/GPG-KEY-system" \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.ivolces.com/extra-tools/${OS} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/volctools.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends onion-ai-data \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
