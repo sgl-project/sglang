@@ -80,6 +80,15 @@ class AttentionArch(IntEnum):
     SSM = auto()  # State Space Models (Mamba, Mamba2)
 
 
+# Pure state-space (SSM) causal-LMs: no attention, so no num_attention_heads /
+# head_dim in their HF config. Used for head-dim derivation and attention-arch
+# detection below.
+PURE_SSM_ARCHITECTURES = (
+    "Mamba2ForCausalLM",
+    "FalconMambaForCausalLM",
+)
+
+
 class ModelImpl(str, Enum):
     AUTO = "auto"
     SGLANG = "sglang"
@@ -852,14 +861,23 @@ class ModelConfig:
         self.hf_config.context_len = self.context_len
 
     def _derive_model_shapes(self):
+        # Pure SSM models have no attention heads; use head_dim == 0 so the
+        # KV-cell size is 0 rather than a division on a missing head count.
+        is_pure_ssm = any(
+            arch in self.hf_config.architectures for arch in PURE_SSM_ARCHITECTURES
+        )
+
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(self.hf_text_config, "head_dim", None)
         if self.head_dim is None:
-            self.head_dim = (
-                self.hf_text_config.hidden_size
-                // self.hf_text_config.num_attention_heads
-            )
-            setattr(self.hf_text_config, "head_dim", self.head_dim)
+            if is_pure_ssm:
+                self.head_dim = 0
+            else:
+                self.head_dim = (
+                    self.hf_text_config.hidden_size
+                    // self.hf_text_config.num_attention_heads
+                )
+                setattr(self.hf_text_config, "head_dim", self.head_dim)
 
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
         if self.v_head_dim is None:
@@ -1008,13 +1026,19 @@ class ModelConfig:
             elif "BaichuanForCausalLM" in self.hf_config.architectures:
                 self.use_alibi = self.hf_config.hidden_size != 4096
 
-            # Mamba2 is a state-space model, not attention.
+            # Pure state-space models (Mamba/Mamba2) use SSM mixers, not attention.
             if "Mamba2ForCausalLM" in self.hf_config.architectures:
                 self.attention_arch = AttentionArch.SSM
                 # Cache params are built later in the model runner (needs tp_size).
                 self.hf_text_config.full_attention_layer_ids = []
                 # hybrid_arch.py keys off this flag.
                 self.hf_text_config._is_pure_mamba2 = True
+            elif "FalconMambaForCausalLM" in self.hf_config.architectures:
+                # Falcon-Mamba is a pure Mamba-1 (selective-scan) SSM.
+                self.attention_arch = AttentionArch.SSM
+                self.hf_text_config.full_attention_layer_ids = []
+                # hybrid_arch.py keys off this flag.
+                self.hf_text_config._is_pure_falcon_mamba = True
             else:
                 self.attention_arch = AttentionArch.MHA
 
