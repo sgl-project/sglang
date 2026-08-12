@@ -11,6 +11,16 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 MM_EMBEDDING_CACHE_LEASE_ID_KEY = "mm_embedding_cache_lease_id"
 MM_EMBEDDING_CACHE_IDENTITY_KEY = "mm_embedding_cache_identity"
+MM_EMBEDDING_CACHE_HASH_KEY = "mm_embedding_cache_hash"
+
+
+def get_mm_embedding_cache_hash(item) -> Optional[int]:
+    """Return the processor-derived embedding key, if one was provided.
+
+    ``MultimodalDataItem.hash`` remains the legacy router/pad hash and may be
+    overwritten by a caller-supplied ``mm_hashes`` value.
+    """
+    return item.model_specific_data.get(MM_EMBEDDING_CACHE_HASH_KEY, item.hash)
 
 
 class MultimodalCache(abc.ABC):

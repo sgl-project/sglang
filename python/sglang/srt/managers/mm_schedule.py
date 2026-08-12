@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.multimodal_cache import (
     MM_EMBEDDING_CACHE_LEASE_ID_KEY,
     EmbeddingResult,
     MultiModalStaticCache,
+    get_mm_embedding_cache_hash,
 )
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_schedule
@@ -27,15 +28,19 @@ def _embedding_identity(item: MultimodalDataItem) -> Optional[str]:
     return item.model_specific_data.get(MM_EMBEDDING_CACHE_IDENTITY_KEY)
 
 
+def _embedding_hash(item: MultimodalDataItem) -> int:
+    return get_mm_embedding_cache_hash(item)
+
+
 def _embedding_cache_key(item: MultimodalDataItem) -> tuple[int, Optional[str]]:
-    return item.hash, _embedding_identity(item)
+    return _embedding_hash(item), _embedding_identity(item)
 
 
 def _get_cached_embedding(item: MultimodalDataItem) -> Optional[EmbeddingResult]:
     lease_id = item.model_specific_data.get(MM_EMBEDDING_CACHE_LEASE_ID_KEY)
     if lease_id is not None:
         cached = embedding_cache.get_leased(
-            lease_id, item.hash, _embedding_identity(item)
+            lease_id, _embedding_hash(item), _embedding_identity(item)
         )
         if cached is None:
             raise RuntimeError(
@@ -43,7 +48,7 @@ def _get_cached_embedding(item: MultimodalDataItem) -> Optional[EmbeddingResult]
                 "admission; this indicates an invalid cache lifecycle"
             )
         return cached
-    cached = embedding_cache.get_single(item.hash)
+    cached = embedding_cache.get_single(_embedding_hash(item))
     if cached is None or not embedding_cache.matches_identity(
         cached, _embedding_identity(item)
     ):
@@ -257,7 +262,7 @@ def _get_chunked_embedding_full(
     Fallback: encode all items at once, cache combined result, extract chunk.
     Used for non-bundled items or EVS results.
     """
-    item_hashes = [item.hash for item in embedding_items_per_req]
+    item_hashes = [_embedding_hash(item) for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
     embedding_per_req = embedding_cache.get(item_hashes)
 
@@ -383,7 +388,7 @@ def _batch_encode_per_image_misses(
         for cache_key, emb in zip(ordered_keys, split_embeddings):
             item = unique_misses[cache_key][0]
             embedding_cache.set(
-                item.hash,
+                _embedding_hash(item),
                 EmbeddingResult(embedding=emb, identity=_embedding_identity(item)),
             )
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
@@ -458,7 +463,7 @@ def _get_chunked_embedding_by_item(
         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
             cached_embeddings[idx] = emb
             embedding_cache.set(
-                item.hash,
+                _embedding_hash(item),
                 EmbeddingResult(embedding=emb, identity=_embedding_identity(item)),
             )
 

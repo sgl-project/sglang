@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_HASH_KEY,
     MM_EMBEDDING_CACHE_IDENTITY_KEY,
     MM_EMBEDDING_CACHE_LEASE_ID_KEY,
 )
@@ -706,6 +707,10 @@ def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
         item.model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY]
         for item in output.mm_items
     ] == ["sha256:" + "11" * 32, "sha256:" + "22" * 32]
+    assert [
+        item.model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY]
+        for item in output.mm_items
+    ] == [int("11" * 8, 16), int("22" * 8, 16)]
     torch.testing.assert_close(
         output.mm_items[0].precomputed_embeddings, embeddings[Modality.IMAGE][:3]
     )
@@ -769,6 +774,9 @@ def test_kimi_k3_featureless_artifact_keeps_hash_and_lease():
     item = output.mm_items[0]
     assert item.feature is None
     assert item.hash == artifact.feature_hash
+    assert (
+        item.model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY] == artifact.feature_hash
+    )
     assert item.model_specific_data[MM_EMBEDDING_CACHE_LEASE_ID_KEY] == "lease"
 
 

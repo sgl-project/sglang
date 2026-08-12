@@ -1678,6 +1678,7 @@ class Scheduler(
         from sglang.srt.mem_cache.multimodal_cache import (
             MM_EMBEDDING_CACHE_IDENTITY_KEY,
             MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+            get_mm_embedding_cache_hash,
         )
 
         if self.ps.pp_rank != 0:
@@ -1696,13 +1697,14 @@ class Scheduler(
             if lease_id is None:
                 continue
             lease_ids.add(lease_id)
+            embedding_hash = get_mm_embedding_cache_hash(item)
             if (
                 item.feature is not None
-                or item.hash is None
+                or embedding_hash is None
                 or cache is None
                 or not cache.lease_contains(
                     lease_id,
-                    item.hash,
+                    embedding_hash,
                     item.model_specific_data.get(MM_EMBEDDING_CACHE_IDENTITY_KEY),
                 )
             ):

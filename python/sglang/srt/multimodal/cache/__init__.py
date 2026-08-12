@@ -14,6 +14,7 @@ from sglang.srt.multimodal.cache.identity import (
     build_mm_global_cache_key,
     build_mm_radix_cache_namespace,
     build_processor_fingerprint,
+    compact_feature_hash,
     parse_content_hash,
     snapshot_media,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "build_mm_global_cache_key",
     "build_mm_radix_cache_namespace",
     "build_processor_fingerprint",
+    "compact_feature_hash",
     "estimate_cache_size_bytes",
     "parse_content_hash",
     "snapshot_media",

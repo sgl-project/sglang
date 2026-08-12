@@ -21,6 +21,7 @@ from sglang.srt.managers.tokenizer_manager import (
     _namespace_mm_radix_cache,
 )
 from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_HASH_KEY,
     MM_EMBEDDING_CACHE_IDENTITY_KEY,
     MM_EMBEDDING_CACHE_LEASE_ID_KEY,
     EmbeddingResult,
@@ -139,6 +140,27 @@ def test_admission_rejects_a_lease_with_a_different_strong_identity():
 
     assert output.lease_id == "lease"
     assert not cache.lease_contains("lease", 11)
+
+
+def test_caller_router_hash_cannot_redirect_an_embedding_lease():
+    identity = "sha256:" + "01" * 32
+    cache = MultiModalStaticCache(max_size=1024)
+    cache.set(11, _embedding(11, identity=identity))
+    cache.acquire_many("lease", [11], ttl_s=300, identities=[identity])
+    scheduler = _scheduler()
+    item = _featureless_item(11, "lease", identity=identity)
+    item.model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY] = 11
+
+    # The legacy API may replace the router/pad key after lease acquisition.
+    item.set_hash(22)
+    request = SimpleNamespace(rid="request", mm_inputs=SimpleNamespace(mm_items=[item]))
+
+    with patch.object(mm_schedule, "embedding_cache", cache):
+        assert scheduler._validate_mm_embedding_leases(request) is None
+        assert mm_schedule._get_cached_embedding(item).embedding.item() == 11
+
+    assert item.hash == 22
+    assert item.model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY] == 11
 
 
 def test_cache_replaces_an_unpinned_hash_collision_with_the_new_identity():

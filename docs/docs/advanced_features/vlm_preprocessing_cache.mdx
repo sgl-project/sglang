@@ -55,6 +55,9 @@ the same ordered media still do.
 K3 global embedding-cache keys likewise retain the full feature identity. A
 caller-provided legacy cache key is namespaced by that identity and cannot
 replace it.
+Legacy `mm_hashes` can still select the external-router and pad sentinel, but
+K3 keeps its processor-derived embedding key separately so a caller hash cannot
+redirect an embedding lease.
 Prompt text is intentionally excluded: every request rebuilds and validates its
 prompt tokens, image spans, grids, and offsets from the cached per-image
 metadata.

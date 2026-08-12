@@ -24,6 +24,7 @@ from sglang.srt.multimodal.cache import (
     build_mm_global_cache_key,
     build_mm_radix_cache_namespace,
     build_processor_fingerprint,
+    compact_feature_hash,
     estimate_cache_size_bytes,
     parse_content_hash,
     snapshot_media,
@@ -261,7 +262,7 @@ class TestMediaIdentity(unittest.TestCase):
         )
         self.assertEqual(
             build_feature_hash(first, 1),
-            int(build_feature_identity(first, 1)[7:23], 16),
+            compact_feature_hash(build_feature_identity(first, 1)),
         )
         self.assertIsInstance(build_feature_hash(first, 1 << 128), int)
         with self.assertRaises(ValueError):

@@ -296,7 +296,14 @@ def build_feature_identity(artifact_key: str, processor_output_hash: int) -> str
 
 def build_feature_hash(artifact_key: str, processor_output_hash: int) -> int:
     """Return the compact lookup key for a complete feature identity."""
-    digest = build_feature_identity(artifact_key, processor_output_hash)
+    return compact_feature_hash(
+        build_feature_identity(artifact_key, processor_output_hash)
+    )
+
+
+def compact_feature_hash(feature_identity: str) -> int:
+    """Derive the stable 64-bit lookup key from a full feature identity."""
+    digest = parse_content_hash(feature_identity)
     return int.from_bytes(
         bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :])[:8],
         byteorder="big",

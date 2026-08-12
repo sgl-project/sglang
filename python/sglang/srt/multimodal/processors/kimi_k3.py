@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_HASH_KEY,
     MM_EMBEDDING_CACHE_IDENTITY_KEY,
     MM_EMBEDDING_CACHE_LEASE_ID_KEY,
 )
@@ -36,6 +37,7 @@ from sglang.srt.multimodal.cache import (
     build_artifact_key,
     build_feature_hash,
     build_feature_identity,
+    compact_feature_hash,
     parse_content_hash,
     snapshot_media,
 )
@@ -931,6 +933,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY] = (
                 artifact.feature_identity
             )
+            model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY] = artifact.feature_hash
             item = MultimodalDataItem(
                 modality=Modality.IMAGE,
                 feature=None if featureless else artifact.feature,
@@ -1085,4 +1088,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 )
             for item, identity in zip(output.mm_items, feature_identities):
                 item.model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY] = identity
+                item.model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY] = (
+                    compact_feature_hash(identity)
+                )
         return output
