@@ -179,11 +179,23 @@ Balanced and High Throughput share one shape and differ only in capacity. Low La
 
 Extra build requirements: FP8 Balanced and High Throughput need the **DeepEP v2 wheel** (`2.1.0+01dc3aa`), since their `--moe-a2a-backend deepep_v2` flags do not exist upstream. NVFP4 High Throughput needs `nvfp4_agg_wideep_dep16_flashinfer_setup.sh` run first, and its `SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8192` is not optional — unset it falls back to 1024 and startup raises once `1024 × ep_size` no longer covers the largest CuteDSL MoE forward.
 
+### GB300 PD disaggregation layouts
+
+The PD role selector adds the role and transfer flags to the selected base recipe. It does not resize the prefill and decode workers. Use separate workers with the layouts below for the measured GB300 operating points:
+
+| Checkpoint and operating point | Prefill workers | Decode worker | Capacity setting |
+|---|---|---|---|
+| FP8, high throughput | 2 × TP1 / PP16 | DP4-attention / TP4 / EP16, DeepEP v2 + EPLB | Keep frontend concurrency above the decode MRR so prefill remains queued |
+| NVFP4, high throughput | 2 × TP1 / PP6 | DP2-attention / TP4 / EP8, FlashInfer one-sided A2A | Prefill MRR 128 per worker; decode MRR 512; frontend concurrency 1536 |
+| NVFP4, low latency | TP4 / PP2 | TP16 | Decode MRR 1 and frontend concurrency 1 at the latency endpoint |
+
+For NVFP4 with NEXTN, use the 3/1/4 settings on both roles so the prefill worker transfers the draft state. Enable ReplaySSM on the decode role. The generated router command explicitly sets the main, prefill, and decode policies to `round_robin`; the server-side `--load-balance-method` does not configure router worker selection.
+
 ### AllReduce fusion
 
-The four cells running one flat TP group — GB300 FP8 Low Latency, GB300 NVFP4 Low Latency, GB300 BF16, B300 NVFP4 — set `SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION`, the Qwen3.5 CuteDSL path whose single workspace fuses AllReduce + Residual + RMSNorm with the MoE finalize. Worth 6–13% over the legacy path. Don't pass `--flashinfer-allreduce-fusion-backend` alongside it — the env suppresses the flag with a warning.
+The four cells running one flat TP group — GB300 FP8 Low Latency, GB300 NVFP4 Low Latency, GB300 BF16, B300 NVFP4 — set `--flashinfer-allreduce-fusion-backend mnnvl`. This fuses AllReduce + Residual + RMSNorm with the MoE finalize. It is worth 6–13% over the legacy path in the measured configurations.
 
-Nothing else can use it: the fusion needs DP-attention off and the built-in TP MoE, so the wide-EP tiers are out, and the pipelined cells put their cross-node traffic on IB rather than NVLink. The three GB300 cells also carry `NCCL_NVLS_ENABLE=1`, because SGLang forces NVLS collectives off when that variable is unset.
+The other cells on this page do not use it: the fusion needs DP-attention off and the built-in TP MoE, so the wide-EP tiers are out, and the pipelined cells put their cross-node traffic on IB rather than NVLink. The three GB300 cells also carry `NCCL_NVLS_ENABLE=1`, because SGLang forces NVLS collectives off when that variable is unset.
 
 ### AMD
 
