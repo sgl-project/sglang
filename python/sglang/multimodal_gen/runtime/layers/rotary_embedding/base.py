@@ -45,6 +45,17 @@ class RotaryEmbedding(CustomOp):
         self.dtype = dtype
         self.use_precomputed_cache = use_precomputed_cache
 
+        # Static per-instance gates: fixed for the lifetime of this object,
+        # so compute them once here instead of re-deriving them from
+        # is_neox_style/rotary_dim/head_size on every forward call.
+        self._is_full_rotation = rotary_dim == head_size
+        self._can_use_complex_style = not is_neox_style
+        self._npu_rotary_mul_style_ok = (
+            current_platform.is_npu()
+            and is_neox_style
+            and rotary_dim < NPU_ROTARY_MUL_MAX_HEAD_SIZE
+        )
+
         if use_precomputed_cache:
             cache = self._compute_cos_sin_cache()
             cache = cache.to(dtype)
@@ -75,6 +86,26 @@ class RotaryEmbedding(CustomOp):
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
+    def _combine_rotated_and_pass(
+        self,
+        q_rotated: torch.Tensor,
+        k_rotated: torch.Tensor,
+        q_pass: torch.Tensor,
+        k_pass: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reattach the untouched tail (rotary_dim < head_size) if present.
+
+        When rotary_dim == head_size, q_pass/k_pass are always empty and
+        torch.cat against an empty tensor still allocates + copies the
+        whole (large) q_rotated/k_rotated — skip it in that (common) case.
+        """
+        if self._is_full_rotation:
+            return q_rotated, k_rotated
+        return (
+            torch.cat((q_rotated, q_pass), dim=-1),
+            torch.cat((k_rotated, k_pass), dim=-1),
+        )
 
     def forward_npu(
         self,
@@ -115,7 +146,7 @@ class RotaryEmbedding(CustomOp):
         can_use_complex = (
             complex_freqs is not None
             and complex_freqs.dim() == 3
-            and self.is_neox_style == False
+            and self._can_use_complex_style
         )
         if can_use_complex:
             return (
@@ -127,8 +158,8 @@ class RotaryEmbedding(CustomOp):
             complex_freqs is None
             and cos is not None
             and sin is not None
-            and not self.is_neox_style
-            and self.rotary_dim == self.head_size
+            and self._can_use_complex_style
+            and self._is_full_rotation
             and cos.shape[0] == seq_len
         )
         if can_derive_complex_from_cos_sin:
@@ -148,10 +179,9 @@ class RotaryEmbedding(CustomOp):
             num_heads = query.shape[2]
 
             can_use_npu_rotary_mul = (
-                self.is_neox_style
+                self._npu_rotary_mul_style_ok
                 and cos.shape[0] == seq_len
                 and num_heads < NPU_ROTARY_MUL_MAX_NUM_HEADS
-                and self.rotary_dim < NPU_ROTARY_MUL_MAX_HEAD_SIZE
             )
             if can_use_npu_rotary_mul:
                 # torch_npu.npu_rotary_mul, called directly on the natural
@@ -196,9 +226,8 @@ class RotaryEmbedding(CustomOp):
                 k_rotated = torch_npu.npu_rotary_mul(
                     k_rot, cos_prepared, sin_prepared
                 )
-                return (
-                    torch.cat((q_rotated, q_pass), dim=-1),
-                    torch.cat((k_rotated, k_pass), dim=-1),
+                return self._combine_rotated_and_pass(
+                    q_rotated, k_rotated, q_pass, k_pass
                 )
 
             # Keep batch and sequence as separate axes (don't flatten to
@@ -229,9 +258,8 @@ class RotaryEmbedding(CustomOp):
                 is_neox_style=self.is_neox_style,
                 interleaved=not self.is_neox_style,
             )
-            return (
-                torch.cat((q_rotated, q_pass), dim=-1),
-                torch.cat((k_rotated, k_pass), dim=-1),
+            return self._combine_rotated_and_pass(
+                q_rotated, k_rotated, q_pass, k_pass
             )
 
         if cos_sin_cache is not None:
@@ -335,7 +363,8 @@ class RotaryEmbedding(CustomOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
 
-        if self.use_precomputed_cache:
+        use_precomputed_cache = self.use_precomputed_cache
+        if use_precomputed_cache:
             if offsets is not None:
                 positions = positions + offsets
             positions = positions.flatten()
@@ -344,14 +373,14 @@ class RotaryEmbedding(CustomOp):
             cos, sin = cos_sin.chunk(2, dim=-1)
 
         can_derive_complex_from_cos_sin = (
-            not self.use_precomputed_cache
+            not use_precomputed_cache
             and complex_freqs is None
             and cos is not None
             and sin is not None
-            and not self.is_neox_style
+            and self._can_use_complex_style
             and query.dim() == 4
             and key.dim() == 4
-            and self.rotary_dim == self.head_size
+            and self._is_full_rotation
             and cos.shape[0] == query.shape[1]
         )
         if can_derive_complex_from_cos_sin:
@@ -370,7 +399,7 @@ class RotaryEmbedding(CustomOp):
             )
 
         if cos is not None and sin is not None:
-            if self.use_precomputed_cache:
+            if use_precomputed_cache:
                 # Legacy positions-indexed callers (e.g. llama/qwen3/gemma2/
                 # gemma3 via get_rope()) pass query/key as 3D [batch, seq,
                 # hidden], and cos/sin above were already index_select'd
@@ -394,7 +423,6 @@ class RotaryEmbedding(CustomOp):
                     is_neox_style=self.is_neox_style,
                     interleaved=not self.is_neox_style,
                 )
-                q = torch.cat((q_rotated, q_pass), dim=-1).reshape(q_shape)
                 k_rotated = _apply_rotary_emb(
                     k_rot,
                     cos,
@@ -402,8 +430,10 @@ class RotaryEmbedding(CustomOp):
                     is_neox_style=self.is_neox_style,
                     interleaved=not self.is_neox_style,
                 )
-                k = torch.cat((k_rotated, k_pass), dim=-1).reshape(k_shape)
-                return q, k
+                q, k = self._combine_rotated_and_pass(
+                    q_rotated, k_rotated, q_pass, k_pass
+                )
+                return q.reshape(q_shape), k.reshape(k_shape)
 
             # Direct DiT-style call: keep batch and sequence as separate
             # axes (don't flatten to [batch*seq, ...]) so that cos/sin —
@@ -428,9 +458,8 @@ class RotaryEmbedding(CustomOp):
                 is_neox_style=self.is_neox_style,
                 interleaved=not self.is_neox_style,
             )
-            return (
-                torch.cat((q_rotated, q_pass), dim=-1),
-                torch.cat((k_rotated, k_pass), dim=-1),
+            return self._combine_rotated_and_pass(
+                q_rotated, k_rotated, q_pass, k_pass
             )
 
         if query.dim() != 4 or key.dim() != 4:
