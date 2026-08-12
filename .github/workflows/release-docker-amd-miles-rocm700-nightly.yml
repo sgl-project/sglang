@@ -56,3 +56,9 @@ jobs:
 
       - name: Push dated tag
         run: docker push rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
+
+      - name: Point the undated tag at this build
+        run: |
+          docker buildx imagetools create \
+            -t rocm/sgl-dev:miles-${{ matrix.variant }} \
+               rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
