@@ -113,7 +113,7 @@ classes.
 Selecting weights:
 
 - `--model-variant dev` serves the full / SFT DiT from `transformer_full/`; the
-  default is the distilled one. See [section 4.5](#4-5-full-sft-dev-transformer).
+  default is the distilled one. See [section 4.5](#4-5-the-dev-transformer).
 
 ### 3.3 Multi-GPU presets
 
@@ -172,7 +172,7 @@ muxed into one MP4.
 
 The default DiT is distilled and runs off a fixed 8-sigma schedule rather than a
 step count, so `--num-inference-steps` and `--guidance-scale` have no effect
-here. Use [`--model-variant dev`](#4-5-full-sft-dev-transformer) when you want
+here. Use [`--model-variant dev`](#4-5-the-dev-transformer) when you want
 control over either.
 
 ### 4.2 Image-to-video
@@ -190,7 +190,9 @@ The conditioning image is re-compressed to match the compression the model was
 trained against — CRF 18 for LTX-2.5, where LTX-2 / 2.3 use 33. SGLang picks the
 right one from the checkpoint, so nothing needs to be passed.
 
-### 4.3 Auto-duration <span style={{fontSize: "0.7em", verticalAlign: "middle", padding: "2px 8px", borderRadius: "9999px", background: "#16a34a", color: "#fff"}}>NEW</span>
+### 4.3 Auto-duration
+
+<span style={{fontSize: "0.7em", verticalAlign: "middle", padding: "2px 8px", borderRadius: "9999px", background: "#16a34a", color: "#fff"}}>NEW</span>
 
 LTX-2.5 ships a duration head — a small module that reads the encoded caption
 and regresses the natural length of the shot it describes. Use it when the
@@ -227,7 +229,7 @@ sglang generate \
 Resolution must be divisible by 64. Unlike LTX-2.3, no `--distilled-lora-path`
 is needed: the LTX-2.5 transformer is already distilled.
 
-### 4.5 Full / SFT (dev) transformer
+### 4.5 The dev transformer
 
 LTX-2.5 ships two DiTs. `model_index.json` points at the distilled one; the
 full / SFT weights live in `transformer_full/` and are deliberately left out of
@@ -252,7 +254,9 @@ step count and *does* want CFG, so pass `--num-inference-steps` and
 Note that `from_pretrained` only fetches what `model_index.json` lists, so a
 partial snapshot download will not include `transformer_full/` (another 38 GB).
 
-### 4.6 Diffusion decoder <span style={{fontSize: "0.7em", verticalAlign: "middle", padding: "2px 8px", borderRadius: "9999px", background: "#16a34a", color: "#fff"}}>NEW</span>
+### 4.6 Diffusion decoder
+
+<span style={{fontSize: "0.7em", verticalAlign: "middle", padding: "2px 8px", borderRadius: "9999px", background: "#16a34a", color: "#fff"}}>NEW</span>
 
 LTX-2.5 adds a diffusion-based video decoder as an alternative to the
 convolutional VAE decoder. Rather than deconvolving the latent it denoises
