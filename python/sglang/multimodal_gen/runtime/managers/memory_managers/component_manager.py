@@ -16,13 +16,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_s
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
+    is_resident_layerwise_module,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
-    is_dit_component_name,
-    is_image_encoder_component_name,
-    is_text_encoder_component_name,
-    is_vae_component_name,
-)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import DiffusionNvtxHooks
@@ -91,22 +87,6 @@ class ComponentResidencyPipeline(Protocol):
     component_residency_strategies: MutableMapping[str, "ComponentResidencyStrategy"]
 
 
-def should_cpu_offload_component(
-    component_name: str, module: nn.Module, server_args: ServerArgs
-) -> bool:
-    if server_args.use_fsdp_inference or is_fsdp_managed_module(module):
-        return False
-    if is_dit_component_name(component_name):
-        return bool(server_args.dit_cpu_offload)
-    if is_text_encoder_component_name(component_name):
-        return bool(server_args.text_encoder_cpu_offload)
-    if is_image_encoder_component_name(component_name):
-        return bool(server_args.image_encoder_cpu_offload)
-    if is_vae_component_name(component_name):
-        return bool(server_args.vae_cpu_offload)
-    return False
-
-
 def build_component_residency_strategy(
     component_name: str,
     module: nn.Module,
@@ -114,7 +94,12 @@ def build_component_residency_strategy(
 ) -> ComponentResidencyStrategy:
     if is_layerwise_offloaded_module(module):
         return LayerwiseOffloadStrategy()
-    if should_cpu_offload_component(component_name, module, server_args):
+    if (
+        not current_platform.is_mps()
+        and not server_args.use_fsdp_inference
+        and not is_fsdp_managed_module(module)
+        and server_args.should_cpu_offload_component(component_name)
+    ):
         return VanillaD2HStrategy()
     return ResidentStrategy()
 
@@ -160,7 +145,6 @@ class ComponentResidencyManager:
         if pipeline is not self.pipeline:
             self._remove_nvtx_hooks()
             self.strategy_for.cache_clear()
-            self._should_keep_single_dit.cache_clear()
             self._active_use = None
             self._active_use_module = None
             self._uses_seen.clear()
@@ -186,7 +170,10 @@ class ComponentResidencyManager:
     ) -> None:
         """A hook called before processing an actual request"""
         self.refresh_server_args(server_args)
-        self.state = ResidencyState(stages=stages, batch_is_warmup=batch.is_warmup)
+        self.state = ResidencyState(
+            stages=stages,
+            batch_is_warmup=self._is_warmup_batch(batch),
+        )
         self._active_use = None
         self._active_use_module = None
         self._disable_active_nvtx()
@@ -200,6 +187,14 @@ class ComponentResidencyManager:
         self._ordered_uses = tuple(
             use for uses in self._stage_uses_by_index for use in uses
         )
+
+    @staticmethod
+    def _is_warmup_batch(batch: ResidencyBatch | list[ResidencyBatch]) -> bool:
+        if isinstance(batch, list):
+            return bool(batch) and all(
+                getattr(item, "is_warmup", False) for item in batch
+            )
+        return batch.is_warmup
 
     def before_stage(
         self,
@@ -405,6 +400,11 @@ class ComponentResidencyManager:
             # Avoid making two vanilla-offloaded heavy components resident before
             # a budget-aware planner can prove the overlap is safe.
             return
+        if is_resident_layerwise_module(module):
+            # A layerwise DiT holding a large resident set must not be prefetched
+            # during a prior peer stage (e.g. text encoding): co-residing can lead
+            # to OOMs. Pin it lazily at the DiT's own use-site.
+            return
 
         self._uses_seen[use.component_name] = use
         if strategy.prefetch_for_use(module, use, self.state):
@@ -444,8 +444,17 @@ class ComponentResidencyManager:
             if self.state.batch_is_warmup and use.keep_ready_after_warmup:
                 continue
             preferred = component_name in preferred_uses
-            if not preferred and self._should_keep_single_dit(component_name):
+            if is_resident_layerwise_module(module):
+                preferred = False
+            keep_single_dit = self._should_keep_single_dit(component_name, module)
+            if not preferred and keep_single_dit:
                 continue
+            # A preferred component is normally prefetched for the next request.
+            # Do not let that performance hint override CPU/layerwise offload for
+            # a single DiT, which must obey the selected memory policy.
+            preferred = preferred and (
+                not self._is_single_dit_component(component_name) or keep_single_dit
+            )
             strategy = self.strategy_for(component_name, module)
             if preferred and not self.state.batch_is_warmup:
                 strategy.prepare_after_request(module, use, self.state)
@@ -522,12 +531,25 @@ class ComponentResidencyManager:
         }
         if use.component_name in future_component_names:
             return True
-        if self._should_keep_single_dit(use.component_name):
+        module = self.get_module(use.component_name)
+        if module is not None and self._should_keep_single_dit(
+            use.component_name, module
+        ):
             return True
         return False
 
-    @lru_cache(maxsize=None)
-    def _should_keep_single_dit(self, component_name: str) -> bool:
+    def _should_keep_single_dit(self, component_name: str, module: nn.Module) -> bool:
+        """Keep a single DiT resident only when its effective strategy is resident.
+
+        The single-DiT fast path is a performance optimization, not a memory
+        policy. In particular, it must not override explicit or auto-selected
+        CPU/layerwise offload.
+        """
+        if not self._is_single_dit_component(component_name):
+            return False
+        return isinstance(self.strategy_for(component_name, module), ResidentStrategy)
+
+    def _is_single_dit_component(self, component_name: str) -> bool:
         modules = self.pipeline.modules
         return (component_name == "transformer" and "transformer_2" not in modules) or (
             component_name == "video_dit" and "video_dit_2" not in modules

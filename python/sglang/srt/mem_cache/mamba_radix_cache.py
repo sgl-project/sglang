@@ -50,7 +50,9 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    mamba_cache_chunk_size,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -450,7 +452,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
-        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -546,7 +548,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             self.req_to_token_pool.free_mamba_cache(req)
             return
 
@@ -573,7 +575,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 cache_len = 0
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
-                self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
+                self.token_to_kv_pool_allocator.free_segment(
+                    kv_indices[cache_end_idx:], start_pos=cache_end_idx
+                )
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
 
@@ -636,7 +640,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # state already cached -> the int8 slot we just allocated is a duplicate
                 self.int8_ckpt_pool.free(mamba_value)
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices[req.cache_protected_len :],
+                start_pos=req.cache_protected_len,
+            )
             mamba_exist = True
 
         if mamba_exist:
@@ -797,7 +804,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
         self._record_remove_event(x)
-        self.token_to_kv_pool_allocator.free(x.value)
+        # Tree values are page-aligned copies of a kv row: page-exact segment.
+        self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
         full_num_evicted = len(x.value)
         self._free_mamba_value(x.mamba_value)
         mamba_num_evicted = len(x.mamba_value)
@@ -1244,7 +1252,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if prev_prefix_len < total_prefix_length + prefix_len:
                 start = max(0, prev_prefix_len - total_prefix_length)
-                self.token_to_kv_pool_allocator.free(value[start:prefix_len])
+                # value sits at offset total_prefix_length of the kv row; match()
+                # rounds prefix_len to page multiples, so frees never share a page.
+                self.token_to_kv_pool_allocator.free_segment(
+                    value[start:prefix_len],
+                    start_pos=total_prefix_length + start,
+                )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -1299,7 +1312,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
             self._record_remove_event(node.parent)
-            self.token_to_kv_pool_allocator.free(node.parent.value)
+            self.token_to_kv_pool_allocator.free_segment(node.parent.value, start_pos=0)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)

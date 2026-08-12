@@ -287,6 +287,9 @@ class TinyDSV4ModelConfig:
         self.hf_text_config = self.hf_config
         self.linear_attn_registry_result = None
 
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
 
 class MockDSV4ModelRunner:
     """Minimal runner exposing what `DeepseekV4AttnBackend.__init__` reads.
@@ -329,6 +332,11 @@ class MockDSV4ModelRunner:
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
@@ -363,7 +371,7 @@ class MockDSV4ModelRunner:
             max_running_requests=None,
             pp_size=1,
             revision=None,
-            speculative_algorithm=None,
+            speculative_algorithm=("EAGLE" if speculative_num_draft_tokens else None),
             speculative_eagle_topk=speculative_eagle_topk,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
@@ -392,7 +400,7 @@ class MockDSV4ModelRunner:
             c4_state_pool_size=pool_batch_size,
             c128_state_pool_size=pool_batch_size,
             page_size=case.page_size,
-            swa_page_size=DSV4_SWA_WINDOW,
+            swa_page_size=case.page_size,
             dtype=torch.float8_e4m3fn,
             c4_state_dtype=dtype,
             c128_state_dtype=dtype,
