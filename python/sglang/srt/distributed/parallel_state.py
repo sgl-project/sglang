@@ -883,6 +883,46 @@ class GroupCoordinator:
         except Exception:
             return None
 
+    def fused_allreduce_rmsnorm_quant_per_token(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Fused all-reduce + RMSNorm + per-token FP8 quant (ROCm/aiter).
+
+        Returns ``(fp8, residual_out, per_token_scale, bf16)`` -- the kernel
+        writes both the quantized and the pre-quantization normed output, so
+        consumers that cannot take FP8 keep a bf16 view for free. ``None`` when
+        the backend cannot service the request.
+        """
+        if not is_hip():
+            return None
+
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_quant"):
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            use_1stage_ar = input_.numel() * input_.element_size() <= 128 * 1024
+
+        try:
+            return ca_comm.custom_fused_ar_rms_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+                emit_bf16=True,
+            )
+        except Exception:
+            return None
+
     def _resolve_outplace_all_reduce_method(
         self,
         input_: torch.Tensor,
