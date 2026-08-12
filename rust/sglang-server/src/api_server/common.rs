@@ -1,22 +1,27 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
-//! (+ `/model_info` alias), plus the control-request submission path
+//! (+ `/model_info` alias), `/save_remote_model`, `/save_sharded_model`, plus the
+//! control-request submission path
 //! (`await_control_result`, on the shared `submit`). Data-plane endpoints (incl. `/health*`,
 //! which round-trips a generate probe) live in the sibling `native_api` and
 //! `openai` modules; the shared `AppState` lives in the parent
 //! `api_server` module.
 
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
+use serde::Deserialize;
 
 use super::AppState;
 use super::guard::AbortGuard;
 use super::submit::submit;
-use crate::message::{ControlRequest, EgressItem, GetInternalStateReq, RequestKind};
+use crate::message::{
+    ControlRequest, EgressItem, GetInternalStateReq, RequestKind, SaveRemoteModelReqInput,
+    SaveShardedModelReqInput,
+};
 use crate::runtime::ServerArgs;
 
 /// The routes this module owns, mounted by `api_server::serve`.
@@ -29,6 +34,11 @@ pub(super) fn routes() -> Router<AppState> {
         // alias).
         .route("/get_model_info", get(model_info))
         .route("/model_info", get(model_info))
+        // Weight export: these write to a caller-supplied path or upload to a
+        // caller-supplied URL, and the TODO(auth) in `api_server::serve` applies:
+        // no route in this server is behind an api key yet.
+        .route("/save_remote_model", post(save_remote_model))
+        .route("/save_sharded_model", post(save_sharded_model))
 }
 
 /// Submit a control request through the ingress FSM (no tokenization) and await the
@@ -119,6 +129,82 @@ async fn server_info(State(state): State<AppState>) -> Response {
                 .into_response()
         }
     }
+}
+
+#[derive(Deserialize)]
+struct SaveRemoteModelBody {
+    url: String,
+    #[serde(default)]
+    draft_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SaveShardedModelBody {
+    path: String,
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default)]
+    max_size: Option<i64>,
+}
+
+/// `POST /save_remote_model`: export the weights to a remote connector URL.
+async fn save_remote_model(
+    State(state): State<AppState>,
+    Json(body): Json<SaveRemoteModelBody>,
+) -> Response {
+    await_save(
+        &state,
+        ControlRequest::SaveRemoteModelReqInput(SaveRemoteModelReqInput::new(
+            crate::ids::Rid::new().to_string(),
+            body.url,
+            body.draft_url,
+        )),
+    )
+    .await
+}
+
+/// `POST /save_sharded_model`: export the weights as one shard per TP rank.
+async fn save_sharded_model(
+    State(state): State<AppState>,
+    Json(body): Json<SaveShardedModelBody>,
+) -> Response {
+    await_save(
+        &state,
+        ControlRequest::SaveShardedModelReqInput(SaveShardedModelReqInput::new(
+            crate::ids::Rid::new().to_string(),
+            body.path,
+            body.pattern,
+            body.max_size,
+        )),
+    )
+    .await
+}
+
+/// A failed export comes back as an ordinary result with `success: false`, not an
+/// egress error: the scheduler must catch it to reach its all-rank barrier.
+async fn await_save(state: &AppState, control: ControlRequest) -> Response {
+    let bytes = match await_control_result(state, control).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    match rmp_serde::from_slice::<SaveModelReqOutput>(&bytes) {
+        Ok(out) if out.success => {
+            (StatusCode::OK, Json(serde_json::json!({"success": true}))).into_response()
+        }
+        Ok(out) => (StatusCode::INTERNAL_SERVER_ERROR, out.message).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "save_model: undecodable scheduler response");
+            (StatusCode::INTERNAL_SERVER_ERROR, "bad save_model response").into_response()
+        }
+    }
+}
+
+/// Named map, not a positional array: `push_control_output` sends the output
+/// through `msgspec.structs.asdict`, so field order does not matter here.
+#[derive(Deserialize)]
+struct SaveModelReqOutput {
+    success: bool,
+    message: String,
 }
 
 /// Runtime-metric keys `get_internal_state` adds atop the server-args dump. We copy

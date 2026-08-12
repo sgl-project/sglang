@@ -69,6 +69,22 @@ control_messages! {
 
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
+
+    /// The scheduler's `SaveRemoteModelReqInput`: export the weights to a
+    /// remote connector URL, one key namespace per TP rank.
+    SaveRemoteModelReqInput {
+        url: String,
+        /// The scheduler asserts on this when a draft model is loaded.
+        draft_url: Option<String>,
+    }
+
+    /// The scheduler's `SaveShardedModelReqInput`: export the weights as one
+    /// safetensors shard per TP rank under `path`.
+    SaveShardedModelReqInput {
+        path: String,
+        pattern: Option<String>,
+        max_size: Option<i64>,
+    }
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -122,6 +138,27 @@ impl GetInternalStateReq {
     }
 }
 
+impl SaveRemoteModelReqInput {
+    pub fn new(rid: String, url: String, draft_url: Option<String>) -> Self {
+        Self {
+            rid,
+            url,
+            draft_url,
+        }
+    }
+}
+
+impl SaveShardedModelReqInput {
+    pub fn new(rid: String, path: String, pattern: Option<String>, max_size: Option<i64>) -> Self {
+        Self {
+            rid,
+            path,
+            pattern,
+            max_size,
+        }
+    }
+}
+
 impl AbortReq {
     pub fn new(rid: String, abort_all: bool) -> Self {
         Self {
@@ -153,6 +190,41 @@ mod tests {
         assert_eq!(arr[3].as_bool(), Some(false));
         assert!(arr[4].is_nil());
         assert!(arr[5].is_nil());
+    }
+
+    /// The save requests carry the export destination on a POSITIONAL wire, so a
+    /// field inserted in the wrong slot writes the weights somewhere else (or
+    /// fails to decode) rather than erroring here. Pin every index.
+    #[test]
+    fn save_req_msgpack_shape() {
+        let b = SaveRemoteModelReqInput::new("r1".into(), "s3://bucket/m".into(), None)
+            .encode()
+            .unwrap();
+        let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(arr.len(), 5, "[tag, rid, http_ipc, url, draft_url]");
+        assert_eq!(arr[0].as_str(), Some("SaveRemoteModelReqInput"));
+        assert_eq!(arr[1].as_str(), Some("r1"));
+        assert!(arr[2].is_nil());
+        assert_eq!(arr[3].as_str(), Some("s3://bucket/m"));
+        assert!(arr[4].is_nil(), "draft_url defaults to nil");
+
+        let b = SaveShardedModelReqInput::new("r2".into(), "/out".into(), None, Some(4096))
+            .encode()
+            .unwrap();
+        let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            6,
+            "[tag, rid, http_ipc, path, pattern, max_size]"
+        );
+        assert_eq!(arr[0].as_str(), Some("SaveShardedModelReqInput"));
+        assert_eq!(arr[1].as_str(), Some("r2"));
+        assert!(arr[2].is_nil());
+        assert_eq!(arr[3].as_str(), Some("/out"));
+        assert!(arr[4].is_nil(), "pattern defaults to nil");
+        assert_eq!(arr[5].as_u64(), Some(4096), "max_size at idx 5");
     }
 
     /// The header must be positionally aligned: `input_embeds` (idx 5) /

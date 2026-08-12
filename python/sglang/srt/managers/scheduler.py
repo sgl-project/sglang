@@ -25,7 +25,18 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     get_device,
@@ -154,6 +165,9 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    SaveModelReqOutput,
+    SaveRemoteModelReqInput,
+    SaveShardedModelReqInput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -1587,6 +1601,8 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
+                (SaveRemoteModelReqInput, self.handle_save_remote_model),
+                (SaveShardedModelReqInput, self.handle_save_sharded_model),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (
@@ -4399,6 +4415,39 @@ class Scheduler(
 
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
+
+    def handle_save_remote_model(self, recv_req: SaveRemoteModelReqInput):
+        return self._save_model_on_all_ranks(
+            lambda: self.weight_updater.save_remote_model(
+                {"url": recv_req.url, "draft_url": recv_req.draft_url}
+            )
+        )
+
+    def handle_save_sharded_model(self, recv_req: SaveShardedModelReqInput):
+        return self._save_model_on_all_ranks(
+            lambda: self.weight_updater.save_sharded_model(
+                {
+                    "path": recv_req.path,
+                    "pattern": recv_req.pattern,
+                    "max_size": recv_req.max_size,
+                }
+            )
+        )
+
+    def _save_model_on_all_ranks(self, save: Callable[[], None]) -> SaveModelReqOutput:
+        # Every rank writes its own shard, so rank 0 must not answer "saved"
+        # until the peers are done. The caller reads the files right after.
+        success = True
+        message = ""
+        try:
+            save()
+        except Exception as e:
+            success = False
+            message = str(e)
+            logger.error(f"Failed to save model: {e}")
+
+        barrier(group=self.tp_group.cpu_group)
+        return SaveModelReqOutput(success=success, message=message)
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests

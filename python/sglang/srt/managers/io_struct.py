@@ -2122,6 +2122,23 @@ class RpcReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class SaveRemoteModelReqInput(BaseReq, kw_only=True):
+    url: str
+    # Required when a draft model is loaded; the scheduler asserts on it.
+    draft_url: Optional[str] = None
+
+
+class SaveShardedModelReqInput(BaseReq, kw_only=True):
+    path: str
+    pattern: Optional[str] = None
+    max_size: Optional[int] = None
+
+
+class SaveModelReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
 class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):
     # The name of the lora module to newly loaded.
     lora_name: str

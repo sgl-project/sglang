@@ -26,6 +26,9 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput,
     ParallelismInfo,
     RpcReqInput,
+    SaveModelReqOutput,
+    SaveRemoteModelReqInput,
+    SaveShardedModelReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -123,6 +126,17 @@ REGISTRY_TYPE_INSTANCES = {
         parameters={"flag": True, "n": 1, "ratio": 2.0, "name": "x", "opt": None},
     ),
     "RpcReqInput/none": RpcReqInput(method="collective_rpc", parameters=None),
+    "SaveRemoteModelReqInput": SaveRemoteModelReqInput(
+        url="s3://bucket/model", draft_url="s3://bucket/draft"
+    ),
+    "SaveShardedModelReqInput": SaveShardedModelReqInput(
+        path="/tmp/out",
+        pattern="model-rank-{rank}-part-{part}.safetensors",
+        max_size=4096,
+    ),
+    "SaveModelReqOutput": SaveModelReqOutput(
+        success=False, message="no such directory"
+    ),
     "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput(
         lora_name="adapter",
         config_dict={"r": 8, "lora_alpha": 16, "target_modules": ["q_proj", "v_proj"]},
