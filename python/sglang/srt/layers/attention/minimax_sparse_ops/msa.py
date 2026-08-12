@@ -15,7 +15,8 @@
 from __future__ import annotations
 
 import functools
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Sequence
 
 import torch
 
@@ -45,6 +46,20 @@ def _check_msa_dtypes(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Ten
     assert v_cache.dtype == k_cache.dtype
 
 
+@dataclass(frozen=True)
+class MSAPrefillMetadata:
+    """Request-level MSA sparse-prefill metadata shared by every layer."""
+
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    seqused_k: torch.Tensor
+    page_table: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    total_k: int
+    total_rows: int
+
+
 @functools.lru_cache(maxsize=1)
 def _load_fmha_sm100():
     try:
@@ -56,6 +71,22 @@ def _load_fmha_sm100():
     if not callable(fmha_sm100) or not callable(fmha_sm100_plan):
         raise MSAUnavailableError("fmha_sm100 exports must be callable")
     return fmha_sm100, fmha_sm100_plan
+
+
+@functools.lru_cache(maxsize=1)
+def _load_msa_sparse():
+    """Load MSA's stable direct sparse-prefill API lazily."""
+    try:
+        from fmha_sm100.sparse import build_k2q_csr, sparse_atten_func
+    except Exception as err:
+        raise MSAUnavailableError(
+            "fmha_sm100 direct sparse-prefill API is not importable"
+        ) from err
+    if not callable(build_k2q_csr) or not callable(sparse_atten_func):
+        raise MSAUnavailableError(
+            "fmha_sm100 direct sparse-prefill exports must be callable"
+        )
+    return build_k2q_csr, sparse_atten_func
 
 
 def _run_fmha_sm100_plan(*args, **kwargs):
@@ -79,6 +110,16 @@ def msa_available() -> bool:
         return False
     try:
         _load_fmha_sm100()
+        return True
+    except MSAUnavailableError:
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def msa_direct_prefill_available() -> bool:
+    """True iff MSA exposes its stable direct sparse-prefill entry points."""
+    try:
+        _load_msa_sparse()
         return True
     except MSAUnavailableError:
         return False
@@ -118,6 +159,195 @@ def _build_page_table(
     return (req_to_token[rows, logical_first] // P).to(torch.int32)
 
 
+def _build_padded_page_table(
+    req_to_token: torch.Tensor,
+    slot_ids: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    max_seqlen_k: int,
+) -> torch.Tensor:
+    """Build the final 2-D page table consumed by ``sparse_atten_func``.
+
+    Unlike the flattened bridge format, this table can be shared directly by
+    all sparse layers and therefore does not need to be unpacked inside MSA on
+    every layer.
+    """
+    batch_size = slot_ids.shape[0]
+    max_pages = (max_seqlen_k + page_size - 1) // page_size
+    if max_pages == 0:
+        return torch.empty(
+            (batch_size, 0), dtype=torch.int32, device=req_to_token.device
+        )
+
+    logical_first = torch.arange(
+        0,
+        max_pages * page_size,
+        page_size,
+        dtype=torch.int64,
+        device=req_to_token.device,
+    )
+    rows = slot_ids.to(torch.int64).view(-1, 1)
+    page_table = (req_to_token[rows, logical_first.view(1, -1)] // page_size).to(
+        torch.int32
+    )
+    valid = logical_first.view(1, -1) < seq_lens.view(-1, 1)
+    page_table.masked_fill_(~valid, 0)
+    return page_table.contiguous()
+
+
+def _cu_seqlens_from_lengths(
+    lengths: torch.Tensor,
+    lengths_cpu: Optional[Sequence[int]] = None,
+) -> torch.Tensor:
+    """Create int32 cumulative lengths, preferring host-known lengths."""
+    if lengths_cpu is not None and len(lengths_cpu) == lengths.numel():
+        cumulative = [0]
+        for length in lengths_cpu:
+            cumulative.append(cumulative[-1] + int(length))
+        return torch.tensor(cumulative, dtype=torch.int32, device=lengths.device)
+    lengths_i32 = lengths.to(torch.int32)
+    return torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=lengths.device),
+            lengths_i32.cumsum(0),
+        ]
+    )
+
+
+def build_msa_prefill_metadata(
+    req_to_token: torch.Tensor,
+    slot_ids: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    qo_segment_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    block_size_k: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    seq_lens_cpu: Optional[Sequence[int]] = None,
+) -> MSAPrefillMetadata:
+    """Build direct MSA prefill metadata once for the whole model forward."""
+    seq_lens_i32 = seq_lens.to(torch.int32)
+    qo_segment_lens_i32 = qo_segment_lens.to(torch.int32)
+    prefix_lens_i32 = prefix_lens.to(torch.int32)
+    cu_seqlens_k = _cu_seqlens_from_lengths(seq_lens_i32, seq_lens_cpu)
+
+    if seq_lens_cpu is None:
+        total_k = int(seq_lens_i32.sum().item())
+        total_rows = int(
+            ((seq_lens_i32 + block_size_k - 1) // block_size_k).sum().item()
+        )
+    else:
+        total_k = sum(int(length) for length in seq_lens_cpu)
+        total_rows = sum(
+            (int(length) + block_size_k - 1) // block_size_k for length in seq_lens_cpu
+        )
+
+    return MSAPrefillMetadata(
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=(qo_segment_lens_i32 + prefix_lens_i32).to(torch.int32),
+        page_table=_build_padded_page_table(
+            req_to_token,
+            slot_ids,
+            seq_lens_i32,
+            block_size_k,
+            max_seqlen_k,
+        ),
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        total_k=total_k,
+        total_rows=total_rows,
+    )
+
+
+def build_msa_prefill_bridge_meta(
+    req_to_token: torch.Tensor,
+    slot_ids: torch.Tensor,
+    qo_segment_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    block_size_k: int,
+    topk: int,
+    is_fp8: bool = False,
+):
+    """Compatibility metadata for older MSA packages without the direct API."""
+    kv_indices = _build_page_table(req_to_token, slot_ids, seq_lens, block_size_k)
+    seq_lens_i32 = seq_lens.to(torch.int32)
+    plan = _run_fmha_sm100_plan(
+        qo_segment_lens.to(torch.int32),
+        seq_lens_i32,
+        num_q_heads,
+        num_kv_heads=num_kv_heads,
+        page_size=block_size_k,
+        kv_block_num=topk,
+        causal=True,
+        qo_offset=prefix_lens.to(torch.int32),
+        use_fp8_kvcache=is_fp8,
+    )
+    return kv_indices, plan
+
+
+def _run_msa_direct_prefill(
+    q: torch.Tensor,
+    k_paged: torch.Tensor,
+    v_paged: torch.Tensor,
+    topk_idx: torch.Tensor,
+    metadata: MSAPrefillMetadata,
+    block_size_k: int,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Run MSA's public sparse API and normalize compatibility failures."""
+    try:
+        build_k2q_csr, sparse_atten_func = _load_msa_sparse()
+        q2k = topk_idx.to(torch.int32)
+        if not q2k.is_contiguous():
+            q2k = q2k.contiguous()
+        num_q_heads = q.shape[1]
+        num_kv_heads = k_paged.shape[1]
+        qhead_per_kv = num_q_heads // num_kv_heads
+        topk = q2k.shape[-1]
+        k2q_row_ptr, k2q_q_indices, schedule = build_k2q_csr(
+            q2k,
+            metadata.cu_seqlens_q,
+            metadata.cu_seqlens_k,
+            block_size_k,
+            total_k=metadata.total_k,
+            max_seqlen_k=metadata.max_seqlen_k,
+            max_seqlen_q=metadata.max_seqlen_q,
+            total_rows=metadata.total_rows,
+            qhead_per_kv=qhead_per_kv,
+            return_schedule=True,
+        )
+        return sparse_atten_func(
+            q,
+            k_paged,
+            v_paged,
+            k2q_row_ptr,
+            k2q_q_indices,
+            topk,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            max_seqlen_q=metadata.max_seqlen_q,
+            max_seqlen_k=metadata.max_seqlen_k,
+            blk_kv=block_size_k,
+            causal=True,
+            softmax_scale=sm_scale,
+            partial_dtype=torch.bfloat16,
+            return_softmax_lse=False,
+            page_table=metadata.page_table,
+            seqused_k=metadata.seqused_k,
+            schedule=schedule,
+            usable_SM_count=-1,
+        )
+    except MSAUnavailableError:
+        raise
+    except (AttributeError, RuntimeError, TypeError) as err:
+        raise MSAUnavailableError("fmha_sm100 direct sparse-prefill failed") from err
+
+
 def msa_sparse_prefill_main(
     q: torch.Tensor,  # [total_q, num_q_heads, head_dim]
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (slot-major NHD)
@@ -133,17 +363,27 @@ def msa_sparse_prefill_main(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    prefill_metadata: Optional[MSAPrefillMetadata] = None,
+    kv_indices: Optional[torch.Tensor] = None,
+    plan=None,
 ) -> torch.Tensor:
     """Drop-in for flash_prefill_with_gqa_share_sparse using MSA fmha_sm100.
 
-    Returns o [total_q, num_q_heads, head_dim] (bf16 for fp8 inputs).
+    ``prefill_metadata`` is the preferred path. It contains the final padded
+    page table and all request-level CSR metadata, built once before entering
+    the layer loop. Older MSA packages use the bridge ``kv_indices`` / ``plan``
+    compatibility path instead. When all three are omitted, standalone callers
+    retain the old build-on-demand behavior.
+
+    Returns o [total_q, num_q_heads, head_dim] (bf16 for fp8 inputs). Only the
+    top-k-to-CSR transform and its schedule remain per-layer because
+    ``topk_idx`` is layer-dependent.
 
     Scale semantics (per-tensor, None = unit): attention runs on Q*q_scale,
-    K*k_scale, V*v_scale. The long-q cute path honors only sm_scale, so
-    q_scale*k_scale is folded into sm_scale (exact for softmax) and v_scale is
-    applied on the output; the short-q cutlass path gets the same folded values.
+    K*k_scale, V*v_scale. Both MSA prefill implementations honor only the
+    softmax scale, so q_scale*k_scale is folded into it (exact for softmax) and
+    v_scale is applied to the output.
     """
-    fmha_sm100, _ = _load_fmha_sm100()
     _check_msa_dtypes(q, k_cache, v_cache)
     is_fp8 = q.dtype == torch.float8_e4m3fn
     v_scale = unit_scale(v_scale)
@@ -163,24 +403,39 @@ def msa_sparse_prefill_main(
     k_paged = k_cache.view(n_phys_pages, P, num_kv_heads, head_dim).permute(0, 2, 1, 3)
     v_paged = v_cache.view(n_phys_pages, P, num_kv_heads, head_dim).permute(0, 2, 1, 3)
 
-    # Per-request Q lengths (extend) and physical page table.
-    qo_segment_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
-    kv_indices = _build_page_table(req_to_token, slot_ids, seq_lens, P)
+    if prefill_metadata is not None:
+        o = _run_msa_direct_prefill(
+            q,
+            k_paged,
+            v_paged,
+            topk_idx,
+            prefill_metadata,
+            P,
+            sm_scale,
+        )
+        if v_scale != 1.0:
+            o = o * v_scale
+        return o
 
-    # topk_idx [Hkv, total_q, topk] -> kv_block_indexes [total_q, Hkv, topk].
+    fmha_sm100, _ = _load_fmha_sm100()
+    if kv_indices is None or plan is None:
+        qo_segment_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+        kv_indices, plan = build_msa_prefill_bridge_meta(
+            req_to_token,
+            slot_ids,
+            qo_segment_lens,
+            seq_lens,
+            prefix_lens,
+            num_q_heads,
+            num_kv_heads,
+            P,
+            topk,
+            is_fp8=is_fp8,
+        )
+
+    # Compatibility bridge layout. The direct path above consumes the native
+    # contiguous [Hkv, total_q, topk] tensor without these transposes.
     kv_block_indexes = topk_idx.permute(1, 0, 2).contiguous().to(torch.int32)
-
-    plan = _run_fmha_sm100_plan(
-        qo_segment_lens,
-        seq_lens.to(torch.int32),
-        num_q_heads,
-        num_kv_heads=num_kv_heads,
-        page_size=P,
-        kv_block_num=topk,
-        causal=True,
-        qo_offset=prefix_lens.to(torch.int32),
-        use_fp8_kvcache=is_fp8,
-    )
     o, _ = fmha_sm100(
         q,
         k_paged,
