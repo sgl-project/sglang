@@ -11,11 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Extract audio from video bytes using PyAV (in-process, CUDA-safe).
-
-PyAV wraps FFmpeg's C libraries in-process, avoiding subprocess forks which
-would crash CUDA-active workers.
-"""
+"""Decode audio from media containers with PyAV."""
 
 import io
 import logging
@@ -24,66 +20,129 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+_INVALID_AUDIO_CONTAINER_MESSAGE = (
+    "Invalid input_audio: no decodable audio stream was found in the media container."
+)
+_AUDIO_CONTAINER_SIGNATURES = (
+    ((4, b"ftyp"),),
+    ((0, b"RIFF"), (8, b"AVI ")),
+    ((0, b"#!AMR\n"),),
+    ((0, b"#!AMR-WB\n"),),
+    # EBML magic: WebM / Matroska (e.g. browser MediaRecorder output)
+    ((0, b"\x1a\x45\xdf\xa3"),),
+)
+
+
+class _AudioContainerDecodeError(ValueError):
+    pass
+
+
+def is_audio_container(data: bytes) -> bool:
+    """Return whether the header identifies a supported media container."""
+    return any(
+        all(data[offset : offset + len(magic)] == magic for offset, magic in signature)
+        for signature in _AUDIO_CONTAINER_SIGNATURES
+    )
+
+
+def _append_resampled_frames(
+    chunks: list[np.ndarray],
+    frames,
+    *,
+    mono: bool,
+) -> None:
+    for frame in frames:
+        array = frame.to_ndarray()
+        chunks.append(array.reshape(-1) if mono else array.T)
+
+
+def decode_audio_container(
+    source: bytes | str,
+    *,
+    target_sr: int,
+    mono: bool,
+) -> np.ndarray:
+    """Strictly decode the first audio stream from a supported container."""
+    if not isinstance(target_sr, int) or target_sr <= 0:
+        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+    if isinstance(source, bytes) and not source:
+        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+
+    try:
+        import av
+
+        input_source = io.BytesIO(source) if isinstance(source, bytes) else source
+        with av.open(input_source) as container:
+            if not container.streams.audio:
+                raise _AudioContainerDecodeError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+
+            audio_stream = container.streams.audio[0]
+            if mono:
+                resampler = av.audio.resampler.AudioResampler(
+                    format="fltp", layout="mono", rate=target_sr
+                )
+            else:
+                resampler = av.audio.resampler.AudioResampler(
+                    format="fltp", rate=target_sr
+                )
+
+            chunks: list[np.ndarray] = []
+            skipped_packets = 0
+            first_decode_error = None
+            for packet in container.demux(audio_stream):
+                try:
+                    for frame in packet.decode():
+                        _append_resampled_frames(
+                            chunks,
+                            resampler.resample(frame),
+                            mono=mono,
+                        )
+                except av.error.FFmpegError as error:
+                    skipped_packets += 1
+                    if first_decode_error is None:
+                        first_decode_error = error
+
+            _append_resampled_frames(
+                chunks,
+                resampler.resample(None),
+                mono=mono,
+            )
+            if skipped_packets:
+                logger.warning(
+                    "Skipped %d undecodable audio packet(s); kept %d decoded "
+                    "chunk(s). First decode error: %s",
+                    skipped_packets,
+                    len(chunks),
+                    first_decode_error,
+                )
+    except _AudioContainerDecodeError:
+        raise
+    except Exception as error:
+        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE) from error
+
+    if not chunks:
+        if first_decode_error is not None:
+            raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE) from first_decode_error
+        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+
+    waveform = np.concatenate(chunks, axis=0)
+    expected_ndim = 1 if mono else 2
+    if waveform.ndim != expected_ndim or waveform.size == 0:
+        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+    return np.ascontiguousarray(waveform, dtype=np.float32)
+
 
 def extract_audio_from_video_bytes(
     video_bytes: bytes,
     target_sr: int = 16000,
 ) -> np.ndarray | None:
-    """Extract mono audio from video bytes at the target sample rate.
-
-    Args:
-        video_bytes: Raw video file bytes (e.g. MP4).
-        target_sr: Target sample rate for the output waveform.
-
-    Returns:
-        1-D float32 numpy array of audio samples, or None if the video
-        has no audio track.
-    """
+    """Extract optional mono audio for callers that accept silent videos."""
     try:
-        import av
-    except ImportError:
-        logger.warning(
-            "PyAV (av) is not installed. Cannot extract audio from video. "
-            "Install with: pip install av"
+        return decode_audio_container(
+            video_bytes,
+            target_sr=target_sr,
+            mono=True,
         )
-        return None
-
-    try:
-        container = av.open(io.BytesIO(video_bytes))
-    except Exception:
-        logger.warning("Failed to open video bytes for audio extraction")
-        return None
-
-    if not container.streams.audio:
-        container.close()
-        return None
-
-    try:
-        audio_stream = container.streams.audio[0]
-        native_sr = audio_stream.rate or target_sr
-
-        resampler = av.audio.resampler.AudioResampler(
-            format="flt",
-            layout="mono",
-            rate=target_sr,
-        )
-
-        chunks = []
-        for frame in container.decode(audio=0):
-            resampled = resampler.resample(frame)
-            for rf in resampled:
-                arr = rf.to_ndarray().flatten()
-                chunks.append(arr)
-
-        container.close()
-
-        if not chunks:
-            return None
-
-        waveform = np.concatenate(chunks).astype(np.float32)
-        return waveform
-
     except Exception:
         logger.warning("Error extracting audio from video", exc_info=True)
-        container.close()
         return None

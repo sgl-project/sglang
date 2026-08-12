@@ -41,7 +41,7 @@ def _patched_flashinfer(*, has_set_group):
     """Inject a fake ``flashinfer.autotuner`` and stub torch cuda/stream calls.
 
     ``has_set_group=False`` omits ``set_autotune_process_group`` so the context
-    manager's guarded import falls back to ``None`` (pre-0.6.15 flashinfer).
+    manager's guarded import falls back to ``None`` (pre-0.6.16 flashinfer).
     """
     autotuner = types.ModuleType("flashinfer.autotuner")
     autotuner.autotune = lambda *a, **k: contextlib.nullcontext()
@@ -87,7 +87,7 @@ class TestFlashinferAutotuneTPSync(CustomTestCase):
         ctx = self._ctx()
         mr = _make_model_runner(tp_size=8)
         with _patched_flashinfer(has_set_group=True) as set_group:
-            with ctx(mr, skip_logits=False):
+            with ctx(mr, run_lm_head=False):
                 # entry: called once with the gloo cpu_group sentinel
                 set_group.assert_called_once_with(mr.tp_group.cpu_group)
             # exit: reset to None
@@ -100,7 +100,7 @@ class TestFlashinferAutotuneTPSync(CustomTestCase):
         ctx = self._ctx()
         mr = _make_model_runner(tp_size=1)
         with _patched_flashinfer(has_set_group=True) as set_group:
-            with ctx(mr, skip_logits=False):
+            with ctx(mr, run_lm_head=False):
                 pass
             set_group.assert_not_called()
 
@@ -109,7 +109,7 @@ class TestFlashinferAutotuneTPSync(CustomTestCase):
         mr = _make_model_runner(tp_size=4)
         with _patched_flashinfer(has_set_group=True) as set_group:
             with self.assertRaises(RuntimeError):
-                with ctx(mr, skip_logits=False):
+                with ctx(mr, run_lm_head=False):
                     raise RuntimeError("boom")
             # finally still reset the group to None
             self.assertEqual(
@@ -122,7 +122,7 @@ class TestFlashinferAutotuneTPSync(CustomTestCase):
         mr = _make_model_runner(tp_size=8)
         ran = []
         with _patched_flashinfer(has_set_group=False) as set_group:
-            with ctx(mr, skip_logits=False):
+            with ctx(mr, run_lm_head=False):
                 ran.append(True)
         # body executed and the (absent) symbol was never invoked
         self.assertEqual(ran, [True])

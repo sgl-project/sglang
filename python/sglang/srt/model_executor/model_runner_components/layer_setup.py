@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
+from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -23,7 +24,10 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
     moe_fusions: list[Any] = []
     dsa_indexers: list[Any] = []
     mha_companion_layers: list[Any] = []
-    for layer in layer_model.layers:
+    layers = layer_model.layers
+    if isinstance(layers, nn.ModuleDict):
+        layers = layers.values()
+    for layer in layers:
         attn_layer = None
         mha_companion_layer = None
         if hasattr(layer, "self_attn"):
@@ -36,7 +40,11 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
                     mha_companion_layer = layer.self_attn.attn_mha
         # For hybrid model
         elif hasattr(layer, "attn"):
-            attn_layer = layer.attn
+            inner = layer.attn
+            # Inkling wraps RadixAttention inside a InklingAttention module
+            # (layer.attn.attn); descend to the inner RadixAttention that BCG
+            # needs. Other hybrid models put RadixAttention at layer.attn.
+            attn_layer = inner.attn if hasattr(inner, "attn") else inner
         elif hasattr(layer, "linear_attn"):
             if hasattr(layer.linear_attn, "attn"):
                 attn_layer = layer.linear_attn.attn
@@ -167,6 +175,10 @@ def _compute_model_num_layers(
     if model_config.hf_config.architectures[0] == "MiMoV2MTP":
         model_num_layers = 1
     elif model_config.hf_config.architectures[0] == "Step3p5MTP":
+        model_num_layers = 1
+    elif (
+        model_config.hf_config.architectures[0] == "InklingForConditionalGenerationMTP"
+    ):
         model_num_layers = 1
     return model_num_layers
 

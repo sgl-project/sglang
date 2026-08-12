@@ -182,6 +182,8 @@ def _fake_server_args(cfg=None):
         disable_autocast=False,
         enable_cfg_parallel=False,
         attention_backend_config=None,
+        kv_gather_degree=1,
+        sp_split_auto=False,
     )
 
 
@@ -357,7 +359,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             torch.manual_seed(0)
             batch_size, seq_len, num_heads, head_dim = 2, 5, 2, 8
@@ -734,12 +741,12 @@ class TestIdeogram4(unittest.TestCase):
             ["transformer", "unconditional_transformer"],
         )
 
-    def test_ideogram_attention_backend_is_passed_from_config(self):
+    def test_ideogram_attention_backend_is_declared_by_runtime_model(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         config = Ideogram4DiTConfig()
         self.assertEqual(
-            config.arch_config._supported_attention_backends,
+            Ideogram4Transformer2DModel._supported_attention_backends,
             {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
         )
         prev_args = server_args_module._global_server_args
@@ -756,7 +763,7 @@ class TestIdeogram4(unittest.TestCase):
 
         self.assertEqual(
             model.supported_attention_backends,
-            config.arch_config._supported_attention_backends,
+            Ideogram4Transformer2DModel._supported_attention_backends,
         )
         self.assertEqual(
             model.layers[0].attention.attn.backend,
@@ -769,7 +776,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with patch(
                 "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
@@ -794,7 +806,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with patch(
                 "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
@@ -842,7 +859,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with (
                 patch(
@@ -888,7 +910,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with (
                 patch(
@@ -941,7 +968,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with patch(
                 "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
@@ -997,7 +1029,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with (
                 patch(
@@ -1210,7 +1247,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with (
                 patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}),
@@ -1250,7 +1292,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with (
                 patch(

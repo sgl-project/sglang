@@ -217,6 +217,15 @@ def fused_experts_none_to_triton(
             fused_experts,
         )
 
+        # SGLANG_OPT_MOE_QUANT_ONCE: use the caller's pre-quantized activation
+        # (per-token-group-128 fp8 q + scales) instead of re-quantizing inside
+        # invoke_fused_moe_kernel.
+        pre_quant = dispatch_output.hidden_states_pre_quant
+        if pre_quant is not None:
+            a1_q, a1_scale = pre_quant
+        else:
+            a1_q, a1_scale = None, quant_info.a13_scale
+
         output = fused_experts(
             hidden_states=dispatch_output.hidden_states,
             w1=quant_info.w13_weight,
@@ -234,9 +243,10 @@ def fused_experts_none_to_triton(
             w2_scale=quant_info.w2_scale,
             w1_zp=quant_info.w13_zp,
             w2_zp=quant_info.w2_zp,
-            a1_scale=quant_info.a13_scale,
+            a1_scale=a1_scale,
             a2_scale=quant_info.a2_scale,
             block_shape=quant_info.block_shape,
+            a1_q=a1_q,
         )
 
     return StandardCombineInput(
