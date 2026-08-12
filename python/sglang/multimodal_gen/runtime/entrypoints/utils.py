@@ -163,6 +163,7 @@ class SetLoraReq:
     target: Union[str, List[str]] = "all"
     strength: Union[float, List[float]] = 1.0
     merge_mode: Optional[str] = None
+    lora_alpha: Optional[Union[int, List[Optional[int]]]] = None
 
 
 @dataclass
