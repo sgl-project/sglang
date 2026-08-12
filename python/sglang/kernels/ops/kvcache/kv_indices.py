@@ -7,19 +7,33 @@ FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SI
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_to_token_ptr,  # [max_batch, max_context_len] token table; at
+    # SRC_PAGE_SIZE > 1 a PAGE-granular table (the unified pool's canonical)
     req_pool_indices_ptr,
     page_kernel_lens_ptr,
     kv_indptr,
     kv_start_idx,
     kv_indices_ptr,
-    req_to_token_ptr_stride: tl.constexpr,
+    # Runtime, not constexpr: the choke point's eager canonical is allocated at
+    # the batch's live width, so a constexpr stride would JIT-specialize per
+    # width (a recompile every few decode steps at small page sizes).
+    req_to_token_ptr_stride,
+    SRC_PAGE_SIZE: tl.constexpr = 1,
 ):
+    """Gather per-request token ids into a flat CSR kv_indices stream.
+
+    ``SRC_PAGE_SIZE == 1`` (default): the source table is token-granular and
+    entries are emitted verbatim — byte-identical to the historical kernel.
+    ``SRC_PAGE_SIZE == ps``: the source is the choke point's PAGE-granular
+    canonical table (entries already kernel-facing page ids); token ids are
+    reconstructed by the affine rule ``token = entry * ps + pos % ps``, exact
+    because every kernel-facing id space preserves in-page offsets.
+    """
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
 
     # find the req pool idx, this is for batch to token
-    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
     kv_indices_offset = tl.load(kv_indptr + pid)
 
     kv_start = 0
@@ -34,13 +48,23 @@ def create_flashinfer_kv_indices_triton(
         # index into req_to_token_ptr needs to be int64
         offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
         mask = offset < kv_end - kv_start
-        data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + kv_start
-            + offset,
-            mask=mask,
-        )
+        if SRC_PAGE_SIZE == 1:
+            data = tl.load(
+                req_to_token_ptr
+                + req_pool_index * req_to_token_ptr_stride
+                + kv_start
+                + offset,
+                mask=mask,
+            )
+        else:
+            pos = kv_start + offset
+            entry = tl.load(
+                req_to_token_ptr
+                + req_pool_index * req_to_token_ptr_stride
+                + pos // SRC_PAGE_SIZE,
+                mask=mask,
+            )
+            data = entry.to(tl.int64) * SRC_PAGE_SIZE + pos % SRC_PAGE_SIZE
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 
@@ -105,16 +129,11 @@ def create_flashmla_kv_indices_triton(
     req_to_token_ptr_stride: tl.constexpr,
     kv_indices_ptr_stride: tl.constexpr,
     PAGED_SIZE: tl.constexpr = 64,
-    # Unified-memory dense-view path (page-major envelope shared with the mamba
-    # sub-pool). req_to_token holds VIRTUAL token ids; the block table the MLA
-    # kernel consumes must hold DENSE page ids. When v2p_ptr is given, map each
-    # virtual page through it to the physical page, then scale by PAGE_MULT
-    # (= num MLA layers) so the entry addresses the layer's dense per-page block
-    # in the (num_pages*L, page_size, kv_cache_dim) reshaped view. Both default
-    # to the identity (v2p_ptr None, PAGE_MULT 1) for the static pool.
-    v2p_ptr=None,
-    PAGE_MULT: tl.constexpr = 1,
 ):
+    # Static-pool builder only: token ids here are physical, entry = token//ps.
+    # Under the unified pool the block table is filled by the choke point
+    # (KVIndexSource.build_into) instead — this kernel holds no id-space
+    # knowledge.
     NUM_PAGE_PER_BLOCK: tl.constexpr = (
         FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON // PAGED_SIZE
     )
@@ -154,13 +173,8 @@ def create_flashmla_kv_indices_triton(
             + paged_offset,
             mask=mask,
         )
-        page = data // PAGED_SIZE
-        if v2p_ptr is not None:
-            # virtual page -> physical page (page-level v2p); masked so padded
-            # lanes never index the table out of bounds.
-            page = tl.load(v2p_ptr + page, mask=mask_out, other=0)
         tl.store(
             kv_indices_ptr + pid * kv_indices_ptr_stride + paged_offset_out,
-            page * PAGE_MULT,
+            data // PAGED_SIZE,
             mask=mask_out,
         )

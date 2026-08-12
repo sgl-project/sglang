@@ -26,6 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    apply_unified_kv_loc_rebind,
     compute_position,
 )
 from sglang.srt.runtime_context import get_exec
@@ -1158,6 +1159,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        # Fused draft KV: this write bypasses BOTH attention metadata AND the
+        # ForwardBatch rebind (apply_unified_kv_loc_rebind) — its inputs are
+        # ScheduleBatch-side VIRTUAL tensors, not a forward batch — so it is
+        # the one intentional caller-side translate: every loc reaching a
+        # unified pool method must already be PHYSICAL, and this door follows
+        # the same rule (translate exactly once, at the point of use). Probed
+        # at call time because pools bind after __init__ (alloc_memory_pool);
+        # non-unified allocators have no translate_kv_loc, so this is a no-op
+        # for them. Every id in cache_loc/cache_loc_2d is a real pre-allocated
+        # slot of the verify block (commit_lens only limits which rows are
+        # WRITTEN), so translating the dense tensors is safe.
+        translate_kv_loc = getattr(
+            self.draft_model_runner.token_to_kv_pool_allocator,
+            "translate_kv_loc",
+            None,
+        )
+        if translate_kv_loc is not None:
+            cache_loc = translate_kv_loc(cache_loc)
+            if cache_loc_2d is not None:
+                cache_loc_2d = translate_kv_loc(cache_loc_2d.reshape(-1)).view(
+                    cache_loc_2d.shape
+                )
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 
@@ -1684,6 +1707,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        # Physical-loc contract: this is the ONE live forward whose
+        # ForwardBatch is hand-built (the block-draft batch is synthetic —
+        # mask-token input_ids, noise embeds, hand-computed positions — so it
+        # cannot go through init_new). Apply the same rebind init_new applies:
+        # this FB gets its own PHYSICAL tensor while `verify_out_cache_loc`
+        # itself stays VIRTUAL for the ScheduleBatch rail (req_to_token
+        # bookkeeping above, `batch.out_cache_loc` for target verify below,
+        # accept bookkeeping after verify).
+        apply_unified_kv_loc_rebind(forward_batch, self.draft_model_runner)
 
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(forward_batch)

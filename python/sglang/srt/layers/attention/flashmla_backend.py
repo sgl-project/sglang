@@ -162,17 +162,28 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(eager_max_k, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            create_flashmla_kv_indices_triton[
-                (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
-            ](
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                None,
-                block_kv_indices,
-                self.req_to_token.stride(0),
-                block_kv_indices.stride(0),
-            )
+            if self.kv_index_source.enabled:
+                # Unified pool: the canonical entries ARE the dense block-table
+                # rows (pool page size is snapped to PAGE_SIZE for flashmla);
+                # prefix-only build, stale tail unread (bounded by seq_lens_k).
+                assert self.page_size == PAGE_SIZE
+                self.kv_index_source.build_into(
+                    out=block_kv_indices,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                )
+            else:
+                create_flashmla_kv_indices_triton[
+                    (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
+                ](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    None,
+                    block_kv_indices,
+                    self.req_to_token.stride(0),
+                    block_kv_indices.stride(0),
+                )
             mla_metadata, num_splits = get_mla_metadata(
                 forward_batch.seq_lens.to(torch.int32),
                 self.num_q_heads,
@@ -328,22 +339,35 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             else:
                 max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
 
-            create_flashmla_kv_indices_triton[
-                (
-                    bs,
-                    get_num_kv_index_blocks_flashmla(
-                        self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
-                    ),
+            if self.kv_index_source.enabled:
+                # Unified pool: prefix-only refresh of the capture-stable table
+                # (spec is asserted off, so only decode/idle reaches this under
+                # unified; the builder takes seq_lens as a tensor, so the
+                # verify/draft-widened lengths plug in when the spec seam
+                # opens). Stale tail unread — bounded by seq_lens_k.
+                assert self.page_size == PAGE_SIZE
+                self.kv_index_source.build_into(
+                    out=self.cuda_graph_kv_indices,
+                    req_pool_indices=req_pool_indices[:bs],
+                    seq_lens=seq_lens,
                 )
-            ](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens,
-                None,
-                self.cuda_graph_kv_indices,
-                self.req_to_token.stride(0),
-                self.cuda_graph_kv_indices.stride(0),
-            )
+            else:
+                create_flashmla_kv_indices_triton[
+                    (
+                        bs,
+                        get_num_kv_index_blocks_flashmla(
+                            self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
+                        ),
+                    )
+                ](
+                    self.req_to_token,
+                    req_pool_indices[:bs],
+                    seq_lens,
+                    None,
+                    self.cuda_graph_kv_indices,
+                    self.req_to_token.stride(0),
+                    self.cuda_graph_kv_indices.stride(0),
+                )
 
             q_head_mult = (
                 self.num_draft_tokens

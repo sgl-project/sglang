@@ -68,8 +68,8 @@ def _make_prefill_aware_swa_runner(*, pool_size: int, max_context_len: int = 64)
         device=device,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool=object(),  # not a SWAKVPool instance -> use_sliding_window_kv_pool=False
-        # getattr(..., "full_v2p_page_table", None) is None -> unified_mla_hooks
-        # falls back to the static (disabled) hook set.
+        # A bare object is not a unified composite, so the runner's
+        # KVIndexSource comes up disabled (strict passthrough).
         token_to_kv_pool_allocator=object(),
         kv_cache_dtype=torch.float16,
         kv_cache_dtype_str="auto",

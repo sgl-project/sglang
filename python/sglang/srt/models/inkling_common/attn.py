@@ -414,6 +414,13 @@ class InklingAttention(nn.Module):
         # (non-bf16) and HND/vectorized_5d (4D/5D, paged (page, head) index)
         # pools keep the backend store, which owns their quant + layout. conv +
         # windows + qk-norm stay fused regardless.
+        #
+        # The unified pool's DENSE views deliberately pass this gate (3-D,
+        # contiguous, stock shape) and the locs below are already in the
+        # matching kernel-facing id space (swa_out_cache_loc = swa-dense rail,
+        # out_cache_loc_full_physical = full-dense; both rebound once at
+        # ForwardBatch prep). The unified STRIDED views are 4-D and keep the
+        # backend store, as before.
         do_bf16_store = (
             k_buf.dtype == torch.bfloat16
             and k_buf.dim() == 3

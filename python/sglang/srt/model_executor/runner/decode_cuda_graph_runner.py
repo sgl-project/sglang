@@ -178,6 +178,13 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        # Unified physical-loc contract: carry the rebound state so the
+        # backend's replay-prep sees the physical loc, the swa rail, and the
+        # tripwire flag (apply_unified_kv_loc_rebind ran at init_new).
+        swa_out_cache_loc=getattr(forward_batch, "swa_out_cache_loc", None),
+        out_cache_loc_is_physical=getattr(
+            forward_batch, "out_cache_loc_is_physical", False
+        ),
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
         # reads THAT in the decode track-save — this slot is never mutated. None

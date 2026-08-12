@@ -1,10 +1,15 @@
 """
-End-to-end accuracy test for the page-major KV layout on a hybrid-SWA MoE model.
+End-to-end accuracy tests for the page-major KV layout on a hybrid-SWA MoE model.
 
-Launches gpt-oss-20b with ``--enable-page-major-kv-layout`` on the Triton
-attention backend and checks that GSM8K accuracy holds. This exercises the
-SWA + full-attention KV pools under the page-granularity envelope layout
-(SWAKVPool routes both sub-pools through PageMajorMHATokenToKVPool).
+Launches gpt-oss-20b with ``--enable-page-major-kv-layout`` (Triton, strided
+views) and with ``--enable-unified-memory`` across the dense-view backend
+matrix, checking GSM8K accuracy on each. gpt-oss is a uniform-row hybrid-SWA
+model, so under the unified pool its MHA + SWA sub-pools flip to DENSE
+per-layer views and the fa3 cell reads them through the choke point's
+canonical page tables; the resolved-default cell pins the no-pin path (the
+pattern that caught both #32972 review defects — a pinned backend hides
+default-resolution breakage by construction). flashinfer is absent on
+purpose: gpt-oss uses attention sinks, which flashinfer does not support.
 
 Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
 
@@ -20,7 +25,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
-register_cuda_ci(est_time=420, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1500, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestPageMajorGptOss(DefaultServerBase):
@@ -63,6 +68,35 @@ class TestPageMajorGptOss(DefaultServerBase):
             f"(threshold: {self.gsm8k_threshold})"
         )
         self.assertGreaterEqual(metrics["accuracy"], self.gsm8k_threshold)
+
+
+_UNIFIED_COMMON_ARGS = [
+    "--enable-unified-memory",
+    "--mem-fraction-static",
+    "0.70",
+    "--cuda-graph-backend-prefill=disabled",
+]
+
+
+class TestUnifiedGptOssTriton(TestPageMajorGptOss):
+    """Unified pool, Triton pinned: dense MHA/SWA views through the strided-
+    capable reference backend."""
+
+    other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "triton"]
+
+
+class TestUnifiedGptOssFa3(TestPageMajorGptOss):
+    """Unified pool, fa3 pinned: dense views read via the choke point's
+    canonical page tables (eager direct-bind + captured fused copy)."""
+
+    other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "fa3"]
+
+
+class TestUnifiedGptOssResolvedDefault(TestPageMajorGptOss):
+    """Unified pool, NO backend pin: whatever the host resolves must be in the
+    backend allow-list or the server fails to boot under its own defaults."""
+
+    other_args = _UNIFIED_COMMON_ARGS
 
 
 if __name__ == "__main__":

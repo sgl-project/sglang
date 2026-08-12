@@ -292,6 +292,13 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
     pool = get_token_to_kv_pool()
+    # Unified-pool interaction: SWA-hybrid composites are excluded by the
+    # SWAKVPool isinstance below (UnifiedSWAKVPool subclasses it). A
+    # mamba-hybrid HybridLinearKVPool passes; with DENSE unified views the
+    # fused store is correct by construction (out_cache_loc is kernel-facing
+    # post-rebind and the per-layer buffers are stock 3-D), while the STRIDED
+    # unified views fail loudly in create_fused_set_kv_buffer_arg's .view —
+    # models that fuse (bailing-class) require dense mode under unified.
     return (
         _is_cuda
         and pool.dtype == torch.bfloat16

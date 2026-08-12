@@ -668,6 +668,15 @@ class TboForwardBatchPreparer:
             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
             output_dict[key] = old_value[start_token_index:end_token_index]
 
+        # Unified hybrid-SWA write rail: token-sliced like out_cache_loc
+        # (slices of a physical tensor are physical). None elsewhere.
+        swa_out_cache_loc = getattr(batch, "swa_out_cache_loc", None)
+        output_dict["swa_out_cache_loc"] = (
+            swa_out_cache_loc[start_token_index:end_token_index]
+            if swa_out_cache_loc is not None
+            else None
+        )
+
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
@@ -734,6 +743,11 @@ class TboForwardBatchPreparer:
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
+            # Unified physical-loc contract: both children inherit the parent's
+            # rebound state (out_cache_loc slices above are physical iff the
+            # parent was rebound; the choke-point source is batch-invariant).
+            "out_cache_loc_is_physical",
+            "_kv_index_source",
         ]:
             output_dict[key] = getattr(batch, key)
 

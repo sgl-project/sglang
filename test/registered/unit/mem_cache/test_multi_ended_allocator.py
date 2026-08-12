@@ -31,11 +31,13 @@ import torch
 
 from sglang.srt.mem_cache.multi_ended_allocator import (
     MultiEndedAllocator,
+    UnifiedMambaTokenToKVPoolAllocator,
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
+    MLASubPoolSpec,
     UnifiedKVPool,
 )
 
@@ -522,6 +524,31 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         self.assertEqual(int(buf[1].item()), 0)
 
+    def test_slot_zero_sink_invariant_survives_churn(self):
+        """PINNED INVARIANT: virtual 0 <-> physical 0 (the padding sink), so
+        `translate_kv_loc(zeros) == zeros` — after init AND after alloc/free/
+        compaction churn. The cuda-graph capture path RELIES on this: the
+        physical-loc contract replaced capture-time translate with a plain
+        copy of the zero-filled static buffer, which is only equivalent while
+        v2p[0] == 0. If an allocator change breaks this, captured stores would
+        write pad lanes to a live slot."""
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        zeros = torch.zeros(4, dtype=torch.int64)
+
+        self.assertEqual(int(full_alloc.virtual_to_physical[0].item()), 0)
+        self.assertTrue(torch.equal(full_alloc.translate_kv_loc(zeros), zeros))
+
+        # Churn: allocate, free interior (forces compaction moves), re-allocate.
+        a = self._alloc(full_alloc, full_kv, 6)
+        b = self._alloc(full_alloc, full_kv, 6)
+        self._free(full_alloc, full_kv, a)
+        c = self._alloc(full_alloc, full_kv, 4)
+        self._free(full_alloc, full_kv, b)
+        self._free(full_alloc, full_kv, c)
+
+        self.assertEqual(int(full_alloc.virtual_to_physical[0].item()), 0)
+        self.assertTrue(torch.equal(full_alloc.translate_kv_loc(zeros), zeros))
+
 
 # ---------------------------------------------------------------------------
 # Shared SWA composite — unit tests
@@ -916,6 +943,34 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         self.assertIs(ret, buf)
         self.assertTrue(bool((buf >= 0).all().item()))
         self.assertEqual(int(buf[1].item()), 0)
+
+    def test_swa_slot_zero_sink_invariant_survives_churn(self):
+        """PINNED INVARIANT (swa side of the physical-loc contract): BOTH maps
+        send virtual 0 to physical 0 — `translate_kv_loc(zeros) == zeros` AND
+        `translate_loc_from_full_to_swa(zeros) == zeros` — after init and
+        after alloc/free/free_swa churn. Cuda-graph capture replaced the
+        capture-time translate with zero-fill/copy of the zero-filled static
+        buffers; that is only equivalent while slot 0 stays the sink in both
+        sub-pools."""
+        _, allocator, kvcache = self._build()
+        zeros64 = torch.zeros(4, dtype=torch.int64)
+        zeros32 = torch.zeros(4, dtype=torch.int32)
+
+        def check():
+            self.assertTrue(torch.equal(allocator.translate_kv_loc(zeros64), zeros64))
+            self.assertTrue(
+                torch.equal(allocator.translate_loc_from_full_to_swa(zeros64), zeros32)
+            )
+
+        check()
+        a = self._alloc(allocator, kvcache, 5)
+        b = self._alloc(allocator, kvcache, 5)
+        allocator.free_swa(a)  # tombstone swa side only
+        self._free(allocator, kvcache, b)  # full free (compaction on both)
+        self._free(allocator, kvcache, a)
+        c = self._alloc(allocator, kvcache, 3)
+        self._free(allocator, kvcache, c)
+        check()
 
 
 # ---------------------------------------------------------------------------
@@ -2497,6 +2552,189 @@ class TestO3FusedAllocBind(unittest.TestCase):
         for v, p in zip(v_pages.tolist(), expected.tolist()):
             self.assertEqual(int(sa.virtual_to_physical[v].item()), p)
             self.assertEqual(int(sa.physical_to_virtual[p].item()), v)
+
+
+class TestSWACompositeDenseSurface(unittest.TestCase):
+    """The SWA composite's dense (kernel-facing) id surface.
+
+    Presence of `translate_kv_loc_dense` / `full_v2p_page_table` is what flips
+    the dense-first probes (the write-loc rebind and the attention backends'
+    read hooks), and the `page_stride` scale in `translate_loc_from_full_to_swa`
+    is what carries the swa dense space. Everything must collapse
+    byte-identically at multiplier 1 — the strided arm every existing SWA model
+    runs — and follow `dense(t) = v2p[t//ps]*(ps*mult) + t%ps` otherwise.
+    """
+
+    PS = 4
+    FULL_L = 4
+    SWA_L = 2
+
+    def _build(self, full_mult=1, swa_mult=1):
+        full_spec = MHASubPoolSpec(
+            name="full",
+            layer_num=self.FULL_L,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.float16,
+            grow_direction="up",
+        )
+        swa_spec = MHASubPoolSpec(
+            name="swa",
+            layer_num=self.SWA_L,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.float16,
+            grow_direction="down",
+        )
+        n_full, n_swa = 64, 32  # tokens = 16 / 8 pages at PS=4
+        total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full_spec, swa_spec],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+        )
+        kvcache = _FakeUnifiedSWAKVPool(pool)
+        return UnifiedSWATokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=kvcache,
+            device=_DEV,
+            full_max_total_num_tokens=n_full,
+            swa_max_total_num_tokens=n_swa,
+            page_size=self.PS,
+            need_sort=False,
+            forward_stream=None,
+            full_kernel_page_multiplier=full_mult,
+            swa_kernel_page_multiplier=swa_mult,
+        )
+
+    def test_surface_collapses_at_multiplier_one(self):
+        """Strided-arm guard: with both multipliers 1, the new surface must be
+        byte-identical to the physical translate and expose the raw v2p
+        tables — a drift here silently changes every existing SWA model."""
+        a = self._build()
+        self.assertEqual(a.kernel_page_multiplier, 1)
+        self.assertEqual(a.swa_kernel_page_multiplier, 1)
+        self.assertIs(a.full_v2p_page_table, a.full_attn_allocator.virtual_to_physical)
+        self.assertIs(a.swa_v2p_page_table, a.swa_attn_allocator.virtual_to_physical)
+        v = a.alloc(2 * self.PS)
+        self.assertIsNotNone(v)
+        self.assertTrue(torch.equal(a.translate_kv_loc_dense(v), a.translate_kv_loc(v)))
+
+    def test_full_dense_translate_matches_formula(self):
+        mult = 2 * self.FULL_L
+        a = self._build(full_mult=mult)
+        v = a.alloc(3 * self.PS)
+        self.assertIsNotNone(v)
+        v2p = a.full_attn_allocator.virtual_to_physical
+        expected = v2p[v // self.PS] * (self.PS * mult) + v % self.PS
+        self.assertTrue(torch.equal(a.translate_kv_loc_dense(v), expected))
+        # The PHYSICAL translate must stay unscaled — compaction and the byte
+        # machinery depend on it staying in physical space.
+        phys = v2p[v // self.PS] * self.PS + v % self.PS
+        self.assertTrue(torch.equal(a.translate_kv_loc(v), phys))
+
+    def test_swa_translate_scales_page_stride(self):
+        mult = 2 * self.SWA_L
+        a = self._build(swa_mult=mult)
+        v = a.alloc(3 * self.PS)
+        self.assertIsNotNone(v)
+        v2p_swa = a.swa_attn_allocator.virtual_to_physical
+        expected = (v2p_swa[v // self.PS] * (self.PS * mult) + v % self.PS).to(
+            torch.int32
+        )
+        self.assertTrue(torch.equal(a.translate_loc_from_full_to_swa(v), expected))
+
+    def test_swa_dense_tombstone_still_lands_on_sink(self):
+        """The scaled stride must not break the tombstone clamp: a tombstoned
+        page's ids (v2p == -1 -> -stride + offset, negative for every in-page
+        offset) still land on the sink, never negative."""
+        mult = 2 * self.SWA_L
+        a = self._build(swa_mult=mult)
+        v = a.alloc(2 * self.PS)
+        self.assertIsNotNone(v)
+        tomb_page = int(v[0].item()) // self.PS
+        a.swa_attn_allocator.virtual_to_physical[tomb_page] = -1
+        got = a.translate_loc_from_full_to_swa(v)
+        self.assertTrue(bool((got >= 0).all().item()))
+        in_tomb = v // self.PS == tomb_page
+        self.assertTrue(bool((got[in_tomb] == 0).all().item()))
+
+
+class TestPs64MLACompositeFeasibility(unittest.TestCase):
+    """The Kimi/flashmla shape: MLA + mamba composite at page_size=64 (the
+    flashmla arg snap). Large pages stress every sizing derivation at once —
+    the 64-token sink-page floor, the ps*entry_bytes dense-view tail pad, and
+    the page-granular alloc — so this pins that the factory-shaped
+    construction stays FEASIBLE and the dense surface stays on-formula when
+    the page size jumps from the usual 1..4 to 64."""
+
+    PS = 64
+    LAYERS = 3
+
+    def _build(self):
+        full = MLASubPoolSpec(
+            name="full",
+            layer_num=self.LAYERS,
+            kv_lora_rank=64,
+            qk_rope_head_dim=16,
+            store_dtype=torch.float16,
+            grow_direction="down",
+        )
+        mamba = MambaSubPoolSpec(
+            name="mamba",
+            layer_num=2,
+            conv_state_shapes=((8, 16),),
+            conv_dtype=torch.bfloat16,
+            temporal_state_shape=(4, 8, 8),
+            temporal_dtype=torch.float32,
+            grow_direction="up",
+        )
+        n_full = 8 * self.PS  # 8 pages incl. the sink page
+        total = n_full * full.entry_bytes() + 16 * mamba.entry_bytes()
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+            view_tail_pad_bytes=self.PS * full.entry_bytes(),
+        )
+        full_kv = _FakeKVCache(pool.max_slots("full"))
+        full_kv.attach_allocator = lambda allocator: None
+        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        mamba_kv.attach_allocator = lambda allocator: None
+        mamba_kv._copy_from_physical = lambda src, dst: None
+
+        class _FakeHybridLinearKVPool:
+            full_kv_pool = full_kv
+            mamba_pool = mamba_kv
+
+        return UnifiedMambaTokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=_FakeHybridLinearKVPool(),
+            device=_DEV,
+            page_size=self.PS,
+            need_sort=False,
+            forward_stream=None,
+            full_kernel_page_multiplier=self.LAYERS,
+        )
+
+    def test_construction_alloc_and_dense_formula(self):
+        a = self._build()
+        self.assertEqual(a.kernel_page_multiplier, self.LAYERS)
+        v = a.alloc(2 * self.PS)
+        self.assertIsNotNone(v, "2-page alloc infeasible at ps=64")
+        # Page-aligned virtual run (page-granular allocator invariant).
+        self.assertEqual(int(v[0].item()) % self.PS, 0)
+        # Dense translate follows the affine formula at ps=64, and every id
+        # fits int32 (the canonical narrows on store).
+        v2p = a.full_v2p_page_table
+        want = v2p[v // self.PS] * (self.PS * self.LAYERS) + v % self.PS
+        got = a.translate_kv_loc_dense(v)
+        self.assertTrue(torch.equal(got, want), "dense formula broke at ps=64")
+        self.assertTrue(bool((got < 2**31).all().item()))
 
 
 if __name__ == "__main__":
