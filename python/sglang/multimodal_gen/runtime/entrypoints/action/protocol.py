@@ -199,6 +199,8 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
         "policy_family",
         type(pipeline_config).__name__.removesuffix("PipelineConfig").lower(),
     )
+    prefix_graph_enabled = pipeline_config.prefix_cuda_graph_available()
+    action_graph_enabled = pipeline_config.action_cuda_graph_available()
     return {
         "object": "action.metadata",
         "model": server_args.served_model_name,
@@ -219,6 +221,13 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
         "runtime": {
             "materialize_dtype": pipeline_config.materialize_dtype,
             "enable_autocast": pipeline_config.enable_autocast,
+            "cuda_graph": {
+                "prefix_enabled": prefix_graph_enabled,
+                "prefix_max_entries": pipeline_config.prefix_cuda_graph_max_entries,
+                "action_enabled": action_graph_enabled,
+                "action_max_entries": pipeline_config.action_cuda_graph_max_entries,
+                "prompt_token_buckets": list(pipeline_config.prompt_token_buckets),
+            },
             "parallelism": {
                 "num_gpus": server_args.num_gpus,
                 "tp_size": server_args.tp_size,
@@ -236,11 +245,13 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
             "prefix_cache": (
                 "auto" if pipeline_config.enable_global_prefix_cache else False
             ),
-            "cuda_graph": "auto" if pipeline_config.enable_action_cuda_graph else False,
+            "cuda_graph": (
+                "auto" if prefix_graph_enabled or action_graph_enabled else False
+            ),
         },
         "capabilities": {
             "exact_prefix_cache": True,
-            "cuda_graph": pipeline_config.enable_action_cuda_graph,
+            "cuda_graph": prefix_graph_enabled or action_graph_enabled,
             "realtime_websocket": True,
             "openpi_websocket": True,
             "batch_inputs": False,
