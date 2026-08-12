@@ -92,10 +92,7 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         return not self.rewriter_auto_negative
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        # torch.compile stays opt-in: not yet validated for this DiT.
-        return ModelDeploymentConfig(
-            speed_mode_enable_torch_compile_by_default=False,
-        )
+        return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]

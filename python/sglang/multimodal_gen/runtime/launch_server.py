@@ -309,7 +309,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             logger.info(
                 "Action generation endpoint ready: model=%s; per-request details are "
                 "debug-only (use --log-level debug).",
-                server_args.model_id or server_args.model_path,
+                server_args.served_model_name,
             )
         logger.info("Starting FastAPI server.")
         if server_args.webui:

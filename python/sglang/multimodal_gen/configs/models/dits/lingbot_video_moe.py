@@ -2,12 +2,13 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_block
 
 
 @dataclass
 class LingBotVideoMoEArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
+    param_names_mapping: dict = field(default_factory=dict)
+    reverse_param_names_mapping: dict = field(default_factory=dict)
+    lora_param_names_mapping: dict = field(default_factory=dict)
 
     patch_size: tuple[int, int, int] = (1, 2, 2)
     in_channels: int = 16
