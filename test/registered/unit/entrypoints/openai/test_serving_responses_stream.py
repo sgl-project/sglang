@@ -286,7 +286,9 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
 class StreamLogprobsTestCase(CustomTestCase):
     def _delta_events(self, events):
         return [
-            p for p in event_payloads(events) if p["type"] == "response.output_text.delta"
+            p
+            for p in event_payloads(events)
+            if p["type"] == "response.output_text.delta"
         ]
 
     def _done_payload(self, events):
@@ -399,8 +401,15 @@ class StreamLogprobsTestCase(CustomTestCase):
         self.assertEqual(len(deltas), 1)
         self.assertEqual(len(deltas[0]["logprobs"]), 1)
         self.assertEqual(deltas[0]["logprobs"][0]["token"], "Hi")
-        # top_logprobs=0 -> empty alternatives.
-        self.assertEqual(len(deltas[0]["logprobs"][0]["top_logprobs"]), 0)
+        # top_logprobs=0 requests no alternatives: tokenizer_manager only sets
+        # output_top_logprobs when top_logprobs_num > 0, so this slot must carry
+        # no top entries. Assert the None-or-empty contract directly (rather than
+        # len()==0) so the case breaks loudly -- not silently via the builder's
+        # `or []` fallback -- if the manager ever emits top-logprobs unconditionally.
+        self.assertIn(
+            deltas[0]["logprobs"][0]["top_logprobs"],
+            (None, []),
+        )
 
 
 if __name__ == "__main__":

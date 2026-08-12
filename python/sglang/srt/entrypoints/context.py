@@ -220,11 +220,20 @@ class StreamingHarmonyContext(HarmonyContext):
         self.encoding = get_encoding()
         self.last_tok = None
         self.num_processed_tokens = 0
-        # Logprob of the most recent final-channel content token in the current
-        # chunk, exposed so the streaming delta event can carry it. Reset every
-        # append_output call; None when the chunk added no final-content token.
-        self.last_delta_logprob = None
-        self.last_delta_top_logprob = None
+        # Per-chunk slices of the final-channel content-token logprobs added in
+        # the current append_output call, exposed so the streaming delta event
+        # carries one logprob per token in the chunk (instead of just the last).
+        # Reset every append_output call; empty list when the chunk added no
+        # final-content token. delta_top_logprobs is None when top-logprobs were
+        # never requested, otherwise a list aligned 1:1 with delta_token_logprobs.
+        self.delta_token_logprobs: list = []
+        self.delta_top_logprobs: Optional[list] = None
+        # Concatenated text of those same final-channel tokens. Carried alongside
+        # delta_token_logprobs so the delta string and its logprobs stay aligned:
+        # delta_text holds one text piece per delta_token_logprobs entry. The
+        # parser's own last_content_delta is last-token-only, so for a chunk that
+        # carries several final tokens it would otherwise under-cover the text.
+        self.delta_text: str = ""
 
     @property
     def messages(self) -> list:
@@ -269,32 +278,37 @@ class StreamingHarmonyContext(HarmonyContext):
 
             self._record_finish_reason(meta_info)
 
-            # Reset per-chunk delta state so last_delta_logprob always describes
-            # the current chunk's last final-channel content token (or None).
-            self.last_delta_logprob = None
-            self.last_delta_top_logprob = None
+            # Reset per-chunk delta slices so they describe only the final-channel
+            # content tokens added in this append_output call.
+            self.delta_token_logprobs = []
+            self.delta_top_logprobs = None
+            self.delta_text = ""
             for i, token_id in enumerate(new_token_ids):
                 self.parser.process(token_id)
                 # Bucket final-channel content tokens (see HarmonyContext) and
-                # track the latest one for the streaming delta event.
+                # collect this chunk's slice -- logprob entries AND the matching
+                # text -- so the streaming delta string and its logprobs carry
+                # one entry per token and stay aligned.
+                delta_text = self.parser.last_content_delta
                 if (
                     new_token_logprobs is not None
                     and self.parser.current_channel == "final"
-                    and self.parser.last_content_delta
+                    and delta_text
                 ):
                     token_lp = new_token_logprobs[i]
                     self.final_token_logprobs.append(token_lp)
-                    self.last_delta_logprob = token_lp
+                    self.delta_token_logprobs.append(token_lp)
+                    self.delta_text += delta_text
                     if new_top_logprobs is not None:
                         top_lp = (
-                            new_top_logprobs[i]
-                            if i < len(new_top_logprobs)
-                            else None
+                            new_top_logprobs[i] if i < len(new_top_logprobs) else None
                         )
                         if self.final_top_logprobs is None:
                             self.final_top_logprobs = []
                         self.final_top_logprobs.append(top_lp)
-                        self.last_delta_top_logprob = top_lp
+                        if self.delta_top_logprobs is None:
+                            self.delta_top_logprobs = []
+                        self.delta_top_logprobs.append(top_lp)
 
         else:
             # Handle the case of tool output in direct message format

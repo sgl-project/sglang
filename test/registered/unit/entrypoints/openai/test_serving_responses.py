@@ -997,15 +997,15 @@ class StreamingHarmonyLogprobsTestCase(CustomTestCase):
                     "meta_info": {"output_token_logprobs": [self._lp(i, tok, delta)]},
                 }
             )
-            # last_delta_logprob tracks the chunk's last final-content token,
-            # and is None when the chunk added none.
+            # delta_token_logprobs holds the final-content tokens added in this
+            # chunk (one token per chunk here); empty when the chunk added none.
             if channel == "final" and delta:
-                self.assertIsNotNone(ctx.last_delta_logprob)
+                self.assertEqual(len(ctx.delta_token_logprobs), 1)
                 self.assertEqual(
-                    ctx.last_delta_logprob[2], self._lp(i, tok, delta)[2]
+                    ctx.delta_token_logprobs[0][2], self._lp(i, tok, delta)[2]
                 )
             else:
-                self.assertIsNone(ctx.last_delta_logprob)
+                self.assertEqual(ctx.delta_token_logprobs, [])
 
         self.assertEqual("".join(lp[2] for lp in ctx.final_token_logprobs), "Hello!")
 
@@ -1033,6 +1033,54 @@ class StreamingHarmonyLogprobsTestCase(CustomTestCase):
             )
         # Correct slicing => each final-content token captured exactly once.
         self.assertEqual("".join(lp[2] for lp in ctx.final_token_logprobs), "Hello!")
+
+    def test_multi_token_chunk_delta_slice_keeps_every_token(self):
+        """Regression guard for the harmony streaming delta path: when a single
+        chunk carries several final-channel content tokens (normal batched
+        decode, or a multi-byte char spanning decode steps), delta_token_logprobs
+        must hold one entry per token -- not just the last. Previously the delta
+        event pinned a single logprob to the whole multi-token delta string, so
+        len(logprobs) != len(delta tokens) and aligning clients got garbage."""
+        gen_toks, info = self._token_info("Hello wonderful world")
+        final_deltas = [
+            info[i][0]
+            for i in range(len(gen_toks))
+            if info[i][1] == "final" and info[i][0]
+        ]
+        # The answer must actually span >=2 final tokens for the guard to bite.
+        self.assertGreaterEqual(len(final_deltas), 2)
+        all_lps = [self._lp(i, tok, info[i][0]) for i, tok in enumerate(gen_toks)]
+        ctx = StreamingHarmonyContext(
+            [
+                Message.from_role_and_content(Role.SYSTEM, "x"),
+                Message.from_role_and_content(Role.USER, "q"),
+            ],
+            {},
+        )
+        # Incremental mode (no completion_tokens): the whole batch is new in a
+        # single append_output call.
+        ctx.append_output(
+            {
+                "output_ids": gen_toks,
+                "meta_info": {"output_token_logprobs": all_lps},
+            }
+        )
+        # Every final-content token of this chunk is in the per-chunk slice...
+        self.assertEqual([lp[2] for lp in ctx.delta_token_logprobs], final_deltas)
+        # ...and it matches the fully-accumulated list, since this is the only
+        # chunk fed so far.
+        self.assertEqual(
+            [lp[2] for lp in ctx.delta_token_logprobs],
+            [lp[2] for lp in ctx.final_token_logprobs],
+        )
+        # The delta text is the concatenation of every final token's piece -- one
+        # per logprob entry -- not just the last token's. This is what keeps the
+        # delta string aligned with len(delta_token_logprobs); the parser's own
+        # last_content_delta would only be "world" here.
+        self.assertEqual(ctx.delta_text, "".join(final_deltas))
+        # Sanity: delta_text is strictly longer than the last token's piece, which
+        # is the value the pre-fix code would have shipped.
+        self.assertGreater(len(ctx.delta_text), len(final_deltas[-1]))
 
 
 class StreamingLogprobsAcceptedTestCase(CustomTestCase):

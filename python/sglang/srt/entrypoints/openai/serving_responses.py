@@ -1665,15 +1665,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
                     delta_logprobs = []
-                    if wants_logprobs and ctx.last_delta_logprob is not None:
-                        delta_top = (
-                            [ctx.last_delta_top_logprob]
-                            if ctx.last_delta_top_logprob is not None
-                            else None
-                        )
+                    if wants_logprobs and ctx.delta_token_logprobs:
                         delta_logprobs = (
                             to_responses_text_delta_logprobs(
-                                [ctx.last_delta_logprob], delta_top
+                                ctx.delta_token_logprobs,
+                                ctx.delta_top_logprobs,
                             )
                             or []
                         )
@@ -1684,7 +1680,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             content_index=current_content_index,
                             output_index=current_output_index,
                             item_id=current_item_id,
-                            delta=ctx.parser.last_content_delta,
+                            delta=ctx.delta_text,
                             logprobs=delta_logprobs,
                         )
                     )

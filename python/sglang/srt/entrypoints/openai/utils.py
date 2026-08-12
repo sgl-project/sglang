@@ -1,4 +1,3 @@
-import itertools
 import logging
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -89,9 +88,16 @@ def _build_responses_logprobs(
         return kwargs
 
     result: List[Any] = []
-    for (logprob, _token_id, token_text), top in itertools.zip_longest(
-        output_token_logprobs, output_top_logprobs or [], fillvalue=None
-    ):
+    # Align by index, not zip_longest: output_top_logprobs is positionally
+    # sparse (None where a token has no top-k), and a length divergence between
+    # the two lists must not shift later top entries onto the wrong token. Pad
+    # missing/short positions with None rather than re-indexing.
+    for i, (logprob, _token_id, token_text) in enumerate(output_token_logprobs):
+        top = (
+            output_top_logprobs[i]
+            if output_top_logprobs is not None and i < len(output_top_logprobs)
+            else None
+        )
         top_entries = []
         if top is not None:
             for tp_logprob, _tp_token_id, tp_token_text in top:
