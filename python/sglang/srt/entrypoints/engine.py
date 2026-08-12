@@ -101,7 +101,6 @@ from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     SerializedTensorPayload,
     assert_pkg_version,
     configure_logger,
@@ -1470,16 +1469,22 @@ class Engine(EngineScoreMixin, EngineBase):
     ) -> List[bytes]:
         """One serialized payload per TP rank: each rank deserializes only its
         own copy, so producer-side CUDA-IPC refcounts drop cleanly after every
-        load. flattened_bucket callers pass pre-serialized per-rank payloads."""
+        load. flattened_bucket callers pass pre-serialized per-rank payloads.
+
+        Payloads use the safetensors wire format (tensor data only, no
+        code-execution semantics) instead of pickle; the server still accepts
+        legacy pickle for backward compatibility via SafeUnpickler.
+        """
         if load_format == "flattened_bucket":
             return normalize_serialized_named_tensor_payloads(
                 cast(List[SerializedTensorPayload], tensors)
             )
         else:
-            return [
-                MultiprocessingSerializer.serialize(tensors)
-                for _ in range(self.server_args.tp_size)
-            ]
+            import safetensors.torch
+
+            save_dict = tensors if isinstance(tensors, dict) else dict(tensors)
+            payload = safetensors.torch.save(save_dict)
+            return [payload for _ in range(self.server_args.tp_size)]
 
     def load_lora_adapter_from_tensors(
         self,
