@@ -17,6 +17,41 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def test_forwards_segment_release_to_logical_allocator(self):
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.is_not_in_free_group = True
+        logical_allocator = MagicMock(spec=["free_segment"])
+        allocator.logical_attn_allocator = logical_allocator
+        indices = torch.arange(8, dtype=torch.int64)
+
+        allocator.free_segment(indices, start_pos=256)
+
+        logical_allocator.free_segment.assert_called_once_with(indices, start_pos=256)
+
+    def test_grouped_segment_release_preserves_segment_metadata(self):
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 4
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+        allocator.free_segments_group = []
+        allocator.swa_free_segments_group = []
+        logical_allocator = MagicMock(spec=["free_segment"])
+        allocator.logical_attn_allocator = logical_allocator
+        indices = torch.arange(8, dtype=torch.int64)
+
+        allocator.free_group_begin()
+        allocator.free_segment(indices, start_pos=256)
+        logical_allocator.free_segment.assert_not_called()
+        allocator.free_group_end()
+
+        logical_allocator.free_segment.assert_called_once()
+        freed_indices = logical_allocator.free_segment.call_args.args[0]
+        self.assertTrue(torch.equal(freed_indices, indices))
+        self.assertIsNot(freed_indices, indices)
+        self.assertEqual(
+            logical_allocator.free_segment.call_args.kwargs["start_pos"], 256
+        )
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
