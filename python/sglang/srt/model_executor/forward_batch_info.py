@@ -702,6 +702,39 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if skip_attn_backend_init:
             self.mark_forward_metadata_ready()
 
+    def init_mlp_sync_metadata(
+        self, batch: ScheduleBatch, device: Union[str, torch.device]
+    ) -> None:
+        """Populate per-rank token counts for DP-attention MLP synchronization."""
+        if batch.global_num_tokens is None:
+            return
+
+        assert batch.global_num_tokens_for_logprob is not None
+        if self.spec_info is not None:
+            from sglang.srt.speculative.spec_info import spec_scale_global_num_tokens
+
+            global_num_tokens, global_num_tokens_for_logprob = (
+                spec_scale_global_num_tokens(
+                    self.spec_info,
+                    batch.global_num_tokens,
+                    batch.global_num_tokens_for_logprob,
+                )
+            )
+        else:
+            global_num_tokens = batch.global_num_tokens
+            global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+
+        self.original_global_num_tokens_cpu = batch.global_num_tokens
+        self.global_num_tokens_cpu = global_num_tokens
+        self.global_num_tokens_gpu = torch.tensor(
+            global_num_tokens, dtype=torch.int64
+        ).to(device, non_blocking=True)
+        self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
+        self.global_num_tokens_for_logprob_gpu = torch.tensor(
+            global_num_tokens_for_logprob, dtype=torch.int64
+        ).to(device, non_blocking=True)
+        self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+
     @classmethod
     def init_new(
         cls,
@@ -841,37 +874,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
         ret.num_token_non_padded_cpu = num_tokens
 
-        # For MLP sync
-        if batch.global_num_tokens is not None:
-            assert batch.global_num_tokens_for_logprob is not None
-
-            # process global_num_tokens and global_num_tokens_for_logprob
-            if batch.spec_info is not None:
-                from sglang.srt.speculative.spec_info import (
-                    spec_scale_global_num_tokens,
-                )
-
-                global_num_tokens, global_num_tokens_for_logprob = (
-                    spec_scale_global_num_tokens(
-                        batch.spec_info,
-                        batch.global_num_tokens,
-                        batch.global_num_tokens_for_logprob,
-                    )
-                )
-            else:
-                global_num_tokens = batch.global_num_tokens
-                global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
-
-            ret.original_global_num_tokens_cpu = batch.global_num_tokens
-            ret.global_num_tokens_cpu = global_num_tokens
-            ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
-            ).to(device, non_blocking=True)
-
-            ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
-            ).to(device, non_blocking=True)
+        ret.init_mlp_sync_metadata(batch, device)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -921,7 +924,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
-                model_runner.server_args.attention_backend,
+                model_runner.prefill_attention_backend_str,
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
@@ -959,12 +962,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         if (
-            getattr(model_runner, "dcp_size", 1) > 1
+            model_runner.ps.attn_dcp_size > 1
             and ret.out_cache_loc is not None
             and is_hip()
         ):
             ret.dcp_kv_mask = (
-                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
+                ret.positions % model_runner.ps.attn_dcp_size
+                == model_runner.ps.attn_dcp_rank
             )
 
         return ret
@@ -1435,6 +1439,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._original_num_tokens = self.positions.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
+        if self.input_embeds is not None:
+            # Keep token-aligned inputs consistent after padding.
+            self.input_embeds = self._pad_tensor_to_size(self.input_embeds, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.lora_ids is not None:
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
@@ -1520,9 +1527,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_accept_tokens = self._pad_tensor_to_size(
                     spec_info.num_accept_tokens, bs
                 )
-            spec_info.hidden_states = self._pad_tensor_to_size(
-                spec_info.hidden_states, num_tokens
-            )
+            if spec_info.hidden_states is not None:
+                spec_info.hidden_states = self._pad_tensor_to_size(
+                    spec_info.hidden_states, num_tokens
+                )
 
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
         from sglang.srt.layers.communicator import get_attn_tp_context
@@ -1569,12 +1577,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
-                num_tokens = bs * self.spec_info.draft_token_num
+                num_tokens = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :num_tokens
                     ]
-                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[
+                        :num_tokens
+                    ]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:
