@@ -94,6 +94,8 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
+        req.req_pool_idx = None
+        req.dllm_incomplete_ids = array("q")
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
@@ -403,16 +405,31 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIn(req, adder.can_run_list)
         self.assertEqual(req.extend_range, Range(0, 32))
 
+    def test_dllm_staging_reuses_retained_kv_with_zero_available_pages(self):
+        adder = self.create_dllm_adder(is_prefill=False, available_size=0)
+        req = self.create_dllm_req(origin_len=20, prefix_len=0, is_prefill=False)
+        req.req_pool_idx = 1
+        req.dllm_incomplete_ids = array("q", range(32))
+        req.full_untruncated_fill_ids = list(req.dllm_incomplete_ids)
+        req.kv = SimpleNamespace(kv_allocated_len=32)
+        scheduler = SimpleNamespace(_abort_dllm_req_exact=MagicMock())
+
+        result = SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, adder, [req])
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(req.extend_range, Range(0, 32))
+        scheduler._abort_dllm_req_exact.assert_not_called()
+
     def test_dllm_staging_aborts_when_no_batch_can_make_progress(self):
         adder = self.create_dllm_adder(is_prefill=False, available_size=0)
         req = self.create_dllm_req(origin_len=20, prefix_len=0, is_prefill=False)
-        scheduler = SimpleNamespace(abort_request=MagicMock())
+        scheduler = SimpleNamespace(_abort_dllm_req_exact=MagicMock())
 
         result = SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, adder, [req])
 
         self.assertEqual(result, AddReqResult.NO_TOKEN)
-        scheduler.abort_request.assert_called_once()
-        self.assertEqual(scheduler.abort_request.call_args.args[0].rid, req.rid)
+        scheduler._abort_dllm_req_exact.assert_called_once_with(req)
 
     def test_dllm_scheduler_uses_normal_extend_only_for_prefill(self):
         scheduler = SimpleNamespace(

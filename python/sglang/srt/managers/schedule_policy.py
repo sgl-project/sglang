@@ -762,20 +762,25 @@ class PrefillAdder:
             if req.is_dllm_prefill()
             else self.dllm_block_size
         )
+        non_kv_budget = min(
+            self.rem_dllm_tokens,
+            per_req_cap,
+            self.rem_input_tokens,
+        )
+
+        # Retained incomplete-block KV is reused by alloc_for_extend; skip KV budget.
+        reuse_retained_kv = req.req_pool_idx is not None and bool(
+            req.dllm_incomplete_ids
+        )
+        if reuse_retained_kv:
+            return max(0, non_kv_budget)
+
         # Reuse the prefix page tail and do not reserve an extra page here.
         # The aligned extend may exactly fill the remaining pages.
         prefix_page_slack = (-len(req.prefix_indices)) % self.page_size
         kv_budget = min(int(self.rem_total_tokens), int(self.cur_rem_tokens))
         kv_budget += prefix_page_slack
-        return max(
-            0,
-            min(
-                self.rem_dllm_tokens,
-                per_req_cap,
-                self.rem_input_tokens,
-                kv_budget,
-            ),
-        )
+        return max(0, min(non_kv_budget, kv_budget))
 
     def _get_dllm_extend_len(self, req: Req, prefix_len: int) -> int:
         available = self._get_dllm_remain_tokens(req)
