@@ -352,8 +352,6 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
-
-    // ==== BF16 checkpoint — identical recipes, only --model-path resolves to the -BF16 repo ====
     // ==== NVIDIA B200 (SM100) + BF16, single GPU ====
     // The Nemotron-H resolver selects FlashInfer target attention without
     // speculation and TRT-LLM MHA target/eligible-draft attention with it.
