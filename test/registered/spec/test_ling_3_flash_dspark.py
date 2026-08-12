@@ -90,7 +90,6 @@ class _Ling3FlashServerMixin:
     classes mix it in so the base is never collected on its own.
     """
 
-    # Subclasses set these.
     _server_extra_args: list[str] = []
     _server_env: dict = {}
 
@@ -116,9 +115,6 @@ class _Ling3FlashServerMixin:
     def _run_gsm8k_and_assert(self) -> dict:
         metrics = _run_gsm8k(self)
         self.assertGreaterEqual(metrics["score"], GSM8K_SCORE_THRESHOLD)
-        # Fail loudly if the eval stack stops reporting finish reasons rather
-        # than silently dropping the no-EOS gate.
-        self.assertIn("stop_rate", metrics)
         self.assertGreaterEqual(metrics["stop_rate"], STOP_RATE_THRESHOLD)
         return metrics
 

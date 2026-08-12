@@ -124,7 +124,6 @@ class BailingHybridConfig(PretrainedConfig):
         self.moe_router_enable_expert_bias = moe_router_enable_expert_bias
         self.routed_scaling_factor = routed_scaling_factor
 
-        # MoE configs
         self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -134,12 +133,10 @@ class BailingHybridConfig(PretrainedConfig):
         self.first_k_dense_replace = first_k_dense_replace
         self.output_router_logits = output_router_logits
 
-        # Linear configs
         self.layer_group_size = layer_group_size
         self.group_norm_size = group_norm_size
         self.linear_silu = linear_silu
         self.num_linear_key_value_heads = num_attention_heads
-        # mla
         self.kv_lora_rank = kv_lora_rank
         self.q_lora_rank = q_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -147,7 +144,6 @@ class BailingHybridConfig(PretrainedConfig):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.rope_interleave = rope_interleave
-        # kda
         self.short_conv_kernel_size = short_conv_kernel_size
         # KDA is what distinguishes Ling-V3 from the V2.5 / lightning
         # checkpoints; only the former carries a short conv.

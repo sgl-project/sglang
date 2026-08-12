@@ -211,14 +211,12 @@ class DsV3MLA(DeepseekV2AttentionMLA):
 
     def _apply_gated(self, attn_output: torch.Tensor, gate: torch.Tensor):
         if self.gated_attention_proj_granularity_type == "head_wise":
-            # gate shape: [seq_len, head_num]
             attn_output = (
                 attn_output.view(-1, self.num_local_heads, self.v_head_dim)
                 * gate[:, :, None]
             )
             attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
         else:
-            # gate shape: [seq_len, head_num*head_dim]
             attn_output = attn_output * gate
         return attn_output
 
@@ -298,7 +296,6 @@ class BailingMLP(nn.Module):
         self.tp_size = tp_size if tp_size is not None else get_parallel().tp_size
         self.tp_rank = tp_rank if tp_rank is not None else get_parallel().tp_rank
 
-        # Store original and padded intermediate sizes
         self.intermediate_size = intermediate_size
         self.padded_intermediate_size = padded_intermediate_size or intermediate_size
 
@@ -322,7 +319,6 @@ class BailingMLP(nn.Module):
             tp_size=tp_size,
         )
 
-        # Pre-compute padding-related values for forward optimization
         if self.padded_intermediate_size > self.intermediate_size:
             self.padded_size_per_partition = (
                 self.padded_intermediate_size // self.tp_size
@@ -345,21 +341,13 @@ class BailingMLP(nn.Module):
     ):
         x, _ = self.gate_up_proj(x)
 
-        # Handle padded intermediate size for FP8 quantization
-        # When padded_intermediate_size > intermediate_size:
-        # - gate_up_proj outputs [batch, 2 * padded_intermediate_size_per_partition]
-        # - We need to extract the effective part, apply activation, then pad back
         if self.padded_size_per_partition is not None:
-            # Use pre-computed values for better performance
-            # Split into gate and up parts
             gate_padded = x[..., : self.padded_size_per_partition]
             up_padded = x[..., self.padded_size_per_partition :]
 
-            # Extract effective parts
             gate_effective = gate_padded[..., : self.effective_size_per_partition]
             up_effective = up_padded[..., : self.effective_size_per_partition]
 
-            # Apply SiLU to gate and multiply with up
             if self.swiglu_limit is not None:
                 x = F.silu(gate_effective).clamp(
                     max=self.swiglu_limit
@@ -367,7 +355,6 @@ class BailingMLP(nn.Module):
             else:
                 x = F.silu(gate_effective) * up_effective
 
-            # Pad back to padded_intermediate_size_per_partition for down_proj
             x = F.pad(x, (0, self.pad_size_per_partition))
         else:
             if self.swiglu_limit is not None:
@@ -458,10 +445,8 @@ class BailingMoE(nn.Module):
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.score_function = getattr(config, "score_function", None)
 
-        # Fuse shared experts support
         self.num_fused_shared_experts = num_fused_shared_experts
 
-        # SwiGLU clip limits
         expert_swiglu_limit_list = getattr(config, "expert_swiglu_limit_list", None)
         share_expert_swiglu_limit_list = getattr(
             config, "share_expert_swiglu_limit_list", None
@@ -481,7 +466,6 @@ class BailingMoE(nn.Module):
         # ling-v3 TP4: accuracy-neutral (greedy), ~17% bs=1 TPOT improvement.
         self.router_dtype = torch.bfloat16
 
-        # check group topk
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
         if self.num_expert_group > 0 or self.topk_group > 0:
@@ -512,7 +496,6 @@ class BailingMoE(nn.Module):
                 self.score_function == "sigmoid" and self.correction_bias is not None
             ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
 
-        # Whether A2A MoE (DeepEP, etc.) is enabled
         self._enable_a2a_moe = not get_moe_a2a_backend().is_none()
 
         # Scaling factor for fused shared experts in EP mode.
@@ -568,7 +551,6 @@ class BailingMoE(nn.Module):
             and self.routed_scaling_factor != 1.0
         )
 
-        # Only create separate shared_experts when not using fusion
         if self.num_shared_experts > 0 and self.num_fused_shared_experts == 0:
             intermediate_size = getattr(
                 config,
@@ -584,8 +566,6 @@ class BailingMoE(nn.Module):
             if self._enable_a2a_moe:
                 shared_tp_kwargs = dict(tp_rank=0, tp_size=1)
                 shared_tp_size = 1
-            # Compute padded intermediate size for FP8 quantization using the
-            # actual TP degree used by shared_experts.
             padded_intermediate_size = self._compute_padded_intermediate_size(
                 intermediate_size, quant_config, shared_tp_size
             )
@@ -629,12 +609,9 @@ class BailingMoE(nn.Module):
         if quant_config is None:
             return None
 
-        # Only apply padding for FP8 quantization
         if quant_config.get_name() != "fp8":
             return None
 
-        # Get block size from quantization config
-        # FP8 uses block_n for column parallel and block_k for row parallel
         weight_block_size = getattr(quant_config, "weight_block_size", None)
         if weight_block_size is None:
             return None
@@ -643,17 +620,14 @@ class BailingMoE(nn.Module):
         block_k = weight_block_size[1]
         block_size = max(block_n, block_k)
 
-        # Check if padding is needed
         intermediate_size_per_partition = intermediate_size // tp_size
 
-        # Check if already aligned
         if (
             intermediate_size_per_partition % block_n == 0
             and intermediate_size_per_partition % block_k == 0
         ):
             return None
 
-        # Compute padded size: align to block_size * tp_size
         alignment = block_size * tp_size
         padded_intermediate_size = (
             (intermediate_size + alignment - 1) // alignment
@@ -1027,7 +1001,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
             )
         else:
             if is_nextn or self.layer_id >= config.first_k_dense_replace:
-                # MoE layer
                 self.mlp = BailingMoE(
                     config,
                     quant_config=quant_config,
@@ -1037,7 +1010,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     alt_stream=alt_stream,
                 )
             else:
-                # dense layer
                 self.mlp = BailingMLP(
                     hidden_size=self.hidden_size,
                     intermediate_size=config.intermediate_size,
@@ -1085,15 +1057,12 @@ class BailingMoELinearDecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Step 1: prepare_attn (dp_scatter + input_layernorm)
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
 
-        # Step 2: attention
         if not forward_batch.forward_mode.is_idle():
             if self.attention_type == 0:
-                # KDA (linear attention) — needs zero_allocator
                 hidden_states = self.attention(
                     hidden_states=hidden_states,
                     positions=positions,
@@ -1101,7 +1070,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     zero_allocator=zero_allocator,
                 )
             elif self.use_mla:
-                # MLA (softmax attention)
                 hidden_states = self.attention(
                     positions=positions,
                     hidden_states=hidden_states,
@@ -1109,19 +1077,16 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     zero_allocator=zero_allocator,
                 )
             else:
-                # GQA fallback
                 hidden_states = self.attention(
                     hidden_states=hidden_states,
                     positions=positions,
                     forward_batch=forward_batch,
                 )
 
-        # Step 3: prepare_mlp (all-reduce attn output + dp_gather + post_attention_layernorm)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
 
-        # Step 4: MLP
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
@@ -1145,7 +1110,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     forward_batch=forward_batch,
                 )
 
-        # Step 5: postprocess_layer (dp_scatter for next layer)
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -1393,7 +1357,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
         quant_config,
         expected_architecture="BailingMoeV3ForCausalLM",
     ):
-        """Why this checkpoint cannot fuse its shared experts, or None."""
         num_shared_experts = getattr(hf_config, "num_shared_experts", 0)
         if num_shared_experts == 0:
             return None
@@ -1496,7 +1459,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
                 f"one fused shared expert. AMD platform with aiter supports multiple shared experts."
             )
 
-        # Log EP mode info
         moe_ep_size = get_parallel().moe_ep_size
         if moe_ep_size > 1:
             log_info_on_rank0(
@@ -1511,7 +1473,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
             )
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        # Perform post-processing after loading weights
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
         else:
@@ -1536,7 +1497,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
             if hasattr(self_attn.kv_b_proj, "qweight"):
-                # AWQ compatible
                 if _is_cuda or _is_hip:
                     w = awq_dequantize(
                         self_attn.kv_b_proj.qweight,
@@ -1619,7 +1579,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
 
             if w.dtype == torch.int8:
                 if hasattr(self.quant_config, "weight_block_size"):
-                    # block-wise int8 need it
                     weight_block_size = self.quant_config.weight_block_size
                     if weight_block_size is not None:
                         assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
@@ -1629,7 +1588,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
                             weight, weight_scale, weight_block_size
                         ).to(torch.bfloat16)
                 else:
-                    # channel-wise int8 need it
                     w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
                         torch.bfloat16
                     )
@@ -1769,24 +1727,20 @@ class BailingMoeV3ForCausalLM(nn.Module):
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", self.weight_direct_load)
             if "A_log" in name:
-                # Temporary use this way
-                # As our A_log param's shape is different from kimi's
+                # A_log param shape differs from Kimi's
                 loaded_weight = loaded_weight[None, None, :, None]
             weight_loader(param, loaded_weight)
             return
 
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
-            # no_kda_lora
             (".fused_qkvbfg_proj", ".q_proj", 0),
             (".fused_qkvbfg_proj", ".k_proj", 1),
             (".fused_qkvbfg_proj", ".v_proj", 2),
             (".fused_qkvbfg_proj", ".b_proj", 3),
             (".fused_qkvbfg_proj", ".f_proj", 3),
             (".fused_qkvbfg_proj", ".g_proj", 4),
-            # Fused path
             (".fused_qkvbfg_a_proj", ".q_proj", 0),
             (".fused_qkvbfg_a_proj", ".k_proj", 1),
             (".fused_qkvbfg_a_proj", ".v_proj", 2),
@@ -1795,11 +1749,9 @@ class BailingMoeV3ForCausalLM(nn.Module):
             (".fused_qkvbfg_a_proj", ".g_a_proj", 5),
             (".fused_fg_b_proj", ".f_b_proj", 0),
             (".fused_fg_b_proj", ".g_b_proj", 1),
-            # Unfused path: separate qkv_proj (when do_fuse_qkvbfg=False)
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            # qkv conv fuse
             (".qkv_conv1d", ".q_conv1d", 0),
             (".qkv_conv1d", ".k_conv1d", 1),
             (".qkv_conv1d", ".v_conv1d", 2),

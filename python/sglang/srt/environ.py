@@ -1077,7 +1077,6 @@ class Envs:
 
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
-    # ====================================================================
     # Linear attention (KDA)
     # Fuse KDA conv1d + gating-delta-rule into one kernel on the MTP
     # target-verify chain path (speculative_eagle_topk == 1). Experimental.

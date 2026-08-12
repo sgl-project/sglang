@@ -275,13 +275,13 @@ class KimiDeltaAttention(nn.Module):
                 tp_rank=self.shard_tp_rank,
                 tp_size=self.shard_tp_size,
             )
-            self.split_sizes = [3 * projection_size // self.shard_tp_size]  # qkv
+            self.split_sizes = [3 * projection_size // self.shard_tp_size]
             if self.fuse_no_lora_beta:
-                self.split_sizes.append(self.num_heads // self.shard_tp_size)  # beta
+                self.split_sizes.append(self.num_heads // self.shard_tp_size)
             self.split_sizes.extend(
                 [
-                    projection_size // self.shard_tp_size,  # f
-                    projection_size // self.shard_tp_size,  # g
+                    projection_size // self.shard_tp_size,
+                    projection_size // self.shard_tp_size,
                 ]
             )
             if not self.fuse_no_lora_beta:
@@ -305,17 +305,17 @@ class KimiDeltaAttention(nn.Module):
 
             self.fused_qkvbfg_a_proj = MergedColumnParallelRepeatedLinear(
                 self.hidden_size,
-                self.qkvb_sizes,  # Column parallel
-                self.fg_sizes,  # Replicated: f_a, g_a
+                self.qkvb_sizes,
+                self.fg_sizes,
                 quant_config=quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
                 tp_rank=self.shard_tp_rank,
                 tp_size=self.shard_tp_size,
             )
             self.split_sizes = [
-                3 * projection_size // self.shard_tp_size,  # qkv
-                self.num_heads // self.shard_tp_size,  # beta
-                2 * self.head_dim,  # f_a, g_a
+                3 * projection_size // self.shard_tp_size,
+                self.num_heads // self.shard_tp_size,
+                2 * self.head_dim,
             ]
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
                 2,
@@ -449,7 +449,6 @@ class KimiDeltaAttention(nn.Module):
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        # Compute beta, forget_gate, and g_proj_states
         beta = self.b_proj(hidden_states)[0]
         forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
@@ -462,7 +461,6 @@ class KimiDeltaAttention(nn.Module):
         )
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
-        # Single fused projection for all: qkv + beta + f_a + g_a
         if self.no_kda_lora:
             # Full-rank f/g: everything comes out of one GEMM, no batched
             # second-stage matmul.

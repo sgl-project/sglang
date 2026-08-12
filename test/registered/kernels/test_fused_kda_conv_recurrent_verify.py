@@ -18,7 +18,6 @@ register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 
 _DEVICE = "cuda"
 
-# (B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed)
 _CASES = [
     (1, 4, 4, 4, 128, 128, 4, False, None, False, 1),
     (1, 4, 4, 4, 128, 128, 4, True, None, False, 2),

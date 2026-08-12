@@ -84,8 +84,6 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         self.assertAlmostEqual(shared_weight, 1.0 / self.ROUTED_SCALING_FACTOR)
 
     def _run_post_process_standard_path(self, *, scaling_factor):
-        """Run _post_process_topk_ids on the standard path (no aiter, no
-        per-rank shared slots, non-CUDA/HIP dispatch)."""
         topk_ids = torch.tensor([[5, 40, 100, 256]], dtype=torch.int32)
         topk_weights = torch.tensor([[1.0, 0.5, 0.25, 1.0]], dtype=torch.float32)
         topk_config = TopKConfig(

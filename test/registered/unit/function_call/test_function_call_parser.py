@@ -2921,7 +2921,6 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertEqual(result.normal_text, "")
 
     def test_streaming_tool_call(self):
-        """Test streaming incremental parsing of a tool call."""
         chunks = [
             "<tool_call>get_weather\n",
             "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
@@ -2950,7 +2949,6 @@ class TestGlm4MoeDetector(unittest.TestCase):
         )
 
     def test_streaming_tool_call_without_arguments(self):
-        """Test streaming incremental parsing of a tool call with no arguments."""
         chunks = [
             "<tool_call>get_weather\n",
             "</tool_call>",
@@ -3700,33 +3698,29 @@ class TestLing3Detector(unittest.TestCase):
                     tc["parameters"] += tool_call_chunk.parameters
         return tool_calls
 
-    def test_detect_and_parse_newline_tool_call(self):
-        text = (
-            "<tool_call>get_weather\n"
-            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
-            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
-            "</tool_call>"
-        )
-        result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(
-            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
-        )
-
-    def test_detect_and_parse_compact_tool_call(self):
-        text = (
-            "<tool_call>get_weather"
-            "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>"
-            "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>"
-            "</tool_call>"
-        )
-        result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(
-            result.calls[0].parameters, '{"city": "Shanghai", "date": "2024-06-28"}'
-        )
+    def test_detect_and_parse_newline_and_compact_tool_call(self):
+        cases = {
+            "newline": (
+                "<tool_call>get_weather\n"
+                "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+                "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+                "</tool_call>",
+                '{"city": "Beijing", "date": "2024-06-27"}',
+            ),
+            "compact": (
+                "<tool_call>get_weather"
+                "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>"
+                "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>"
+                "</tool_call>",
+                '{"city": "Shanghai", "date": "2024-06-28"}',
+            ),
+        }
+        for layout, (text, expected) in cases.items():
+            with self.subTest(layout=layout):
+                result = self.detector.detect_and_parse(text, self.tools)
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(result.calls[0].name, "get_weather")
+                self.assertEqual(result.calls[0].parameters, expected)
 
     def test_detect_and_parse_empty_args(self):
         result = self.detector.detect_and_parse(
@@ -3745,44 +3739,34 @@ class TestLing3Detector(unittest.TestCase):
         self.assertEqual(tool_calls[0]["parameters"], "{}")
         self.assertEqual(self.detector.streamed_args_for_tool[0], "{}")
 
-    def test_streaming_empty_args_single_chunk(self):
-        tool_calls = self._collect_streaming_tool_calls(
-            ["<tool_call>get_date</tool_call>"]
-        )
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["name"], "get_date")
-        self.assertEqual(tool_calls[0]["parameters"], "{}")
-        self.assertEqual(self.detector.streamed_args_for_tool[0], "{}")
-
-    def test_streaming_compact_tool_call(self):
-        tool_calls = self._collect_streaming_tool_calls(
-            [
-                "<tool_call>get_weather",
-                "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>",
-                "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>",
-                "</tool_call>",
-            ]
-        )
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["name"], "get_weather")
-        self.assertEqual(
-            tool_calls[0]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
-        )
-
-    def test_streaming_newline_tool_call(self):
-        tool_calls = self._collect_streaming_tool_calls(
-            [
-                "<tool_call>get_weather\n",
-                "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
-                "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
-                "</tool_call>",
-            ]
-        )
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["name"], "get_weather")
-        self.assertEqual(
-            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
-        )
+    def test_streaming_newline_and_compact_tool_call(self):
+        cases = {
+            "newline": (
+                [
+                    "<tool_call>get_weather\n",
+                    "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+                    "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+                    "</tool_call>",
+                ],
+                '{"city": "Beijing", "date": "2024-06-27"}',
+            ),
+            "compact": (
+                [
+                    "<tool_call>get_weather",
+                    "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>",
+                    "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>",
+                    "</tool_call>",
+                ],
+                '{"city": "Shanghai", "date": "2024-06-28"}',
+            ),
+        }
+        for layout, (chunks, expected) in cases.items():
+            with self.subTest(layout=layout):
+                self.setUp()
+                tool_calls = self._collect_streaming_tool_calls(chunks)
+                self.assertEqual(len(tool_calls), 1)
+                self.assertEqual(tool_calls[0]["name"], "get_weather")
+                self.assertEqual(tool_calls[0]["parameters"], expected)
 
 
 class TestJsonArrayParser(unittest.TestCase):

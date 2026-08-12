@@ -413,7 +413,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             source=self.buffers,
         )
 
-        # --- metadata glue graph (opt-in) ------------------------------
         # Captures the per-replay attention-metadata prep into a small CUDA
         # graph; see metadata_glue_graph.py for the correctness contract.
         # Force-off for DFlash-family spec: verify installs host-fed fast

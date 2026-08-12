@@ -126,7 +126,6 @@ class BailingMoEModelNextN(nn.Module):
                 config,
                 0,
                 quant_config=quant_config,
-                # is_nextn=True,
                 prefix=add_prefix("decoder", prefix),
             )
 
@@ -197,7 +196,6 @@ class BailingMoeForCausalLMNextN(nn.Module):
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-    # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
             "attention.dense": "attention.o_proj",
