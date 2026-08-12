@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
+    get_schedule,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
@@ -37,7 +38,6 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         num_tokens: int,
         max_running_requests: int,
         device: str,
-        num_tokens_per_bs: int = 1,
     ) -> Optional["RoutedExpertsCapturer"]:
         if not get_exec().features.enable_return_routed_experts:
             return None
@@ -50,7 +50,6 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             max_running_requests=max_running_requests,
             num_fused_shared_experts=num_fused_shared_experts,
             device=device,
-            num_tokens_per_bs=num_tokens_per_bs,
         )
 
     def __init__(
@@ -60,7 +59,6 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         max_running_requests: int,
         num_fused_shared_experts: int,
         device: str,
-        num_tokens_per_bs: int = 1,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
         topk_size = model_config.hf_text_config.num_experts_per_tok
@@ -70,13 +68,10 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
         # and otherwise overflows on dp_rank > 0 when max_running_requests >
         # chunked_prefill_size.
-        #
-        # Under speculative decoding the captured batch is TARGET_VERIFY with
-        # `num_tokens_per_bs` draft tokens per sequence.
-        num_tokens_per_bs = max(1, num_tokens_per_bs)
+        # FIXME: spec decoding's num_verify_tokens is still not accounted for.
         max_batch_size = max(
-            get_exec().schedule.chunked_prefill_size * get_exec().parallel.dp_size,
-            max_running_requests * get_exec().parallel.dp_size * num_tokens_per_bs,
+            get_schedule().chunked_prefill_size * get_parallel().dp_size,
+            max_running_requests * get_parallel().dp_size,
         )
 
         super().__init__(

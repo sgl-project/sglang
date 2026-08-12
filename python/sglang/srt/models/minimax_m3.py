@@ -29,7 +29,6 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
 )
 from sglang.srt.distributed import (
-    get_attn_tp_group,
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -44,7 +43,6 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attn_tp_group,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -130,12 +128,6 @@ if _is_hip:
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
         split_qkv_rmsnorm_rope_pos_cache_half_npu,
-    )
-
-    # Per-layer qk-norm + partial RoPE + q|k|v split fallback (used by the
-    # non-fused branch of forward_prepare_npu for dense per_layer layers).
-    from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import (
-        split_qkv_tp_rmsnorm_rope,
     )
 
     from sglang.srt.hardware_backend.npu.utils import (
@@ -1049,35 +1041,6 @@ class MiniMaxM3Attention(nn.Module):
             return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
 
-    def _can_use_npu_fused_qkv_norm_rope(self) -> bool:
-        """Main qkv can use the fused per-head GemmaRMSNorm + RoPE + split op."""
-        return (
-            _is_npu
-            and self.use_qk_norm
-            and self.qk_norm_type == "per_head"
-            and self.use_gemma_norm
-            and self.head_dim == 128
-            and self.rotary_dim == 64
-            and getattr(self.rotary_emb, "is_neox_style", False)
-            and getattr(self.rotary_emb, "cos_sin_cache", None) is not None
-            # bf16 cache is accepted: the fused kernel upcasts to fp32 in-kernel.
-            and self.rotary_emb.cos_sin_cache.dtype in (torch.float32, torch.bfloat16)
-        )
-
-    def _can_use_npu_fused_index_qkv_norm_rope(self) -> bool:
-        """Fused split [q|k|v] + norm + RoPE applies to idx_qkv.
-
-        Main-branch guards carry over (index_rotary_emb IS rotary_emb). M3 disables
-        the index V head, so this returns False for all M3 layers; it only fires
-        for configs that keep the index V head.
-        """
-        return (
-            self.is_sparse_attention_layer
-            and not self.disable_index_value
-            and self.num_idx_heads >= 1
-            and (self.idx_head_dim & (self.idx_head_dim - 1)) == 0  # power of 2
-        )
-
     def forward_prepare_npu(
         self,
         positions: torch.Tensor,
@@ -1091,65 +1054,29 @@ class MiniMaxM3Attention(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, forward_batch, None
 
-        if self._can_use_npu_fused_qkv_norm_rope():
-            # One fused op: per-head GemmaRMSNorm + partial NeoX RoPE + QKV split.
-            qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
-                input_tensor=qkv,
-                positions=positions.reshape(-1),
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                q_hidden_size=self.q_size,
-                kv_hidden_size=self.kv_size,
-                head_dim=self.head_dim,
-                eps=self.q_norm.variance_epsilon,
-                q_weight=self.q_norm.gemma_weight,
-                k_weight=self.k_norm.gemma_weight,
-                rope_dim=self.rotary_dim,
-                cast_norm_to_bf16=True,
-            )
-            if self.is_sparse_attention_layer:
-                idx_qkv, _ = self.index_qkv_proj(hidden_states)
-                if self._can_use_npu_fused_index_qkv_norm_rope():
-                    # Same fused op as the main branch (shared gemma_weight buffers).
-                    idx_q, idx_k, idx_v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
-                        input_tensor=idx_qkv,
-                        positions=positions.reshape(-1),
-                        cos_sin_cache=self.index_rotary_emb.cos_sin_cache,
-                        q_hidden_size=self.num_idx_heads * self.idx_head_dim,
-                        kv_hidden_size=self.idx_head_dim,
-                        head_dim=self.idx_head_dim,
-                        eps=self.index_q_norm.variance_epsilon,
-                        q_weight=self.index_q_norm.gemma_weight,
-                        k_weight=self.index_k_norm.gemma_weight,
-                        rope_dim=self.rotary_dim,
-                        cast_norm_to_bf16=True,
-                    )
-                else:
-                    idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
-                    idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
-                inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
-            else:
-                inner_state = (q, k, v, forward_batch)
-            return None, forward_batch, inner_state
-
         qkv, _ = self.qkv_proj(hidden_states)
-        cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        q, k, v = split_qkv_tp_rmsnorm_rope(
-            input=qkv,
-            cos=cos,
-            sin=sin,
-            q_weight=self.q_norm.weight,
-            k_weight=self.k_norm.weight,
+        q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
+            input_tensor=qkv,
+            positions=positions.reshape(-1),
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
             q_hidden_size=self.q_size,
             kv_hidden_size=self.kv_size,
             head_dim=self.head_dim,
-            rotary_dim=self.rotary_dim,
             eps=self.q_norm.variance_epsilon,
-            tp_world=getattr(self.q_norm, "attn_tp_size", self.attn_tp_size),
-            tp_group=get_attn_tp_group().device_group,
+            q_weight=self.q_norm.gemma_weight,
+            k_weight=self.k_norm.gemma_weight,
+            rope_dim=self.rotary_dim,
+            cast_norm_to_bf16=True,
         )
-        inner_state = (q, k, v, None, forward_batch)
+        if self.is_sparse_attention_layer:
+            idx_qkv, _ = self.index_qkv_proj(hidden_states)
+            # Index attention disables the V head on all M3 sparse layers, so
+            # index_qkv_proj emits a 2-way [q|k] tensor.
+            idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+            idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
+            inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
+        else:
+            inner_state = (q, k, v, forward_batch)
         return None, forward_batch, inner_state
 
     def forward_prepare(
@@ -1675,8 +1602,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 num_layers // 2,
                 num_layers - 3,
             ]
-            if _is_npu:
-                self.model.layers_to_capture = [val + 1 for val in layer_ids]
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
