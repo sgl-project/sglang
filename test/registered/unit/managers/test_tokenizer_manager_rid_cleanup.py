@@ -515,7 +515,9 @@ class TestDiscardPendingReqStates(CustomTestCase):
         tm = _make_tokenizer_manager()
         rid = "discard_lease_rid"
         tm.rid_to_state[rid] = _make_req_state(rid)
-        tm._mm_cache_retry_contexts[rid] = Mock(lease_id="lease-2", routed_dp_rank=3)
+        tm._mm_cache_retry_contexts[rid] = Mock(
+            lease_id="lease-2", routed_dp_rank=3, dispatched=False
+        )
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = True
         obj.rid = rid

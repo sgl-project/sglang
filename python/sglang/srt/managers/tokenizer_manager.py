@@ -3707,7 +3707,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _release_pending_mm_cache_lease(self, rid: str) -> None:
         contexts = getattr(self, "_mm_cache_retry_contexts", {})
         context = contexts.get(rid)
-        if context is not None and context.dispatched:
+        if context is not None and context.dispatched is True:
             return
         context = contexts.pop(rid, None)
         if context is not None:
@@ -3715,7 +3715,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _mark_mm_cache_lease_dispatched(self, rid: str) -> None:
         context = getattr(self, "_mm_cache_retry_contexts", {}).get(rid)
-        if context is not None and not context.dispatched:
+        if context is not None and context.dispatched is False:
             self._mm_cache_retry_contexts[rid] = dataclasses.replace(
                 context, dispatched=True
             )
