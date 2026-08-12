@@ -108,8 +108,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
     let policy = CacheAwareZmqPolicy::new(
         CacheAwareConfig {
             cache_threshold: 0.0,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
+            ..Default::default()
         },
         kv_index.tree(),
         Arc::clone(&tokenizers),
@@ -148,8 +147,9 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         .expect("send block-stored event");
 
     // 7. Bump worker B's load so the tie-break picks A among matched
-    //    workers. The bump stays below balance_abs_threshold so the
-    //    imbalance fast-path does not skip cache-aware selection.
+    //    workers. The bump stays under the default fleet-spread gate's
+    //    absolute threshold so the imbalance fast-path does not skip
+    //    cache-aware selection.
     //    Bind the guards to a Vec held for the rest of the test scope
     //    so the counter stays > 0 through the polling loop.
     let w_a = build_worker(url_a, "tiny");

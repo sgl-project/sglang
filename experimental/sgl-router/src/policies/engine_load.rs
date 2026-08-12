@@ -108,6 +108,54 @@ struct LoadEntry {
     at: Instant,
 }
 
+/// One worker's engine-reported load, summed across its dp ranks.
+///
+/// The two halves are stored, not the sum, so `waiting <= depth()` holds by
+/// construction. Storing `running + waiting` and `waiting` instead would let a
+/// caller build a value where the queue exceeds the total, and would discard
+/// `running` — the quantity that answers whether an engine is near its
+/// concurrency cap or queueing well below it, which is the observation this
+/// whole load signal exists to expose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkerDepth {
+    running: usize,
+    waiting: usize,
+}
+
+impl WorkerDepth {
+    pub fn new(running: usize, waiting: usize) -> Self {
+        Self { running, waiting }
+    }
+
+    /// Total outstanding work. Ranks who is least loaded.
+    pub fn depth(&self) -> usize {
+        self.running.saturating_add(self.waiting)
+    }
+
+    /// Requests admitted to the engine that have not started yet — the direct
+    /// answer to "would a request sent here wait behind others", which
+    /// [`Self::depth`] only approximates, and approximates badly: an engine can
+    /// queue while running well below its concurrency cap, so equal depth does
+    /// not imply equal queue.
+    ///
+    /// Summed across the worker's dp ranks while a request is dispatched to
+    /// one of them, so on a multi-rank worker this reads roughly `dp_size`
+    /// times the queue any single request would actually sit behind.
+    pub fn waiting(&self) -> usize {
+        self.waiting
+    }
+
+    /// Requests the engine is actively working on.
+    pub fn running(&self) -> usize {
+        self.running
+    }
+
+    fn add(&mut self, other: Self) {
+        self.running = self.running.saturating_add(other.running);
+        self.waiting = self.waiting.saturating_add(other.waiting);
+    }
+}
+
 /// Per-`(worker_url, dp_rank)` engine-reported load. Written by the load
 /// subscriber pump, read by the cache-aware-zmq policy. Shared out of
 /// [`super::kv_events::index::KvEventIndex`] the same way the hash tree is.
@@ -186,35 +234,62 @@ impl EngineLoadTable {
     /// not a correctness hole) rather than something this method can close
     /// on its own — closing it would require per-rank dispatch attribution,
     /// which the router-side slot tracking below doesn't have.
-    pub(crate) fn fresh_worker_state(&self, now: Instant) -> HashMap<String, (usize, Instant)> {
-        // url -> (summed depth across all ranks, all-ranks-fresh, oldest at).
-        let mut acc: HashMap<String, (usize, bool, Instant)> = HashMap::new();
+    /// `depth` and `waiting` are kept apart rather than pre-summed because they
+    /// answer different questions and the difference is load-bearing. `depth`
+    /// ranks who is least loaded. `waiting` alone says whether a request sent
+    /// here would sit behind others before its prefill starts — and on real
+    /// traffic those diverge: engines have been observed queueing at 7-8
+    /// running, far below `max_running_requests`, so a large `depth` is neither
+    /// necessary nor sufficient for "this worker will make you wait".
+    pub(crate) fn fresh_worker_state(
+        &self,
+        now: Instant,
+    ) -> HashMap<String, (WorkerDepth, Instant)> {
+        // A named accumulator, not a 4-tuple: the fields are read by name at
+        // every update, so adding one cannot silently renumber the others.
+        struct Acc {
+            load: WorkerDepth,
+            all_fresh: bool,
+            oldest_at: Instant,
+        }
+        let mut acc: HashMap<String, Acc> = HashMap::new();
         for entry in self.by_rank.iter() {
             let at = entry.value().at;
             let fresh = now.duration_since(at) <= self.freshness;
             let l = &entry.value().load;
-            let depth = (l.num_running_reqs.saturating_add(l.num_waiting_reqs)) as usize;
-            let slot = acc.entry(entry.key().0.clone()).or_insert((0, true, at));
-            slot.0 = slot.0.saturating_add(depth);
-            slot.1 = slot.1 && fresh;
-            slot.2 = slot.2.min(at);
+            // `try_from`, not `as`: the counts are engine-supplied and the
+            // deserializer defaults missing fields, so they are not trusted
+            // input. Two independent truncating casts could otherwise produce
+            // `waiting > running + waiting` on a 32-bit target.
+            let rank = WorkerDepth::new(
+                usize::try_from(l.num_running_reqs).unwrap_or(usize::MAX),
+                usize::try_from(l.num_waiting_reqs).unwrap_or(usize::MAX),
+            );
+            let slot = acc.entry(entry.key().0.clone()).or_insert(Acc {
+                load: WorkerDepth::default(),
+                all_fresh: true,
+                oldest_at: at,
+            });
+            slot.load.add(rank);
+            slot.all_fresh = slot.all_fresh && fresh;
+            slot.oldest_at = slot.oldest_at.min(at);
         }
         acc.into_iter()
-            .filter_map(|(url, (depth, all_fresh, oldest_at))| {
-                all_fresh.then_some((url, (depth, oldest_at)))
-            })
+            .filter_map(|(url, a)| a.all_fresh.then_some((url, (a.load, a.oldest_at))))
             .collect()
     }
 
-    /// Per worker URL, the summed queue depth (`num_running_reqs +
-    /// num_waiting_reqs`) across that worker's ranks, for workers whose
-    /// every known rank is fresh. Computed once per selection so per-worker
-    /// lookups are O(1). See [`Self::fresh_worker_state`] for the freshness
-    /// gate behind this.
+    /// Per worker URL, total depth across that worker's ranks, for workers
+    /// whose every known rank is fresh.
+    ///
+    /// Test-only, and deliberately not public: it collapses the queue back into
+    /// the depth sum, which is exactly the distinction the routing path depends
+    /// on keeping. Production reads [`Self::fresh_worker_state`].
+    #[cfg(test)]
     pub fn snapshot_fresh(&self, now: Instant) -> HashMap<String, usize> {
         self.fresh_worker_state(now)
             .into_iter()
-            .map(|(url, (depth, _))| (url, depth))
+            .map(|(url, (d, _))| (url, d.depth()))
             .collect()
     }
 
@@ -304,8 +379,30 @@ mod tests {
         let now = later + Duration::from_millis(1);
         assert_eq!(
             t.fresh_worker_state(now).get("http://w:30000").copied(),
-            Some((11, earlier)),
-            "must expose the OLDEST rank's timestamp, not the newest"
+            Some((WorkerDepth::new(8, 3), earlier)),
+            "must sum depth AND waiting across ranks, and expose the OLDEST rank's timestamp"
+        );
+    }
+
+    /// `waiting` must survive the per-URL rank sum as its own quantity: the
+    /// queue gate reads it directly, and collapsing it into `depth` is what the
+    /// gate exists to stop doing.
+    #[test]
+    fn fresh_worker_state_keeps_waiting_separable_from_depth() {
+        let t = EngineLoadTable::new();
+        let now = Instant::now();
+        // Same depth (13), very different queueing behaviour.
+        t.set("http://queueing:30000", 0, load(8, 5), now);
+        t.set("http://flowing:30000", 0, load(13, 0), now);
+        let state = t.fresh_worker_state(now);
+        assert_eq!(
+            state.get("http://queueing:30000").map(|(d, _)| *d),
+            Some(WorkerDepth::new(8, 5)),
+        );
+        assert_eq!(
+            state.get("http://flowing:30000").map(|(d, _)| *d),
+            Some(WorkerDepth::new(13, 0)),
+            "equal depth must not imply equal queue"
         );
     }
 

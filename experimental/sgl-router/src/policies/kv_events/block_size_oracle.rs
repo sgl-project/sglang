@@ -23,7 +23,7 @@
 //! through `KvEventIndex::add_worker`; that refactor can land later
 //! without changing the oracle's public surface.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Tri-state for the bigram flag: distinguishes "not yet reported" from an
@@ -40,15 +40,25 @@ const BIGRAM_BIGRAM: u8 = 2;
 /// [`Self::get`] to read at routing time.
 ///
 /// Also carries a `bigram` flag — EAGLE-family workers hash KV blocks over
-/// token bigrams, so the policy must pick the bigram hasher. Like `value` it
-/// is a per-cluster property (all workers run the same model) and is
-/// established first-wins with a loud warning on disagreement, mirroring
-/// `try_set` — a heterogeneous EAGLE/non-EAGLE cluster would otherwise let the
-/// last registrant silently flip the global hashing mode.
+/// token bigrams, so the policy must pick the bigram hasher. The **primary**
+/// mode (`bigram`) is established first-wins, mirroring `try_set`, and is what
+/// `hash_config` / `is_bigram` report — the peer-snapshot prewarm protocol
+/// vets replicas against it, so it must stay a single stable value.
+///
+/// A heterogeneous fleet (EAGLE-family + non-EAGLE workers behind one base
+/// model — e.g. an EAGLE3 fleet with a non-EAGLE canary) is no longer treated as
+/// pure misconfiguration: the second mode's arrival is recorded in
+/// `secondary_seen` so [`Self::is_bimodal`] reports it, and the selection path
+/// dual-hashes queries (hashing each request both ways and unioning the
+/// eligible owners) so neither family loses cache affinity. `block_size` must
+/// still agree across the fleet; only the hashing *mode* may differ.
 #[derive(Debug, Default)]
 pub struct BlockSizeOracle {
     value: AtomicU32,
     bigram: AtomicU8,
+    /// Latched `true` once a worker registers with the opposite hashing mode
+    /// from the established primary — i.e. the fleet is bimodal.
+    secondary_seen: AtomicBool,
 }
 
 /// Returned by [`BlockSizeOracle::try_set`] when the candidate disagrees
@@ -77,12 +87,15 @@ impl BlockSizeOracle {
         }
     }
 
-    /// Publish whether the cluster's workers use bigram (EAGLE-family) KV-block
+    /// Publish whether a registering worker uses bigram (EAGLE-family) KV-block
     /// hashing. Called from `KvEventIndex::add_worker` alongside `try_set`.
-    /// First-wins: the first worker establishes the mode; a later worker that
-    /// disagrees is logged (not silently honored), since the query-hashing mode
-    /// is process-wide and one mismatched worker would zero out cache-aware
-    /// routing for the cluster.
+    ///
+    /// The **primary** mode is first-wins (the first worker establishes what
+    /// `hash_config` / `is_bigram` report, which the peer-snapshot protocol
+    /// depends on). A later worker of the *opposite* mode no longer just loses:
+    /// it latches [`Self::is_bimodal`] so the selection path dual-hashes queries
+    /// and both families keep cache affinity. `block_size` must still agree
+    /// (enforced separately by [`Self::try_set`]); only the mode may differ.
     pub fn set_bigram(&self, is_bigram: bool) {
         let candidate = if is_bigram {
             BIGRAM_BIGRAM
@@ -98,16 +111,30 @@ impl BlockSizeOracle {
             Ok(_) => {}
             Err(existing) if existing == candidate => {}
             Err(existing) => {
-                tracing::warn!(
-                    established_bigram = existing == BIGRAM_BIGRAM,
+                // Opposite hashing mode from the established primary. In a mixed
+                // EAGLE-family + non-EAGLE fleet behind one base model both modes
+                // are legitimately present; record it so selection dual-hashes.
+                self.secondary_seen.store(true, Ordering::Release);
+                tracing::info!(
+                    primary_bigram = existing == BIGRAM_BIGRAM,
                     worker_bigram = is_bigram,
-                    "kv-events: worker hashing mode (bigram/EAGLE) disagrees with the \
-                     established cluster value; keeping the first. A heterogeneous \
-                     EAGLE/non-EAGLE cluster will silently never match cache for the \
-                     minority workers — check that all workers run the same model.",
+                    "kv-events: worker uses the opposite KV-block hashing mode from the \
+                     established primary; fleet is bimodal (EAGLE-family + non-EAGLE). \
+                     Cache-aware selection will dual-hash queries so both families keep \
+                     cache affinity — ensure all workers serve the same base model and \
+                     the same block_size.",
                 );
             }
         }
+    }
+
+    /// Whether the fleet carries workers of **both** hashing modes (an
+    /// EAGLE-family bigram worker and a non-EAGLE unigram worker). Latched
+    /// `true` the first time a worker of the non-primary mode registers; never
+    /// clears. Read at routing time so `CacheAwareZmqPolicy::select` dual-hashes
+    /// only when it must, leaving the uniform-fleet fast path untouched.
+    pub fn is_bimodal(&self) -> bool {
+        self.secondary_seen.load(Ordering::Acquire)
     }
 
     /// Whether query hashing should use the bigram variant
@@ -201,15 +228,22 @@ mod tests {
         );
         oracle.set_bigram(true);
         assert!(oracle.is_bigram(), "first worker establishes the mode");
+        assert!(!oracle.is_bimodal(), "a single mode is not bimodal");
         oracle.set_bigram(true); // idempotent agreement
         assert!(oracle.is_bigram());
+        assert!(!oracle.is_bimodal(), "agreement does not make it bimodal");
         // Independent of block_size establishment.
         assert_eq!(oracle.get(), None);
-        // First-wins: a conflicting later worker is logged, not honored.
+        // First-wins for the PRIMARY: a conflicting later worker does not flip
+        // the reported mode, but it does latch the fleet as bimodal.
         oracle.set_bigram(false);
         assert!(
             oracle.is_bigram(),
-            "a disagreeing worker must not flip the established mode"
+            "a disagreeing worker must not flip the established primary mode"
+        );
+        assert!(
+            oracle.is_bimodal(),
+            "an opposite-mode worker latches the fleet as bimodal"
         );
     }
 
@@ -218,8 +252,23 @@ mod tests {
         let oracle = BlockSizeOracle::new();
         oracle.set_bigram(false);
         assert!(!oracle.is_bigram(), "established as unigram");
-        oracle.set_bigram(true); // conflicting; first (unigram) wins
+        assert!(!oracle.is_bimodal());
+        oracle.set_bigram(true); // conflicting; first (unigram) wins, fleet bimodal
         assert!(!oracle.is_bigram());
+        assert!(oracle.is_bimodal(), "opposite mode latches bimodal");
+    }
+
+    #[test]
+    fn is_bimodal_latches_and_never_clears() {
+        let oracle = BlockSizeOracle::new();
+        assert!(!oracle.is_bimodal(), "fresh oracle is unimodal");
+        oracle.set_bigram(true); // primary = bigram
+        oracle.set_bigram(false); // opposite → bimodal
+        assert!(oracle.is_bimodal());
+        // Subsequent agreeing workers of either established mode never clear it.
+        oracle.set_bigram(true);
+        oracle.set_bigram(false);
+        assert!(oracle.is_bimodal(), "bimodal is a latch, not a live count");
     }
 
     #[test]

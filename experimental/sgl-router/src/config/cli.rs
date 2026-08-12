@@ -8,12 +8,13 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use std::num::NonZeroU32;
+use std::num::NonZeroUsize;
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    DiscoveryBackend, K8sDiscoveryConfig, LoadGate, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -69,6 +70,46 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
+    /// Queued-request count at or above which a worker stops winning
+    /// selections on cache affinity: the request is sent to another worker
+    /// holding the same prefix, or to the least-loaded of a
+    /// `--min-load-choices` sample if there is none. Counts
+    /// `num_waiting_reqs` only, so it measures whether the
+    /// request would wait rather than how busy the worker is.
+    ///
+    /// Start at 4 on a single-rank worker — low enough to catch a real
+    /// backlog, high enough not to chase a queue of 1 that drains
+    /// immediately — and scale it with `dp_size`: the count is summed across
+    /// a worker's dp ranks while a request lands on one of them, so on a
+    /// dp-8 worker a queue of one on four ranks already sums to 4.
+    ///
+    /// Requires engines that publish load (same enablement as KV events).
+    /// With no fresh load snapshot the gate has nothing to read, fails open,
+    /// and never fires — and because it REPLACES the fleet-spread check
+    /// rather than layering on it, the router then has no load override at
+    /// all. Mutually exclusive with `--balance-abs-threshold` /
+    /// `--balance-rel-threshold`.
+    #[arg(long)]
+    pub worker_queue_limit: Option<NonZeroUsize>,
+    /// Candidates sampled for each min-load fallback pick: the fallback
+    /// ranks this many uniformly random workers and takes the least-loaded
+    /// of them. Default 2 (power-of-two choices).
+    ///
+    /// A fleet-wide exact minimum converges across router replicas: every
+    /// replica reads the same engine load snapshots, none sees the others'
+    /// dispatches made since the snapshot, so they all hand the request to
+    /// the same current minimum and overshoot it. Ranking a small random
+    /// sample keeps the pick near-loaded-minimal while making concurrent
+    /// replicas diverge.
+    ///
+    /// Sampling applies within each gating tier, so the tier order is
+    /// unchanged: with `--worker-queue-limit` set, the sample is drawn from
+    /// unqueued workers first and only from queueing ones when nothing is
+    /// unqueued. A value of 1 is uniform-random routing among the eligible
+    /// tier, not the exact minimum — set this at or above the fleet size for
+    /// the deterministic exact fleet-wide minimum.
+    #[arg(long)]
+    pub min_load_choices: Option<NonZeroUsize>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -157,11 +198,25 @@ impl Cli {
         }
         let tuned_cache_aware = self.cache_threshold.is_some()
             || self.balance_abs_threshold.is_some()
-            || self.balance_rel_threshold.is_some();
+            || self.balance_rel_threshold.is_some()
+            || self.worker_queue_limit.is_some()
+            || self.min_load_choices.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
-                 require --policy cache_aware_zmq"
+                "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
+                 --balance-rel-threshold / --worker-queue-limit / --min-load-choices) \
+                 requires --policy cache_aware_zmq"
+            ));
+        }
+        // The queue gate replaces the fleet-spread check rather than layering on
+        // it, so accepting both would leave the operator believing a knob is
+        // live when the policy never reads it.
+        if self.worker_queue_limit.is_some()
+            && (self.balance_abs_threshold.is_some() || self.balance_rel_threshold.is_some())
+        {
+            return Err(anyhow!(
+                "--worker-queue-limit replaces the fleet-spread check, so it cannot be \
+                 combined with --balance-abs-threshold / --balance-rel-threshold; pass only one"
             ));
         }
 
@@ -236,14 +291,26 @@ impl Cli {
         // defaults. Unset knobs fall back to the per-field defaults.
         let cache_aware = if tuned_cache_aware {
             let d = CacheAwareConfig::default();
+            // `validate` has already rejected the combination, so the queue
+            // limit alone decides which gate is built.
+            let load_gate = match self.worker_queue_limit {
+                Some(limit) => LoadGate::PerWorkerQueue(limit),
+                None => LoadGate::FleetSpread {
+                    abs_threshold: self
+                        .balance_abs_threshold
+                        .unwrap_or(LoadGate::DEFAULT_ABS_THRESHOLD),
+                    rel_threshold: self
+                        .balance_rel_threshold
+                        .unwrap_or(LoadGate::DEFAULT_REL_THRESHOLD),
+                },
+            };
             Some(CacheAwareConfig {
                 cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
-                balance_abs_threshold: self
-                    .balance_abs_threshold
-                    .unwrap_or(d.balance_abs_threshold),
-                balance_rel_threshold: self
-                    .balance_rel_threshold
-                    .unwrap_or(d.balance_rel_threshold),
+                load_gate,
+                min_load_choices: self
+                    .min_load_choices
+                    .map(NonZeroUsize::get)
+                    .unwrap_or(d.min_load_choices),
             })
         } else {
             None
@@ -741,7 +808,13 @@ mod tests {
         let ca = c.model.cache_aware.expect("cache_aware set");
         assert_eq!(ca.cache_threshold, 0.7);
         // Untouched knobs fall back to defaults.
-        assert_eq!(ca.balance_abs_threshold, 32);
+        assert!(matches!(
+            ca.load_gate,
+            LoadGate::FleetSpread {
+                abs_threshold: 32,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -769,9 +842,181 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("require --policy cache_aware_zmq"),
+            err.contains("requires --policy cache_aware_zmq"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn worker_queue_limit_reaches_the_policy_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "4",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert_eq!(ca.load_gate.queue_limit(), Some(4));
+        // The gate REPLACES the spread strategy — the spread knobs must not
+        // survive alongside it in the built config.
+        assert!(matches!(ca.load_gate, LoadGate::PerWorkerQueue(_)));
+    }
+
+    /// A limit of 0 would make every worker ineligible, silently degrading the
+    /// policy to pure min-load. `NonZeroUsize` makes that unrepresentable.
+    #[test]
+    fn rejects_zero_worker_queue_limit() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("worker-queue-limit"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_worker_queue_limit_without_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--worker-queue-limit",
+            "4",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("requires --policy cache_aware_zmq"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn min_load_choices_reaches_the_policy_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--min-load-choices",
+            "3",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert_eq!(ca.min_load_choices, 3);
+    }
+
+    /// Explicit balance thresholds must land in the FleetSpread gate — the
+    /// values became enum payload when LoadGate was introduced, so a wiring
+    /// slip here would silently revert operators to the defaults.
+    #[test]
+    fn explicit_balance_thresholds_reach_the_fleet_spread_gate() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--balance-abs-threshold",
+            "64",
+            "--balance-rel-threshold",
+            "1.5",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        match ca.load_gate {
+            LoadGate::FleetSpread {
+                abs_threshold,
+                rel_threshold,
+            } => {
+                assert_eq!(abs_threshold, 64);
+                assert_eq!(rel_threshold, 1.5);
+            }
+            other => panic!("expected FleetSpread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_load_choices_defaults_to_two() {
+        // The default IS the herd damping this knob exists for: a silent
+        // edit from 2 to 1 turns every fallback into uniform-random routing
+        // and a large value disables sampling — neither fails any other test.
+        assert_eq!(CacheAwareConfig::default().min_load_choices, 2);
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--cache-threshold",
+            "0.7",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        // Tuning any other knob must not disturb the shipped default.
+        assert_eq!(ca.min_load_choices, 2);
+    }
+
+    #[test]
+    fn rejects_min_load_choices_without_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--min-load-choices",
+            "2",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("requires --policy cache_aware_zmq"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_min_load_choices() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--min-load-choices",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("min-load-choices"), "got: {err}");
+    }
+
+    /// The queue gate replaces the fleet-spread check rather than layering
+    /// on it, so accepting both would leave the spread knob silently dead.
+    #[test]
+    fn rejects_worker_queue_limit_combined_with_balance_threshold() {
+        for spread in [
+            ["--balance-abs-threshold", "32"],
+            // The relative knob alone is just as dead, and is the arm a
+            // `&&`-instead-of-`||` slip would let through.
+            ["--balance-rel-threshold", "1.5"],
+        ] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--policy",
+                "cache_aware_zmq",
+                "--worker-queue-limit",
+                "4",
+                spread[0],
+                spread[1],
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("cannot be combined"), "{spread:?} got: {err}");
+        }
     }
 
     #[test]

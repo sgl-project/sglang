@@ -13,7 +13,8 @@
 //! caller) and a `SelectionContext` carrying the JSON request body and the
 //! ingress-precomputed routing tokens:
 //!
-//! Every load comparison below uses [`WorkerLoads::load_of`]: where a fresh
+//! Every load *ranking* below uses [`WorkerLoads::load_of`] (the queue gate
+//! reads [`WorkerLoads::waiting_of`] instead): where a fresh
 //! [`super::engine_load::EngineLoadTable`] snapshot exists, the
 //! engine-reported queue depth (`num_running + num_waiting`) PLUS this
 //! worker's dispatches since that snapshot was taken (the engine hasn't had
@@ -31,11 +32,19 @@
 //! workers that are idle on the engine side but still draining a finished
 //! stream to a slow client.
 //!
-//! 1. **Load-imbalance fast-path.** If `max_load - min_load >
-//!    balance_abs_threshold` AND `max_load > min_load *
-//!    balance_rel_threshold`, skip the cache lookup and pick the
-//!    lowest-load worker. This prevents one hot worker from dominating
-//!    cache-aware selection while every other worker idles.
+//! 1. **Load gate**, per [`crate::config::LoadGate`]. Two mutually exclusive
+//!    strategies; see that type for why each measures what it does.
+//!
+//!    `PerWorkerQueue` defers to step 3, because a per-worker question cannot
+//!    be answered until the cache has named a worker. The cache lookup is
+//!    unchanged, but every min-load fallback in this file additionally prefers
+//!    a non-queueing worker — including the below-threshold tree-miss path,
+//!    which is the highest-volume one.
+//!
+//!    `FleetSpread` — the default — decides here: when the spread is wide it
+//!    skips the cache lookup entirely and picks the lowest-load of a
+//!    `min_load_choices` sample,
+//!    abandoning locality for every request on the strength of one busy one.
 //! 2. **Routing tokens.** Prefer the ingress-precomputed ids
 //!    (`ctx.request_tokens()`); fall back to tokenizing the body here
 //!    (chat-encoder-aware for chat traffic, raw `prompt`/`text` otherwise)
@@ -44,17 +53,29 @@
 //! 3. **Hash + match.** Compute block hashes via
 //!    [`super::kv_events::compute_block_hashes`], query the shared hash tree
 //!    for the longest matching prefix. If `match_rate > cache_threshold`,
-//!    pick the lowest-load worker whose `url` appears in the match result.
-//!    Otherwise, fall through.
-//! 4. **Min-load fallback.** Pick the lowest-load worker.
+//!    pick the lowest-load worker whose `url` appears in the match result and
+//!    whose engine queue is under `PerWorkerQueue`'s limit, if one is
+//!    configured. Otherwise, fall through.
+//! 4. **Min-load fallback.** Least-loaded among `min_load_choices` uniformly
+//!    sampled workers that are not known to be queueing; if every worker is
+//!    queueing, least-loaded among a sample of the whole fleet. Sampling is
+//!    the power-of-X defence against cross-replica herds: an exact fleet
+//!    minimum makes every replica with the same load snapshots pick the same
+//!    worker. The second tier is what makes this unable to fail — the gate is
+//!    never allowed to turn a busy fleet into a selection error. Reaching it
+//!    means no worker is unqueued, and with prefix owners present that
+//!    saturation is recorded as `cache_hit_all_queued` — the fleet-saturation
+//!    signal. The label keys on saturation, not on where the sampled draw
+//!    lands, which usually is NOT a prefix owner; treat it as locality only
+//!    on fleets pinned to unsampled picks (`min_load_choices >= fleet`).
 //!
 //! The implementation never returns `None` for a non-empty `workers` slice;
 //! a misconfigured tree or tokenizer degrades to round-robin-with-load
 //! tiebreak, not a routing failure.
 
-use crate::config::CacheAwareConfig;
+use crate::config::{CacheAwareConfig, LoadGate};
 
-use crate::policies::engine_load::EngineLoadTable;
+use crate::policies::engine_load::{EngineLoadTable, WorkerDepth};
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
@@ -80,6 +101,8 @@ use std::time::Instant;
 const FALLBACK_LOG_SAMPLE: u64 = 64;
 static TOKENIZATION_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HASH_CONFIG_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MATCHED_FALLBACK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static QUEUE_GATE_BLIND_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn should_log(counter: &AtomicU64) -> bool {
     counter
@@ -147,8 +170,9 @@ struct BalanceCheck {
 /// router-side in-flight counter (`Worker::active_load`). Holding the
 /// snapshot keeps every per-worker `load_of` an O(1) map lookup.
 struct WorkerLoads {
-    /// url -> (engine-reported depth, that snapshot's oldest-rank timestamp).
-    fresh: HashMap<String, (usize, Instant)>,
+    /// url -> (engine-reported depth + queue, that snapshot's oldest-rank
+    /// timestamp).
+    fresh: HashMap<String, (WorkerDepth, Instant)>,
 }
 
 impl WorkerLoads {
@@ -189,9 +213,27 @@ impl WorkerLoads {
             // problem (memory exhaustion, a corrupt engine payload) that is
             // already symptomatic elsewhere, not something worth a panic on
             // this per-request hot path.
-            Some(&(engine_load, at)) => engine_load.saturating_add(w.slots_acquired_since(at)),
+            Some(&(d, at)) => d.depth().saturating_add(w.slots_acquired_since(at)),
             None => w.active_load(),
         }
+    }
+
+    /// How many requests are queued on this worker's engine, or `None` when no
+    /// fresh snapshot says.
+    ///
+    /// Deliberately not defaulted to 0 or to any router-side value. The
+    /// router-side counter has no queue component at all — it cannot tell a
+    /// dispatched-and-running request from a dispatched-and-waiting one — so
+    /// there is no honest substitute, and inventing one would silently turn a
+    /// queue gate into a comparison against a different quantity. `None` means
+    /// "unknown", and callers gate open on it.
+    ///
+    /// Unlike [`Self::load_of`] this carries no since-snapshot correction: a
+    /// dispatch this router just made is not known to be *queued* — the engine
+    /// may well be running it — so adding it here would manufacture queue
+    /// depth that may not exist.
+    fn waiting_of(&self, w: &Worker) -> Option<usize> {
+        self.fresh.get(w.url.as_str()).map(|(d, _)| d.waiting())
     }
 
     /// Number of workers whose load came from the engine (vs the router-side
@@ -199,6 +241,30 @@ impl WorkerLoads {
     fn engine_worker_count(&self) -> usize {
         self.fresh.len()
     }
+}
+
+/// Outcome of [`CacheAwareZmqPolicy::match_request`] — the matched cache
+/// owners plus the best-mode stats the caller logs and meters. In a uniform
+/// fleet these describe the single established hashing mode; in a bimodal
+/// fleet they are the union of owners and the best-matching mode's numbers.
+struct MatchOutcome {
+    /// URLs of workers owning a matched prefix, drawn only from hashing modes
+    /// whose per-mode overlap cleared `cache_threshold`. Empty ⇒ no affinity.
+    owner_urls: std::collections::HashSet<String>,
+    /// Best (max-rate) mode's matched-block count — logging / metrics only.
+    matched_blocks: usize,
+    /// Best mode's query-block count — the match_rate denominator and the
+    /// query-blocks metric sample.
+    query_blocks: usize,
+    /// Best mode's match_rate.
+    match_rate: f32,
+    /// True once some mode produced query blocks (else too few tokens to hash).
+    had_blocks: bool,
+    /// True when some mode cleared the threshold even if its matched node had
+    /// no live owner — lets the caller separate "unowned" from "below threshold".
+    any_above_threshold: bool,
+    /// "bigram" | "unigram" | "dual", for the debug log.
+    label: &'static str,
 }
 
 impl CacheAwareZmqPolicy {
@@ -244,15 +310,82 @@ impl CacheAwareZmqPolicy {
         }
     }
 
-    /// Lowest-load worker by the per-selection load lookup — ties broken by
-    /// stable iteration order (the order the registry returned, i.e.
-    /// dashmap-undefined). For production traffic the ties are rare; tests
-    /// pin the load skew.
-    fn pick_min_load(workers: &[Arc<Worker>], loads: &WorkerLoads) -> Option<Arc<Worker>> {
-        workers
+    /// Lowest-load worker among `choices` uniformly sampled candidates, by
+    /// the per-selection load lookup — power-of-X choices, not a fleet-wide
+    /// minimum.
+    ///
+    /// Ranking the whole fleet and taking the single minimum converges
+    /// across router replicas: every replica reads the same engine load
+    /// snapshots, none sees the others' dispatches made since the snapshot
+    /// ([`WorkerLoads::load_of`] corrects only its own), so they all hand
+    /// the request to the same current minimum and overshoot it. Sampling
+    /// `choices` workers per pick keeps the selection near-minimal while
+    /// making concurrent replicas diverge to different near-minima.
+    /// `choices == 1` is uniform-random within the tier; `choices >=
+    /// eligible pool` degenerates to the deterministic exact minimum
+    /// (unsampled — equal-load ties resolve in pool order, so pinning
+    /// `usize::MAX` keeps tests deterministic). A programmatic
+    /// `choices == 0` (impossible from the CLI, which is `NonZeroUsize`)
+    /// is treated as 1.
+    ///
+    /// Under [`LoadGate::PerWorkerQueue`] this stays a two-tier pick, and
+    /// the sampling happens WITHIN each tier: the sample is drawn from the
+    /// workers that are not already queueing, and only when none exists
+    /// from the queueing ones — a sample never lands on a queueing worker
+    /// while an unqueued one exists.
+    ///
+    /// The two tiers are not optional. Load is ranked by total depth while the
+    /// gate reads queue length, and those disagree exactly where this gate
+    /// earns its keep: a shallow worker with a backlog is the fleet minimum by
+    /// depth, so a single-tier min-load fallback hands the request straight
+    /// back to the cache home the gate just rejected. Preferring unqueued
+    /// workers first is what makes the diversion actually happen; falling back
+    /// to the whole fleet is what keeps an all-queueing fleet routable
+    /// instead of returning `None` and failing every request.
+    fn pick_min_load(
+        workers: &[Arc<Worker>],
+        loads: &WorkerLoads,
+        gate: &LoadGate,
+        choices: usize,
+    ) -> Option<Arc<Worker>> {
+        // Tier order is decided by the gate, never by sampling: rank the
+        // unqueued workers if any exist, else the whole fleet.
+        let mut pool: Vec<usize> = workers
             .iter()
-            .min_by_key(|w| loads.load_of(w))
-            .map(Arc::clone)
+            .enumerate()
+            .filter(|(_, w)| gate.admits_affinity(loads.waiting_of(w)))
+            .map(|(i, _)| i)
+            .collect();
+        if pool.is_empty() {
+            pool.extend(0..workers.len());
+        }
+        // Guard against a programmatically constructed 0 (the CLI is
+        // NonZeroUsize; the field is a bare usize for full-fleet pinning).
+        let k = choices.max(1).min(pool.len());
+        if k == 0 {
+            // workers is empty.
+            return None;
+        }
+        let min_of = |candidates: &[usize]| {
+            candidates
+                .iter()
+                .min_by_key(|&&i| loads.load_of(&workers[i]))
+                .map(|&i| Arc::clone(&workers[i]))
+        };
+        if k == pool.len() {
+            // The unsampled exact minimum: no shuffle, so ties resolve in
+            // pool order exactly as the pre-sampling implementation did.
+            return min_of(&pool);
+        }
+        // partial_shuffle leaves `amount` uniformly sampled DISTINCT
+        // elements in the TAIL of the slice (rand 0.8: it randomizes
+        // positions len-1 down to len-amount) and returns them as the
+        // first tuple element. Reading the front is the classic misuse:
+        // the remainder is only disturbed by swaps and is biased toward
+        // low indices.
+        use rand::seq::SliceRandom;
+        let (sample, _) = pool.partial_shuffle(&mut rand::thread_rng(), k);
+        min_of(sample)
     }
 
     /// Detect load imbalance. Returns the min/max load snapshot together
@@ -267,20 +400,102 @@ impl CacheAwareZmqPolicy {
     /// engine number alone. An on-call reader comparing this log's
     /// `max_load` against the engine's own `/metrics` queue depth during an
     /// incident should expect them to differ by that correction.
-    fn balance_check(&self, workers: &[Arc<Worker>], loads: &WorkerLoads) -> BalanceCheck {
+    fn balance_check(
+        &self,
+        workers: &[Arc<Worker>],
+        loads: &WorkerLoads,
+        abs_threshold: usize,
+        rel_factor: f32,
+    ) -> BalanceCheck {
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(mn, mx), w| {
             let l = loads.load_of(w);
             (mn.min(l), mx.max(l))
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
         let abs_diff = max_load.saturating_sub(min_load);
-        let rel_threshold = (min_load as f32 * self.config.balance_rel_threshold) as usize;
-        let imbalanced = abs_diff > self.config.balance_abs_threshold && max_load > rel_threshold;
+        let rel_threshold = (min_load as f32 * rel_factor) as usize;
+        let imbalanced = abs_diff > abs_threshold && max_load > rel_threshold;
         BalanceCheck {
             min_load,
             max_load,
             abs_diff,
             imbalanced,
+        }
+    }
+
+    /// Match the request against the tree across one or both hashing modes.
+    ///
+    /// Uniform fleet (oracle not bimodal): hash once with the established mode
+    /// — the historical fast path, one hash + one lookup. Bimodal fleet
+    /// (EAGLE-family + non-EAGLE behind one base model): hash the request BOTH
+    /// ways, look up each, and union the owners of every mode whose per-mode
+    /// overlap cleared `cache_threshold`. The two hash spaces are disjoint
+    /// (SHA256 over different preimages), so each mode's query only matches its
+    /// own family's tree entries and the union cannot cross-contaminate.
+    fn match_request(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        primary_bigram: bool,
+    ) -> MatchOutcome {
+        let bimodal = self.block_size_oracle.is_bimodal();
+        // Primary mode first; append the opposite only when the fleet is mixed.
+        let modes: &[bool] = match (bimodal, primary_bigram) {
+            (false, true) => &[true],
+            (false, false) => &[false],
+            (true, true) => &[true, false],
+            (true, false) => &[false, true],
+        };
+
+        let mut owner_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut had_blocks = false;
+        let mut any_above_threshold = false;
+        // (rate, matched_blocks, query_blocks) of the best-matching mode, for
+        // logging + metrics. Seeded by the first hashed mode so a zero-match
+        // request still reports a real query-block denominator.
+        let mut best: Option<(f32, usize, usize)> = None;
+
+        for &mode_bigram in modes {
+            let hashes = if mode_bigram {
+                compute_block_hashes_bigram(tokens, block_size)
+            } else {
+                compute_block_hashes(tokens, block_size)
+            };
+            if hashes.is_empty() {
+                continue;
+            }
+            had_blocks = true;
+            let matched = self.tree.match_prefix(None, &hashes);
+            debug_assert!(matched.matched_blocks <= hashes.len());
+            let rate = matched.matched_blocks as f32 / hashes.len() as f32;
+            if best.is_none_or(|(r, _, _)| rate > r) {
+                best = Some((rate, matched.matched_blocks, hashes.len()));
+            }
+            // Per-mode threshold BEFORE unioning: a mode contributes owners only
+            // if its own overlap cleared the bar, so a strong match in one family
+            // never drags in a weak match's owners from the other.
+            if rate > self.config.cache_threshold {
+                any_above_threshold = true;
+                for w in matched.workers {
+                    owner_urls.insert(w.url);
+                }
+            }
+        }
+
+        let (match_rate, matched_blocks, query_blocks) = best.unwrap_or((0.0, 0, 0));
+        let label = match (bimodal, primary_bigram) {
+            (true, _) => "dual",
+            (false, true) => "bigram",
+            (false, false) => "unigram",
+        };
+        MatchOutcome {
+            owner_urls,
+            matched_blocks,
+            query_blocks,
+            match_rate,
+            had_blocks,
+            any_above_threshold,
+            label,
         }
     }
 }
@@ -298,43 +513,86 @@ impl Policy for CacheAwareZmqPolicy {
         // every comparison below (imbalance check, min-load fallback,
         // matched-set tiebreak).
         let loads = WorkerLoads::from_engine(&self.engine_load, Instant::now());
+        let queue_limit = self.config.load_gate.queue_limit();
 
-        // 1. Load-imbalance fast-path: even the best cache hit gets
-        //    dropped in favour of evening out load. Logged on every
-        //    request (debug) so the input to the decision is auditable;
-        //    the actual rebalance is logged at info when it fires.
-        let balance = self.balance_check(workers, &loads);
-        tracing::debug!(
-            model = %ctx.model(),
-            min_load = balance.min_load,
-            max_load = balance.max_load,
-            abs_diff = balance.abs_diff,
-            balance_abs_threshold = self.config.balance_abs_threshold,
-            balance_rel_threshold = self.config.balance_rel_threshold,
-            imbalanced = balance.imbalanced,
-            engine_load_workers = loads.engine_worker_count(),
-            engine_load_expected = self.engine_load.expected_count(),
-            "cache-aware-zmq: load-balance check considered",
-        );
-        if balance.imbalanced {
-            self.record_decision(model_id, CacheAwareDecision::LoadImbalance);
-            let chosen = Self::pick_min_load(workers, &loads);
-            if let Some(w) = &chosen {
-                tracing::info!(
+        // 1. Load gate. With a queue limit configured the gate is per-worker and
+        //    cannot be decided yet — it needs to know which worker the cache
+        //    would pick — so it moves to step 3 and only the audit log runs here.
+        //    Without one, the fleet-spread check can short-circuit the whole
+        //    selection before any tokenization happens.
+        //
+        //    Both paths log `engine_load_workers` against `engine_load_expected`
+        //    on every selection: that pair is the only signal that `load_of` has
+        //    fallen back to the per-process in-flight counter, which silently
+        //    rescales every load comparison below it.
+        match self.config.load_gate {
+            LoadGate::PerWorkerQueue(limit) => {
+                // `waiting_of` is `None` for every worker here, so the gate
+                // admits everything and the fleet-spread strategy it replaced
+                // is not running either — the router has no load override at
+                // all. Silent otherwise: `cache_worker_queued` sitting at 0 is
+                // indistinguishable from a healthy fleet, and the
+                // workers/expected pair reads 0/0 when no worker ever
+                // advertised a load port, which looks correctly configured.
+                if loads.engine_worker_count() == 0 && should_log(&QUEUE_GATE_BLIND_LOG_COUNTER) {
+                    tracing::warn!(
+                        model = %ctx.model(),
+                        worker_queue_limit = limit.get(),
+                        engine_load_expected = self.engine_load.expected_count(),
+                        "cache-aware-zmq: --worker-queue-limit is set but no worker has a fresh engine load snapshot, so the queue gate is inert and the fleet-spread gate it replaced is not running. Check that engines advertise a load port and publish LoadStat",
+                    );
+                }
+                tracing::debug!(
                     model = %ctx.model(),
-                    worker = %w.url,
-                    worker_load = loads.load_of(w),
+                    worker_queue_limit = limit.get(),
+                    engine_load_workers = loads.engine_worker_count(),
+                    engine_load_expected = self.engine_load.expected_count(),
+                    "cache-aware-zmq: per-worker queue gate active; deferring the load gate to the matched set",
+                );
+            }
+            LoadGate::FleetSpread {
+                abs_threshold,
+                rel_threshold,
+            } => {
+                let balance = self.balance_check(workers, &loads, abs_threshold, rel_threshold);
+                tracing::debug!(
+                    model = %ctx.model(),
                     min_load = balance.min_load,
                     max_load = balance.max_load,
                     abs_diff = balance.abs_diff,
-                    balance_abs_threshold = self.config.balance_abs_threshold,
-                    balance_rel_threshold = self.config.balance_rel_threshold,
+                    balance_abs_threshold = abs_threshold,
+                    balance_rel_threshold = rel_threshold,
+                    imbalanced = balance.imbalanced,
                     engine_load_workers = loads.engine_worker_count(),
                     engine_load_expected = self.engine_load.expected_count(),
-                    "cache-aware-zmq: load imbalance detected — bypassing cache, routing to min-load worker",
+                    "cache-aware-zmq: load-balance check considered",
                 );
+                if balance.imbalanced {
+                    self.record_decision(model_id, CacheAwareDecision::LoadImbalance);
+                    let chosen = Self::pick_min_load(
+                        workers,
+                        &loads,
+                        &self.config.load_gate,
+                        self.config.min_load_choices,
+                    );
+                    if let Some(w) = &chosen {
+                        tracing::info!(
+                            model = %ctx.model(),
+                            worker = %w.url,
+                            worker_load = loads.load_of(w),
+                            min_load = balance.min_load,
+                            max_load = balance.max_load,
+                            abs_diff = balance.abs_diff,
+                            balance_abs_threshold = abs_threshold,
+                            balance_rel_threshold = rel_threshold,
+                            engine_load_workers = loads.engine_worker_count(),
+                            engine_load_expected = self.engine_load.expected_count(),
+                            "cache-aware-zmq: load imbalance detected — bypassing cache, routing to sampled min-load worker",
+                        );
+                    }
+                    return chosen;
+                }
             }
-            return chosen;
         }
 
         // 2. Routing tokens. Prefer the ids computed once at ingress; fall
@@ -353,7 +611,12 @@ impl Policy for CacheAwareZmqPolicy {
                             model = %ctx.model(),
                             "cache-aware-zmq: policy reached without request tokens or a request body; ingress validation invariant broken",
                         );
-                        return Self::pick_min_load(workers, &loads);
+                        return Self::pick_min_load(
+                            workers,
+                            &loads,
+                            &self.config.load_gate,
+                            self.config.min_load_choices,
+                        );
                     }
                 };
                 let value = match serde_json::from_slice::<serde_json::Value>(body) {
@@ -365,7 +628,12 @@ impl Policy for CacheAwareZmqPolicy {
                             error = %error,
                             "cache-aware-zmq: policy received invalid JSON after ingress validation; invariant broken",
                         );
-                        return Self::pick_min_load(workers, &loads);
+                        return Self::pick_min_load(
+                            workers,
+                            &loads,
+                            &self.config.load_gate,
+                            self.config.min_load_choices,
+                        );
                     }
                 };
                 let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
@@ -373,10 +641,15 @@ impl Policy for CacheAwareZmqPolicy {
                     if should_log(&TOKENIZATION_LOG_COUNTER) {
                         tracing::warn!(
                             model = %ctx.model(),
-                            "cache-aware-zmq: routing tokens unavailable, routing by min-load; check tokenizer and chat encoder configuration. Also expected for requests whose messages carry no text",
+                            "cache-aware-zmq: routing tokens unavailable, routing by sampled min-load; check tokenizer and chat encoder configuration. Also expected for requests whose messages carry no text",
                         );
                     }
-                    return Self::pick_min_load(workers, &loads);
+                    return Self::pick_min_load(
+                        workers,
+                        &loads,
+                        &self.config.load_gate,
+                        self.config.min_load_choices,
+                    );
                 };
                 fallback_ids = rt.ids;
                 &fallback_ids
@@ -398,92 +671,177 @@ impl Policy for CacheAwareZmqPolicy {
             if should_log(&HASH_CONFIG_LOG_COUNTER) {
                 tracing::warn!(
                     model = %ctx.model(),
-                    "cache-aware-zmq: no worker has published a complete block-hashing config, routing by min-load. Transient while workers register; if it persists, no engine is publishing KV events",
+                    "cache-aware-zmq: no worker has published a complete block-hashing config, routing by sampled min-load. Transient while workers register; if it persists, no engine is publishing KV events",
                 );
             }
-            return Self::pick_min_load(workers, &loads);
+            return Self::pick_min_load(
+                workers,
+                &loads,
+                &self.config.load_gate,
+                self.config.min_load_choices,
+            );
         };
-        // EAGLE-family workers hash KV blocks over token bigrams; query hashes
-        // must use the same worker-reported mode or overlap always stays zero.
-        let block_hashes = if is_bigram {
-            compute_block_hashes_bigram(tokens, block_size as usize)
-        } else {
-            compute_block_hashes(tokens, block_size as usize)
-        };
-        if block_hashes.is_empty() {
+        // Uniform fleet: hash once with the established mode. Bimodal fleet
+        // (EAGLE-family + non-EAGLE behind one base model): hash both ways and
+        // union the eligible owners, so a prefix warm on either family is a hit.
+        let outcome = self.match_request(tokens, block_size as usize, is_bigram);
+        if !outcome.had_blocks {
             self.record_decision(model_id, CacheAwareDecision::NoHashBlocks);
-            return Self::pick_min_load(workers, &loads);
+            return Self::pick_min_load(
+                workers,
+                &loads,
+                &self.config.load_gate,
+                self.config.min_load_choices,
+            );
         }
-        let matched = self.tree.match_prefix(None, &block_hashes);
-        debug_assert!(matched.matched_blocks <= block_hashes.len());
-        let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
         tracing::debug!(
             model = %ctx.model(),
-            hashing = if is_bigram { "bigram" } else { "unigram" },
-            n_blocks = block_hashes.len(),
-            matched_blocks = matched.matched_blocks,
-            matched_workers = matched.workers.len(),
-            match_rate,
+            hashing = outcome.label,
+            n_blocks = outcome.query_blocks,
+            matched_blocks = outcome.matched_blocks,
+            matched_workers = outcome.owner_urls.len(),
+            match_rate = outcome.match_rate,
             cache_threshold = self.config.cache_threshold,
             "cache-aware-zmq match_prefix",
         );
-        // Record the matched overlap into `sgl_router_overlap_blocks` before
-        // the threshold branch, so the histogram captures the full
-        // distribution — including low-overlap selections that fall back to
-        // min-load. This is the quantitative signal that cache-aware routing
-        // is matching prefixes at all.
+        // Record overlap + query-block count before the affinity branch so the
+        // histogram captures the full distribution, including below-threshold
+        // selections. In a bimodal fleet these are the best-matching mode's
+        // numbers, keeping one sample per request.
         if let Some(m) = self.metrics.get() {
-            m.observe_overlap_blocks(model_id, matched.matched_blocks as u64);
-            m.add_cache_aware_query_blocks(model_id, block_hashes.len() as u64);
+            m.observe_overlap_blocks(model_id, outcome.matched_blocks as u64);
+            m.add_cache_aware_query_blocks(model_id, outcome.query_blocks as u64);
         }
-        if match_rate <= self.config.cache_threshold {
-            self.record_decision(model_id, CacheAwareDecision::BelowThreshold);
+        if outcome.owner_urls.is_empty() {
+            // Same taxonomy as the single-mode path: a cleared-threshold match
+            // whose node has no live owner is distinct from no match at all.
+            let decision = if outcome.any_above_threshold {
+                CacheAwareDecision::MatchedNodeUnowned
+            } else {
+                CacheAwareDecision::BelowThreshold
+            };
+            self.record_decision(model_id, decision);
             tracing::debug!(
                 model = %ctx.model(),
-                n_blocks = block_hashes.len(),
-                matched_blocks = matched.matched_blocks,
-                matched_workers = matched.workers.len(),
-                match_rate,
+                n_blocks = outcome.query_blocks,
+                matched_blocks = outcome.matched_blocks,
+                match_rate = outcome.match_rate,
                 cache_threshold = self.config.cache_threshold,
-                "cache-aware-zmq: overlap below threshold, falling back to min-load",
+                "cache-aware-zmq: no eligible cache owner, falling back to sampled min-load",
             );
-            return Self::pick_min_load(workers, &loads);
-        }
-        if matched.workers.is_empty() {
-            self.record_decision(model_id, CacheAwareDecision::MatchedNodeUnowned);
-            tracing::debug!(
-                model = %ctx.model(),
-                n_blocks = block_hashes.len(),
-                matched_blocks = matched.matched_blocks,
-                match_rate,
-                "cache-aware-zmq: matched prefix has no worker owners, falling back to min-load",
+            return Self::pick_min_load(
+                workers,
+                &loads,
+                &self.config.load_gate,
+                self.config.min_load_choices,
             );
-            return Self::pick_min_load(workers, &loads);
         }
-        // Among workers in the matched set, pick the lowest-load one.
-        let matched_urls: std::collections::HashSet<&str> =
-            matched.workers.iter().map(|kw| kw.url.as_str()).collect();
+        // Among the matched owners (either family, in a bimodal fleet), pick the
+        // lowest-load one that is not already queueing. The gate and the tiebreak
+        // read different quantities — queue length vs total depth — so filtering
+        // the whole set is not the same as vetoing its minimum: the least-loaded
+        // prefix owner can be the one with a backlog, while a slightly busier
+        // owner has none.
+        let matched_urls = &outcome.owner_urls;
         let best_matched: Option<Arc<Worker>> = workers
             .iter()
             .filter(|w| matched_urls.contains(w.url.as_str()))
+            .filter(|w| self.config.load_gate.admits_affinity(loads.waiting_of(w)))
             .min_by_key(|w| loads.load_of(w))
             .map(Arc::clone);
         let Some(chosen) = best_matched else {
-            self.record_decision(model_id, CacheAwareDecision::MatchedWorkersIneligible);
-            tracing::debug!(
-                model = %ctx.model(),
-                n_blocks = block_hashes.len(),
-                matched_blocks = matched.matched_blocks,
-                matched_workers = matched.workers.len(),
-                "cache-aware-zmq: matched workers are not eligible, falling back to min-load",
+            let owners_present = workers
+                .iter()
+                .any(|w| matched_urls.contains(w.url.as_str()));
+            // The fallback prefers an unqueued worker but is never queue-
+            // *bounded*: with no unqueued worker it samples the whole fleet
+            // and takes the least-loaded of the sample regardless, so a fleet
+            // where everything is queueing still routes
+            // instead of failing every request.
+            let fallback = Self::pick_min_load(
+                workers,
+                &loads,
+                &self.config.load_gate,
+                self.config.min_load_choices,
             );
-            return Self::pick_min_load(workers, &loads);
+            // That second tier is the only way the fallback can land back on a
+            // prefix owner: every owner failed the gate, so the preference tier
+            // excluded them too, so reaching one means NO worker in the fleet is
+            // unqueued. Routing is then identical to affinity, which is why it
+            // is booked as a hit — but under a distinct label, because "every
+            // worker is queueing" is the single most important thing an operator
+            // sizing the limit needs to see, and burying it in `cache_hit` would
+            // make a fully saturated fleet read as a healthy one.
+            //
+            // Classify the SATURATION, not the draw. Landing on an owner
+            // implies the all-queued tier (every owner failed the gate, so no
+            // tier-1 pool contains one), but under sampling the converse is
+            // random: an all-queued pick usually lands on a non-owner, and
+            // booking that as `CacheWorkerQueued` would both under-report the
+            // saturation signal this label exists for and poison the diverted-
+            // overlap histogram with requests where NO unqueued alternative —
+            // hence no diversion — existed.
+            let all_queued = !workers
+                .iter()
+                .any(|w| self.config.load_gate.admits_affinity(loads.waiting_of(w)));
+            let landed_on_owner = fallback
+                .as_ref()
+                .is_some_and(|w| matched_urls.contains(w.url.as_str()));
+            // `landed_on_owner` is intentionally not a disjunct here: it is
+            // implied by `all_queued` (see above), so it carries no
+            // classification information. It stays for the log line below.
+            let decision = if owners_present && all_queued {
+                CacheAwareDecision::CacheHitAllQueued
+            } else if owners_present {
+                CacheAwareDecision::CacheWorkerQueued
+            } else {
+                // Separate from the queue case: the prefix owners were not
+                // candidates at all (e.g. they drained from discovery between
+                // the tree match and this selection).
+                CacheAwareDecision::MatchedWorkersIneligible
+            };
+            self.record_decision(model_id, decision);
+            // Record what the diversion cost, but only when one happened: the
+            // gate tests queue length alone and is blind to how much prefix is
+            // at stake, so the distribution of what it throws away is the
+            // evidence for whether that simplification holds. Compared against
+            // `sgl_router_overlap_blocks` over all selections — a diverted curve
+            // that skews high means the gate is trading large cached prefixes
+            // for small waits.
+            if matches!(decision, CacheAwareDecision::CacheWorkerQueued) {
+                if let Some(m) = self.metrics.get() {
+                    m.observe_diverted_overlap_blocks(model_id, outcome.matched_blocks as u64);
+                }
+            }
+            if should_log(&MATCHED_FALLBACK_LOG_COUNTER) {
+                tracing::info!(
+                    model = %ctx.model(),
+                    worker = fallback.as_ref().map(|w| w.url.as_str()),
+                    worker_load = fallback.as_ref().map(|w| loads.load_of(w)),
+                    worker_waiting = fallback.as_ref().and_then(|w| loads.waiting_of(w)),
+                    matched_min_waiting = workers
+                        .iter()
+                        .filter(|w| matched_urls.contains(w.url.as_str()))
+                        .filter_map(|w| loads.waiting_of(w))
+                        .min(),
+                    n_blocks = outcome.query_blocks,
+                    matched_blocks = outcome.matched_blocks,
+                    matched_workers = matched_urls.len(),
+                    worker_queue_limit = queue_limit,
+                    owners_present,
+                    landed_on_owner,
+                    engine_load_workers = loads.engine_worker_count(),
+                    engine_load_expected = self.engine_load.expected_count(),
+                    "cache-aware-zmq: cache affinity given up, falling back to sampled min-load",
+                );
+            }
+            return fallback;
         };
         self.record_decision(model_id, CacheAwareDecision::CacheHit);
         tracing::debug!(
             model = %ctx.model(),
             worker = %chosen.url,
-            matched_blocks = matched.matched_blocks,
+            matched_blocks = outcome.matched_blocks,
             "cache-aware-zmq: selected worker by cache overlap",
         );
         Some(chosen)
@@ -507,13 +865,22 @@ mod tests {
     use crate::policies::kv_events::tree::KvWorkerId;
     use crate::policies::kv_events::HashTree;
     use crate::tokenizer::adapter;
+    use std::num::NonZeroUsize;
     use std::time::Duration;
 
+    /// Helpers pin `min_load_choices: usize::MAX` so every fallback is the
+    /// deterministic fleet-wide minimum — these tests assert *which* worker
+    /// other policy mechanics route to, and per-pick sampling would make
+    /// that nondeterministic. The sampling behaviour itself has dedicated
+    /// tests below (`min_load_sampled_*`). Inline `..Default::default()`
+    /// literals that skip the helpers stay deterministic only because their
+    /// 2-worker fleets make k == pool; do NOT copy such a literal onto a 3+
+    /// worker test — route through a helper or pin the field explicitly.
     fn cfg_default() -> CacheAwareConfig {
         CacheAwareConfig {
             cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
+            min_load_choices: usize::MAX,
+            ..Default::default()
         }
     }
 
@@ -660,8 +1027,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0, // any match counts
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -675,6 +1041,164 @@ mod tests {
         let ctx = SelectionContext::new(&model, Some(&body));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000");
+    }
+
+    /// Helper: an oracle for a **bimodal** fleet — `primary_bigram` established
+    /// first, then the opposite mode registers, latching `is_bimodal()`.
+    /// Mirrors `add_worker` seeing an EAGLE-family worker and a non-EAGLE worker
+    /// behind the same base model.
+    fn bimodal_oracle(block_size: u32, primary_bigram: bool) -> Arc<BlockSizeOracle> {
+        let o = BlockSizeOracle::new();
+        o.try_set(block_size)
+            .expect("fresh oracle accepts first set");
+        o.set_bigram(primary_bigram); // primary mode
+        o.set_bigram(!primary_bigram); // opposite mode -> bimodal
+        assert!(o.is_bimodal(), "two opposite modes must latch bimodal");
+        o
+    }
+
+    /// Bimodal fleet, primary = bigram (EAGLE). A prefix cached ONLY on the
+    /// unigram-hashing worker is still matched: the query is dual-hashed, so
+    /// the unigram entry is found even though the established primary is bigram.
+    /// Without dual-hashing a bigram-only query never touches the unigram tree
+    /// entry and the unigram worker is starved to min-load — the exact
+    /// mixed-fleet artifact this change fixes.
+    #[test]
+    fn bimodal_matches_unigram_owner_under_bigram_primary() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let block_size = 4u32;
+        // non-EAGLE worker publishes UNIGRAM block hashes.
+        let hashes = compute_block_hashes(&ids, block_size as usize);
+        assert!(!hashes.is_empty());
+        tree.insert(
+            &KvWorkerId::new("http://unigram:30000".into(), 0),
+            None,
+            &hashes,
+        );
+
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0, // any match counts
+                ..Default::default()
+            },
+            tree,
+            registry,
+            bimodal_oracle(4, /* primary_bigram= */ true),
+        );
+        let w_eagle = worker("http://eagle:30000", "tiny");
+        let w_unigram = worker("http://unigram:30000", "tiny");
+        // Skew load so min-load would pick the EAGLE worker; only cache affinity
+        // (via the unigram/secondary hash) can select the unigram owner.
+        let _g1 = w_unigram.load_guard();
+        let _g2 = w_unigram.load_guard();
+        let workers = vec![Arc::clone(&w_eagle), Arc::clone(&w_unigram)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://unigram:30000",
+            "dual-hash must find the unigram owner despite a bigram primary",
+        );
+    }
+
+    /// Gate guard: the SAME unigram-only prefix under a UNIMODAL bigram oracle
+    /// is NOT matched — the query hashes bigram only, misses the unigram entry,
+    /// and falls back to min-load (the EAGLE worker). Pins that dual-hashing
+    /// engages strictly when the fleet is bimodal, not on every request.
+    #[test]
+    fn unimodal_bigram_does_not_match_unigram_owner() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let block_size = 4u32;
+        let hashes = compute_block_hashes(&ids, block_size as usize);
+        tree.insert(
+            &KvWorkerId::new("http://unigram:30000".into(), 0),
+            None,
+            &hashes,
+        );
+
+        // Unimodal bigram oracle: only set_bigram(true), never the opposite.
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(4).unwrap();
+        oracle.set_bigram(true);
+        assert!(!oracle.is_bimodal());
+
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                ..Default::default()
+            },
+            tree,
+            registry,
+            oracle,
+        );
+        let w_eagle = worker("http://eagle:30000", "tiny");
+        let w_unigram = worker("http://unigram:30000", "tiny");
+        // the unigram worker holds the prefix but has higher load; a bigram-only query can't
+        // see its unigram entry, so min-load (eagle) wins.
+        let _g1 = w_unigram.load_guard();
+        let _g2 = w_unigram.load_guard();
+        let workers = vec![Arc::clone(&w_eagle), Arc::clone(&w_unigram)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://eagle:30000",
+            "unimodal bigram must not match a unigram entry (no dual-hash)",
+        );
+    }
+
+    /// Symmetric direction: bimodal fleet, primary = unigram. A prefix
+    /// cached only on the bigram (EAGLE) worker is matched via the secondary
+    /// bigram hash — proving dual-hash works regardless of which mode is primary.
+    #[test]
+    fn bimodal_matches_bigram_owner_under_unigram_primary() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let block_size = 4u32;
+        // EAGLE worker publishes BIGRAM block hashes.
+        let hashes = compute_block_hashes_bigram(&ids, block_size as usize);
+        assert!(!hashes.is_empty());
+        tree.insert(
+            &KvWorkerId::new("http://eagle:30000".into(), 0),
+            None,
+            &hashes,
+        );
+
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                ..Default::default()
+            },
+            tree,
+            registry,
+            bimodal_oracle(4, /* primary_bigram= */ false),
+        );
+        let w_eagle = worker("http://eagle:30000", "tiny");
+        let w_unigram = worker("http://unigram:30000", "tiny");
+        let _g1 = w_eagle.load_guard();
+        let _g2 = w_eagle.load_guard();
+        let workers = vec![Arc::clone(&w_eagle), Arc::clone(&w_unigram)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://eagle:30000",
+            "dual-hash must find the bigram owner despite a unigram primary",
+        );
     }
 
     /// The cache-aware path records the matched prefix-overlap block count
@@ -697,8 +1221,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -762,8 +1285,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             toks,
@@ -823,8 +1345,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 1.0, // match_rate <= 1.0 always -> always fall back
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             toks,
@@ -1045,8 +1566,7 @@ mod tests {
             let policy = new_policy(
                 CacheAwareConfig {
                     cache_threshold: 0.0,
-                    balance_abs_threshold: 32,
-                    balance_rel_threshold: 1.1,
+                    ..Default::default()
                 },
                 tree,
                 Arc::clone(&registry),
@@ -1085,8 +1605,7 @@ mod tests {
             let policy = new_policy(
                 CacheAwareConfig {
                     cache_threshold: 0.0,
-                    balance_abs_threshold: 32,
-                    balance_rel_threshold: 1.1,
+                    ..Default::default()
                 },
                 tree,
                 Arc::clone(&registry),
@@ -1143,8 +1662,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1215,8 +1733,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1253,8 +1770,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1356,8 +1872,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1391,8 +1906,11 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0, // would normally always match
-                balance_abs_threshold: 5,
-                balance_rel_threshold: 2.0,
+                load_gate: LoadGate::FleetSpread {
+                    abs_threshold: 5,
+                    rel_threshold: 2.0,
+                },
+                ..Default::default()
             },
             tree,
             registry,
@@ -1437,8 +1955,11 @@ mod tests {
         let policy = new_policy_with_load(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                balance_abs_threshold: 5,
-                balance_rel_threshold: 2.0,
+                load_gate: LoadGate::FleetSpread {
+                    abs_threshold: 5,
+                    rel_threshold: 2.0,
+                },
+                ..Default::default()
             },
             tree,
             registry,
@@ -1484,8 +2005,11 @@ mod tests {
                 cache_threshold: 0.0,
                 // High thresholds so the imbalance fast-path never fires (10 vs
                 // 2) and selection reaches the matched-set tiebreak.
-                balance_abs_threshold: 100,
-                balance_rel_threshold: 100.0,
+                load_gate: LoadGate::FleetSpread {
+                    abs_threshold: 100,
+                    rel_threshold: 100.0,
+                },
+                ..Default::default()
             },
             tree,
             registry,
@@ -1534,8 +2058,11 @@ mod tests {
                 // High thresholds so the imbalance fast-path never fires on
                 // the raw engine numbers (1 vs 3) and selection reaches the
                 // matched-set tiebreak, which also uses `load_of`.
-                balance_abs_threshold: 100,
-                balance_rel_threshold: 100.0,
+                load_gate: LoadGate::FleetSpread {
+                    abs_threshold: 100,
+                    rel_threshold: 100.0,
+                },
+                ..Default::default()
             },
             tree,
             registry,
@@ -1640,8 +2167,7 @@ mod tests {
         let policy = new_policy_with_load(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1766,8 +2292,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.99,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             tokenizer_registry_with_tiny(),
@@ -1783,6 +2308,335 @@ mod tests {
         let ctx = SelectionContext::new(&model, Some(body));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000");
+    }
+
+    /// The whole point of sampling: with `min_load_choices = 1` every pick is
+    /// one uniform draw, so two replicas (or one over time) stop converging
+    /// on the same current minimum and the load diffuses. Over 200 selects a
+    /// deterministic pick would land on one URL exclusively; sampling must
+    /// visit both — the failing alternative is fixed, not statistical
+    /// (single-draw visits either side with p ≥ 1/2 each select).
+    #[test]
+    fn min_load_sampled_pick_diffuses_across_near_min_workers() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            CacheAwareConfig {
+                min_load_choices: 1,
+                ..cfg_default()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            seen.insert(
+                policy
+                    .select(&workers, &ctx)
+                    .expect("must pick")
+                    .url
+                    .clone(),
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "single-draw picks must diffuse; got {seen:?}"
+        );
+    }
+
+    /// Sampling relaxes the exact MINIMUM, never the tier: with the queue
+    /// gate active and one worker queueing, a single-draw pick still cannot
+    /// land on it while an unqueued worker exists.
+    #[test]
+    fn min_load_sampled_pick_respects_the_queue_tier() {
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(4, 4), now); // queueing
+        engine_load.set("http://w1:30000", 0, load_stat(15, 0), now); // deep, unqueued
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                min_load_choices: 1,
+                ..queue_cfg(2)
+            },
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        for _ in 0..50 {
+            assert_eq!(
+                policy.select(&workers, &ctx).expect("must pick").url,
+                "http://w1:30000",
+                "a queueing worker must never win while an unqueued one exists",
+            );
+        }
+    }
+
+    /// `choices >= pool` is the old exact minimum, kept as the escape hatch
+    /// the deployment can set without a rebuild.
+    #[test]
+    fn min_load_full_sample_is_the_exact_minimum() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            CacheAwareConfig {
+                min_load_choices: 2,
+                ..cfg_default()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let _g = w0.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        for _ in 0..50 {
+            assert_eq!(
+                policy.select(&workers, &ctx).expect("must pick").url,
+                "http://w1:30000",
+                "a full sample must rank the whole pool and take the minimum",
+            );
+        }
+    }
+
+    /// Reach, not shape: with five workers every one must be a possible
+    /// single-draw pick (P(any worker missed) ≤ 5·(4/5)⁵⁰⁰ ≈ 10⁻⁴⁸). This is
+    /// the test the 2-worker diffusion test CANNOT be: on n=2 a biased
+    /// sampler that only ever reaches two of the candidates still passes
+    /// "both workers visited", so only a ≥4-worker fleet detects a sampler
+    /// reading the wrong end of a partial shuffle.
+    #[test]
+    fn min_load_sampled_pick_reaches_every_worker_on_five_workers() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            CacheAwareConfig {
+                min_load_choices: 1,
+                ..cfg_default()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let workers: Vec<_> = (0..5)
+            .map(|i| worker(&format!("http://w{i}:30000"), "tiny"))
+            .collect();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            seen.insert(
+                policy
+                    .select(&workers, &ctx)
+                    .expect("must pick")
+                    .url
+                    .clone(),
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            5,
+            "every worker must be reachable by the sampler; got {seen:?}"
+        );
+    }
+
+    /// The shipped default path: 1 < k < pool. Deterministic to assert
+    /// against because the deepest worker can only win a sampled pick when
+    /// it shares the sample with no one lighter — impossible with three
+    /// lighter workers and two draws, so "deepest never picked" has no
+    /// statistical tail at all.
+    #[test]
+    fn min_load_power_of_two_never_picks_the_deepest_of_four() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            CacheAwareConfig {
+                min_load_choices: 2,
+                ..cfg_default()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let workers: Vec<_> = (0..4)
+            .map(|i| worker(&format!("http://w{i}:30000"), "tiny"))
+            .collect();
+        let _heavy = workers[3].load_guard();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        for _ in 0..100 {
+            assert_ne!(
+                policy.select(&workers, &ctx).expect("must pick").url,
+                "http://w3:30000",
+                "a 2-sample can always dodge the single deepest worker",
+            );
+        }
+    }
+
+    /// A full-tie fleet (all loads equal) is where "choices >= pool
+    /// recovers the deterministic exact minimum" pays the helpers back:
+    /// the pick is stable across selects under the usize::MAX pin, which a
+    /// shuffled full-sample implementation would break without failing any
+    /// assertion that pins load skew.
+    #[test]
+    fn min_load_full_sample_is_deterministic_under_ties() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            cfg_default(),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        // Pool order, not just "some fixed worker": the no-shuffle full
+        // sample preserves the pre-sampling tiebreak, and pinning the URL
+        // (not just cross-select stability) guards that contract.
+        let first = policy
+            .select(&workers, &ctx)
+            .expect("must pick")
+            .url
+            .clone();
+        assert_eq!(first, "http://w0:30000");
+        for _ in 0..50 {
+            assert_eq!(policy.select(&workers, &ctx).expect("must pick").url, first);
+        }
+    }
+
+    /// Where `min_load_sampled_pick_respects_the_queue_tier` degenerates
+    /// (its tier-1 pool is a singleton, so no sampler runs), this one
+    /// exercises the actual draw: two unqueued workers + one queueing, a
+    /// single-draw pick must stay inside the tier over 100 selects.
+    /// P(queueing worker surviving under a whole-fleet-sampling regression)
+    /// = (2/3)¹⁰⁰ ≈ 10⁻¹⁸.
+    #[test]
+    fn min_load_sampled_draw_stays_inside_the_unqueued_tier() {
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(4, 4), now); // queueing
+        engine_load.set("http://w1:30000", 0, load_stat(9, 0), now); // unqueued
+        engine_load.set("http://w2:30000", 0, load_stat(15, 0), now); // unqueued
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                min_load_choices: 1,
+                ..queue_cfg(2)
+            },
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let workers: Vec<_> = (0..3)
+            .map(|i| worker(&format!("http://w{i}:30000"), "tiny"))
+            .collect();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let picked = policy.select(&workers, &ctx).expect("must pick");
+            assert_ne!(
+                picked.url, "http://w0:30000",
+                "a queueing worker must never win while an unqueued one exists",
+            );
+            seen.insert(picked.url.clone());
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "both unqueued workers are reachable draws; got {seen:?}"
+        );
+    }
+
+    /// The CLI is NonZeroUsize, but a programmatically constructed 0 is
+    /// clamped to a single draw rather than passed to `partial_shuffle` as
+    /// an empty sample. Pins the documented clamp.
+    #[test]
+    fn min_load_zero_choices_clamps_to_a_single_draw() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            CacheAwareConfig {
+                min_load_choices: 0,
+                ..cfg_default()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let workers = vec![Arc::clone(&w0)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+        );
+    }
+
+    /// Sampling relaxes the exact minimum, never the saturation signal: at
+    /// choices=1 with every worker queueing, a pick landing on a NON-owner
+    /// is now the common case — but the routing could not have used locality
+    /// anyway (no unqueued worker existed), so the decision must still be
+    /// `cache_hit_all_queued`, not `cache_worker_queued`, or the fleet-
+    /// saturation label goes silent exactly when it should climb.
+    #[test]
+    fn queue_gate_all_queued_classification_keys_on_saturation_not_the_draw() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(8, 5), now); // owner, queueing
+        engine_load.set("http://w1:30000", 0, load_stat(1, 5), now); // non-owner, queueing, shallower
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                min_load_choices: 1,
+                ..queue_cfg(4)
+            },
+            Arc::clone(&tree),
+            Arc::clone(&registry),
+            oracle_for_tests(4),
+            Arc::clone(&engine_load),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        // Tier 2 must stay routable: every pick is Some, and it may land on
+        // either worker — that draw is the saturation this label captures.
+        for _ in 0..50 {
+            policy
+                .select(&workers, &ctx)
+                .expect("tier 2 must keep routing");
+        }
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit_all_queued\"} 50"
+            ),
+            "every all-queued pick is saturation regardless of where the draw lands; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("decision=\"cache_worker_queued\""),
+            "nothing was diverted — no unqueued worker existed; got:\n{rendered}"
+        );
     }
 
     /// Byte-slice helper over the shared `extract_prompt_text_from_value` free
@@ -1849,8 +2703,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree.clone(),
             registry,
@@ -1946,8 +2799,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1969,5 +2821,568 @@ mod tests {
             chosen.url, "http://w0:30000",
             "select must use ctx tokens (w0's prefix), not re-tokenize the body"
         );
+    }
+
+    // ---- per-worker queue gate ----
+
+    const QUEUE_TEXT: &str = "hello world hello world hello world";
+
+    fn queue_cfg(limit: usize) -> CacheAwareConfig {
+        CacheAwareConfig {
+            cache_threshold: 0.0, // any match counts; the gate is what's under test
+            load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(limit).expect("limit > 0")),
+            min_load_choices: usize::MAX,
+        }
+    }
+
+    /// Fleet-spread config with the shipped defaults, for the side-by-side arms
+    /// that characterise the strategy the queue gate replaces.
+    fn spread_cfg() -> CacheAwareConfig {
+        CacheAwareConfig {
+            cache_threshold: 0.0,
+            min_load_choices: usize::MAX,
+            ..Default::default()
+        }
+    }
+
+    /// Seed `owners` as prefix holders for [`QUEUE_TEXT`] and return the tree
+    /// plus the encoded request body.
+    fn queue_fixture(
+        registry: &Arc<TokenizerRegistry>,
+        owners: &[&str],
+    ) -> (Arc<HashTree>, Vec<u8>) {
+        let tree = Arc::new(HashTree::new());
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, QUEUE_TEXT).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        assert!(
+            !hashes.is_empty(),
+            "fixture must produce at least one block"
+        );
+        for owner in owners {
+            tree.insert(&KvWorkerId::new((*owner).into(), 0), None, &hashes);
+        }
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": QUEUE_TEXT})).unwrap();
+        (tree, body)
+    }
+
+    /// The gate reads the queue, not total depth. A cache home that is busy but
+    /// draining — high `running`, empty queue — keeps its traffic; sending it
+    /// elsewhere would trade a warm prefix for nothing.
+    #[test]
+    fn queue_gate_keeps_affinity_on_a_busy_but_unqueued_cache_home() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        // w0 is far deeper than w1, but nothing is waiting on it.
+        engine_load.set("http://w0:30000", 0, load_stat(30, 0), now);
+        engine_load.set("http://w1:30000", 0, load_stat(1, 0), now);
+
+        let policy = new_policy_with_load(
+            queue_cfg(4),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+            "depth 30 with an empty queue must not cost the request its cache home",
+        );
+    }
+
+    /// The case a depth threshold cannot express, and the reason this gate is
+    /// keyed on the queue: engines have been observed queueing while running
+    /// well under their concurrency cap. Here the cache home is SHALLOWER than
+    /// the alternative — depth 13 vs 20 — yet it is the one that would make the
+    /// request wait. Any depth-based gate keeps feeding it; the queue gate does
+    /// not, and the fleet-spread arm does not either.
+    #[test]
+    fn queue_gate_diverts_a_shallow_but_queueing_cache_home() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(8, 5), now); // depth 13, queue 5
+        engine_load.set("http://w1:30000", 0, load_stat(20, 0), now); // depth 20, queue 0
+
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            queue_cfg(4),
+            Arc::clone(&tree),
+            Arc::clone(&registry),
+            oracle_for_tests(4),
+            Arc::clone(&engine_load),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+            "a queue of 5 disqualifies the cache home even though it is the shallower worker",
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_worker_queued\"} 1"
+            ),
+            "the diversion must be attributable to the queue gate; got:\n{rendered}"
+        );
+
+        let spread = new_policy_with_load(
+            spread_cfg(),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        assert_eq!(
+            spread.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+            "the fleet-spread strategy keeps feeding the queueing worker: spread is only 7",
+        );
+    }
+
+    /// Boundary: the limit is a ceiling on the queue, not a preference. A cache
+    /// home one under it keeps the request.
+    #[test]
+    fn queue_gate_boundary_is_at_the_limit_not_below_it() {
+        let registry = tokenizer_registry_with_tiny();
+        let model = ModelId("tiny".into());
+        for (waiting, expected) in [(3usize, "http://w0:30000"), (4, "http://w1:30000")] {
+            let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+            let engine_load = EngineLoadTable::new();
+            let now = Instant::now();
+            engine_load.set("http://w0:30000", 0, load_stat(5, waiting as u64), now);
+            engine_load.set("http://w1:30000", 0, load_stat(5, 0), now);
+            let policy = new_policy_with_load(
+                queue_cfg(4),
+                tree,
+                Arc::clone(&registry),
+                oracle_for_tests(4),
+                engine_load,
+            );
+            let workers = vec![
+                worker("http://w0:30000", "tiny"),
+                worker("http://w1:30000", "tiny"),
+            ];
+            let ctx = SelectionContext::new(&model, Some(&body));
+            assert_eq!(
+                policy.select(&workers, &ctx).expect("must pick").url,
+                expected,
+                "queue={waiting} against limit=4",
+            );
+        }
+    }
+
+    /// Locality survives through a second prefix owner: only the queueing one is
+    /// skipped, and the request still lands on a worker holding the prefix
+    /// rather than on the idle non-owner. Recorded as a hit, because it is one.
+    #[test]
+    fn queue_gate_prefers_an_unqueued_prefix_owner_over_an_idle_non_owner() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000", "http://w1:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(6, 9), now); // owner, queueing
+        engine_load.set("http://w1:30000", 0, load_stat(18, 0), now); // owner, no queue
+        engine_load.set("http://w2:30000", 0, load_stat(0, 0), now); // idle non-owner
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            queue_cfg(4),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+            worker("http://w2:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+            "the unqueued prefix owner must win over an idle worker holding nothing",
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit\"} 1"
+            ),
+            "serving from a second prefix owner is still a cache hit; got:\n{rendered}"
+        );
+    }
+
+    /// Fail-open: when every worker is queueing the policy must still return
+    /// one. Filtering the min-load fallback too would return `None`, which the
+    /// admission path turns into a hard selection failure on every request.
+    #[test]
+    fn queue_gate_never_returns_none_when_the_whole_fleet_is_queueing() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(20, 9), now);
+        engine_load.set("http://w1:30000", 0, load_stat(9, 6), now);
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            queue_cfg(4),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must still route").url,
+            "http://w1:30000",
+            "an all-queueing fleet still routes, to the least loaded worker",
+        );
+        assert!(
+            metrics.render().contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit_all_queued\"} 1"
+            ),
+            "every worker queueing is saturation, whatever the draw picks: with NO unqueued \
+             alternative the gate vetoed nothing, so this is the saturation label, not a \
+             diversion — and under sampled picks it lands off-owner almost always, which is \
+             why the classification keys on saturation rather than where the draw landed",
+        );
+    }
+
+    /// The fallback's second tier can land back on the queueing cache home when
+    /// it is also the least loaded. Routing is then identical to affinity, so it
+    /// is not a diversion — but it is reachable ONLY when no worker in the fleet
+    /// is unqueued, so it gets its own label rather than being folded into
+    /// `cache_hit`, where a fully saturated fleet would read as a healthy one.
+    #[test]
+    fn queue_gate_records_all_queued_when_the_fallback_lands_on_the_cache_home() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        // Both queueing; the cache home is also the fleet minimum by depth.
+        engine_load.set("http://w0:30000", 0, load_stat(2, 5), now); // depth 7
+        engine_load.set("http://w1:30000", 0, load_stat(30, 8), now); // depth 38
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            queue_cfg(4),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit_all_queued\"} 1"
+            ),
+            "landing back on the cache home is a hit, but a saturated one; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("decision=\"cache_worker_queued\""),
+            "no locality was given up; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("decision=\"cache_hit\"}"),
+            "must NOT be indistinguishable from an unqueued hit — that is the \
+             whole point of the separate label; got:\n{rendered}"
+        );
+    }
+
+    /// Over-firing, the other half of what this replaces: a wide fleet spread
+    /// makes `FleetSpread` bypass the cache for every request. The queue gate
+    /// never consults the spread, so a cache home with no backlog keeps its
+    /// traffic no matter how uneven the fleet is.
+    #[test]
+    fn queue_gate_ignores_fleet_spread_when_the_cache_home_is_not_queueing() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(10, 0), now);
+        engine_load.set("http://w1:30000", 0, load_stat(2, 0), now);
+        engine_load.set("http://w2:30000", 0, load_stat(45, 0), now); // spread 43
+
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+            worker("http://w2:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+
+        let policy = new_policy_with_load(
+            queue_cfg(4),
+            Arc::clone(&tree),
+            Arc::clone(&registry),
+            oracle_for_tests(4),
+            Arc::clone(&engine_load),
+        );
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+            "a wide spread must not divert a request whose cache home has no queue",
+        );
+
+        let spread = new_policy_with_load(
+            spread_cfg(),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        assert_eq!(
+            spread.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+            "documents the behaviour the queue gate replaces",
+        );
+    }
+
+    /// No fresh engine snapshot means no queue signal, and the router-side
+    /// in-flight counter cannot supply one — it cannot tell a running request
+    /// from a waiting one. The gate fails open rather than comparing the limit
+    /// against a different quantity.
+    #[test]
+    fn queue_gate_fails_open_without_an_engine_snapshot() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        // Empty engine-load table -> `waiting_of` is None for every worker.
+        let policy = new_policy(queue_cfg(1), tree, registry, oracle_for_tests(4));
+
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+
+        // Even a limit of 1 with router-side load piled on w0 cannot gate it:
+        // there is no queue reading to compare against.
+        let _g: Vec<_> = (0..10).map(|_| w0.load_guard()).collect();
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+            "an unknown queue leaves the cache home eligible",
+        );
+    }
+
+    /// The queue preference applies to EVERY min-load fallback, not just the
+    /// matched-set diversion — including the below-threshold tree-miss path,
+    /// which is the highest-volume one. Without this, replacing the gate with
+    /// `None` at the seven early-fallback call sites leaves the suite green
+    /// while every cache miss during a tokenizer or oracle outage piles onto
+    /// whichever worker is shallowest, backlog and all.
+    #[test]
+    fn queue_gate_applies_to_the_below_threshold_fallback() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        // w0 is the fleet minimum by depth but is queueing; w1 is deeper and idle.
+        engine_load.set("http://w0:30000", 0, load_stat(2, 7), now); // depth 9
+        engine_load.set("http://w1:30000", 0, load_stat(25, 0), now); // depth 25
+
+        // cache_threshold 1.0 makes every match fall below the bar, so the
+        // request takes the below-threshold path rather than the matched-set one.
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                cache_threshold: 1.0,
+                load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(4).unwrap()),
+                ..Default::default()
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+            "a below-threshold fallback must still avoid the queueing worker",
+        );
+        assert!(
+            metrics.render().contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"below_threshold\"} 1"
+            ),
+            "this must be exercising the below-threshold path, not the matched-set one",
+        );
+    }
+
+    /// `waiting_of` deliberately carries no `slots_acquired_since` correction:
+    /// a request this router just dispatched is not known to be QUEUED — the
+    /// engine may well be running it — so adding it would manufacture queue
+    /// depth that does not exist and turn the gate back into an over-firing
+    /// depth-ish check under burst.
+    #[test]
+    fn queue_gate_does_not_count_this_routers_own_recent_dispatches_as_queued() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        // Snapshot taken in the past, reporting an empty queue.
+        let earlier = Instant::now() - Duration::from_millis(500);
+        engine_load.set("http://w0:30000", 0, load_stat(5, 0), earlier);
+        engine_load.set("http://w1:30000", 0, load_stat(5, 0), earlier);
+
+        let policy = new_policy_with_load(
+            queue_cfg(4),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+
+        // Eight dispatches since that snapshot — well past the limit of 4 if
+        // they were (wrongly) counted as queue depth.
+        let _g: Vec<_> = (0..8).map(|_| w0.load_guard()).collect();
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+            "recent dispatches raise depth, not queue — the gate must not fire on them",
+        );
+    }
+
+    /// A real diversion records what it gave up, so the forgone-prefix
+    /// distribution can be compared against the all-selections one. Without
+    /// this there is no way to tell a gate that diverts a representative sample
+    /// from one that is trading away large cached prefixes to dodge short
+    /// queues.
+    #[test]
+    fn queue_gate_records_the_overlap_a_diversion_gave_up() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, QUEUE_TEXT).unwrap();
+        let expected_blocks = compute_block_hashes(&ids, 4).len();
+
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(5, 9), now); // owner, queueing
+        engine_load.set("http://w1:30000", 0, load_stat(5, 0), now);
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            queue_cfg(4),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(&format!(
+                "sgl_router_diverted_overlap_blocks_sum{{model_id=\"tiny\"}} {expected_blocks}"
+            )),
+            "a diversion must record the prefix it forwent; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("sgl_router_diverted_overlap_blocks_count{model_id=\"tiny\"} 1"),
+            "exactly one diversion observed; got:\n{rendered}"
+        );
+    }
+
+    /// Selections that kept their cache home must NOT appear in the diverted
+    /// histogram — otherwise it measures traffic rather than sacrifice, and the
+    /// comparison against the all-selections curve is meaningless.
+    #[test]
+    fn queue_gate_records_no_diverted_overlap_when_affinity_is_kept() {
+        let registry = tokenizer_registry_with_tiny();
+        let model = ModelId("tiny".into());
+
+        // (a) cache home has room -> plain hit.
+        // (b) every worker is queueing and the fallback lands back on the home
+        //     -> cache_hit_all_queued, which gave up nothing.
+        for (home, other) in [((5u64, 0u64), (5u64, 0u64)), ((2, 5), (30, 8))] {
+            let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+            let engine_load = EngineLoadTable::new();
+            let now = Instant::now();
+            engine_load.set("http://w0:30000", 0, load_stat(home.0, home.1), now);
+            engine_load.set("http://w1:30000", 0, load_stat(other.0, other.1), now);
+
+            let metrics = MetricsRegistry::new();
+            let policy = new_policy_with_load(
+                queue_cfg(4),
+                tree,
+                Arc::clone(&registry),
+                oracle_for_tests(4),
+                engine_load,
+            )
+            .with_metrics(Arc::clone(&metrics));
+            let workers = vec![
+                worker("http://w0:30000", "tiny"),
+                worker("http://w1:30000", "tiny"),
+            ];
+            let ctx = SelectionContext::new(&model, Some(&body));
+            assert_eq!(
+                policy.select(&workers, &ctx).expect("must pick").url,
+                "http://w0:30000",
+                "home={home:?} other={other:?} should keep the cache home",
+            );
+            let rendered = metrics.render();
+            assert!(
+                !rendered.contains("sgl_router_diverted_overlap_blocks_count{model_id=\"tiny\"} 1"),
+                "no prefix was given up for home={home:?}; got:\n{rendered}"
+            );
+        }
     }
 }

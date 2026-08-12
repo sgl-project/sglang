@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use std::num::NonZeroUsize;
 
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
@@ -157,6 +158,115 @@ pub struct ModelConfig {
     pub sticky: Option<StickyConfig>,
 }
 
+/// How the cache-aware policy decides that load should override cache
+/// affinity. The two strategies are alternatives, not layers, so this is an
+/// enum: a struct carrying both sets of knobs can represent a configuration
+/// where half of them are silently unread, which is the state the CLI has to
+/// reject by hand and which a config dump would still print as if live.
+///
+/// The distinction that matters is *what is measured*. `FleetSpread` measures
+/// the candidate set; `PerWorkerQueue` measures whether the worker this request
+/// would actually land on is already making requests wait.
+#[derive(Debug, Clone, Copy)]
+pub enum LoadGate {
+    /// Skip the cache lookup entirely when `max_load - min_load >
+    /// abs_threshold` AND `max_load > min_load * rel_threshold`, and route to
+    /// the least-loaded of a `min_load_choices` sample instead.
+    ///
+    /// `max - min` over the candidate set is an order statistic of the fleet,
+    /// so in a large fleet it is dominated by the tail and says little about
+    /// any single request. It therefore both over-fires (one busy worker
+    /// diverts every request, including the vast majority whose cache home is
+    /// idle) and under-fires (a worker one slot from shedding is unprotected
+    /// whenever the fleet minimum is high enough to close the spread).
+    FleetSpread {
+        /// Default 32 — picked to dominate over typical batch-of-8 effect.
+        abs_threshold: usize,
+        /// Default 1.1 — 10 % relative difference triggers re-balancing.
+        rel_threshold: f32,
+    },
+    /// Number of already-queued requests at or above which a worker stops being
+    /// eligible to win a selection on cache affinity — the request goes to
+    /// another worker holding the same prefix, or failing that to the
+    /// least-loaded of a `min_load_choices` sample.
+    ///
+    /// The cache lookup itself is unchanged, but every min-load fallback in the
+    /// policy additionally *prefers* a non-queueing worker, so this reorders
+    /// more than the matched-set pick — including the ordinary below-threshold
+    /// tree-miss path, which is the highest-volume one. The fallback is never
+    /// queue-*bounded*, though: when no unqueued worker exists it samples the
+    /// whole fleet and takes the least-loaded of the sample regardless, so a
+    /// fleet where everything is queueing still routes.
+    ///
+    /// Gating on the queue rather than on total depth is what makes this
+    /// targeted. `num_waiting_reqs` IS the question the request cares about —
+    /// will I sit behind other work before my prefill starts — whereas depth
+    /// only proxies it, and proxies it badly: on long-prompt traffic engines
+    /// have been observed queueing at 7-8 running, far below
+    /// `max_running_requests`, so a depth threshold high enough to avoid firing
+    /// on healthy busy workers misses most of the workers that are actually
+    /// making requests wait.
+    ///
+    /// Gating on the queue makes the healthy *baseline* topology-independent,
+    /// which a depth threshold is not: depth summed across a worker's dp ranks
+    /// carries a `dp_size × max_running_requests` term, while a healthy worker
+    /// reads ~0 waiting at any `dp_size`. The *firing point* still scales,
+    /// though — `fresh_worker_state` sums `waiting` across ranks while a request
+    /// is dispatched to one of them, so on a `dp_size=8` worker a queue of one
+    /// on four ranks sums to 4 and trips a limit of 4, where the request would
+    /// actually sit behind at most one. Scale the limit with `dp_size`.
+    ///
+    /// Read from `cache_aware_zmq::WorkerLoads::waiting_of`, which is `None`
+    /// when no fresh all-ranks snapshot exists. There is no router-side
+    /// substitute — the in-flight counter cannot distinguish a running request
+    /// from a waiting one — so an unknown queue leaves the worker eligible.
+    /// The gate fails open and says so, rather than comparing the threshold
+    /// against a different quantity.
+    PerWorkerQueue(NonZeroUsize),
+}
+
+impl Default for LoadGate {
+    fn default() -> Self {
+        Self::FleetSpread {
+            abs_threshold: default_balance_abs(),
+            rel_threshold: default_balance_rel(),
+        }
+    }
+}
+
+impl LoadGate {
+    pub const DEFAULT_ABS_THRESHOLD: usize = 32;
+    pub const DEFAULT_REL_THRESHOLD: f32 = 1.1;
+
+    /// Whether a worker with this queue reading may still win a selection on
+    /// cache affinity, and be preferred by the min-load fallback.
+    ///
+    /// The single place the gate's rule is written. Both decisions live here:
+    /// the boundary is `<` (at the limit disqualifies), and an unknown queue
+    /// (`None`) admits — there is no per-worker router-side substitute for the
+    /// engine's queue, so the gate fails open rather than comparing the limit
+    /// against a different quantity. Callers that re-derived this from
+    /// [`Self::queue_limit`] could drift apart; the matched-set filter and the
+    /// fallback's preference tier must agree or the fallback hands requests
+    /// back to workers the gate just rejected.
+    pub fn admits_affinity(&self, waiting: Option<usize>) -> bool {
+        match (self, waiting) {
+            (Self::PerWorkerQueue(limit), Some(waiting)) => waiting < limit.get(),
+            _ => true,
+        }
+    }
+
+    /// The configured queue limit, or `None` under [`Self::FleetSpread`].
+    /// For logging and diagnostics — the routing decision goes through
+    /// [`Self::admits_affinity`].
+    pub fn queue_limit(&self) -> Option<usize> {
+        match self {
+            Self::PerWorkerQueue(limit) => Some(limit.get()),
+            Self::FleetSpread { .. } => None,
+        }
+    }
+}
+
 /// Per-model cache-aware-ZMQ tuning.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheAwareConfig {
@@ -166,22 +276,24 @@ pub struct CacheAwareConfig {
     /// signal but not so weak that random hash collisions could trigger
     /// affinity to an arbitrary worker.
     pub cache_threshold: f32,
-    /// Absolute load spread (`max - min`) above which the cache check is
-    /// skipped in favour of min-load. Default 32 — picked to dominate
-    /// over typical batch-of-8 effect.
-    pub balance_abs_threshold: usize,
-    /// Multiplicative load spread (`max > min * balance_rel_threshold`)
-    /// that the absolute check is gated on. Default 1.1 — 10 % relative
-    /// difference triggers re-balancing.
-    pub balance_rel_threshold: f32,
+    /// Which load signal is allowed to override cache affinity.
+    pub load_gate: LoadGate,
+    /// Candidates sampled for each min-load fallback pick: the pick is the
+    /// least-loaded of this many uniformly random eligible workers, not the
+    /// fleet-wide minimum. Default 2 (power-of-two choices), which damps the
+    /// cross-replica herd on the shared current minimum while losing almost
+    /// no load quality. Applies within each gating tier (unqueued first),
+    /// so a busy fleet never becomes a selection error. A value at or above
+    /// the fleet size recovers the exact-minimum behavior.
+    pub min_load_choices: usize,
 }
 
 impl Default for CacheAwareConfig {
     fn default() -> Self {
         Self {
             cache_threshold: default_cache_threshold(),
-            balance_abs_threshold: default_balance_abs(),
-            balance_rel_threshold: default_balance_rel(),
+            load_gate: LoadGate::default(),
+            min_load_choices: default_min_load_choices(),
         }
     }
 }
@@ -190,10 +302,14 @@ fn default_cache_threshold() -> f32 {
     0.5
 }
 fn default_balance_abs() -> usize {
-    32
+    LoadGate::DEFAULT_ABS_THRESHOLD
 }
 fn default_balance_rel() -> f32 {
-    1.1
+    LoadGate::DEFAULT_REL_THRESHOLD
+}
+
+fn default_min_load_choices() -> usize {
+    2
 }
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix
@@ -832,5 +948,48 @@ mod k8s_discovery_config_tests {
         )
         .expect("distinct selectors must validate");
         assert!(matches!(m, K8sDiscoveryMode::PdDisaggregation { .. }));
+    }
+}
+
+#[cfg(test)]
+mod load_gate_tests {
+    use super::*;
+
+    /// The gate's whole rule, pinned directly rather than through a policy
+    /// fixture: the boundary is `<` (at the limit disqualifies) and an unknown
+    /// queue admits. Both the matched-set filter and the fallback's preference
+    /// tier read this one method, so if they ever disagree it is because this
+    /// changed — and then this test says so, instead of one routing fixture's
+    /// numbers happening to still work out.
+    #[test]
+    fn load_gate_admits_affinity_encodes_the_boundary_and_fails_open() {
+        let gate = LoadGate::PerWorkerQueue(NonZeroUsize::new(4).unwrap());
+        assert!(gate.admits_affinity(Some(0)));
+        assert!(gate.admits_affinity(Some(3)), "3 < 4 is still eligible");
+        assert!(!gate.admits_affinity(Some(4)), "at the limit disqualifies");
+        assert!(!gate.admits_affinity(Some(99)));
+        assert!(
+            gate.admits_affinity(None),
+            "an unknown queue must admit: there is no per-worker router-side \
+             substitute, so the gate fails open rather than comparing the limit \
+             against a different quantity"
+        );
+
+        // The fleet-spread strategy has no per-worker queue opinion at all.
+        let spread = LoadGate::default();
+        for waiting in [None, Some(0), Some(1_000)] {
+            assert!(spread.admits_affinity(waiting));
+        }
+        assert_eq!(spread.queue_limit(), None);
+    }
+
+    /// A limit of 1 gates any queue at all — the most aggressive representable
+    /// setting, and the reason `NonZeroUsize` matters: 0 would gate everything
+    /// unconditionally and silently degrade the policy to pure min-load.
+    #[test]
+    fn load_gate_limit_of_one_gates_any_queue() {
+        let gate = LoadGate::PerWorkerQueue(NonZeroUsize::new(1).unwrap());
+        assert!(gate.admits_affinity(Some(0)));
+        assert!(!gate.admits_affinity(Some(1)));
     }
 }
