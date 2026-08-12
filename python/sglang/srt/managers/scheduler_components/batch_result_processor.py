@@ -1107,7 +1107,11 @@ class SchedulerBatchResultProcessor:
     ):
         think_end_ids = self.model_config.think_end_ids
         if req.require_reasoning and think_end_ids:
-            req.update_reasoning_tokens(next_token_id, think_end_ids)
+            req.update_reasoning_tokens(
+                token_id=next_token_id,
+                think_start_ids=self.model_config.think_start_ids,
+                think_end_ids=think_end_ids,
+            )
 
     def _mamba_prefix_cache_update(
         self,

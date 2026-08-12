@@ -145,6 +145,8 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
 
+PROMPT_THINK_SCAN_TOKENS = 256
+
 logger = logging.getLogger(__name__)
 
 
@@ -906,8 +908,12 @@ class Req(ReqDllmMixin):
         self.require_reasoning = require_reasoning
 
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
+        self._is_reasoning_started = False
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
+        self._pending_reasoning_tokens = 0
+        self._think_start_matcher: Optional[TokenSequenceMatcher] = None
+        self._think_start_match_len = 0
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
 
@@ -1816,7 +1822,28 @@ class Req(ReqDllmMixin):
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
-    def update_reasoning_tokens(self, token_id, think_end_ids):
+    def _init_reasoning_state(self, think_start_ids, think_end_ids):
+        self._think_end_matcher = TokenSequenceMatcher(think_end_ids)
+        if not think_start_ids:
+            self._is_reasoning_started = True
+            return
+        self._think_start_matcher = TokenSequenceMatcher(think_start_ids)
+        self._is_reasoning_started = self._prompt_opens_reasoning()
+
+    def _prompt_opens_reasoning(self) -> bool:
+        """Whether the last thinking delimiter of the prompt tail leaves a block open."""
+        is_open = False
+        start_len = end_len = 0
+        for token in self.origin_input_ids[-PROMPT_THINK_SCAN_TOKENS:]:
+            start_len = self._think_start_matcher.advance(start_len, token)
+            end_len = self._think_end_matcher.advance(end_len, token)
+            if start_len == len(self._think_start_matcher):
+                is_open, start_len = True, 0
+            if end_len == len(self._think_end_matcher):
+                is_open, end_len = False, 0
+        return is_open
+
+    def update_reasoning_tokens(self, token_id, think_start_ids, think_end_ids):
         if self._is_reasoning_over:
             return
 
@@ -1824,18 +1851,29 @@ class Req(ReqDllmMixin):
             token_id = [token_id]
 
         if self._think_end_matcher is None:
-            self._think_end_matcher = TokenSequenceMatcher(think_end_ids)
+            self._init_reasoning_state(think_start_ids, think_end_ids)
+            unseen = max(0, len(self.output_ids) - len(token_id))
+            token_id = list(self.output_ids[:unseen]) + token_id
 
-        matched = self._think_end_match_len
-        for position, token in enumerate(token_id):
-            matched = self._think_end_matcher.advance(matched, token)
-            if matched == len(self._think_end_matcher):
-                self.reasoning_tokens += position + 1
+        for token in token_id:
+            if not self._is_reasoning_started:
+                self._pending_reasoning_tokens += 1
+                self._think_start_match_len = self._think_start_matcher.advance(
+                    self._think_start_match_len, token
+                )
+                if self._think_start_match_len == len(self._think_start_matcher):
+                    self._is_reasoning_started = True
+                    self.reasoning_tokens += self._pending_reasoning_tokens
+                    self._pending_reasoning_tokens = 0
+                continue
+
+            self.reasoning_tokens += 1
+            self._think_end_match_len = self._think_end_matcher.advance(
+                self._think_end_match_len, token
+            )
+            if self._think_end_match_len == len(self._think_end_matcher):
                 self._is_reasoning_over = True
                 return
-
-        self._think_end_match_len = matched
-        self.reasoning_tokens += len(token_id)
 
     def __repr__(self):
         return (

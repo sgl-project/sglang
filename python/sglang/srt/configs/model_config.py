@@ -527,6 +527,7 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
         # Set by scheduler when reasoning_parser is enabled
+        self.think_start_ids: Optional[List[int]] = None
         self.think_end_ids: Optional[List[int]] = None
 
         # multimodal
