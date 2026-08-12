@@ -31,10 +31,12 @@ use crate::policies::kv_events::EventConfig;
 /// payload served by SGLang's HTTP server.
 const SERVER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Retry budget for transient `/server_info` failures (connect/timeout/5xx).
-/// 4xx + JSON-parse errors short-circuit — they're authoritative.
-/// EndpointSlice can flip ready=true before the worker's HTTP server is
-/// actually serving; without retry, that race lands a worker in the
+/// Retry budget for transient `/server_info` failures: connect/timeout/5xx
+/// AND body-read errors (a body that resets/truncates mid-stream — a worker
+/// whose HTTP server accepted the connection but hasn't finished init). Only
+/// 4xx and a *fully-read but undeserializable* body short-circuit — those are
+/// authoritative. EndpointSlice can flip ready=true before the worker's HTTP
+/// server is actually serving; without retry, that race lands a worker in the
 /// registry with empty model_ids and chat dispatch fails with 502.
 const FETCH_MAX_ATTEMPTS: u32 = 3;
 const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(100);
@@ -107,10 +109,11 @@ impl WorkerIntrospector {
     /// worker with empty model IDs and no event subscription on the
     /// failure path; future re-discovery will retry.
     ///
-    /// Transient failures (network errors, 5xx) are retried up to
-    /// `FETCH_MAX_ATTEMPTS` times with exponential backoff. 4xx
-    /// responses and JSON-parse errors short-circuit immediately —
-    /// the worker answered authoritatively, retrying won't help.
+    /// Transient failures (network errors, 5xx, and body-read errors —
+    /// a response whose body resets/truncates mid-stream) are retried up
+    /// to `FETCH_MAX_ATTEMPTS` times with exponential backoff. 4xx
+    /// responses and a fully-read-but-undeserializable body short-circuit
+    /// immediately — the worker answered authoritatively, retrying won't help.
     pub async fn fetch(&self, worker_url: &str) -> ServerInfo {
         let server_info_url = format!("{}/server_info", worker_url.trim_end_matches('/'));
         let parsed = match Self::fetch_with_retry(&self.client, &server_info_url, worker_url).await
@@ -190,16 +193,37 @@ impl WorkerIntrospector {
                     );
                     return None;
                 }
-                Ok(resp) => match resp.json::<ServerInfoBody>().await {
-                    Ok(body) => return Some(body),
+                Ok(resp) => match resp.bytes().await {
+                    // Reading the body is a SEPARATE failure domain from the
+                    // status. A body-read error (connection reset mid-body, a
+                    // truncated response from a worker whose HTTP server is up
+                    // but still initializing) is TRANSIENT — fall through to
+                    // backoff + retry instead of dropping the worker to empty
+                    // model_ids on the first blip. Lumping this in with a parse
+                    // error (as `resp.json()` does) turns a ~1s not-yet-ready
+                    // race into a worker that never registers for the model.
                     Err(e) => {
                         warn!(
                             worker_url = %worker_url,
+                            attempt,
                             error = %e,
-                            "introspect: /server_info JSON parse failed; registering worker with empty model_ids"
+                            "introspect: /server_info body read failed; will retry"
                         );
-                        return None;
                     }
+                    // A body we read in full but cannot deserialize IS
+                    // authoritative — the worker answered, retrying won't change
+                    // the bytes. Short-circuit to empty model_ids.
+                    Ok(bytes) => match serde_json::from_slice::<ServerInfoBody>(&bytes) {
+                        Ok(body) => return Some(body),
+                        Err(e) => {
+                            warn!(
+                                worker_url = %worker_url,
+                                error = %e,
+                                "introspect: /server_info JSON parse failed; registering worker with empty model_ids"
+                            );
+                            return None;
+                        }
+                    },
                 },
             }
             if attempt < FETCH_MAX_ATTEMPTS {
@@ -372,9 +396,96 @@ mod tests {
     use super::*;
     use axum::{routing::get, Json, Router};
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    /// A raw-TCP fake worker for `/server_info` whose response is scripted per
+    /// connection, so tests can exercise the body-read failure domain that
+    /// `axum::Json` can't produce. For the first `truncate_first` connections it
+    /// sends 200 headers with a `Content-Length` far larger than the bytes it
+    /// actually writes, then drops the socket — reqwest surfaces the incomplete
+    /// body as a body-read error. Every later connection serves `good_body` in
+    /// full. Returns the URL and a hit counter (one increment per connection).
+    async fn spawn_scripted_worker(
+        truncate_first: usize,
+        good_body: Value,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                let n = hits_srv.fetch_add(1, Ordering::SeqCst);
+                let good = good_body.clone();
+                tokio::spawn(async move {
+                    // Drain the request head so the client's write completes.
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    if n < truncate_first {
+                        // Claim a big body, deliver a fragment, then close:
+                        // an incomplete-body read error the caller must retry.
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                  Content-Length: 4096\r\n\r\n{\"serv",
+                            )
+                            .await;
+                    } else {
+                        let body = serde_json::to_vec(&good).unwrap();
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(&body).await;
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    /// A raw-TCP fake worker that serves the SAME complete `raw` body on every
+    /// connection (correct `Content-Length`), counting hits. Used to prove an
+    /// authoritative parse failure is not retried.
+    async fn spawn_static_body_worker(raw: &'static str) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\n\r\n",
+                        raw.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(raw.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
 
     async fn spawn_fake_worker(body: Value) -> (String, oneshot::Sender<()>) {
         let body = Arc::new(body);
@@ -514,6 +625,49 @@ mod tests {
         assert!(
             got.event_config.is_none(),
             "event_config must be None on connection refused"
+        );
+    }
+
+    /// The regression this fix targets: a worker whose HTTP server is up but
+    /// still initializing truncates its `/server_info` body (200 headers, then
+    /// the socket drops mid-body). That is a TRANSIENT body-read error and must
+    /// be RETRIED — not collapsed to empty model_ids like an authoritative parse
+    /// failure. After the worker finishes init it answers cleanly and
+    /// introspection must recover the served_model_name.
+    #[tokio::test]
+    async fn fetch_retries_transient_body_read_error_and_recovers() {
+        // Truncate the first two attempts, answer on the third.
+        let (url, hits) = spawn_scripted_worker(2, json!({"served_model_name": "m"})).await;
+        let got = fast_introspector().fetch(&url).await;
+        assert_eq!(
+            got.served_model_name.as_deref(),
+            Some("m"),
+            "a transient truncated body must be retried until the worker answers",
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "should take 3 attempts: 2 truncated + 1 good",
+        );
+    }
+
+    /// The other half of the fix: a COMPLETE body that isn't the expected schema
+    /// is authoritative — the worker answered, the bytes won't change on a
+    /// retry. It must short-circuit to empty model_ids after exactly ONE attempt
+    /// (no wasted retries burning the `FETCH_MAX_ATTEMPTS` budget).
+    #[tokio::test]
+    async fn fetch_does_not_retry_authoritative_parse_failure() {
+        // Valid, complete JSON that is an array, not the ServerInfoBody object.
+        let (url, hits) = spawn_static_body_worker("[1,2,3]").await;
+        let got = fast_introspector().fetch(&url).await;
+        assert!(
+            got.served_model_name.is_none(),
+            "an unparseable body must register empty model_ids",
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a full-body parse failure is authoritative and must NOT be retried",
         );
     }
 
