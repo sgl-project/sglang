@@ -318,7 +318,7 @@ RUN git clone ${AITER_REPO} \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
-# Hot patch: AITER stream handling on torch 2.11 (rocm724 only).
+# Hot patch: AITER stream handling on torch 2.11 (rocm720 and rocm724).
 # Dynamo reconstructs a stream as a base torch.Stream across a graph break, which
 # AITER's ctypes converter rejects because it only accepts the cuda subclass, so
 # every --enable-torch-compile run dies with "Unsupported type: torch.Stream".
@@ -330,7 +330,7 @@ RUN export GPU_ARCH="${GPU_ARCH}" \
 import os
 import pathlib
 
-if not os.environ.get("GPU_ARCH", "").endswith("-rocm724"):
+if not os.environ.get("GPU_ARCH", "").endswith(("-rocm720", "-rocm724")):
     raise SystemExit(0)
 
 OLD = """        elif isinstance(arg, torch.cuda.Stream):
