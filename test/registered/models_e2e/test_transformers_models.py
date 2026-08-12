@@ -48,7 +48,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=64,
+            num_examples=512,
             num_threads=32,
         )
         metrics = run_eval(args)
