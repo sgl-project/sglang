@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
 from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     can_fuse_linear_gelu,
     fused_gelu_active,
@@ -26,8 +27,15 @@ from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
     ltx2_rms_norm_modulate_active,
     mark_ltx2_rms_norm_modulate_site,
 )
+from sglang.kernels.ops.diffusion.modulate_scale_shift import (
+    can_use_modulate_scale_shift_cuda,
+    modulate_scale_shift_cuda,
+)
 from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig, LTX2Config
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_blocks_or_transformer_blocks,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
@@ -135,6 +143,54 @@ def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
     return ADALN_NUM_BASE_PARAMS + (
         ADALN_NUM_CROSS_ATTN_PARAMS if cross_attention_adaln else 0
     )
+
+
+_LTX2_MODULATE = BitExactFusionGate("LTX-2 fused modulate")
+
+
+def _ltx2_modulate(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+) -> torch.Tensor:
+    """``x * (1 + scale) + shift`` via the bit-exact fused CUDA modulate.
+
+    The adaLN scale/shift rows here are ``(B, 1, D)`` views (from
+    ``unbind``/``squeeze`` of the combined tables), so they are made dense and
+    squeezed to the ``(B, D)`` layout the kernel expects — a bit-exact copy of
+    tiny tensors.  Per-token modulation rows (``dim 1 > 1``) and any other
+    unsupported layout keep the eager chain; the first fused call
+    self-verifies ``torch.equal`` against the eager chain and falls back
+    permanently on any mismatch.
+    """
+    verified = _LTX2_MODULATE.verified
+    if (
+        not _LTX2_MODULATE.disabled
+        and x.dim() == 3
+        and x.is_contiguous()
+        and scale.dim() == 3
+        and scale.shape == (x.shape[0], 1, x.shape[-1])
+        and shift.shape == scale.shape
+        and (verified or _LTX2_MODULATE.can_attempt_once())
+    ):
+        scale_rows = scale.squeeze(1).contiguous()
+        shift_rows = shift.squeeze(1).contiguous()
+        if can_use_modulate_scale_shift_cuda(x, scale_rows, shift_rows):
+            try:
+                out = modulate_scale_shift_cuda(x, scale_rows, shift_rows)
+            except Exception as exc:
+                _LTX2_MODULATE.on_exception(exc, logger=logger)
+            else:
+                if verified:
+                    return out
+                return _LTX2_MODULATE.accept_or_fallback(
+                    out,
+                    x * (1 + scale) + shift,
+                    logger=logger,
+                    mismatch_msg=(
+                        "LTX-2 fused modulate is not bit-exact on this "
+                        "platform; falling back to eager"
+                    ),
+                )
+    return x * (1 + scale) + shift
 
 
 def _ltx2_rms_norm_modulate(
@@ -1298,8 +1354,8 @@ class LTX2TransformerBlock(nn.Module):
             norm_hidden_states = _ltx2_rms_norm_modulate(
                 self, self.rms_norm, hidden_states, vscale_q, vshift_q, self.norm_eps
             )
-            mod_encoder_hidden_states = (
-                encoder_hidden_states * (1 + v_prompt_scale) + v_prompt_shift
+            mod_encoder_hidden_states = _ltx2_modulate(
+                encoder_hidden_states, v_prompt_scale, v_prompt_shift
             )
             attn_hidden_states = self.attn2(
                 norm_hidden_states,
@@ -1330,8 +1386,8 @@ class LTX2TransformerBlock(nn.Module):
                 ashift_q,
                 self.norm_eps,
             )
-            mod_audio_encoder_hidden_states = (
-                audio_encoder_hidden_states * (1 + a_prompt_scale) + a_prompt_shift
+            mod_audio_encoder_hidden_states = _ltx2_modulate(
+                audio_encoder_hidden_states, a_prompt_scale, a_prompt_shift
             )
             attn_audio_hidden_states = self.audio_attn2(
                 norm_audio_hidden_states,
@@ -1420,11 +1476,11 @@ class LTX2TransformerBlock(nn.Module):
         v2a_gate = audio_ca_gate[0].squeeze(2)
 
         # A2V
-        mod_norm_hidden_states = (
-            norm_hidden_states * (1 + video_a2v_ca_scale) + video_a2v_ca_shift
+        mod_norm_hidden_states = _ltx2_modulate(
+            norm_hidden_states, video_a2v_ca_scale, video_a2v_ca_shift
         )
-        mod_norm_audio_hidden_states = (
-            norm_audio_hidden_states * (1 + audio_a2v_ca_scale) + audio_a2v_ca_shift
+        mod_norm_audio_hidden_states = _ltx2_modulate(
+            norm_audio_hidden_states, audio_a2v_ca_scale, audio_a2v_ca_shift
         )
 
         if not skip_a2v_cross_attn:
@@ -1445,11 +1501,11 @@ class LTX2TransformerBlock(nn.Module):
             )
 
         # V2A
-        mod_norm_hidden_states = (
-            norm_hidden_states * (1 + video_v2a_ca_scale) + video_v2a_ca_shift
+        mod_norm_hidden_states = _ltx2_modulate(
+            norm_hidden_states, video_v2a_ca_scale, video_v2a_ca_shift
         )
-        mod_norm_audio_hidden_states = (
-            norm_audio_hidden_states * (1 + audio_v2a_ca_scale) + audio_v2a_ca_shift
+        mod_norm_audio_hidden_states = _ltx2_modulate(
+            norm_audio_hidden_states, audio_v2a_ca_scale, audio_v2a_ca_shift
         )
 
         if not skip_v2a_cross_attn:
@@ -1504,9 +1560,8 @@ class LTX2TransformerBlock(nn.Module):
 
 
 class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = LTX2ArchConfig()._fsdp_shard_conditions
-    _compile_conditions = LTX2ArchConfig()._compile_conditions
-    _supported_attention_backends = LTX2ArchConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
+    _compile_conditions = [is_blocks_or_transformer_blocks]
     param_names_mapping = LTX2ArchConfig().param_names_mapping
     reverse_param_names_mapping = LTX2ArchConfig().reverse_param_names_mapping
     lora_param_names_mapping = LTX2ArchConfig().lora_param_names_mapping
@@ -2218,7 +2273,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
         with torch.autocast(device_type=hidden_states.device.type, enabled=False):
             hidden_states = self.norm_out(hidden_states)
-        hidden_states = hidden_states * (1 + scale) + shift
+        hidden_states = _ltx2_modulate(hidden_states, scale, shift)
         hidden_states, _ = self.proj_out(hidden_states)
 
         # Audio
@@ -2231,7 +2286,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         with torch.autocast(device_type=audio_hidden_states.device.type, enabled=False):
             audio_hidden_states = self.audio_norm_out(audio_hidden_states)
-        audio_hidden_states = audio_hidden_states * (1 + audio_scale) + audio_shift
+        audio_hidden_states = _ltx2_modulate(
+            audio_hidden_states, audio_scale, audio_shift
+        )
         audio_hidden_states, _ = self.audio_proj_out(audio_hidden_states)
         # Unpatchify if requested (default True for pipeline compatibility)
         return_latents = kwargs.get("return_latents", True)
