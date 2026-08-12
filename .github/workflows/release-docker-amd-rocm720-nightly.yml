@@ -134,7 +134,11 @@ jobs:
   # of publish failed; legs without an artifact will fail at download and be
   # the only ones marked red.
   push_local_registry:
-    if: ${{ false }}
+    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' }}
+    # Best-effort, for the same reason as the ROCm 7.0 nightly workflow: AMD CI
+    # falls back to Docker Hub for any tag the mirror is missing, so this must
+    # never turn image publication red.
+    continue-on-error: true
     runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish
@@ -158,16 +162,23 @@ jobs:
           echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
           echo "Resolved IMAGE_TAG=${image_tag}"
 
-      - name: Login to Docker Hub (AMD)
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
-
-      - name: Mirror rocm/sgl-dev to local registry
+      - name: Mirror rocm/sgl-dev to the in-network registry
+        env:
+          MIRROR_REGISTRY: ${{ vars.AMD_CI_DOCKER_REGISTRY_MIRROR || '10.44.14.109:5000' }}
+          SRC_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          SRC_PASSWORD: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
         run: |
-          src="rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          dst="10.44.14.109:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          docker pull "${src}"
-          docker tag "${src}" "${dst}"
-          docker push "${dst}"
+          set -euo pipefail
+          src="rocm/sgl-dev:${IMAGE_TAG}"
+          dst="${MIRROR_REGISTRY}/rocm/sgl-dev:${IMAGE_TAG}"
+
+          # skopeo copies registry-to-registry and takes the destination's
+          # plain-HTTP listener per invocation; see the ROCm 7.0 nightly workflow
+          # for why `docker push` cannot be used here.
+          args=(copy --retry-times 3 --dest-tls-verify=false)
+          if [ -n "${SRC_USERNAME}" ] && [ -n "${SRC_PASSWORD}" ]; then
+            args+=(--src-creds "${SRC_USERNAME}:${SRC_PASSWORD}")
+          fi
+          docker run --rm --network host quay.io/skopeo/stable:v1.22 \
+            "${args[@]}" "docker://${src}" "docker://${dst}"
+          echo "Mirrored ${src} -> ${dst}"

@@ -125,7 +125,12 @@ jobs:
   # of publish failed; legs without an artifact will fail at download and be
   # the only ones marked red.
   push_local_registry:
-    if: ${{ false }}
+    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' }}
+    # The mirror only makes AMD CI faster: amd_ci_start_container.sh falls back
+    # to Docker Hub for any tag it cannot find there. A mirror problem must
+    # therefore never turn image publication red, which is what got this job
+    # disabled in #31436.
+    continue-on-error: true
     runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish
@@ -149,19 +154,30 @@ jobs:
           echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
           echo "Resolved IMAGE_TAG=${image_tag}"
 
-      - name: Login to Docker Hub (AMD)
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
-
-      - name: Mirror rocm/sgl-dev to local registry
+      - name: Mirror rocm/sgl-dev to the in-network registry
+        env:
+          MIRROR_REGISTRY: ${{ vars.AMD_CI_DOCKER_REGISTRY_MIRROR || '10.44.14.109:5000' }}
+          SRC_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          SRC_PASSWORD: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
         run: |
-          src="rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          dst="10.44.14.109:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          docker pull "${src}"
-          docker tag "${src}" "${dst}"
-          docker push "${dst}"
+          set -euo pipefail
+          src="rocm/sgl-dev:${IMAGE_TAG}"
+          dst="${MIRROR_REGISTRY}/rocm/sgl-dev:${IMAGE_TAG}"
+
+          # Copy registry-to-registry with skopeo instead of
+          # `docker pull && docker tag && docker push`. A `docker push` needs the
+          # host daemon to carry the mirror in insecure-registries, which does not
+          # hold on every AMD scale set: that is the "server gave HTTP response to
+          # HTTPS client" failure this job died of. skopeo takes the destination's
+          # plain-HTTP listener per invocation, and streams the blobs, so the
+          # runner never has to store the image either.
+          args=(copy --retry-times 3 --dest-tls-verify=false)
+          if [ -n "${SRC_USERNAME}" ] && [ -n "${SRC_PASSWORD}" ]; then
+            args+=(--src-creds "${SRC_USERNAME}:${SRC_PASSWORD}")
+          fi
+          docker run --rm --network host quay.io/skopeo/stable:v1.22 \
+            "${args[@]}" "docker://${src}" "docker://${dst}"
+          echo "Mirrored ${src} -> ${dst}"
 
   # Temporarily disable docker cache seeding until performant storage is in place
   # cache:
