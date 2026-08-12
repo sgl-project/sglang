@@ -203,6 +203,8 @@ class TestMxfp8LinearBackends(_LinearBackendCheck):
         self._run("flashinfer_cutedsl")
 
     def test_auto(self):
+        if "auto" not in _mxfp8_backends():
+            self.skipTest(f"auto not in SM{get_device_sm()} MXFP8 backend set")
         with mock.patch.object(
             fp8_utils,
             "FP8_GEMM_RUNNER_BACKEND",
