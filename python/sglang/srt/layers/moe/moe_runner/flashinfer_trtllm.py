@@ -771,7 +771,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 ),
                 use_shuffled_weight=use_shuffled_weight,
                 output=symm_output,
-                enable_pdl=a_q.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
@@ -807,7 +806,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=use_shuffled_weight,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
-                enable_pdl=a_q.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
             )
@@ -865,7 +863,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             use_routing_scales_on_input=False,
             routing_method_type=routing_method_type,
             tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
-            enable_pdl=a_q.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
             activation_type=quant_info.activation_type,
         )
         symm_output.copy_(output)
