@@ -88,7 +88,8 @@ class TestNightlyKimiK3PerformanceMI35x(unittest.TestCase):
             "bfloat16",
             "--mem-fraction-static",
             "0.85",
-            "--cuda-graph-max-bs",
+            # The cookbook cell writes this as the deprecated --cuda-graph-max-bs.
+            "--cuda-graph-max-bs-decode",
             "256",
             "--mamba-full-memory-ratio",
             str(mamba_full_memory_ratio(cls.input_lens[0], cls.output_lens[0])),
