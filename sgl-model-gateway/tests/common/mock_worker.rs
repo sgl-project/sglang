@@ -308,6 +308,7 @@ async fn generate_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    record_generate_request(config.port);
     let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config).await {
@@ -1554,6 +1555,36 @@ pub fn clear_fail_status_code(port: u16) {
 fn get_fail_status_code_for_port(port: u16) -> Option<u16> {
     let map = get_fail_status_code_config().lock().unwrap();
     map.get(&port).copied()
+}
+
+// --- Generate request counting (for retry tests) ---
+
+static GENERATE_REQUEST_COUNTS: OnceLock<Mutex<HashMap<u16, usize>>> = OnceLock::new();
+
+fn record_generate_request(port: u16) {
+    let mut counts = GENERATE_REQUEST_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    *counts.entry(port).or_default() += 1;
+}
+
+/// Reset the number of generate requests observed by a worker port.
+pub fn reset_generate_request_count(port: u16) {
+    let mut counts = GENERATE_REQUEST_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    counts.remove(&port);
+}
+
+/// Return the number of generate requests observed by a worker port.
+pub fn generate_request_count(port: u16) -> usize {
+    let counts = GENERATE_REQUEST_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    counts.get(&port).copied().unwrap_or_default()
 }
 
 // --- Stream cancellation tracking (for upstream cancel tests) ---
