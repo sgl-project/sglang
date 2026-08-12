@@ -13,7 +13,8 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
-    build_step_span_name,  
+    build_detailed_annotation_suffix,
+    detailed_annotations_enabled,
     set_detailed_annotations_enabled,
 )
 from sglang.srt.platforms import current_platform
@@ -453,11 +454,29 @@ class _ProfilerRPD(_ProfilerConcreteBase):
             rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
 
 
-def build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step."""
+def build_step_span_name(
+    forward_batch: ForwardBatch, detailed_annotations: bool | None = None
+) -> str:
+    """Build the profile-trace span name for one forward step.
+
+    Detailed annotations are folded into the label (via
+    build_detailed_annotation_suffix) when enabled. detailed_annotations
+    defaults to the process-wide toggle (detailed_annotations_enabled, set
+    by the profiler manager); pass an explicit bool to override (e.g. in tests).
+    """
+    if detailed_annotations is None:
+        detailed_annotations = detailed_annotations_enabled()
+
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
     if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
-        return f"step[EXTEND bs={bs} toks={ext_toks}]"
-    return f"step[{mode.name} bs={bs}]"
+        base = f"step[EXTEND bs={bs} toks={ext_toks}"
+    else:
+        base = f"step[{mode.name} bs={bs}"
+
+    if detailed_annotations:
+        suffix = build_detailed_annotation_suffix(forward_batch)
+        if suffix:
+            base = f"{base} {suffix}"
+    return f"{base}]"
