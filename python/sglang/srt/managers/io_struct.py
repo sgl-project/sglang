@@ -260,7 +260,7 @@ class GenerateReqInput:
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
-    session_params: Optional[Dict[str, Any]] = None
+    session_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     # The path to the LoRA adaptors
     lora_path: Optional[Union[List[Optional[str]], str]] = None
@@ -415,6 +415,15 @@ class GenerateReqInput:
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
+        self._normalize_session_params()
+        if (
+            self.text is None
+            and self.input_ids == []
+            and not (self.session_params and self.session_params.get("id"))
+        ):
+            # Session history may supply the entire prompt. The scheduler
+            # rejects requests that are still empty after reconstruction.
+            raise ValueError("input_ids cannot be empty.")
         self._handle_parallel_sampling()
 
         if self.is_single:
@@ -464,19 +473,7 @@ class GenerateReqInput:
                 self.batch_size = len(self.text)
             self.input_embeds = None
         elif self.input_ids is not None:
-            if len(self.input_ids) == 0:
-                # Session history may supply the entire prompt. The scheduler
-                # rejects requests that are still empty after reconstruction.
-                session_id = (
-                    self.session_params.get("id")
-                    if isinstance(self.session_params, dict)
-                    else None
-                )
-                if not session_id:
-                    raise ValueError("input_ids cannot be empty.")
-                self.is_single = True
-                self.batch_size = 1
-            elif isinstance(self.input_ids[0], int):
+            if not self.input_ids or isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
             else:
@@ -532,6 +529,18 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+
+    def _normalize_session_params(self):
+        if self.session_params is None or isinstance(self.session_params, dict):
+            return
+        if not isinstance(self.session_params, list) or not all(
+            isinstance(item, dict) for item in self.session_params
+        ):
+            raise ValueError("session_params must be a dict or a list of dicts.")
+        if not self.session_params or len(self.session_params) != self.batch_size:
+            raise ValueError("session_params length must equal the batch size.")
+        if self.is_single:
+            self.session_params = self.session_params[0]
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -962,7 +971,11 @@ class GenerateReqInput:
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
-            session_params=self.session_params,
+            session_params=(
+                self.session_params[i]
+                if isinstance(self.session_params, list)
+                else self.session_params
+            ),
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             custom_logit_processor=(
