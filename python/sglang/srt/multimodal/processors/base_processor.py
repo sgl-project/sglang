@@ -238,8 +238,10 @@ class BaseMultimodalProcessor(ABC):
         self.trust_mm_content_hashes = bool(
             getattr(self.server_args, "trust_mm_content_hashes", False)
         )
-        self.processor_fingerprint = build_processor_fingerprint(
-            self, hf_config, server_args
+        self.processor_fingerprint = (
+            build_processor_fingerprint(self, hf_config, server_args)
+            if self.mm_preprocess_cache.enabled
+            else None
         )
         if self.mm_preprocess_cache.enabled:
             logger.info(
