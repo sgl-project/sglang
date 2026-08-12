@@ -702,11 +702,8 @@ def _extract_runner_configs(content):
 
 
 def _extract_legacy_suites(content):
-    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)` calls.
-
-    Mirrors _extract_runner_configs for the legacy nightly/weekly shape: a file
-    may register on multiple pools, so collect all of them rather than the first.
-    """
+    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)`
+    calls. Used only to report why such a file is not dispatchable."""
     out = []
     for args in re.finditer(
         r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
@@ -715,38 +712,6 @@ def _extract_legacy_suites(content):
         if m:
             out.append(m.group(1))
     return out
-
-
-# Legacy nightly/weekly CUDA suites register with a single-string `suite=`
-# instead of `runner_config=`, so they carry no runner metadata of their own.
-# Map each to the runner_config in scripts/ci/runner_configs.yml whose hardware
-# matches the runner the nightly/weekly pipeline actually uses (see
-# .github/workflows/{nightly,weekly}-test-nvidia.yml), so /rerun-test can still
-# dispatch a single nightly/weekly test. The runner label, install script,
-# timeout and rdma_devices are then resolved from
-# runner_configs.yml as usual, keeping that file the single source of truth for
-# runner details.
-#
-# Suites on hardware with no matching runner_config (e.g. nightly-4-gpu-gb300)
-# and non-CUDA suites (npu/amd) are intentionally absent and stay
-# non-dispatchable until a matching runner_config exists.
-_LEGACY_SUITE_TO_RUNNER_CONFIG = {
-    "nightly-1-gpu": "1-gpu-large",
-    "nightly-kernel-1-gpu": "1-gpu-large",
-    "nightly-eval-text-2-gpu": "2-gpu-large",
-    "nightly-perf-text-2-gpu": "2-gpu-large",
-    "nightly-eval-vlm-2-gpu": "2-gpu-large",
-    "nightly-perf-vlm-2-gpu": "2-gpu-large",
-    "nightly-4-gpu": "4-gpu-h100",
-    "nightly-4-gpu-b200": "4-gpu-b200",
-    "nightly-8-gpu-common": ["8-gpu-h200", "8-gpu-b200"],
-    "nightly-8-gpu-h200": "8-gpu-h200",
-    "nightly-kernel-8-gpu-h200": "8-gpu-h200",
-    "nightly-precision-8-gpu-h200": "8-gpu-h200",
-    "nightly-8-gpu-h20": "8-gpu-h20",
-    "nightly-8-gpu-b200": "8-gpu-b200",
-    "weekly-8-gpu-h200": "8-gpu-h200",
-}
 
 
 def _dispatch_err(suite, msg):
@@ -811,11 +776,10 @@ def detect_suite(file_path_from_test):
     pool it should run on — so this returns a *list* of dispatch dicts, one
     per registration. Runner label, install script, timeout, and rdma_devices
     are all resolved from scripts/ci/runner_configs.yml — the
-    same single source of truth that drives the main PR test pipeline.
-
-    Legacy nightly/weekly CUDA suites (single-string `suite=`) are dispatchable
-    too: each suite name is mapped to the matching runner_config via
-    _LEGACY_SUITE_TO_RUNNER_CONFIG, then resolved the same way.
+    same single source of truth that drives the main PR test pipeline. Every
+    dispatchable CUDA suite, per-commit and scheduled alike, goes through that
+    one path; the legacy single-string `suite=` carries no runner_config and is
+    reported as non-dispatchable.
 
     CPU files yield a single-element list. A file with no recognised (or no
     dispatchable) registration yields a one-element list whose dict has an
@@ -837,19 +801,7 @@ def detect_suite(file_path_from_test):
             results.append(_resolve_runner_config(rc, full_path, suite))
         return results
 
-    # Legacy nightly/weekly CUDA suites: single-string `suite=`, no
-    # runner_config. Map each mappable suite to its runner_config and resolve.
     legacy_suites = _extract_legacy_suites(content)
-    mappable = [s for s in legacy_suites if s in _LEGACY_SUITE_TO_RUNNER_CONFIG]
-    if mappable:
-        results = []
-        for s in mappable:
-            rcs = _LEGACY_SUITE_TO_RUNNER_CONFIG[s]
-            if isinstance(rcs, str):
-                rcs = [rcs]
-            for rc in rcs:
-                results.append(_resolve_runner_config(rc, full_path, s))
-        return results
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
         return [
@@ -869,11 +821,11 @@ def detect_suite(file_path_from_test):
         return [
             _dispatch_err(
                 suite,
-                f"Suite `{suite}` in `{full_path}` is not dispatchable via "
-                f"/rerun-test. It has no entry in _LEGACY_SUITE_TO_RUNNER_CONFIG "
-                f"— either it is a non-CUDA suite (npu/amd) or it runs on "
-                f"hardware with no matching runner_config in "
-                f"scripts/ci/runner_configs.yml.",
+                f"Suite `{suite}` in `{full_path}` is registered with the legacy "
+                f"single-string `suite=`, which carries no runner_config and so "
+                f"is not dispatchable via /rerun-test. Re-register it with "
+                f"`stage=`/`runner_config=` (CUDA), or dispatch its own "
+                f"workflow (npu/amd).",
             )
         ]
 
@@ -1449,7 +1401,7 @@ def main():
             "- **Full CI rerun** (with extra coverage): add the `run-ci` or "
             "`run-ci-extra` label and push a new commit (or use `/tag-and-rerun-ci`).\n\n"
             "**AMD CI**: stage-level dispatch is still available via "
-            "Actions UI → *PR Test (AMD)* / *PR Test ROCm 7.2 (AMD)* → "
+            "Actions UI → *PR Test ROCm 7.2 (AMD)* (default) / *PR Test ROCm 7.0 (AMD)* → "
             "*Run workflow* → pick a stage from the dropdown."
         )
 
