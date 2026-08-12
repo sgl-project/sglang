@@ -3740,14 +3740,15 @@ class UnifiedRadixCacheSuite:
         if (
             not self.cfg.has_swa
             or self.cfg.has_mamba
-            or self.cfg.page_size != 1
+            or self.cfg.page_size not in (1, 4)
             or self.cfg.sliding_window_size != 4
         ):
-            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+            self.skipTest("requires Full+SWA with window_size=4")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         window = self.cfg.sliding_window_size
-        prefix = self._make_seq(1, window)
-        tokens = prefix + self._make_seq(1000, window + 1)
+        window_pages = (window + self.cfg.page_size - 1) // self.cfg.page_size
+        prefix = self._make_seq(1, window_pages)
+        tokens = prefix + self._make_seq(1000, 2)
         self._insert(cache, allocator, req_to_token_pool, prefix)
         self._insert(cache, allocator, req_to_token_pool, tokens)
 
@@ -3762,6 +3763,23 @@ class UnifiedRadixCacheSuite:
 
         self.assertEqual(result.full_kv_hit_length, len(tokens))
         self.assertEqual(result.swa_branching_seqlen, len(tokens))
+        self.assertEqual(result.swa_branching_seqlen % self.cfg.page_size, 0)
+
+        # Simulate forward producing fresh SWA KV at the branching point.
+        self._insert(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens[: result.swa_branching_seqlen],
+        )
+
+        rematch = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertEqual(
+            len(rematch.device_indices), result.swa_branching_seqlen
+        )
+        self.assertIsNone(rematch.swa_branching_seqlen)
 
     def test_swa_branching_seqlen_uses_host_full_hit(self):
         if (
