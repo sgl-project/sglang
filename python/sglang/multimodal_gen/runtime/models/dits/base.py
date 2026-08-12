@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 # TODO
 class BaseDiT(nn.Module, ABC):
+    # These are runtime implementation capabilities, not checkpoint metadata.
+    # Concrete DiT implementations override them when their tensor layout or
+    # execution semantics support only a subset of the available backends.
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
     param_names_mapping: dict
@@ -60,8 +63,8 @@ class BaseDiT(nn.Module, ABC):
 
     def __init__(self, config: DiTConfig, hf_config: dict[str, Any], **kwargs) -> None:
         super().__init__()
-        # runtime models expose checkpoint architecture through `config`; load
-        # settings such as the model prefix stay separate
+        # `config.arch_config` contains static model metadata. Runtime
+        # capabilities remain class attributes on the model implementation.
         self.config: DiTArchConfig = config.arch_config
         self.prefix = config.prefix
         self.hf_config = hf_config

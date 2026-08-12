@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.bridges.mova_dual_tower import (
+    MOVADualTowerArchConfig,
     MOVADualTowerConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
@@ -397,6 +398,10 @@ class ConditionalCrossAttentionBlock(nn.Module):
         return self.inner(x=x, y=y, x_freqs=x_freqs, y_freqs=y_freqs)
 
 
+def _is_conditioner_block(_name: str, module: nn.Module) -> bool:
+    return isinstance(module, ConditionalCrossAttentionBlock)
+
+
 class DualTowerConditionalBridge(
     CachableDiT,
     LayerwiseOffloadableModuleMixin,
@@ -411,12 +416,11 @@ class DualTowerConditionalBridge(
 
     layerwise_offload_dit_group_enabled = False
 
-    _fsdp_shard_conditions = MOVADualTowerConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVADualTowerConfig()._compile_conditions
-    _supported_attention_backends = MOVADualTowerConfig()._supported_attention_backends
-    param_names_mapping = MOVADualTowerConfig().param_names_mapping
-    reverse_param_names_mapping = MOVADualTowerConfig().reverse_param_names_mapping
-    lora_param_names_mapping = MOVADualTowerConfig().lora_param_names_mapping
+    _fsdp_shard_conditions = [_is_conditioner_block]
+    _compile_conditions = [_is_conditioner_block]
+    param_names_mapping = MOVADualTowerArchConfig().param_names_mapping
+    reverse_param_names_mapping = MOVADualTowerArchConfig().reverse_param_names_mapping
+    lora_param_names_mapping = MOVADualTowerArchConfig().lora_param_names_mapping
 
     def __init__(
         self,
