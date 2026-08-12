@@ -35,6 +35,7 @@ from .common import (
     get_rope_config,
     get_sparse_attention_config,
     get_tokenizer_from_processor,
+    resolve_hf_gguf_reference,
 )
 from .config import get_config
 from .processor import get_processor, resolve_image_processor_backend
@@ -51,6 +52,7 @@ __all__ = [
     "_fix_v5_add_bos_eos_token",
     "attach_additional_stop_token_ids",
     "check_gguf_file",
+    "resolve_hf_gguf_reference",
     "download_from_hf",
     "get_config",
     "get_context_length",

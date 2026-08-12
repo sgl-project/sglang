@@ -467,7 +467,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         server_args = self.server_args
 
         # Initialize tokenizer and processor
-        if self.model_config.is_multimodal:
+        if self.model_config.is_multimodal and not server_args.language_model_only:
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
@@ -1024,6 +1024,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         contains_mm_input = obj.contains_mm_input()
+        if contains_mm_input and self.server_args.language_model_only:
+            raise ValueError(
+                "Multimodal inputs are not supported when --language-model-only "
+                "is set; the encoder is not loaded. Restart without the flag."
+            )
         is_mossvl = (
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures

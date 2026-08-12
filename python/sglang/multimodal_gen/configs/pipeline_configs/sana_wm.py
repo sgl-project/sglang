@@ -161,7 +161,7 @@ class SanaWMPipelineConfig(PipelineConfig):
     # --- Deployment ---
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
+            dit_layerwise_offload_modes=("memory",),
             # Conservative auto-FSDP gate for the 720p world-model path. Users
             # can still force FSDP explicitly on smaller cards.
             fsdp_auto_min_available_memory_gb=60,
@@ -328,7 +328,7 @@ class SanaWMRealtimeConfig(SanaWMPipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
+            dit_layerwise_offload_modes=("memory",),
             keep_resident_min_available_gb=120,
             keep_resident_components=("dit",),
             auto_enable_cfg_parallel=False,
