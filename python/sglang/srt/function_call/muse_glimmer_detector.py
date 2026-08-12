@@ -40,6 +40,15 @@ _PARAM_RE = re.compile(
 # Recipients whose bodies are prose, never tool calls.
 _NON_TOOL_RECIPIENTS = frozenset({"self", "user"})
 
+# Stand-in recipient for a tool payload that arrived without a channel header.
+_IMPLICIT_TOOL = "\x00implicit-tool"
+
+
+def _atem_start(text: str) -> int:
+    """Index where an ATEM payload begins in ``text``, or -1."""
+    hits = [i for i in (text.find(FUNCTION_CALLS_OPEN), text.find("<atem:invoke")) if i != -1]
+    return min(hits) if hits else -1
+
 
 def _is_tool_channel(recipient: Optional[str]) -> bool:
     """True when this channel routes to a tool."""
@@ -219,15 +228,45 @@ class MuseGlimmerDetector(BaseFormatDetector):
         final: bool,
     ) -> int:
         if not _is_tool_channel(self._recipient):
-            normal_parts.append(chunk)
-            return len(chunk)
+            # Opt-in, and only for an unframed body. A body that explicitly
+            # routes to self or user is reasoning or a final answer, and ATEM
+            # markup inside it is quoted text -- never a call -- so those
+            # channels keep upstream's strict behaviour even when enabled.
+            start = (
+                _atem_start(chunk)
+                if (
+                    self._recipient is None
+                    and envs.SGLANG_ENABLE_MUSE_IMPLICIT_TOOL_CALLS.get()
+                )
+                else -1
+            )
+            if start == -1:
+                normal_parts.append(chunk)
+                return len(chunk)
+            # The model appends a call to a prose body with no <|eom|> and no
+            # to=<tool><|message|> header. The content ends at the ATEM marker and
+            # the rest of the body is a tool channel.
+            if start:
+                normal_parts.append(chunk[:start])
+            self._recipient = _IMPLICIT_TOOL
+            return start + self._consume_body(
+                chunk[start:], registered, calls, normal_parts, final
+            )
 
         pos = 0
         while pos < len(chunk):
             if self._open_invoke is None:
                 m = _INVOKE_OPEN_RE.search(chunk, pos)
                 if m is None:
-                    return pos if not final else len(chunk)
+                    if not final:
+                        return pos
+                    # A tool body with no ATEM invoke: the model emitted the
+                    # JSON-array form (what a grammar constraint asks for).
+                    # Parse it instead of discarding the whole generation.
+                    self._emit_json_calls(
+                        chunk[pos:], registered, calls, normal_parts
+                    )
+                    return len(chunk)
                 self._open_invoke = m.group("name")
                 pos = m.end()
                 continue
@@ -247,6 +286,56 @@ class MuseGlimmerDetector(BaseFormatDetector):
             pos = close_at + len(INVOKE_CLOSE)
 
         return len(chunk)
+
+    def _emit_json_calls(
+        self,
+        chunk: str,
+        registered: Set[str],
+        calls: List[ToolCallItem],
+        normal_parts: List[str],
+    ) -> None:
+        """Parse a ``[{"name": ..., "parameters": {...}}]`` body on a tool channel.
+
+        Falls back to emitting the text so an unrecognized body surfaces to the
+        client instead of vanishing.
+        """
+        residue = chunk
+        for marker in (FUNCTION_CALLS_OPEN, FUNCTION_CALLS_CLOSE, INVOKE_CLOSE):
+            residue = residue.replace(marker, "")
+        if not residue.strip():
+            # Nothing but framing left over from an already-emitted call.
+            return
+
+        # Parse the marker-stripped residue, not the raw chunk: a body that
+        # closes with </atem:function_calls> leaves trailing markup that makes
+        # json.loads fail, which would surface the whole block as content.
+        start = min(
+            (i for i in (residue.find("["), residue.find("{")) if i != -1), default=-1
+        )
+        payload = None
+        if start != -1:
+            try:
+                payload = json.loads(residue[start:].strip())
+            except (json.JSONDecodeError, ValueError):
+                payload = None
+        if payload is None:
+            normal_parts.append(chunk)
+            return
+        if isinstance(payload, dict):
+            payload = [payload]
+        emitted = False
+        for entry in payload if isinstance(payload, list) else []:
+            if not isinstance(entry, dict) or "name" not in entry:
+                continue
+            args = entry.get("parameters", entry.get("arguments")) or {}
+            if isinstance(args, str):
+                args = _decode_value(args)
+            item = self._emit_call(entry["name"], args, registered)
+            if item is not None:
+                calls.append(item)
+                emitted = True
+        if not emitted:
+            normal_parts.append(chunk)
 
     def supports_structural_tag(self) -> bool:
         return False

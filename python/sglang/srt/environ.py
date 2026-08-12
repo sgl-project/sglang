@@ -513,6 +513,12 @@ class Envs:
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    # Muse Glimmer: treat an ATEM payload that arrives with no
+    # "to=<tool><|message|>" channel header as a tool call instead of content.
+    # Off by default: the detector is deliberately stricter than the vendor
+    # parser, so an <atem:invoke> inside reasoning or a final answer stays text.
+    # Turn on for checkpoints that emit header-less calls in practice.
+    SGLANG_ENABLE_MUSE_IMPLICIT_TOOL_CALLS = EnvBool(False)
 
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the

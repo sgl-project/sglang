@@ -10,6 +10,7 @@ must never become a real tool call.
 import json
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.muse_glimmer_detector import MuseGlimmerDetector
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -235,6 +236,22 @@ class TestMuseGlimmerDetector(CustomTestCase):
         normal, calls = self.parse(text)
         self.assertEqual(calls, [])
         self.assertEqual(normal, text)
+
+    def test_unframed_atem_becomes_a_call_when_opted_in(self):
+        """The opt-in reverses the strictness above for checkpoints that need it."""
+        text = atem(DOUBLED, city="Paris")
+        with envs.SGLANG_ENABLE_MUSE_IMPLICIT_TOOL_CALLS.override(True):
+            normal, calls = self.parse(text)
+        self.assertEqual(calls, [("get_weather", {"city": "Paris"})])
+        self.assertEqual(normal, "")
+
+    def test_prose_then_unframed_atem_keeps_both_when_opted_in(self):
+        """Content before the marker survives alongside the call."""
+        prose = "I'll check the weather for Paris.\n"
+        with envs.SGLANG_ENABLE_MUSE_IMPLICIT_TOOL_CALLS.override(True):
+            normal, calls = self.parse(prose + atem(DOUBLED, city="Paris"))
+        self.assertEqual(calls, [("get_weather", {"city": "Paris"})])
+        self.assertEqual(normal, prose)
 
     # ---- integration with the reasoning parser ----------------------------
 
