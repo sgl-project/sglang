@@ -1208,36 +1208,21 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
 
-    def configure_cache_dit_input_preservation(
-        self,
-        *,
-        fn_compute_blocks: int | None,
-        bn_compute_blocks: int,
-    ) -> None:
-        """Preserve the two block-stack inputs retained by Cache-DiT Pattern 3."""
+    def set_cache_dit_input_preservation(self, enabled: bool) -> None:
+        """Stop the blocks from overwriting the input Cache-DiT holds by reference.
+
+        Cache-DiT snapshots the block-stack input to measure its residuals, so a
+        block that rewrites its own input in place makes that residual read as
+        zero. Only the first gated residual of a block writes the block input;
+        the second one operates on a buffer this block just allocated, so it is
+        left on the in-place fused path either way.
+
+        The caller owns the lifecycle. It has to be on before Cache-DiT mounts,
+        because mounting replaces `blocks` with a wrapper and the real blocks
+        stop being reachable by iterating it.
+        """
         for block in self.blocks:
-            block.preserve_input_for_cache_dit = False
-
-        if fn_compute_blocks is None:
-            return
-
-        num_blocks = len(self.blocks)
-        if not 1 <= fn_compute_blocks <= num_blocks:
-            raise ValueError(
-                f"Fn_compute_blocks must be in [1, {num_blocks}], "
-                f"got {fn_compute_blocks}."
-            )
-        if not 0 <= bn_compute_blocks <= num_blocks:
-            raise ValueError(
-                f"Bn_compute_blocks must be in [0, {num_blocks}], "
-                f"got {bn_compute_blocks}."
-            )
-
-        self.blocks[0].preserve_input_for_cache_dit = True
-        first_middle_block = fn_compute_blocks
-        middle_end = num_blocks - bn_compute_blocks
-        if first_middle_block < middle_end:
-            self.blocks[first_middle_block].preserve_input_for_cache_dit = True
+            block.preserve_input_for_cache_dit = enabled
 
     def _resolve_attention_backend_once(self) -> None:
         if self._resolved_attention_backend is not None:

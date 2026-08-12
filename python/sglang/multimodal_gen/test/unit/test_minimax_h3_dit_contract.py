@@ -189,40 +189,21 @@ def test_cache_dit_compat_flag_only_spares_the_block_input():
         assert gate_modes == [False, True]
 
 
-def test_cache_dit_preserves_only_fn_and_mn_inputs():
+def test_cache_dit_input_preservation_toggles_every_block():
     model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
     torch.nn.Module.__init__(model)
     model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in range(5)])
 
-    model.configure_cache_dit_input_preservation(
-        fn_compute_blocks=2,
-        bn_compute_blocks=1,
-    )
-    assert [block.preserve_input_for_cache_dit for block in model.blocks] == [
-        True,
-        False,
-        True,
-        False,
-        False,
-    ]
+    model.set_cache_dit_input_preservation(True)
+    assert all(block.preserve_input_for_cache_dit for block in model.blocks)
 
-    model.configure_cache_dit_input_preservation(
-        fn_compute_blocks=4,
-        bn_compute_blocks=1,
-    )
-    assert [block.preserve_input_for_cache_dit for block in model.blocks] == [
-        True,
-        False,
-        False,
-        False,
-        False,
-    ]
-
-    model.configure_cache_dit_input_preservation(
-        fn_compute_blocks=None,
-        bn_compute_blocks=0,
-    )
+    model.set_cache_dit_input_preservation(False)
     assert not any(block.preserve_input_for_cache_dit for block in model.blocks)
+
+    # Idempotent: repeating a transition must not leave blocks half-flipped.
+    model.set_cache_dit_input_preservation(True)
+    model.set_cache_dit_input_preservation(True)
+    assert all(block.preserve_input_for_cache_dit for block in model.blocks)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
