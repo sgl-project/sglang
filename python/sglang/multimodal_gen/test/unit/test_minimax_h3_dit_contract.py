@@ -45,7 +45,6 @@ def _ensure_single_process_parallel_runtime() -> None:
 
 def test_native_weight_names_and_grouped_qkv_reorder():
     arch = MiniMaxH3DiTArchConfig()
-    assert arch.param_names_mapping == {}
     assert arch.reverse_param_names_mapping == {}
     mapping = get_param_names_mapping(arch.param_names_mapping)
     for key in (
@@ -55,6 +54,35 @@ def test_native_weight_names_and_grouped_qkv_reorder():
         "final_layer.audio_out.weight",
     ):
         assert mapping(key) == (key, None, None)
+
+    assert mapping(
+        "base_model.model.transformer.transformer_blocks.7.attn.to_k.lora_A.default"
+    ) == ("blocks.7.attn.qkv_proj.lora_A", 1, 3)
+    assert mapping("token_refiner.refiner_blocks.1.ff.net.0.proj.lora_B") == (
+        "token_refiner.blocks.1.mlp.fc1.lora_B",
+        None,
+        None,
+    )
+    assert mapping("transformer.transformer_blocks.3.adaln_proj.linear.lora_A") == (
+        "blocks.3.adaln_proj.linear.lora_A",
+        None,
+        None,
+    )
+    assert mapping("transformer.audio_proj_out.lora_B") == (
+        "final_layer.audio_out.lora_B",
+        None,
+        None,
+    )
+    assert mapping("blocks.3.attn.out_proj.lora_A") == (
+        "blocks.3.attn.out_proj.lora_A",
+        None,
+        None,
+    )
+    assert mapping("transformer.blocks.0.attn.qkv_proj.weight") == (
+        "transformer.blocks.0.attn.qkv_proj.weight",
+        None,
+        None,
+    )
 
     weight = torch.arange(12, dtype=torch.float32).reshape(12, 1)
     actual = _reorder_grouped_qkv_to_qkv(
@@ -248,12 +276,36 @@ def test_tp_and_ulysses_admission_uses_tp_local_shapes():
             ulysses_size=4,
             ring_size=1,
         )
-    with pytest.raises(NotImplementedError):
+    # ring is implemented now: it splits rows, not heads, so it carries no
+    # head-divisibility constraint of its own
+    MiniMaxH3DiTModel._validate_sequence_parallel_config(
+        arch=arch,
+        tp_size=1,
+        ulysses_size=1,
+        ring_size=2,
+    )
+    MiniMaxH3DiTModel._validate_sequence_parallel_config(
+        arch=arch,
+        tp_size=1,
+        ulysses_size=8,
+        ring_size=2,
+    )
+    # what ring does constrain is the packed-sequence alignment, which has to
+    # divide by the *combined* degree because ring adds an outer row split on
+    # top of Ulysses's inner one
+    with pytest.raises(ValueError):
+        MiniMaxH3DiTModel._validate_sequence_parallel_config(
+            arch=arch,
+            tp_size=1,
+            ulysses_size=8,
+            ring_size=3,
+        )
+    with pytest.raises(ValueError):
         MiniMaxH3DiTModel._validate_sequence_parallel_config(
             arch=arch,
             tp_size=1,
             ulysses_size=1,
-            ring_size=2,
+            ring_size=0,
         )
 
 
@@ -268,6 +320,8 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
         )
 
     assert model._fsdp_mixed_dtype_params
+    qkv_weight = model.blocks[0].attn.qkv_proj.weight
+    assert callable(qkv_weight.rank_local_weight_transform)
     for name, tensor in model.state_dict().items():
         if name in expected_fp32:
             assert tensor.dtype == torch.float32, name
@@ -351,7 +405,7 @@ def test_packed_qkv_exchange_preserves_rank_and_head_order(_):
         head_slice = slice(destination * 2, (destination + 1) * 2)
         return torch.cat((q[:, head_slice], k[:, head_slice], v[:, head_slice]), dim=-1)
 
-    def fake_all_to_all(actual):
+    def fake_all_to_all(actual, role=None):
         expected_input = torch.stack(
             [
                 packet(q_ranks[0], k_ranks[0], v_ranks[0], destination)
