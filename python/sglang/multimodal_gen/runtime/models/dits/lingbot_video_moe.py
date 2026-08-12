@@ -13,6 +13,7 @@ from torch import nn
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEConfig,
 )
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_world_size,
@@ -72,10 +73,6 @@ LINGBOT_VIDEO_FP32_MODULES = (
     "norm_out_modulation",
     "router",
 )
-
-
-def is_lingbot_block(name: str, _module: object) -> bool:
-    return "blocks" in name and name.split(".")[-1].isdigit()
 
 
 def should_keep_in_fp32(name: str) -> bool:
@@ -361,8 +358,8 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     # own dtype instead of the bf16 default.
     _fsdp_mixed_dtype_params = True
 
-    _fsdp_shard_conditions = [is_lingbot_block]
-    _compile_conditions = [is_lingbot_block]
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = LingBotVideoMoEConfig().param_names_mapping
     reverse_param_names_mapping = LingBotVideoMoEConfig().reverse_param_names_mapping
     lora_param_names_mapping = LingBotVideoMoEConfig().lora_param_names_mapping

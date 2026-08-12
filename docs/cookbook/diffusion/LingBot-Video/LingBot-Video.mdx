@@ -29,7 +29,15 @@ Please refer to the [official SGLang-diffusion installation guide](/docs/sglang-
 sglang serve --model-path robbyant/lingbot-video-moe-30b-a3b
 ```
 
-One GPU is enough to bring the model up: the DiT is offloaded to CPU between uses by default, and the text encoder, image encoder, and VAE are offloaded layer by layer. `--performance-mode speed` keeps the DiT resident instead, which needs enough memory for all 30B parameters.
+One GPU is enough to bring the model up. `--performance-mode` decides where the DiT lives:
+
+| Mode | DiT | Text encoder, image encoder, VAE |
+| --- | --- | --- |
+| `auto` (default) | offloaded to CPU between uses | layer by layer |
+| `speed` | resident, needs room for all 30B parameters | resident |
+| `memory` | streamed layer by layer | layer by layer |
+
+`memory` keeps the least memory in use and is the mode to reach for when a whole DiT does not fit; it streams each block from CPU as the loop reaches it.
 
 Across multiple GPUs, sequence parallelism splits the joint video and text sequence:
 
@@ -40,9 +48,11 @@ sglang serve \
   --ulysses-degree 4
 ```
 
-Sequence parallelism splits the sequence, not the weights, so every rank still holds all 30B parameters. When that does not fit, shard the weights as well with `--dit-layerwise-offload` or `--use-fsdp-inference true`; otherwise the DiT runs out of memory as it is placed on device.
+Sequence parallelism splits the sequence, not the weights, so every rank still holds all 30B parameters. When that does not fit, either shard the weights across ranks with `--use-fsdp-inference true` or stream them from CPU with `--performance-mode memory`; otherwise the DiT runs out of memory as it is placed on device.
 
-`--tp-size`, `--ulysses-degree`, `--ring-degree`, and CFG parallel can be combined, except that image conditioning does not support sequence parallelism (see 5.2). `num_attention_heads` divided by `--tp-size` must stay divisible by `--ulysses-degree`; the server refuses the configuration at startup otherwise. The full list of supported optimizations is in the [compatibility matrix](/docs/sglang-diffusion/compatibility_matrix).
+`--tp-size`, `--ulysses-degree`, `--ring-degree`, and CFG parallel can be combined, and their degrees multiply out to `--num-gpus`. Left unset they are chosen for you: on two or more GPUs CFG parallel takes a degree of 2 and sequence parallelism gets the rest, so 8 GPUs run CFG parallel with `--ulysses-degree 4`. Pinning the full width to sequence parallelism, as the example above does, turns CFG parallel off. Pinning only part of it does not: `--num-gpus 8 --ulysses-degree 4` on its own is refused at startup, because the remaining factor of 2 is unaccounted for — add `--enable-cfg-parallel` to claim it.
+
+Image conditioning does not support sequence parallelism (see 5.2), and `num_attention_heads` divided by `--tp-size` must stay divisible by `--ulysses-degree`; the server refuses the configuration at startup otherwise. The full list of supported optimizations is in the [compatibility matrix](/docs/sglang-diffusion/compatibility_matrix).
 
 `torch.compile` is not enabled by default for this model, including under `--performance-mode speed`. Benchmark it on your own hardware before enabling it: whether it pays off depends on the GPU.
 
@@ -217,7 +227,7 @@ On 8 GPUs:
 - Image-to-video: `--tp-size 8`. Sequence parallelism is rejected for image conditioning, so tensor parallelism is the way to shard.
 - Refiner: `--ulysses-degree 8 --use-fsdp-inference true`. Sequence parallelism replicates both sets of DiT weights on every GPU; FSDP shards them, which is what keeps the second pass inside memory at 1088x1920. The refiner tiles the VAE for its own decode and re-encode regardless of `--vae-tiling`.
 
-The model uses CFG, so `--enable-cfg-parallel` is also available: it runs the two guidance branches on separate GPU groups and halves the sequence-parallel group size. Whether that beats pure Ulysses depends on interconnect bandwidth, so benchmark both on your own topology. Cache-DiT does not support this model.
+Each of these pins the full GPU count to one layout, which turns off the CFG parallel that would otherwise be picked by default (see 3). The rows above were measured that way, with both guidance branches computed sequentially. Splitting the branches across GPU groups instead halves the sequence-parallel group size; whether that wins depends on interconnect bandwidth, so benchmark both on your own topology. Cache-DiT does not support this model.
 
 ## 7. Notes
 
