@@ -158,6 +158,10 @@ __global__ __launch_bounds__(1024, 1)  //
     warp_max[tx] = 0;
     warp_min[tx] = 0xFFFFFFFFu;
   }
+  // Warp 0 initializes all warp slots while each warp later writes its own.
+  // Without this barrier, init can clobber a reduction result and make ragged
+  // extend look uniform, selecting the MTP fast path with out-of-range ragged_id.
+  __syncthreads();
 
   // === Stage B: min/max(extend_len) for MTP-uniform detection ===
   // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.
