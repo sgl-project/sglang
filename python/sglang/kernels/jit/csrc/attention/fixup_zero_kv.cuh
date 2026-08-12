@@ -130,10 +130,8 @@ void fixup_zero_kv_rows(
   // Every row base is 16-byte aligned iff the current data pointer and row
   // stride are both 16-byte aligned. The data pointer may include a non-zero
   // PyTorch storage offset even for a contiguous view.
-  const bool lse_aligned =
-      (reinterpret_cast<uintptr_t>(lse_ptr) % 16 == 0) && ((nh * sizeof(float)) % 16 == 0);
-  const bool out_aligned =
-      (reinterpret_cast<uintptr_t>(out_ptr) % 16 == 0) && ((nh * vd * sizeof(OutT)) % 16 == 0);
+  const bool lse_aligned = (reinterpret_cast<uintptr_t>(lse_ptr) % 16 == 0) && ((nh * sizeof(float)) % 16 == 0);
+  const bool out_aligned = (reinterpret_cast<uintptr_t>(out_ptr) % 16 == 0) && ((nh * vd * sizeof(OutT)) % 16 == 0);
 
   if (lse_aligned && out_aligned) {
     LaunchKernel(grid, block, device.unwrap())(
