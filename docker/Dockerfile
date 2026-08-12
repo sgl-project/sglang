@@ -13,10 +13,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.15.post1
-ARG TRTLLM_GEN_MOE_CUBIN_URL="https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip"
-ARG TRTLLM_GEN_MOE_CUBIN_SHA256="4900501cbe782a76b08a5858f9f07152287b97cb68114466dac286366b66c192"
-ARG TRTLLM_GEN_MOE_CUBIN_ARCHIVE_ROOT="trtllm_gen_moe_cubin_pool_20260617_v0613rc1"
+ARG FLASHINFER_VERSION=0.6.17
 ARG MOONCAKE_VERSION=0.3.12.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
@@ -25,8 +22,7 @@ ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=O
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    FLASHINFER_VERSION=${FLASHINFER_VERSION} \
-    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool
+    FLASHINFER_VERSION=${FLASHINFER_VERSION}
 
 # Add GKE default lib and bin locations
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -73,7 +69,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     build-essential \
     cmake \
     perl \
-    patch \
     patchelf \
     ccache \
     git-lfs \
@@ -164,7 +159,6 @@ ENV LANG=en_US.UTF-8 \
 #     |
 #     +-- devtools_builder (independent)
 #     +-- gateway_builder  (independent, only needs gateway source)
-#     +-- trtllm_cubin_builder (independent)
 #     |
 #     v
 #   framework (combines all artifacts)
@@ -401,27 +395,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
 
 ########################################################
-# PARALLEL STAGE 6: TRT-LLM Generated-MoE Cubin Pool
-########################################################
-FROM base AS trtllm_cubin_builder
-
-RUN cubin_archive="/tmp/trtllm_gen_moe_cubin_pool.zip" && \
-    cubin_extract_dir="/tmp/trtllm_gen_moe_cubin_extract" && \
-    wget --no-verbose --output-document="${cubin_archive}" \
-      "${TRTLLM_GEN_MOE_CUBIN_URL}" && \
-    echo "${TRTLLM_GEN_MOE_CUBIN_SHA256}  ${cubin_archive}" | \
-      sha256sum --check --strict - && \
-    mkdir -p "${cubin_extract_dir}" && \
-    unzip -q "${cubin_archive}" -d "${cubin_extract_dir}" && \
-    test ! -e "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" && \
-    mv "${cubin_extract_dir}/${TRTLLM_GEN_MOE_CUBIN_ARCHIVE_ROOT}" \
-      "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" && \
-    test "$(find "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" \
-      -type f -name '*.cubin' | wc -l)" -eq 1696 && \
-    rm -f "${cubin_archive}" && \
-    rm -rf "${cubin_extract_dir}"
-
-########################################################
 ########## Final Framework Image ######################
 ########################################################
 #
@@ -454,21 +427,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
-
-# Apply the FlashInfer CuTeDSL MLA decode-context-parallel runtime patch.
-# Exclude tests because they are not included in the installed wheel.
-COPY docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt /tmp/flashinfer-perkz-dcp-0.6.15.txt
-RUN FLASHINFER_DCP_PATCH=/tmp/flashinfer-perkz-dcp-0.6.15.txt && \
-    FLASHINFER_SITE_PACKAGES="$(python3 -c 'from pathlib import Path; import flashinfer; print(Path(flashinfer.__file__).resolve().parent.parent)')" && \
-    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
-      patch --dry-run --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
-    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
-      patch --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
-    rm -f "${FLASHINFER_DCP_PATCH}" && \
-    rm -rf /root/.cache/flashinfer /root/.cache/pip
-
-# Copy the pinned FlashInfer MXFP4 MoE runner cubin pool
-COPY --from=trtllm_cubin_builder /opt/trtllm_gen_moe_cubin_pool /opt/trtllm_gen_moe_cubin_pool
 
 # Copy dev tools
 COPY --from=devtools_builder /tools/diff-so-fancy /usr/local/bin/
@@ -734,8 +692,7 @@ ARG GDRCOPY_VERSION=2.5.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool
+    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
@@ -820,9 +777,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
 
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
-
-# Copy the pinned FlashInfer MXFP4 MoE runner cubin pool
-COPY --from=framework_final /opt/trtllm_gen_moe_cubin_pool /opt/trtllm_gen_moe_cubin_pool
 
 # Copy SGLang workspace
 COPY --from=framework_final /sgl-workspace /sgl-workspace

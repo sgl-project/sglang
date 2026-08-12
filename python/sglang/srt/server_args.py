@@ -1755,7 +1755,7 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),
@@ -5708,8 +5708,8 @@ class ServerArgs:
             view, model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
         assert (
-            is_cuda() or is_musa() or is_npu() or is_hip()
-        ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
+            is_cuda() or is_musa() or is_npu() or is_hip() or is_xpu()
+        ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."
         if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
             # The PD-disagg decode pool is not wired for lazy slots.
             assert view.disaggregation_mode == "null", (
@@ -8083,6 +8083,7 @@ class ServerArgs:
                         "MistralLarge3ForCausalLM",
                         "PixtralForConditionalGeneration",
                         "GlmMoeDsaForCausalLM",
+                        "Glm4MoeLiteForCausalLM",
                     ]
                 except Exception:
                     pass
@@ -8097,11 +8098,11 @@ class ServerArgs:
                     not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
                 ):
                     raise ValueError(
-                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
+                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with absorbed-MLA models. But you're using {attention_backend}."
                     )
                 if attention_backend == "fa4" and not is_sm100_or_sm110_supported():
                     raise ValueError(
-                        "Deterministic inference with DeepSeek models on the fa4 "
+                        "Deterministic inference with absorbed-MLA models on the fa4 "
                         "attention backend requires SM100/SM110: it runs "
                         "absorbed MLA, whose qv argument flash_attn.cute only "
                         "implements on those archs."
