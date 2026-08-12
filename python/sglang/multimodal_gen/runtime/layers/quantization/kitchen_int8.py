@@ -129,7 +129,7 @@ class KitchenInt8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "KitchenInt8Config":
+    def from_config(cls, config: dict[str, Any]) -> KitchenInt8Config:
         return cls(
             group_size=cls.get_from_keys_or(config, ["group_size"], 256),
             ignored_layers=cls.get_from_keys_or(config, ["ignored_layers"], None),
