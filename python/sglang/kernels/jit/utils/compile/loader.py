@@ -55,7 +55,6 @@ def load_jit(
     extra_ldflags: List[str] | None = None,
     extra_include_paths: List[str] | None = None,
     extra_dependencies: List[str] | None = None,
-    build_directory: str | None = None,
     header_only: bool = True,
 ) -> Module:
     """Load a JIT module, compiling it if no cached build still applies.
@@ -75,14 +74,6 @@ def load_jit(
     :param extra_ldflags: Extra linker flags.
     :param extra_include_paths: Extra include paths.
     :param extra_dependencies: Registered header-only dependencies, e.g. cutlass.
-    :param build_directory: Escape hatch — build in this directory instead of
-                            the content-addressed cache. Avoid it. A pinned
-                            directory is shared state: every process naming it
-                            writes the same sources and objects there, so it
-                            gives up the cache's staging, atomic publication and
-                            content-addressed staleness checks, and keeps only
-                            the build lock and whatever ninja can infer from
-                            mtimes in that directory.
     :param header_only: Compile through a generated wrapper that exports the
                         given entry points. Otherwise the sources must export
                         from the C++ side themselves.
@@ -117,15 +108,6 @@ def load_jit(
     # Generated once and threaded through: the cache key is taken over this
     # exact text, and this exact text is what gets compiled.
     build_file = ninja.generate(spec)
-
-    # An explicit build_directory is a caller-pinned location; honour it and
-    # stay out of the shared cache entirely. It still needs the lock: callers
-    # pin a *shared* directory, so every tensor-parallel rank would otherwise
-    # run ninja in it at once and clobber each other's build log and objects.
-    if build_directory is not None:
-        dir = pathlib.Path(build_directory)
-        with _build_lock(dir):
-            return _load(ninja.build(spec=spec, build_dir=dir, build_file=build_file))
 
     build_key = cache.compute_build_key(spec, build_file=build_file)
     scope = cache.build_key_dir(module_name=spec.module_name, build_key=build_key)
