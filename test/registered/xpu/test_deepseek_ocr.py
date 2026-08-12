@@ -26,8 +26,9 @@ from sglang.test.test_utils import (
 register_xpu_ci(
     est_time=360,
     suite="stage-b-test-1-gpu-xpu",
-    disabled="Temporarily disabled",
+    disabled="Temporarily disabled. The failure found in PR31751 and may introduced by other PR.",
 )
+
 
 class TestDeepSeekOCR(CustomTestCase):
     @classmethod
