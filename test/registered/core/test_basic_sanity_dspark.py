@@ -88,10 +88,6 @@ class TestBasicSanityDSpark(
             },
         )
 
-    @unittest.skip("DSPARK rejects return_logprob at admission")
-    def test_grammar_logprob_count_matches_completion_tokens(self):
-        pass
-
     @classmethod
     def tearDownClass(cls):
         if cls.process is not None:
