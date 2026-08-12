@@ -10,6 +10,7 @@ from sglang.kernels.ops.kv_canary.scatter_req_token_ids import (
     launch_scatter_req_token_ids_kernel,
     scatter_req_token_ids_torch_reference,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -63,7 +64,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             req_pool_indices=req_pool_indices,
             pool_out=ref_pool,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         self.assertTrue(torch.equal(triton_pool, ref_pool))
         # Spot-check: req in slot 3 holds [10,20,30,0,0,...] etc.
@@ -85,7 +86,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             req_pool_indices=req_pool_indices,
             pool_out=pool,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertTrue(torch.equal(pool, pool_before))
 
     def test_scatter_single_req(self) -> None:
@@ -112,7 +113,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             req_pool_indices=req_pool_indices,
             pool_out=ref_pool,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertTrue(torch.equal(triton_pool, ref_pool))
 
     def test_scatter_truncates_at_max_context_len(self) -> None:
@@ -135,7 +136,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             req_pool_indices=req_pool_indices,
             pool_out=pool,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         self.assertEqual(
             pool[1, :max_context_len].tolist(), list(range(max_context_len))
@@ -166,7 +167,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             req_pool_indices=req_pool_indices,
             pool_out=ref_pool,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         self.assertTrue(torch.equal(triton_pool, ref_pool))
         # Middle req contributes nothing; its pool row stays zero.
@@ -209,7 +210,7 @@ class TestScatterReqTokenIds(CustomTestCase):
                 req_pool_indices=req_pool_indices,
                 pool_out=ref_pool,
             )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             self.assertTrue(torch.equal(triton_pool, ref_pool))
 
 

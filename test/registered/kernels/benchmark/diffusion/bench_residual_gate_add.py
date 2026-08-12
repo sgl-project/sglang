@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add_cuda
 from sglang.kernels.ops.diffusion.triton.scale_shift import fuse_scale_shift_kernel
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -39,7 +40,7 @@ CI_WORKLOADS = [
 def cuda_event_us(fn, warmups: int, repeats: int, rounds: int) -> float:
     for _ in range(warmups):
         fn()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     samples = []
     for _ in range(rounds):
@@ -82,7 +83,7 @@ def benchmark() -> None:
         ref = residual + update * gate
         triton_out = fuse_scale_shift_kernel(update, gate, residual, scale_constant=0)
         cuda_out = residual_gate_add_cuda(residual, update, gate)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         torch.testing.assert_close(triton_out, ref, atol=5e-2, rtol=5e-2)
         torch.testing.assert_close(cuda_out, ref, atol=5e-2, rtol=5e-2)
 
@@ -108,7 +109,7 @@ def benchmark() -> None:
             f"{times['triton'] / times['cuda']:.3f}x |"
         )
 
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
 
 if __name__ == "__main__":

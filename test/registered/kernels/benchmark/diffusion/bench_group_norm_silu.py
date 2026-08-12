@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import triton.testing
 
 from sglang.kernels.ops.diffusion.triton.group_norm_silu import triton_group_norm_silu
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -182,7 +183,7 @@ def run_case(
 
     native_median_us = summarize([stats[0] for stats in native_stats])
     fused_median_us = summarize([stats[0] for stats in fused_stats])
-    torch.cuda.empty_cache()
+    current_platform.empty_cache()
     return {
         "case": case.name,
         "shape": "x".join(str(dim) for dim in case.shape),
@@ -222,10 +223,10 @@ def run_profile(case: Case, dtype: torch.dtype, provider: str, iters: int) -> No
     with torch.inference_mode():
         for _ in range(5):
             fn()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         for _ in range(iters):
             fn()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
 
 def write_csv(rows: list[dict[str, object]], output_path: Path) -> None:

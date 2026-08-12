@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe.inkling_moe import silu_and_mul
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -150,7 +151,7 @@ def test_int64_offsets():
         assert int(_ulp_diff_bf16(out[-4:], tail_ref).max()) <= 1
         assert out[-4:].isfinite().all()
         del out
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
 
 if __name__ == "__main__":

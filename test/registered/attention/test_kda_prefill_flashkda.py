@@ -12,6 +12,7 @@ otherwise. Mirrors ``test_kda_prefill_cutedsl.py``.
 import pytest
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # SM90+ single-GPU kernel-unit suite. Disabled in CI: flash_kda is not in the
@@ -119,7 +120,7 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
         lower_bound=LOWER_BOUND,
         extend_seq_lens_cpu=seq_lens,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.isfinite(out).all(), "FlashKDA output has non-finite values"
     assert torch.isfinite(st_fk).all(), "FlashKDA final state has non-finite values"
@@ -154,7 +155,7 @@ def test_flashkda_falls_back_without_lower_bound():
         lower_bound=None,
         extend_seq_lens_cpu=[256],
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.isfinite(out).all()
     # Same Triton code path as the reference -> matches closely.
@@ -185,7 +186,7 @@ def test_flashkda_spec_verify_falls_back():
         extend_seq_lens_cpu=[256],
         is_spec_decode=True,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.isfinite(out).all()
     # Took the Triton fallback (not FlashKDA) -> matches chunk_kda closely. If

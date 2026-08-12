@@ -20,6 +20,7 @@ from sglang.kernels.ops.kimi_k3 import (
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
@@ -140,7 +141,7 @@ def test_all_reduce_push():
         residual,
         ws_mc_base=comm.mc_base_ptr,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(x, expected, rtol=0, atol=0)
 
 
@@ -207,7 +208,7 @@ def test_sequence_parallel_collectives():
         ws_mc_base=comm.mc_base_ptr,
         tuning=_SP_TUNING,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(reduce_output, expected_reduce, rtol=2e-2, atol=3e-2)
     torch.testing.assert_close(gather_output, expected_gather, rtol=0, atol=0)
@@ -245,7 +246,7 @@ def test_gemm_all_gather():
         output,
         ws_mc_base=comm.mc_base_ptr,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
 
 
@@ -267,7 +268,7 @@ def test_gemm_all_reduce():
     dist.all_reduce(expected, group=nccl_group)
 
     output = gemm_ar.o_proj_gemm_ar(x, weight)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     bad = ((output.float() - expected).abs() > 0.05 + 0.02 * expected.abs()).sum()
     assert bad.item() <= output.numel() / 1000
 
@@ -335,7 +336,7 @@ def test_attention_residual_direct_all_gather():
         output_mc_ptr=multicast_ptr,
         max_blocks=4,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(output, full_reference, rtol=2e-2, atol=3e-2)
     assert handle is not None
 

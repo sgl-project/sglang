@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sglang.srt.mem_cache.pool_host.mha import AsymmetricMHATokenToKVPoolHost
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
@@ -154,7 +155,7 @@ def test_asymmetric_mha_kernel_page_first_roundtrip(dtype):
     host.backup_from_device_all_layer(
         device_pool, host_indices, device_indices, io_backend="kernel"
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert_backup_matches_device(
         host, device_pool, host_indices_host, device_indices_host
     )
@@ -165,7 +166,7 @@ def test_asymmetric_mha_kernel_page_first_roundtrip(dtype):
         host.load_to_device_per_layer(
             device_pool, host_indices, load_indices, layer_id, io_backend="kernel"
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert_load_matches_host(host, device_pool, host_indices_host, load_indices_host)
 
 

@@ -24,6 +24,7 @@ from sglang.kernels.ops.kv_canary.verify_ref import (
 from sglang.kernels.ops.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
@@ -1221,7 +1222,7 @@ class TestLayoutAndScheduling:
             plan=plan,
             check_verify_expected_token=True,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         assert _n_violations(log) == 0
         assert int(log.slot_run_counter[0].item()) == 1
@@ -1279,7 +1280,7 @@ class TestLayoutAndScheduling:
             check_verify_expected_token=True,
         )
         if runner is launch_canary_verify_kernel:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
         assert torch.equal(log.ring, ring_before)
         assert torch.equal(log.write_index, write_index_before)

@@ -29,6 +29,7 @@ import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import init_custom_process_group
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
@@ -233,7 +234,7 @@ def init_process_hf(
         rank=rank,
         group_name="test_parameter_update_group",
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     barrier.wait()
 
     # Warmup: trigger RCCL initialization so it's excluded from timing
@@ -245,7 +246,7 @@ def init_process_hf(
             load_format,
             group,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
     time_begin_broadcast = time.perf_counter()
 
@@ -273,7 +274,7 @@ def init_process_hf(
                 src=0,
                 group=group,
             )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     time_end_broadcast = time.perf_counter()
 
     # Measure the latency of broadcasting/weights update.
@@ -288,7 +289,7 @@ def init_process_hf(
     del hf_instruct_model
     del hf_base_model
     gc.collect()
-    torch.cuda.empty_cache()
+    current_platform.empty_cache()
 
 
 def init_process_sgl(
@@ -307,7 +308,7 @@ def init_process_sgl(
     pause_generation_mode,
 ):
     torch.cuda.set_device(rank)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     base_gpu_id = 1 if rank == 1 else 1 + tp_size
     if backend == "Engine":
         print(f"[sgl] rank {rank} init engine")
@@ -338,7 +339,7 @@ def init_process_sgl(
                 2,
             ),
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Get weights of instruct model, i.e. pre-training weights.
     instruct_params = []
@@ -420,7 +421,7 @@ def init_process_sgl(
             url + "/pause_generation",
             json={"mode": pause_generation_mode},
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     barrier.wait()
 
     # Warmup: trigger RCCL initialization so it's excluded from timing
@@ -435,7 +436,7 @@ def init_process_sgl(
             load_format,
             pause_generation_mode,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
     time_begin_update = time.perf_counter()
     if backend == "Engine":
@@ -458,7 +459,7 @@ def init_process_sgl(
                 "flush_cache": not (pause_generation_mode == "in_place"),
             },
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     time_end_update = time.perf_counter()
     if pause_generation_mode in ["in_place", "retract"]:
         requests.post(
@@ -706,7 +707,7 @@ def test_update_weights_from_distributed(
     param_queue.close()
     param_queue.join_thread()
     gc.collect()
-    torch.cuda.empty_cache()
+    current_platform.empty_cache()
 
 
 class TestUpdateWeightsFromDistributed(CustomTestCase):
@@ -810,7 +811,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             }
             del model
             gc.collect()
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
         truncate_size = 10
         checking_parameters = [

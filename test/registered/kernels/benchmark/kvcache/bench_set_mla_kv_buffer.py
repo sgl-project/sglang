@@ -24,6 +24,7 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.kvcache.set_mla_kv_buffer import set_mla_kv_buffer as jit_set
 from sglang.srt.mem_cache.utils import set_mla_kv_buffer_kernel as sglang_triton_kernel
 from sglang.srt.mem_cache.utils import set_mla_kv_buffer_triton as sglang_wrapper
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -104,7 +105,7 @@ def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
         device=DEFAULT_DEVICE,
     )
     loc = torch.randperm(CACHE_SIZE, device=DEFAULT_DEVICE)[:batch_size]
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     FN_MAP = {
         "wrapper": sglang_wrapper,

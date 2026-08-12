@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana import (
     _eager_ln_modulate,
     _sana_ln_modulate,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=3, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -44,7 +45,7 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
         out = _sana_ln_modulate(norm, x, scale, shift)
         assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
         out2 = _sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert torch.equal(out, _eager_ln_modulate(norm, x, scale, shift))
     assert torch.equal(out2, out) and not sana._SANA_LN_MOD.disabled
 

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,7 +30,7 @@ class TestLoadBackDurationMetric(CustomTestCase):
             start.wait(stream)
             torch.empty(payload_floats, device="cuda").fill_(0)
             finish.record()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         return start, finish
 
     def test_elapsed_time_works(self):
@@ -93,7 +94,7 @@ class TestLoadBackDurationMetric(CustomTestCase):
         finish = torch.cuda.Event()
         start.record()
         finish.record()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         ack = self.cc.HiCacheAck(
             start_event=start,

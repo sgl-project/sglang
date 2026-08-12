@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -623,7 +624,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.admit_request_into_staging(req)
         self.assertTrue(req.hisparse_staging)
 
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         ready = self.coordinator.collect_ready_reqs()
         self.assertEqual(len(ready), 1)
         self.assertFalse(req.hisparse_staging)
@@ -659,7 +660,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self._write_device_patterns(kv_loc, fill_len)
 
         self.coordinator.admit_request_into_staging(req)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         ready = self.coordinator.collect_ready_reqs()
         self.assertEqual(ready, [req])
 

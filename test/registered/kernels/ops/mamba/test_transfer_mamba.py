@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -218,7 +219,7 @@ def test_mamba_kernel_backup_load_roundtrip(dtype, layout):
     host.backup_from_device_all_layer(
         device_pool, host_indices, device_indices, io_backend="kernel"
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert_host_matches_device(host, device_pool, host_indices, device_indices)
 
     # --- Clear device buffers ---
@@ -236,7 +237,7 @@ def test_mamba_kernel_backup_load_roundtrip(dtype, layout):
             layer_id,
             io_backend="kernel",
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert_device_matches_host(host, device_pool, host_indices, load_indices)
 
     # Verify non-target positions remain zero (catch kernel writing wrong indices)
@@ -272,7 +273,7 @@ def test_mamba_kernel_empty_indices(dtype, layout):
     host.backup_from_device_all_layer(
         device_pool, empty_host, empty_device, io_backend="kernel"
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     # Host buffers should remain all zeros
     assert host.temporal_buffer.abs().max() == 0
 
@@ -280,7 +281,7 @@ def test_mamba_kernel_empty_indices(dtype, layout):
         host.load_to_device_per_layer(
             device_pool, empty_host, empty_device, layer_id, io_backend="kernel"
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -298,7 +299,7 @@ def test_mamba_kernel_single_item(dtype, layout):
     host.backup_from_device_all_layer(
         device_pool, host_indices, device_indices, io_backend="kernel"
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert_host_matches_device(host, device_pool, host_indices, device_indices)
 
     for layer_id in range(NUM_LAYERS):
@@ -310,7 +311,7 @@ def test_mamba_kernel_single_item(dtype, layout):
         host.load_to_device_per_layer(
             device_pool, host_indices, load_indices, layer_id, io_backend="kernel"
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert_device_matches_host(host, device_pool, host_indices, load_indices)
 
 
@@ -329,7 +330,7 @@ def test_mamba_kernel_full_indices(dtype, layout):
     host.backup_from_device_all_layer(
         device_pool, host_indices, device_indices, io_backend="kernel"
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert_host_matches_device(host, device_pool, host_indices, device_indices)
 
     for layer_id in range(NUM_LAYERS):
@@ -341,7 +342,7 @@ def test_mamba_kernel_full_indices(dtype, layout):
         host.load_to_device_per_layer(
             device_pool, host_indices, load_indices, layer_id, io_backend="kernel"
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert_device_matches_host(host, device_pool, host_indices, load_indices)
 
 

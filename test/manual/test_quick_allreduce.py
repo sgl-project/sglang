@@ -23,6 +23,7 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     initialize_model_parallel,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.test_utils import CustomTestCase
 
 torch.manual_seed(42)
@@ -128,7 +129,7 @@ class TestQuickAllReduce(CustomTestCase):
         data = torch.zeros(1)
         data = data.to(device=device)
         torch.distributed.all_reduce(data, group=group)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         del data
 
         for sz in self.TEST_SIZES:
@@ -150,7 +151,7 @@ class TestQuickAllReduce(CustomTestCase):
                             dtype=dtype,
                             device=torch.cuda.current_device(),
                         )
-                        torch.cuda.synchronize()
+                        current_platform.synchronize()
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(
                             graph, stream=graph_capture_context.stream
@@ -297,13 +298,13 @@ def qr_graph_replay(rank, world_size, quant_mode="FP", num_replays=10):
     # Warmup, then capture a graph with EXACTLY ONE quick-reduce.
     inp.fill_(1.0)
     qr.quick_all_reduce(inp, out=out)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         qr.quick_all_reduce(inp, out=out)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     dist.barrier()
 
     try:
@@ -311,7 +312,7 @@ def qr_graph_replay(rank, world_size, quant_mode="FP", num_replays=10):
             inp.fill_(float(v))  # in-place: same value on every rank
             dist.barrier()
             graph.replay()
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             dist.barrier()
             expected = float(v * world_size)
             assert torch.all(out.float() == expected), (

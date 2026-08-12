@@ -20,6 +20,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
 )
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
@@ -189,7 +190,7 @@ def test_metadata_update_records_inside_cuda_graph():
 
     backend.init_forward_metadata_out_graph(fb, in_capture=True)
     backend.init_forward_metadata_in_graph(fb)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -197,7 +198,7 @@ def test_metadata_update_records_inside_cuda_graph():
 
     fb.seq_lens.copy_(torch.tensor([5, 6], dtype=torch.int32, device=DEVICE))
     graph.replay()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(
         backend.forward_metadata.cache_seqlens_int32,
@@ -236,7 +237,7 @@ def test_graph_read_done_event_fences_slot_mutation():
 
     backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
     backend.init_forward_metadata_in_graph(forward_batch)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     read_done = torch.cuda.Event(external=True)
     graph = torch.cuda.CUDAGraph()
@@ -259,7 +260,7 @@ def test_graph_read_done_event_fences_slot_mutation():
         backend._swa_full_to_swa_mapping.add_(64)
         mutation_done.record()
     torch.cuda.current_stream().wait_event(mutation_done)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(
         backend.forward_metadata.page_table,
@@ -287,7 +288,7 @@ def test_graph_read_done_event_fences_slot_mutation():
         backend._swa_full_to_swa_mapping.sub_(64)
         mutation_done.record()
     torch.cuda.current_stream().wait_event(mutation_done)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(
         backend.forward_metadata.page_table,
@@ -477,7 +478,7 @@ def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width)
         q_stride=q_stride,
         q_mode=q_mode,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # ---- cache_seqlens ----
     torch.testing.assert_close(cache_seqlens, cache_seqlens_ref, rtol=0, atol=0)

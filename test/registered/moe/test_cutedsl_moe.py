@@ -7,6 +7,7 @@ from torch.nn import functional as F
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.quant_ref_utils import (
     FLOAT4_E2M1_MAX,
@@ -567,19 +568,19 @@ class TestCuteDslV2(unittest.TestCase):
 
                     for _ in range(3):
                         _run_wrapper(wrapper_graph, tensors)
-                    torch.cuda.synchronize()
+                    current_platform.synchronize()
 
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
                         graph_output = _run_wrapper(wrapper_graph, tensors)
-                    torch.cuda.synchronize()
+                    current_platform.synchronize()
 
                     graph.replay()
-                    torch.cuda.synchronize()
+                    current_platform.synchronize()
                     out_graph1 = graph_output.clone()
 
                     graph.replay()
-                    torch.cuda.synchronize()
+                    current_platform.synchronize()
                     out_graph2 = graph_output.clone()
 
                 torch.testing.assert_close(

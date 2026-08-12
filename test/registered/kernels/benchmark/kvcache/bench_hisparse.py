@@ -7,6 +7,7 @@ import triton.testing
 
 from sglang.kernels.jit.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE
 from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_mla
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
@@ -144,10 +145,10 @@ def _time_kernel(batch_size: int, hot_buffer_size: int, miss_rate: float) -> flo
         )
 
     run_once()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     for _ in range(WARMUP_ROUNDS):
         run_once()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -155,7 +156,7 @@ def _time_kernel(batch_size: int, hot_buffer_size: int, miss_rate: float) -> flo
     for _ in range(ROUNDS):
         run_once()
     end.record()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     return start.elapsed_time(end) * 1000.0 / ROUNDS
 
 

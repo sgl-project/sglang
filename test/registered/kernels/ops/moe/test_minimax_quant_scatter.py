@@ -27,6 +27,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -326,7 +327,7 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
     masked_is_masked, masked_all_tokens, masked_m_indices, masked_output = (
         run_with_layout("masked")
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert not compact_is_masked
     assert masked_is_masked

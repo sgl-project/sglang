@@ -8,6 +8,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode_fast,
     transform_index_page_table_prefill_fast,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -23,7 +24,7 @@ class TestDSATransformIndex(CustomTestCase):
         self.device = torch.device("cuda")
 
     def tearDown(self):
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         super().tearDown()
 
     def _make_page_table(self, rows: int, context_length: int) -> torch.Tensor:
@@ -114,7 +115,7 @@ class TestDSATransformIndex(CustomTestCase):
             topk_indices=topk_indices,
             result=result,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         if result is not None:
             self.assertIs(actual, result)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -151,7 +152,7 @@ class TestDSATransformIndex(CustomTestCase):
             output_num_tokens=output_num_tokens,
             page_table_is_expanded=page_table_is_expanded,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_prefill_uses_dedicated_kernel(self):

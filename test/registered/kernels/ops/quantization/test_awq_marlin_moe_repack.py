@@ -9,6 +9,7 @@ from sglang.kernels.ops.quantization.awq_marlin_repack import (
     awq_marlin_moe_repack as jit_awq_marlin_moe_repack,
 )
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -79,7 +80,7 @@ def test_awq_marlin_moe_repack_jit_vs_aot(
         b_q_weight, perm, size_k, size_n, num_bits
     )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Bitwise equality
     torch.testing.assert_close(out_jit, out_aot, rtol=0, atol=0)
@@ -113,7 +114,7 @@ def test_awq_marlin_moe_repack_shape(
     perm = torch.empty((num_experts, 0), dtype=torch.int32, device="cuda")
 
     out = jit_awq_marlin_moe_repack(b_q_weight, perm, size_k, size_n, num_bits)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert out.is_cuda and out.dtype == torch.int32
     expected_shape = (num_experts, size_k // 16, size_n * (num_bits // 2))

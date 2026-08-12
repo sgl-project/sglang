@@ -17,6 +17,7 @@ import requests
 import torch
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -79,7 +80,7 @@ class TestPooledHiddenStatesEngine(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "engine") and cls.engine:
             cls.engine.shutdown()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def test_phs_returned_when_requested(self):
         """Pooled hidden states are present and shaped correctly."""
@@ -217,7 +218,7 @@ class TestPooledHiddenStatesMISEngine(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "engine") and cls.engine:
             cls.engine.shutdown()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def test_mis_phs_count_matches_items(self):
         """MIS must return one PHS tensor per item."""
@@ -311,7 +312,7 @@ class TestPooledHiddenStatesCausalLMRejection(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "engine") and cls.engine:
             cls.engine.shutdown()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def test_causal_lm_rejects_phs(self):
         """ValueError raised when requesting PHS from a CausalLM."""

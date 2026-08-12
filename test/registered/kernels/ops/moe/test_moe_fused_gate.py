@@ -23,6 +23,7 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -153,7 +154,7 @@ def test_moe_fused_gate_matches_reference(
     )
     triton_w, triton_i = moe_fused_gate(scores, bias, **kwargs)
     ref_w, ref_i = _reference_gate(scores, bias, **kwargs)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     num_columns = num_experts + num_shared
     torch.testing.assert_close(
@@ -192,7 +193,7 @@ def test_moe_fused_gate_matches_cuda_jit(
     )
     triton_w, triton_i = moe_fused_gate(scores, bias, **kwargs)
     cuda_w, cuda_i = moe_fused_gate_jit(scores, bias, **kwargs)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     num_columns = num_experts + num_shared
     torch.testing.assert_close(
@@ -242,7 +243,7 @@ def test_moe_fused_gate_matches_production_impl(
         routed_scaling_factor=scale,
         apply_routed_scaling_factor_on_output=apply_scale,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(
         _scatter_by_expert(triton_w, triton_i, num_experts),
@@ -332,7 +333,7 @@ def test_moe_fused_gate_softmax_matches_aot(
     aot_w = torch.empty(M, topk, dtype=torch.float32, device=DEVICE)
     aot_i = torch.empty(M, topk, dtype=torch.int32, device=DEVICE)
     sgl_kernel.topk_softmax(aot_w, aot_i, gating, renormalize)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     dense_tri = _scatter_by_expert(tri_w, tri_i, num_experts)
     torch.testing.assert_close(
@@ -391,7 +392,7 @@ def test_moe_fused_gate_sigmoid_matches_aot(
     sgl_kernel.topk_sigmoid(
         aot_w, aot_i, gating, renormalize, bias if with_bias else None
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(
         _scatter_by_expert(tri_w, tri_i, num_experts),
@@ -452,7 +453,7 @@ def test_moe_fused_gate_grouped_matches_production_impl(
         routed_scaling_factor=1.0,
         apply_routed_scaling_factor_on_output=False,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(
         _scatter_by_expert(tri_w, tri_i, num_experts),
@@ -508,7 +509,7 @@ def test_grouped_dispatch_flag_matches_default(
         jit_w, jit_i = biased_grouped_topk_gpu(
             hidden, gating, bias, topk, True, **kwargs
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Compare routed experts only (shared-expert slot ids are placeholders the
     # downstream fusion overwrites; the routed selection + weights are what matter).

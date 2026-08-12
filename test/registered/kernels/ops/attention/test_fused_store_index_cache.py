@@ -2,7 +2,7 @@
 Test for fused_store_index_k_cache kernel.
 
 Design Notes:
-  1. torch.cuda.synchronize() needed after TVM FFI kernel call.
+  1. current_platform.synchronize() needed after TVM FFI kernel call.
   2. _split_buffer used buf[:, :vb].reshape(-1) which COPIES data for
      non-contiguous slices → reference buffer stayed all-zeros.
      Fix: use flat byte-offset indexing.
@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 import pytest
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
@@ -262,7 +263,7 @@ def test_fused_kernel_matches_own_algorithm(num_tokens: int, base_index: int):
     # Fused kernel
     out_buf = _make_buffer(num_pages)
     fused_store_index_k_cache(key, out_buf, loc, page_size=PAGE_SIZE)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     out_f, out_s = _gather_tokens(out_buf, loc)
     ref_f, ref_s = _gather_tokens(ref_buf, loc)
@@ -321,7 +322,7 @@ def test_fused_kernel_vs_act_quant_semantic(scale_fmt: Optional[str]):
 
     out_buf = _make_buffer(num_pages)
     fused_store_index_k_cache(key, out_buf, loc, page_size=PAGE_SIZE)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     out_f, out_s = _gather_tokens(out_buf, loc)
     ref_f, ref_s = _gather_tokens(ref_buf, loc)
@@ -381,7 +382,7 @@ def test_roundtrip_reconstruction(num_tokens: int):
 
     buf = _make_buffer(num_pages)
     fused_store_index_k_cache(key, buf, loc, page_size=PAGE_SIZE)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     fp8_f32, scales = _gather_tokens(buf, loc)
     reconstructed = fp8_f32 * scales.unsqueeze(-1)
@@ -407,7 +408,7 @@ def test_single_token():
 
     buf = _make_buffer(1)
     fused_store_index_k_cache(key, buf, loc, page_size=PAGE_SIZE)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     fp8_f32, scales = _gather_tokens(buf, loc)
     reconstructed = fp8_f32 * scales.unsqueeze(-1)
@@ -424,7 +425,7 @@ def test_zero_input():
 
     buf = _make_buffer(1)
     fused_store_index_k_cache(key, buf, loc, page_size=PAGE_SIZE)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     fp8_f32, scales = _gather_tokens(buf, loc)
 

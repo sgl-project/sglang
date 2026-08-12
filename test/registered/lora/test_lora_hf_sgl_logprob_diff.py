@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
@@ -476,7 +477,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
 
         # Clear GPU memory
         print("\nClearing GPU memory...")
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         # Step 2: Run HuggingFace with LoRA
         hf_logprobs = run_hf_with_lora(
@@ -567,6 +568,5 @@ if __name__ == "__main__":
         unittest.main(warnings="ignore", verbosity=2)
     finally:
         # Final cleanup
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()

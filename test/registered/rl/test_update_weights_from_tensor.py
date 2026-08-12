@@ -1,3 +1,4 @@
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=147, stage="extra-a", runner_config="1-gpu-small")
@@ -27,7 +28,7 @@ from sglang.test.test_utils import (
 
 def test_update_weights_from_tensor(tp_size):
     assert torch.cuda.device_count() >= tp_size, f"At least {tp_size} GPUs are required"
-    torch.cuda.empty_cache()
+    current_platform.empty_cache()
 
     engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, tp_size=tp_size)
 
@@ -50,7 +51,7 @@ def test_update_weights_from_tensor(tp_size):
     del new_tensor
     gc.collect()
     torch.cuda.ipc_collect()
-    torch.cuda.empty_cache()
+    current_platform.empty_cache()
     memory_after = torch.cuda.memory_allocated()
     assert (
         memory_after <= memory_before + 1024

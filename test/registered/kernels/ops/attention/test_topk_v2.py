@@ -30,6 +30,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2, topk_transform_512_v2
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -146,7 +147,7 @@ def _run(scores, seq_lens, page_table, inv_cpu, k):
     out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
     metadata = plan_topk_v2(seq_lens)
     topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     out_cpu = out.cpu().tolist()
     return [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
 
@@ -160,7 +161,7 @@ def _run_raw(scores, seq_lens, page_table, k):
     raw = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
     metadata = plan_topk_v2(seq_lens)
     topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     raw_cpu = raw.cpu().tolist()
     return [[v for v in raw_cpu[i] if v != -1] for i in range(batch)]
 
@@ -257,7 +258,7 @@ def test_topk_v2_raw_indices(batch: int, seq: int, page_mode: str) -> None:
 
     metadata = plan_topk_v2(seq_lens)
     topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     out_cpu, raw_cpu = out.cpu().tolist(), raw.cpu().tolist()
     for i in range(batch):

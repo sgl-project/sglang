@@ -24,6 +24,7 @@ from sglang.kernels.ops.kv_canary.write import WritePlan, launch_canary_write_ke
 from sglang.kernels.ops.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
@@ -139,7 +140,7 @@ def _run_pipeline(
             plan=plan_v,
             check_verify_expected_token=check_verify_expected_token,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
     else:
         launch_canary_write_kernel_torch_reference(
             context=VerifyOrWriteContext(
@@ -663,7 +664,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         plan=plan_v_real,
         check_verify_expected_token=True,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     launch_canary_verify_kernel_torch_reference(
         context=VerifyOrWriteContext(

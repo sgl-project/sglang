@@ -8,6 +8,7 @@ SM100-only and requires a FlashInfer build that exposes it.
 import pytest
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # SM100 suite, same slot as the CuteDSL KDA prefill test.
@@ -179,7 +180,7 @@ def test_kda_decode_flashinfer_matches_triton(batch_size):
     ref_out = _decode(tri, d, st_ref).float()
     st_fi = d["ssm"].clone()
     out = _decode(fi, d, st_fi).float()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.isfinite(out).all(), "FlashInfer decode output has non-finite values"
     assert torch.isfinite(st_fi).all(), "FlashInfer decode state has non-finite values"
@@ -210,7 +211,7 @@ def test_kda_target_verify_flashinfer_matches_triton(batch_size, num_spec):
         tri, d, d["ssm"].clone(), d["intermediate_states"].clone()
     ).float()
     out = _verify(fi, d, d["ssm"].clone(), d["intermediate_states"].clone()).float()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.isfinite(out).all(), "FlashInfer verify output has non-finite values"
     o_err = (out - ref_out).abs()
@@ -242,7 +243,7 @@ def test_kda_target_verify_flashinfer_checkpoint_states(
     _verify(
         fi, d, d["ssm"].clone(), intermediate_states
     )  # fills intermediate_states[n, t] in place
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     got = intermediate_states[:, : d["T"]].float()  # [B, T, HV, V, K] checkpoint states
     assert torch.isfinite(got).all(), "verify checkpoint states have non-finite values"

@@ -23,6 +23,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
@@ -52,7 +53,7 @@ class TestCausalLMScoring(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "engine") and cls.engine:
             cls.engine.shutdown()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -79,7 +80,7 @@ class TestCausalLMScoring(CustomTestCase):
         finally:
             model.cpu()
             del model, tokenizer
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
     def _assert_scores_close(self, hf, sgl, tol=0.01):
         self.assertEqual(len(hf), len(sgl))
@@ -285,7 +286,7 @@ class TestSeqClsScoring(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "engine") and cls.engine:
             cls.engine.shutdown()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def test_score_shape(self):
         """Each item gets a score vector of length num_labels."""
@@ -401,7 +402,7 @@ class TestSeqClsMISScoring(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "engine") and cls.engine:
             cls.engine.shutdown()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def test_mis_one_vector_per_item(self):
         """MIS produces exactly one score vector per item."""
@@ -473,7 +474,7 @@ class TestSeqClsMISAdvancedScoring(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "engine") and cls.engine:
             cls.engine.shutdown()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def test_many_labels_correct_shape(self):
         """5 items × 12 labels — each score vector has the right length."""

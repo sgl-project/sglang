@@ -17,10 +17,10 @@ import asyncio
 import os
 import unittest
 
-import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -73,7 +73,7 @@ class TestMultiItemScoringOptimization(CustomTestCase):
             cls.engine.shutdown()
         if cls.non_mis_engine is not None:
             cls.non_mis_engine.shutdown()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def test_mis_basic(self):
         """Test basic MIS: correct shapes, valid probabilities."""
@@ -178,7 +178,7 @@ class TestMultiItemScoringClassification(CustomTestCase):
         for engine in (cls.engine, cls.non_mis_engine):
             if engine is not None:
                 engine.shutdown()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def test_classification_mis_basic(self):
         """Classification MIS: correct shapes, valid softmax probabilities."""
@@ -443,7 +443,7 @@ class TestMultiItemScoringParity(CustomTestCase):
             cls.engine_single.shutdown()
         if cls.engine_mis is not None:
             cls.engine_mis.shutdown()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def _compare_scores(
         self, query, items, label_token_ids=None, apply_softmax=True, test_name=""

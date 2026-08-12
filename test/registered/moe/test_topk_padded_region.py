@@ -11,6 +11,7 @@ from sglang.srt.layers.moe.topk import (
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -103,7 +104,7 @@ class TestTopkPaddedRegion(CustomTestCase):
             work.copy_(weights)
             num_token_non_padded.fill_(n_valid)
             graph.replay()
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             expected = _eager_fill_padded_rows(weights, num_token_non_padded, 0.0)
             self.assertTrue(torch.equal(work, expected))
 

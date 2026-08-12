@@ -10,6 +10,7 @@ from enum import IntEnum
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.phase_checker import SimplePhaseChecker
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -77,14 +78,14 @@ class TestUpdateAssertDisabled(CustomTestCase):
     def test_update_advances_phase_on_match(self) -> None:
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         checker.update(expect_phase=_Phase.IDLE, next_phase=_Phase.A, caller_name="t")
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.A))
 
     def test_update_advances_phase_on_mismatch(self) -> None:
         """assert OFF tolerates mismatches — store still happens unconditionally."""
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         checker.update(expect_phase=_Phase.C, next_phase=_Phase.B, caller_name="t")
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.B))
 
     def test_init_time_lifecycle_violations_tolerated(self) -> None:
@@ -98,7 +99,7 @@ class TestUpdateAssertDisabled(CustomTestCase):
         checker.update(
             expect_phase=_Phase.B, next_phase=_Phase.IDLE, caller_name="warmup"
         )
-        torch.cuda.synchronize()  # no raise
+        current_platform.synchronize()  # no raise
         self.assertEqual(_phase_value(checker), int(_Phase.IDLE))
 
 
@@ -113,7 +114,7 @@ class TestUpdateAssertEnabled(CustomTestCase):
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         checker.enable_assert()
         checker.update(expect_phase=_Phase.IDLE, next_phase=_Phase.A, caller_name="t")
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.A))
 
     def test_full_4_state_lifecycle_round_trip(self) -> None:
@@ -129,7 +130,7 @@ class TestUpdateAssertEnabled(CustomTestCase):
             checker.update(
                 expect_phase=_Phase.C, next_phase=_Phase.IDLE, caller_name="p4"
             )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.IDLE))
 
     def test_update_mismatch_after_enable_raises_in_subprocess(self) -> None:
@@ -150,7 +151,7 @@ class TestUpdateAssertEnabled(CustomTestCase):
             # phase=0 but we claim expect=99 — kernel must fire device_assert.
             checker.update(expect_phase=99, next_phase=1, caller_name="bad")
             try:
-                torch.cuda.synchronize()
+                current_platform.synchronize()
             except RuntimeError as e:
                 msg = str(e).lower()
                 if "device-side assert" in msg or "phase mismatch" in msg:
@@ -208,7 +209,7 @@ class TestEnableAssert(CustomTestCase):
         checker.update(
             expect_phase=_Phase.IDLE, next_phase=_Phase.C, caller_name="warmup"
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.C))
 
         checker.enable_assert()
@@ -218,7 +219,7 @@ class TestEnableAssert(CustomTestCase):
         """Reset target tracks the original initial_phase, not 0."""
         checker = SimplePhaseChecker(initial_phase=42, device=self.device)
         checker.update(expect_phase=42, next_phase=7, caller_name="t")
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), 7)
 
         checker.enable_assert()
@@ -242,7 +243,7 @@ class TestResetToIdle(CustomTestCase):
     def test_reset_after_update_restores_initial_phase(self) -> None:
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         checker.update(expect_phase=_Phase.IDLE, next_phase=_Phase.B, caller_name="t")
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.B))
 
         checker._reset_to_idle()
@@ -264,7 +265,7 @@ class TestResetToIdle(CustomTestCase):
     def test_reset_with_nonzero_initial_phase(self) -> None:
         checker = SimplePhaseChecker(initial_phase=5, device=self.device)
         checker.update(expect_phase=5, next_phase=9, caller_name="t")
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         checker._reset_to_idle()
         self.assertEqual(_phase_value(checker), 5)
 
@@ -299,7 +300,7 @@ class TestCallerTagRegistry(CustomTestCase):
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         checker.enable_assert()
         checker.update(expect_phase=_Phase.IDLE, next_phase=_Phase.A)  # caller_name=""
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertIn("", checker._caller_tag_registry)
         self.assertEqual(_phase_value(checker), int(_Phase.A))
 
@@ -311,7 +312,7 @@ class TestCallerTagRegistry(CustomTestCase):
         checker.update(
             expect_phase=_Phase.A, next_phase=_Phase.IDLE, caller_name="beta"
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(checker._caller_tag_registry, {"alpha": 1, "beta": 2})
 
 
@@ -326,7 +327,7 @@ class TestMultipleInstances(CustomTestCase):
         a = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         b = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         a.update(expect_phase=_Phase.IDLE, next_phase=_Phase.B, caller_name="a")
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(a), int(_Phase.B))
         self.assertEqual(_phase_value(b), int(_Phase.IDLE))
 
@@ -379,7 +380,7 @@ class TestCudaGraphCapture(CustomTestCase):
                 caller_name=caller_name,
             )
         torch.cuda.current_stream(self.device).wait_stream(stream)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
@@ -404,13 +405,13 @@ class TestCudaGraphCapture(CustomTestCase):
         # Enable assert (resets phase -> IDLE) and replay — captured expect=IDLE matches.
         checker.enable_assert()
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.B))
 
         # Reset + replay again — same result, no raise.
         checker._reset_to_idle()
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.B))
 
     def test_assert_flag_toggle_visible_to_replayed_graph(self) -> None:
@@ -433,7 +434,7 @@ class TestCudaGraphCapture(CustomTestCase):
         # Replay with assert OFF tolerates a deliberately diverged phase.
         checker._phase.fill_(999)
         graph.replay()
-        torch.cuda.synchronize()  # no raise — flag is OFF
+        current_platform.synchronize()  # no raise — flag is OFF
         self.assertEqual(_phase_value(checker), int(_Phase.A))
 
         # Now turn on asserts (also resets phase -> IDLE) and replay.
@@ -442,7 +443,7 @@ class TestCudaGraphCapture(CustomTestCase):
         self.assertEqual(_phase_value(checker), int(_Phase.IDLE))
 
         graph.replay()
-        torch.cuda.synchronize()  # no raise — phase matched expect
+        current_platform.synchronize()  # no raise — phase matched expect
         self.assertEqual(_phase_value(checker), int(_Phase.A))
 
 
@@ -457,7 +458,7 @@ class TestPhaseReprNoCrash(CustomTestCase):
         checker = SimplePhaseChecker(initial_phase=0, device=self.device)
         checker.enable_assert()
         checker.update(expect_phase=0, next_phase=1, caller_name="ints")
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), 1)
 
     def test_update_with_intenum_phases_does_not_crash(self) -> None:
@@ -466,7 +467,7 @@ class TestPhaseReprNoCrash(CustomTestCase):
         checker.update(
             expect_phase=_Phase.IDLE, next_phase=_Phase.A, caller_name="enums"
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.A))
 
     def test_update_mixing_int_and_intenum_phases(self) -> None:
@@ -474,10 +475,10 @@ class TestPhaseReprNoCrash(CustomTestCase):
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         checker.enable_assert()
         checker.update(expect_phase=_Phase.IDLE, next_phase=5, caller_name="mix1")
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), 5)
         checker.update(expect_phase=5, next_phase=_Phase.IDLE, caller_name="mix2")
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.IDLE))
 
 

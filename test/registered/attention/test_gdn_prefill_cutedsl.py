@@ -11,6 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # CuteDSL prefill kernel only exists on Blackwell. Single-GPU kernel-unit
@@ -94,7 +95,7 @@ def test_gdn_chunk_cutedsl_correctness(num_seqs: int, state_dtype: torch.dtype):
 
     # Metadata kernel matches the FLA reference helpers.
     chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, total_tokens)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     expected_indices = prepare_chunk_indices(cu_seqlens, 64)
     expected_offsets = prepare_chunk_offsets(cu_seqlens, 64)
@@ -132,7 +133,7 @@ def test_gdn_chunk_cutedsl_correctness(num_seqs: int, state_dtype: torch.dtype):
         chunk_offsets=chunk_offsets,
         core_attn_out=actual_core_attn_out,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     o_error = (actual_o.float() - ref_o.float()).abs()
     state_error = (
@@ -158,7 +159,7 @@ def test_gdn_chunk_cutedsl_correctness(num_seqs: int, state_dtype: torch.dtype):
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     no_buffer_o_error = (no_buffer_o.float() - ref_o.float()).abs()
     no_buffer_state_error = (
@@ -272,7 +273,7 @@ def test_gdn_chunk_cutedsl_pool_mode_matches_dense(state_dtype: torch.dtype):
         chunk_offsets=chunk_offsets,
         initial_state_indices=slots,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Same kernels and math; only the state addressing differs -> bit-identical.
     assert ht_pool is pool

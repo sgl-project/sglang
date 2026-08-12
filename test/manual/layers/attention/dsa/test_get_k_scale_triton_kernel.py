@@ -3,6 +3,7 @@ import torch
 from sglang.kernels.ops.attention.dsa.index_buf_accessor import (
     _get_k_and_s_triton_kernel,
 )
+from sglang.srt.platforms import current_platform
 
 
 def golden_torch_gen(
@@ -136,7 +137,7 @@ def get_k_and_s_triton():
     # perf test =====================
     import time
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     for _ in range(10):
         _get_k_and_s_triton_kernel[grid](
             buf_ptr=buffer,
@@ -154,7 +155,7 @@ def get_k_and_s_triton():
             BLOCK_SIZE_K=BLOCK_SIZE_K,
         )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     start_time = time.perf_counter()
 
     _get_k_and_s_triton_kernel[grid](

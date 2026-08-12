@@ -2654,23 +2654,11 @@ def get_gpu_count():
 
 def empty_gpu_cache():
     """
-    Unified empty_cache for PyTorch 2.8 (no torch.accelerator)
-    and PyTorch 2.9+ (where torch.accelerator.empty_cache() exists).
+    Unified empty_cache across devices. The platform picks the backend call
+    (torch.cuda / torch.xpu / a GC pass on CPU), so OOT plugins are covered
+    instead of falling through to a silent no-op.
     """
-    if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "empty_cache"):
-        return torch.accelerator.empty_cache()
-
-    # CUDA
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        current_platform.empty_cache()
-        return
-
-    # XPU (Intel)
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        torch.xpu.empty_cache()
-        return
-
-    return
+    current_platform.empty_cache()
 
 
 def get_gpu_memory_gb():

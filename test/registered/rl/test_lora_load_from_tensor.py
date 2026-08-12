@@ -7,6 +7,7 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
 import sglang as sgl
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -259,7 +260,7 @@ class TestLoRALoadFromTensor(CustomTestCase):
 
         # Step 2: Run HuggingFace with LoRA
         print("[Test]Running HuggingFace with LoRA...")
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         with HFRunner(
             MODEL_PATH,

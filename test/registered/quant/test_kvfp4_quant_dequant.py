@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.quantization.kvfp4_tensor import FP4MXBlock16KVQuantizeUtil
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
@@ -39,18 +40,18 @@ def run_benchmark(m, n, k, num_runs=10) -> dict[str, dict[str, float]]:
     # --- FP8 ---
     for _ in range(3):  # warmup
         _ = tensor_bf16 * 2
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     start = time.time()
     for _ in range(num_runs):
         tensor_fp8 = tensor_bf16.to(torch.float8_e4m3fn)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     fp8_quant_time = (time.time() - start) / num_runs
 
     start = time.time()
     for _ in range(num_runs):
         tensor_fp8_dequant = tensor_fp8.to(torch.bfloat16)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     fp8_dequant_time = (time.time() - start) / num_runs
 
     fp8_metrics = calculate_accuracy_metrics(tensor_bf16, tensor_fp8_dequant)
@@ -64,7 +65,7 @@ def run_benchmark(m, n, k, num_runs=10) -> dict[str, dict[str, float]]:
         tensor_fp4, scale_factors = FP4MXBlock16KVQuantizeUtil.batched_quantize(
             tensor_bf16
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     fp4_quant_time = (time.time() - start) / num_runs
 
     start = time.time()
@@ -72,7 +73,7 @@ def run_benchmark(m, n, k, num_runs=10) -> dict[str, dict[str, float]]:
         tensor_fp4_dequant = FP4MXBlock16KVQuantizeUtil.batched_dequantize(
             tensor_fp4, scale_factors
         )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     fp4_dequant_time = (time.time() - start) / num_runs
 
     fp4_metrics = calculate_accuracy_metrics(tensor_bf16, tensor_fp4_dequant)

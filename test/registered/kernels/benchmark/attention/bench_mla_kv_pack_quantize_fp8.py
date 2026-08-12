@@ -18,6 +18,7 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8 as hybrid_pack,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
@@ -189,7 +190,7 @@ def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
         dtype=torch.float8_e4m3fn,
         device=DEFAULT_DEVICE,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     if provider == "hybrid":
 

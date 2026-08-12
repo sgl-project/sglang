@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,7 +36,7 @@ class TestZeroExpertsComputeTriton(CustomTestCase):
             zero_expert_type="identity",
             hidden_states=hidden_states,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         zero_expert_mask = original_indices >= num_experts
         normal_expert_mask = ~zero_expert_mask

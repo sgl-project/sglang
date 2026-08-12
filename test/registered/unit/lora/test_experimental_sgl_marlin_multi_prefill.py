@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
@@ -386,7 +387,7 @@ def test_multi_shared_outer_prefill_cuda_graph_parity(
             **common, full_routing_cache={}, collapsed_routing_cache={}
         )
     torch.cuda.current_stream().wait_stream(warmup_stream)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     full_routing_cache: dict = {}
     collapsed_routing_cache: dict = {}
@@ -424,7 +425,7 @@ def test_multi_shared_outer_prefill_cuda_graph_parity(
             scale,
         )
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         torch.testing.assert_close(gate_output, expected_gate, rtol=0.025, atol=0.025)
         torch.testing.assert_close(down_output, expected_down, rtol=0.025, atol=0.025)

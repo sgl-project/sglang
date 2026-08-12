@@ -19,6 +19,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool,
     _pool_handle_cache_clear,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -99,7 +100,7 @@ class TestCudaIpcTransport(CustomTestCase):
                 )
 
             reconstructed = proxy.reconstruct_on_target_device(0)
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             self.assertEqual(reconstructed.cpu().tolist(), expected)
         finally:
             # The scheduler retains this cache for its lifetime. The test's

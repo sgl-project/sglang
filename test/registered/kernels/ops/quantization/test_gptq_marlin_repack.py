@@ -10,6 +10,7 @@ from sglang.srt.layers.quantization.utils import (
     pack_rows,
     sort_weights,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import get_weight_perm, marlin_weights
 
@@ -85,7 +86,7 @@ def test_gptq_marlin_repack(
         q_w_gptq, sort_indices, size_k, size_n, quant_type.size_bits
     )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # JIT should match the reference (computed from CPU marlin_weights)
     torch.testing.assert_close(jit_output, q_w_marlin_ref)

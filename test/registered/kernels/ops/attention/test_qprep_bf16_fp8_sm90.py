@@ -12,6 +12,7 @@ Gates (mirroring benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py convention
 import pytest
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -62,7 +63,7 @@ def test_qprep_vs_triton_two_dot(T, h_k, pad_heads_extra):
     out = torch.zeros_like(ref)
     absorbed_bmm_concat_cast_q_fp8(ref, q_nope, w_kc, q_rope, H, variant="two_dot")
     q8kv8_qprep_fwd(out, q_nope, w_kc, q_rope, H)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # rope half: identical conversion chain -> bit-exact.
     assert torch.equal(
@@ -100,7 +101,7 @@ def test_qprep_fp64_reference_parity(h_k):
     out8 = torch.zeros_like(ref8)
     absorbed_bmm_concat_cast_q_fp8(ref8, q_nope, w_kc, q_rope, H, variant="two_dot")
     q8kv8_qprep_fwd(out8, q_nope, w_kc, q_rope, H)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # gate (b): the CUDA kernel's fp8 must land as close to the exact bmm as
     # the Triton kernel's (same quantization noise floor, ~1.8e-2 mean).

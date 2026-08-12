@@ -14,6 +14,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion.timestep_embedding import (
     timestep_embedding as timestep_embedding_cuda,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -135,7 +136,7 @@ def test_timestep_embedding_perf():
 
         for _ in range(warmup_times):
             kernel_fn(*args, **kwargs)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         start.record()
         for _ in range(repeat_times):

@@ -10,6 +10,7 @@ from sglang.kernels.jit.benchmark.utils import (
     get_benchmark_range,
     run_benchmark,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -219,7 +220,7 @@ def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str)
     positions = torch.randint(
         MAX_SEQ_LEN, (batch_size,), device=DEFAULT_DEVICE, dtype=torch.int64
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     FN_MAP = {
         "flashinfer": flashinfer_rope,
@@ -291,7 +292,7 @@ def benchmark_store(batch_size: int, num_q_k_heads: str, is_neox: bool, provider
     positions = torch.randint(
         MAX_SEQ_LEN, (batch_size,), device=DEFAULT_DEVICE, dtype=torch.int64
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     FN_MAP = {
         "jit_rope_then_store": jit_rope_then_store,

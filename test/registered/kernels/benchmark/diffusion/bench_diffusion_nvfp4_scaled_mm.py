@@ -12,6 +12,7 @@ import torch
 
 from sglang.kernels.jit.benchmark.utils import DEFAULT_DTYPE
 from sglang.kernels.jit.utils import KERNEL_PATH
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -48,7 +49,7 @@ def benchmark_provider(
     for _ in range(warmup):
         y = fn()
         del y
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     times_ms: list[float] = []
     for _ in range(iters):

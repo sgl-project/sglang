@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.mamba_slot_fused import (
     fused_clear_conv_slots,
     fused_copy_conv_slots,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -93,7 +94,7 @@ class TestMambaSlotFused(CustomTestCase):
                     got = [t.clone() for t in base]
                     _ref_clear(ref, idx)
                     fused_clear_conv_slots(build_conv_slot_descriptor(got), idx)
-                    torch.cuda.synchronize()
+                    current_platform.synchronize()
                     for r, g in zip(ref, got):
                         self.assertTrue(torch.equal(r, g))
                     # Cleared slots are exactly zero; the rest is untouched.
@@ -116,7 +117,7 @@ class TestMambaSlotFused(CustomTestCase):
                 got = [t.clone() for t in base]
                 _ref_copy(ref, src, dst)
                 fused_copy_conv_slots(build_conv_slot_descriptor(got), src, dst)
-                torch.cuda.synchronize()
+                current_platform.synchronize()
                 for r, g in zip(ref, got):
                     self.assertTrue(torch.equal(r, g))
 
@@ -148,7 +149,7 @@ class TestMambaSlotFused(CustomTestCase):
             ),
             idx,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertTrue(torch.equal(ref_buf, got_buf))
 
         # copy on the same strided layout
@@ -164,7 +165,7 @@ class TestMambaSlotFused(CustomTestCase):
             src,
             dst,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertTrue(torch.equal(ref_buf, got_buf))
 
     def test_empty_indices_is_noop(self):
@@ -175,7 +176,7 @@ class TestMambaSlotFused(CustomTestCase):
         desc = build_conv_slot_descriptor(got)
         fused_clear_conv_slots(desc, empty)
         fused_copy_conv_slots(desc, empty, empty)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         for b, g in zip(base, got):
             self.assertTrue(torch.equal(b, g))
 
@@ -188,7 +189,7 @@ class TestMambaSlotFused(CustomTestCase):
         got = [t.clone() for t in base]
         _ref_clear(ref, idx.long())
         fused_clear_conv_slots(build_conv_slot_descriptor(got), idx)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         for r, g in zip(ref, got):
             self.assertTrue(torch.equal(r, g))
 

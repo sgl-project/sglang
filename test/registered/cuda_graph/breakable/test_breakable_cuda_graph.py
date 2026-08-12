@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -60,7 +61,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         # Replay with new input
         x.fill_(5.0)
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 6.0, device=self.device)))
 
     def test_single_break(self):
@@ -83,7 +84,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         # Replay with new input
         x.fill_(10.0)
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         # x=10 -> intermediate=11 -> eager: 11*2=22 -> y=22+3=25
         self.assertTrue(torch.allclose(y, torch.full((4,), 25.0, device=self.device)))
 
@@ -112,7 +113,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         # Replay: x=5 -> +1=6 -> add_one=7 -> +1=8 -> double=16
         x.fill_(5.0)
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
 
     def test_eager_on_graph_disabled(self):
@@ -160,13 +161,13 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
 
         # First replay: x=0 -> 0+1=1 -> 1*3=3
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 3.0, device=self.device)))
 
         # Second replay: x=10 -> 10+1=11 -> 11*3=33
         x.fill_(10.0)
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 33.0, device=self.device)))
 
     def test_side_stream_join_across_break(self):
@@ -191,7 +192,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
 
         x.fill_(5.0)
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 12.0, device=self.device)))
 
     def test_eager_output_is_held_strongly_for_replay_bridge(self):
@@ -358,7 +359,7 @@ class TestBreakGraphHelper(CustomTestCase):
 
         x.fill_(10.0)
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         # x=10 -> +1=11 -> break -> +2=13
         self.assertTrue(torch.allclose(y, torch.full((4,), 13.0, device=self.device)))
 

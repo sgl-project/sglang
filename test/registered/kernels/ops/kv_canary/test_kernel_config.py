@@ -11,6 +11,7 @@ from sglang.kernels.ops.kv_canary.verify import (
     launch_canary_verify_kernel,
 )
 from sglang.kernels.ops.kv_canary.write import WritePlan
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
@@ -299,7 +300,7 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
             check_verify_expected_token=True,
         )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert (
         int(cuda_log.kernel_run_counter[0].item()) == num_launches

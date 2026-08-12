@@ -30,6 +30,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -152,7 +153,7 @@ def test_ue8m0_bitexact(dtype, num_tokens, hidden):
     x_q = torch.zeros_like(x, dtype=fp8_dtype)
     x_s = _alloc_scale((num_tokens, hidden), column_major=True, scale_ue8m0=True)
     per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=True)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "codes differ"
     exp = _decode_packed_exp(x_s, hidden // G)
@@ -180,7 +181,7 @@ def test_ue8m0_group_sizes(group_size):
     )
     x_s.zero_()
     per_token_group_quant(x, x_q, x_s, group_size, scale_ue8m0=True)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "codes differ"
     exp = _decode_packed_exp(x_s, hidden // group_size)
@@ -204,7 +205,7 @@ def test_ue8m0_row_packed_bitexact(hidden):
         num_tokens, (hidden // G + 3) // 4, device="cuda", dtype=torch.int32
     )
     per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=True)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "codes differ"
     exp = _decode_packed_exp(x_s, hidden // G)
@@ -241,7 +242,7 @@ def test_fp32_scale(dtype, column_major, hidden):
         (num_tokens, hidden), column_major=column_major, scale_ue8m0=False
     )
     per_token_group_quant(x, x_q, x_s, G)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(x_s, scale_ref, rtol=0, atol=0)
     assert _dequant_rel_err(x_q, x_s, x, G) < 0.05
@@ -262,7 +263,7 @@ def test_int8_scale(column_major):
         (num_tokens, hidden), column_major=column_major, scale_ue8m0=False
     )
     per_token_group_quant(x, x_q, x_s, G)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(x_s, scale_ref, rtol=0, atol=0)
     # int8 group-quant is coarser than fp8 (127 vs 448 levels), so its mean
@@ -283,7 +284,7 @@ def test_group_size_256_roundtrip():
     x_q = torch.zeros_like(x, dtype=fp8_dtype)
     x_s = torch.zeros(num_tokens, hidden // gs, device="cuda", dtype=torch.float32)
     per_token_group_quant(x, x_q, x_s, gs)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     torch.testing.assert_close(x_s, scale_ref, rtol=0, atol=0)
     assert _dequant_rel_err(x_q, x_s, x, gs) < 0.05
@@ -329,7 +330,7 @@ def test_fused_silu(scale_ue8m0, column_major):
     per_token_group_quant(
         x, x_q, x_s, G, scale_ue8m0=scale_ue8m0, fuse_silu_and_mul=True
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     deq_scale = _packed_exp_to_dequant_scale(x_s, hidden // G) if scale_ue8m0 else x_s
     assert _dequant_rel_err(x_q, deq_scale, act, G) < 0.05
@@ -373,7 +374,7 @@ def test_masked(num_experts, hidden, tokens_pad, expected_m, masked_m_dtype):
     per_token_group_quant(
         x, x_q, x_s, G, scale_ue8m0=True, masked_m=masked_m, expected_m=expected_m
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     q_ref, exp_ref = ref_fp8_ue8m0(x, G)
     exp = _decode_packed_exp(x_s, hidden // G)
@@ -420,7 +421,7 @@ def test_masked_fused():
     per_token_group_quant(
         x, x_q, x_s, G, scale_ue8m0=True, fuse_silu_and_mul=True, masked_m=masked_m
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     act = _ref_silu_mul(x, hidden)
     deq_scale = _packed_exp_to_dequant_scale(x_s, hidden // G)
@@ -460,7 +461,7 @@ def test_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
         masked_m=masked_m,
         column_major_scales=scale_ue8m0,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     if masked:
         rows = [x_q[e, :m] for e, m in enumerate(masked_m.tolist()) if m > 0]
         written = torch.cat([r.reshape(-1, x_q.shape[-1]) for r in rows])
@@ -494,7 +495,7 @@ def test_mn_major_tma_aligned_transform_keeps_ownership():
     # The production pattern: rebind + allocator churn between quant and GEMM.
     del s
     reuse = torch.full((E, num_groups, N), float("nan"), device="cuda")
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert not torch.isnan(out).any(), "scale storage was freed and reused"
     torch.testing.assert_close(out, expected)
     del reuse
@@ -537,7 +538,7 @@ def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
         column_major_scales=column_major_scales,
         out_dtype=out_dtype,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     assert q_auto.dtype == out_dtype and q_auto.shape == x.shape
     assert s_auto.dtype == s_buf.dtype and s_auto.shape == s_buf.shape

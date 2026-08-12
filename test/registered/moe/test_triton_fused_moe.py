@@ -8,6 +8,7 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsQuantInfo
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -187,7 +188,7 @@ class TestFusedMOE(CustomTestCase):
                                             topk,
                                             dtype,
                                         )
-                                        torch.cuda.empty_cache()
+                                        current_platform.empty_cache()
                                     pbar.update(1)
 
 

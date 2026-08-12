@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.cuda_vmm_transport_utils import (
     CudaVmmMemoryPool,
@@ -129,7 +130,7 @@ class TestCudaVmmTransport(CustomTestCase):
                     tensor = consumer_proxy.reconstruct_on_target_device(
                         device, consumer_count=1
                     )
-                torch.cuda.synchronize(device)
+                current_platform.synchronize(device)
                 self.assertEqual(tensor.cpu().tolist(), expected)
                 reconstructed.append(tensor)
         finally:
@@ -163,7 +164,7 @@ class TestCudaVmmTransport(CustomTestCase):
             pool.memory_pool[old.control_offset : old.control_offset + 8].view(
                 torch.int32
             ).fill_(1)
-            torch.cuda.synchronize(0)
+            current_platform.synchronize(0)
             with pool._lock:
                 pool._recycle_chunks()
                 pool._merge_chunks()
@@ -223,7 +224,7 @@ class TestCudaVmmTransport(CustomTestCase):
                     proxy.reconstruct_on_target_device(0, consumer_count=1)
                     for proxy in proxies
                 ]
-            torch.cuda.synchronize(0)
+            current_platform.synchronize(0)
 
             for actual, wanted in zip(reconstructed, expected):
                 self.assertTrue(torch.equal(actual.cpu(), wanted))
@@ -345,7 +346,7 @@ class TestCudaVmmTransport(CustomTestCase):
                 self.assertRaisesRegex(RuntimeError, "forced sync failure"),
             ):
                 pool.wrap_tensor(torch.ones(16, device="cuda:0"))
-            torch.cuda.synchronize(0)
+            current_platform.synchronize(0)
             self.assertIsNotNone(pool._pool_error)
             with self.assertRaisesRegex(RuntimeError, "pool failed"):
                 pool.wrap_tensor(torch.ones(16, device="cuda:0"))
@@ -420,7 +421,7 @@ class TestCudaVmmTransport(CustomTestCase):
                 self.assertRaises(RuntimeError),
             ):
                 proxy.reconstruct_on_target_device(0, consumer_count=1)
-            torch.cuda.synchronize(0)
+            current_platform.synchronize(0)
             with pool._lock:
                 pool._recycle_chunks()
             self.assertFalse(pool.occupied_chunks)

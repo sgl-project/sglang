@@ -9,6 +9,8 @@ import time
 import torch
 import torch.distributed as dist
 
+from sglang.srt.platforms import current_platform
+
 
 def main():
     dist.init_process_group("nccl")
@@ -58,12 +60,12 @@ def main():
     def timeit(fn, n=100):
         for _ in range(15):
             fn()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         dist.barrier()
         t0 = time.perf_counter()
         for _ in range(n):
             fn()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         dist.barrier()
         return (time.perf_counter() - t0) / n * 1000
 
