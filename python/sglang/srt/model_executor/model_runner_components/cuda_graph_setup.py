@@ -180,6 +180,17 @@ def capture_prefill_graph(
         )
         return eager_runner
 
+    if (
+        model_runner.server_args.enable_lora
+        and not model_runner.lora_manager.supports_prefill_cuda_graph
+    ):
+        logger.warning(
+            "Disable prefill CUDA graph because the current LoRA "
+            "configuration does not support it (unsupported LoRA backend, "
+            "MoE LoRA, or DP attention)."
+        )
+        return eager_runner
+
     # Resolve the decoder once. Some VLM wrappers (for example Kimi-VL)
     # expose it as ``language_model`` rather than ``model``.
     try:

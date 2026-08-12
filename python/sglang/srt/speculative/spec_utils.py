@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -32,19 +32,21 @@ from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
 )
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -69,8 +71,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
 if _is_cuda:
@@ -499,12 +501,11 @@ def traverse_tree(
 
 def generate_token_bitmask(
     reqs: List[Req],
-    verify_input: EagleVerifyInput,
     retrieve_next_token_cpu: torch.Tensor,
     retrieve_next_sibling_cpu: torch.Tensor,
     draft_tokens_cpu: torch.Tensor,
     vocab_size: int,
-):
+) -> Tuple[Optional[torch.Tensor], Optional[BaseGrammarObject]]:
     """
     Generate the logit mask for structured output.
     Draft model's token can be either valid or invalid with respect to the grammar.
@@ -545,8 +546,97 @@ def generate_token_bitmask(
                     f"grammar: {req.grammar}"
                 )
 
-    verify_input.grammar = grammar
-    return allocate_token_bitmask
+    return allocate_token_bitmask, grammar
+
+
+class GrammarTree:
+    """The verify tree the grammar bitmask is built over, on the host.
+
+    ``from_device`` starts an async copy, so build it before the target verify
+    launch; ``from_host`` is for algorithms that build the tree there (NGRAM).
+    """
+
+    def __init__(self, host: Tuple[torch.Tensor, ...], done_event):
+        self._host = host
+        self._done = done_event
+
+    @classmethod
+    def from_device(
+        cls,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        draft_token: torch.Tensor,
+    ) -> GrammarTree:
+        tensors = (retrieve_next_token, retrieve_next_sibling, draft_token)
+        host = tuple(_async_d2h(t) for t in tensors)
+        # Sources may be mixed -- an algorithm can synthesize part of the tree on
+        # the host -- so the event has to key off whichever one is on device.
+        device = next((t.device for t in tensors if t.device.type != "cpu"), None)
+        if device is None:
+            return cls(host, None)
+        done = torch.get_device_module(device).Event()
+        done.record()
+        return cls(host, done)
+
+    @classmethod
+    def from_host(
+        cls,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        draft_token: torch.Tensor,
+    ) -> GrammarTree:
+        return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
+
+    @classmethod
+    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> GrammarTree:
+        """Degenerate tree for chain-verify algorithms: node i's only child is i + 1.
+
+        ``verify_ids_2d`` is (bs, chain_len) with column 0 the already-committed
+        token, so mask rows line up with the target's logits rows one-for-one.
+        Only the ids need a copy; the links are fixed by the shape.
+        """
+        bs, chain_len = verify_ids_2d.shape
+        next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
+        next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        return cls.from_device(next_token, next_sibling, verify_ids_2d)
+
+    def resolve(self) -> Tuple[torch.Tensor, ...]:
+        if self._done is not None:
+            self._done.synchronize()
+        return self._host
+
+
+def build_grammar_vocab_mask(
+    *,
+    reqs: List[Req],
+    tree: GrammarTree,
+    sampling_info: SamplingBatchInfo,
+    device,
+    barrier: Optional[Callable[[], None]],
+) -> Optional[GrammarMask]:
+    """Build the constrained-decoding bitmask over a verify tree and stage it on device.
+
+    Call it after the target verify launch -- every step here is host work, so it all
+    overlaps that forward. ``barrier`` advances the previous batch's FSM over its
+    committed tokens, which the traversal then reads, so it has to run first.
+    """
+    if barrier is not None:
+        barrier()
+    vocab_mask, grammar = generate_token_bitmask(
+        reqs,
+        *tree.resolve(),
+        sampling_info.vocab_size,
+    )
+    if vocab_mask is None:
+        return None
+
+    # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
+    # order keeps the copy ahead of the sampler's apply_vocab_mask.
+    vocab_mask = vocab_mask.to(device, non_blocking=True)
+    # Otherwise the extend stage's leftover mask is applied instead.
+    sampling_info.grammar_mask = None
+    return GrammarMask(grammar, vocab_mask)
 
 
 def load_token_map(token_map_path: str) -> List[int]:
@@ -801,7 +891,7 @@ def commit_mamba_states_after_verify(
             # we need to update the mamba state for the request at the crossing point.
             seq_lens_pre_verify = batch.seq_lens
             seq_lens_post_verify = batch.seq_lens + accept_lens
-            mamba_track_interval = get_exec().mamba.mamba_track_interval
+            mamba_track_interval = get_server_args().mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval

@@ -9,12 +9,12 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.runtime_context import get_lora
+from sglang.srt.runtime_context import get_server_args
 
 
 def lora_compatible_layout_enabled() -> bool:
     """Use the contiguous ``[gate || up]`` layout required by LoRA slicing."""
-    return get_lora().enable_lora
+    return get_server_args().enable_lora
 
 
 def use_inkling_shared_fused_moe(

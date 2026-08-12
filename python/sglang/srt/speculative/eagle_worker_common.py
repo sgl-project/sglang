@@ -9,7 +9,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
-from sglang.srt.managers.utils import GenerationBatchResult, _async_d2h
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -23,8 +23,9 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_sample,
 )
 from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
-    generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -528,21 +529,16 @@ def run_eagle_verify(
             ),
         )
 
-    # Prepare grammar data on CPU if needed. Use async pinned D2H copies (not
-    # blocking .cpu()) and record an event. The copies are issued before the
-    # target verify launch below so they run right after the draft, but the
-    # host does not block here. We wait on grammar_copy_done only just before
-    # the CPU bitmask traversal reads the buffers, so the traversal (and these
-    # copies) overlap the target verify forward instead of stalling the GPU.
-    grammar_copy_done = None
-    if batch.has_grammar:
-        retrieve_next_token_cpu = _async_d2h(verify_input.retrieve_next_token)
-        retrieve_next_sibling_cpu = _async_d2h(verify_input.retrieve_next_sibling)
-        draft_tokens_cpu = _async_d2h(
-            verify_input.draft_token.view(verify_input.retrieve_next_token.shape)
+    # Must stay ahead of the target verify launch below.
+    grammar_tree = (
+        GrammarTree.from_device(
+            verify_input.retrieve_next_token,
+            verify_input.retrieve_next_sibling,
+            verify_input.draft_token.view(verify_input.retrieve_next_token.shape),
         )
-        grammar_copy_done = torch.get_device_module(device).Event()
-        grammar_copy_done.record()
+        if batch.has_grammar
+        else None
+    )
 
     if metadata_ready_pre_pad:
         # Multi-layer eagle preserved-verbatim behavior: metadata init is
@@ -568,40 +564,15 @@ def run_eagle_verify(
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding
-    vocab_mask = None
+    grammar_mask = None
     if batch.has_grammar:
-        # Grammar barrier: advance the previous batch's grammar FSM over its
-        # committed tokens before building this batch's bitmask. Runs after the
-        # target forward launch, so the FSM advance and the traversal below both
-        # overlap the target verify forward. No-op if there is nothing pending.
-        if grammar_barrier is not None:
-            grammar_barrier()
-        # Wait for the async draft/verify-input D2H copies above to land before
-        # the CPU traversal reads them. The event was recorded right after the
-        # copies (before the target verify launch), so this wait — and the
-        # traversal below — overlap the target verify forward.
-        grammar_copy_done.synchronize()
-        # Generate the logit mask for structured output.
-        vocab_mask = generate_token_bitmask(
-            batch.reqs,
-            verify_input,
-            retrieve_next_token_cpu,
-            retrieve_next_sibling_cpu,
-            draft_tokens_cpu,
-            batch.sampling_info.vocab_size,
+        grammar_mask = build_grammar_vocab_mask(
+            reqs=batch.reqs,
+            tree=grammar_tree,
+            sampling_info=batch.sampling_info,
+            device=verify_input.retrieve_next_token.device,
+            barrier=grammar_barrier,
         )
-
-        if vocab_mask is not None:
-            assert verify_input.grammar is not None
-            # non_blocking H2D so the mask copy overlaps the tail of the target
-            # verify forward instead of syncing the host; stream ordering keeps
-            # it before eagle_sample's apply_vocab_mask below.
-            vocab_mask = vocab_mask.to(
-                verify_input.retrieve_next_token.device, non_blocking=True
-            )
-            # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
-            # and will be applied to produce wrong results
-            batch.sampling_info.vocab_mask = None
 
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
@@ -610,7 +581,7 @@ def run_eagle_verify(
         predict,
         accept_lens,
         accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

@@ -83,6 +83,24 @@ class TestHostKVCache(CustomTestCase):
         self.assertIn("Double-free", msg)
         self.assertIn(str(indices.tolist()), msg)
 
+    def test_shm_allocator(self):
+        shm_host_pool = MHATokenToKVPoolHost(
+            device_pool=self.device_pool,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=self.page_size,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="shm",
+        )
+        self.assertIsNotNone(shm_host_pool.fd)
+        self.assertGreaterEqual(shm_host_pool.fd, 0)
+
+        indices = shm_host_pool.alloc(4)
+        self.assertEqual(len(indices), 4)
+        shm_host_pool.free(indices)
+
     def test_empty_free_keeps_release_list_empty(self):
         self.assertEqual(self.host_pool.free(torch.empty(0, dtype=torch.int64)), 0)
         self.assertEqual(self.host_pool.num_release_slots, 0)

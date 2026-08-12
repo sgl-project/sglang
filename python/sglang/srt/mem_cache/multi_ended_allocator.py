@@ -285,33 +285,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._inflight_forward = None
         self._latest_forward_done_event = None
 
-    def backup_state(self):
-        # Spec-decode allocates only inside a backup window (no free), so
-        # `_inverse_history` doesn't grow under correct usage.
-        return (
-            self.watermark_physical,
-            (len(self.free_virtual_ids) if self.is_id_owner else None),
-            len(self._inverse_history),
-        )
-
-    def restore_state(self, state):
-        watermark, n_free_virtual, n_inverse = state
-        self.watermark_physical = watermark
-        if self.is_id_owner and n_free_virtual is not None:
-            pass  # spec asserted off; no free-list rollback.
-        new_entries = self._inverse_history[n_inverse:]
-        if new_entries:
-            logger.warning(
-                "MultiEndedAllocator.restore_state: %d relocation(s) recorded inside "
-                "a backup window (sub_pool=%s). Eager compaction is not fully "
-                "reversible; SGLang's spec path should not produce a free() inside a "
-                "backup window.",
-                len(new_entries),
-                self.sub_pool_name,
-            )
-        del self._inverse_history[n_inverse:]
-        return new_entries
-
     def clear_inverse_history(self) -> None:
         self._inverse_history.clear()
 
@@ -1890,18 +1863,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.clear_inverse_history()
             self.mamba_allocator.clear_inverse_history()
 
-    def backup_state(self):
-        return [
-            self.full_attn_allocator.backup_state(),
-            self.mamba_allocator.backup_state(),
-        ]
-
-    def restore_state(self, state):
-        assert len(state) == 2
-        full_rollback = self.full_attn_allocator.restore_state(state[0])
-        mamba_rollback = self.mamba_allocator.restore_state(state[1])
-        return full_rollback + mamba_rollback
-
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.mamba_allocator.clear()
@@ -2411,20 +2372,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.free(merged)
-
-    # -- spec-decode hooks (asserted off; preserved for future use) --
-
-    def backup_state(self):
-        return [
-            self.full_attn_allocator.backup_state(),
-            self.swa_attn_allocator.backup_state(),
-        ]
-
-    def restore_state(self, state):
-        assert len(state) == 2
-        full_rollback = self.full_attn_allocator.restore_state(state[0])
-        swa_rollback = self.swa_attn_allocator.restore_state(state[1])
-        return full_rollback + swa_rollback
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()

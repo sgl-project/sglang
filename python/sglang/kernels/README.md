@@ -19,21 +19,28 @@ sglang/kernels/
   selector.py    # heuristic select_kernel() and cached get_kernel()
   fused_op.py    # BaseFusedOp: per-operator multi-backend contract
   ops/
-    <group>/     # one subpackage per operator group
+    <group>/     # one subpackage per operator group (see list below)
+  jit/           # shared JIT CUDA build/runtime infra: utils/, csrc/,
+                 # include/, __main__ (KERNEL_PATH resolves here)
 ```
 
-Groups populated in this phase: `activation`, `gemm`, `kvcache`, `layernorm`,
-`moe`, `quantization`. The remaining groups (`attention`, `communication`,
-`diffusion`, `grammar`, `mamba`, `memory`, `sampling`, `spatial`,
-`speculative`) are reserved package placeholders whose implementations still
-live in `sglang.jit_kernel` / `sgl_kernel` / `triton_ops` and will migrate in
-later phases.
+Operator groups (all populated): `activation`, `attention`, `communication`,
+`diffusion`, `elementwise`, `embeddings`, `gemm`, `grammar`, `kv_canary`,
+`kvcache`, `layernorm`, `lplb`, `mamba`, `memory`, `moe`, `quantization`,
+`sampling`, `speculative`.
+
+As of the RFC #29630 finale (#32072) the legacy `sglang.jit_kernel` package has
+been **removed**: its shared build/runtime infra moved to `sglang.kernels.jit`
+and each JIT-backed operator into its group as
+`sglang.kernels.ops.<group>._jit_<op>`. Tests and benchmarks live under
+`test/registered/kernels/` (`ops/<group>/` for tests, `benchmark/<group>/` for
+benchmarks); shared test helpers are in `sglang.test.kernels`.
 
 ## How it works
 
-Implementations are not moved yet. Each `ops.<group>` function is a thin
-wrapper that forwards to a chosen backend, and every backend is described by a
-`KernelSpec` in the registry so alternatives can be inventoried and compared:
+Each `ops.<group>` function is a thin wrapper that forwards to a chosen
+backend, and every backend is described by a `KernelSpec` in the registry so
+alternatives can be inventoried and compared:
 
 - `register_kernel(KernelSpec(...))` records metadata only — an operator id
   (`"<group>.<name>"`), a backend, and an import path (`"module:attr"`). No
@@ -85,8 +92,8 @@ What this buys (see the
 
 - **Unified correctness testing** — a generic harness enumerates
   `available_backends()` and asserts each one matches `forward_native`
-  (`test/registered/kernels/test_fused_op_gpu_parity.py`); new backends are
-  picked up automatically.
+  (`test/registered/kernels/ops/layernorm/test_fused_op_gpu_parity.py`); new
+  backends are picked up automatically.
 - **One-switch debugging** — `SGLANG_FORCE_FUSED_OP_BACKEND=torch` (or
   `set_fused_op_backend(KernelBackend.TORCH)`) flips *every* fused op to its
   reference implementation for numerical-bug bisection.
@@ -104,7 +111,7 @@ What this buys (see the
 > SGLang runtime code and tests should import callable kernels from
 > `sglang.kernels.ops.*`.
 
-Implementation work can still happen in `sglang.jit_kernel` or `sgl_kernel`.
+Implementation work can still happen in `sglang.kernels.jit` or `sgl_kernel`.
 When a PR adds a new callable kernel, add a `sglang.kernels.ops.*` entry point
-for it, and avoid growing `sglang.jit_kernel` as a long-term public operator
+for it, and avoid growing `sglang.kernels.jit` as a long-term public operator
 namespace.

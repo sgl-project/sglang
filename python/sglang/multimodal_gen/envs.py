@@ -12,17 +12,14 @@ from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL: int = 60
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
     SGLANG_DIFFUSION_CACHE_ROOT: str = os.path.expanduser("~/.cache/sgl_diffusion")
     SGLANG_DIFFUSION_CONFIG_ROOT: str = os.path.expanduser("~/.config/sgl_diffusion")
-    SGLANG_DIFFUSION_CONFIGURE_LOGGING: int = 1
     SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
-    SGLANG_DIFFUSION_LOGGING_CONFIG_PATH: str | None = None
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
@@ -62,7 +59,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
-    SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
@@ -81,10 +77,6 @@ def get_default_config_root() -> str:
         "XDG_CONFIG_HOME",
         os.path.join(os.path.expanduser("~"), ".config"),
     )
-
-
-def maybe_convert_int(value: str | None) -> int | None:
-    return int(value) if value is not None else None
 
 
 # helpers for environment variable definitions
@@ -108,20 +100,6 @@ def _lazy_float(key: str, default: str | float) -> Callable[[], float]:
 
 def _lazy_bool(key: str, default: str = "false") -> Callable[[], bool]:
     return lambda: get_bool_env_var(key, default)
-
-
-def _lazy_bool_any(keys: list[str], default: str = "false") -> Callable[[], bool]:
-    def _getter():
-        for key in keys:
-            if get_bool_env_var(key, "false"):
-                return True
-        return (
-            get_bool_env_var("", default)
-            if not keys
-            else get_bool_env_var(keys[0], default)
-        )
-
-    return _getter
 
 
 def _lazy_path(
@@ -157,13 +135,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default this is 1.
     # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
     "NVCC_THREADS": _lazy_str("NVCC_THREADS"),
-    # If set, sgl_diffusion will use precompiled binaries (*.so)
-    "SGLANG_DIFFUSION_USE_PRECOMPILED": _lazy_bool_any(
-        [
-            "SGLANG_DIFFUSION_USE_PRECOMPILED",
-            "SGLANG_DIFFUSION_PRECOMPILED_WHEEL_LOCATION",
-        ]
-    ),
     # CMake build type
     # If not set, defaults to "Debug" or "RelWithDebInfo"
     # Available options: "Debug", "Release", "RelWithDebInfo"
@@ -186,39 +157,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_DIFFUSION_CACHE_ROOT",
         lambda: os.path.join(get_default_cache_root(), "sgl_diffusion"),
     ),
-    # Interval in seconds to log a warning message when the ring buffer is full
-    "SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL": _lazy_int(
-        "SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL", 60
-    ),
     # Path to the NCCL library file. It is needed because nccl>=2.19 brought
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
     "SGLANG_DIFFUSION_NCCL_SO_PATH": _lazy_str("SGLANG_DIFFUSION_NCCL_SO_PATH"),
     # when `SGLANG_DIFFUSION_NCCL_SO_PATH` is not set, sgl_diffusion will try to find the nccl
     # library file in the locations specified by `LD_LIBRARY_PATH`
     "LD_LIBRARY_PATH": _lazy_str("LD_LIBRARY_PATH"),
-    # Internal flag to enable Dynamo fullgraph capture
-    "SGLANG_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE": _lazy_bool(
-        "SGLANG_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE", "1"
-    ),
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": _lazy_int("LOCAL_RANK", 0),
     # used to control the visible devices in the distributed setting
     "CUDA_VISIBLE_DEVICES": _lazy_str("CUDA_VISIBLE_DEVICES"),
-    # timeout for each iteration in the engine
-    "SGLANG_DIFFUSION_ENGINE_ITERATION_TIMEOUT_S": _lazy_int(
-        "SGLANG_DIFFUSION_ENGINE_ITERATION_TIMEOUT_S", 60
-    ),
-    # Logging configuration
-    # If set to 0, sgl_diffusion will not configure logging
-    # If set to 1, sgl_diffusion will configure logging using the default configuration
-    #    or the configuration file specified by SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
-    "SGLANG_DIFFUSION_CONFIGURE_LOGGING": _lazy_int(
-        "SGLANG_DIFFUSION_CONFIGURE_LOGGING", 1
-    ),
-    "SGLANG_DIFFUSION_LOGGING_CONFIG_PATH": _lazy_str(
-        "SGLANG_DIFFUSION_LOGGING_CONFIG_PATH"
-    ),
     # this is used for configuring the default logging level
     "SGLANG_DIFFUSION_LOGGING_LEVEL": _lazy_str(
         "SGLANG_DIFFUSION_LOGGING_LEVEL", "INFO"

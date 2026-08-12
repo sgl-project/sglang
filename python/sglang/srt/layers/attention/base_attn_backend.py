@@ -105,6 +105,27 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
+    # Chunked-prefix FullCG capture has a second model topology and stable
+    # prefix buffers. Backends must opt in explicitly so the runner does not
+    # assume that generic ForwardBatch metadata is sufficient for every
+    # attention implementation.
+    supports_full_cuda_graph_chunked_prefix: bool = False
+
+    def prepare_full_cuda_graph_chunked_prefix(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        in_capture: bool,
+    ) -> None:
+        """Prepare backend-private metadata for chunked-prefix FullCG.
+
+        Only called for backends that set
+        ``supports_full_cuda_graph_chunked_prefix``; the runner validates the
+        flag up front. The runner owns and refreshes the shared ForwardBatch
+        prefix buffers. Backends that need wrappers or other derived metadata
+        should override this hook for both capture and replay.
+        """
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()

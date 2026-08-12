@@ -913,6 +913,7 @@ class TestModuleLevelHelpers(unittest.TestCase):
             backends.FLASHINFER_CUTLASS,
             backends.FLASHINFER_MXFP4,
             backends.FLASHINFER_CUTEDSL,
+            backends.HPC_OPS,
         }
         config = types.SimpleNamespace(
             num_experts=8,

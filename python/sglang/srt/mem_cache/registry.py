@@ -166,7 +166,7 @@ def _create_unified_radix_cache(
     params: CacheInitParams,
 ) -> BasePrefixCache:
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
-    from sglang.srt.mem_cache.unified_cache_components import ComponentType
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     tree_components = [ComponentType.FULL]

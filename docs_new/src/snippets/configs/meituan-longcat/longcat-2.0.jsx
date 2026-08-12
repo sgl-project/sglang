@@ -8,7 +8,7 @@ export const config = {
 
   // Model-specific GPUs the shared HARDWARE_CATALOG does not carry.
   hardware: [
-    { id: "h20", label: "H20", vram: "96GB", vendor: "nvidia" },
+    { id: "h20", label: "H20", vram: "96GB", vendor: "hopper" },
   ],
 
   variants: [

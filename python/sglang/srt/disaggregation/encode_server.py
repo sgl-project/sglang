@@ -59,10 +59,17 @@ from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.observability.req_time_stats import EncoderReqTimeStats
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.runtime_context import get_disagg, get_exec, get_mm
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.observability.trace import (
+    process_tracing_init,
+    trace_set_thread_info,
+)
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
     add_prometheus_middleware,
     configure_logger,
     load_audio,
@@ -191,17 +198,17 @@ _mm_feature_attrs = {
 
 
 def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
-    # Kimi K2.5 vision processor only emits `grid_thws`; prefer it over generic keys
-    # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
     attrs = _mm_grid_attrs[modality]
-    if (model_type or "").lower() in [
-        "kimi_k25",
-        "kimi_vl",
-    ] and modality == Modality.IMAGE:
-        attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+    model_type = (model_type or "").lower()
+    if modality == Modality.IMAGE:
+        # Kimi K2.5 emits grid_thws, while Kimi-VL emits image_grid_hws.
+        if model_type == "kimi_k25":
+            attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+        elif model_type == "kimi_vl":
+            attrs = ("image_grid_hws", "image_grid_thw", "grid_thws")
     for attr in attrs:
         if attr in mm_inputs and mm_inputs[attr] is not None:
-            return mm_inputs[attr]
+            return _convert(mm_inputs[attr])
     raise ValueError(f"Grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}")
 
 
@@ -256,9 +263,7 @@ class MMEncoder:
     ):
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
-        from sglang.srt.runtime_context import publish
-
-        publish(server_args, role="encoder")
+        set_global_server_args_for_scheduler(server_args)
         self.rank = rank
         # DP rank for metric labels; overridden by run_dp_worker in DP mode.
         # 0 in the single-instance (non-DP) path.
@@ -345,7 +350,7 @@ class MMEncoder:
             [], dtype=self._embedding_dtype
         ).element_size()
 
-        if get_mm().enable_mm_global_cache:
+        if self.server_args.enable_mm_global_cache:
             from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
                 EmbeddingCacheController,
             )
@@ -363,15 +368,15 @@ class MMEncoder:
             self.mm_global_cache = None
 
         # Pre-compute embedding metadata (needed by all ranks for mooncake)
-        if get_disagg().encoder_transfer_backend == "mooncake":
+        if self.server_args.encoder_transfer_backend == "mooncake":
             self._embedding_dims = self._infer_embedding_dims()
 
         if self.rank == 0:
             logger.info(
-                f"Using transfer backend: {get_disagg().encoder_transfer_backend}"
+                f"Using transfer backend: {self.server_args.encoder_transfer_backend}"
             )
 
-            if get_disagg().encoder_transfer_backend == "mooncake":
+            if self.server_args.encoder_transfer_backend == "mooncake":
                 self.local_ip = get_local_ip_auto()
 
                 self.engine = get_mooncake_transfer_engine()
@@ -384,8 +389,8 @@ class MMEncoder:
                         hostname=self.local_ip,
                         gpu_id=self.gpu_id,
                         ib_device=(
-                            get_disagg().disaggregation_ib_device
-                            or get_exec().moe.mooncake_ib_device
+                            self.server_args.disaggregation_ib_device
+                            or self.server_args.mooncake_ib_device
                         ),
                     )
 
@@ -394,7 +399,7 @@ class MMEncoder:
             self.encode_dispatch_lock = asyncio.Lock()
 
             # Async mooncake state: track background VIT forward completion
-            if get_disagg().encoder_transfer_backend == "mooncake":
+            if self.server_args.encoder_transfer_backend == "mooncake":
                 self._forward_ready_events: Dict[str, asyncio.Event] = {}
                 self._forward_results: Dict[str, dict] = {}
                 # when multiple decoder TP ranks call
@@ -408,12 +413,12 @@ class MMEncoder:
 
         # Bind unified encode entry point based on backend and cache config
         if self.mm_global_cache is not None:
-            if get_disagg().encoder_transfer_backend == "mooncake":
+            if self.server_args.encoder_transfer_backend == "mooncake":
                 self._encode_fn = self.encode_with_global_cache_mooncake
             else:
                 self._encode_fn = self.encode_with_global_cache
         else:
-            if get_disagg().encoder_transfer_backend == "mooncake":
+            if self.server_args.encoder_transfer_backend == "mooncake":
                 self._encode_fn = self.encode_with_mooncake
             else:
                 self._encode_fn = self.encode
@@ -620,6 +625,9 @@ class MMEncoder:
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 
+        except CLIENT_MEDIA_EXCEPTIONS as e:
+            # Not ValueError: the DP envelope classifies by `.code`, which only MMError carries.
+            raise BadRequestError(f"Error while loading data {data}: {e}") from e
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
 
@@ -750,16 +758,33 @@ class MMEncoder:
         """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing."""
         if modality == Modality.AUDIO:
             return int(grid.item())
+        if self.model_type == "kimi_vl" and modality == Modality.IMAGE:
+            h, w = self._kimi_hw_from_patch_grid(grid)
+            return h * w
+        return int(grid[0] * grid[1] * grid[2])
+
+    @staticmethod
+    def _kimi_hw_from_patch_grid(
+        grid: Union[torch.Tensor, np.ndarray, List[int], Tuple[int, ...]],
+    ) -> Tuple[int, int]:
+        """Extract (height, width) from Kimi 2D or 3D patch-grid metadata."""
+        if isinstance(grid, torch.Tensor):
+            values = grid.flatten().tolist()
+        elif isinstance(grid, np.ndarray):
+            values = grid.reshape(-1).tolist()
         else:
-            return int(grid[0] * grid[1] * grid[2])
+            values = np.asarray(grid).reshape(-1).tolist()
+
+        if len(values) not in (2, 3):
+            raise ValueError(
+                f"Invalid Kimi image grid metadata: {values}; "
+                "expected [h, w] or [t, h, w]"
+            )
+        return int(values[-2]), int(values[-1])
 
     def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
         """MoonViT + tpool: output len is (h//mh)*(w//mw); temporal dim is pooled (not t*h*w/merge^2)."""
-        if isinstance(grid, torch.Tensor):
-            flat = grid.flatten()
-            _t, h, w = (int(x) for x in flat[:3].tolist())
-        else:
-            _t, h, w = int(grid[0]), int(grid[1]), int(grid[2])
+        h, w = self._kimi_hw_from_patch_grid(grid)
         merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
         return (h * w) // (merge_h * merge_w)
 
@@ -1683,7 +1708,7 @@ class MMEncoder:
                 mm_item.set(k, _convert(v))
 
             cache_hit = False
-            use_mm_cache = get_mm().enable_prefix_mm_cache and log_metrics
+            use_mm_cache = self.server_args.enable_prefix_mm_cache and log_metrics
             if use_mm_cache:
                 mm_item.set_pad_value()
                 mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
@@ -1779,7 +1804,7 @@ class MMEncoder:
         embedding_port=None,
         url=None,
     ):
-        if get_disagg().encoder_transfer_backend == "mooncake":
+        if self.server_args.encoder_transfer_backend == "mooncake":
             # Wait for async VIT forward completion if needed
             req_id = mm_data.req_id
             if req_id in self._forward_ready_events:
@@ -1809,16 +1834,15 @@ class MMEncoder:
                 f"(shape={mm_data.shape}, element_size={self._element_size})"
             )
 
-            # MR was registered once in _run_forward and is shared across all
-            # sibling-TP /send calls;
-            mr_already_registered = (
-                self._forward_results.get(req_id, {}).get("mr_ptr")
-                == embedding.data_ptr()
-            )
+            # Request-level shared MR, registered lazily on the first /send;
+            # deregistration is deferred to _cleanup_inflight_encode_state.
+            fwd_state = self._forward_results.setdefault(req_id, {})
+            mr_already_registered = fwd_state.get("mr_ptr") == embedding.data_ptr()
             if not mr_already_registered:
                 self.engine.register(embedding.data_ptr(), embedding.nbytes)
+                self._forward_results[req_id]["mr_ptr"] = embedding.data_ptr()
             _t_xfer_start = time.monotonic()
-            await asyncio.to_thread(
+            xfer_ret = await asyncio.to_thread(
                 self.engine.transfer_sync,
                 session_id,
                 embedding.data_ptr(),
@@ -1830,17 +1854,19 @@ class MMEncoder:
                 encoder_metrics_collector.observe_transfer(
                     xfer_ms / 1000.0, backend="mooncake"
                 )
-            if not mr_already_registered:
-                self.engine.deregister(embedding.data_ptr())
-            # Only emit at INFO when transfer is slow or fell back
-            # to per-/send register;
+            if xfer_ret < 0:
+                raise InternalError(
+                    f"Mooncake transfer_sync failed for {req_id} "
+                    f"(session={session_id}, nbytes={embedding.nbytes}, "
+                    f"ret={xfer_ret})"
+                )
+            # Only emit at INFO when transfer is slow or the MR was
+            # registered lazily by this /send;
             if xfer_ms > 200.0 or not mr_already_registered:
                 logger.info(
                     f"[{req_id}] mooncake transfer_sync={xfer_ms:.1f}ms "
                     f"nbytes={embedding.nbytes} shared_mr={mr_already_registered}"
                 )
-
-            mm_data.embedding = None
 
         # Send ack/data
         if url is not None:
@@ -1850,7 +1876,7 @@ class MMEncoder:
         logger.info(f"{endpoint = }")
 
         # Serialize data
-        if get_disagg().encoder_transfer_backend == "mooncake":
+        if self.server_args.encoder_transfer_backend == "mooncake":
             # Mooncake already pushed the embedding via RDMA;
             new_mm_data = mm_data.copy_without_embedding()
             serialized_data = pickle.dumps(new_mm_data)
@@ -1882,11 +1908,11 @@ class MMEncoder:
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
         if (
             encoder_metrics_collector is not None
-            and get_disagg().encoder_transfer_backend != "mooncake"
+            and self.server_args.encoder_transfer_backend != "mooncake"
         ):
             encoder_metrics_collector.observe_transfer(
                 time.perf_counter() - _zmq_xfer_start,
-                backend=get_disagg().encoder_transfer_backend,
+                backend=self.server_args.encoder_transfer_backend,
             )
 
     async def encode(
@@ -2006,8 +2032,6 @@ class MMEncoder:
                 task.cancel()
         # Also clean up embedding data and forward state
         mm_data = self.embedding_to_send.pop(req_id, None)
-        if mm_data is not None:
-            mm_data.cached_embedding = None
         # Release the rkey after all /send calls have completed.
         forward_state = self._forward_results.pop(req_id, None)
         if forward_state is not None:
@@ -2019,6 +2043,11 @@ class MMEncoder:
                     logger.warning(
                         f"Shared-MR deregister failed for {req_id}: {dereg_err}"
                     )
+            forward_state.pop("embedding", None)
+        # Release the embedding only after the MR is deregistered.
+        if mm_data is not None:
+            mm_data.embedding = None
+            mm_data.cached_embedding = None
         self._forward_ready_events.pop(req_id, None)
 
     def _schedule_inflight_encode_cleanup(self, req_id: str):
@@ -3876,38 +3905,38 @@ async def handle_encode_request(request: dict):
             encoder.background_tasks.add(task)
             task.add_done_callback(encoder.background_tasks.discard)
 
-        # broadcast request, lock together with rank0 await so NCCL
-        # launch order matches the ZMQ dispatch order rank>0 sees.
-        async with encoder.encode_dispatch_lock:
-            request.update({"enter_time": time.time()})
-            modality = Modality.from_str(request["modality"])
-            if time_stats_json:
-                time_stats.decode_json(time_stats_json)
+        request.update({"enter_time": time.time()})
+        modality = Modality.from_str(request["modality"])
+        if time_stats_json:
+            time_stats.decode_json(time_stats_json)
 
-            modality_str = modality.name.lower()
-            time_stats.modality = modality_str
-            time_stats.set_metrics_collector(encoder_metrics_collector)
-            time_stats.set_mm_encode_start_time()
-            if encoder_metrics_collector is not None:
-                encoder_metrics_collector.inc_requests_received(modality=modality_str)
-            if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
-                try:
-                    nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                        await encoder_scheduler.submit(request)
-                    )
-                except asyncio.TimeoutError:
-                    time_stats.trace_ctx.abort(
-                        abort_info={"reason": "encoder batch timed out"}
-                    )
-                    return ORJSONResponse(
-                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
-                        content={
-                            "status": "error",
-                            "message": "encoder batch timed out",
-                            "req_id": req_id,
-                        },
-                    )
-            else:
+        modality_str = modality.name.lower()
+        time_stats.modality = modality_str
+        time_stats.set_metrics_collector(encoder_metrics_collector)
+        time_stats.set_mm_encode_start_time()
+        if encoder_metrics_collector is not None:
+            encoder_metrics_collector.inc_requests_received(modality=modality_str)
+        if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
+            try:
+                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                    await encoder_scheduler.submit(request)
+                )
+            except asyncio.TimeoutError:
+                time_stats.trace_ctx.abort(
+                    abort_info={"reason": "encoder batch timed out"}
+                )
+                return ORJSONResponse(
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    content={
+                        "status": "error",
+                        "message": "encoder batch timed out",
+                        "req_id": req_id,
+                    },
+                )
+        else:
+            # Lock direct dispatch together with rank0 await so its NCCL launch
+            # order matches the ZMQ dispatch order rank>0 sees.
+            async with encoder.encode_dispatch_lock:
                 for socket in send_sockets:
                     sock_send(socket, wrap_as_pickle(request))
                 nbytes, embedding_len, embedding_dim, error_msg, error_code = (

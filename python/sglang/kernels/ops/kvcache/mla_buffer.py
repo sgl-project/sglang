@@ -116,10 +116,10 @@ def set_mla_kv_buffer_triton(
     Name retained for caller compatibility; the implementation is no longer
     Triton-only.
     """
-    from sglang.kernels.ops.kvcache._jit_set_mla_kv_buffer import (
+    from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
         can_use_set_mla_kv_buffer,
     )
-    from sglang.kernels.ops.kvcache._jit_set_mla_kv_buffer import (
+    from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
         set_mla_kv_buffer as jit_set_mla_kv_buffer,
     )
 

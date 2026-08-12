@@ -23,14 +23,13 @@ export const Qwen36Deployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      // NVFP4 is a Blackwell-only, 27B-only checkpoint (nvidia/Qwen3.6-27B-NVFP4);
-      // only surface it when both conditions hold so we never emit an unrunnable command.
+      // NVFP4 checkpoints are available for both model sizes on Blackwell (B200/B300).
       getDynamicItems: (values) => {
         const items = [
           { id: 'fp8', label: 'FP8', default: true },
           { id: 'bf16', label: 'BF16', default: false },
         ];
-        const nvfp4Supported = values.modelSize === '27b' && (values.hardware === 'b200' || values.hardware === 'b300');
+        const nvfp4Supported = values.hardware === 'b200' || values.hardware === 'b300';
         if (nvfp4Supported) {
           items.push({ id: 'nvfp4', label: 'NVFP4', default: false });
         }
@@ -94,8 +93,8 @@ export const Qwen36Deployment = () => {
       baseName: '35B-A3B',
       h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
+      b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       xeon: { bf16: { tp: 3 },           fp8: { tp: 3 } },
     },
     '27b': {
@@ -175,7 +174,7 @@ export const Qwen36Deployment = () => {
       mambaCache: speculative === 'enabled' ? 'v2' : values.mambaCache,
     };
 
-    // NVFP4: nvidia/Qwen3.6-27B-NVFP4 on Blackwell (B200/B300). Follows the exact command
+    // NVFP4: nvidia/Qwen3.6-{35B-A3B,27B}-NVFP4 on Blackwell (B200/B300). Follows the exact command
     // shape from the checkpoint's docs — explicit --tp-size 1, --attention-backend trtllm_mha,
     // new-style --mamba-radix-cache-strategy, and explicit --host/--port (no
     // --mem-fraction-static). Reasoning / tool-call parsers still follow their toggles.

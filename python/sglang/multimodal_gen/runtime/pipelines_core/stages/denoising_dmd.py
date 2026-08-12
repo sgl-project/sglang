@@ -14,10 +14,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 from sglang.multimodal_gen.utils import dict_to_3d_list
 
 logger = init_logger(__name__)
@@ -150,9 +152,9 @@ class DmdDenoisingStage(DenoisingStage):
                     )
 
                     # Predict noise residual
-                    with torch.autocast(
-                        device_type=current_platform.device_type,
-                        dtype=target_dtype,
+                    with precision_autocast_context(
+                        target_dtype,
+                        server_args.disable_autocast,
                         enabled=autocast_enabled,
                     ):
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)

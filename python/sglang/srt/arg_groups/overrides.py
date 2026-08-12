@@ -261,17 +261,19 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
 
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
     """Declare a load-time resolved field (model-file config overrides,
-    weight-resolved dtypes) after publish. it is written to the config
-    bags via ``get_context().override`` (namespace readers see it); server_args
-    stays the pristine startup record. Validated against the resolvable
-    whitelist first."""
+    weight-resolved dtypes) on the published ``server_args``: resolution has
+    already materialized, so the declaration writes through, joining the
+    declaration stash for provenance and republish consistency."""
     from sglang.srt.runtime_context import get_context
 
-    context = get_context()
-    validate_declarations(context.server_args, [(source, dict(declared))])
-    # write the config bags (namespace readers see it); server_args
-    # stays the pristine startup record.
-    context.override(source, **declared)
+    server_args = get_context().server_args
+    validate_declarations(server_args, [(source, dict(declared))])
+    override = getattr(server_args, "override", None)
+    if override is not None:
+        override(source, **declared)
+    else:
+        # Config-shaped fixtures without the mutation entry point.
+        _apply_fields(server_args, declared)
 
 
 def collect_model_override_declarations(
@@ -1246,6 +1248,29 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
+def _check_tilelang_dsa_fp8_kv(
+    kv_cache_dtype: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    *,
+    hip: bool,
+) -> None:
+    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
+    Reject here instead of crashing at decode CUDA-graph capture."""
+    if (
+        not hip
+        and kv_cache_dtype == "fp8_e4m3"
+        and "tilelang" in {prefill_backend, decode_backend}
+    ):
+        raise ValueError(
+            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
+            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
+            "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
+            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+
 @register_post_process
 def _dsa_split_backend_resolution(view: Any) -> dict:
     """Slot pass in the DSA arm: default the DSA prefill/decode split
@@ -1268,6 +1293,25 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
     declared: Dict[str, Any] = {}
+    model_arch = hf_config.architectures[0]
+    is_glm_sm12_fp8 = (
+        model_arch == "GlmMoeDsaForCausalLM"
+        and major == 12
+        and kv_cache_dtype == "fp8_e4m3"
+        and not is_hip()
+    )
+
+    if is_glm_sm12_fp8:
+        backend = "flashinfer_sparse_mla"
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = backend
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = backend
+        logger.warning(
+            "Set DSA backends for GLM FP8 KV Cache on SM120/SM121: "
+            f"prefill={backend}, decode={backend}."
+        )
+        return declared
 
     if view.enable_hisparse:
         from sglang.srt.arg_groups.hisparse_hook import _hisparse_default_backend
@@ -1304,6 +1348,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+    _check_tilelang_dsa_fp8_kv(kv_cache_dtype, prefill, decode, hip=is_hip())
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."
@@ -1737,6 +1782,16 @@ def _mla_backend_page_constraints(view: Any) -> dict:
                 f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {page_size} to 64."
             )
             page_size = 64
+    if (
+        view.attention_backend == "hpc_ops"
+        or view.decode_attention_backend == "hpc_ops"
+        or view.prefill_attention_backend == "hpc_ops"
+    ):
+        if page_size != 64:
+            logger.warning(
+                f"HPC-Ops attention only supports a page_size of 64, changing page_size from {page_size} to 64."
+            )
+            page_size = 64
     if page_size != view.page_size:
         return {"page_size": page_size}
     return {}
@@ -1976,7 +2031,13 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 "--moe-runner-backend flashinfer_trtllm or "
                 "flashinfer_trtllm_routed."
             )
-    if view.quantization == "mxfp8":
+    # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
+    # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:
+    # FusedMoE keys its w1/w3 shard swap ("flashinfer assumes w31") and its
+    # 128-alignment round-up off flashinfer_trtllm, so the experts would silently
+    # load with gate and up exchanged. Leave the backend at "auto" and let
+    # create_moe_runner resolve it to ASCEND.
+    if view.quantization == "mxfp8" and not is_npu():
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
         is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()

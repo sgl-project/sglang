@@ -25,7 +25,7 @@ import torch.nn as nn
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.runtime_context import get_mm
+from sglang.srt.runtime_context import get_server_args
 
 
 class ViTCudaGraphRunner:
@@ -151,7 +151,7 @@ class ViTCudaGraphRunner:
         cu_full_kk = self.cu_full_len_kk[graph_key]
         max_full_len = int(cu_full_kk.max().item())
 
-        override_backend = get_mm().mm_attention_backend
+        override_backend = get_server_args().mm_attention_backend
 
         if self._fullatt_block_indexes and 0 not in vit.fullatt_block_indexes:
             warmup_cu_ws = [cu_window, cu_window_kk, max_window_len]

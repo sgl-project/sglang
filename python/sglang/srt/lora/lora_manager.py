@@ -89,6 +89,7 @@ class LoRAManager:
         self.pending_lora_load_events = {}
 
         self.eviction_policy = server_args.lora_eviction_policy
+        self.enable_dp_attention: bool = server_args.enable_dp_attention
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
         )
@@ -137,6 +138,54 @@ class LoRAManager:
 
             init_lora_two_stream_resources(self.device)
         # ===== END TO BE REFACTORED ====
+
+    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+        """Allocate the static prefill-CUDA-graph LoRA metadata, sized by the
+        largest captured token bucket. Called before capture."""
+        self.lora_backend.init_prefill_cuda_graph_batch_info(
+            max_num_tokens=max_num_tokens
+        )
+
+    @property
+    def supports_prefill_cuda_graph(self) -> bool:
+        """Whether LoRA kernels can be captured into the prefill CUDA graph;
+        excludes MoE LoRA and DP attention."""
+        return (
+            self.lora_backend.supports_prefill_cuda_graph
+            and not self.lora_backend.is_moe_lora
+            and not self.enable_dp_attention
+        )
+
+    @property
+    def prefill_cuda_graph_max_bs(self) -> Optional[int]:
+        """Request-count cap for prefill-graph LoRA batches; None until
+        init_prefill_cuda_graph_batch_info() ran."""
+        return self.lora_backend.prefill_cuda_graph_max_bs
+
+    def can_use_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this batch can use the static prefill-graph LoRA metadata;
+        shared by prepare_lora_batch and can_run_graph so they stay consistent."""
+        max_bs = self.lora_backend.prefill_cuda_graph_max_bs
+        max_tokens = self.lora_backend.prefill_cuda_graph_max_tokens
+        if max_bs is None or max_tokens is None:
+            return False
+        # DP attention: per-rank eligibility could diverge across ranks and
+        # desync collectives; keep LoRA prefill eager.
+        if self.enable_dp_attention:
+            return False
+        # Decode-CUDA-graph extend modes (TARGET_VERIFY, DLLM_EXTEND) are
+        # owned by the decode static batch info path.
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_cuda_graph()
+        ):
+            return False
+        if forward_batch.extend_num_tokens is None:
+            return False
+        return (
+            forward_batch.batch_size <= max_bs
+            and forward_batch.extend_num_tokens <= max_tokens
+        )
 
     def init_cuda_graph_moe_buffers(
         self, max_bs: int, max_loras: int, compute_dtype, moe_layer
@@ -374,6 +423,11 @@ class LoRAManager:
             and bs <= self.max_bs_in_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
         )
+        # Eligible extend batches refresh the static prefill batch info in
+        # place so captured kernels read current values at replay.
+        use_prefill_cuda_graph = not use_cuda_graph and self.can_use_prefill_cuda_graph(
+            forward_batch
+        )
 
         weight_indices = [0] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
@@ -394,6 +448,7 @@ class LoRAManager:
             lora_ranks=lora_ranks,
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices

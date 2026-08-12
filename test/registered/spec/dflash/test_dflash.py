@@ -6,11 +6,13 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import (
     gen_radix_tree,
     run_radix_attention_test,
 )
+from sglang.test.kits.spec_server_kits import SpecGrammarKit
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
     DEFAULT_TARGET_MODEL_DFLASH,
@@ -20,11 +22,17 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=302, stage="stage-b", runner_config="1-gpu-small-amd")
+register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=420, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
-class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
+class TestDFlashServerBase(
+    CustomTestCase,
+    MatchedStopMixin,
+    GSM8KMixin,
+    JSONConstrainedMixin,
+    SpecGrammarKit,
+):
     max_running_requests = 64
     attention_backend = "triton" if is_hip() else "flashinfer"
     page_size = 1
@@ -123,6 +131,10 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
         print(f"determinism: {outputs=}")
         self.assertEqual(outputs[0], outputs[1])
         assert self.process.poll() is None
+
+    @unittest.skip("DFLASH rejects return_logprob at admission")
+    def test_grammar_logprob_count_matches_completion_tokens(self):
+        pass
 
 
 class TestDFlashServerPage256(TestDFlashServerBase):

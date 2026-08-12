@@ -1040,6 +1040,7 @@
                   {
                     "group": "Google",
                     "pages": [
+                      "cookbook/autoregressive/Google/EmbeddingGemma",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
                     ]
@@ -1059,6 +1060,7 @@
                   {
                     "group": "Moonshotai",
                     "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K3",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.5",

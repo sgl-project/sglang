@@ -59,6 +59,7 @@ NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
+    "fa4",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
     "flashinfer",

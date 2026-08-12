@@ -58,6 +58,7 @@ def store_cache(
     row_bytes: int = 0,
     num_split: int = 0,  # can be tuned for performance
     size_limit: int = 0,
+    reserved_skip_index: int = 0,
 ) -> None:
     """Store key and value tensors into KV cache at specified indices.
 
@@ -71,6 +72,9 @@ def store_cache(
             reserved padding slot); an index outside [0, size_limit) fails fast
             (device assert) instead of an illegal memory access. Defaults to the
             cache row count when 0.
+        reserved_skip_index (int): If nonnegative, writes targeting this index
+            are skipped. Defaults to the reserved CUDA-graph padding slot 0;
+            pass -1 to disable skipping.
     """
     row_bytes = row_bytes or k.shape[-1] * k.element_size()
     module = _jit_kvcache_module(row_bytes)
@@ -91,4 +95,5 @@ def store_cache(
         indices,
         num_split,
         size_limit,
+        reserved_skip_index,
     )

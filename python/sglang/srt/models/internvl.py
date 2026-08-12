@@ -46,7 +46,7 @@ from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
     InternViTCudaGraphRunner,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
-from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import is_cuda
 from sglang.utils import logger
 
@@ -520,7 +520,7 @@ class InternVLChatModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.use_data_parallel = get_mm().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
         self.quant_config = quant_config
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         image_size = config.force_image_size or config.vision_config.image_size

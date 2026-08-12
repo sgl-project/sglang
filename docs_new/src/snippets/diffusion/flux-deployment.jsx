@@ -14,6 +14,8 @@ export const FluxDeployment = () => {
           { id: 'mi355x', label: 'MI355X', default: false },
           { id: 'mi325x', label: 'MI325X', default: false },
           { id: 'mi300x', label: 'MI300X', default: false },
+          { id: 'a2', label: 'A2', default: false },
+          { id: 'a3', label: 'A3', default: false }
         ]
       },
       version: {
@@ -32,8 +34,29 @@ export const FluxDeployment = () => {
     },
 
     generateCommand: function(values) {
-      const { version } = values;
+      const { hardware, version } = values;
       const config = this.modelConfigs[version];
+
+      if (hardware === 'a2') {
+        if (version === 'flux1-dev') {
+          return `sglang serve \\
+  --model-path ${config.repoId} \\
+  --num-gpus 1`;
+        }
+
+        return `sglang serve \\
+  --model-path ${config.repoId} \\
+  --tp-size 2 \\
+  --num-gpus 2`;
+      }
+
+      if (hardware === 'a3') {
+        return `#One A3 card has 2 npu chips
+sglang serve \\
+  --tp-size 2 \\
+  --model-path ${config.repoId} \\
+  --num-gpus 2`;
+      }
 
       return `sglang serve \\
   --model-path ${config.repoId} \\
@@ -107,6 +130,19 @@ export const FluxDeployment = () => {
 
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    const isAscend = values.hardware === 'a2' || values.hardware === 'a3';
+    const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
+
+    const allTabs = document.querySelectorAll('button, [role="tab"]');
+    allTabs.forEach((tab) => {
+      const text = tab.textContent.trim();
+      if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
+        tab.click();
+      }
+    });
+  }, [values.hardware]);
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => ({ ...prev, [optionName]: value }));

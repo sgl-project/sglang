@@ -150,18 +150,16 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
-    def test_convert_to_internal_request_rejects_stream_return_prompt_token_ids(self):
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Hi?"}],
-            stream=True,
-            return_prompt_token_ids=True,
-        )
-
-        with self.assertRaisesRegex(
-            ValueError, "return_prompt_token_ids is not supported with streaming"
-        ):
-            self.chat._convert_to_internal_request(req, self.fastapi_request)
+    def test_convert_to_internal_request_rejects_stream_token_ids(self):
+        for field in ("return_prompt_token_ids", "return_token_ids"):
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                stream=True,
+                **{field: True},
+            )
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                self.chat._convert_to_internal_request(req, self.fastapi_request)
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -1656,18 +1654,20 @@ class ServingChatTestCase(unittest.TestCase):
             },
         )
 
-    def test_non_streaming_chat_response_returns_requested_prompt_ids_and_meta_info(
+    def test_non_streaming_chat_response_returns_requested_token_ids_and_meta_info(
         self,
     ):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             return_prompt_token_ids=True,
+            return_token_ids=True,
             return_meta_info=True,
         )
         ret = [
             {
                 "text": "Answer",
+                "output_ids": [21, 22],
                 "prompt_token_ids": [11, 12, 13],
                 "meta_info": {
                     "id": "chatcmpl-token-ids",
@@ -1684,9 +1684,11 @@ class ServingChatTestCase(unittest.TestCase):
         choice = response.choices[0]
 
         self.assertEqual(choice.prompt_token_ids, [11, 12, 13])
+        self.assertEqual(choice.token_ids, [21, 22])
         self.assertEqual(choice.meta_info, ret[0]["meta_info"])
         dumped_choice = response.model_dump()["choices"][0]
         self.assertEqual(dumped_choice["prompt_token_ids"], [11, 12, 13])
+        self.assertEqual(dumped_choice["token_ids"], [21, 22])
         self.assertEqual(dumped_choice["meta_info"], ret[0]["meta_info"])
 
     def test_streaming_cached_tokens_details_emits_sglext(self):

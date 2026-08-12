@@ -19,8 +19,15 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+_is_hip = is_hip()
+
+_GLM_DSA_MODEL_ARCHS = (
+    "GlmMoeDsaForCausalLM",
+    "GlmMoeDsaForCausalLMNextN",
+)
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
@@ -474,3 +481,78 @@ def _flash_mla_flashinfer(
     )
 
     return (output.unsqueeze(1), None)
+
+
+def _validate_flashinfer_sparse_mla_backend(
+    *,
+    model_arch: str,
+    device_sm_major: int,
+    kv_cache_dtype: torch.dtype,
+    prefill_impl: str,
+    decode_impl: str,
+) -> bool:
+    selected = {prefill_impl, decode_impl}
+    uses_flashinfer_sparse_mla = "flashinfer_sparse_mla" in selected
+    is_glm_sm12_fp8 = (
+        model_arch in _GLM_DSA_MODEL_ARCHS
+        and device_sm_major == 12
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and not _is_hip
+    )
+    if uses_flashinfer_sparse_mla and not is_glm_sm12_fp8:
+        raise ValueError(
+            "flashinfer_sparse_mla supports only GLM DSA with FP8 KV cache "
+            "on NVIDIA SM120/SM121; "
+            f"got model_arch={model_arch!r}, sm_major={device_sm_major}, "
+            f"kv_cache_dtype={kv_cache_dtype}, prefill_impl={prefill_impl!r}, "
+            f"decode_impl={decode_impl!r}."
+        )
+    if is_glm_sm12_fp8:
+        unsupported = selected - {"flashinfer_sparse_mla"}
+        if unsupported:
+            raise ValueError(
+                "GLM DSA with FP8 KV cache on NVIDIA SM120/SM121 supports "
+                "only flashinfer_sparse_mla, "
+                f"but got {sorted(unsupported)}."
+            )
+    return uses_flashinfer_sparse_mla
+
+
+def flashinfer_sparse_mla_forward(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    *,
+    page_size: int,
+    kv_cache_dim: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sm_scale: float,
+    skip_softmax_threshold_scale_factor: float | None,
+) -> torch.Tensor:
+    """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    topk = indices.shape[1]
+    result = trtllm_batch_decode_with_kv_cache_mla(
+        query=q.unsqueeze(1),
+        kv_cache=kv_cache.view(torch.uint8)
+        .view(-1, page_size, kv_cache_dim)
+        .unsqueeze(1),
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=indices.unsqueeze(1),
+        seq_lens=seq_lens,
+        max_seq_len=topk,
+        sparse_mla_top_k=topk,
+        bmm1_scale=float(sm_scale),
+        bmm2_scale=1.0,
+        kv_scale_format="arbitrary_fp32",
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    )
+    return result.squeeze(1)

@@ -15,7 +15,6 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
-from sglang.srt.runtime_context import get_context, get_lora, get_serving
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -230,7 +229,9 @@ class RuntimeHandle:
             return self._openai_serving_classes
 
         from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-        from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
+        from sglang.srt.entrypoints.openai.serving_classify import (
+            OpenAIServingClassify,
+        )
         from sglang.srt.entrypoints.openai.serving_completions import (
             OpenAIServingCompletion,
         )
@@ -375,20 +376,16 @@ class RuntimeHandle:
         model_config = self.tokenizer_manager.model_config
         result = {
             "model_path": self.tokenizer_manager.model_path,
-            "tokenizer_path": get_serving().tokenizer_path,
+            "tokenizer_path": self.server_args.tokenizer_path,
             "is_generation": self.tokenizer_manager.is_generation,
-            "weight_version": get_serving().weight_version,
+            "weight_version": self.server_args.weight_version,
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        # Overlay post-publish overrides (weight version, model path, runtime
-        # tunables) so the report reflects current config, not the startup record.
-        result: Dict[str, Any] = get_context().resolved_server_args_dict(
-            base=dataclasses.asdict(self.server_args)
-        )
+        result: Dict[str, Any] = dataclasses.asdict(self.server_args)
         result.update(self.scheduler_info)
         return json.dumps(msgspec_to_builtins(result), default=str)
 
@@ -427,7 +424,9 @@ class RuntimeHandle:
                 "max_model_len": self.tokenizer_manager.model_config.context_len,
             }
         ]
-        if get_lora().enable_lora and hasattr(self.tokenizer_manager, "lora_registry"):
+        if self.server_args.enable_lora and hasattr(
+            self.tokenizer_manager, "lora_registry"
+        ):
             lora_registry = self.tokenizer_manager.lora_registry
             for _, lora_ref in lora_registry.get_all_adapters().items():
                 models.append(

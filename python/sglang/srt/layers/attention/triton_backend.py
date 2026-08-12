@@ -29,7 +29,12 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_utils import (
@@ -223,7 +228,14 @@ class TritonAttnBackend(AttentionBackend):
             self.use_pdl = False
 
         self.allow_bidirectional_attention_in_extend = (
-            cuda_graph_fully_disabled()
+            # BCG captures one complete prefill forward. It is therefore safe
+            # for encoder-style attention, unlike the other CUDA graph modes
+            # that can split or pad requests. Eager prefill remains supported
+            # as before.
+            (
+                cuda_graph_fully_disabled()
+                or check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+            )
             and model_runner.server_args.chunked_prefill_size == -1
         )
 

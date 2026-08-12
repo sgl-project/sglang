@@ -16,7 +16,7 @@ register_npu_ci(
 ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
-    "HCCL_BUFFSIZE": "1000",
+    "DEEPEP_HCCL_BUFFSIZE": "1000",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
@@ -57,12 +57,12 @@ OTHER_ARGS = [
 ]
 
 
-class TestNPUDeepSeek_V3_2_8P_AIME2025(TestNpuAccuracyTestCaseBase):
+class TestNPUGLM_4_7_FLASH_1P_AIME25(TestNpuAccuracyTestCaseBase):
 
     model = GLM_4_7_FLASH_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
-    accuracy = 0.916
+    accuracy = 0.7667
     datasets = ["aime25"]
     few_shot_num = 0
     generation_config = {"max_tokens": 65536, "temperature": 1.0}

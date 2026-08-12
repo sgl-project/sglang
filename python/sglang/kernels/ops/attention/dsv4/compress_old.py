@@ -57,7 +57,7 @@ def _jit_compress_128_online_module(head_dim: int) -> Module:
 
 
 @cache_once
-def _jit_norm_rope_module(
+def norm_rope_module(
     dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
@@ -276,7 +276,7 @@ def compress_fused_norm_rope_inplace(
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
+    module = norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
         kv,
         weight,
@@ -296,7 +296,7 @@ def fused_norm_rope_inplace(
     positions: torch.Tensor,
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
+    module = norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
         kv,
         weight,

@@ -19,9 +19,11 @@ from sglang.srt.layers.attention.flashattention_backend import (
     merge_state_v2_wrapper,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_allgather_and_save_kv_cache
+from sglang.srt.layers.utils.cp_utils import (
+    cp_allgather_and_save_kv_cache,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -513,7 +515,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not get_schedule().disable_chunked_prefix_cache
+                    assert not get_server_args().disable_chunked_prefix_cache
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
                     assert forward_batch.prefix_chunk_max_seq_lens is not None

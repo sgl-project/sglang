@@ -1035,6 +1035,7 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
+        self.load_up_proj_weight_first = layer.scheme.load_up_proj_weight_first
         layer.scheme.create_weights(
             layer=layer,
             num_experts=num_experts,

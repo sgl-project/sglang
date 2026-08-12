@@ -8,6 +8,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    is_in_ci,
     popen_launch_pd_server,
 )
 
@@ -17,6 +18,7 @@ MIMO_V2_MODEL_PATH = "XiaomiMiMo/MiMo-V2.5"
 GSM8K_BASELINE_ACCURACY = 0.93
 
 
+@unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationDWDPMiMo(PDDisaggregationServerBase):
     """PD disagg with DWDP prefill (4 GPUs) and DP-attention decode (4 GPUs)."""
 

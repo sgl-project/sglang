@@ -13,7 +13,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import torch_release
 
 if TYPE_CHECKING:
@@ -34,6 +34,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -392,6 +393,7 @@ if is_blackwell_supported() and is_flashinfer_available():
         input: torch.Tensor,
         _is_sf_swizzled_layout: bool = True,
         alignment: int = 32,
+        backend: str = "cute-dsl",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Fake mode only needs dtypes and output rank to propagate compile graph.
         # The scale tensor shape is not consumed before the following fake mm op.
@@ -411,12 +413,18 @@ if is_blackwell_supported() and is_flashinfer_available():
         input: torch.Tensor,
         is_sf_swizzled_layout: bool = True,
         alignment: int = 32,
+        backend: str = "cute-dsl",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return _raw_flashinfer_mxfp8_quantize(
             input,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             alignment=alignment,
-            sf_swizzle_layout=SfLayout.layout_128x4,
+            backend=backend,
+            sf_swizzle_layout=(
+                SfLayout.layout_128x4
+                if is_sf_swizzled_layout
+                else SfLayout.layout_linear
+            ),
         )
 
     @register_custom_op(
@@ -1469,7 +1477,9 @@ def requant_block_scale_ue8m0_for_deepgemm(
     scales are not already UE8M0, and DeepGEMM can run the layer (bf16 output,
     aligned shape). Returns True when it requantizes.
     """
-    from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
+    from sglang.srt.model_loader.utils import (
+        should_deepgemm_weight_requant_ue8m0,
+    )
 
     if (
         not use_deepgemm_runner
@@ -1791,7 +1801,7 @@ def apply_fp8_linear(
         if (
             input_scale is not None
             and input_scale.numel() == 1
-            and get_exec().graph.cuda_graph_config.prefill.tc_compiler == "inductor"
+            and get_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
         ):
             qinput = (
                 (input_2d * input_scale.reciprocal())

@@ -773,7 +773,7 @@ def compute_initial_expert_location_metadata(
 
     # TODO unify with the utils function
     if data.endswith(".pt"):
-        data_dict = torch.load(data, weights_only=True)
+        data_dict = torch.load(data, weights_only=True, map_location="cpu")
     elif data.endswith(".json"):
         data_dict = json.loads(Path(data).read_text())
     else:

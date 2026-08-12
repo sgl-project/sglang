@@ -73,7 +73,9 @@ def _local_jit_source_hash(source_files: List[str]) -> str:
 @cache_once
 def _resolve_kernel_path() -> pathlib.Path:
     # Resolve via the package spec so the lookup is location-independent.
-    spec = importlib.util.find_spec("sglang.jit_kernel")
+    # The C++/CUDA sources (``csrc/``) and headers (``include/``) live next to
+    # this package under ``sglang.kernels.jit`` (RFC #29630).
+    spec = importlib.util.find_spec("sglang.kernels.jit")
     assert spec is not None and spec.origin is not None
     cur_dir = pathlib.Path(spec.origin).parent.resolve()
 
@@ -90,7 +92,7 @@ def _resolve_kernel_path() -> pathlib.Path:
 
     path = _environment_install() or _package_install()
     if path is None:
-        raise RuntimeError("Cannot find sglang.jit_kernel path")
+        raise RuntimeError("Cannot find sglang.kernels.jit path")
     return path
 
 
