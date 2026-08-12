@@ -2152,3 +2152,9 @@ def test_sm120_paged_decode_graph_pdl_is_correct_and_eager_reusable(
     assert all(plan.launch_split_combine_early for plan in captured_plans)
     assert all(plan.transpose_qk_pv is expected_transpose for plan in captured_plans)
     assert all(plan.split_qk_n is expected_split_qk for plan in captured_plans)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
