@@ -1600,13 +1600,31 @@ class MultiModalMixin:
 
         mm_kwargs = self._collect_mm_kwargs(forward_batch)
 
-        return self._run_hf_backbone(
+        hidden_states = self._run_hf_backbone(
             input_ids=input_ids,
             input_embeds=None,
             positions=positions,
             forward_batch=forward_batch,
             **mm_kwargs,
         )
+
+        if mm_kwargs and torch.xpu.is_available():
+            # Anyres-style models (e.g. llava-onevision) pad each image's
+            # patch/tile tensors to a per-request max in _collect_mm_kwargs, so
+            # every request with a different image builds a differently-shaped
+            # 5D pixel_values tensor. XPU's caching allocator can't reuse
+            # blocks across this variety of shapes, so reserved device memory
+            # grows monotonically across requests -- independent of
+            # concurrency -- until the device genuinely OOMs (same failure
+            # family fixed for Mistral3/Pixtral in models/mistral.py:
+            # get_image_feature). A threshold-gated flush (only calling
+            # empty_cache() once fragmentation exceeds N bytes) was tried
+            # there and measured to still crash, just later -- only an
+            # unconditional flush after every multimodal request reliably
+            # prevents it.
+            torch.xpu.empty_cache()
+
+        return hidden_states
 
 
 class TransformersForCausalLM(CausalMixin, TransformersBase):
