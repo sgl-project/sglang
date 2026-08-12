@@ -1349,7 +1349,7 @@ async def destroy_weights_update_group(
 
 
 @app.post("/update_weights_from_tensor")
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_tensor(
     obj: Annotated[UpdateWeightsFromTensorReqInput, Body()], request: Request
 ):
@@ -1528,7 +1528,7 @@ async def load_lora_adapter(
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter_from_tensors(
     obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
