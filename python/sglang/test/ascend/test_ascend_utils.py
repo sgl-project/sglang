@@ -212,7 +212,7 @@ QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-Next-80B-A3B-Instruct"
 )
 QWEN3_32B_EAGLE3_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "Zjcxy-SmartAI/Qwen3-32B-Eagle3"
+    MODEL_WEIGHTS_DIR, "Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh"
 )
 QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "aleoyang/Qwen3-32B-w8a8-MindIE"

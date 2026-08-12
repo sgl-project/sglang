@@ -1,9 +1,9 @@
 import unittest
 
 import torch
+from transformers import AutoProcessor
 
 from sglang import Engine
-from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -13,12 +13,13 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     SimpleNamespace,
+    build_vlm_image_prompt,
     is_in_amd_ci,
     popen_launch_server,
 )
 
 # CI Registration
-register_cuda_ci(est_time=180, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=250, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-large-amd")
 
 
@@ -73,8 +74,9 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
 
     def test_embedding(self):
         model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
-        chat_template = get_chat_template_by_model_path(model_path)
-        text = f"{chat_template.image_token}What is in this picture? Answer: "
+        text = build_vlm_image_prompt(
+            AutoProcessor.from_pretrained(model_path), "What is in this picture?"
+        )
         extra_args = (
             {"mem_fraction_static": AMD_MEM_FRACTION_STATIC} if is_in_amd_ci() else {}
         )

@@ -564,11 +564,19 @@ class _GenerationStreamAccumulator:
 
         if self.return_hidden_states:
             if req.return_hidden_states:
-                # Mirror output_ids_through_stop: spec verify steps can overshoot finished_len.
-                hs = req.hidden_states
-                if req.finished_len is not None:
-                    hs = hs[: req.finished_len]
-                self.output_hidden_states.append(hs)
+                if req.return_hidden_states == "last":
+                    # Collection keeps this list bounded to the final valid
+                    # accepted token, including speculative verify overshoot.
+                    self.output_hidden_states.append(
+                        req.hidden_states[-1] if req.hidden_states else None
+                    )
+                else:
+                    # Mirror output_ids_through_stop: spec verify steps can
+                    # overshoot finished_len.
+                    hs = req.hidden_states
+                    if req.finished_len is not None:
+                        hs = hs[: req.finished_len]
+                    self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)
         if self.return_routed_experts:

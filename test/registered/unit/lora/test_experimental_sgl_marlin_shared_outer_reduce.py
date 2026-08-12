@@ -1,4 +1,6 @@
-"""CUDA parity tests for the fused shared-outer Marlin decode reduction."""
+"""Guards the fused shared-outer Marlin decode reduction against the three-launch
+fallback it replaces; reds when down-B orientation, router weighting, the routing
+scale, a ragged-tile mask, or capture-time value baking is wrong."""
 
 from __future__ import annotations
 
@@ -7,10 +9,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
-
-# Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
-pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 _CUDA_BF16_AVAILABLE = bool(
@@ -18,6 +17,10 @@ _CUDA_BF16_AVAILABLE = bool(
     and torch.version.hip is None
     and torch.cuda.get_device_capability()[0] >= 8
 )
+
+# Two BF16 ulps (2**-7 each), plus an absolute floor for cancelled outputs.
+_RTOL = 1.6e-2
+_ATOL = 1e-3
 
 
 def _reference_reduce(
@@ -54,6 +57,8 @@ def _mapped_reference_reduce(
     token_lora_mapping: torch.Tensor,
     routed_scaling_factor: float,
 ) -> torch.Tensor:
+    """Same reduction with a per-token adapter slot; ``-1`` rows stay base-only."""
+
     dtype = routed_base.dtype
     base_sum = routed_base.float().sum(dim=1).mul(routed_scaling_factor).to(dtype)
     rank_sum = (
@@ -79,11 +84,11 @@ def _mapped_reference_reduce(
 @pytest.mark.parametrize(
     ("num_tokens", "rank", "routed_scaling_factor", "hidden_width"),
     [
-        (1, 16, 1.0, 128),
-        (2, 32, 1.75, 137),
-        (4, 64, 1.0, 128),
-        (32, 16, 1.75, 137),
-        (512, 64, 1.0, 137),
+        # Dominant decode shape (BLOCK_M=1) with a ragged trailing column tile.
+        (1, 32, 1.75, 137),
+        # BLOCK_M=8 with 7 out-of-range rows -- the only param reaching the token
+        # mask; scale 1.0 pairs with 1.75 so neither value can be hard-coded.
+        (65, 64, 1.0, 137),
     ],
 )
 def test_fused_base_shared_lora_reduce_cuda_graph_parity(
@@ -144,6 +149,7 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
     )
     output = torch.empty((num_tokens, hidden_width), device=device, dtype=dtype)
 
+    # Production launch geometry, so the tuned tiles and their ragged tails run.
     block_m, block_k = fused_base_shared_lora_reduce_config(num_tokens)
 
     def invoke() -> None:
@@ -158,8 +164,7 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
             block_k=block_k,
         )
 
-    # Compile the rank/block specialization and initialize CUDA state away from
-    # the capture stream.
+    # Specialize and initialize CUDA state off the capture stream.
     warmup_stream = torch.cuda.Stream()
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
@@ -168,16 +173,12 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
     torch.cuda.current_stream().wait_stream(warmup_stream)
     torch.cuda.synchronize()
 
-    stable_tensors = (routed_base, routed_rank, topk_weights, shared_b, output)
-    stable_addresses = tuple(tensor.data_ptr() for tensor in stable_tensors)
-
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         invoke()
 
     for replay in range(2):
-        # Mutate every captured operand in place so replay proves that the graph
-        # follows stable addresses rather than values observed during capture.
+        # In-place mutation: replay must follow pointers, not capture-time values.
         routed_base.mul_(0.75).add_(0.002 * (replay + 1))
         routed_rank.mul_(-0.5).add_(0.001 * (replay + 1))
         topk_weights.copy_(torch.roll(topk_weights, shifts=1, dims=1))
@@ -187,7 +188,6 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
         graph.replay()
         torch.cuda.synchronize()
 
-        assert tuple(tensor.data_ptr() for tensor in stable_tensors) == stable_addresses
         expected = _reference_reduce(
             routed_base,
             routed_rank,
@@ -195,8 +195,7 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
             shared_b,
             routed_scaling_factor,
         )
-        torch.testing.assert_close(output, expected, rtol=0.03, atol=0.004)
-        assert torch.isfinite(output).all().item()
+        torch.testing.assert_close(output, expected, rtol=_RTOL, atol=_ATOL)
 
 
 @pytest.mark.skipif(
@@ -208,8 +207,12 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
     [(2, 1, 128), (3, 32, 137)],
 )
 def test_fused_base_mapped_shared_lora_reduce_cuda_graph_parity(
-    num_tokens: int, num_slots: int, hidden_width: int
+    num_slots: int, num_tokens: int, hidden_width: int
 ):
+    """Guards the device-side per-token slot lookup; reds when the adapted-token
+    predicate degrades to always-true (``-1`` rows gain a delta) or the lookup
+    moves host-side (replay serves the capture-time mapping)."""
+
     from sglang.srt.lora.marlin_lora_temp.shared_outer import (
         fused_base_mapped_shared_lora_reduce,
     )
@@ -296,8 +299,7 @@ def test_fused_base_mapped_shared_lora_reduce_cuda_graph_parity(
         token_lora_mapping,
         1.75,
     )
-    torch.testing.assert_close(output, expected, rtol=0.03, atol=0.004)
-    assert torch.isfinite(output).all().item()
+    torch.testing.assert_close(output, expected, rtol=_RTOL, atol=_ATOL)
 
 
 if __name__ == "__main__":

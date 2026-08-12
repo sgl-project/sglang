@@ -21,12 +21,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -55,6 +55,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
+_flashinfer_rmsnorm_quant_available = False
 
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
@@ -83,8 +84,19 @@ if _is_cuda or _is_xpu or _is_musa:
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
             _flashinfer_layernorm_available = False
+
+        try:
+            from flashinfer.norm import (
+                fused_add_rmsnorm_quant as _flashinfer_fused_add_rmsnorm_quant,
+            )
+            from flashinfer.norm import rmsnorm_quant as _flashinfer_rmsnorm_quant
+
+            _flashinfer_rmsnorm_quant_available = True
+        except (ImportError, AttributeError):
+            _flashinfer_rmsnorm_quant_available = False
     else:
         _flashinfer_layernorm_available = False
+        _flashinfer_rmsnorm_quant_available = False
 
     from sgl_kernel import (
         fused_add_rmsnorm,
@@ -156,6 +168,7 @@ if _is_cuda:
 
 
 logger = logging.getLogger(__name__)
+
 
 if _is_npu:
     import torch_npu
@@ -354,7 +367,58 @@ def _forward_with_allreduce_fusion_quant_per_group(
     return (bf16_out, fp8_out, scale_out), residual_out
 
 
-class RMSNorm(MultiPlatformOp):
+def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
+    """Return the per-tensor static FP8 activation scale of ``linear`` if it is
+    an FP8 linear using static per-tensor activation scaling that can consume a
+    pre-quantized ``(fp8, scale)`` input; otherwise ``None``.
+
+    Recognizes both the native ``Fp8LinearMethod`` (non block/mxfp8/marlin) and
+    the compressed-tensors W8A8-FP8 scheme with a static per-tensor input scale
+    (e.g. RedHatAI ``*-FP8`` checkpoints). The flashinfer fused kernel only
+    supports per-tensor quant, hence the ``numel() == 1`` requirement.
+    """
+    if linear is None:
+        return None
+    quant_method = getattr(linear, "quant_method", None)
+    if quant_method is None:
+        return None
+    if not _is_static_per_tensor_fp8_linear(quant_method, linear):
+        return None
+    input_scale = getattr(linear, "input_scale", None)
+    if input_scale is None or input_scale.numel() != 1:
+        return None
+    return input_scale
+
+
+def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
+    try:
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+    except ImportError:
+        Fp8LinearMethod = ()
+    if isinstance(quant_method, Fp8LinearMethod):
+        return not (
+            getattr(quant_method, "block_quant", False)
+            or getattr(quant_method, "use_mxfp8", False)
+            or getattr(quant_method, "use_marlin", False)
+        )
+    try:
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsLinearMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            CompressedTensorsW8A8Fp8,
+        )
+    except ImportError:
+        return False
+    if isinstance(quant_method, CompressedTensorsLinearMethod):
+        scheme = getattr(linear, "scheme", None)
+        return isinstance(scheme, CompressedTensorsW8A8Fp8) and getattr(
+            scheme, "is_static_input_scheme", False
+        )
+    return False
+
+
+class RMSNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size: int,
@@ -407,6 +471,7 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if x.numel() == 0:
             if residual is not None:
@@ -436,6 +501,20 @@ class RMSNorm(MultiPlatformOp):
             if needs_reshape:
                 out = out.reshape(original_shape)
             return out
+        # Fuse the downstream FP8 static per-tensor activation quant into the
+        # norm when supported. Placed after the empty / variance-override /
+        # batch-invariant guards above (all incompatible with the fused kernel)
+        # and gated on not-HF-cast, so it only runs on the standard RMSNorm path.
+        if (
+            quant_linear is not None
+            and not self.cast_x_before_out_mul
+            and _flashinfer_rmsnorm_quant_available
+        ):
+            scale = _fp8_static_input_scale(quant_linear)
+            if scale is not None:
+                return self.forward_with_per_tensor_quant_fusion(
+                    x, scale, residual, post_residual_addition
+                )
         if self.cast_x_before_out_mul and residual is None:
             # Use HF-semantics kernel (cast to dtype before weight multiply).
             if (
@@ -493,6 +572,7 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
             if post_residual_addition is not None:
@@ -508,6 +588,7 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # Fix dsv4 dp attenton issue
         # the symptom is torch.AcceleratorError: HIP error: invalid configuration argument
@@ -584,6 +665,7 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # Fallback to native implementation if vllm is not available
         if not _has_vllm_rms_norm:
@@ -623,6 +705,7 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
             return self.forward_native(x, residual, post_residual_addition)
@@ -646,6 +729,7 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             x = x.contiguous()
@@ -696,6 +780,7 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if _is_cpu_amx_available:
             if residual is not None:
@@ -716,6 +801,7 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
@@ -769,8 +855,67 @@ class RMSNorm(MultiPlatformOp):
             self, x, residual, self.weight, group_size, use_attn_tp_group, keep_bf16
         )
 
+    def forward_with_per_tensor_quant_fusion(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+        fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor, torch.dtype],
+        Tuple[Tuple[torch.Tensor, torch.Tensor, torch.dtype], torch.Tensor],
+    ]:
+        """Fused RMSNorm + static per-tensor FP8 quantization.
 
-class LayerNorm(MultiPlatformOp):
+        The normed activation is quantized to ``fp8_dtype`` using the per-tensor
+        reciprocal ``scale`` (same convention as ``static_quant_fp8``:
+        ``q = normed / scale``), so a downstream FP8 linear carrying a matching
+        static ``input_scale`` can skip its own activation quant.
+
+        The quantized activation is emitted as a ``(fp8_out, scale, orig_dtype)``
+        tuple; ``orig_dtype`` (the un-quantized activation dtype) is carried so
+        the downstream FP8 GEMM produces its output in the model's dtype rather
+        than defaulting to bf16.
+
+        Return contract mirrors ``forward``:
+        * no residual -> ``(fp8_out, scale, orig_dtype)``
+        * w/ residual -> ``((fp8_out, scale, orig_dtype), residual_out)``
+        """
+        orig_dtype = x.dtype
+        needs_reshape = x.dim() != 2
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, original_shape[-1])
+        elif not x.is_contiguous():
+            x = x.contiguous()
+
+        out = torch.empty_like(x, dtype=fp8_dtype)
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            if residual.dim() != 2:
+                residual = residual.contiguous().reshape(-1, residual.shape[-1])
+            elif not residual.is_contiguous():
+                residual = residual.contiguous()
+            # In-place: residual += x, then out = quant(rmsnorm(residual) * w).
+            _flashinfer_fused_add_rmsnorm_quant(
+                out, x, residual, self.weight.data, scale, self.variance_epsilon
+            )
+            if needs_reshape:
+                out = out.reshape(original_shape)
+                residual = residual.reshape(original_shape)
+            return (out, scale, orig_dtype), residual
+
+        _flashinfer_rmsnorm_quant(
+            out, x, self.weight.data, scale, self.variance_epsilon
+        )
+        if needs_reshape:
+            out = out.reshape(original_shape)
+        return out, scale, orig_dtype
+
+
+class LayerNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size: int,
@@ -854,7 +999,7 @@ class LayerNorm(MultiPlatformOp):
             return self.forward_native(x)
 
 
-class GemmaRMSNorm(MultiPlatformOp):
+class GemmaRMSNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size: int,
@@ -1014,6 +1159,16 @@ class GemmaRMSNorm(MultiPlatformOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual, post_residual_addition)
 
+    def forward_musa(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # sgl_kernel's gemma norm ops are built for MUSA (see the import gate
+        # above); opt into the CUDA-path implementation explicitly.
+        return self._forward_impl(x, residual, post_residual_addition)
+
     def forward_with_allreduce_fusion(
         self,
         x: torch.Tensor,
@@ -1051,7 +1206,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         )
 
 
-class Gemma3RMSNorm(MultiPlatformOp):
+class Gemma3RMSNorm(BaseFusedOp):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -1090,6 +1245,10 @@ class Gemma3RMSNorm(MultiPlatformOp):
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x)
 
+    def forward_musa(self, x, residual: Optional[torch.Tensor] = None):
+        # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.
+        return self.forward_cuda(x, residual)
+
     def forward_hip(self, x, residual: Optional[torch.Tensor] = None):
         # sgl_kernel's gemma_rmsnorm/gemma_fused_add_rmsnorm are not available on
         # ROCm; delegate to the pure-PyTorch implementation.
@@ -1105,7 +1264,7 @@ class Gemma3RMSNorm(MultiPlatformOp):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-class Gemma4RMSNorm(MultiPlatformOp):
+class Gemma4RMSNorm(BaseFusedOp):
     def __init__(
         self,
         dim: int,
@@ -1177,13 +1336,17 @@ class Gemma4RMSNorm(MultiPlatformOp):
             out = rmsnorm(x, self.weight.data, self.eps)
         return out
 
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.
+        return self.forward_cuda(x)
+
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         # sgl_kernel's gemma_rmsnorm is not available on ROCm;
         # delegate to the pure-PyTorch implementation.
         return self.forward_native(x)
 
 
-class RMSNormWithoutScale(MultiPlatformOp):
+class RMSNormWithoutScale(BaseFusedOp):
     def __init__(self, hidden_size: int, eps=1e-6):
         super().__init__()
         self.hidden_size = hidden_size

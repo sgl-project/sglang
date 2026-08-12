@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <type_traits>
 
+namespace sglang {
+
 namespace device::warp {
 
 /// \brief Full warp active mask.
@@ -181,7 +183,11 @@ SGL_DEVICE uint32_t inclusive_sum(uint32_t lane_id, uint32_t val) {
   static_assert(kWarpThreads == 32);
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
+#ifndef USE_ROCM
     uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+#else
+    uint32_t n = __shfl_up_sync(kFullMask, val, offset, kWarpThreads);
+#endif
     if (lane_id >= offset) val += n;
   }
   return val;
@@ -205,3 +211,5 @@ SGL_DEVICE bool elect_one_lane() {
 }
 
 }  // namespace device::warp
+
+}  // namespace sglang

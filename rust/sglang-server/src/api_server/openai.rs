@@ -1,55 +1,240 @@
-//! OpenAI-compatible endpoints: `/v1/completions`, `/v1/chat/completions`, and
-//! `/v1/models`. Each runs the same tokenize→generate→detok pipeline as
-//! `/generate` and shapes the neutral [`ChunkEvent`] delta into OpenAI types
-//! (`dynamo-protocols`), with chat-template rendering (`dynamo-renderer`) and
-//! reasoning / tool-call parsing (`dynamo-parsers`).
+//! OpenAI-compatible generation endpoints.
 //!
-//! Mounted on the shared [`AppState`](super::AppState) by the parent
-//! `api_server` module; the submit machinery and control plane live there.
+//! The HTTP adapter stays deliberately thin: Dynamo owns the standard OpenAI
+//! request and response primitives. Native [`ChunkEvent`] values remain the one
+//! backend output type for both unary and streaming responses.
 
 use axum::{
-    extract::State,
+    Json, Router,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use futures::StreamExt;
+use tokio::sync::mpsc;
 
-use axum::{Router, routing::get};
+mod chat;
+mod completions;
+mod models;
+mod reasoning;
+mod template;
+mod tools;
+
+pub(super) use template::ChatFormatter;
 
 use super::AppState;
+use super::frame::OutputAccumulator;
+use super::guard::AbortGuard;
+use super::submit::submit;
+use crate::ids::Rid;
+use crate::message::{ChunkEvent, EgressItem, GenerateRequest, RequestKind};
+use crate::runtime::ServerArgs;
+
+const MAX_OPENAI_CHOICES: usize = 4096;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
-    // `/v1/models` is OpenAI-compatible; completions/chat land here too.
-    Router::new().route("/v1/models", get(available_models))
+    Router::new()
+        .merge(models::routes())
+        .merge(completions::routes())
+        .merge(chat::routes())
 }
 
-/// `GET /v1/models` — OpenAI-compatible model list. Served from `server_args`;
-/// no scheduler round-trip. Mirrors `http_server.available_models`.
-///
-/// TODO(v1/models): when `--enable-lora`, append a `ModelCard` per loaded LoRA
-/// adapter (`id=lora_name, root=lora_path, parent=served_model_name,
-/// max_model_len=None`). Adapters load/unload at runtime, so that part needs a
-/// control-request query to the scheduler's LoRA registry.
-async fn available_models(State(state): State<AppState>) -> Response {
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let name = &state.server_args.served_model_name;
-    let base = serde_json::json!({
-        "id": name,
-        "object": "model",
-        "created": created,
-        "owned_by": "sglang",
-        "root": name,
-        "parent": serde_json::Value::Null,
-        "max_model_len": state.server_args.model_config.context_len,
-    });
-    let list = serde_json::json!({ "object": "list", "data": [base] });
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        serde_json::to_vec(&list).unwrap_or_default(),
-    )
-        .into_response()
+/// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions
+/// endpoint. Tokenization is the tokenizer pool's job (the api server never
+/// encodes); the formatter needs at most `tokenizer_config.json` — a built-in
+/// `--chat-template` name or a model-path-inferred legacy template resolve
+/// without it, so its absence must not disable chat.
+pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatter> {
+    // Chat needs the tokenizer pool behind it: under `skip_tokenizer_init`
+    // there is none (text cannot be submitted), so chat is disabled.
+    if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
+        return None;
+    }
+    let config_file = crate::tokenizer::resolve_model_file(
+        &server_args.tokenizer_path,
+        server_args.revision.as_deref(),
+        "tokenizer_config.json",
+    );
+
+    match template::load_chat_formatter(
+        config_file.as_deref(),
+        (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
+        server_args.chat_template.as_deref(),
+    ) {
+        Ok(formatter) => {
+            tracing::info!(
+                config = ?config_file.as_deref().unwrap_or("<built-in / inferred>"),
+                "loaded OpenAI chat template"
+            );
+            Some(formatter)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "OpenAI chat completions disabled");
+            None
+        }
+    }
 }
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_seconds_u32() -> u32 {
+    u32::try_from(unix_seconds()).unwrap_or(u32::MAX)
+}
+
+/// The OpenAI `{"error": {...}}` payload: `type` is the SDK-facing error kind
+/// (`AuthenticationError` / `InternalServerError` / `BadRequestError`), and
+/// `code` carries the HTTP status — the shape Python's OpenAI frontend emits.
+fn error_payload(code: StatusCode, message: String) -> serde_json::Value {
+    let error_type = if code == StatusCode::UNAUTHORIZED {
+        "AuthenticationError"
+    } else if code.is_server_error() {
+        "InternalServerError"
+    } else {
+        "BadRequestError"
+    };
+    serde_json::json!({
+        "error": {
+            "object": "error",
+            "message": message,
+            "type": error_type,
+            "param": null,
+            "code": code.as_u16(),
+        }
+    })
+}
+
+/// Shape a `StatusCode` + message into an OpenAI error response, mirroring
+/// `pre_submit_error`'s rule: unary requests get the JSON error with its
+/// status; a request whose stream is already committed gets 200 + one SSE
+/// error frame + `[DONE]`.
+pub(super) fn openai_error_response(
+    code: StatusCode,
+    message: impl Into<String>,
+    stream: bool,
+) -> Response {
+    let body = error_payload(code, message.into());
+    if !stream {
+        return (code, Json(body)).into_response();
+    }
+    super::submit::sse_error_response(body)
+}
+
+/// Unary OpenAI error — the common pre-submit case (Python validates before
+/// the stream starts and answers 4xx in JSON even for `stream=true`).
+fn openai_error(code: StatusCode, message: impl Into<String>) -> Response {
+    openai_error_response(code, message, false)
+}
+
+/// The OpenAI error frame payload for errors raised *inside* a committed
+/// stream, where only a `data:` frame can be emitted (the status is folded
+/// into the body, since the response status is already 200).
+pub(super) fn streaming_error(code: u16, message: impl Into<String>) -> String {
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    error_payload(status, message.into()).to_string()
+}
+
+async fn collect_output(
+    mut rx: mpsc::Receiver<EgressItem>,
+    guard: &mut AbortGuard,
+    rid: &Rid,
+) -> Result<ChunkEvent, (StatusCode, String)> {
+    let mut accumulator = OutputAccumulator::default();
+    let output = loop {
+        match rx.recv().await {
+            Some(EgressItem::Frame(output)) => accumulator.fold(&output),
+            Some(EgressItem::Done(output)) => {
+                accumulator.fold(&output);
+                break accumulator.into_output();
+            }
+            Some(EgressItem::Error(error)) => {
+                guard.disarm(rid);
+                let status = StatusCode::from_u16(error.http_status())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return Err((status, error.to_string()));
+            }
+            Some(EgressItem::Control(_)) | Some(EgressItem::Data(_)) => {}
+            None => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "response truncated before completion".into(),
+                ));
+            }
+        }
+    };
+    guard.disarm(rid);
+    if let Some((code, message)) = output
+        .finish_reason
+        .as_ref()
+        .and_then(|reason| reason.abort_status())
+    {
+        return Err((
+            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            message.to_owned(),
+        ));
+    }
+    Ok(output)
+}
+
+async fn submit_generation(
+    state: &AppState,
+    request: GenerateRequest,
+    stream: bool,
+    guard: &mut AbortGuard,
+) -> Result<mpsc::Receiver<EgressItem>, Response> {
+    match submit(state, RequestKind::Generate(Box::new(request)), stream).await {
+        Ok((rid, rx)) => {
+            guard.arm(rid);
+            Ok(rx)
+        }
+        // Same rule as `pre_submit_error`: a committed stream gets 200 plus an
+        // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
+        // error shape, since this is the OpenAI frontend.
+        Err(_) => Err(openai_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable",
+            stream,
+        )),
+    }
+}
+
+fn indexed_egress_stream(
+    index: usize,
+    rx: mpsc::Receiver<EgressItem>,
+) -> futures::stream::BoxStream<'static, (usize, Option<EgressItem>)> {
+    futures::stream::unfold((rx, false), move |(mut rx, finished)| async move {
+        if finished {
+            return None;
+        }
+        match rx.recv().await {
+            Some(item) => {
+                let finished = matches!(item, EgressItem::Done(_) | EgressItem::Error(_));
+                Some(((index, Some(item)), (rx, finished)))
+            }
+            None => Some(((index, None), (rx, true))),
+        }
+    })
+    .boxed()
+}
+
+fn contains_media(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(contains_media),
+        serde_json::Value::Object(object) => {
+            object.keys().any(|key| {
+                matches!(
+                    key.as_str(),
+                    "image_url" | "video_url" | "input_audio" | "audio_url" | "file"
+                )
+            }) || object.values().any(contains_media)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod test_utils;

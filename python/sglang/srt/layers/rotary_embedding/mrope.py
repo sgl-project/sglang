@@ -18,7 +18,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
@@ -42,7 +42,6 @@ if _is_xpu:
     from sgl_kernel import multimodal_rotary_embedding
 
 from sglang.kernels.ops.attention.mrope import apply_interleaved_rope_triton
-from sglang.srt.runtime_context import get_server_args
 
 
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list) -> torch.Tensor:
@@ -144,7 +143,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         last_dim = cos_sin.size()[-1]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.mrope_interleaved:
-            if support_triton(get_server_args().attention_backend):
+            if support_triton(get_exec().kernel.attention_backend):
                 cos = apply_interleaved_rope_triton(cos, self.mrope_section)
                 sin = apply_interleaved_rope_triton(sin, self.mrope_section)
             else:
