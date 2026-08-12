@@ -110,22 +110,22 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         from sglang.srt.environ import envs
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
-        server_args = SimpleNamespace(
-            disable_radix_cache=False,
-            disable_overlap_schedule=disable_overlap,
-            enable_mamba_extra_buffer=lambda: extra_buffer,
-            enable_mamba_extra_buffer_lazy=lambda: lazy,
+        fake = SimpleNamespace(server_args=SimpleNamespace())
+        # Every input is a published leaf now: the extra-buffer predicates read
+        # the radix-cache strategy off the bags, so the fixture publishes the
+        # strategy that produces the combination under test.
+        strategy = (
+            "extra_buffer_lazy"
+            if lazy
+            else "extra_buffer" if extra_buffer else "no_buffer"
         )
-        fake = SimpleNamespace(server_args=server_args)
-        # The bag reads (disable_radix_cache / disable_overlap_schedule) come
-        # from the published context; the derived-method calls stay on the
-        # injected stand-in.
         from sglang.srt import runtime_context as rc
 
         with envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip):
             with rc.get_context().override_server_args(
                 disable_radix_cache=False,
                 disable_overlap_schedule=disable_overlap,
+                mamba_radix_cache_strategy=strategy,
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
 

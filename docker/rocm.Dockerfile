@@ -62,12 +62,10 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Base image 942 with rocm724 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_942_ROCM724 AS gfx942-rocm724
 ENV BUILD_VLLM="0"
-# AITER installs the Triton version pinned by AITER_COMMIT. Do not replace it
-# with the shared source-Triton build later in this Dockerfile.
-ENV BUILD_TRITON="0"
+# Install AITER's pinned Triton after all other Python dependencies.
+ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
-ENV AITER_USE_SYSTEM_TRITON="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
@@ -100,11 +98,10 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Base image 950 with rocm724 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_950_ROCM724 AS gfx950-rocm724
 ENV BUILD_VLLM="0"
-# See gfx942-rocm724: AITER owns the Triton installation for this flavor.
-ENV BUILD_TRITON="0"
+# See gfx942-rocm724: install AITER's pinned Triton last.
+ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
-ENV AITER_USE_SYSTEM_TRITON="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
@@ -135,13 +132,9 @@ ARG BRANCH_TYPE=remote
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
-ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
-
-# ROCm 7.2.4 torch upgrade pins (Python 3.12). torch 2.11 for ROCm 7.2 is only
-# published on the PyTorch Foundation index; AMD's repo.radeon.com wheels top out
-# at torch 2.10. triton needs no pin here: torch 2.11 requires triton-rocm==3.6.0
-# and that wheel is served from this same index, so pip resolves it on its own.
+# ROCm 7.2.4 torch upgrade pins (Python 3.12). Torch 2.11 for ROCm 7.2 is only
+# published on the PyTorch Foundation index; AMD's repo.radeon.com wheels top
+# out at torch 2.10.
 ARG TORCH_ROCM_INDEX_URL="https://download.pytorch.org/whl/rocm7.2"
 ARG TORCH_ROCM_VERSION="2.11.0+rocm7.2"
 ARG TORCHVISION_ROCM_VERSION="0.26.0+rocm7.2"
@@ -270,8 +263,8 @@ RUN case "${GPU_ARCH}" in \
 
 # Populate the PIP_CONSTRAINT file, which only the rocm724 stages define, so that
 # resolving AITER and SGLang dependencies cannot replace the torch stack above.
-# 'triton' is deliberately left out: constraining the base image's wheel version
-# would make the later BUILD_TRITON source install unsatisfiable.
+# 'triton' is deliberately left out because AITER installs its own pinned wheel
+# after all other Python dependencies.
 RUN case "${GPU_ARCH}" in \
       *-rocm724) \
         python3 -m pip freeze \
@@ -303,9 +296,9 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # leak into AITER's version when AITER uses setuptools_scm)
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-# Keep the base image's Torch-compatible Triton by default. Override with
-# AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
-ENV AITER_USE_SYSTEM_TRITON="${AITER_USE_SYSTEM_TRITON:-1}"
+# Compile AITER against the base image's Triton; the Triton step at the end of
+# this file swaps in AITER's own pin afterwards.
+ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
 # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does not
@@ -372,34 +365,6 @@ RUN cd aiter \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         fi \
       && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
-
-# torch 2.11 declares triton-rocm==3.6.0, while AITER replaces that distribution
-# with its pinned `triton` wheel. Keep torch's installed metadata aligned with
-# the actual provider so later pip operations do not restore triton-rocm.
-RUN python3 - <<'PY'
-import importlib.metadata as metadata
-import os
-import pathlib
-import re
-
-if os.environ.get("AITER_USE_SYSTEM_TRITON") != "0":
-    raise SystemExit(0)
-
-triton_version = metadata.version("triton")
-torch_dist = metadata.distribution("torch")
-metadata_path = pathlib.Path(torch_dist._path) / "METADATA"
-source = metadata_path.read_text()
-pattern = r"^Requires-Dist: triton-rocm==3\.6\.0(?P<marker>\s*;.*)?$"
-updated, count = re.subn(
-    pattern,
-    lambda match: f"Requires-Dist: triton=={triton_version}{match.group('marker') or ''}",
-    source,
-    flags=re.MULTILINE,
-)
-assert count == 1, f"expected one torch triton-rocm requirement, found {count}"
-metadata_path.write_text(updated)
-print(f"Rewrote torch Triton requirement to triton=={triton_version}")
-PY
 
 # -----------------------
 # Build Mooncake
@@ -801,31 +766,6 @@ RUN cd /tmp/whl \
         ;; \
     esac
 
-
-# -----------------------
-# Hot patch: Triton
-# For ROCm 7.2, this custom build breaks pip dependency management,
-# so future `pip install` will break the ROCm stack.
-# A workaround for this is to reinstall the default triton
-# wheel with the `rocm/pytorch` image in the root directory.
-RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        pip uninstall -y triton \
-     && apt install -y cmake \
-     && git clone ${TRITON_REPO} triton-custom \
-     && cd triton-custom \
-     && git checkout ${TRITON_COMMIT} \
-     && pip install -r python/requirements.txt \
-     && pip install -e . \
-     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
-    fi
-
-# Validate the final imported Triton against the pin declared by AITER_COMMIT.
-# This runs after the optional source-Triton block so later steps cannot silently
-# replace AITER's wheel.
-RUN if [ "${GPU_ARCH##*-}" = "rocm724" ] && [ "$AITER_USE_SYSTEM_TRITON" = "0" ]; then \
-      python3 -c "import importlib.metadata as m, pathlib, re, torch, triton, triton.backends; script=pathlib.Path('/sgl-workspace/aiter/.github/scripts/install_triton.sh').read_text(); expected=re.search(r'\"triton==([^\"]+)\"', script).group(1); actual=m.version('triton'); assert actual.startswith(expected), (expected, actual); assert 'triton-custom' not in triton.__file__, triton.__file__; assert 'amd' in triton.backends.backends, triton.backends.backends; assert torch.__version__.startswith('2.11.'), torch.__version__; assert torch.version.hip, 'torch lost HIP'; print('Validated AITER Triton:', actual, triton.__file__)"; \
-    fi
-
 # -----------------------
 # Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
 # _compute_local_source_files_hash calls Path(...).resolve() on custom-code
@@ -855,6 +795,20 @@ else:
     path.write_text(patched)
     print("patched transformers dynamic_module_utils.py (symlink hash fix)")
 PY
+
+# -----------------------
+# Install the Triton AITER pins, replacing the base image's. No version check
+# on purpose: the pin is AITER's to move, and its installer enforces a floor.
+#
+# Keep this last. Base ROCm Torch pins triton==3.5.1 and the torch patch above
+# is what drops that pin, so installing Triton any earlier lets the next pip
+# install pull CUDA torch instead. The hip check below is the tripwire.
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        cd /sgl-workspace/aiter \
+     && test -f .github/scripts/install_triton.sh \
+     && PIP_NO_CACHE_DIR=1 bash .github/scripts/install_triton.sh \
+     && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
+    fi
 
 # -----------------------
 # Performance environment variable.
