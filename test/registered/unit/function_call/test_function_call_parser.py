@@ -5033,6 +5033,24 @@ class TestGemma4Detector(unittest.TestCase):
         self.assertIsInstance(result[3], dict)
         self.assertEqual(result[3]["key"], "val")
 
+    def test_parse_gemma4_array_nested_strings_with_brackets(self):
+        cases = (
+            (
+                '[<|"|>a]b<|"|>,<|"|>c<|"|>],<|"|>tail<|"|>',
+                [["a]b", "c"], "tail"],
+            ),
+            (
+                '[<|"|>a[b]c<|"|>,<|"|>d<|"|>]',
+                [["a[b]c", "d"]],
+            ),
+        )
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                self.assertEqual(_parse_gemma4_array(payload), expected)
+
+    def test_parse_gemma4_array_stray_closing_bracket(self):
+        self.assertEqual(_parse_gemma4_array("42,]trailing"), [42])
+
     def test_parse_gemma4_value_types(self):
         self.assertIs(_parse_gemma4_value("true"), True)
         self.assertIs(_parse_gemma4_value("false"), False)
