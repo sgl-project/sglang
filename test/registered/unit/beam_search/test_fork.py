@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.beam_search.fork import (
+    StagedOrphans,
     alias_members_prompt_kv,
     collect_orphan_slots,
     free_member_rows,
@@ -214,7 +215,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
             member_rows=torch.tensor([1, 2], dtype=torch.int64),
             member_rows_cpu=torch.tensor([1, 2], dtype=torch.int64),
             all_rows=rows,
-            pending_orphans=[(7, old_map, new_map)],
+            pending_orphans=[StagedOrphans(7, old_map, new_map)],
             slots_freed=0,
             retired=False,
             _pending_steps=[],

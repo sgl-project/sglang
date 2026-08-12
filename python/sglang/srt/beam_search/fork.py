@@ -17,7 +17,18 @@ decode step computes the selected token's KV like normal decode.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
+
+
+class StagedOrphans(NamedTuple):
+    """A remap's before/after mapping, awaiting the deferred set difference."""
+
+    tick: int
+    old_mapping: torch.Tensor
+    new_mapping: torch.Tensor
+
 
 # Members outlive the group's own length checks by a margin so that row-side
 # length limits can never truncate before the coordinator's deterministic
@@ -83,8 +94,7 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
         # Rewinding the leader's kv lengths then leaves its per-Req release
         # path exactly the region still its own -- [0, prompt_len), the aliased
         # prompt. Without the rewind it frees the decode region a second time.
-        rows = group.all_rows if group.all_rows is not None else group.member_rows
-        slots = req_to_token_pool.req_to_token[rows, start:end]
+        slots = req_to_token_pool.req_to_token[group.all_rows, start:end]
         token_to_kv_pool_allocator.free(slots.flatten().unique())
         if leader.kv is not None:
             leader.kv_committed_len = start

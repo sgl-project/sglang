@@ -174,9 +174,7 @@ def _build_beam_search_out_dict(
     # Only BatchStrOutput carries detokenized text.
     include_text = isinstance(recv_obj, BatchStrOutput)
     beam_results = []
-    total_completion_tokens = sum(
-        len(beam_seq.tokens) for beam_seq in beam_search_output.sequences
-    )
+    total_completion_tokens = beam_completion_tokens(beam_search_output)
     for idx, beam_seq in enumerate(beam_search_output.sequences):
         beam_out_dict = {"output_ids": beam_seq.tokens.copy()}
         if include_text:

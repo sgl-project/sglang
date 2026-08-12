@@ -16,6 +16,7 @@ from typing import List, Optional, Sequence
 
 import torch
 
+from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
 from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
 
@@ -98,10 +99,10 @@ class BeamGroup:
         self.member_rows_cpu: Optional[torch.Tensor] = None
         # Device [k]: leader row first, then member_rows (frontier-row order).
         self.all_rows: Optional[torch.Tensor] = None
-        # (tick, old_mapping, new_mapping) staged by the launch half; the
-        # deferred half turns them into freed slots (share-on-fork GC), gated
-        # on the tick whose copy_done sync already happened.
-        self.pending_orphans: List = []
+        # StagedOrphans from the launch half; the deferred half turns them into
+        # freed slots (share-on-fork GC), gated on the tick whose copy_done
+        # sync already happened.
+        self.pending_orphans: List[StagedOrphans] = []
         # Running total the GC has returned, so held KV is a host-side
         # arithmetic (allocated - freed) rather than a tensor read.
         self.slots_freed = 0

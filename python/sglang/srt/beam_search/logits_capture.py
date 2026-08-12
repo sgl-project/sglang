@@ -49,7 +49,7 @@ def capture_pre_sample_logits(
         n = batch.beam_tail.num_base_rows
         logits = logits_output.next_token_logits
         logits_output.next_token_logits = logits[:n]
-        leader_rows = [e[1] for e in batch.beam_tail.entries]
+        leader_rows = [e.leader_idx for e in batch.beam_tail.entries]
         logits_output.beam = BeamLogitsCapture(
             leader_logits=logits[leader_rows].clone(),
             tail_logits=logits[n:],

@@ -91,12 +91,9 @@ def joint_select(
     finished = is_stop & examined
     fin_rank = finished.long().cumsum(0)
 
-    surv_slot = torch.where(
-        survivor, non_stop_rank - 1, torch.full_like(non_stop_rank, k)
-    )
-    fin_slot = torch.where(
-        finished, fin_rank - 1, torch.full_like(fin_rank, num_candidates)
-    )
+    # Non-selected candidates all target the dump slot, sliced away below.
+    surv_slot = torch.where(survivor, non_stop_rank - 1, k)
+    fin_slot = torch.where(finished, fin_rank - 1, num_candidates)
 
     return SelectResult(
         next_tokens=_scatter_fixed(tokens, surv_slot, k),

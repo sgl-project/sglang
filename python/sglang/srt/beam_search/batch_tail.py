@@ -7,7 +7,7 @@ batch class carries only the beam_tail field and one-line hook calls.
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, List, Tuple
+from typing import TYPE_CHECKING, Any, List, NamedTuple
 
 import torch
 
@@ -15,13 +15,17 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
+class BeamTailEntry(NamedTuple):
+    group: Any
+    leader_idx: int  # index into batch.reqs
+    start: int  # tail-relative
+    end: int
+
+
 @dataclasses.dataclass
 class BeamTail:
-    """entries hold, per group in batch order: (group, leader index in reqs,
-    tail-relative start, tail-relative end)."""
-
     num_base_rows: int
-    entries: List[Tuple[Any, int, int, int]]
+    entries: List[BeamTailEntry]  # one per group, in batch order
 
 
 def append_beam_tail(batch: ScheduleBatch) -> None:
@@ -36,22 +40,24 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
     tails = []
     tails_cpu = []
     leader_idx = []
+    widths = []
     t = 0
     for i, req in enumerate(batch.reqs):
         group = req.beam_group
         if group is None or group.member_rows is None or group.retired:
             continue
         m = group.num_member_rows
-        entries.append((group, i, t, t + m))
+        entries.append(BeamTailEntry(group, i, t, t + m))
         tails.append(group.member_rows)
         tails_cpu.append(group.member_rows_cpu)
         leader_idx.append(i)
+        widths.append(m)
         t += m
     if not entries:
         return
 
     leader_idx_cpu = torch.tensor(leader_idx, dtype=torch.int64)
-    widths_cpu = torch.tensor([e[3] - e[2] for e in entries], dtype=torch.int64)
+    widths_cpu = torch.tensor(widths, dtype=torch.int64)
     leader_idx_dev = leader_idx_cpu.to(batch.device, non_blocking=True)
     widths_dev = widths_cpu.to(batch.device, non_blocking=True)
 

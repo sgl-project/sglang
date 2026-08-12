@@ -26,6 +26,7 @@ import torch
 from sglang.srt.beam_search.beam_group import BeamGroup, BeamGroupState
 from sglang.srt.beam_search.fork import (
     MEMBER_LENGTH_MARGIN,
+    StagedOrphans,
     alias_members_prompt_kv,
     collect_orphan_slots,
     free_member_rows,
@@ -61,6 +62,9 @@ def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
     [rows, vocab] log_softmax; topk order on the raw logits is identical
     (monotone shift). Returns fp32 [rows, 2k] values and int64 token ids.
     """
+    # Per piece, not on one concatenated tensor: logsumexp's CUDA reduction
+    # splits by row count, so folding the pieces together shifts the leader
+    # row's lse by an ulp and can flip topk order between near-equal beams.
     vals, toks = [], []
     for piece in pieces:
         if piece.shape[0] == 0:
@@ -368,13 +372,14 @@ class BeamCoordinator:
         if tail is None:
             return
         capture = logits_output.beam
-        for gi, (group, leader_idx, start, end) in enumerate(tail.entries):
+        for gi, entry in enumerate(tail.entries):
+            group = entry.group
             if group.retired or group.state != BeamGroupState.DECODING:
                 continue
             top_logprobs, top_tokens = _rows_topk_logprobs(
                 [
                     capture.leader_logits[gi : gi + 1],
-                    capture.tail_logits[start:end],
+                    capture.tail_logits[entry.start : entry.end],
                 ],
                 group.num_candidates,
             )
@@ -466,7 +471,7 @@ class BeamCoordinator:
                 # covers the KV computed through this step.
                 seq_len=group.leader.kv_committed_len,
             )
-            group.pending_orphans.append((tick, old_map, new_map))
+            group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
             group.leader.output_ids.append(0)  # length placeholder
         self._stash_next_tokens(rows, next_tokens)
 
@@ -483,9 +488,9 @@ class BeamCoordinator:
         if up_to_tick is None:
             staged, group.pending_orphans = group.pending_orphans, []
         else:
-            staged = [e for e in group.pending_orphans if e[0] <= up_to_tick]
+            staged = [e for e in group.pending_orphans if e.tick <= up_to_tick]
             group.pending_orphans = [
-                e for e in group.pending_orphans if e[0] > up_to_tick
+                e for e in group.pending_orphans if e.tick > up_to_tick
             ]
         if not staged:
             return
@@ -493,8 +498,8 @@ class BeamCoordinator:
         # pending list and free_group_end does not clear it, so an inner
         # begin/end pair inside the decode path's group double-frees.
         allocator = self.token_to_kv_pool_allocator
-        for _tick, old_map, new_map in staged:
-            orphans = collect_orphan_slots(old_map, new_map)
+        for entry in staged:
+            orphans = collect_orphan_slots(entry.old_mapping, entry.new_mapping)
             if orphans.numel():
                 group.slots_freed += orphans.numel()
                 allocator.free(orphans)
