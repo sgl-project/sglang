@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
@@ -146,6 +147,8 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+
+logger = logging.getLogger(__name__)
 
 _is_cpu = is_cpu()
 _is_hip = is_hip()
@@ -543,6 +546,85 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
+    def _k3_situ_gfx942_int4_enabled(self, layer) -> bool:
+        if not envs.SGLANG_K3_SITU_GFX942_INT4.get():
+            return False
+        if getattr(layer.moe_runner_config, "activation", None) != "situ":
+            return False
+        try:
+            from aiter.jit.utils.chip_info import get_gfx
+
+            return get_gfx() == "gfx942"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _check_aiter_packed_int4_activation() -> None:
+        import inspect
+
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        if "act" not in inspect.signature(compile_moe_gemm1).parameters:
+            raise RuntimeError(
+                "SGLANG_K3_SITU_GFX942_INT4 needs an aiter carrying "
+                "ROCm/aiter#4471; this one computes SiLU instead of SiTUv2."
+            )
+
+    def _convert_k3_situ_weights_to_int4(self, layer) -> None:
+        """Requantize MXFP4 experts to int4 with a groupwise-32 bf16 scale."""
+        from aiter import dtypes as _adt
+        from aiter.ops.quant import per_1x32_i4_quant
+        from aiter.ops.shuffle import (
+            pack_int8_to_packed_int4,
+            shuffle_scale_for_int4,
+            shuffle_weight,
+        )
+        from aiter.utility import fp4_utils
+
+        self._check_aiter_packed_int4_activation()
+        logger.warning(
+            "Requantizing Kimi-K3's MXFP4 experts to int4 for gfx942. e2m1 is "
+            "non-uniform and int4 is not, so this re-grids every weight."
+        )
+
+        fp4_dtype = torch.float4_e2m1fn_x2
+        e8m0_dtype = torch.float8_e8m0fnu
+
+        def _convert(w_param, s_param):
+            w_f32 = fp4_utils.mxfp4_to_f32(w_param.data.view(fp4_dtype))
+            s_f32 = fp4_utils.e8m0_to_f32(s_param.data.view(e8m0_dtype))
+            E, N, K = w_f32.shape
+            w_deq = (
+                (w_f32.view(E, N, K // 32, 32) * s_f32.view(E, N, K // 32, 1))
+                .view(E, N, K)
+                .to(torch.bfloat16)
+            )
+            del w_f32, s_f32
+            w_qt, w_scale = per_1x32_i4_quant(w_deq)
+            del w_deq
+            w_qt = w_qt.view(_adt.i4x2).view(E, N, K)
+            w_packed = pack_int8_to_packed_int4(
+                shuffle_weight(w_qt.view(_adt.i8), (16, 16))
+            )
+            w_packed = w_packed.view(E, N, K // 2).view(_adt.i4x2)
+            w_scale_shuf = (
+                shuffle_scale_for_int4(w_scale, group_size=32).view(-1).contiguous()
+            )
+            del w_qt, w_scale
+            torch.cuda.empty_cache()
+            return w_packed, w_scale_shuf
+
+        w13, w13_scale = _convert(layer.w13_weight, layer.w13_weight_scale)
+        w2, w2_scale = _convert(layer.w2_weight, layer.w2_weight_scale)
+
+        layer.w13_weight.data = w13
+        layer.w2_weight.data = w2
+        layer.w13_weight_scale.data = w13_scale
+        layer.w2_weight_scale.data = w2_scale
+        layer.w13_weight.is_shuffled = True
+        layer.w2_weight.is_shuffled = True
+        self._k3_situ_int4 = True
+
     def process_weights_after_loading(self, layer):
         if self.use_marlin:
             from sglang.srt.layers.quantization.marlin_utils import (
@@ -846,6 +928,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
             if getattr(layer, "w2_weight_bias", None) is not None:
                 layer.w2_weight_bias.data = layer.w2_weight_bias.data.to(torch.float32)
+
+            if self._k3_situ_gfx942_int4_enabled(layer):
+                self._convert_k3_situ_weights_to_int4(layer)
+                return
 
             e, n, k = layer.w13_weight.shape
             gate_up_interleaved = getattr(
@@ -1690,7 +1776,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 AiterQuantType,
             )
 
-            if hasattr(torch, "float4_e2m1fn_x2"):
+            if getattr(self, "_k3_situ_int4", False):
+                w13_weight = layer.w13_weight
+                w2_weight = layer.w2_weight
+            elif hasattr(torch, "float4_e2m1fn_x2"):
                 w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
                 w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
             else:

@@ -688,6 +688,8 @@ class Envs:
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+    # Requantize Kimi-K3's MXFP4 experts to int4 on gfx942 (lossy, opt-in).
+    SGLANG_K3_SITU_GFX942_INT4 = EnvBool(False)
 
     # Quantization (Humming)
     SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)
