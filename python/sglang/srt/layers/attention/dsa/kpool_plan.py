@@ -116,9 +116,6 @@ class KPoolWritePlan:
     write_loc: torch.Tensor  # int64 [B, max_closed_pools]
     num_draft_tokens: int
     pool_seqlens_per_q: Optional[torch.Tensor] = None
-    # DeepGEMM supports a compact [B, N] query/schedule layout for small
-    # speculative batches.  Keep a stable view in the plan for graph replay.
-    pool_seqlens_per_q_2d: Optional[torch.Tensor] = None
     seqlens_per_q: Optional[torch.Tensor] = None
     pool_schedule_metadata: Optional[torch.Tensor] = None
     effective_n_per_batch: Optional[torch.Tensor] = None
@@ -569,11 +566,8 @@ def _compute_pool_schedule_metadata(
     deep_gemm = _get_deep_gemm()
     if deep_gemm is None:
         return None
-    context_lens = pool_seqlens.contiguous()
-    if context_lens.dim() == 1:
-        context_lens = context_lens.unsqueeze(-1)
     return deep_gemm.get_paged_mqa_logits_metadata(
-        context_lens.clamp(min=1),
+        pool_seqlens.contiguous().view(-1, 1).clamp(min=1),
         slots_per_page,
         deep_gemm.get_num_sms(),
     )
@@ -679,14 +673,8 @@ def _alloc_kpool_write_plan_buffers(
     verify_extras = {}
     if is_verify:
         n_rows = max_bs * num_draft_tokens
-        pool_seqlens_per_q = torch.zeros(n_rows, dtype=torch.int32, device=device)
         verify_extras = dict(
-            pool_seqlens_per_q=pool_seqlens_per_q,
-            pool_seqlens_per_q_2d=(
-                pool_seqlens_per_q.view(max_bs, num_draft_tokens)
-                if num_draft_tokens <= 6
-                else None
-            ),
+            pool_seqlens_per_q=torch.zeros(n_rows, dtype=torch.int32, device=device),
             seqlens_per_q=torch.zeros(n_rows, dtype=torch.int32, device=device),
         )
     if is_v2:
@@ -731,11 +719,7 @@ def init_kpool_write_plan_capture(
     )
     if is_verify and build_schedule_metadata:
         schedule = _compute_pool_schedule_metadata(
-            (
-                plan.pool_seqlens_per_q_2d
-                if plan.pool_seqlens_per_q_2d is not None
-                else plan.pool_seqlens_per_q
-            ),
+            plan.pool_seqlens_per_q,
             slots_per_page=slots_per_page,
         )
         plan = dataclasses.replace(plan, pool_schedule_metadata=schedule)
@@ -799,11 +783,7 @@ def update_kpool_write_plan(
     # captured kernel replays.
     if include_deep_gemm_schedule and plan.pool_schedule_metadata is not None:
         new_schedule = _compute_pool_schedule_metadata(
-            (
-                plan.pool_seqlens_per_q_2d
-                if plan.pool_seqlens_per_q_2d is not None
-                else plan.pool_seqlens_per_q
-            ),
+            plan.pool_seqlens_per_q,
             slots_per_page=slots_per_page,
         )
         if new_schedule is not None:
