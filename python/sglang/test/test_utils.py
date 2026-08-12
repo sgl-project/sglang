@@ -2241,12 +2241,7 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
-# Sized for the largest scheduled-suite models. Observed in a nightly run: the
-# class after test_ring_2_5_1t (1T params, ~122 GiB on each of 8 GPUs) failed
-# setUpClass with "GPU 0 uses 122.22 GiB" -- the server process had exited well
-# inside 30s but the driver had not returned the memory. Free when the GPUs are
-# already idle: the first poll returns immediately.
-_GPU_IDLE_TIMEOUT_SECS = 180.0
+_GPU_IDLE_TIMEOUT_SECS = 30.0
 _GPU_IDLE_POLL_INTERVAL_SECS = 2.0
 _GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
 
