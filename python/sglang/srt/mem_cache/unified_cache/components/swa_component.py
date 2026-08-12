@@ -233,11 +233,7 @@ class SWAComponent(TreeComponent):
     ) -> MatchResult:
         ct = self.component_type
         root = self.tree_core.root_node
-        swa_boundary_len = 0
-        node = result.best_match_node
-        while node is not root:
-            swa_boundary_len += len(node.key)
-            node = node.parent
+        swa_boundary_len = len(result.device_indices) + result.host_hit_length
 
         page_size = self.tree_core.page_size
         aligned_seqlen = (result.full_kv_hit_length // page_size) * page_size

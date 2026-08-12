@@ -189,9 +189,9 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
-        swa_branching_seqlen: The deepest page-aligned Full-KV hit that can be
-                              materialized as an SWA branch by ending a prefill
-                              chunk at that position.
+        swa_branching_seqlen: The SWA radix cache branching point, which is the longest
+                              page-aligned position that could've been cache hit if there
+                              exists an SWA window.
         full_kv_hit_length: Longest Full-KV prefix available on either device or
                             host, independent of other components.
     """
