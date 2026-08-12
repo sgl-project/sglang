@@ -13,7 +13,6 @@ from sglang.multimodal_gen.configs.models.adapter.ltx_2_duration_head import (
 from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_diffusion_decoder import (
     LTX25DiffusionDecoderConfig,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -72,8 +71,12 @@ class AdapterLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
+        # Ask about the component actually being loaded: this loader also serves
+        # `duration_head` and `diffusion_decoder`, which the offload policy
+        # answers differently from `connectors` (the latter follows
+        # `dit_cpu_offload`, the other two default to staying resident).
         target_device = self.target_device(
-            server_args.should_cpu_offload_component("connectors")
+            server_args.should_cpu_offload_component(component_name)
         )
         default_dtype = resolve_precision(
             server_args, component_name, precision_attr="dit_precision"
