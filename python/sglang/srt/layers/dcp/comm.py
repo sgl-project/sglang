@@ -500,7 +500,6 @@ def dcp_a2a_lse_reduce(
         send_combined.reshape(-1).view(torch.uint8),
     )
 
-    # The combine kernel takes strides, so it reads the packed buffer in place.
     recv_output = recv_combined[:, :B, :, :D]
     recv_lse = recv_combined.view(torch.float32)[:, :B, :, D // lpd]
 

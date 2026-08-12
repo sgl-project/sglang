@@ -398,12 +398,7 @@ def _dcp_pack_a2a_send_kernel(
     WORDS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Scatter one (batch, head) partial into its peer's a2a send slot.
-
-    Grid: (B, H). Head h belongs to peer h // H_PER_RANK. Everything is moved as
-    fp32 words so the same kernel serves bf16/fp16/fp8 outputs: the payload is
-    copied verbatim and the fp32 LSE lands in the trailing word.
-    """
+    """Scatter one (batch, head) partial into its peer's a2a send slot."""
     b = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1).to(tl.int64)
 
@@ -430,9 +425,8 @@ def dcp_pack_a2a_send(
 ) -> None:
     """Pack ``[B, H, D]`` partials + ``[B, H]`` LSE into the a2a send buffer.
 
-    ``send_combined`` is ``[N, B_max, H // N, D + lse_pack_dim]`` in the output
-    dtype; rows beyond ``B`` are left untouched (the receiver slices to ``B``).
-    Replaces a permute-contiguous plus two strided ``copy_`` launches.
+    ``send_combined`` is ``[N, B_max, H // N, D + lse_pack_dim]``; rows beyond
+    ``B`` are left untouched.
     """
     B, H, D = cp_attn_out.shape
     N, B_max, H_per_rank, row_width = send_combined.shape
@@ -448,7 +442,6 @@ def dcp_pack_a2a_send(
             f"out {tuple(cp_attn_out.shape)}"
         )
 
-    # fp32 views: [B, H, WORDS] and [N, B_max, H_per_rank, WORDS + 1].
     out_words = cp_attn_out.view(torch.float32)
     send_words = send_combined.view(torch.float32)
     words = D // lpd

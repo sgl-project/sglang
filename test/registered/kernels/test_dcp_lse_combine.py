@@ -453,11 +453,6 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
         self.assertFalse(torch.isnan(result).any())
 
     def test_pack_matches_the_copy_formulation_it_replaces(self):
-        """The packed row is payload words followed by the fp32 LSE in the
-        trailing word. Pin the layout against the permute+bitcast copies it
-        replaces: a wrong lane index or word count still produces a
-        well-formed buffer, and only shows up as garbage weights after the
-        all-to-all."""
         from sglang.kernels.ops.attention.dcp_kernels import (
             _lse_pack_dim,
             dcp_pack_a2a_send,
@@ -480,7 +475,6 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
                 )
                 dcp_pack_a2a_send(out, lse, got)
 
-                # Reference: the permute + fp32->out-dtype bitcast copies.
                 want = torch.zeros_like(got)
                 want[:, :B, :, :D] = out.view(B, N, H_per_rank, D).permute(1, 0, 2, 3)
                 want[:, :B, :, D:] = (
@@ -490,15 +484,10 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
                     .view(dtype)
                     .view(N, B, H_per_rank, lpd)
                 )
-                # Compare raw bytes: an fp32 LSE reinterpreted as output-dtype
-                # lanes is frequently a NaN bit pattern, and torch.equal reports
-                # NaN != NaN even when the bits are identical.
                 self.assertTrue(
                     torch.equal(got.view(torch.uint8), want.view(torch.uint8))
                 )
 
-                # And the LSE reads back bit-exactly through the fp32 lane the
-                # combine kernel indexes.
                 lane = got.view(torch.float32)[:, :B, :, D // lpd]
                 self.assertTrue(
                     torch.equal(lane, lse.view(B, N, H_per_rank).permute(1, 0, 2))
