@@ -392,7 +392,6 @@ class Runtime:
         for port in range(requested_port, 40000):
             if is_port_available(port):
                 break
-        kwargs = ServerArgs._remap_legacy_kwargs(kwargs)
         self.server_args = ServerArgs(*args, log_level=log_level, port=port, **kwargs)
 
         self.url = self.server_args.url()

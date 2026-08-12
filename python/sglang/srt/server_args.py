@@ -39,7 +39,6 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
     LoRAPathAction,
-    print_deprecated_warning,
 )
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
@@ -3520,17 +3519,6 @@ class ServerArgs:
         "The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
         NS("observability"),
     ] = None
-
-    @classmethod
-    def _remap_legacy_kwargs(cls, kwargs: dict) -> dict:
-        """Accept flags the CLI still takes as deprecated aliases."""
-        if kwargs.pop("language_model_only", False):
-            print_deprecated_warning(
-                "'language_model_only' is deprecated and will be removed in a "
-                "future release. Use 'language_only' instead."
-            )
-            kwargs["language_only"] = True
-        return kwargs
 
     def __post_init__(self):
         """
@@ -8578,13 +8566,6 @@ class ServerArgs:
             help="[Deprecated] Use --incremental-streaming-output instead.",
         )
         parser.add_argument(
-            "--language-model-only",
-            action=DeprecatedStoreTrueAction,
-            dest="language_model_only",
-            new_flag="--language-only",
-            help="[Deprecated] Use --language-only instead.",
-        )
-        parser.add_argument(
             "--prefill-round-robin-balance",
             action=DeprecatedAction,
             help="Note: --prefill-round-robin-balance is deprecated now.",
@@ -8786,10 +8767,7 @@ class ServerArgs:
         attrs = [
             attr.name for attr in dataclasses.fields(cls) if hasattr(args, attr.name)
         ]
-        kwargs = {attr: getattr(args, attr) for attr in attrs}
-        if getattr(args, "language_model_only", False):
-            kwargs["language_only"] = True
-        return cls(**kwargs)
+        return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def get_tokenizer_worker_class(self):
         from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker

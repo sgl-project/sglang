@@ -235,9 +235,7 @@ class RayEngine(Engine):
         self._placement_group = kwargs.pop("placement_group", None)
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
-        super().__init__(
-            server_args=ServerArgs(**ServerArgs._remap_legacy_kwargs(kwargs))
-        )
+        super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""

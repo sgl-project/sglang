@@ -240,7 +240,6 @@ class Engine(EngineScoreMixin, EngineBase):
             if "log_level" not in kwargs:
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
-            kwargs = self.server_args_class._remap_legacy_kwargs(kwargs)
             server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
         logger.info(f"{server_args=}")

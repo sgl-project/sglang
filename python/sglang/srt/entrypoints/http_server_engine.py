@@ -54,7 +54,7 @@ class HttpServerEngineAdapter(EngineBase):
     """
 
     def __init__(self, **kwargs):
-        self.server_args = ServerArgs(**ServerArgs._remap_legacy_kwargs(kwargs))
+        self.server_args = ServerArgs(**kwargs)
         print(
             f"Launch HttpServerEngineAdapter at: {self.server_args.host}:{self.server_args.port}"
         )
