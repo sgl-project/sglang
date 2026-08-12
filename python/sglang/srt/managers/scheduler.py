@@ -2938,6 +2938,21 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+    def _contains_last_prefill_chunk(self, can_run_list: List[Req]) -> bool:
+        """Whether any request in this batch consumes the sampled token.
+
+        False only for a batch of pure middle chunks, whose sampled tokens
+        nobody reads -- the case that lets PP skip output communication
+        entirely (`_pp_can_skip_output_comm`).
+
+        Derived from batch membership rather than from the batch size. The
+        former `len(can_run_list) != 1` was a proxy for "the chunked request is
+        the sole member" and misreads the parked case: `chunked_req` is set but
+        was not admitted to the batch (see `_count_inflight_chunk`), so the one
+        request present does finish its prefill and does consume its token.
+        """
+        return any(req is not self.chunked_req for req in can_run_list)
+
     def _count_inflight_chunk(self, batch_reqs: AbstractSet[Req]) -> None:
         """Mark the chunked request as having a chunk in flight this batch.
 
@@ -3429,8 +3444,8 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
 
-        new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+        new_batch.contains_last_prefill_chunk = self._contains_last_prefill_chunk(
+            can_run_list
         )
 
         if self.enable_hierarchical_cache:
@@ -3473,6 +3488,10 @@ class Scheduler(
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
+                # Decode requests are merged in after the flag was computed
+                # above, and every one of them consumes the sampled token, so
+                # the batch is no longer pure middle chunks.
+                new_batch.contains_last_prefill_chunk = True
             running_batch = ScheduleBatch(
                 reqs=[], batch_is_full=running_batch.batch_is_full
             )
