@@ -16,20 +16,18 @@ use crate::pb::{
 };
 
 /// Protocol-level resource bounds, enforced before a backend sees the request so
-/// no caller can make one allocate or schedule work proportional to an unbounded
-/// repeated field.
+/// no caller can make it allocate work proportional to an unbounded field.
 const MAX_HASHES_PER_REQUEST: usize = 16_384;
 const MAX_ACTIONS_PER_BATCH: usize = 256;
 pub const DEFAULT_PREFIX_QUERY_MAX_INFLIGHT: usize = 32;
 
 static OVERLOAD_LOG: RejectionLog = RejectionLog::new();
 
-/// Storage backend for the indexer. Deliberately narrow: every mutation flows
-/// through `apply_external_kv_batch`, preserving one ordered write path.
+/// Storage backend for the indexer. Every mutation flows through
+/// `apply_external_kv_batch`, preserving one ordered write path.
 ///
-/// Async so a backend that does IO fits without reshaping the trait, even though
-/// this build's is process-local. Made dyn-safe via `#[tonic::async_trait]` so the
-/// server can select a backend at runtime and hold it as `Arc<dyn KvIndexerBackend>`.
+/// Async so a backend that does IO fits without reshaping the trait, and
+/// dyn-safe so the server can hold it as `Arc<dyn KvIndexerBackend>`.
 #[tonic::async_trait]
 pub trait KvIndexerBackend: Send + Sync + 'static {
     /// Applies a whole SGLang KVEventBatch. The actions are pre-validated and
@@ -48,11 +46,9 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
     /// Collects the per-worker, per-block component placement needed to compute a
     /// prefix, aligned with `hashes`.
     ///
-    /// The default implementation is component-blind: it composes
-    /// `match_external_kv` and treats every held block as a legacy whole-block
-    /// placement (no components, no size, no spec). Component-aware backends
-    /// override it to attach each worker's `WorkerCacheSpec` and the resident
-    /// component set per `(hash, tier)`.
+    /// The default implementation is component-blind: every held block becomes a
+    /// legacy whole-block placement. Component-aware backends override it to
+    /// attach each worker's `WorkerCacheSpec` and the resident component set.
     async fn collect_worker_prefix_inputs(
         &self,
         hashes: &[String],
@@ -69,16 +65,12 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
     /// Answers, per worker, the longest reusable request prefix it holds.
     ///
     /// This default implementation *is* the written definition of the prefix
-    /// semantics: it collects each worker's component placement (see
-    /// [`KvIndexerBackend::collect_worker_prefix_inputs`]) and runs the shared
-    /// rule engine ([`compute_prefix_response`]), so any backend that overrides
-    /// it for performance must stay field-for-field identical (except
-    /// `blocks_read`, which is observability, not semantics).
+    /// semantics, so a backend that overrides it for performance must stay
+    /// field-for-field identical except for `blocks_read`, which is
+    /// observability rather than semantics.
     ///
-    /// The result is a safe lower bound of what the worker can actually reuse: a
-    /// component-aware match applies each required component's rule (contiguous /
-    /// trailing-window / exact-boundary), so the indexer can only under-report,
-    /// never over-report, whenever its index state is accurate.
+    /// The result is a safe lower bound: every required component's rule is
+    /// applied, so an accurate index can only under-report, never over-report.
     async fn match_external_kv_prefix(
         &self,
         request: MatchExternalKvPrefixRequest,
@@ -189,8 +181,7 @@ where
         // of the backlog needs to drain.
         reject_if_deadline_passed(&metadata, &extensions)?;
         validate_hashes(&request.hashes)?;
-        // Bounds a backend that holds this permit across IO; see `admission` for
-        // why that cannot observe a process-local one.
+        // Caps concurrent prefix queries; excess is rejected, never queued.
         let _permit = self.prefix_query_semaphore.try_acquire().map_err(|_| {
             if let Some(rejected_total) = OVERLOAD_LOG.record() {
                 tracing::warn!(
@@ -260,9 +251,8 @@ fn validate_tier(tier: i32) -> Result<(), Status> {
 }
 
 fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
-    // An empty actions list is accepted and applied as a no-op; it only refreshes
-    // the worker's recorded address. Non-empty batches still have every action
-    // validated below.
+    // An empty actions list is a no-op that only refreshes the worker's recorded
+    // address. Non-empty batches still have every action validated below.
     if actions.len() > MAX_ACTIONS_PER_BATCH {
         return Err(Status::resource_exhausted(format!(
             "batch contains {} actions; maximum is {MAX_ACTIONS_PER_BATCH}",
@@ -320,9 +310,8 @@ pub(crate) fn prefix_limit(len: usize, max_blocks: u32) -> usize {
     }
 }
 
-/// KV component bits. The set and their rules are fixed (a component's rule is a
-/// property of its type), so the indexer applies fixed semantics, not a
-/// per-worker rule binding.
+/// KV component bits. Each component's rule is a property of its type, so the
+/// indexer applies fixed semantics rather than a per-worker rule binding.
 pub const COMPONENT_FULL: u32 = 1 << 0;
 pub const COMPONENT_SWA: u32 = 1 << 1;
 pub const COMPONENT_MAMBA: u32 = 1 << 2;
@@ -369,9 +358,8 @@ pub struct WorkerPrefixInput {
     pub blocks: Vec<Option<BlockComponents>>,
 }
 
-/// Builds component-blind (legacy) prefix inputs from a `MatchExternalKv` result.
-/// Each block the worker holds becomes a whole-block placement (mask `0`) with no
-/// size and no spec — reproducing the pre-component behaviour.
+/// Builds component-blind (legacy) prefix inputs from a `MatchExternalKv` result:
+/// each held block becomes a whole-block placement (mask `0`, no size, no spec).
 pub(crate) fn legacy_inputs_from_match(
     hashes: &[String],
     matched: &MatchExternalKvResponse,
@@ -411,8 +399,7 @@ pub(crate) fn legacy_inputs_from_match(
 }
 
 /// Runs the component-aware rule engine over each worker and assembles the
-/// response. This is the single definition of the prefix semantics; every
-/// backend feeds the same engine so fast paths cannot drift from it.
+/// response. Every backend feeds this same engine, so fast paths cannot drift.
 pub(crate) fn compute_prefix_response(
     inputs: &[WorkerPrefixInput],
     blocks_read: u32,
@@ -534,8 +521,7 @@ fn component_available(
 }
 
 /// Sorts `(worker_id, address, prefix)` entries by prefix descending and builds
-/// the response, so `best_prefix_blocks` and the match order are derived in one
-/// place rather than per caller.
+/// the response, so `best_prefix_blocks` and the order come from one place.
 fn assemble_prefix_response(
     mut entries: Vec<(String, String, u32)>,
     blocks_read: u32,
@@ -756,9 +742,7 @@ mod tests {
     #[test]
     fn validate_actions_rejects_misaligned_side_arrays() {
         let base = action(ExternalKvActionType::ActionReport, hbm(), &["a", "b"]);
-        // Empty side arrays (legacy) are fine.
         assert!(validate_actions(std::slice::from_ref(&base)).is_ok());
-        // Aligned arrays are fine.
         let mut aligned = base.clone();
         aligned.component_masks = vec![COMPONENT_FULL, COMPONENT_FULL];
         aligned.block_sizes = vec![16, 16];
@@ -979,9 +963,8 @@ mod tests {
 
     #[test]
     fn missing_component_data_under_spec_excludes() {
-        // Spec requires full+swa, but the worker reported legacy whole-block
-        // placement (mask 0, e.g. the component flag was off): full itself cannot
-        // be confirmed, so it is excluded rather than over-reported.
+        // Spec requires full+swa but the worker reported legacy whole-block
+        // placement (mask 0), so full cannot be confirmed and it is excluded.
         let s = spec(COMPONENT_FULL | COMPONENT_SWA, 100, &[hbm()], &[hbm()], &[]);
         let blocks = vec![legacy_blk(), legacy_blk()];
         assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);

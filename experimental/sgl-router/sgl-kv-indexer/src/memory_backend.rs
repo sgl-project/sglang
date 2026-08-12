@@ -3,11 +3,9 @@
 
 //! Process-local storage backend for the KV Indexer.
 //!
-//! The complete placement view lives behind one [`RwLock`]. This makes an
-//! apply batch atomic within the process and gives every query a consistent
-//! snapshot without an external storage service. The state is intentionally
-//! soft: it is not shared with another server and is lost when the process
-//! exits.
+//! The complete placement view lives behind one [`RwLock`], making an apply batch
+//! atomic and every query a consistent snapshot. The state is soft: not shared
+//! with another server, and lost when the process exits.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -122,9 +120,8 @@ impl InMemoryKvIndexerBackend {
                         block
                             .placements
                             .insert((worker_id.clone(), action.tier), mask);
-                        // A legacy report carries no size, so 0 means "unknown"
-                        // and must not erase a count a component-aware report
-                        // already established for this block.
+                        // A legacy report carries no size, so 0 means
+                        // "unknown" and must not erase a known count.
                         if token_count > 0 {
                             block.token_count = token_count;
                         }
@@ -206,9 +203,8 @@ impl InMemoryKvIndexerBackend {
         hashes: &[String],
         with_blocks: bool,
     ) -> (Vec<WorkerView>, Vec<String>) {
-        // Keyed by a borrow of the stored worker id, which is copied once per
-        // worker in the result instead of once per scanned `(block, worker)`
-        // placement — a 512-block query over 15 workers walks 7,680 of those.
+        // Keyed by a borrow of the stored worker id, so it is copied once per
+        // worker in the result rather than once per scanned placement.
         let mut worker_order: Vec<&str> = Vec::new();
         let mut by_worker: HashMap<&str, WorkerView> = HashMap::new();
         let mut matched_hashes = Vec::new();

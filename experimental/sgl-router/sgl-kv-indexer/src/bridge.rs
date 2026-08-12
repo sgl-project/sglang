@@ -6,11 +6,10 @@
 //! Subscribes to a worker's ZMQ KV-event stream, decodes each batch, and
 //! forwards it to the indexer over gRPC.
 //!
-//! This is the basic build. It keeps a reconnect supervisor so the bridge can be
-//! started before SGLang, but it does not recover data: there is no sequence
-//! tracking, no replay of missed batches, no incarnation token, and no liveness
-//! heartbeat. A gap in the publisher's sequence is logged and otherwise ignored,
-//! and events produced while the bridge is disconnected are lost.
+//! It keeps a reconnect supervisor but does not recover data: no sequence
+//! tracking, no replay of missed batches, no incarnation token, no liveness
+//! heartbeat. A sequence gap is logged and ignored, and events produced while
+//! the bridge is disconnected are lost.
 
 use std::io::Cursor;
 use std::time::Duration;
@@ -130,23 +129,23 @@ fn classify_rpc(status: Status) -> BridgeError {
         | Code::NotFound
         | Code::AlreadyExists
         | Code::OutOfRange
-        | Code::ResourceExhausted
         | Code::Unauthenticated
         | Code::PermissionDenied
         | Code::Unimplemented
         | Code::DataLoss => BridgeError::PermanentRpc(status),
+        // RESOURCE_EXHAUSTED is the indexer shedding load or refusing an
+        // oversized batch. Reconnecting loses that batch's events, which costs
+        // routing accuracy; exiting loses every later batch too.
         _ => BridgeError::Rpc(status),
     }
 }
 
 /// A single indexer mutation, kept in the exact order it appeared in the event
-/// batch so that store/remove/clear operations on the same hash are never
-/// reordered relative to each other.
+/// batch so mutations on the same hash are never reordered.
 ///
 /// `Report` carries per-hash component metadata in arrays index-aligned with
-/// `hashes`: `masks[i]` is `None` for a legacy whole-block store and
-/// `Some(bitmask)` for a component-aware store; `block_sizes[i]` is the reported
-/// token count, `None` when the reporter did not supply one (legacy).
+/// `hashes`: `masks[i]` is `None` for a legacy whole-block store, and
+/// `block_sizes[i]` is the reported token count, `None` when none was supplied.
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Report {
@@ -169,10 +168,9 @@ struct EventActions {
 
 impl EventActions {
     /// Append a store for the block hashes of one `BlockStored`, coalescing only
-    /// with an immediately-preceding store to the same tier. Coalescing never
-    /// crosses a revoke/clear, so ordering (and therefore the final per-hash
-    /// state) is preserved. All hashes in this call share the event's component
-    /// mask and block size.
+    /// with an immediately-preceding store to the same tier and never across a
+    /// revoke/clear, so the final per-hash state is preserved. All hashes here
+    /// share the event's component mask and block size.
     fn report(
         &mut self,
         tier: i32,
@@ -232,10 +230,8 @@ pub async fn run_bridge(config: BridgeConfig) -> Result<(), BridgeError> {
     run_bridge_until(config, std::future::pending()).await
 }
 
-/// [`run_bridge`], but returns as soon as `shutdown` resolves.
-///
-/// An in-flight apply is simply dropped. This build does not track which batches
-/// the indexer acknowledged, so a batch interrupted by shutdown is lost.
+/// [`run_bridge`], but returns as soon as `shutdown` resolves. An in-flight apply
+/// is dropped: acknowledgements are not tracked, so that batch is lost.
 pub async fn run_bridge_until<F>(config: BridgeConfig, shutdown: F) -> Result<(), BridgeError>
 where
     F: std::future::Future<Output = ()>,
@@ -261,10 +257,8 @@ async fn supervise(config: BridgeConfig) -> Result<(), BridgeError> {
     // Supervisor loop: (re)connect to both the indexer and the ZMQ publisher,
     // run until a connection-level error, then back off and retry. Decode-level
     // problems are handled inside the session and never tear down the bridge.
-    //
-    // Reconnecting exists so the bridge can be started before SGLang and survive
-    // an indexer restart during joint debugging. It recovers the connection only:
-    // events published while disconnected are lost.
+    // Reconnecting recovers the connection only: events published while
+    // disconnected are lost.
     let mut delay = RECONNECT_MIN_DELAY;
     loop {
         match connect(&config).await {
@@ -399,9 +393,8 @@ async fn forward_raw_batch(
 }
 
 /// Maps a decoded `EventActions` into a single `ApplyExternalKvBatchRequest`,
-/// preserving the exact per-action order. A `ClearAll` is expanded, in place,
-/// into one `CLEAR_ALL_AT_TIER` action per configured clear tier so the batch
-/// carries the same semantics as the legacy per-tier revoke-all RPCs.
+/// preserving per-action order. A `ClearAll` is expanded in place into one
+/// `CLEAR_ALL_AT_TIER` action per configured clear tier.
 fn build_apply_request(
     config: &BridgeConfig,
     seq: u64,
@@ -419,9 +412,9 @@ fn build_apply_request(
                 r#type: ExternalKvActionType::ActionReport as i32,
                 tier,
                 hashes,
-                // Emit the per-hash arrays only when at least one hash carries
-                // component data; a fully-legacy report leaves them empty so the
-                // backend keeps the whole-block fast path.
+                // Emit the per-hash arrays only when some hash carries
+                // component data; a fully-legacy report leaves them empty so
+                // the backend keeps the whole-block fast path.
                 component_masks: encode_component_masks(&masks),
                 block_sizes: encode_block_sizes(&block_sizes),
             }),
@@ -455,9 +448,8 @@ fn build_apply_request(
     }
 }
 
-/// Maps per-hash component sets to the wire form. Returns an empty vector (the
-/// legacy signal) when no hash carries components, otherwise one mask
-/// per hash, with a legacy hash represented by an empty set.
+/// Maps per-hash component sets to the wire form: an empty vector (the legacy
+/// signal) when no hash carries components, otherwise one mask per hash.
 fn encode_component_masks(masks: &[Option<u32>]) -> Vec<u32> {
     if masks.iter().all(Option::is_none) {
         return Vec::new();
@@ -522,8 +514,8 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
     match event_type {
         "BlockStored" => {
             // At least 7 fields (the legacy schema); an 8th `component_types`
-            // slot is present when the producer runs with
-            // `--enable-kv-events-component-types`. Both shapes are accepted.
+            // slot appears with `--enable-kv-events-component-types`. Both
+            // shapes are accepted.
             if event.len() < 7 {
                 return Err(BridgeError::Decode(
                     "BlockStored must have at least 7 array fields".to_string(),
@@ -580,12 +572,9 @@ fn decode_hashes(value: &Value) -> Result<Vec<String>, BridgeError> {
         .collect()
 }
 
-/// Decodes the optional `component_types` slot of a `BlockStored` into a
-/// component bitmask.
-///
-/// `nil` (the default when the producer omits the field) maps to `None`, a
-/// legacy whole-block store. A msgpack array of labels folds into a bitmask;
-/// labels this build does not model are ignored (never counted).
+/// Decodes the optional `component_types` slot of a `BlockStored` into a component
+/// bitmask. `nil` maps to `None`, a legacy whole-block store; an array of labels
+/// folds into a bitmask, and labels this build does not model are ignored.
 fn decode_component_mask(value: &Value) -> Result<Option<u32>, BridgeError> {
     if matches!(value, Value::Nil) {
         return Ok(None);
@@ -631,9 +620,8 @@ fn medium_to_tier(medium: Option<&str>) -> Result<i32, BridgeError> {
 }
 
 /// Builds the worker's [`WorkerCacheSpec`] from the environment, `None` for a
-/// legacy / full-only worker (no `KV_INDEXER_CACHE_COMPONENTS`). Components have
-/// fixed rules, so the config only declares which are present, the SWA window,
-/// and each component's servable tiers:
+/// legacy / full-only worker. Rules are fixed, so the config only declares which
+/// components are present, the SWA window, and their servable tiers:
 ///
 /// ```text
 ///   KV_INDEXER_CACHE_COMPONENTS = full,swa      (present components; FULL implied)
@@ -1005,7 +993,6 @@ mod tests {
         for code in [
             Code::InvalidArgument,
             Code::FailedPrecondition,
-            Code::ResourceExhausted,
             Code::PermissionDenied,
         ] {
             assert!(classify_rpc(Status::new(code, "bad batch")).is_permanent());
@@ -1014,7 +1001,15 @@ mod tests {
         assert!(!classify_rpc(Status::deadline_exceeded("retry")).is_permanent());
     }
 
-    // --- ordering regressions (the whole point of the in-order rewrite) ---
+    /// Indexer backpressure must not take the bridge down: the router treats the
+    /// same code as recoverable, and a rejected batch is worth less than the
+    /// entire event stream.
+    #[test]
+    fn shed_batches_keep_the_bridge_alive() {
+        assert!(!classify_rpc(Status::resource_exhausted("batch too large")).is_permanent());
+    }
+
+    // --- ordering regressions ---
 
     #[test]
     fn remove_then_store_same_hash_keeps_order() {
@@ -1107,9 +1102,8 @@ mod tests {
 
     #[test]
     fn python_msgspec_bigram_tokens_golden_decodes() {
-        // token_ids contains Python tuples, encoded as nested msgpack arrays.
-        // The bridge intentionally ignores token payload shape and indexes the
-        // publisher-provided block hashes.
+        // token_ids contains Python tuples as nested msgpack arrays; the
+        // bridge ignores payload shape and indexes the published hashes.
         let payload = golden_bytes(concat!(
             "93cb3ff80000000000009197ab426c6f636b53746f726564916f",
             "c092920a1492141e02c0a347505503"
@@ -1122,9 +1116,8 @@ mod tests {
 
     #[test]
     fn python_msgspec_nil_medium_golden_is_safely_skipped() {
-        // The Python schema permits medium=None. Such events cannot be mapped
-        // to an Indexer tier, so they are isolated rather than poisoning the
-        // batch or inventing a placement.
+        // The Python schema permits medium=None; such events map to no
+        // Indexer tier, so they are isolated rather than given a placement.
         let payload = golden_bytes(concat!(
             "93cb00000000000000009297ab426c6f636b53746f7265649101",
             "c092050602c0c093ac426c6f636b52656d6f7665649102c0c0"

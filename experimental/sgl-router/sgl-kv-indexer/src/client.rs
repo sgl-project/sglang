@@ -4,13 +4,9 @@
 //! Router-facing client for the prefix-match query.
 //!
 //! A successful query distinguishes a real match from an empty result. Transport
-//! failures, deadlines, and server rejections remain errors so callers can fail
-//! the routing request instead of silently using a different signal.
-//!
-//! The surface is deliberately tiny (one trait, one method, one outcome type):
-//! the router intersects [`PrefixMatch::address`] with its own registered worker
-//! URLs and picks by its own load metric, so anything beyond address and prefix
-//! length would just be unused weight.
+//! failures, deadlines, and server rejections stay distinct errors so the caller
+//! chooses between degrading and failing the request, instead of silently using
+//! a different signal.
 
 use std::time::Duration;
 
@@ -21,8 +17,7 @@ use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::MatchExternalKvPrefixRequest;
 
 /// Default per-query deadline. Indexer failures are request failures, so this
-/// allows normal cross-host scheduling jitter without stalling requests for an
-/// unbounded duration.
+/// absorbs normal cross-host jitter without stalling a request indefinitely.
 pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_millis(100);
 /// Default process-local bound on prefix-query RPCs issued by one client.
 pub const DEFAULT_QUERY_MAX_INFLIGHT: usize = 32;
@@ -64,6 +59,25 @@ impl std::fmt::Display for PrefixIndexError {
 }
 
 impl std::error::Error for PrefixIndexError {}
+
+/// A configured endpoint that is not a usable gRPC target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidEndpoint {
+    endpoint: String,
+    reason: &'static str,
+}
+
+impl std::fmt::Display for InvalidEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid KV Indexer endpoint `{}`: {}",
+            self.endpoint, self.reason
+        )
+    }
+}
+
+impl std::error::Error for InvalidEndpoint {}
 
 /// Result of a successful prefix query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,27 +124,25 @@ pub trait PrefixIndex: Send + Sync {
 
 /// tonic-backed [`PrefixIndex`] with a lazily-established connection.
 pub struct GrpcPrefixIndex {
-    /// `None` when the endpoint URI could not be parsed; queries then fail as
-    /// [`PrefixIndexError::Unreachable`].
-    channel: Option<Channel>,
+    channel: Channel,
     deadline: Duration,
     prefix_query_semaphore: Semaphore,
 }
 
 impl GrpcPrefixIndex {
-    pub fn new(config: PrefixIndexConfig) -> Self {
+    /// Rejects an unusable endpoint instead of building a client that can only
+    /// fail, so a misconfigured address stops startup rather than silently
+    /// costing every request its cache affinity.
+    pub fn new(config: PrefixIndexConfig) -> Result<Self, InvalidEndpoint> {
         assert!(
             config.max_inflight > 0,
             "prefix query max inflight must be greater than zero"
         );
-        let channel = Endpoint::from_shared(config.endpoint)
-            .ok()
-            .map(|endpoint| endpoint.connect_lazy());
-        Self {
-            channel,
+        Ok(Self {
+            channel: parse_endpoint(&config.endpoint)?.connect_lazy(),
             deadline: config.query_deadline,
             prefix_query_semaphore: Semaphore::new(config.max_inflight),
-        }
+        })
     }
 
     fn try_acquire_prefix_query(&self) -> Result<SemaphorePermit<'_>, PrefixIndexError> {
@@ -143,15 +155,12 @@ impl GrpcPrefixIndex {
 #[tonic::async_trait]
 impl PrefixIndex for GrpcPrefixIndex {
     async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
-        let Some(channel) = self.channel.clone() else {
-            return Err(PrefixIndexError::Unreachable);
-        };
         if hashes.is_empty() {
             return Ok(PrefixOutcome::Empty);
         }
         let _permit = self.try_acquire_prefix_query()?;
 
-        let mut client = KvIndexerClient::new(channel);
+        let mut client = KvIndexerClient::new(self.channel.clone());
         let mut request = tonic::Request::new(MatchExternalKvPrefixRequest {
             // The bridge encodes block hashes as decimal strings; mirror it.
             hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
@@ -188,6 +197,33 @@ impl PrefixIndex for GrpcPrefixIndex {
     }
 }
 
+/// Validates the endpoint the operator configured. tonic itself only checks URI
+/// syntax, which accepts a host:port with no scheme and then fails on every
+/// connect, so the scheme and host are checked here.
+fn parse_endpoint(endpoint: &str) -> Result<Endpoint, InvalidEndpoint> {
+    let reject = |reason: &'static str| InvalidEndpoint {
+        endpoint: endpoint.to_string(),
+        reason,
+    };
+    let parsed =
+        Endpoint::from_shared(endpoint.to_string()).map_err(|_| reject("not a valid URI"))?;
+    // A `unix:` endpoint is fully specified by its socket path.
+    if endpoint.starts_with("unix:") {
+        return Ok(parsed);
+    }
+    match parsed.uri().scheme_str() {
+        None => Err(reject("missing scheme, expected http:// or https://")),
+        Some("http" | "https") => {
+            if parsed.uri().host().unwrap_or_default().is_empty() {
+                Err(reject("missing host"))
+            } else {
+                Ok(parsed)
+            }
+        }
+        Some(_) => Err(reject("unsupported scheme, expected http:// or https://")),
+    }
+}
+
 fn classify(code: tonic::Code) -> PrefixIndexError {
     match code {
         tonic::Code::Unavailable => PrefixIndexError::Unreachable,
@@ -219,13 +255,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn accepts_endpoints_the_client_can_actually_dial() {
+        for endpoint in [
+            "http://10.0.0.1:50051",
+            "https://indexer.svc:443",
+            "unix:/tmp/i",
+        ] {
+            assert!(
+                parse_endpoint(endpoint).is_ok(),
+                "{endpoint} should be accepted"
+            );
+        }
+    }
+
+    /// A host:port with no scheme parses as a URI but can never connect, which
+    /// is the misconfiguration that otherwise only shows up under traffic.
+    #[test]
+    fn rejects_endpoints_that_could_only_fail_at_query_time() {
+        for endpoint in [
+            "10.0.0.1:50051",
+            "indexer.svc",
+            "grpc://10.0.0.1:50051",
+            "http://",
+        ] {
+            let error = parse_endpoint(endpoint)
+                .expect_err(&format!("{endpoint} should be rejected"))
+                .to_string();
+            assert!(
+                error.contains(endpoint),
+                "error should name the endpoint: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn construction_fails_on_an_invalid_endpoint() {
+        assert!(GrpcPrefixIndex::new(PrefixIndexConfig::new("10.0.0.1:50051")).is_err());
+    }
+
     #[tokio::test]
     async fn local_admission_rejects_without_queueing() {
         let index = GrpcPrefixIndex::new(PrefixIndexConfig {
             endpoint: "http://127.0.0.1:1".to_string(),
             query_deadline: DEFAULT_QUERY_DEADLINE,
             max_inflight: 1,
-        });
+        })
+        .expect("valid endpoint");
 
         let permit = index.try_acquire_prefix_query().unwrap();
         assert_eq!(

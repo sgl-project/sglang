@@ -655,14 +655,23 @@ fn resolve_prefix_query(
     result: Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
     model: &str,
 ) -> Result<sgl_kv_indexer::PrefixOutcome, ApiError> {
+    use sgl_kv_indexer::PrefixIndexError;
     match result {
         Ok(outcome) => Ok(outcome),
-        Err(sgl_kv_indexer::PrefixIndexError::Overloaded) => {
-            tracing::warn!(%model, "KV Indexer overloaded; falling back to min-load routing");
+        // The prefix hit only improves worker choice, so an indexer that is
+        // shedding, slow, or down costs cache affinity — not availability.
+        Err(
+            error @ (PrefixIndexError::Overloaded
+            | PrefixIndexError::Timeout
+            | PrefixIndexError::Unreachable),
+        ) => {
+            tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
             Ok(sgl_kv_indexer::PrefixOutcome::Empty)
         }
+        // A rejection means the router and the indexer disagree on the request
+        // contract; degrading would hide that from every request.
         Err(error) => {
-            tracing::warn!(%model, error = %error, "KV Indexer query failed");
+            tracing::warn!(%model, error = %error, "KV Indexer rejected the query");
             Err(ApiError::PolicySelectionFailed {
                 model: model.to_string(),
             })
@@ -961,19 +970,32 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
 mod tests {
     use super::*;
 
+    /// An unavailable indexer must never fail a request that min-load routing
+    /// can still serve.
     #[test]
-    fn indexer_overload_degrades_to_empty_prefix_signal() {
-        assert_eq!(
-            resolve_prefix_query(Err(sgl_kv_indexer::PrefixIndexError::Overloaded), "tiny")
-                .unwrap(),
-            sgl_kv_indexer::PrefixOutcome::Empty
-        );
+    fn unavailable_indexer_degrades_to_empty_prefix_signal() {
+        for error in [
+            sgl_kv_indexer::PrefixIndexError::Overloaded,
+            sgl_kv_indexer::PrefixIndexError::Timeout,
+            sgl_kv_indexer::PrefixIndexError::Unreachable,
+        ] {
+            assert_eq!(
+                resolve_prefix_query(Err(error.clone()), "tiny").unwrap(),
+                sgl_kv_indexer::PrefixOutcome::Empty,
+                "{error} should degrade"
+            );
+        }
     }
 
     #[test]
-    fn non_overload_indexer_error_still_fails_selection() {
+    fn rejected_indexer_query_still_fails_selection() {
         assert!(matches!(
-            resolve_prefix_query(Err(sgl_kv_indexer::PrefixIndexError::Unreachable), "tiny"),
+            resolve_prefix_query(
+                Err(sgl_kv_indexer::PrefixIndexError::Rejected(
+                    sgl_kv_indexer::RpcCode::InvalidArgument
+                )),
+                "tiny"
+            ),
             Err(ApiError::PolicySelectionFailed { .. })
         ));
     }

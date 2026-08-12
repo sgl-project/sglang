@@ -36,18 +36,18 @@ FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
 RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work/sgl-router
 COPY experimental/sgl-router/Cargo.toml ./
-COPY experimental/sgl-kv-indexer/Cargo.toml ../sgl-kv-indexer/Cargo.toml
+COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
 # Stub a minimal src tree so cargo can resolve the workspace, generate
 # the lockfile (gitignored upstream), then prepare the chef recipe.
-RUN mkdir -p src ../sgl-kv-indexer/src/bin \
+RUN mkdir -p src sgl-kv-indexer/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
-    && echo "" > ../sgl-kv-indexer/src/lib.rs \
-    && echo "fn main() {}" > ../sgl-kv-indexer/src/bin/kv-indexer-server.rs \
-    && echo "fn main() {}" > ../sgl-kv-indexer/src/bin/kv-indexer-bridge.rs \
+    && echo "" > sgl-kv-indexer/src/lib.rs \
+    && echo "fn main() {}" > sgl-kv-indexer/src/bin/kv-indexer-server.rs \
+    && echo "fn main() {}" > sgl-kv-indexer/src/bin/kv-indexer-bridge.rs \
     && cargo generate-lockfile \
     && cargo chef prepare --recipe-path recipe.json \
-    && rm -rf src ../sgl-kv-indexer/src
+    && rm -rf src sgl-kv-indexer/src
 
 ######################## STAGE 2 — builder ##############################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
@@ -67,31 +67,24 @@ ENV PCRE2_SYS_STATIC=1
 
 COPY --from=chef /work/sgl-router/recipe.json ./recipe.json
 COPY --from=chef /work/sgl-router/Cargo.lock ./Cargo.lock
-COPY experimental/sgl-kv-indexer/Cargo.toml ../sgl-kv-indexer/Cargo.toml
+COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
 
-# Cook (compile + cache) the dep graph from the recipe. cargo-chef does not
-# recreate source stubs for path dependencies outside this workspace, so provide
-# the minimal Indexer targets while cooking and remove them before real sources.
-RUN mkdir -p ../sgl-kv-indexer/src/bin \
-    && echo "fn main() {}" > ../sgl-kv-indexer/build.rs \
-    && echo "" > ../sgl-kv-indexer/src/lib.rs \
-    && echo "fn main() {}" > ../sgl-kv-indexer/src/bin/kv-indexer-server.rs \
-    && echo "fn main() {}" > ../sgl-kv-indexer/src/bin/kv-indexer-bridge.rs \
-    && cargo chef cook --release --recipe-path recipe.json \
-    && rm -rf ../sgl-kv-indexer/src ../sgl-kv-indexer/build.rs
+# Cook (compile + cache) the dep graph from the recipe. The recipe carries every
+# workspace member's manifest, so chef recreates the Indexer's source stubs itself.
+RUN cargo chef cook --release --recipe-path recipe.json
 
 # Now bring in the real sources and the manifest they need.
 COPY experimental/sgl-router/Cargo.toml ./
 COPY experimental/sgl-router/src ./src
-COPY experimental/sgl-kv-indexer/Cargo.toml ../sgl-kv-indexer/Cargo.toml
-COPY experimental/sgl-kv-indexer/build.rs ../sgl-kv-indexer/build.rs
-COPY experimental/sgl-kv-indexer/proto ../sgl-kv-indexer/proto
-COPY experimental/sgl-kv-indexer/src ../sgl-kv-indexer/src
+COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+COPY experimental/sgl-router/sgl-kv-indexer/build.rs sgl-kv-indexer/build.rs
+COPY experimental/sgl-router/sgl-kv-indexer/proto sgl-kv-indexer/proto
+COPY experimental/sgl-router/sgl-kv-indexer/src sgl-kv-indexer/src
 
 # --locked is intentionally omitted: the lockfile is generated in-container
 # (gitignored upstream) and `cargo chef cook` may have mutated it during the
 # dep-cook step, so a strict --locked check would spuriously fail.
-RUN touch ../sgl-kv-indexer/build.rs \
+RUN touch sgl-kv-indexer/build.rs \
     && cargo build --release --bin sgl-router \
     && strip target/release/sgl-router
 

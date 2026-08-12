@@ -58,7 +58,6 @@ jobs:
           filters: |
             sgl_router:
               - 'experimental/sgl-router/**'
-              - 'experimental/sgl-kv-indexer/**'
               - '.github/workflows/pr-test-sgl-router.yml'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
       # `run-ci` label gate. Cheap workflow runs (e.g. docs-only PRs
@@ -161,17 +160,17 @@ jobs:
 
       - name: cargo check
         working-directory: experimental/sgl-router
-        run: cargo check --all-targets
+        run: cargo check --workspace --all-targets
 
       - name: cargo clippy
         working-directory: experimental/sgl-router
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo fmt
         working-directory: experimental/sgl-router
         run: |
           rustup toolchain install nightly --profile minimal --component rustfmt
-          cargo +nightly fmt -- --check
+          cargo +nightly fmt --all -- --check
 
       # cargo-deny 0.19.6+ required for CVSS 4.0 parsing.
       - name: Install cargo-deny
@@ -247,7 +246,7 @@ jobs:
         # the Qwen3-0.6B tokenizer.json. Filter is matched against the
         # full test path `tokenizer::parity::parity_matrix`; substring
         # `parity_matrix` is unique to that test.
-        run: cargo test --release -- --skip parity_matrix
+        run: cargo test --release --workspace -- --skip parity_matrix
 
       # Regenerate the cross-impl block-hash parity fixture and fail if it
       # differs from the committed file.  The Python script replicates

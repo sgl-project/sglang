@@ -61,8 +61,8 @@ whole-block events. `REPORT` replaces the component snapshot for one
 ## Build
 
 ```bash
-cd experimental/sgl-kv-indexer
-cargo build --release
+cd experimental/sgl-router
+cargo build --release -p sgl-kv-indexer
 ```
 
 This produces:
@@ -172,8 +172,12 @@ The Indexer returns every candidate sorted by prefix length; it does not choose
 a worker. When configured, it replaces the Router's local radix tree as the
 cache signal: the Router intersects Indexer results with its healthy candidates,
 and a successful query with no usable match selects by minimum active load.
-Indexer connection failures, timeouts, and rejected RPCs fail the Router request
-with `503`. The local radix tree is used only when no Indexer endpoint is
+Indexer connection failures, timeouts, and overload fall back to that same
+minimum-active-load selection, so an unreachable Indexer costs cache affinity
+rather than availability; a rejected RPC still fails the Router request with
+`503`, because it means the two sides disagree on the request contract. An
+endpoint the Router could never dial is rejected at startup instead of failing
+every query later. The local radix tree is used only when no Indexer endpoint is
 configured. The per-query deadline defaults to 100ms and can be changed with
 `--kv-indexer-query-timeout-ms`. The Router-side admission bound defaults to 32
 concurrent calls and can be changed with `--kv-indexer-query-max-inflight`.
@@ -187,8 +191,8 @@ component-aware result from one consistent in-memory snapshot.
 The Router and server apply separate admission bounds. The Router rejects a
 query locally when its `--kv-indexer-query-max-inflight` permits are exhausted;
 the server returns gRPC `RESOURCE_EXHAUSTED` when
-`KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT` is exhausted. Both surface as `503` from
-the authoritative Router path.
+`KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT` is exhausted. Both leave the request
+routed by minimum active load, logged at `WARN` on the Router.
 
 Every Router query publishes its timeout through the gRPC `grpc-timeout` header.
 The server timestamps arrival and returns `DEADLINE_EXCEEDED` before backend work

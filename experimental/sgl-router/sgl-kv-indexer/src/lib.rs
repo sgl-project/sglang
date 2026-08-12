@@ -19,8 +19,8 @@ mod shutdown;
 
 pub use admission::stamp_arrival;
 pub use client::{
-    GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig, PrefixIndexError, PrefixMatch, PrefixOutcome,
-    DEFAULT_QUERY_MAX_INFLIGHT,
+    GrpcPrefixIndex, InvalidEndpoint, PrefixIndex, PrefixIndexConfig, PrefixIndexError,
+    PrefixMatch, PrefixOutcome, DEFAULT_QUERY_MAX_INFLIGHT,
 };
 pub use memory_backend::InMemoryKvIndexerBackend;
 pub use service::{
@@ -28,3 +28,6 @@ pub use service::{
     COMPONENT_FULL, COMPONENT_MAMBA, COMPONENT_SWA, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT,
 };
 pub use shutdown::shutdown_signal;
+/// Re-exported because [`PrefixIndexError::Rejected`] carries it, so callers can
+/// match on a rejection without depending on tonic.
+pub use tonic::Code as RpcCode;

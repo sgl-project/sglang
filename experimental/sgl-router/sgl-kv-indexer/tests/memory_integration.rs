@@ -135,9 +135,8 @@ itest!(duplicate_report_is_idempotent, b, {
 });
 
 itest!(identical_batch_replay_is_idempotent, b, {
-    // A batch that stores then removes then stores again the same hash; the net
-    // state is "stored". Re-delivering the identical batch must not change it,
-    // since every individual mutation is idempotent.
+    // Stores, removes, then stores the same hash again; the net state is
+    // "stored". Re-delivering the identical batch must not change it.
     let batch = apply_req(
         "w1",
         "a",
@@ -246,8 +245,7 @@ itest!(recomputed_split_reports_only_materialized_hashes, b, {
 
 itest!(recomputed_batch_replay_keeps_cpu_copy, b, {
     // Re-materializing on GPU must not revoke the existing host backup, and
-    // re-delivering the same batch must leave both tiers unchanged because the
-    // individual mutations are idempotent.
+    // re-delivering the same batch must leave both tiers unchanged.
     b.apply_external_kv_batch(apply_req(
         "w1",
         "a",
@@ -429,8 +427,8 @@ itest!(
 
 itest!(full_revoke_drops_hit_key, b, {
     // Report a block, count a hit (creates the co-located :h key), then fully
-    // revoke it. The hit key must be removed together with placement; otherwise a
-    // matched-then-evicted block would otherwise leak its counter forever.
+    // revoke it. The hit key must go with the placement, or a
+    // matched-then-evicted block leaks its counter forever.
     b.apply_external_kv_batch(apply_req(
         "w1",
         "a",
@@ -461,7 +459,6 @@ itest!(full_revoke_drops_hit_key, b, {
     .await
     .unwrap();
 
-    // Placement is gone.
     let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
     assert!(resp.matches.is_empty());
 
@@ -549,11 +546,10 @@ itest!(batch_action_order_is_preserved, b, {
 
 // --- prefix query: backend override vs. the trait's default implementation ---
 //
-// The default `match_external_kv_prefix` (composed from `match_external_kv`) is
-// the written semantics; the backend override is a read optimization. It
-// must stay field-for-field identical on the parts that ARE the contract
-// (per-worker prefix set and best_prefix_blocks); `blocks_read` is observability
-// and legitimately differs, so it is not compared.
+// The trait default is the written semantics and the backend override is a read
+// optimization, so they must agree field-for-field on the parts that ARE the
+// contract (per-worker prefix set and best_prefix_blocks). `blocks_read` is
+// observability and legitimately differs, so it is not compared.
 
 /// Delegates every RPC to an in-memory backend EXCEPT `match_external_kv_prefix`,
 /// which it leaves to the trait default — giving a reference answer computed from
@@ -576,9 +572,8 @@ impl KvIndexerBackend for DefaultViaMemory {
         self.0.match_external_kv(request).await
     }
 
-    // Delegate the component-aware read to the same backend so the trait-default
-    // `match_external_kv_prefix` computes over the same placement + specs the
-    // fast path sees — the parity contract covers component-aware data too.
+    // Delegate the component-aware read to the same backend so the trait
+    // default computes over the same placement and specs the fast path sees.
     async fn collect_worker_prefix_inputs(
         &self,
         hashes: &[String],

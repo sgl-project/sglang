@@ -436,14 +436,13 @@ async fn start_recording_deadlines(
         endpoint,
         query_deadline,
         max_inflight: sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT,
-    });
+    })
+    .expect("test endpoint is valid");
     (index, seen)
 }
 
-/// The router-facing client must publish its deadline on the wire, since that
-/// header is the only thing letting the indexer shed a query whose caller has
-/// already given up. Nothing else in the suite covers `GrpcPrefixIndex` itself,
-/// so without this the header could be dropped silently.
+/// The router-facing client must publish its deadline on the wire: that header is
+/// the only thing letting the indexer shed a query whose caller gave up.
 #[tokio::test]
 async fn router_client_publishes_its_deadline_on_the_wire() {
     let (index, seen) = start_recording_deadlines(Duration::from_millis(250)).await;
@@ -460,9 +459,9 @@ async fn router_client_publishes_its_deadline_on_the_wire() {
         "exactly one query reached the server: {seen:?}"
     );
     let raw = &seen[0];
-    // Asserted structurally rather than byte-for-byte: the wire spec lets the
-    // sender pick any unit that fits, so pinning tonic's current choice would
-    // make this fail on an encoding change that is still correct.
+    // Asserted structurally, not byte-for-byte: the wire spec lets the sender
+    // pick any unit that fits, so pinning tonic's choice would fail on a
+    // change that is still correct.
     let (digits, unit) = raw.split_at(raw.len() - 1);
     assert!(
         matches!(unit, "H" | "M" | "S" | "m" | "u" | "n"),

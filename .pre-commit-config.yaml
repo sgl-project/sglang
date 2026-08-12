@@ -128,15 +128,9 @@ repos:
         language: system
         files: ^sgl-model-gateway/.*\.rs$
         pass_filenames: false
-      - id: rustfmt-sgl-kv-indexer
-        name: rustfmt experimental/sgl-kv-indexer
-        entry: bash -c 'cd experimental/sgl-kv-indexer && cargo fmt -- --check'
-        language: system
-        files: ^experimental/sgl-kv-indexer/.*\.rs$
-        pass_filenames: false
       - id: rustfmt-sgl-router
         name: rustfmt experimental/sgl-router
-        entry: bash -c 'cd experimental/sgl-router && cargo fmt -- --check'
+        entry: bash -c 'cd experimental/sgl-router && cargo fmt --all -- --check'
         language: system
         files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false

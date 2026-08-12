@@ -13,19 +13,17 @@ enum TierType {
   TIER_SSD = 3;
 }
 
-// KV components are a fixed, small set with fixed match semantics -- a
-// component's rule is a property of its type, not a free choice:
-//   FULL  (bit 0, value 1) -- path component: resident on every prefix block.
-//   SWA   (bit 1, value 2) -- sliding-window: resident contiguously over at
-//                             least `swa_window_tokens` tokens ending at the
-//                             boundary (an unbroken run from the head is valid).
-//   MAMBA (bit 2, value 4) -- checkpoint: resident on the boundary block only.
-// Components are carried as a bitmask (OR of the above); FULL is always present
-// on a stored block.
+// KV components are a fixed set; each component's rule is a property of its
+// type, not a per-worker choice:
+//   FULL  (bit 0, value 1) -- resident on every prefix block.
+//   SWA   (bit 1, value 2) -- resident contiguously over at least
+//                             `swa_window_tokens` tokens ending at the boundary,
+//                             or in an unbroken run from the head.
+//   MAMBA (bit 2, value 4) -- resident on the boundary block only.
+// Carried as a bitmask; FULL is always present on a stored block.
 
 // A worker's versioned cache spec: which components its cache holds and the
-// static parameters the fixed rules need. Absent on a worker means legacy /
-// full-only (whole-block) behaviour.
+// parameters the fixed rules need. Absent means legacy / full-only behaviour.
 message WorkerCacheSpec {
   uint32 version = 1;
   // Bitmask of components this worker's cache holds (FULL|SWA|MAMBA); selects
@@ -33,18 +31,16 @@ message WorkerCacheSpec {
   uint32 components = 2;
   // Sliding-window size in tokens; used only when SWA is present.
   uint32 swa_window_tokens = 3;
-  // Per-component servable tiers, each a bitmask of (1 << TierType). Intersected
-  // with the indexer's servable set (V1: HBM+DRAM) at query time; a component is
-  // reusable only from a tier set here.
+  // Per-component servable tiers, each a bitmask of (1 << TierType), intersected
+  // with the indexer's servable set (V1: HBM+DRAM) at query time.
   uint32 full_tier_mask = 4;
   uint32 swa_tier_mask = 5;
   uint32 mamba_tier_mask = 6;
 }
 
 message MatchExternalKvRequest {
-  // MVP semantics: these are block-level hashes to match against placement
-  // metadata. The indexer returns block placement matches and does not compute
-  // the longest reusable prefix.
+  // Block-level hashes matched against placement metadata. This RPC returns
+  // placement matches only; it does not compute the longest reusable prefix.
   repeated string hashes = 1;
 
   // When true, only hashes that are actually matched should increase hit
@@ -79,22 +75,19 @@ message ExternalKvAction {
 
 message ApplyExternalKvBatchRequest {
   string worker_id = 1;
-  // The SGLang batch sequence number, monotonic per worker. Carried for
-  // observability only: this build applies every batch it receives and does not
-  // deduplicate, fence, or checkpoint on it.
+  // The SGLang batch sequence number, monotonic per worker. Observability only:
+  // every batch is applied, with no deduplication, fencing, or checkpointing.
   uint64 seq = 2;
   repeated ExternalKvAction actions = 3;
   // The worker's KV-transfer address, used to populate MatchExternalKvResponse.
-  // Supplied by the bridge; may be empty, in which case matches for this worker
-  // carry an empty address.
+  // Supplied by the bridge; may be empty, and then matches carry no address.
   string worker_address = 4;
 
   // Field 5 held the worker incarnation token used for restart fencing.
   reserved 5;
 
-  // The worker's component cache spec. Carried on every batch (like
-  // worker_address) so it self-heals across reconnects and indexer restarts.
-  // Absent means a legacy / full-only worker.
+  // The worker's component cache spec, carried on every batch so it self-heals
+  // across reconnects and indexer restarts. Absent means legacy / full-only.
   WorkerCacheSpec cache_spec = 6;
 }
 
@@ -130,18 +123,16 @@ message MatchExternalKvPrefixRequest {
   // missing, so a misordered list silently truncates every match.
   repeated string hashes = 1;
 
-  // Caller-supplied ceiling on how many leading blocks to consider, so the
-  // caller bounds its own query cost. 0 means "no caller ceiling"; the server
-  // still bounds the scan with its own limit.
+  // Caller-supplied ceiling on how many leading blocks to consider. 0 means no
+  // caller ceiling; the server still bounds the scan with its own limit.
   uint32 max_blocks = 2;
 }
 
 message ExternalKvPrefixMatch {
   // The worker's router-facing routing identity, NOT its KV-transfer address.
   // The router intersects this byte-for-byte with the worker URLs it registered,
-  // so a mismatch makes the intersection always empty and silently disables
-  // cache-aware routing. Workers with an empty address are unroutable and are
-  // excluded from this response entirely.
+  // so a mismatch silently disables cache-aware routing. Workers with an empty
+  // address are excluded from this response entirely.
   string worker_address = 1;
 
   // Largest n such that this worker holds hashes[0..n) contiguously.
@@ -158,10 +149,9 @@ message MatchExternalKvPrefixResponse {
   // The longest contiguous prefix held by any single worker (0 when no match).
   uint32 best_prefix_blocks = 2;
 
-  // How many blocks the server actually read placement for. Lets early
-  // termination and truncation be observed; it is NOT part of the prefix
-  // semantics, so different backends may report different values for the same
-  // matches.
+  // How many blocks the server actually read placement for, so early termination
+  // and truncation are observable. NOT part of the prefix semantics: backends may
+  // report different values for the same matches.
   uint32 blocks_read = 3;
 }
 
@@ -185,9 +175,8 @@ service KVIndexer {
   rpc MatchExternalKv(MatchExternalKvRequest) returns (MatchExternalKvResponse);
 
   // Answers, per worker, how long a contiguous prefix of the request it holds.
-  // The indexer deliberately does not pick a worker: it cannot see the router's
-  // health checks, circuit breakers, PD-pool split or in-flight load, so the
-  // final choice stays with the router.
+  // The indexer never picks a worker: it cannot see the router's health, load, or
+  // pool split, so the final choice stays with the router.
   rpc MatchExternalKvPrefix(MatchExternalKvPrefixRequest) returns (MatchExternalKvPrefixResponse);
 
   rpc GetExternalKvHitCounts(GetExternalKvHitCountsRequest) returns (GetExternalKvHitCountsResponse);

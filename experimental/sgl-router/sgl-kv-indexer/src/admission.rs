@@ -3,17 +3,10 @@
 
 //! Deadline-based load shedding for the query path.
 //!
-//! A concurrency limit only measures overload for a backend that yields: one
-//! doing IO holds its permit across the wait, whereas this build's process-local
-//! backend returns its permit before the next request is even decoded, so the
-//! limit stays far from its ceiling while requests pile up in the runtime
-//! instead. What is observable in both cases is how long a request waited to
-//! reach its handler.
-//!
-//! Once that wait has consumed the caller's whole deadline the answer can no
-//! longer be read, so computing it only pushes the backlog further behind. The
-//! budget is the caller's own `grpc-timeout`, which leaves no server-side
-//! threshold to tune and never sheds a caller that declared no deadline.
+//! A query that already waited out its caller's whole deadline can no longer be
+//! answered usefully, so serving it only delays the rest of the backlog. The
+//! budget is the caller's own `grpc-timeout`: no server-side threshold to tune,
+//! and a caller that declared no deadline is never shed.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -25,13 +18,8 @@ use tonic::{Extensions, Request, Status};
 #[derive(Clone, Copy)]
 struct Arrival(Instant);
 
-/// Counts rejections of one kind and picks which ones to log.
-///
-/// Overload is a rate, not an event. Logging every rejection adds load exactly
-/// when the service is shedding to get rid of some, while logging none leaves an
-/// operator unable to tell shedding apart from ordinary latency. Reporting on
-/// doubling counts keeps the first rejection immediate and the volume
-/// logarithmic in a sustained overload.
+/// Counts rejections of one kind and reports on doubling totals, so the first
+/// rejection is visible immediately and a sustained overload cannot flood the log.
 pub(crate) struct RejectionLog(AtomicU64);
 
 impl RejectionLog {
@@ -49,12 +37,9 @@ impl RejectionLog {
 
 static DEADLINE_SHED_LOG: RejectionLog = RejectionLog::new();
 
-/// Server interceptor that timestamps a request's arrival, so the query path can
-/// measure how long it then waited to be served.
-///
-/// Runs while the connection task is still dispatching the stream, before the
-/// per-request task is spawned, so the stamp precedes any scheduling delay.
-/// Without this interceptor installed nothing is ever shed.
+/// Timestamps a request's arrival so the query path can measure how long it then
+/// waited. Runs before the per-request task is spawned, so the stamp precedes
+/// any scheduling delay. Without this interceptor nothing is ever shed.
 pub fn stamp_arrival(mut request: Request<()>) -> Result<Request<()>, Status> {
     request.extensions_mut().insert(Arrival(Instant::now()));
     Ok(request)
@@ -62,9 +47,8 @@ pub fn stamp_arrival(mut request: Request<()>) -> Result<Request<()>, Status> {
 
 /// Rejects a query that spent its caller's entire deadline waiting to be served.
 ///
-/// Deliberately not applied to the apply path: dropping a KV event would leave
-/// the index permanently diverged from the worker that reported it, while
-/// dropping a query costs the caller one routing hint it had already given up on.
+/// Never applied to the apply path: dropping a KV event would leave the index
+/// permanently diverged from the worker that reported it.
 pub(crate) fn reject_if_deadline_passed(
     metadata: &MetadataMap,
     extensions: &Extensions,
@@ -92,10 +76,8 @@ pub(crate) fn reject_if_deadline_passed(
 
 /// The budget the caller declared in `grpc-timeout`, per the gRPC wire spec (up
 /// to 8 digits followed by a unit). `None` for an absent or unparsable value,
-/// which leaves the request unshed.
-///
-/// This is the budget as of the caller's send, so measuring it against the wait
-/// since arrival ignores transit time and can only shed late, never early.
+/// which leaves the request unshed. Measured against the wait since arrival, so
+/// transit time is ignored and shedding can only be late, never early.
 fn caller_deadline(metadata: &MetadataMap) -> Option<Duration> {
     let raw = metadata.get("grpc-timeout")?.to_str().ok()?;
     let unit = *raw.as_bytes().last()?;
@@ -174,8 +156,6 @@ mod tests {
     fn rejections_are_reported_on_doubling_counts() {
         let log = RejectionLog::new();
         let reported: Vec<u64> = (0..16).filter_map(|_| log.record()).collect();
-        // The first rejection is always reported, and the gaps then double, so a
-        // sustained overload cannot flood the log.
         assert_eq!(reported, vec![1, 2, 4, 8, 16]);
     }
 

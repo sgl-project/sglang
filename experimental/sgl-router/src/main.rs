@@ -109,8 +109,11 @@ async fn main() -> Result<()> {
                 query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
                 max_inflight: indexer.query_max_inflight,
             };
-            Arc::new(sgl_kv_indexer::GrpcPrefixIndex::new(config))
-        });
+            sgl_kv_indexer::GrpcPrefixIndex::new(config)
+                .map(Arc::new)
+                .context("configure KV Indexer client")
+        })
+        .transpose()?;
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
     // share its `HashTree` handle + `BlockSizeOracle`. When no model uses

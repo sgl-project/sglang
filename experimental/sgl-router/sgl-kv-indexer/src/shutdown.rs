@@ -5,11 +5,8 @@
 
 use tracing::{info, warn};
 
-/// Resolves once the process has been asked to terminate.
-///
-/// Container runtimes send `SIGTERM` first and only escalate to `SIGKILL` after
-/// a grace period, so handling it is what turns a hard kill into a drained
-/// exit. `SIGINT` is also handled to keep interactive runs responsive.
+/// Resolves once the process has been asked to terminate, on `SIGTERM` (which
+/// container runtimes send before escalating to `SIGKILL`) or `SIGINT`.
 ///
 /// A handler that cannot be installed never resolves: firing immediately would
 /// shut the process down at startup instead of leaving it running unsupervised.

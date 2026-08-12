@@ -29,9 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prefix_query_max_inflight = prefix_query_max_inflight_from_env()?;
 
     let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
-    // The interceptor timestamps each request on the connection task, before its
-    // own task is queued, which is what lets the query path shed work whose
-    // caller deadline expired while it waited.
+    // The interceptor timestamps each request before its own task is queued,
+    // which is what lets the query path shed work whose deadline expired.
     let service = KvIndexerServer::with_interceptor(
         KvIndexerService::with_prefix_query_max_inflight(backend, prefix_query_max_inflight),
         stamp_arrival,
