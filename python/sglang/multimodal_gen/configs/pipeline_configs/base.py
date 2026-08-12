@@ -226,6 +226,10 @@ class PipelineConfig:
     vae_precision: str = "fp32"
     vae_decode_precision: str | None = None
     vae_tiling: bool = True
+    # LTX-2.5's diffusion decoder. Tiling bounds the attention grid its stages
+    # see, which is what makes a full-length decode tractable; turn it off to
+    # decode the whole volume at once.
+    diffusion_decoder_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True
 
@@ -844,6 +848,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}vae_tiling",
             default=PipelineConfig.vae_tiling,
             help="Enable VAE tiling",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}diffusion-decoder-tiling",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_tiling",
+            default=PipelineConfig.diffusion_decoder_tiling,
+            help="Enable tiling for the LTX-2.5 diffusion decoder",
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-slicing",

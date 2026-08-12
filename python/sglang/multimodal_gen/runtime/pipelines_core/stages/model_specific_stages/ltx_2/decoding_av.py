@@ -58,12 +58,18 @@ class LTX2AVDecodingStage(DecodingStage):
         arch_config = server_args.pipeline_config.vae_config.arch_config
         return str(getattr(arch_config, "video_decoder_variant", "ltx_2")) != "ltx_2_3"
 
-    def _decode_with_diffusion_decoder(self, latents, batch, vae_dtype):
+    def _decode_with_diffusion_decoder(self, latents, batch, vae_dtype, server_args):
         """Decode with the LTX-2.5 diffusion decoder.
 
         It is a diffusion model in its own right, so it needs a generator; the
         request's seed keeps a decode reproducible.
         """
+        # Without tiling every stage attends over the whole volume, and the
+        # neighborhood block mask costs O(tokens^2) to build -- minutes at a
+        # full-length 121-frame grid.
+        self.diffusion_decoder.use_tiling = bool(
+            server_args.pipeline_config.diffusion_decoder_tiling
+        )
         generator = torch.Generator(device=latents.device).manual_seed(int(batch.seed))
         with temporary_module_dtype(
             self.diffusion_decoder, vae_dtype, enabled=True
@@ -112,7 +118,7 @@ class LTX2AVDecodingStage(DecodingStage):
                 )
                 if use_diffusion_decoder:
                     decode_output = self._decode_with_diffusion_decoder(
-                        latents, batch, vae_dtype
+                        latents, batch, vae_dtype, server_args
                     )
                 else:
                     with temporary_module_dtype(

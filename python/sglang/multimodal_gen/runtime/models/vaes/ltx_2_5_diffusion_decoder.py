@@ -9,9 +9,9 @@ prediction *is* the output.
 
 Attention here is 3D *neighborhood* attention: each query attends to a fixed
 window that shifts inward at the grid borders so it always covers exactly
-`kernel_size` positions. Upstream reaches for NATTEN's `na3d` kernel and falls
-back to a FlexAttention block mask; this port implements the FlexAttention path
-only, so it has no Hub-kernel dependency.
+`kernel_size` positions. Like upstream this prefers NATTEN's fused `na3d`
+kernel and falls back to a FlexAttention block mask when NATTEN is missing, so
+NATTEN is an optimisation rather than a hard dependency.
 """
 
 import math
@@ -34,6 +34,30 @@ logger = init_logger(__name__)
 # *count* keeps that independent of resolution. Tiling is exact: the MLP is
 # pointwise across tokens.
 _SWIGLU_TILE_SIZE = 16384
+
+_na3d_fn: object = None
+_NA3D_UNAVAILABLE = object()
+
+
+def _na3d():
+    """NATTEN's fused 3D neighborhood attention, or `None` if unavailable.
+
+    This is the kernel upstream uses, and it is the fast path: it walks only the
+    window around each query instead of scoring against a mask over the whole
+    sequence. Measured at a 1.08M-token stage-5 grid it runs ~4.8x faster than
+    the compiled `flex_attention` fallback, and needs no block mask at all --
+    the window is an argument, not a materialised structure.
+    """
+    global _na3d_fn
+    if _na3d_fn is None:
+        try:
+            from natten.functional import na3d
+
+            _na3d_fn = na3d
+        except ImportError:
+            _na3d_fn = _NA3D_UNAVAILABLE
+    return None if _na3d_fn is _NA3D_UNAVAILABLE else _na3d_fn
+
 
 _compiled_flex_attention = None
 
@@ -92,6 +116,14 @@ def _unpatchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     )
 
 
+# Block masks are pure functions of the grid and kernel, but cost O(S^2) to
+# build -- measured at 17.5 s for a 1.08M-token stage. A decode reuses each
+# stage's mask across its blocks already; this keeps them across *decodes*, so a
+# server answering repeated requests at one resolution pays the cost once.
+_BLOCK_MASK_CACHE: dict = {}
+_BLOCK_MASK_CACHE_MAX = 16
+
+
 def _neighborhood_block_mask(
     num_frames: int,
     height: int,
@@ -106,6 +138,11 @@ def _neighborhood_block_mask(
     than truncation, is what NATTEN's `na3d` does.
     """
     from torch.nn.attention.flex_attention import create_block_mask
+
+    cache_key = (num_frames, height, width, tuple(kernel_size), str(device))
+    cached = _BLOCK_MASK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     kernel_t, kernel_h, kernel_w = kernel_size
     kernel_t = min(kernel_t, num_frames)
@@ -131,7 +168,7 @@ def _neighborhood_block_mask(
     # `_compile=True` is not an optimisation here but a requirement: the eager
     # path evaluates `mask_mod` over every (query, key) pair, which is O(S^2)
     # booleans and tens of GiB at production grids.
-    return create_block_mask(
+    block_mask = create_block_mask(
         mask_mod,
         B=None,
         H=None,
@@ -140,6 +177,10 @@ def _neighborhood_block_mask(
         device=device,
         _compile=True,
     )
+    if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_MAX:
+        _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
+    _BLOCK_MASK_CACHE[cache_key] = block_mask
+    return block_mask
 
 
 class LTX2VideoVaeRotaryPosEmbed3D(nn.Module):
@@ -258,7 +299,13 @@ class LTX2VideoVaeNeighborhoodAttention(nn.Module):
         return self.rope(query), self.rope(key), value
 
     def build_block_mask(self, hidden_states: torch.Tensor):
-        """The window mask for this grid. Fixed within a stage, so built once."""
+        """The window mask for this grid. Fixed within a stage, so built once.
+
+        `None` when NATTEN is available: that path takes the window as an
+        argument, and building the mask anyway would cost O(S^2) for nothing.
+        """
+        if _na3d() is not None:
+            return None
         num_frames, height, width = hidden_states.shape[1:4]
         return _neighborhood_block_mask(
             num_frames, height, width, self.kernel_size, hidden_states.device
@@ -275,6 +322,20 @@ class LTX2VideoVaeNeighborhoodAttention(nn.Module):
             )
 
         query, key, value = self.project_qkv(hidden_states)
+
+        na3d = _na3d()
+        if na3d is not None:
+            # `project_qkv` already yields NATTEN's (B, T, H, W, heads, dim)
+            # layout, so the fast path needs no reshaping. scale=1.0: the query
+            # is already scaled in project_qkv.
+            hidden_states = na3d(
+                query, key, value, kernel_size=self.kernel_size, scale=1.0
+            )
+            hidden_states = hidden_states.reshape(
+                batch_size, num_frames, height, width, self.heads * self.head_dim
+            )
+            return self.to_out[0](hidden_states)
+
         seq_len = num_frames * height * width
         # flex_attention wants (B, heads, S, head_dim).
         query = query.reshape(batch_size, seq_len, self.heads, self.head_dim).transpose(
@@ -688,6 +749,25 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
         return self.denoise(latent_context, x_t, num_inference_steps)
 
 
+def _tile_intervals(
+    length: int, tile_size: int, stride: int, min_size: int
+) -> list[tuple[int, int]]:
+    """Overlapping `[start, end)` tiles covering `[0, length)`.
+
+    A trailing remnant shorter than `min_size` is merged into the previous tile
+    rather than decoded alone: neighborhood attention rejects any grid smaller
+    than its kernel, so a short remnant cannot always stand on its own.
+    """
+    if length <= tile_size:
+        return [(0, length)]
+    starts = list(range(0, length, stride))
+    while len(starts) > 1 and length - starts[-1] < min_size:
+        starts.pop()
+    return [(start, min(start + tile_size, length)) for start in starts[:-1]] + [
+        (starts[-1], length)
+    ]
+
+
 class LTX2VideoDiffusionDecoderModel(nn.Module):
     """Checkpoint-level wrapper: the decoder plus the latent statistics.
 
@@ -707,12 +787,207 @@ class LTX2VideoDiffusionDecoderModel(nn.Module):
             "latents_std", torch.ones(latent_channels), persistent=True
         )
 
+        # Tiling runs the memory- and compute-dominant stages (the last
+        # deterministic stage and the diffusion blocks) on overlapping tiles.
+        # The earlier stages always see the whole latent, so it changes the
+        # output only near tile borders. The caller owns this: the decoding
+        # stage sets it from `--diffusion-decoder-tiling`. Tile sizes match
+        # upstream.
+        self.use_tiling = False
+        self.tile_sample_min_height = 768
+        self.tile_sample_min_width = 768
+        self.tile_sample_min_num_frames = 32
+        self.tile_sample_stride_height = 512
+        self.tile_sample_stride_width = 512
+        self.tile_sample_stride_num_frames = 16
+
+    @staticmethod
+    def _blend(a: torch.Tensor, b: torch.Tensor, extent: int, dim: int) -> torch.Tensor:
+        """Linear cross-fade of `a`'s tail into `b`'s head along `dim`."""
+        extent = min(a.shape[dim], b.shape[dim], extent)
+        if extent <= 0:
+            return b
+        ramp = torch.arange(extent, device=b.device, dtype=torch.float32) / extent
+        shape = [1] * b.ndim
+        shape[dim] = extent
+        ramp = ramp.reshape(shape).to(b.dtype)
+        a_tail = a.narrow(dim, a.shape[dim] - extent, extent)
+        b_head = b.narrow(dim, 0, extent)
+        b_head.copy_(a_tail * (1 - ramp) + b_head * ramp)
+        return b
+
+    def _should_tile(self, hidden_states: torch.Tensor) -> bool:
+        if not self.use_tiling:
+            return False
+        arch = self.config.arch_config
+        return (
+            hidden_states.shape[2]
+            > self.tile_sample_min_num_frames // arch.temporal_compression_ratio
+            or hidden_states.shape[3]
+            > self.tile_sample_min_height // arch.spatial_compression_ratio
+            or hidden_states.shape[4]
+            > self.tile_sample_min_width // arch.spatial_compression_ratio
+        )
+
+    def tiled_decode(
+        self,
+        hidden_states: torch.Tensor,
+        generator: torch.Generator | None = None,
+        num_inference_steps: int | None = None,
+    ) -> torch.Tensor:
+        """Decode with stage 4 and the diffusion stage running per tile.
+
+        Tiles live on the grid entering the last deterministic stage, where one
+        cell maps to a fixed block of output pixels. Temporal tiles follow the
+        causal frame mapping: only the tile holding t=0 drops the temporal
+        upsample's duplicate leading frame, and only the tile holding the end of
+        the video carries the border padding to crop.
+        """
+        decoder = self.decoder
+        arch = self.config.arch_config
+        num_inference_steps = num_inference_steps or decoder.default_num_inference_steps
+        batch_size = hidden_states.shape[0]
+        patch_size = decoder.patch_size
+
+        # Pixels per tiling-grid cell: the last upsample's stride times the patch.
+        stride_up = decoder.upsamples[-1].stride
+        scale_t, scale_h, scale_w = (
+            stride_up[0],
+            stride_up[1] * patch_size,
+            stride_up[2] * patch_size,
+        )
+        tile_t = self.tile_sample_min_num_frames // scale_t
+        step_t = self.tile_sample_stride_num_frames // scale_t
+        tile_h = self.tile_sample_min_height // scale_h
+        step_h = self.tile_sample_stride_height // scale_h
+        tile_w = self.tile_sample_min_width // scale_w
+        step_w = self.tile_sample_stride_width // scale_w
+        # A tile has to satisfy both remaining kernels: stage 4 sees it as-is,
+        # stage 5 sees it scaled by the upsample stride.
+        min_sizes = [
+            max(k4, -(-k5 // stride))
+            for k4, k5, stride in zip(
+                arch.decoder_stage_kernels[-1], arch.decoder_stage5_kernel, stride_up
+            )
+        ]
+
+        features = decoder.forward_stages_1_to_3(hidden_states)
+        # The trailing ghost frames replicate through the earlier temporal
+        # upsamples, whose composed mapping is affine in their stride product.
+        ghost = decoder.trailing_pad_latent_frames * math.prod(
+            up.stride[0] for up in decoder.upsamples[:-1]
+        )
+        num_frames = features.shape[1] - ghost
+        height, width = features.shape[2], features.shape[3]
+
+        temporal_tiles = _tile_intervals(num_frames, tile_t, step_t, min_sizes[0])
+        height_tiles = _tile_intervals(height, tile_h, step_h, min_sizes[1])
+        width_tiles = _tile_intervals(width, tile_w, step_w, min_sizes[2])
+        blend_frames = (tile_t - step_t) * scale_t
+        blend_height = (tile_h - step_h) * scale_h
+        blend_width = (tile_w - step_w) * scale_w
+
+        # A single-step x0 decode predicts pixels from pure noise, so each tile
+        # may draw its own. A multi-step decode integrates noise across steps, so
+        # overlapping tiles have to start from one shared canvas.
+        single_step_x0 = num_inference_steps == 1 and decoder.model_output_type == "x0"
+        x_t_full = None
+        if not single_step_x0:
+            pixel_frames = num_frames * scale_t - (1 if scale_t == 2 else 0)
+            x_t_full = torch.randn(
+                (
+                    batch_size,
+                    decoder.out_channels,
+                    pixel_frames,
+                    height * scale_h,
+                    width * scale_w,
+                ),
+                generator=generator,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+
+        frame_groups = []
+        for t0, t1 in temporal_tiles:
+            is_origin = t0 == 0
+            is_trailing = t1 == num_frames
+            feature_t1 = features.shape[1] if is_trailing else t1
+            rows = []
+            for h0, h1 in height_tiles:
+                row = []
+                for w0, w1 in width_tiles:
+                    context = decoder.forward_stage_4(
+                        features[:, t0:feature_t1, h0:h1, w0:w1],
+                        drop_leading_frame=is_origin,
+                        crop_trailing_ghost=is_trailing,
+                    )
+                    tile_shape = (
+                        batch_size,
+                        decoder.out_channels,
+                        context.shape[1],
+                        context.shape[2] * patch_size,
+                        context.shape[3] * patch_size,
+                    )
+                    if single_step_x0:
+                        x_t = torch.randn(
+                            tile_shape,
+                            generator=generator,
+                            device=hidden_states.device,
+                            dtype=hidden_states.dtype,
+                        )
+                    else:
+                        # A non-origin tile keeps its duplicate leading frame, so
+                        # it starts one pixel frame earlier than t0 * scale_t.
+                        pixel_t0 = t0 * scale_t - (
+                            1 if not is_origin and scale_t == 2 else 0
+                        )
+                        x_t = x_t_full[
+                            :,
+                            :,
+                            pixel_t0 : pixel_t0 + tile_shape[2],
+                            h0 * scale_h : h0 * scale_h + tile_shape[3],
+                            w0 * scale_w : w0 * scale_w + tile_shape[4],
+                        ]
+                    row.append(decoder.denoise(context, x_t, num_inference_steps))
+                rows.append(row)
+
+            result_rows = []
+            for i, row in enumerate(rows):
+                result_row = []
+                for j, tile in enumerate(row):
+                    if i > 0:
+                        tile = self._blend(rows[i - 1][j], tile, blend_height, dim=3)
+                    if j > 0:
+                        tile = self._blend(row[j - 1], tile, blend_width, dim=4)
+                    # The last tile can run past the stride grid, since a short
+                    # remnant is merged into it, so it keeps its full extent.
+                    keep_h = step_h * scale_h if i < len(rows) - 1 else tile.shape[3]
+                    keep_w = step_w * scale_w if j < len(row) - 1 else tile.shape[4]
+                    result_row.append(tile[:, :, :, :keep_h, :keep_w])
+                result_rows.append(torch.cat(result_row, dim=4))
+            frame_groups.append(torch.cat(result_rows, dim=3))
+
+        result = []
+        for k, group in enumerate(frame_groups):
+            if k > 0:
+                group = self._blend(frame_groups[k - 1], group, blend_frames, dim=2)
+            if k < len(frame_groups) - 1:
+                # The origin group is one frame short of stride * scale: its
+                # first cell decodes to a single pixel frame under the causal
+                # mapping.
+                keep_frames = step_t * scale_t - (1 if k == 0 and scale_t == 2 else 0)
+                group = group[:, :, :keep_frames]
+            result.append(group)
+        return torch.cat(result, dim=2)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         generator: torch.Generator | None = None,
         num_inference_steps: int | None = None,
     ) -> torch.Tensor:
+        if self._should_tile(hidden_states):
+            return self.tiled_decode(hidden_states, generator, num_inference_steps)
         return self.decoder(hidden_states, generator, num_inference_steps)
 
     def decode(
