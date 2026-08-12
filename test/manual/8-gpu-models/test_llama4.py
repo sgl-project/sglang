@@ -1,10 +1,10 @@
-"""Archived from test/registered/8-gpu-models/test_llama4.py.
+"""Moved out of test/registered/8-gpu-models/.
 
 Originally registered with `register_cuda_ci(...)` on the nightly 8-gpu-h200 and
 8-gpu-b200 suites. Moved here because nobody serves Llama 4 any more, and the CI
 HF account has no access to meta-llama/Llama-4-Scout-17B-16E-Instruct either, so
 it had been skipping for a while. Run with
-`python3 test/manual/8-gpu-models/test_llama4_archived.py`.
+`python3 test/manual/8-gpu-models/test_llama4.py`.
 """
 
 import unittest
