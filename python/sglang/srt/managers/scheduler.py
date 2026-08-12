@@ -3369,6 +3369,13 @@ class Scheduler(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.mamba_pool_idx = None
+                if res == AddReqResult.SKIP:
+                    # The chunked-prefill slot is taken (long_prefill_token_threshold
+                    # keeps the rest of the budget free): this request waits for a
+                    # later pass, but smaller requests behind it can still be
+                    # admitted into this batch. It keeps its place in the waiting
+                    # queue, so the skip is bounded by the in-flight prefill.
+                    continue
                 break
 
         if mamba_allocator is not None:

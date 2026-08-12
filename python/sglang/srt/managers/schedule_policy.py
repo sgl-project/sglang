@@ -485,6 +485,12 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+    # Skip this request for this pass but keep considering the rest of the
+    # queue: it cannot be admitted right now (a chunked prefill slot is taken)
+    # but later, smaller requests still can be. Only returned when
+    # long_prefill_token_threshold is enabled; at the default the admission
+    # loop keeps its historical stop-at-first-refusal behavior.
+    SKIP = auto()
 
 
 class PrefillAdder:
@@ -704,6 +710,17 @@ class PrefillAdder:
             )
 
         return available_and_evictable - self.cur_rem_token_offset
+
+    def _chunked_slot_busy_result(self) -> AddReqResult:
+        """Result for a request that needs the chunked-prefill slot while it is
+        taken. With the fairness cap enabled, skip only this request so smaller
+        requests behind it can still join this batch; at the default, preserve
+        the historical stop-the-whole-pass behavior."""
+        return (
+            AddReqResult.SKIP
+            if self.long_prefill_token_threshold > 0
+            else AddReqResult.OTHER
+        )
 
     def _apply_long_prefill_cap(self, rem_tokens: int) -> int:
         """Cap one request's share of this prefill batch's token budget.
@@ -1082,7 +1099,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1173,7 +1190,10 @@ class PrefillAdder:
             self._add_dllm_req(req, 0)
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
-            or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+            # it is the last chunk (the fairness cap picks which requests get
+            # chunked here too, same as the add_one_req split)
+            or cand_extend_input_len
+            <= self._apply_long_prefill_cap(self.rem_chunk_tokens)
         ):
             if (
                 tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
@@ -1196,8 +1216,17 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
-            # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            # Same single-chunked-slot invariant as add_one_req's chunked
+            # branch: with the fairness cap leaving budget behind, an in-flight
+            # chunk no longer implies rem_chunk_tokens == 0, so without this
+            # guard an ignore_eos request would overwrite new_chunked_req and
+            # trip the scheduler's `assert self.chunked_req is None`.
+            if self.new_chunked_req is not None or has_chunked_req:
+                return self._chunked_slot_busy_result()
+
+            # Chunked prefill (capped so an ignore_eos request cannot hold the
+            # prefill batch to itself either)
+            trunc_len = self._apply_long_prefill_cap(self.rem_chunk_tokens)
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1231,7 +1260,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1279,14 +1308,6 @@ class PrefillAdder:
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
                     return AddReqResult.NO_TOKEN
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
-
-        # Long-prefill cap, applied before the chunked/non-chunked split below so a
-        # request that already fits under the cap still prefills in a single pass:
-        # only requests longer than the threshold are chunked by it. Composes with the
-        # SWA cap above (whichever is tighter wins). Skipped when chunked prefill is
-        # off -- there is no chunking to spread the request over.
-        if chunk_tokens_limit is not None:
-            chunk_tokens_limit = self._apply_long_prefill_cap(chunk_tokens_limit)
 
         if (
             self.rem_chunk_tokens is None
@@ -1354,6 +1375,17 @@ class PrefillAdder:
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
 
+            # Long-prefill cap, applied before the chunked/non-chunked split
+            # below so a request that already fits under the cap still prefills
+            # in a single pass: only requests longer than the threshold are
+            # chunked by it. Composes with the SWA cap (whichever is tighter
+            # wins) -- applied here, after the post-lock SWA re-check above,
+            # because that re-check recomputes chunk_tokens_limit. Skipped when
+            # chunked prefill is off -- there is no chunking to spread the
+            # request over.
+            if chunk_tokens_limit is not None:
+                chunk_tokens_limit = self._apply_long_prefill_cap(chunk_tokens_limit)
+
             if (
                 self.rem_chunk_tokens is None
                 and len(self.can_run_list) != 0
@@ -1413,9 +1445,11 @@ class PrefillAdder:
                 # exhausts `rem_chunk_tokens` and `budget_state()` ends the pass --
                 # but the cap deliberately leaves budget behind, so refuse here
                 # instead. The request keeps its place in the waiting queue and is
-                # admitted on a later pass.
+                # admitted on a later pass. SKIP (cap on) lets the admission loop
+                # continue to smaller requests queued behind this one; OTHER (cap
+                # off) preserves the historical stop-the-pass behavior.
                 if self.new_chunked_req is not None or has_chunked_req:
-                    return AddReqResult.OTHER
+                    return self._chunked_slot_busy_result()
 
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size

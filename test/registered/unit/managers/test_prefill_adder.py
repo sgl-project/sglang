@@ -912,15 +912,19 @@ class TestPrefillAdder(CustomTestCase):
         )
         return adder
 
-    def _long_prefill_req(self, rid, extend_input_len, prefix_len=0):
+    def _long_prefill_req(self, rid, extend_input_len, prefix_len=0, ignore_eos=False):
         req = self.create_mock_req(rid, priority=0, max_new_tokens=128)
         req.prefix_indices = list(range(prefix_len))
         req.full_untruncated_fill_ids = list(range(prefix_len + extend_input_len))
         # add_one_req reads these; create_mock_req only covers the add_chunked_req
         # and preemption paths the other tests exercise.
-        req.sampling_params.ignore_eos = False
+        req.sampling_params.ignore_eos = ignore_eos
         req.last_node = MagicMock()
         req.swa_host_hit_length = 0
+        # add_one_req_ignore_eos accounting reads these.
+        req.origin_input_ids = list(range(prefix_len + extend_input_len))
+        req.output_ids = []
+        req.mamba_pool_idx = None
         req.set_extend_range = MagicMock(
             side_effect=lambda start, end: setattr(
                 req, "extend_range", Range(start, end)
@@ -1040,7 +1044,9 @@ class TestPrefillAdder(CustomTestCase):
         # left mid-prefill per pass -- a second would be partially prefilled and
         # then dropped, losing its progress. Without the cap this is implicit (the
         # first long request exhausts the budget and ends the pass); the cap leaves
-        # budget behind, so the limit has to be enforced explicitly.
+        # budget behind, so the limit has to be enforced explicitly. SKIP (not
+        # OTHER) so the admission loop continues to smaller requests queued
+        # behind this one.
         adder = self._long_prefill_adder(threshold=2048)
 
         first = self._long_prefill_req("long-0", extend_input_len=500_000)
@@ -1055,7 +1061,7 @@ class TestPrefillAdder(CustomTestCase):
             second, has_chunked_req=False, truncation_align_size=None
         )
 
-        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(result, AddReqResult.SKIP)
         self.assertNotIn(second, adder.can_run_list)
         self.assertIs(adder.new_chunked_req, first)  # not overwritten
 
@@ -1071,8 +1077,22 @@ class TestPrefillAdder(CustomTestCase):
             newcomer, has_chunked_req=True, truncation_align_size=None
         )
 
-        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(result, AddReqResult.SKIP)
         self.assertNotIn(newcomer, adder.can_run_list)
+        self.assertIsNone(adder.new_chunked_req)
+
+    def test_chunked_slot_guard_returns_other_at_default(self):
+        # With the cap disabled the guard must preserve the historical
+        # stop-the-whole-pass result (OTHER) -- the admission loop's behavior at
+        # default settings is unchanged.
+        adder = self._long_prefill_adder(threshold=0)
+
+        newcomer = self._long_prefill_req("newlong", extend_input_len=500_000)
+        result = adder.add_one_req(
+            newcomer, has_chunked_req=True, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
         self.assertIsNone(adder.new_chunked_req)
 
     def test_short_req_still_admitted_behind_inflight_chunk(self):
@@ -1097,6 +1117,94 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder._apply_long_prefill_cap(1024), 1024)  # SWA tighter
         adder_tight = self._long_prefill_adder(threshold=512)
         self.assertEqual(adder_tight._apply_long_prefill_cap(1024), 512)  # cap tighter
+
+    def test_long_prefill_cap_survives_swa_post_lock_recheck(self):
+        # add_one_req re-checks the SWA budget after acquiring the tree lock and
+        # recomputes chunk_tokens_limit there. The cap must be applied after that
+        # recomputation, or a hybrid-SWA request under SWA pressure silently
+        # loses it and takes min(rem_chunk, swa_cap) instead of the threshold.
+        # Numbers: rem_swa=200, reserved=min(40,128)+8=48 -> swa_cap=152;
+        # rem_chunk=512; threshold=64. Without the fix the chunk is 152.
+        # size_swa=512 makes the request _swa_req_never_fits (budget 520 >= 512),
+        # which is what takes the swa_cap escape hatch instead of NO_TOKEN.
+        PAGE, WINDOW, REM_SWA, REM_CHUNK, THRESHOLD = 8, 128, 200, 512, 64
+        self.mock_token_allocator.swa_available_size.return_value = REM_SWA
+        self.mock_token_allocator.full_available_size.return_value = 10_000_000
+        self.mock_token_allocator.available_size.return_value = 10_000_000
+        self.mock_token_allocator.size_swa = 512  # _swa_req_never_fits -> True
+        self.mock_tree_cache.sliding_window_size = WINDOW
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=PAGE,
+            rem_chunk_tokens=REM_CHUNK,
+            long_prefill_token_threshold=THRESHOLD,
+        )
+        adder.is_hybrid_swa = True
+
+        req = self._long_prefill_req("long", extend_input_len=100_000)
+        req.sampling_params.max_new_tokens = 40
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertIs(adder.new_chunked_req, req)
+        start, end = req.set_extend_range.call_args.args
+        self.assertEqual(end - start, THRESHOLD)  # not min(REM_CHUNK, swa_cap)=152
+
+    def test_long_prefill_cap_ignore_eos_chunked_at_threshold(self):
+        # The ignore_eos path (tree cache disabled) has its own chunked branch;
+        # the cap must apply there too or an ignore_eos request could still take
+        # the whole batch budget.
+        self.mock_tree_cache.disable = True
+        adder = self._long_prefill_adder(threshold=2048)
+
+        req = self._long_prefill_req("long", extend_input_len=500_000, ignore_eos=True)
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertIs(adder.new_chunked_req, req)
+        start, end = req.set_extend_range.call_args.args
+        self.assertEqual(end - start, 2048)
+
+    def test_long_prefill_cap_ignore_eos_under_threshold_prefills_whole(self):
+        # Same split as the normal path: an ignore_eos request that fits under
+        # the cap is not chunked by it.
+        self.mock_tree_cache.disable = True
+        adder = self._long_prefill_adder(threshold=2048)
+
+        req = self._long_prefill_req("short", extend_input_len=1024, ignore_eos=True)
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertIsNone(adder.new_chunked_req)
+        start, end = req.set_extend_range.call_args.args
+        self.assertEqual(end - start, 1024)
+
+    def test_long_prefill_cap_ignore_eos_behind_inflight_chunk_is_refused(self):
+        # Crash regression: with the cap on, an in-flight chunk leaves
+        # rem_chunk_tokens > 0, so the ignore_eos chunked branch became
+        # reachable while a chunk is in flight. Without the guard it set
+        # new_chunked_req, tripping the scheduler's
+        # `assert self.chunked_req is None`. With the cap off the same request
+        # is refused at rem_chunk_tokens <= 0, so this state is cap-introduced.
+        self.mock_tree_cache.disable = True
+        adder = self._long_prefill_adder(threshold=2048)
+        adder.add_chunked_req(self._long_prefill_req("inflight", 500_000))
+
+        late = self._long_prefill_req("late", extend_input_len=500_000, ignore_eos=True)
+        result = adder.add_one_req(
+            late, has_chunked_req=True, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.SKIP)
+        self.assertNotIn(late, adder.can_run_list)
+        self.assertIsNone(adder.new_chunked_req)
 
 
 if __name__ == "__main__":
