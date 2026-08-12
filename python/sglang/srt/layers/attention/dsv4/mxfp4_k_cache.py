@@ -368,12 +368,15 @@ def _dequantize_mxfp4_k_cache_paged_kernel(
     high = _decode_e2m1_triton(packed >> 4) * scale[:, None]  # [16, 16]
     nope_all = tl.reshape(tl.join(low, high), (NOPE_TILE,))  # [512]
 
-    # Store nope: NOPE_TILE=512 ≥ NOPE_DIM=448; mask trims to the real dim
+    # Store nope: NOPE_TILE=512 ≥ NOPE_DIM=448; mask trims to the real dim.
+    # Invalid rows are written as zeros so out-of-range indices cannot leak
+    # stale or uninitialized memory into the output (the API guarantees zero
+    # rows for them).
     nope_offsets = tl.arange(0, NOPE_TILE)  # [512]  ← power of two
     tl.store(
         output_ptr + token_id * output_stride_0 + nope_offsets,
-        nope_all,
-        mask=valid_src & (nope_offsets < NOPE_DIM),
+        tl.where(valid_src, nope_all, 0.0),
+        mask=nope_offsets < NOPE_DIM,
     )
 
     # RoPE: ROPE_DIM=64 is a power of two, no masking needed
@@ -385,8 +388,7 @@ def _dequantize_mxfp4_k_cache_paged_kernel(
     )
     tl.store(
         output_ptr + token_id * output_stride_0 + NOPE_DIM + rope_offsets,
-        rope,
-        mask=valid_src,
+        tl.where(valid_src, rope, 0.0),
     )
 
 

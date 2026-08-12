@@ -112,24 +112,36 @@ def test_empty_batch():
 
 
 def test_oob_indices():
-    """Out-of-bounds indices are silently ignored (padded graph batch)."""
+    """Out-of-bounds indices yield zero rows (padded graph batch).
+
+    The output is pre-filled with non-zero values so stale memory (or a
+    reused pre-allocated buffer) cannot mask a missing zero write.
+    """
     torch.manual_seed(3)
     page_size, num_tokens = 32, 16
     dev = torch.device("cuda")
+    num_rows = 4 * page_size
 
     k = torch.randn(num_tokens, MXFP4_TOTAL_DIM, dtype=torch.bfloat16, device=dev)
     pool = _pool(page_size)
     loc = torch.arange(num_tokens, dtype=torch.int32, device=dev) - 4  # [-4 .. 11]
+    loc[0] = num_rows + 17  # above capacity
+    loc[1] = -100  # negative
+    assert (loc < 0).any() and (loc >= num_rows).any()
 
     quantize_dsv4_mxfp4_k_cache_into(k, pool, loc, page_size)
-    out = dequantize_dsv4_mxfp4_k_cache_paged(pool, loc, page_size)
 
-    # OOB rows should be all-zero
-    oob = out[loc < 0]
-    if oob.numel() > 0:
-        assert (oob == 0).all(), (
-            f"OOB rows should be zero, got {(oob != 0).sum().item()} non-zero"
-        )
+    out = torch.full(
+        (num_tokens, 1, MXFP4_TOTAL_DIM), 7.5, dtype=torch.bfloat16, device=dev
+    )
+    dequantize_dsv4_mxfp4_k_cache_paged(pool, loc, page_size, out=out)
+
+    oob = (loc < 0) | (loc >= num_rows)
+    assert (out[oob] == 0).all(), (
+        f"OOB rows should be zero, got {(out[oob] != 0).sum().item()} non-zero"
+    )
+    # In-range rows still dequantize (nonzero signal).
+    assert (out[~oob] != 0).any()
 
 
 def test_pre_allocated_output():
