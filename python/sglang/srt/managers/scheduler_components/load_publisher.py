@@ -2,7 +2,7 @@
 
 Independent of KV-cache events: each scheduler publishes a periodic
 [`LoadStat`] gauge on its own ZMQ PUB socket (a dedicated port range,
-packed immediately after the KV-event publisher's) so load-aware routers —
+packed after the KV-event publisher's) so load-aware routers —
 e.g. the experimental sgl-router `cache_aware_zmq` policy — can route on
 the engine's true queue depth / KV occupancy instead of inferring load
 from a router-side in-flight counter.
@@ -13,7 +13,7 @@ PUSH to node 0) for consumers inside the deployment — the
 DataParallelController's dispatch and `/v1/loads`. Neither transport is
 subscribable by an out-of-process router that only knows the worker's URL,
 so load-aware routers get their own per-rank PUB socket instead, on a port
-derivable from `/server_info` (see
+advertised via `/server_info` (see
 `ServerArgs.describe_kv_events_publisher`). The payload is a compact,
 tagged subset of the snapshot rather than the full `LoadSnapshot`, so the
 router-facing wire contract stays fixed while the internal snapshot keeps
@@ -21,7 +21,13 @@ growing fields.
 
 The transport (`ZmqEventPublisher`), config parsing, and rank/port
 derivation are borrowed from `sglang.srt.disaggregation.kv_events`; the
-load wire format and publishing cadence live here.
+load wire format and publishing cadence live here. The port itself comes
+from `derive_load_port_base` — the same function `/server_info` advertises
+with — which packs the load range after the KV-event range (skipping the
+replay ROUTER range when one is configured). Operators must leave that
+derived range free on the host: in particular, two workers sharing a host
+need a `2 * dp_size` gap between their KV-event port bases, or one
+worker's load socket lands on the other's KV-event port.
 
 Other prior art, considered and not reused: `/v1/loads` serves the same
 snapshot over HTTP, but polling it routes through the HTTP-plane event
@@ -36,14 +42,17 @@ subscribable via /server_info.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Optional
+import time
+from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 
 from sglang.srt.disaggregation.kv_events import (
+    LOAD_TOPIC,
     KVEventsConfig,
-    NullEventPublisher,
     ZmqEventPublisher,
+    derive_load_port_base,
+    is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
 
@@ -53,32 +62,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ZMQ topic the load publisher tags its frames with. The load socket carries
-# only load, so subscribers can subscribe-all; the topic is cosmetic/self-
-# documenting.
-LOAD_TOPIC = "load"
-
 # Publish a load snapshot at most once every this many `publish_load_stat`
 # calls, unless `force=True` (extend/prefill batches, where load changes
 # most). Load is a gauge consumed for routing, so per-decode-step publishing
 # is wasteful.
 LOAD_PUBLISH_INTERVAL = 5
 
+# Wall-clock floor between publishes, applied even to forced ones. Bounds
+# the cost of hot force paths — per-batch publishes under prefill-heavy
+# load, and the idle loop (`on_idle` forces a publish every iteration,
+# which busy-spins when --sleep-on-idle is off) — while staying far fresher
+# than any router's staleness window.
+LOAD_PUBLISH_MIN_INTERVAL_S = 0.05
+
 # Re-warn about publish failures every this many consecutive failures, so a
 # permanent failure (e.g. a renamed field) keeps a live breadcrumb instead of
 # going silent after the first warning, without flooding the log.
 LOAD_PUBLISH_FAIL_WARN_EVERY = 60
-
-
-def _tcp_port(endpoint: Optional[str]) -> Optional[int]:
-    """Port of a tcp:// endpoint, or None when there is none to compare."""
-    if not endpoint or not endpoint.startswith("tcp://"):
-        return None
-    _, _, tail = endpoint.rpartition(":")
-    try:
-        return int(tail)
-    except ValueError:
-        return None
 
 
 class LoadStat(
@@ -112,14 +112,13 @@ class SchedulerLoadPublisher:
     """Owns one scheduler's dedicated load PUB socket and the throttled,
     best-effort `publish_load_stat` path.
 
-    Enabled on the same condition as KV-event publishing (a
-    `kv_events_config` on the pp/attn-TP/CP-rank-0 scheduler), and binds the
-    load port range packed immediately after the KV-event range
-    (`kv_base + dp_size`); within the range, the per-rank offset follows
-    `select_kv_publisher_dp_rank`, exactly like the KV-event publisher, so
-    pure-DP replicas don't collide on one port. Stays a no-op (a
-    `NullEventPublisher`) when disabled or when the KV config has no usable
-    ZMQ endpoint.
+    Enabled on the same condition as KV-event publishing
+    (`is_kv_publisher_rank`), on the port range `derive_load_port_base`
+    packs after the KV-event range; within the range, the per-rank offset
+    follows `select_kv_publisher_dp_rank`, exactly like the KV-event
+    publisher, so pure-DP replicas don't collide on one port. Stays a
+    no-op (`publisher is None`) when disabled or when no load port is
+    derivable from the KV config.
     """
 
     def __init__(
@@ -129,22 +128,16 @@ class SchedulerLoadPublisher:
         ps: ParallelState,
         dp_size: int,
     ) -> None:
-        self.publisher: Any = NullEventPublisher()
-        # `enable` means "a real PUB socket is bound": every early return
-        # below leaves it False so `publish_load_stat` skips the snapshot
-        # computation entirely instead of feeding the null publisher.
-        self.enable = False
+        # `publisher is None` means "no PUB socket is bound"; every early
+        # return below leaves it None so `publish_load_stat` skips the
+        # snapshot computation entirely.
+        self.publisher: Optional[ZmqEventPublisher] = None
         self._publish_counter = 0
+        self._last_publish_ts = 0.0
         # Consecutive publish failures, reset on success (drives the
         # periodic warn).
         self._fail_count = 0
-        eligible = bool(
-            kv_events_config
-            and ps.pp_rank == 0
-            and ps.attn_tp_rank == 0
-            and ps.attn_cp_rank == 0
-        )
-        if not eligible:
+        if not is_kv_publisher_rank(kv_events_config, ps):
             return
         try:
             cfg = KVEventsConfig.from_cli(kv_events_config)
@@ -154,54 +147,22 @@ class SchedulerLoadPublisher:
             return
         if cfg.publisher == "null" or not cfg.endpoint:
             return
-        # Only tcp:// endpoints carry a port to offset. inproc:// and ipc://
-        # are valid KV-event endpoints, but deriving a distinct load endpoint
-        # from them is not defined, and offset_endpoint_port raises on ipc://
-        # — so decline rather than take down scheduler startup over a load
-        # socket.
-        if not cfg.endpoint.startswith("tcp://"):
+        # Shared with describe_kv_events_publisher, which advertises the
+        # same derivation (or omits the key) on /server_info — so a router
+        # never subscribes to a port this constructor declined. (A runtime
+        # bind failure below is the one case where the advertisement can
+        # outlive the socket; the router then sees silence and falls back.)
+        load_base = derive_load_port_base(cfg.endpoint, cfg.replay_endpoint, dp_size)
+        if load_base is None:
             logger.info(
-                "load-publisher disabled: --kv-events-config endpoint %r is not "
-                "tcp://, so no separate load port can be derived",
+                "load-publisher disabled: no load port range is derivable "
+                "from --kv-events-config endpoint %r (needs a tcp:// "
+                "endpoint with an integer port whose load range fits in "
+                "the u16 port space)",
                 cfg.endpoint,
             )
             return
-        # `dp_size` is the KV port range width; the load range starts right
-        # after it.
-        load_endpoint = ZmqEventPublisher.offset_endpoint_port(cfg.endpoint, dp_size)
-        if load_endpoint is None:
-            return
-        # Decline ports the range cannot legally bind, mirroring the
-        # conditions under which describe_kv_events_publisher omits
-        # load_endpoint_port_base from /server_info — so a router never
-        # subscribes to a port this constructor declined: the load range
-        # [kv_port + dp_size, kv_port + 2*dp_size) must fit in u16 and stay
-        # clear of the replay ROUTER range (replay_port + rank), which by the
-        # inherited convention (endpoint 5557 / replay 5558) sits exactly
-        # where this socket would otherwise land.
-        load_base = _tcp_port(load_endpoint)
-        if load_base is None or load_base + dp_size - 1 > 65535:
-            logger.info(
-                "load-publisher disabled: load port range at %r would exceed "
-                "the u16 port space",
-                load_endpoint,
-            )
-            return
-        replay_base = _tcp_port(cfg.replay_endpoint) if cfg.replay_endpoint else None
-        if (
-            replay_base is not None
-            and load_base < replay_base + dp_size
-            and replay_base < load_base + dp_size
-        ):
-            logger.info(
-                "load-publisher disabled: load port range %d..%d overlaps the "
-                "replay_endpoint range %d..%d",
-                load_base,
-                load_base + dp_size - 1,
-                replay_base,
-                replay_base + dp_size - 1,
-            )
-            return
+        load_endpoint = f"{cfg.endpoint[:cfg.endpoint.rfind(':')]}:{load_base}"
         # Dedicated load socket: own port, replay disabled, unbuffered (load
         # is a gauge, not a replayable delta). Best-effort like everything
         # else here: an unforeseen bind failure must not take down scheduler
@@ -222,33 +183,41 @@ class SchedulerLoadPublisher:
                 load_endpoint,
                 exc_info=True,
             )
-            self.publisher = NullEventPublisher()
-            return
-        self.enable = True
+            self.publisher = None
+
+    @property
+    def enable(self) -> bool:
+        """True when a real load PUB socket is bound."""
+        return self.publisher is not None
 
     def publish_load_stat(
         self, load_provider: Callable[[], LoadSnapshot], force: bool = False
     ) -> None:
         """Publish a load snapshot, throttled to [`LOAD_PUBLISH_INTERVAL`]
-        calls unless `force`.
+        calls unless `force`, and to [`LOAD_PUBLISH_MIN_INTERVAL_S`] seconds
+        always.
 
         `load_provider` returns a live [`LoadSnapshot`] read directly from
         scheduler state (`SchedulerLoadInquirer.get_loads`) — used instead of
         metrics stats, whose values are only populated under
-        `--enable-metrics`. Invoked only after the throttle passes, so the
+        `--enable-metrics`. Invoked only after the throttles pass, so the
         snapshot is computed only when actually publishing.
 
         Best-effort: a failure here must never crash the scheduler loop —
         routers fall back to their own in-flight counter. Failures re-warn
         every [`LOAD_PUBLISH_FAIL_WARN_EVERY`] consecutive failures.
         """
-        if not self.enable:
+        if self.publisher is None:
             return
 
         self._publish_counter += 1
         if not force and self._publish_counter < LOAD_PUBLISH_INTERVAL:
             return
+        now = time.monotonic()
+        if now - self._last_publish_ts < LOAD_PUBLISH_MIN_INTERVAL_S:
+            return
         self._publish_counter = 0
+        self._last_publish_ts = now
 
         try:
             load = load_provider()

@@ -9488,8 +9488,15 @@ class ServerArgs:
                                                   # base TCP port of the
                                                   # dedicated load-snapshot
                                                   # range (load rank r =
-                                                  # base + r); omitted if it
-                                                  # would overflow u16
+                                                  # base + r), packed after
+                                                  # the KV-event (and, when
+                                                  # configured, replay)
+                                                  # range; omitted if no
+                                                  # legal range exists
+                "load_topic": "load",             # ZMQ topic prefix on the
+                                                  # load-socket SUB filter;
+                                                  # present iff
+                                                  # load_endpoint_port_base is
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -9503,14 +9510,20 @@ class ServerArgs:
           ipc://, missing port, non-integer port, or port outside
           1..65535).
 
-        Reuses KVEventsConfig.from_cli for JSON parsing; the inline
+        Reuses KVEventsConfig.from_cli for JSON parsing and
+        derive_load_port_base for the load range, so the advertisement
+        cannot drift from what SchedulerLoadPublisher binds; the inline
         rfind(":") endpoint split mirrors
         ZmqEventPublisher.offset_endpoint_port rather than adding a
         new module-level helper.
         """
         # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
-        from sglang.srt.disaggregation.kv_events import KVEventsConfig
+        from sglang.srt.disaggregation.kv_events import (
+            LOAD_TOPIC,
+            KVEventsConfig,
+            derive_load_port_base,
+        )
 
         raw = self.kv_events_config
         page_size = self.page_size
@@ -9547,35 +9560,19 @@ class ServerArgs:
             "block_size": page_size,
             "dp_size": self.dp_size,
         }
-        # Dedicated port range for runtime load snapshots, packed immediately
-        # after the KV-event range (load rank r binds load_endpoint_port_base +
-        # r). Load-aware routers connect there to read the engine's true queue
-        # depth / KV occupancy. Absent => the worker predates load publishing,
-        # or the range would overflow u16; the router then falls back to its
-        # own in-flight counter. Must agree with SchedulerLoadPublisher, which
-        # binds the load publisher at kv_base + dp_size.
-        load_port_base = port + self.dp_size
-        replay_overlaps = False
-        if cfg.replay_endpoint and cfg.replay_endpoint.startswith("tcp://"):
-            _, _, replay_tail = cfg.replay_endpoint.rpartition(":")
-            try:
-                replay_base = int(replay_tail)
-            except ValueError:
-                replay_base = None
-            if replay_base is not None:
-                # Replay ROUTER sockets bind replay_base + rank over the same
-                # rank space; if the two ranges overlap, SchedulerLoadPublisher
-                # declines to bind, so don't advertise the port.
-                replay_overlaps = (
-                    load_port_base < replay_base + self.dp_size
-                    and replay_base < load_port_base + self.dp_size
-                )
-        if (
-            self.dp_size >= 1
-            and load_port_base + self.dp_size - 1 < 65536
-            and not replay_overlaps
-        ):
+        # Dedicated port range for runtime load snapshots (load rank r binds
+        # load_endpoint_port_base + r). Load-aware routers connect there to
+        # read the engine's true queue depth / KV occupancy. Derived by the
+        # same derive_load_port_base call SchedulerLoadPublisher binds with,
+        # so the advertisement and the bound socket cannot drift. Absent =>
+        # the worker predates load publishing, or no legal range exists; the
+        # router then falls back to its own in-flight counter.
+        load_port_base = derive_load_port_base(
+            cfg.endpoint, cfg.replay_endpoint, self.dp_size
+        )
+        if load_port_base is not None:
             descriptor["load_endpoint_port_base"] = load_port_base
+            descriptor["load_topic"] = LOAD_TOPIC
         return descriptor
 
 

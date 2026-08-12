@@ -792,18 +792,24 @@ class Scheduler(
             self.idle_sleeper = None
 
     def publish_load_snapshot(self, force: bool = False):
+        """Returns the LoadSnapshot it published, or None when disabled,
+        throttled, or failed — so co-located sinks (the router-facing load
+        publisher) can reuse it instead of walking the queues again."""
         writer = self.load_snapshot_writer
         if writer is None:
-            return
+            return None
         if not force:
             writer.publish_counter += 1
             if writer.publish_counter < writer.publish_interval:
-                return
+                return None
         writer.publish_counter = 0
         try:
-            writer.write(self.load_inquirer.get_loads())
+            load = self.load_inquirer.get_loads()
+            writer.write(load)
+            return load
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
+            return None
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -3925,14 +3931,20 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
         # Router-facing load gauge on the dedicated load PUB socket, for
         # cache-aware-zmq load-aware selection. Independent of the
         # DP-balancing snapshot above so it works for single workers too.
         # Sourced from the load inquirer (live scheduler counts, not the
-        # metrics-gated stats) and only evaluated when the throttle fires.
+        # metrics-gated stats) and only evaluated when the throttles fire;
+        # reuses the snapshot the DP-balancing publisher just computed
+        # instead of walking the queues a second time.
         self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads,
+            (
+                (lambda: snapshot)
+                if snapshot is not None
+                else self.load_inquirer.get_loads
+            ),
             force=batch.forward_mode.is_extend(),
         )
 
@@ -4082,11 +4094,20 @@ class Scheduler(
         self.new_token_ratio_tracker.reset()
 
         # Publish the idle state so /get_loads and DP balancing do not see stale load.
-        self.publish_load_snapshot(force=True)
+        snapshot = self.publish_load_snapshot(force=True)
         # Same for the router-facing load socket: without this, a load-aware
         # router keeps the last busy LoadStat until its freshness window
-        # expires and routes as if this idle worker were still loaded.
-        self.load_publisher.publish_load_stat(self.load_inquirer.get_loads, force=True)
+        # expires and routes as if this idle worker were still loaded. The
+        # publisher's wall-clock floor caps the send rate while the idle
+        # loop spins; the snapshot is shared with the write above.
+        self.load_publisher.publish_load_stat(
+            (
+                (lambda: snapshot)
+                if snapshot is not None
+                else self.load_inquirer.get_loads
+            ),
+            force=True,
+        )
 
         # sleep until next event
         self.maybe_sleep_on_idle()

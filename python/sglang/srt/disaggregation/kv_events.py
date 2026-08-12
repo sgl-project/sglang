@@ -27,11 +27,14 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from typing import Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import msgspec
 import zmq
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,77 @@ def select_kv_publisher_dp_rank(
     if attn_dp_size > 1:
         return attn_dp_rank
     return dp_rank or 0
+
+
+def is_kv_publisher_rank(kv_events_config: Optional[str], ps: "ParallelState") -> bool:
+    """Whether this scheduler owns a KV-event publisher slot.
+
+    One publisher per independent KV cache: the pp/attn-TP/attn-CP rank-0
+    scheduler. Shared by `SchedulerKvEventsPublisher` and
+    `SchedulerLoadPublisher`, which must gate identically — the per-rank
+    ports a router derives from `/server_info` assume both publish on the
+    same rank population.
+    """
+    return bool(
+        kv_events_config
+        and ps.pp_rank == 0
+        and ps.attn_tp_rank == 0
+        and ps.attn_cp_rank == 0
+    )
+
+
+# ZMQ topic the load publisher tags its frames with, advertised as
+# `load_topic` in /server_info so subscribers can set an exact SUB filter
+# (the load socket carries only load, so subscribe-all works too).
+LOAD_TOPIC = "load"
+
+
+def parse_tcp_port(endpoint: Optional[str]) -> Optional[int]:
+    """Port of a tcp:// endpoint, or None when there is no integer port."""
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    _, _, tail = endpoint.rpartition(":")
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
+def derive_load_port_base(
+    endpoint: Optional[str], replay_endpoint: Optional[str], dp_size: int
+) -> Optional[int]:
+    """Base port of the load-publisher range derived from a KV-events
+    config, or None when no legal range exists.
+
+    The load range is `dp_size` ports packed right after the KV-event range
+    `[kv_port, kv_port + dp_size)`; when a tcp replay endpoint is configured,
+    its ROUTER range `[replay_port, replay_port + dp_size)` is skipped over
+    (under the inherited convention replay = kv + 1, the first candidate
+    always lands on it). Returns None when the endpoint carries no parsable
+    tcp port (ipc://, inproc://, missing/non-integer port) or the range
+    would exceed the u16 port space.
+
+    This is the single source of truth for the load port: called by both
+    `SchedulerLoadPublisher` (which binds the range) and
+    `ServerArgs.describe_kv_events_publisher` (which advertises it on
+    /server_info), so the bind and the advertisement cannot drift.
+    """
+    kv_base = parse_tcp_port(endpoint)
+    if kv_base is None or dp_size < 1:
+        return None
+    load_base = kv_base + dp_size
+    replay_base = parse_tcp_port(replay_endpoint)
+    if (
+        replay_base is not None
+        and load_base < replay_base + dp_size
+        and replay_base < load_base + dp_size
+    ):
+        # Overlap implies kv < replay < kv + 2 * dp_size, so packing after
+        # the replay range also clears the KV range.
+        load_base = replay_base + dp_size
+    if load_base + dp_size - 1 > 65535:
+        return None
+    return load_base
 
 
 class EventBatch(

@@ -12,11 +12,11 @@ CPU-only.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import msgspec.msgpack
 
-from sglang.srt.disaggregation.kv_events import ZmqEventPublisher
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler_components.load_publisher import (
     LoadStat,
@@ -87,7 +87,6 @@ class TestLoadPublisherGating(CustomTestCase):
         with patch(
             "sglang.srt.managers.scheduler_components.load_publisher.ZmqEventPublisher"
         ) as zmq_pub:
-            zmq_pub.offset_endpoint_port = ZmqEventPublisher.offset_endpoint_port
             pub = SchedulerLoadPublisher(
                 kv_events_config=config,
                 ps=ParallelState.trivial(**ps_overrides),
@@ -128,10 +127,18 @@ class TestLoadPublisherGating(CustomTestCase):
         _, zmq_pub = self._build(dp_size=2)
         self.assertEqual(zmq_pub.call_args.kwargs["endpoint"], "tcp://*:5559")
 
-    def test_non_tcp_endpoint_declines_instead_of_raising(self):
-        # ipc:// and inproc:// are valid KV-event endpoints; offset_endpoint_port
-        # raises on ipc://, which must not take down scheduler startup.
-        for endpoint in ("ipc:///tmp/kv.sock", "inproc://kv"):
+    def test_underivable_endpoint_declines_instead_of_raising(self):
+        # ipc:// and inproc:// are valid KV-event endpoints but carry no port
+        # to offset; tcp:// endpoints without an integer port (a port-less
+        # host, or ZMQ's ephemeral-port wildcard "tcp://*:*", on which the KV
+        # publisher itself starts fine) are underivable too. None of them may
+        # take down scheduler startup over a load socket.
+        for endpoint in (
+            "ipc:///tmp/kv.sock",
+            "inproc://kv",
+            "tcp://somehost",
+            "tcp://*:*",
+        ):
             with self.subTest(endpoint=endpoint):
                 pub, zmq_pub = self._build(
                     config='{"publisher": "zmq", "endpoint": "%s"}' % endpoint
@@ -151,25 +158,40 @@ class TestLoadPublisherGating(CustomTestCase):
                 pub, _ = self._build(config=config)
                 self.assertFalse(pub.enable)
 
-    def test_replay_port_collision_declines_instead_of_crashing(self):
+    def test_replay_port_collision_skips_past_the_replay_range(self):
         # Conventional config inherited from upstream: KV on 5557, replay on
         # 5558. With dp_size=1 the load socket would land exactly on the
-        # replay ROUTER's port; binding would abort scheduler startup on a
-        # config that works without the load publisher.
+        # replay ROUTER's port; instead of declining (which would silently
+        # turn the feature off on exactly this common config) the load range
+        # packs after the replay range: 5558 + dp_size = 5559.
         pub, zmq_pub = self._build(
             config='{"publisher": "zmq", "endpoint": "tcp://*:5557", '
             '"replay_endpoint": "tcp://*:5558"}'
         )
-        self.assertFalse(pub.enable)
-        zmq_pub.assert_not_called()
+        self.assertTrue(pub.enable)
+        self.assertEqual(zmq_pub.call_args.kwargs["endpoint"], "tcp://*:5559")
 
-    def test_replay_far_away_still_enables(self):
+    def test_replay_skip_covers_the_whole_per_rank_range(self):
+        # dp_size=4: KV range 5557..5560, replay ROUTER range 5558..5561; the
+        # first candidate (5561) still collides with the replay range's tail,
+        # so the load range packs after it: 5558 + 4 = 5562.
+        pub, zmq_pub = self._build(
+            config='{"publisher": "zmq", "endpoint": "tcp://*:5557", '
+            '"replay_endpoint": "tcp://*:5558"}',
+            dp_size=4,
+        )
+        self.assertTrue(pub.enable)
+        self.assertEqual(zmq_pub.call_args.kwargs["endpoint"], "tcp://*:5562")
+
+    def test_replay_far_away_keeps_the_packed_port(self):
+        # No overlap with the replay range => the load range stays right
+        # after the KV range (no needless jump past a distant replay port).
         pub, zmq_pub = self._build(
             config='{"publisher": "zmq", "endpoint": "tcp://*:5557", '
             '"replay_endpoint": "tcp://*:6000"}'
         )
         self.assertTrue(pub.enable)
-        zmq_pub.assert_called_once()
+        self.assertEqual(zmq_pub.call_args.kwargs["endpoint"], "tcp://*:5558")
 
     def test_port_overflow_declines_instead_of_crashing(self):
         # kv base 65535 + dp_size pushes the load range past u16;
@@ -185,6 +207,27 @@ class TestLoadPublisherGating(CustomTestCase):
         provider = MagicMock()
         pub.publish_load_stat(provider, force=True)
         provider.assert_not_called()
+
+    def test_forced_publishes_respect_the_wall_clock_floor(self):
+        # force=True fires per extend batch and per idle-loop iteration (which
+        # busy-spins without --sleep-on-idle); the wall-clock floor is what
+        # bounds the snapshot + send rate on those paths.
+        pub, _ = self._build()
+        provider = MagicMock(
+            return_value=SimpleNamespace(
+                num_running_reqs=1,
+                num_waiting_reqs=2,
+                num_used_tokens=3,
+                max_total_num_tokens=4,
+            )
+        )
+        pub.publish_load_stat(provider, force=True)
+        pub.publish_load_stat(provider, force=True)  # within the floor: dropped
+        self.assertEqual(provider.call_count, 1)
+        pub._last_publish_ts = 0.0  # simulate the floor elapsing
+        pub.publish_load_stat(provider, force=True)
+        self.assertEqual(provider.call_count, 2)
+        self.assertEqual(pub.publisher.publish.call_count, 2)
 
 
 if __name__ == "__main__":
