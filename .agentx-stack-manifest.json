@@ -1,0 +1,46 @@
+{
+  "schema_version": 2,
+  "status": "pd_prefill_spec_verify_sizing_experiment",
+  "frozen_at": "2026-08-12T01:25:00-07:00",
+  "model": {
+    "repo": "nvidia/Qwen3.5-397B-A17B-NVFP4",
+    "revision": "1dcf92e1a474ef147273a2a2d15ad5daec44edc5"
+  },
+  "container": {
+    "image": "lmsysorg/sglang:nightly-dev-cu13-20260809-cea16bf2",
+    "registry_digest": "sha256:4c44c95626c7601f19259266342341976e848f835fbe33ebb4b09a28dff3063c",
+    "aga_sqsh": "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/yangminl/agentx-max-tps-20260810/containers/lmsysorg+sglang+nightly-dev-cu13-20260809-cea16bf2-arm64-enroot.sqsh",
+    "aga_sqsh_sha256": "87c34529c0e854e85b6075619a0f62cece4843de8bb4698f7aeaf30e0ae04c5a"
+  },
+  "sglang": {
+    "base_commit": "a39f7f4c291915633d3889491c5b90fa64bf6beb",
+    "experiment_commit": "9aee3f46195c0af94c33121af1424f5f2fc4492c",
+    "experiment_tree": "0b93105a2ebd7dc58b673f2dfc5685d2f6df13bb",
+    "patch_sha256": "f0710b92a250aed3d41dc3fc3ee06c126489d54c5f3203a85b0768116f166f57",
+    "change": "Do not reserve speculative TARGET_VERIFY intermediate SSM memory on a disaggregated Prefill worker because its actual HybridReqToTokenPool passes speculative_num_draft_tokens=None.",
+    "targeted_validation": {
+      "py_compile": "pass",
+      "diff_check": "pass",
+      "cpu_unit_test": "pending AGA ARM64 container canary",
+      "real_agentx_canary": "pending"
+    }
+  },
+  "srt_slurm": {
+    "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
+    "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
+  },
+  "aiperf": {
+    "repo": "https://github.com/SemiAnalysisAI/aiperf.git",
+    "commit": "bcfc235c552a17de6d1a7a5d2345cf012401588d",
+    "tag": "agentx-v1.0.3"
+  },
+  "dataset": {
+    "public_alias": "semianalysis_cc_traces_weka_062126_256k",
+    "num_dataset_entries": 393,
+    "live_assistant_responses": false,
+    "random_seed": 42,
+    "trajectory_start_min_ratio": 0.25,
+    "trajectory_start_max_ratio": 0.75,
+    "trace_delays": "recorded"
+  }
+}
