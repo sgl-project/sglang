@@ -112,7 +112,7 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.storage_hit_length = 0
-        req.req_pool_idx = None
+        req.kv.req_pool_idx = None
         req.dllm_incomplete_ids = array("q")
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
@@ -426,10 +426,10 @@ class TestPrefillAdder(CustomTestCase):
     def test_dllm_staging_reuses_retained_kv_with_zero_available_pages(self):
         adder = self.create_dllm_adder(is_prefill=False, available_size=0)
         req = self.create_dllm_req(origin_len=20, prefix_len=0, is_prefill=False)
-        req.req_pool_idx = 1
+        req.kv.req_pool_idx = 1
         req.dllm_incomplete_ids = array("q", range(32))
         req.full_untruncated_fill_ids = list(req.dllm_incomplete_ids)
-        req.kv = SimpleNamespace(kv_allocated_len=32)
+        req.kv.kv_allocated_len = 32
         scheduler = SimpleNamespace(_abort_dllm_req_exact=MagicMock())
 
         result = SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, adder, [req])

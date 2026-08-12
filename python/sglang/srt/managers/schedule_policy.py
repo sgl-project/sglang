@@ -940,7 +940,7 @@ class PrefillAdder:
         )
 
         # Retained incomplete-block KV is reused by alloc_for_extend; skip KV budget.
-        reuse_retained_kv = req.req_pool_idx is not None and bool(
+        reuse_retained_kv = req.kv.req_pool_idx is not None and bool(
             req.dllm_incomplete_ids
         )
         if reuse_retained_kv:

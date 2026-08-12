@@ -377,8 +377,7 @@ class SchedulerDllmMixin:
         for req in reqs:
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
-                # Without a runnable batch, this request would be retried
-                # without a state change. Abort it; otherwise keep it queued.
+                # Abort only when no batch can make progress.
                 running_batch = getattr(adder, "running_batch", None)
                 no_batch = running_batch is None or running_batch.is_empty()
                 if not adder.can_run_list and no_batch:
@@ -387,10 +386,46 @@ class SchedulerDllmMixin:
                         "capacity for an aligned extend",
                         req.rid,
                     )
-                    self.abort_request(AbortReq(rid=req.rid))
+                    self._abort_dllm_req_exact(req)
                 return res
 
         return AddReqResult.CONTINUE
+
+    def _cleanup_dllm_req(self: Scheduler, req: Req) -> None:
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+
+        kv = getattr(req, "kv", None)
+        req_pool_idx = getattr(kv, "req_pool_idx", None)
+        mamba_pool_idx = getattr(kv, "mamba_pool_idx", None)
+        if req_pool_idx is not None or mamba_pool_idx is not None:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            return
+        if kv is None:
+            return
+
+        cache_protected_len = getattr(
+            kv, "cache_protected_len", getattr(req, "cache_protected_len", 0)
+        )
+        uncached = req.prefix_indices[cache_protected_len:]
+        if len(uncached):
+            self.token_to_kv_pool_allocator.free(uncached)
+        if req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node)
+            req.last_node = None
+        mark_released = getattr(kv, "mark_kv_released", None)
+        if callable(mark_released):
+            mark_released()
+        else:
+            if hasattr(kv, "kv_allocated_len"):
+                kv.kv_allocated_len = 0
+            if hasattr(kv, "swa_evicted_seqlen"):
+                kv.swa_evicted_seqlen = 0
+
+    def _abort_dllm_req_exact(self: Scheduler, req: Req) -> None:
+        self._cleanup_dllm_req(req)
+        self.dllm_manager.pop_aborted_reqs(False, req.rid, exact=True)
+        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
 
 
 class DllmManager:
@@ -460,7 +495,9 @@ class DllmManager:
         self.waiting_queue = [req for req in self.waiting_queue if not req.finished()]
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
 
-    def pop_aborted_reqs(self, abort_all: bool, rid: str) -> List[Req]:
+    def pop_aborted_reqs(
+        self, abort_all: bool, rid: str, *, exact: bool = False
+    ) -> List[Req]:
         aborted_reqs: List[Req] = []
         seen: Set[int] = set()
 
@@ -468,7 +505,8 @@ class DllmManager:
             queue = getattr(self, queue_name)
             kept_queue = []
             for req in queue:
-                if abort_all or req.rid.startswith(rid):
+                matches_rid = req.rid == rid if exact else req.rid.startswith(rid)
+                if abort_all or matches_rid:
                     req_id = id(req)
                     if req_id not in seen:
                         aborted_reqs.append(req)
