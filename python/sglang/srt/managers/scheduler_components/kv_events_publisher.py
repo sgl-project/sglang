@@ -61,6 +61,9 @@ class SchedulerKvEventsPublisher:
         self.init_kv_events(self.kv_events_config)
 
     def init_kv_events(self, kv_events_config: Optional[str]):
+        # Publish one metadata stream/snapshot per independently routable DP
+        # replica. TP/CP/PP followers belong to the same logical replica and
+        # must not expose duplicate snapshots of that placement state.
         self.enable_kv_cache_events = bool(
             kv_events_config
             and self.ps.pp_rank == 0

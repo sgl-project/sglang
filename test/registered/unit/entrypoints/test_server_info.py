@@ -150,6 +150,38 @@ class TestServerInfoKvEventsField(CustomTestCase):
         self.assertEqual(info["kv_events"]["block_size"], 128)
         self.assertEqual(info["kv_events"]["dp_size"], 1)
 
+    def test_kv_events_descriptor_advertises_optional_snapshot_endpoint(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
+                '"snapshot_endpoint": "tcp://*:5757"}'
+            ),
+            page_size=64,
+            dp_size=2,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["snapshot_endpoint_host"], "*")
+        self.assertEqual(info["kv_events"]["snapshot_endpoint_port_base"], 5757)
+        self.assertEqual(info["kv_events"]["snapshot_protocol_version"], 1)
+
+    def test_invalid_snapshot_endpoint_does_not_hide_live_publisher(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
+                '"snapshot_endpoint": "inproc://snapshot"}'
+            ),
+            page_size=64,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertNotIn("snapshot_endpoint_host", info["kv_events"])
+
     # ----- disabled / unconfigured -------------------------------------
 
     def test_kv_events_is_null_when_no_publisher_configured(self):

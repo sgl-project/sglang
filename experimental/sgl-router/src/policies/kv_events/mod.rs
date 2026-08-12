@@ -12,19 +12,23 @@
 //! - [`tree`] — hash-keyed radix tree consumed by the routing path.
 //! - [`subscriber`] — per-worker ZMQ SUB tasks.
 //! - [`discovery`] — `/server_info` parse → publisher endpoint.
+//! - [`snapshot`] — chunked placement-snapshot wire protocol.
+//! - `sync` — internal snapshot bootstrap and live-event catch-up state machine.
 //! - [`index`] — public façade bundling the tree + subscribers + pump.
 
 pub mod block_size_oracle;
 pub mod discovery;
 pub mod hash;
 pub mod index;
+pub mod snapshot;
 pub mod subscriber;
+mod sync;
 pub mod tree;
 pub mod wire;
 
 pub use block_size_oracle::BlockSizeOracle;
 pub(crate) use discovery::classify_bigram;
-pub use discovery::{fetch_event_config, EventConfig};
+pub use discovery::{fetch_event_config, EventConfig, SnapshotConfig};
 pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
 pub use index::KvEventIndex;
 pub use subscriber::{KvEventSubscriberRegistry, WorkerEvent};
