@@ -97,9 +97,20 @@ class StandardDispatcher(BaseDispatcher):
         self.use_aiter_moe_runner = backend.is_aiter() or (
             backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
         )
+        # A quant method may build a runner of a different backend than the configured one:
+        # compressed-tensors W4A16 always builds Triton. Where the runner recorded itself as
+        # something other than AITER, believe it -- its kernels are sized for the rank-local
+        # expert range, so handing them global IDs writes out of bounds. This only ever
+        # narrows the inference above: a runner reporting AITER where the inference said
+        # otherwise is the mirror-image mismatch, which needs its own testing.
+        recorded_backend = moe_runner_config.runner_backend
+        if recorded_backend is not None and not recorded_backend.is_aiter():
+            self.use_aiter_moe_runner = False
         # Skip local expert mapping when the backend handles EP with global expert IDs:
         # - cutlass / cutedsl / trtllm_routed handle EP internally
         # - mxfp4 dispatcher mapping is already global
+        # Still read off the configured backend, deliberately: a quant method resolving `auto`
+        # to one of these has the same mismatch, but that side needs its own testing.
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()

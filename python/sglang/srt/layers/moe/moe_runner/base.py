@@ -61,6 +61,13 @@ class MoeRunnerConfig:
     # otherwise chunk gate/up then apply alpha/limit).
     gate_up_interleaved: bool = True
     layer: Optional[torch.nn.Module] = None
+    # Backend of the MoeRunner built for this layer. Written by every MoeRunner.__init__
+    # and read exactly once, by StandardDispatcher.__init__ -- layer.py builds the runner
+    # one line before the dispatcher. So the last runner built before that point decides
+    # the expert-ID namespace, which UnquantizedFusedMoEMethod relies on: under `auto` it
+    # builds Triton first, then the AITER runner apply() prefers. Writes after dispatcher
+    # construction (lora/layers.py) are ignored; do not add readers elsewhere.
+    runner_backend: Optional[MoeRunnerBackend] = None
     use_tp_all_gather_activation: bool = False
 
 
