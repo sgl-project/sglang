@@ -25,7 +25,18 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    AbstractSet,
+    Any,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -2927,6 +2938,25 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+    def _count_inflight_chunk(self, batch_reqs: AbstractSet[Req]) -> None:
+        """Mark the chunked request as having a chunk in flight this batch.
+
+        Only counts a chunk that is actually in the batch. `add_chunked_req`
+        can *park* the request instead of prefilling it -- the hybrid-SWA
+        branch returns it without appending it to `can_run_list` when the SWA
+        pool cannot fit another page. A parked request produces no forward
+        result, so `process_batch_result_prefill` never runs the matching
+        decrement; the counter would ratchet up once per pass and a request
+        stuck above zero is treated as a middle chunk forever, never appending
+        a token and never finishing.
+
+        This mirrors the parked-chunk gate on the stash path in
+        `get_next_batch_to_run` (`extend_range.end > len(prefix_indices)`),
+        which detects the same condition from the request's own state.
+        """
+        if self.chunked_req is not None and self.chunked_req in batch_reqs:
+            self.chunked_req.inflight_middle_chunks += 1
+
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
 
@@ -3383,8 +3413,7 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
+        self._count_inflight_chunk(can_run_set)
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
