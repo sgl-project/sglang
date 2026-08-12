@@ -52,7 +52,7 @@ import msgspec.msgpack
 import msgspec.structs
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.network import is_zmq_endpoint_ipv6
+from sglang.srt.utils.network import NetworkAddress, is_zmq_endpoint_ipv6
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +409,104 @@ class ZmqLoadSnapshotWriter:
         self._socket.close()
 
 
+class PubLoadSnapshotWriter:
+    """Publishes load snapshots via zmq PUB for out-of-process load-aware routers.
+
+    Differs from ZmqLoadSnapshotWriter in both direction and topology: that one
+    PUSHes to the single reader *process* that owns the PULL end, so exactly one
+    consumer exists. This one binds a PUB socket per publishing scheduler rank,
+    so any number of routers can subscribe without stealing each other's
+    snapshots.
+
+    WHY the framing matters: subscribers require a three-frame message --
+    ``[topic, big-endian i64 seq, msgpack payload]`` -- and drop anything with a
+    different frame count. Getting it wrong is silent on this side (PUB never
+    errors on a send nobody wants) and costs one warn per frame on the router,
+    so the layout is part of the wire contract rather than an implementation
+    detail. The topic frame is empty (this socket carries only load, so
+    subscribers subscribe-all) and the sequence counts up from 0, never reaching
+    the -1 that the shared frame format reserves for "publisher going away".
+
+    ZMQ_CONFLATE would be the natural fit for a gauge but cannot be used: it
+    keeps only a single *frame*, which would corrupt the layout above. The send
+    HWM is not equivalent -- PUB drops the newest message once a peer's pipe is
+    full, so a stalled subscriber drains older queued snapshots first. It buys a
+    bounded backlog, not latest-value semantics, and routers stamp arrival time
+    rather than reading the snapshot's own ``timestamp``, so that backlog is not
+    filtered by their freshness window. Keep it small enough that the bound
+    stays well inside that window.
+
+    This class is transport only: when to publish is the publisher's decision,
+    because the right cadence for a network gauge is not the right cadence for
+    the local writers (see `SchedulerLoadPublisher`).
+    """
+
+    DEFAULT_HWM = 8
+
+    def __init__(
+        self,
+        endpoint: str,
+        dp_size: int,
+        dp_rank: int,
+        hwm: int = DEFAULT_HWM,
+    ):
+        import zmq as _zmq
+
+        if dp_rank < 0 or dp_rank >= dp_size:
+            raise ValueError(f"invalid dp_rank={dp_rank} for dp_size={dp_size}")
+        self.dp_size = dp_size
+        self.dp_rank = dp_rank
+        self.endpoint = endpoint
+        self._seq = 0
+
+        # Refused rather than connected: a PUB socket that connects to the load
+        # range reaches nobody, reports no error, and is indistinguishable from
+        # a healthy publisher. Callers route through create_load_pub_writer,
+        # which never produces one, so this guards direct construction.
+        from sglang.srt.disaggregation.kv_events import endpoint_is_bind_style
+
+        if not endpoint_is_bind_style(endpoint):
+            raise ValueError(
+                f"load PUB endpoint {endpoint!r} is not bindable; a concrete "
+                f"host would be connected to and publish into a void"
+            )
+
+        self._zmq = _zmq
+        self._ctx = _zmq.Context.instance()
+        self._socket = self._ctx.socket(_zmq.PUB)
+        try:
+            self._socket.set_hwm(hwm)
+            if is_zmq_endpoint_ipv6(endpoint):
+                self._socket.setsockopt(_zmq.IPV6, 1)
+            self._socket.setsockopt(_zmq.LINGER, 0)
+            self._socket.bind(endpoint)
+        except Exception:
+            # Match ShmLoadSnapshotWriter: release the handle before re-raising
+            # rather than leaking it on the shared context.
+            self._socket.close()
+            raise
+
+    def write(self, snapshot: LoadSnapshot) -> None:
+        if snapshot.dp_rank != self.dp_rank:
+            raise ValueError(
+                f"snapshot dp_rank={snapshot.dp_rank} does not match "
+                f"writer dp_rank={self.dp_rank}"
+            )
+        frames = [
+            b"",
+            struct.pack(">q", self._seq),
+            snapshot_encoder.encode(snapshot),
+        ]
+        self._seq += 1
+        try:
+            self._socket.send_multipart(frames, self._zmq.NOBLOCK)
+        except self._zmq.Again:
+            pass
+
+    def close(self) -> None:
+        self._socket.close()
+
+
 # ---------------------------------------------------------------------------
 # Readers
 # ---------------------------------------------------------------------------
@@ -626,6 +724,10 @@ def _zmq_addr_for(port_args) -> str:
     return f"ipc:///tmp/sglang_load_collector_{safe}_{digest}.sock"
 
 
+# Hosts a PUB socket can listen on. A concrete address is not one of them: the
+# publisher would connect to it instead, and since nothing listens on the load
+
+
 def create_load_snapshot_writer(
     server_args,
     port_args,
@@ -641,6 +743,44 @@ def create_load_snapshot_writer(
     return ShmLoadSnapshotWriter(
         shm_path_for(port_args.instance_id), dp_size, dp_rank, publish_interval
     )
+
+
+def create_load_pub_writer(server_args, dp_rank: int):
+    """This rank's router-facing PUB writer, or None.
+
+    Deliberately separate from `create_load_snapshot_writer`: "which internal
+    backend" and "is there a router-facing socket" are independent questions
+    with independent inputs, and the two sinks differ in how badly their absence
+    matters. Losing the internal writer degrades ``/v1/loads`` and DP dispatch;
+    losing this one costs routers a signal they already know how to live
+    without.
+
+    This is where the decline reason is logged -- once, at construction --
+    rather than in the resolver, which ``/server_info`` calls per request.
+    """
+    from sglang.srt.disaggregation.kv_events import resolve_load_pub_range
+
+    resolved, reason = resolve_load_pub_range(server_args)
+    if resolved is None:
+        if reason:
+            logger.error("router-facing load publishing is off: %s", reason)
+        return None
+    host, base = resolved
+    endpoint = NetworkAddress(host, base + dp_rank).to_tcp()
+    try:
+        return PubLoadSnapshotWriter(endpoint, server_args.dp_size, dp_rank)
+    except Exception as e:
+        # /server_info advertises this range and a static descriptor cannot
+        # retract it, so a router will subscribe and see silence; the log is the
+        # only place that connects the two.
+        logger.error(
+            "router-facing load snapshot writer failed to bind %s; "
+            "/server_info advertises this range but nothing is listening: %s",
+            endpoint,
+            e,
+            exc_info=True,
+        )
+        return None
 
 
 def create_load_snapshot_reader(server_args, port_args, caller: str):

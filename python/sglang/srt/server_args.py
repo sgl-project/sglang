@@ -1603,7 +1603,12 @@ class ServerArgs:
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Note that a TCP endpoint here also reserves the immediately following dp_size ports for load publishing unless --load-publish-endpoint overrides it.",
+        NS("observability"),
+    ] = None
+    load_publish_endpoint: A[
+        Optional[str],
+        "Bind address for the runtime-load PUB socket that load-aware routers subscribe to, e.g. tcp://*:6000; rank r binds port+r and /server_info advertises the base. Must be a wildcard TCP address. Defaults to the dp_size ports immediately after the --kv-events-config range; set it explicitly to move the range off a port conflict. Routers discover the base through the /server_info kv-events block, so load publishing requires --kv-events-config to describe a publisher either way.",
         NS("observability"),
     ] = None
     enable_forward_pass_metrics: A[
@@ -9485,6 +9490,11 @@ class ServerArgs:
                                                   # prompts at this size
                 "dp_size": <dp_size>,             # number of SUB sockets
                                                   # to open
+                "load_endpoint_port_base":        # base TCP port of the
+                    <port + dp_size>,             # load-snapshot range (load
+                                                  # rank r = base + r); omitted
+                                                  # when the range would
+                                                  # overflow u16
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -9534,7 +9544,7 @@ class ServerArgs:
         if not host or not (0 < port < 65536):
             return None
 
-        return {
+        descriptor = {
             "publisher": cfg.publisher,
             "endpoint_host": host,
             "endpoint_port_base": port,
@@ -9542,6 +9552,17 @@ class ServerArgs:
             "block_size": page_size,
             "dp_size": self.dp_size,
         }
+
+        # Dedicated port range for runtime load snapshots, packed immediately
+        # after the KV-event range. Resolved by the same function the writer
+        # binds through, so this cannot advertise a range nothing listens on;
+        # `resolve_load_pub_range` documents when and why it declines.
+        from sglang.srt.disaggregation.kv_events import load_pub_port_base
+
+        load_port_base = load_pub_port_base(self)
+        if load_port_base is not None:
+            descriptor["load_endpoint_port_base"] = load_port_base
+        return descriptor
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:
