@@ -127,7 +127,8 @@ find_latest_image() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  # First, check local cache on the runner.
+  # First, check local cache on the runner. Always cold in CI: the runners are
+  # docker-in-docker with ephemeral storage. See amd_ci_start_container.sh.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
@@ -211,29 +212,23 @@ find_latest_image() {
 
 # Pull and run the latest image
 IMAGE=$(find_latest_image "${GPU_ARCH}")
-if [[ -n "$(docker images -q "${IMAGE}" 2>/dev/null)" ]]; then
-  # Already in this runner's image store, and the tag carries its publish date,
-  # so there is nothing a pull could bring in.
-  echo "Reusing image already present on this runner: ${IMAGE}"
-else
-  pulled_from_mirror=0
-  if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
-    # Try the in-network mirror first: it avoids Docker Hub rate limits and is
-    # faster on the LAN. Capture stderr so the real failure reason (TLS
-    # handshake, 404, connection refused, etc.) is visible in the job log
-    # instead of being silently swallowed.
-    if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-      echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-      docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-      pulled_from_mirror=1
-    else
-      echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-      printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-    fi
+pulled_from_mirror=0
+if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
+  # Try the in-network mirror first: it avoids Docker Hub rate limits and is
+  # faster on the LAN. Capture stderr so the real failure reason (TLS handshake,
+  # 404, connection refused, etc.) is visible in the job log instead of being
+  # silently swallowed.
+  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+    pulled_from_mirror=1
+  else
+    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
   fi
-  if (( pulled_from_mirror == 0 )); then
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  fi
+fi
+if (( pulled_from_mirror == 0 )); then
+  retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
 CACHE_HOST=/home/runner/sglang-data

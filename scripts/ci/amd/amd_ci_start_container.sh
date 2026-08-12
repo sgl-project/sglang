@@ -153,7 +153,10 @@ find_latest_image() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  # First, check local cache on the runner.
+  # First, check local cache on the runner. Note that the CI runners are
+  # docker-in-docker with ephemeral storage and each job starts the container
+  # once, so in CI this store is always cold and these probes always miss --
+  # nothing downstream may assume an image survives from an earlier job.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
@@ -278,30 +281,23 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  if [[ -n "$(docker images -q "${IMAGE}" 2>/dev/null)" ]]; then
-    # find_latest_image prefers this runner's own image store, and every tag it
-    # returns carries the date it was published, so a pull here could only
-    # re-check a manifest that cannot have moved.
-    echo "Reusing image already present on this runner: ${IMAGE}"
-  else
-    pulled_from_mirror=0
-    if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
-      # Try the in-network mirror first: it avoids Docker Hub rate limits and is
-      # faster on the LAN. Capture stderr so the real failure reason (TLS
-      # handshake, 404, connection refused, etc.) is visible in the job log
-      # instead of being silently swallowed.
-      if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-        echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-        docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-        pulled_from_mirror=1
-      else
-        echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-        printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-      fi
+  pulled_from_mirror=0
+  if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
+    # Try the in-network mirror first: it avoids Docker Hub rate limits and is
+    # faster on the LAN. Capture stderr so the real failure reason (TLS
+    # handshake, 404, connection refused, etc.) is visible in the job log
+    # instead of being silently swallowed.
+    if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+      echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+      docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+      pulled_from_mirror=1
+    else
+      echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+      printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
     fi
-    if (( pulled_from_mirror == 0 )); then
-      retry_with_backoff 6 docker pull "${IMAGE}"
-    fi
+  fi
+  if (( pulled_from_mirror == 0 )); then
+    retry_with_backoff 6 docker pull "${IMAGE}"
   fi
 fi
 
