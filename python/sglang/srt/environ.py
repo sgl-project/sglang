@@ -922,6 +922,10 @@ class Envs:
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
+    # Experimental ROCm optimization: group Qwen3.5 target-verify query heads
+    # that share one TP-local KV head, loading prefix K/V once per query group.
+    # False keeps the established per-query-head split-KV implementation.
+    SGLANG_OPT_USE_QWEN3_5_SHARED_KV_VERIFY = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
