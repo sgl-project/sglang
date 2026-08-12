@@ -689,7 +689,7 @@ install_extra_deps() {
     # test/registered/eval/test_text_models_gsm8k_eval.py and the mmlu thresholds
     # of the callers listed there before changing it.
     # This SHA is the first carrying both mmmu_pro_vision and mmlu's seeded
-    # sampling (without which --num-examples 64 scores one subject).
+    # sampling.
     SGL_EVAL_REF="6690895609dcbc5df1e7b00dd57c9502b868ec4d"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"

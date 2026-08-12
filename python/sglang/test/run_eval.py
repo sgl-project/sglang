@@ -138,8 +138,7 @@ def _run_sgl_eval(eval_name, args) -> dict:
         cmd += ["--num-examples", str(args.num_examples)]
     if getattr(args, "top_p", None) is not None:
         cmd += ["--top-p", str(args.top_p)]
-    # sgl-eval leaves the seed unset by default; a caller that samples
-    # (temperature > 0) has to pin it to get a reproducible run.
+    # Unset by default in sgl-eval; only a sampling caller (temperature > 0) needs it.
     if getattr(args, "seed", None) is not None:
         cmd += ["--seed", str(args.seed)]
     if getattr(args, "repeat", None) is not None:
@@ -250,13 +249,10 @@ def run_eval(args):
     )
 
     if args.eval_name == "mmlu":
-        # Scored by sgl-eval, which mirrors NeMo-Skills' mcq prompt and eval_mcq
-        # grader. That replaces the local zero-shot prompt plus the single
-        # `Answer: [A-D]` regex in simple_eval_common, and also switches the
-        # source data from the simple-evals CSV to Hendrycks' per-subject split,
-        # so scores shift and thresholds need re-baselining.
-        # `simple_eval_mmlu` stays for its subject2category table, which the
-        # ascend eval imports.
+        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), which
+        # shifts scores off the local prompt/regex baseline -- a caller's
+        # threshold has to be re-baselined, not carried over.
+        # `simple_eval_mmlu` stays: the ascend eval imports its subject2category.
         return _run_sgl_eval("mmlu", args)
     elif args.eval_name == "math":
         from sglang.test.simple_eval_math import MathEval
@@ -314,9 +310,8 @@ def run_eval(args):
             response_answer_regex=getattr(args, "response_answer_regex", None),
         )
     elif args.eval_name == "mmmu_pro_vision":
-        # MMMU-Pro's `vision` config: question and options are rendered into one
-        # screenshot. sgl-eval owns the dataset, prompt and grader for it -- there
-        # is no simple_eval implementation to fall back to.
+        # sgl-eval owns this benchmark's dataset, prompt and grader; there is no
+        # simple_eval implementation to fall back to.
         return _run_sgl_eval("mmmu_pro_vision", args)
     elif args.eval_name == "aime25":
         from sglang.test.simple_eval_aime25 import AIME25Eval

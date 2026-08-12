@@ -61,11 +61,9 @@ class TestQwen35Fp8(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="Qwen3.5-397B-FP8",
-            # Sampling is pinned to what the previous NeMo-Skills harness sent
-            # implicitly, so the baseline carries over unchanged: `ns eval
-            # --benchmarks=mmmu-pro:1` defaults to temperature 0.7 (only `:0`
-            # or a bare name means greedy) with seed 0, and sends no
-            # chat_template_kwargs.thinking.
+            # Pinned to what `ns eval --benchmarks=mmmu-pro:1` sent implicitly --
+            # its `:1` suffix means temperature 0.7, not greedy -- so the baseline
+            # carries over unchanged. Do not "simplify" these away.
             accuracy_params=AccuracyTestParams(
                 dataset="mmmu_pro_vision",
                 baseline_accuracy=0.76,
