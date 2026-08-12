@@ -2,7 +2,7 @@
 
 import unittest
 
-from sglang.srt.utils.cuda_ipc_transport_utils import (
+from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.test.ci.ci_register import register_cpu_ci

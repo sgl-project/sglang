@@ -24,7 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
-    MINIMAX_H3_QUALITY_PROFILES,
+    MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
@@ -387,7 +387,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             scheduler=None,
             pipeline=pipeline,
         )
-        self._minimax_h3_quality_profile = "lossless"
+        self._minimax_h3_quality = "lossless"
         self._minimax_h3_cache_mode: str | None = None
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
@@ -395,7 +395,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
     def _cache_dit_requested(self) -> bool:
         return (
-            getattr(self, "_minimax_h3_quality_profile", "lossless") != "lossless"
+            getattr(self, "_minimax_h3_quality", "lossless") == "high"
             or super()._cache_dit_requested()
         )
 
@@ -403,19 +403,15 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
         quality = getattr(batch.sampling_params, "quality", "lossless")
-        if quality not in MINIMAX_H3_QUALITY_PROFILES:
-            raise ValueError(f"unsupported MiniMax-H3 quality profile {quality!r}")
         explicit_fields = getattr(batch.sampling_params, "_explicit_fields", ())
         generic_requested = (
             super()._cache_dit_requested() and "quality" not in explicit_fields
         )
         desired_mode = (
-            quality
-            if quality != "lossless"
-            else ("generic" if generic_requested else None)
+            "high" if quality == "high" else ("generic" if generic_requested else None)
         )
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)
-        self._minimax_h3_quality_profile = quality
+        self._minimax_h3_quality = quality
 
         # H3 is monolithic-only, and the scheduler executes one worker batch at
         # a time. Combined with `quality` in the dynamic-batch signature, this
@@ -435,7 +431,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def _cache_dit_scm_masks(
         self, primary_num_steps: int, secondary_num_steps: int | None = None
     ) -> tuple[str, str, list[int] | None, list[int] | None]:
-        if getattr(self, "_minimax_h3_quality_profile", "lossless") != "lossless":
+        if getattr(self, "_minimax_h3_quality", "lossless") == "high":
             return "none", "dynamic", None, None
         return super()._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
 
@@ -447,16 +443,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         *,
         secondary: bool = False,
     ) -> CacheDitConfig:
-        quality = getattr(self, "_minimax_h3_quality_profile", "lossless")
-        profile = MINIMAX_H3_QUALITY_PROFILES[quality]
-        if profile is None or secondary:
+        if secondary or getattr(self, "_minimax_h3_quality", "lossless") != "high":
             return super()._build_cache_dit_config(
                 num_inference_steps,
                 steps_computation_mask,
                 scm_policy,
                 secondary=secondary,
             )
-        warmup, threshold, max_cached = profile
+        warmup, threshold, max_cached = MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG
         return CacheDitConfig(
             enabled=True,
             Fn_compute_blocks=1,

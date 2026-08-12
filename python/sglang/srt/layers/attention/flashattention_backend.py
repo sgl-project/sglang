@@ -242,9 +242,12 @@ class FlashAttentionBackend(AttentionBackend):
                 "Prefill-aware SWA requires page_size=1, "
                 f"got page_size={self.page_size}"
             )
-            max_bs = model_runner.req_to_token_pool.size
+            # Indexed by raw req_pool_idx values (see the write below and
+            # _build_pa_page_table), which range over [0, size] (row 0 is the
+            # reserved padding slot) -- so this needs size+1, not size.
+            max_req_pool_idx = model_runner.req_to_token_pool.size
             self._pa_swa_prefill_lens = torch.zeros(
-                max_bs, dtype=torch.int32, device=model_runner.device
+                max_req_pool_idx + 1, dtype=torch.int32, device=model_runner.device
             )
             self._pa_swa_max_prefill_len = 0
 
@@ -265,6 +268,13 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             self._get_scheduler_metadata = None
+            if model_runner.server_args.enable_deterministic_inference:
+                # Must precede the first kernel compile.
+                from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+                    set_batch_invariant,
+                )
+
+                set_batch_invariant(True)
         else:
             raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 

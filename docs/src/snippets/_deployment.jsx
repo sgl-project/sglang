@@ -59,6 +59,7 @@
 //   dockerImages       optional — `docker run` image, keyed by
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
 //                      falls back to `lmsysorg/sglang:dev`
+//   dockerHostNetworkWhen optional — `(selection, {flags, env}) => boolean`
 //   dockerMounts       optional — additional `-v` mount specs
 //   dockerRunCommand   optional — command placed after the image and before
 //                      generated server flags; string or `(selection) => string`
@@ -100,6 +101,8 @@ export const Deployment = ({ config, benchmarks }) => {
     hopper: [
       { id: "h200",  label: "H200",  vram: "141GB" },
       { id: "h100",  label: "H100",  vram: "80GB"  },
+      { id: "h20-3e", label: "H20-3e", vram: "141GB" },
+      { id: "h800",  label: "H800",  vram: "80GB"  },
     ],
     amd: [
       { id: "mi300x", label: "MI300X", vram: "192GB" },
@@ -726,6 +729,8 @@ export const Deployment = ({ config, benchmarks }) => {
         : (config.dockerRunCommand || "sglang serve");
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
+      const hostNetwork = multinode || (typeof config.dockerHostNetworkWhen === "function"
+        && config.dockerHostNetworkWhen(sel, { flags, env: cellEnv }));
       const vendorOf = (hwId) => {
         for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
           if (list.some((h) => h.id === hwId)) return vendor;
@@ -760,7 +765,7 @@ export const Deployment = ({ config, benchmarks }) => {
         // Multi-node needs host networking so the cross-node rendezvous port
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
-        multinode ? "  --network host" : `  -p ${servePort}:${servePort}`,
+        hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
         ...(multinode ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
         ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),

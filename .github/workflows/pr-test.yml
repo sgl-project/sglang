@@ -226,7 +226,7 @@ jobs:
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
-      runs_on: x64-kernel-build-node
+      runs_on: 1-gpu-5090
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
@@ -295,108 +295,17 @@ jobs:
     if: |
       always() &&
       needs.check-changes.result == 'success' &&
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-      (needs.check-changes.outputs.main_package == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-    env:
-      HF_HOME: ${{ github.workspace }}/.hf-cache
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].arr }}
-    steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          df -h
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-pr-test-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      # This stage compiled the workspace too - 7+ minutes per partition on
-      # billable hosted minutes. rust-ext-build's modules need an older glibc than
-      # this runner has, which is the safe direction, and both pin Python 3.10.
-      - name: Download prebuilt Rust extensions
-        id: rust_ext
-        if: ${{ needs.rust-ext-build.outputs.artifact_name != '' }}
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.rust-ext-build.outputs.artifact_name }}
-          path: python/sglang/srt/
-
-      # Both only serve the fallback where this stage compiles the extensions
-      # itself, so they follow the download's outcome, not the job output: an
-      # expired artifact still needs cargo and a warm target dir here. Otherwise
-      # rust-cache restores ~1 GB per partition for nothing, on an over-quota cache.
-      - name: Install protoc + Rust toolchain
-        if: ${{ steps.rust_ext.outcome != 'success' }}
-        timeout-minutes: 10
-        run: bash scripts/ci/utils/install_rust_protoc.sh
-
-      - name: Rust cache (rust/ workspace)
-        if: ${{ steps.rust_ext.outcome != 'success' }}
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-          shared-key: "sglang-grpc-cpu"
-          save-if: ${{ matrix.partition == 0 }}
-
-      # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
-      - name: Install dependencies
-        timeout-minutes: 20
-        env:
-          UV_SYSTEM_PYTHON: "1"
-          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
-        run: |
-          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
-
-      # Hosted runners are ephemeral, so models are re-fetched every run and the
-      # Hub occasionally returns 429s. Persist the HF cache in GitHub's cache
-      # storage (rolling key + restore-keys) so warm runs never hit the network.
-      - name: Cache HF hub
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.hf-cache
-          key: hf-cpu-${{ matrix.partition }}-${{ github.run_id }}
-          restore-keys: hf-cpu-${{ matrix.partition }}-
-
-      # Pinned SHA so every shard splits against the same snapshot; without
-      # the file run_suite falls back to the (drifting) in-source est_time.
-      - name: Fetch live partition model
-        if: needs.check-changes.outputs.partition_model_sha != ''
-        run: |
-          rm -f /tmp/partition-model.json
-          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ needs.check-changes.outputs.partition_model_sha }}/model.json"
-          curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
-            "$URL" -o /tmp/partition-model.json
-
-      # compute_partitions reads this back as the per-shard budget, so it
-      # drives the fanout rather than capping it -- shrinking it buys more
-      # shards, not shorter ones.
-      - name: Run test
-        timeout-minutes: 15
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test/
-          python3 run_suite.py --hw cpu --suite base-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].size }} --partition-model-file /tmp/partition-model.json $CONTINUE_ON_ERROR_FLAG
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled()))
+    uses: ./.github/workflows/_pr-test-stage-cpu.yml
+    with:
+      self_name: base-a-test-cpu
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '15'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+    # No `secrets: inherit`: this stage has no secret consumer, unlike the GPU
+    # stages' coredump upload. GITHUB_TOKEN and permissions inherit regardless.
 
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:
@@ -489,6 +398,8 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
+      warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4'
+      warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
@@ -503,6 +414,7 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
+      timeout_per_file: '1800'
       # Per-model TP must match the test's launch in test/registered/ -- see
       # FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for extra dp/ep
       # flags. Only models that actually invoke DeepGEMM kernels at runtime
@@ -524,52 +436,6 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-    secrets: inherit
-
-  base-c-test-deepep-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-deepep-4-gpu-h100
-      runner_config: deepep-4-gpu-h100
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
-      warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4'
-      warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-    secrets: inherit
-
-  base-c-test-deepep-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-deepep-4-gpu-b200
-      runner_config: deepep-4-gpu-b200
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
-      timeout_per_file: '1800'
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-    secrets: inherit
-
-  base-c-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-deepep-8-gpu-h200
-      runner_config: deepep-8-gpu-h200
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
-      timeout_per_file: '1800'
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
@@ -602,7 +468,22 @@ jobs:
       timeout_per_file: '1800'
       # aarch64 has no prebuild, so this stage compiles during install - which also
       # makes it the only stage still covering that path. Keep it that way.
-      rust_ext_artifact: ''
+      skip_prebuilt_rust_ext: true
+    secrets: inherit
+
+  base-c-test-8-gpu-b300:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-8-gpu-b300
+      runner_config: 8-gpu-b300
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+      timeout_per_file: '3600'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   # List every build and test job: `skipped` passes here, so an omission turns that
@@ -635,11 +516,9 @@ jobs:
         base-c-test-4-gpu-h100,
         base-c-test-8-gpu-h20,
         base-c-test-8-gpu-h200,
-        base-c-test-deepep-4-gpu-h100,
-        base-c-test-deepep-4-gpu-b200,
-        base-c-test-deepep-8-gpu-h200,
         base-c-test-4-gpu-b200,
         base-c-test-4-gpu-gb300,
+        base-c-test-8-gpu-b300,
       ]
     if: always()
     runs-on: ubuntu-latest
