@@ -58,6 +58,16 @@ class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
         return logits
 
 
+def _open_thinking_start(ids: list[int], start_id: int, end_id: int) -> int:
+    """Return the index of the start token of the currently open thinking block, or -1."""
+    for idx in reversed(range(len(ids))):
+        if ids[idx] == start_id:
+            return idx
+        if ids[idx] == end_id:
+            return -1
+    return -1
+
+
 class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
     """A logit processor that controls the length of thinking."""
 
@@ -85,14 +95,11 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
             cur_ids: list[int] = [*req.origin_input_ids, *req.output_ids]
 
             # Check if out of thinking stage
-            if (
-                self.THINKING_START_TOKEN_ID not in cur_ids
-                or self.THINKING_END_TOKEN_ID in cur_ids
-            ):
+            start_index = _open_thinking_start(
+                cur_ids, self.THINKING_START_TOKEN_ID, self.THINKING_END_TOKEN_ID
+            )
+            if start_index < 0:
                 continue
-
-            # Find the index of the thinking start token
-            start_index = cur_ids.index(self.THINKING_START_TOKEN_ID)
 
             # Count the number of tokens after the thinking start token
             num_tokens_after_start = len(cur_ids) - start_index - 1
@@ -135,6 +142,14 @@ class DeepSeekR1ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     THINKING_START_TOKEN_ID: int = 128798
     THINKING_END_TOKEN_ID: int = 128799
     NEW_LINE_TOKEN_ID: int = 201
+
+
+class InklingThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
+    """A logit processor that controls the length of thinking for Inkling models."""
+
+    THINKING_START_TOKEN_ID: int = 200008
+    THINKING_END_TOKEN_ID: int = 200010
+    NEW_LINE_TOKEN_ID: int = 198
 
 
 # Adapted from DeepSeek's implementation: https://github.com/deepseek-ai/DeepSeek-OCR/blob/main/DeepSeek-OCR-master/DeepSeek-OCR-vllm/process/ngram_norepeat.py
