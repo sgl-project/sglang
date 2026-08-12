@@ -745,7 +745,7 @@ def test_kimi_k3_cached_deferred_artifact_has_model_contract():
 
     artifact = processor._make_artifact(
         content_digest="sha256:" + "ab" * 32,
-        artifact_key="artifact",
+        artifact_key="sha256:" + "cd" * 32,
         original_size=(2, 2),
         resize_config={
             "num_tokens": 1,
