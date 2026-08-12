@@ -127,23 +127,13 @@ def view_aiter_fused_rms_transposed_fp8_scale_tuple(
 ) -> Tuple[torch.Tensor, ...]:
     """Restride the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples.
 
-    Zero-copy counterpart of :func:`materialize_bpreshuffle_fp8_scale_tuple` for
-    producers already invoked with ``transpose_scale=True``.
+    Tuple-level wrapper around
+    :func:`view_aiter_fused_rms_transposed_fp8_scale` for producers already
+    invoked with ``transpose_scale=True``.
     """
     return (
         value[0],
         view_aiter_fused_rms_transposed_fp8_scale(value[1]),
-        *value[2:],
-    )
-
-
-def materialize_bpreshuffle_fp8_scale_tuple(
-    value: Tuple[torch.Tensor, ...],
-) -> Tuple[torch.Tensor, ...]:
-    """Materialize the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples."""
-    return (
-        value[0],
-        materialize_bpreshuffle_fp8_scale(value[1]),
         *value[2:],
     )
 
