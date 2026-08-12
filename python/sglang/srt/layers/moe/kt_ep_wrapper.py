@@ -540,6 +540,93 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             (self.wrapper, x, stream_handle),
         )
 
+    def kt_ascend_pre_dispatch(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        topk_output: "TopKOutput",
+    ):
+        """Pre-dispatch seam for the AscendTP dispatcher.
+
+        The AscendTP dispatcher permutes (and may quantize) tokens before the
+        quant method runs, so both the CPU-side submission (which needs the
+        raw token-major activations) and the CPU-expert routing mask (the
+        dispatch permutation groups rows by expert id, so masking after the
+        fact is too late) must happen BEFORE ``dispatcher.dispatch``.
+
+        Returns ``(bypass_output, masked_topk_output, join_state)``:
+        ``bypass_output`` is the finished [t, hidden] MoE output when the
+        streaming-prefill path took the whole batch (skip dispatch entirely);
+        otherwise it is None and ``masked_topk_output``/``join_state`` feed
+        the dispatch and the post-combine ``kt_ascend_join``.
+        """
+        from types import SimpleNamespace
+
+        x = hidden_states
+        layer_idx = self.kt_config.layer_idx
+
+        _stream_out = maybe_streaming_forward(self, layer_idx, x, topk_output)
+        if _stream_out is not None:
+            return _stream_out.hidden_states, None, None
+
+        # Carrier so submit()/_submit_cpu_npu_graph() (written against
+        # StandardDispatchOutput) run unchanged on the raw tensors.
+        carrier = SimpleNamespace(hidden_states=x, topk_output=topk_output)
+
+        use_npu_graph = (
+            self.tp_rank == 0
+            and self.wrapper is not None
+            and _npu_use_graph_host_callback(x.device)
+        )
+        pending_join = None
+        if use_npu_graph:
+            if _KT_SIDE_STREAM:
+                comp_stream = kt_current_stream(x.device)
+                side_stream = _get_kt_side_stream()
+                fork_ev = torch.npu.Event()
+                join_ev = torch.npu.Event()
+                if not hasattr(self, "_kt_side_events"):
+                    self._kt_side_events = []
+                self._kt_side_events.append((fork_ev, join_ev))
+                fork_ev.record(comp_stream)
+                side_stream.wait_event(fork_ev)
+                with torch.npu.stream(side_stream):
+                    self._submit_cpu_npu_graph(carrier, x)
+                pending_join = (join_ev, side_stream, comp_stream)
+            else:
+                self._submit_cpu_npu_graph(carrier, x)
+        elif self.tp_rank == 0:
+            self.submit(layer, carrier)
+
+        masked_topk_output = topk_output
+        if self.num_gpu_experts > 0:
+            masked_topk_ids, masked_topk_weights = mask_cpu_expert_routing(
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+                self.gpu_experts_mask,
+                self.logical_to_gpu_index,
+            )
+            masked_topk_output = topk_output._replace(
+                topk_ids=masked_topk_ids,
+                topk_weights=masked_topk_weights,
+            )
+        return None, masked_topk_output, (use_npu_graph, pending_join)
+
+    def kt_ascend_join(self, x: torch.Tensor, join_state) -> Optional[torch.Tensor]:
+        """Sync the CPU-side result submitted at ``kt_ascend_pre_dispatch``.
+
+        Called after ``dispatcher.combine`` so both sides are token-major
+        [t, hidden]. Returns None on ranks that did not submit.
+        """
+        if self.tp_rank != 0:
+            return None
+        use_npu_graph, pending_join = join_state
+        if pending_join is not None:
+            join_ev, side_stream, comp_stream = pending_join
+            join_ev.record(side_stream)
+            comp_stream.wait_event(join_ev)
+        return self.sync(x, cpu_already_synced=use_npu_graph)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -560,6 +647,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             Combined computation results from CPU and GPU experts
         """
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        if not hasattr(dispatch_output, "topk_output"):
+            # AscendTP dispatch: tokens are already permuted/quantized and the
+            # CPU side was submitted at the kt_ascend_pre_dispatch seam in
+            # FusedMoE.forward_impl — this call is purely the resident-expert
+            # GPU pass.
+            return self.gpu_method.apply(layer, dispatch_output)
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
