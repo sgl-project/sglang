@@ -1771,86 +1771,6 @@ class DeepseekV4AttnBackend(
 
         raise NotImplementedError("ragged attention")
 
-    def _forward_mxfp4_decode(
-        self,
-        q: torch.Tensor,
-        forward_batch,  # ForwardBatch
-        swa_k_cache: torch.Tensor,
-        swa_page_indices: torch.Tensor,
-        swa_topk_lengths: torch.Tensor,
-        extra_k_cache: torch.Tensor | None,
-        extra_indices: torch.Tensor | None,
-        extra_topk_lengths: torch.Tensor | None,
-        compress_ratio: int,
-        attn_sink: torch.Tensor,
-    ) -> torch.Tensor:
-        """MXFP4 decode: one fused kernel call covers SWA + C4/C128 + attn_sink."""
-        from sglang.jit_kernel.dsv4.mxfp4_decode import mxfp4_decode_attention
-        from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
-            MXFP4_BYTES_PER_TOKEN,
-            MXFP4_TOTAL_DIM,
-        )
-
-        q_orig_shape = q.shape
-        if q.ndim >= 3:
-            q = q.reshape(-1, q.shape[-1])
-        assert q.ndim == 2 and q.shape[1] == MXFP4_TOTAL_DIM
-        N_heads = q.shape[0]
-
-        # Expand per-request metadata to per-head (the kernel is per-query).
-        def _tile_for_heads(x):
-            if x is None or x.shape[0] == N_heads:
-                return x
-            if x.shape[0] > N_heads:
-                return x[:N_heads]
-            # x.shape[0] == bs, N_heads == bs * n_heads_per_req
-            return x.repeat_interleave(n_heads_per_req, dim=0)
-
-        n_heads_per_req = q_orig_shape[1] if len(q_orig_shape) >= 3 else 1
-
-        swa_page_indices = _tile_for_heads(swa_page_indices)
-        swa_topk_lengths = _tile_for_heads(swa_topk_lengths)
-        extra_indices = _tile_for_heads(extra_indices)
-        extra_topk_lengths = _tile_for_heads(extra_topk_lengths)
-        # attn_sink has a fixed dimension (e.g. 4096) unrelated to bs — pad/trim.
-        if attn_sink is not None and attn_sink.shape[0] != N_heads:
-            attn_sink = torch.nn.functional.pad(
-                attn_sink,
-                (0, 0) * (attn_sink.ndim - 1) + (0, max(0, N_heads - attn_sink.shape[0])),
-                value=0.0,
-            )[:N_heads]
-
-        has_extras = compress_ratio > 0 and extra_k_cache is not None
-        swa_window = 128
-
-        extra_k_flat = None
-        extra_tk = None
-        extra_len = None
-        extra_tk_width = 0
-        extra_page_size = 0
-        if has_extras:
-            extra_k_flat = extra_k_cache.view(-1, MXFP4_BYTES_PER_TOKEN)
-            extra_tk = extra_indices.to(torch.int32).contiguous()
-            extra_len = extra_topk_lengths.to(torch.int32).contiguous()
-            extra_tk_width = extra_tk.shape[1]
-            extra_page_size = self.token_to_kv_pool.page_size // compress_ratio
-
-        o = mxfp4_decode_attention(
-            q=q,
-            k_cache=swa_k_cache.view(-1, MXFP4_BYTES_PER_TOKEN),
-            page_indices=swa_page_indices.to(torch.int32),
-            sm_scale=self.softmax_scale,
-            swa_width=swa_window,
-            attn_sink=attn_sink.float() if attn_sink is not None else None,
-            swa_lengths=swa_topk_lengths.to(torch.int32),
-            extra_k_cache=extra_k_flat,
-            extra_indices=extra_tk,
-            extra_topk_lengths=extra_len,
-            extra_topk_width=extra_tk_width,
-            extra_page_size=extra_page_size,
-        )
-        return o.view(*q_orig_shape[:-1], -1)
-
     def _forward_mxfp4_decode_flashmla(
         self,
         q: torch.Tensor,
@@ -1872,7 +1792,7 @@ class DeepseekV4AttnBackend(
         page_block_size=1), and the C4/C128 caches keep their physical
         page layout.
         """
-        from sgl_kernel.flash_mla import (
+        from sglang.kernels.ops.attention.mxfp4_dsv4_decode_sm90 import (
             FlashMLASchedMeta,
             flash_mla_with_kvcache_dsv4_mxfp4,
         )
