@@ -2677,7 +2677,13 @@ class AscendAttnBackend(AttentionBackend):
                 )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
-            elif forward_batch.encoder_lens is None and layer.logit_cap == 0:
+            elif (
+                forward_batch.encoder_lens is None and layer.logit_cap == 0
+                and (
+                        layer.sliding_window_size is None
+                        or layer.sliding_window_size == -1
+                    )
+            ):
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 if not self.use_alibi:
@@ -2712,9 +2718,11 @@ class AscendAttnBackend(AttentionBackend):
                         is_extend=False,
                     )
             else:
+                q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+                num_tokens = q.shape[0]
                 if layer.qk_head_dim != layer.v_head_dim:
                     attn_output = q.new_empty(
-                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        (num_tokens, layer.tp_q_head_num * layer.v_head_dim)
                     )
                 else:
                     attn_output = torch.empty_like(q)

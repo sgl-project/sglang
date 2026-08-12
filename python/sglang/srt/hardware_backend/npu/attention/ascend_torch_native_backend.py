@@ -178,6 +178,14 @@ class AscendTorchNativeAttnBackend:
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
+            attn_mask = None
+            if is_swa_self_attn:
+                idx = torch.arange(redundant_len, device=per_req_query.device)
+                attn_mask = (idx[None, :] <= idx[:, None]) & (
+                    (idx[:, None] - idx[None, :]) <= sliding_window_size
+                )
+                causal = False
+
             if logit_cap > 0:
                 per_req_out_redundant = (
                     self.scaled_dot_product_attention_with_softcapping(
@@ -186,6 +194,7 @@ class AscendTorchNativeAttnBackend:
                         per_req_value.unsqueeze(0),
                         enable_gqa=enable_gqa,
                         scale=scaling,
+                        attn_mask=attn_mask,
                         is_causal=causal,
                         logit_cap=logit_cap,
                         logit_capping_method=logit_capping_method,
@@ -201,6 +210,7 @@ class AscendTorchNativeAttnBackend:
                         per_req_value.unsqueeze(0),
                         enable_gqa=enable_gqa,
                         scale=scaling,
+                        attn_mask=attn_mask,
                         is_causal=causal,
                     )
                     .squeeze(0)
