@@ -172,6 +172,12 @@ def _escape_nested_quotes_in_strings(text: str) -> Tuple[str, bool]:
             k += 1
         return k < len(text) and text[k] in _QUOTE_FOLLOWERS
 
+    # A late-closing reading can swallow a whole sibling call into the
+    # string value (``f(a='x 'y'), g(...)`` parsing as one call with
+    # ``g(...)`` inside ``a``) — worse than dropping it, since the tool then
+    # runs with corrupted arguments. Counting brackets is immune to the
+    # broken quote, so the block's call count is the invariant.
+    expected_calls = len(_split_top_level_calls(text, respect_strings=False))
     prefix: List[str] = []
     index = 0
     while index < len(text):
@@ -198,8 +204,10 @@ def _escape_nested_quotes_in_strings(text: str) -> Tuple[str, bool]:
                 ["".join(prefix), char, "".join(interior), char, text[close + 1 :]]
             )
             try:
-                safe_ast_parse(_escape_ctrl_chars_in_strings(candidate))
+                module = safe_ast_parse(_escape_ctrl_chars_in_strings(candidate))
             except (SyntaxError, ValueError):
+                continue
+            if expected_calls > 1 and _top_level_call_count(module) < expected_calls:
                 continue
             winners.append(candidate)
         if len(winners) == 1:
@@ -323,6 +331,88 @@ def _recovery_candidates(content: str) -> List[str]:
     if kw_renamed:
         candidates.append(renamed)
     return candidates
+
+
+def _split_top_level_calls(text: str, *, respect_strings: bool = True) -> List[str]:
+    """Split a pythonic call block into top-level call segments.
+
+    ``[a(x=1), b(y=2)]`` becomes ``["a(x=1)", "b(y=2)"]``: one enclosing
+    bracket pair is stripped and only commas at bracket depth 0 separate
+    segments. With ``respect_strings=False`` only brackets are counted,
+    which a broken quote cannot desynchronize; string arguments always sit
+    at depth >= 1, so their commas still never split.
+    """
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    segments: List[str] = []
+    start = 0
+    depth = 0
+    quote: Optional[str] = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if respect_strings and quote is not None:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if respect_strings and char in {"'", '"'}:
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            segments.append(text[start:index])
+            start = index + 1
+        index += 1
+    segments.append(text[start:])
+    return [segment.strip() for segment in segments if segment.strip()]
+
+
+def _top_level_call_count(module: ast.Module) -> int:
+    """Number of calls in a parsed ``[a(...), b(...)]`` block."""
+    if not module.body:
+        return 0
+    value = getattr(module.body[0], "value", None)
+    if isinstance(value, ast.List):
+        return sum(1 for element in value.elts if isinstance(element, ast.Call))
+    return 1 if isinstance(value, ast.Call) else 0
+
+
+def _salvage_calls_from_unparsable_block(text: str) -> List[ast.Call]:
+    """Recover individual calls from a block ``ast.parse`` cannot handle.
+
+    When the block as a whole is a SyntaxError no rewrite recovers, there
+    is no call list at all and one bad call drops every parseable sibling,
+    leaving an agent loop with no tool result. Split with both scanning
+    strategies and parse each segment on its own through the rewrite
+    ladder. A wrongly split segment simply fails to parse and is dropped,
+    so this can only under-recover, never attribute arguments to the wrong
+    call.
+    """
+    best: List[ast.Call] = []
+    for respect_strings in (True, False):
+        segments = _split_top_level_calls(text, respect_strings=respect_strings)
+        if len(segments) < 2:
+            continue
+        calls: List[ast.Call] = []
+        for segment in segments:
+            for candidate in [segment] + _recovery_candidates(segment):
+                try:
+                    parsed = ast.parse(candidate, mode="eval").body
+                except (SyntaxError, ValueError):
+                    continue
+                if isinstance(parsed, ast.Call):
+                    calls.append(parsed)
+                break
+        if len(calls) > len(best):
+            best = calls
+    return best
 
 
 class Lfm2Detector(BaseFormatDetector):
@@ -530,7 +620,18 @@ class Lfm2Detector(BaseFormatDetector):
                     except (SyntaxError, ValueError):
                         continue
                 else:
-                    raise
+                    # The block as a whole is unrecoverable. Split it into
+                    # top-level segments and parse each on its own so one bad
+                    # call does not drop every parseable sibling.
+                    salvaged = _salvage_calls_from_unparsable_block(content)
+                    if not salvaged:
+                        raise
+                    calls = []
+                    for call_index, call in enumerate(salvaged):
+                        item = self._parse_pythonic_call(call, call_index, tool_indices)
+                        if item is not None:
+                            calls.append(item)
+                    return calls, ""
             parsed = getattr(module.body[0], "value", None) if module.body else None
 
             if parsed is None:
