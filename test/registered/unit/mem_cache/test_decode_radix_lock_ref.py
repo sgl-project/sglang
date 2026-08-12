@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.utils.common import Range
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_cache_with_pools(page_size=1):
@@ -92,7 +93,7 @@ def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
     return MockReq(fill_ids, req_pool_idx, cache_protected_len, last_node)
 
 
-class TestDecodeLockRefScenarios(unittest.TestCase):
+class TestDecodeLockRefScenarios(CustomTestCase):
     """Test lock_ref balance across decode transfer scenarios."""
 
     def _populate_prefix(self, cache, prefix_ids, prefix_values):
@@ -201,7 +202,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(cache.evictable_size(), len(full_ids))
 
     def test_incremental_transfer_failure(self):
-        """Scenario 3: prefix match > 0, transfer fails.
+        """Scenario 3: prefix match > 0, transfer fails after KV commit.
+
+        The final committed KV slot has no corresponding output token. Cleanup
+        must preserve the matched prefix and release the full request-owned suffix.
 
         Flow: inc_lock_ref(pop_preallocated)
               -> dec_lock_ref(cache_finished_req via release_kv_cache is_insert=False)
@@ -233,12 +237,20 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             cache_protected_len=prefix_len,
             last_node=matched_node,
         )
+        req.output_ids = array("q")
 
         # Transfer fails -> cache_finished_req with is_insert=False
         # This frees delta tokens and dec_lock_ref on last_node
+        cache.token_to_kv_pool_allocator.reset_mock()
         cache.cache_finished_req(
             req, is_insert=False, kv_len_to_handle=req.kv_committed_len
         )
+
+        free_call = cache.token_to_kv_pool_allocator.free_segment.call_args
+        torch.testing.assert_close(
+            free_call.args[0], torch.tensor(full_vals[prefix_len:])
+        )
+        self.assertEqual(free_call.kwargs["start_pos"], prefix_len)
 
         # The prefix node should be unlocked (back to evictable)
         self.assertEqual(cache.root_node.lock_ref, 1)
