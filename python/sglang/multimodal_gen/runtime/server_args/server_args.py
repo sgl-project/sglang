@@ -35,8 +35,14 @@ from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
+    cpu_offload_component_matches,
     cpu_offload_flags_for_layerwise_components,
+    is_dit_component_name,
+    is_image_encoder_component_name,
+    is_text_encoder_component_name,
+    is_vae_component_name,
     layerwise_component_matches_any_selection,
+    normalize_cpu_offload_components,
     normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import (
@@ -276,6 +282,7 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_alpha: int | None = None  # Override training alpha when metadata omits it
     lora_merge_mode: str = "auto"
     lora_weight_name: str | None = None
 
@@ -301,6 +308,8 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_target_modules: list[str] | None = None
 
     # CPU offload parameters
+    # Exact component keys from model_index.json, or a legacy component group.
+    cpu_offload_components: list[str] | None = None
     dit_cpu_offload: bool | None = None
     # trade checkpoint-loading peak memory for faster ordinary DiT startup
     direct_gpu_weight_loading: bool = False
@@ -486,13 +495,14 @@ class ServerArgs(DisaggServerArgsMixin):
         """set defaults and normalize values."""
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust_based_on_performance_mode()
+        self._adjust_cpu_offload_components()
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
             auto_tuner.maybe_adjust_auto_default_layerwise_offload()
         self._adjust_ltx2_two_stage_device_mode()
         if auto_tuner.could_override_server_args():
-            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
+            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
         if self.served_model_name is None:
@@ -516,6 +526,8 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
+        if self.lora_alpha is not None and self.lora_alpha <= 0:
+            raise ValueError("lora_alpha must be a positive integer")
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
@@ -738,6 +750,44 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
+
+    def _adjust_cpu_offload_components(self) -> None:
+        """Apply the unified CPU offload component selector, when provided."""
+        if self.cpu_offload_components is None:
+            return
+
+        legacy_flags = (
+            "dit_cpu_offload",
+            "text_encoder_cpu_offload",
+            "image_encoder_cpu_offload",
+            "vae_cpu_offload",
+        )
+        conflicting_flags = [
+            flag_name
+            for flag_name in legacy_flags
+            if self.is_arg_explicitly_set(flag_name)
+        ]
+        if conflicting_flags:
+            formatted_flags = ", ".join(
+                "--" + flag_name.replace("_", "-") for flag_name in conflicting_flags
+            )
+            raise ValueError(
+                "--cpu-offload-components cannot be combined with the legacy "
+                f"CPU offload flags: {formatted_flags}"
+            )
+
+        selected_components = (
+            normalize_cpu_offload_components(self.cpu_offload_components) or []
+        )
+        self.cpu_offload_components = selected_components
+        self.dit_cpu_offload = self.should_cpu_offload_component("transformer")
+        self.text_encoder_cpu_offload = self.should_cpu_offload_component(
+            "text_encoder"
+        )
+        self.image_encoder_cpu_offload = self.should_cpu_offload_component(
+            "image_encoder"
+        )
+        self.vae_cpu_offload = self.should_cpu_offload_component("vae")
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
@@ -1239,6 +1289,25 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
+
+    def should_cpu_offload_component(self, component_name: str) -> bool:
+        if self.cpu_offload_components is not None:
+            return cpu_offload_component_matches(
+                component_name, self.cpu_offload_components
+            )
+        if is_dit_component_name(component_name) or component_name in (
+            "connectors",
+            "unconditional_transformer",
+            "vision_language_encoder",
+        ):
+            return bool(self.dit_cpu_offload)
+        if is_text_encoder_component_name(component_name):
+            return bool(self.text_encoder_cpu_offload)
+        if is_image_encoder_component_name(component_name):
+            return bool(self.image_encoder_cpu_offload)
+        if is_vae_component_name(component_name) or component_name == "sound_tokenizer":
+            return bool(self.vae_cpu_offload)
+        return False
 
     def should_configure_layerwise_offload_for_lazy_component(
         self, component_name: str
@@ -1798,6 +1867,19 @@ class ServerArgs(DisaggServerArgsMixin):
             "weights and model weights to coexist on GPU. Disabled by default.",
         )
         parser.add_argument(
+            "--cpu-offload-components",
+            type=str,
+            nargs="+",
+            default=ServerArgs.cpu_offload_components,
+            help=(
+                "Select component keys from model_index.json for coarse CPU offload. "
+                "Use dit, text_encoder, image_encoder, or vae as group aliases; "
+                "all selects every loaded module and none disables component offload. "
+                "This unified option cannot be combined with the legacy "
+                "per-component CPU offload flags."
+            ),
+        )
+        parser.add_argument(
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
@@ -2090,6 +2172,15 @@ class ServerArgs(DisaggServerArgsMixin):
             type=float,
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
+        )
+        parser.add_argument(
+            "--lora-alpha",
+            type=int,
+            default=ServerArgs.lora_alpha,
+            help=(
+                "Override the LoRA training alpha when neither the checkpoint nor "
+                "adapter_config.json records it"
+            ),
         )
         parser.add_argument(
             "--lora-merge-mode",

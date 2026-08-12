@@ -152,6 +152,11 @@ class TransformerLoader(ComponentLoader):
         component_server_args = _server_args_for_transformer_component(
             server_args, component_name
         )
+        if server_args.cpu_offload_components is not None:
+            component_server_args = copy.copy(component_server_args)
+            component_server_args.dit_cpu_offload = (
+                server_args.should_cpu_offload_component(component_name)
+            )
 
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
