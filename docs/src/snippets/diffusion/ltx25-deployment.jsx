@@ -8,6 +8,15 @@ export const LTX25Deployment = () => {
         { id: 'tight', label: '1 GPU, tight VRAM', subtitle: 'layerwise offload', default: false },
         { id: 'sp2', label: '2 GPUs', subtitle: 'sequence parallel', default: false },
         { id: 'tp2', label: '2 GPUs', subtitle: 'tensor parallel', default: false },
+        { id: 'cfg2', label: '2 GPUs', subtitle: 'CFG parallel', default: false },
+      ],
+    },
+    precision: {
+      name: 'precision',
+      title: 'Precision',
+      items: [
+        { id: 'bf16', label: 'bf16', subtitle: 'default', default: true },
+        { id: 'fp8', label: 'fp8', subtitle: 'online, -18 GB', default: false },
       ],
     },
     weights: {
@@ -52,6 +61,7 @@ export const LTX25Deployment = () => {
 
   const [values, setValues] = useState({
     hardware: 'h200',
+    precision: 'bf16',
     weights: 'distilled',
     pipeline: 'one-stage',
     decoder: 'vae',
@@ -82,6 +92,7 @@ export const LTX25Deployment = () => {
       tight: ` \\\n  --dit-layerwise-offload`,
       sp2: ` \\\n  --num-gpus 2 \\\n  --ulysses-degree 2`,
       tp2: ` \\\n  --num-gpus 2 \\\n  --tp-size 2`,
+      cfg2: ` \\\n  --num-gpus 2 \\\n  --enable-cfg-parallel`,
     };
     return map[values.hardware] || '';
   };
@@ -92,8 +103,16 @@ export const LTX25Deployment = () => {
     if (values.weights === 'dev') {
       command += ` \\\n  --model-variant dev`;
     }
+    if (values.precision === 'fp8') {
+      command += ` \\\n  --quantization fp8`;
+    }
     command += getParallelFlags();
     command += ` \\\n  --port 30000`;
+
+    // The distilled DiT runs unguided, so there is no negative branch to split.
+    if (values.hardware === 'cfg2' && values.weights !== 'dev') {
+      command += `\n\n# Note: CFG parallel does nothing on the distilled weights (they run\n#   unguided). Pick "Dev / SFT" above, or use sequence/tensor parallel.`;
+    }
 
     // Per-request flags belong on the generate call, not the server.
     const requestFlags = [];

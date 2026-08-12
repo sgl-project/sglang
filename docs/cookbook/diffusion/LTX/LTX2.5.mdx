@@ -120,17 +120,40 @@ Selecting weights:
 | Target | Recommended server flags | Notes |
 | --- | --- | --- |
 | 1 high-VRAM GPU | *(no extra flags)* | 960×544 fits comfortably on an H200. |
-| 1 tight-VRAM GPU | `--dit-layerwise-offload` | Cuts peak memory by roughly 10 GB, at about 4x the wall clock. |
+| 1 tight-VRAM GPU | `--quantization fp8` | Halves the DiT and cuts peak memory ~18 GB at unchanged speed. See [section 3.4](#3-4-fp8-quantization). |
+| 1 very tight GPU | `--dit-layerwise-offload` | Cuts peak memory by roughly 10 GB, at about 4x the wall clock. |
 | 2 GPUs, long sequences | `--num-gpus 2 --ulysses-degree 2` | Sequence parallel; the memory/long-sequence tool. |
 | 2 GPUs, large DiT | `--num-gpus 2 --tp-size 2` | Tensor parallel across attention heads. |
+| 2 GPUs, dev weights | `--num-gpus 2 --enable-cfg-parallel` | Splits the guided and unguided branches across GPUs. Measured 1.69x on denoising. |
 
 <Warning>
 **CFG parallelism does not apply on the default (distilled) path.** That DiT
 runs unguided, so there is no negative branch to split across GPUs and
 `--enable-cfg-parallel` buys nothing — the CFG-parallel presets on the
-LTX-2 / LTX-2.3 page do not carry over. It *is* usable with
+LTX-2 / LTX-2.3 page do not carry over. It *is* worth using with
 `--model-variant dev`, which runs with guidance.
 </Warning>
+
+### 3.4 fp8 quantization
+
+`--quantization fp8` quantizes the DiT's linear layers as it loads them, so it
+needs no pre-quantized checkpoint:
+
+```bash
+sglang serve \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --quantization fp8
+```
+
+At 960×544 / 49 frames the transformer loads in 18.11 GB against 35.37 GB for
+bf16, and the run peaks at 53.5 GB against 71.1 GB. Denoising time is
+unchanged: the distilled 8-step path at this size is bound by memory traffic
+rather than matmul throughput, so fp8 buys headroom rather than speed.
+
+Expect a different sample for a given seed. Quantization nudges the denoising
+trajectory and diffusion amplifies that, so the result differs from bf16
+without being worse.
 
 ## 4. Model Invocation
 
