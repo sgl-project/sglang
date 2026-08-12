@@ -26,11 +26,13 @@ single opaque op under ``torch.compile`` -- no graph break.
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterator
+from typing import Any
 
 import torch
 import torch.nn as nn
 
+from sglang.kernels.jit.utils import get_jit_cuda_arch
+from sglang.kernels.ops.diffusion.quality_gate import QualityGatedFusion
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,11 @@ _HAS_ADDMM_ACTIVATION = hasattr(torch, "_addmm_activation")
 # Attributes of the site protocol (set by ``mark_fused_gelu_site``).
 _SITE_LINEAR_ATTR = "_sgl_fused_gelu_linear_attr"
 _SITE_ENABLED_ATTR = "_sgl_fused_gelu_enabled"
+_FUSION = QualityGatedFusion(
+    name="fused linear+GELU",
+    marker_attr=_SITE_LINEAR_ATTR,
+    enabled_attr=_SITE_ENABLED_ATTR,
+)
 
 
 def _fused_linear_gelu_tanh_fake(
@@ -125,6 +132,13 @@ def can_fuse_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
     """Whether ``gelu(linear(x))`` can use the fused cublasLt epilogue now."""
     if not (x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
         return False
+    arch = get_jit_cuda_arch()
+    if arch.major * 10 + arch.minor >= 120:
+        # The cublasLt GELU epilogue selected by current SM120 PyTorch/CUDA
+        # builds is slower than GEMM + the native GELU kernel for the FLUX
+        # production shape (1, 512, 3072 -> 12288).  Keep quality-gated sites
+        # on their existing eager path on RTX 5090; SM90 dispatch is unchanged.
+        return False
     if getattr(linear, "weight", None) is None or x.dtype != linear.weight.dtype:
         return False
     return can_fuse_linear_gelu_static(linear)
@@ -138,15 +152,17 @@ def mark_fused_gelu_site(module: nn.Module, linear_attr: str) -> None:
     (``_sgl_fused_gelu_enabled = False``): the module's forward must keep the
     reference path bit-exact until :func:`mount_fused_linear_gelu` enables it.
     """
-    setattr(module, _SITE_LINEAR_ATTR, linear_attr)
-    setattr(module, _SITE_ENABLED_ATTR, False)
+    _FUSION.mark(module, linear_attr)
 
 
-def iter_fused_gelu_sites(root: nn.Module) -> Iterator[nn.Module]:
-    """Yield every marked fusion site under ``root`` (including ``root``)."""
-    for module in root.modules():
-        if getattr(module, _SITE_LINEAR_ATTR, None) is not None:
-            yield module
+def fused_gelu_active(module: nn.Module) -> bool:
+    """Whether the quality-gated fused path is mounted on ``module``."""
+    return _FUSION.is_enabled(module)
+
+
+def _site_reject_reason(site: nn.Module) -> str | None:
+    linear = getattr(site, _FUSION.metadata(site), None)
+    return "missing linear" if linear is None else _static_reject_reason(linear)
 
 
 def mount_fused_linear_gelu(root: nn.Module) -> bool:
@@ -156,27 +172,9 @@ def mount_fused_linear_gelu(root: nn.Module) -> bool:
     left (or reset) on the reference path and False is returned. Returns False
     as well when ``root`` has no marked sites.
     """
-    sites = list(iter_fused_gelu_sites(root))
-    if not sites:
-        return False
-    for site in sites:
-        linear = getattr(site, getattr(site, _SITE_LINEAR_ATTR), None)
-        reason = "missing linear" if linear is None else _static_reject_reason(linear)
-        if reason is not None:
-            unmount_fused_linear_gelu(root)
-            logger.info(
-                "fused linear+GELU: %s site failed static guards (%s); "
-                "keeping the whole model on the reference path",
-                type(site).__name__,
-                reason,
-            )
-            return False
-    for site in sites:
-        setattr(site, _SITE_ENABLED_ATTR, True)
-    return True
+    return _FUSION.mount(root, reject_reason=_site_reject_reason, logger=logger)
 
 
 def unmount_fused_linear_gelu(root: nn.Module) -> None:
     """Reset every marked site under ``root`` to the bit-exact reference path."""
-    for site in iter_fused_gelu_sites(root):
-        setattr(site, _SITE_ENABLED_ATTR, False)
+    _FUSION.unmount(root)

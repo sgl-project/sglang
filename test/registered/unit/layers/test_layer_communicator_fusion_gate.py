@@ -1,7 +1,7 @@
 import contextlib
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -21,7 +21,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _fake_communicator():
-    """Minimal stand-in for the attributes should_fuse_mlp_allreduce_with_next_layer reads."""
     return types.SimpleNamespace(
         _speculative_algo=None,
         layer_scatter_modes=types.SimpleNamespace(mlp_mode=ScatterMode.TP_ATTN_FULL),
@@ -65,7 +64,6 @@ class TestPostExpertsAllReduceMerge(CustomTestCase):
     """
 
     def _calls(self, *, moe_ep_size, moe_tp_size, moe_dp_size=1, skip=False):
-        """Which all-reduce helpers post_experts_all_reduce() invokes."""
         called = []
         with patch.object(
             moe_utils, "should_skip_post_experts_all_reduce", return_value=skip
@@ -148,6 +146,71 @@ class TestCanMergePostExpertsAllReduce(CustomTestCase):
         self.assertFalse(self._can_merge(moe_ep_size=4, moe_tp_size=1))
 
 
+class TestResolveFusionGroup(CustomTestCase):
+    """EP2/MoE-TP2/DP1 (e.g. DeepSeek-V4-Flash with --tp-size 4 --ep-size 2) must
+    resolve to the _TP group with world_size=4 and the TP rank."""
+
+    def _resolve(self, *, moe_ep_size, moe_tp_size, moe_dp_size=1, tp_rank=0):
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            resolve_fusion_group,
+            resolve_fusion_world_size,
+        )
+
+        fake_tp_group = MagicMock(name="tp_group")
+        fake_ep_group = MagicMock(name="ep_group")
+        fake_moe_tp_group = MagicMock(name="moe_tp_group")
+        tp_size = moe_ep_size * moe_tp_size * moe_dp_size
+
+        with get_parallel().override(
+            moe_ep_size=moe_ep_size,
+            moe_tp_size=moe_tp_size,
+            moe_dp_size=moe_dp_size,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            moe_ep_rank=tp_rank % moe_ep_size,
+            moe_tp_rank=tp_rank % moe_tp_size,
+        ), patch(
+            "sglang.srt.layers.flashinfer_comm_fusion.get_tp_group",
+            return_value=fake_tp_group,
+        ), patch(
+            "sglang.srt.layers.flashinfer_comm_fusion.get_moe_ep_group",
+            return_value=fake_ep_group,
+        ), patch(
+            "sglang.srt.layers.flashinfer_comm_fusion.get_moe_tp_group",
+            return_value=fake_moe_tp_group,
+        ):
+            ws = resolve_fusion_world_size(use_attn_tp_group=False)
+            group_tuple = resolve_fusion_group(use_attn_tp_group=False)
+        return ws, group_tuple, (fake_tp_group, fake_ep_group, fake_moe_tp_group)
+
+    def test_hybrid_ep2_tp2_dp1_resolves_to_tp_ws4(self):
+        # EP2/MoE-TP2/DP1 (DeepSeek-V4-Flash on 4 GPUs): workspace must sit on
+        # _TP (ws=4) so the fused kernel reduces over all 4 peers.
+        ws, (size, rank, group), (tp_grp, ep_grp, moe_tp_grp) = self._resolve(
+            moe_ep_size=2, moe_tp_size=2, moe_dp_size=1, tp_rank=3
+        )
+        self.assertEqual(ws, 4)
+        self.assertEqual(size, 4)
+        self.assertEqual(rank, 3)
+        self.assertIs(group, tp_grp)
+
+    def test_pure_ep_resolves_to_ep_group(self):
+        ws, (size, rank, group), (tp_grp, ep_grp, moe_tp_grp) = self._resolve(
+            moe_ep_size=4, moe_tp_size=1, moe_dp_size=1, tp_rank=2
+        )
+        self.assertEqual(ws, 4)
+        self.assertEqual(size, 4)
+        self.assertIs(group, ep_grp)
+
+    def test_pure_tp_resolves_to_moe_tp_group(self):
+        ws, (size, rank, group), (tp_grp, ep_grp, moe_tp_grp) = self._resolve(
+            moe_ep_size=1, moe_tp_size=4, moe_dp_size=1, tp_rank=1
+        )
+        self.assertEqual(ws, 4)
+        self.assertEqual(size, 4)
+        self.assertIs(group, moe_tp_grp)
+
+
 class TestFuseMlpAllReduceGate(CustomTestCase):
     """Fusion is allowed only when one group covers the whole reduction.
 
@@ -191,12 +254,9 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
         self.assertFalse(self._should_fuse(moe_ep_size=2, moe_tp_size=2, moe_dp_size=2))
 
     def test_pure_tp_still_fuses(self):
-        # moe_ep_size == 1: the whole post-experts reduction is the _MOE_TP one,
-        # so a single fused all-reduce does cover every peer.
         self.assertTrue(self._should_fuse(moe_ep_size=1, moe_tp_size=4))
 
     def test_pure_ep_still_fuses(self):
-        # moe_tp_size == 1: symmetric, the _MOE_EP reduce covers every peer.
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
 
 

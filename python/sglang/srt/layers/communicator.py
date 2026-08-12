@@ -819,13 +819,10 @@ class LayerCommunicator:
         if is_enable_moe_cp_allgather():
             return False
 
-        # The next layer's residual+LN absorbs the post-experts reduction, and
-        # that fused kernel reduces over a single group. Hybrid EP+TP produces
-        # two reductions over disjoint groups; post_experts_all_reduce() merges
-        # them into one _TP reduction when moe_dp_size == 1, which the fused
-        # kernel can absorb. When it can't merge, there is no single group that
-        # covers both, so fusion has to stay off -- otherwise the fused reduce
-        # covers half the peers and silently under-reduces the activations.
+        # The fused residual+LN reduces over a single group. Hybrid EP+TP spans
+        # two disjoint groups; post_experts_all_reduce() merges them into one
+        # _TP reduction when moe_dp_size == 1, which the fused kernel can absorb.
+        # When merging is blocked, no single group covers both, so fusion stays off.
         parallel = get_parallel()
         if (
             parallel.moe_ep_size > 1

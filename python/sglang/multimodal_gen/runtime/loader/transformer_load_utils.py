@@ -131,6 +131,10 @@ class TransformerQuantLoadSpec:
             return self.quant_config
         return self.nunchaku_config
 
+    @property
+    def is_modelopt_fp4(self) -> bool:
+        return _get_quant_config_name(self.quant_config) == "modelopt_fp4"
+
 
 class _TransformerQuantAdapter:
     def prepare(self) -> None:

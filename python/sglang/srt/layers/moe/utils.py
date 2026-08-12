@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -231,10 +232,11 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     0. Parse server argument.
     1. Parse deprecated environment variables.
     2. If quant_config contains input_global_scale → NVFP4 path.
-    3. Parse quant config
-    4. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
-    5. Otherwise default for NPU → BF16 (the default for NPU).
-    6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
+    3. Parse a mode-specific dtype from quant_config.
+    4. Parse a generic dtype from quant_config.
+    5. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
+    6. Otherwise default for NPU → BF16 (the default for NPU).
+    7. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
 
     # 0. Parse server argument.
@@ -257,12 +259,23 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
         if input_global_scale is not None:
             return DispatcherOutputDtype.NVFP4
 
-        # 3. Parse quant config to determine the output dtype of dispatcher
+        # 3. Some MoE kernels require different wire formats for prefill and
+        # decode. Prefer a mode-specific override when the dispatcher exposes
+        # its concrete mode (normal or low_latency).
+        dispatch_mode = getattr(self, "dispatch_mode", None)
+        if dispatch_mode is not None:
+            mode_dispatcher_output_dtype = self.quant_config.get(
+                f"{dispatch_mode.value}_dispatcher_output_dtype", None
+            )
+            if mode_dispatcher_output_dtype is not None:
+                return DispatcherOutputDtype(mode_dispatcher_output_dtype)
+
+        # 4. Parse quant config to determine the output dtype of dispatcher
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 4. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
+    # 5. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
     if (
         get_moe_runner_backend().is_flashinfer_cutedsl()
         or get_moe_runner_backend().is_cutlass()
@@ -270,11 +283,11 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     ):
         return DispatcherOutputDtype.BF16
 
-    # 5. Default on NPU → BF16
+    # 6. Default on NPU → BF16
     if _is_npu:
         return DispatcherOutputDtype.BF16
 
-    # 6. Default → FP8
+    # 7. Default → FP8
     return DispatcherOutputDtype.FP8
 
 
@@ -321,6 +334,12 @@ def initialize_moe_config(server_args: ServerArgs):
     moe.tbo_token_distribution_threshold = server_args.tbo_token_distribution_threshold
     moe.disable_fp4_allgather = server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     moe.quantization = server_args.quantization
+    # Seeded with the user's intent; each model's gate refines the ACTIVE
+    # value for its own build (install_shared_experts_fusion_decision).
+    moe.disable_shared_experts_fusion = server_args.disable_shared_experts_fusion
+    moe.speculative_disable_shared_experts_fusion = (
+        server_args.disable_shared_experts_fusion
+    )
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -355,6 +374,88 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
         )
         moe.speculative_a2a_backend = MoeA2ABackend.NONE
     return moe.speculative_a2a_backend
+
+
+def is_shared_experts_fusion_disabled() -> bool:
+    """The ACTIVE shared-experts-fusion decision for the model being built.
+
+    Written (both ways) by each MoE model's gate before its layers construct;
+    falls back to the config intent when no gate has run (models without an
+    auto-disable gate read the intent directly off the bag instead).
+
+    Construction-time only: a forward reads what its build baked in
+    (``num_fused_shared_experts`` on the layer). During a draft's build this
+    flag holds the DRAFT's decision, so a forward-time read would race the
+    build window — refuse it loudly."""
+    from sglang.srt.model_executor.forward_context import has_forward_context
+
+    if has_forward_context():
+        raise AssertionError(
+            "is_shared_experts_fusion_disabled() called inside a forward: the "
+            "fusion decision is construction-time state (it can hold the draft's "
+            "value while a draft builds). Read the value your build baked in, "
+            "e.g. the layer's num_fused_shared_experts."
+        )
+    moe = get_flags().moe
+    if moe.disable_shared_experts_fusion is None:
+        from sglang.srt.runtime_context import get_exec
+
+        return get_exec().moe.disable_shared_experts_fusion
+    return moe.disable_shared_experts_fusion
+
+
+@contextmanager
+def draft_model_build_scope():
+    """Brackets a draft model's CONSTRUCTION: the gates it runs record their
+    fusion decision on the speculative leaf as well, and the target's ACTIVE
+    value returns on exit.
+
+    Deliberately does not touch ``runner_backend`` — swapping that is
+    ``speculative_moe_backend_context``'s job and has to bracket the draft's
+    whole lifecycle (build + capture + forward), which not every worker does.
+    """
+    moe = get_flags().moe
+    original_fusion = moe.disable_shared_experts_fusion
+    original_scope = moe.in_speculative_scope
+    try:
+        moe.in_speculative_scope = True
+        yield
+    finally:
+        moe.in_speculative_scope = original_scope
+        moe.disable_shared_experts_fusion = original_fusion
+
+
+def install_shared_experts_fusion_decision(
+    model_class, hf_config, quant_config
+) -> None:
+    """Decide whether this runner's model fuses its shared experts, and install
+    the answer for the model it is about to build.
+
+    Called from the loader's single model-instantiation point, so the decision
+    is made once per runner — before any layer exists — and the model classes
+    are pure readers (``is_shared_experts_fusion_disabled``). A model family
+    that can auto-disable exposes the conditions as
+    ``shared_experts_fusion_disable_reason(hf_config, quant_config)``; families
+    without one follow the user's intent.
+
+    Inside ``draft_model_build_scope`` the answer also lands on the speculative
+    leaf, so a flags dump afterwards shows both runners' decisions.
+    """
+    from sglang.srt.runtime_context import get_exec
+
+    disabled = get_exec().moe.disable_shared_experts_fusion
+    if not disabled:
+        gate = getattr(model_class, "shared_experts_fusion_disable_reason", None)
+        reason = gate(hf_config, quant_config) if gate is not None else None
+        if reason:
+            log_info_on_rank0(
+                logger, f"{reason} Shared experts fusion optimization is disabled."
+            )
+            disabled = True
+    moe = get_flags().moe
+    moe.disable_shared_experts_fusion = disabled
+    if moe.in_speculative_scope:
+        moe.speculative_disable_shared_experts_fusion = disabled
 
 
 def get_deepep_mode() -> DeepEPMode:
@@ -479,30 +580,9 @@ def should_skip_mlp_all_reduce() -> bool:
 
 
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
-    """Whether to skip the post-experts all-reduce (EP or TP) because a
-    downstream component will fuse, replace, or absorb it.
+    """Whether a downstream component will fuse, replace, or absorb the post-experts all-reduce.
 
-    Skip reasons, in order:
-      - ``get_forward().fuse_mlp_allreduce``: LayerCommunicator will fuse the
-        all-reduce with the next layer's residual all-reduce.
-      - ``get_forward().mlp_reduce_scatter``: LayerCommunicator's post-attention
-        scatter will do reduce-scatter, which would double-reduce on top of
-        an all-reduce.
-      - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
-        path replaces the all-reduce with a reduce-scatterv.
-      - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
-        the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
-        the post-experts TP all-reduce. Not relevant to the EP all-reduce.
-      - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
-        dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
-        MoE outputs back to the source rank, so any further EP/TP all-reduce
-        would double-count and overflow BF16. Mirrors TRTLLM's
-        ``not enable_alltoall`` gate
-        (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
-
-    The first two reasons come from per-layer ``ForwardFlags`` published by
-    the decoder via ``get_forward().scoped(...)``. Pass ``is_tp_path=True``
-    for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
+    Pass ``is_tp_path=True`` for the TP all-reduce, ``False`` for the EP one.
     """
     if should_skip_mlp_all_reduce():
         return True
@@ -522,14 +602,10 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
 
 
 def can_merge_post_experts_all_reduce() -> bool:
-    """Whether the EP and MoE-TP reductions can be served by one _TP all-reduce.
+    """Whether the EP and MoE-TP reductions can collapse into one _TP all-reduce.
 
-    ``moe_tp_size = tp_size // moe_ep_size // moe_dp_size``, and both groups are
-    built inside each TP group, so with ``moe_dp_size == 1`` they are an
-    orthogonal decomposition of ``_TP``: reducing over one and then the other is
-    the same sum as reducing over ``_TP`` directly. With ``moe_dp_size > 1``
-    they cover only part of ``_TP`` and merging would incorrectly sum across DP
-    replicas, which hold different tokens.
+    True when moe_dp_size == 1: the two groups are an orthogonal decomposition
+    of _TP, so reducing over each in turn equals one _TP reduction.
     """
     parallel = get_parallel()
     return (
@@ -542,14 +618,9 @@ def can_merge_post_experts_all_reduce() -> bool:
 def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     """Reduce the post-experts MoE output across the EP and MoE-TP groups.
 
-    Single entry point for what every MoE module used to open-code as two
-    guarded all-reduces. When both are live and mergeable it issues one ``_TP``
-    all-reduce instead, which is one collective and one round trip rather than
-    two sequential ones over half-sized groups.
-
-    Merging also restores the invariant the fused residual+LN path depends on --
-    that the deferred post-experts reduction spans exactly ``_TP`` -- which
-    hybrid EP+TP was the only configuration to break.
+    When both are live and mergeable, issues one _TP all-reduce instead of two
+    sequential ones, which also restores the invariant the fused residual+LN path
+    depends on.
     """
     from sglang.srt.distributed.communication_op import (
         moe_expert_parallel_all_reduce,
@@ -576,15 +647,10 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
 
 
 def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
-    """Run inline a post-experts reduction that was deferred to allreduce fusion.
+    """Run the post-experts reduction that was deferred to allreduce fusion.
 
-    ``should_skip_post_experts_all_reduce`` hands the reduction to the next
-    layer's fused residual+LN. When that kernel cannot service the shape, the
-    caller runs it here instead, and it has to span exactly the peers
-    ``post_experts_all_reduce`` would have covered -- the same group
-    ``resolve_fusion_group`` builds the workspace on. ``_MOE_TP`` is a single
-    rank under pure EP, so reducing over it unconditionally would silently drop
-    the reduction rather than perform it.
+    Called when the fused residual+LN kernel cannot service the shape. Reduces
+    over the same group ``resolve_fusion_group`` builds the workspace on.
     """
     from sglang.srt.distributed.communication_op import (
         moe_expert_parallel_all_reduce,
@@ -604,6 +670,7 @@ def speculative_moe_backend_context():
     """
     Context manager to temporarily use the speculative MoE backend for draft model operations.
     This ensures that draft models in speculative decoding use the configured speculative backend.
+
     """
     moe = get_flags().moe
     original_backend = moe.runner_backend
@@ -660,6 +727,41 @@ class RoutingMethodType(IntEnum):
 
 AITER_PADDING_SIZE = 128
 TRITON_PADDING_SIZE = 128
+
+# Row-stride padding, in bytes, applied to XPU MoE expert weights whose K dim
+# lands on an L3 aliasing stride (see xpu_moe_ld_padding_elems). 64B matches
+# the 32 bf16 elements used by the sgl-kernel-xpu MoE benchmark. Expressed in
+# bytes because the aliasing is a property of the row's byte size, so this
+# stays correct if the path ever carries a non-bf16 weight dtype.
+#
+# Measured on BMG: halving this to 32B still clears the aliasing but runs ~6%
+# slower than not padding at all on hidden=7168 shapes (0.94x), presumably by
+# misaligning the grouped GEMM's row loads. Doubling it to 128B gains nothing
+# over 64B. Re-measure before changing.
+XPU_MOE_LD_PADDING_BYTES = 64
+
+
+def xpu_moe_ld_padding_elems(k_dim: int, itemsize: int) -> int:
+    """Extra elements to add to an XPU MoE weight's row stride (leading dim).
+
+    The Xe20 grouped GEMM walks B row-by-row over the K dim, so the row stride
+    in bytes decides which L3 set each row lands in. The L3 set index is
+    derived by XOR-folding address bits; when the row byte size is a multiple
+    of 2048 with an odd cofactor >= 3 (K = 3072, 7168, ... in bf16) successive
+    rows collapse onto a small number of sets and thrash. Padding the stride
+    (without changing the logical shape) breaks the aliasing.
+
+    Returns 0 when the shape is already well distributed, so callers can use
+    this to decide whether to allocate a padded buffer at all.
+    """
+    row_bytes = k_dim * itemsize
+    if row_bytes <= 0 or XPU_MOE_LD_PADDING_BYTES % itemsize != 0:
+        return 0
+    trailing_zeros = (row_bytes & -row_bytes).bit_length() - 1
+    odd_cofactor = row_bytes >> trailing_zeros
+    if trailing_zeros >= 11 and odd_cofactor >= 3:
+        return XPU_MOE_LD_PADDING_BYTES // itemsize
+    return 0
 
 
 # Unit of padding - context dependent
