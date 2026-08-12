@@ -331,6 +331,26 @@ def build_mm_radix_cache_namespace(
     )
 
 
+def build_mm_global_cache_key(
+    feature_identity: str, caller_key: Optional[str] = None
+) -> str:
+    """Keep a caller namespace without allowing it to replace strong identity."""
+    feature_identity = parse_content_hash(feature_identity)
+    if caller_key is None:
+        return feature_identity
+    if not isinstance(caller_key, str):
+        raise ValueError("multimodal global-cache caller key must be a string")
+    return _digest_bytes(
+        _canonical_json(
+            {
+                "version": "multimodal-global-cache-v1",
+                "caller_key": caller_key,
+                "feature_identity": feature_identity,
+            }
+        )
+    )
+
+
 def build_processor_fingerprint(
     processor: Any,
     hf_config: Any,

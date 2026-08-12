@@ -635,7 +635,7 @@ def test_kimi_k3_epd_global_cache_preprocesses_only_metadata_misses():
     encoder._materialize_k3_encoder_media.assert_awaited_once_with(lookups, [1])
     encoder._process_mm_items.assert_awaited_once_with(["miss-media"], Modality.IMAGE)
     assert ctx.prepared_index_map == {1: 0}
-    assert ctx.str_mm_hashes == ["11", "22"]
+    assert ctx.str_mm_hashes == [hit.feature_identity, miss.feature_identity]
     assert ctx.grid_thw.tolist() == [[1, 2, 2], [1, 4, 4]]
     assert ctx.aux_data == {
         "original_image_sizes": [[8, 6], [16, 12]],
@@ -698,7 +698,11 @@ def test_kimi_k3_epd_global_cache_coalesces_concurrent_metadata_misses():
             first_ctx, second_ctx = await asyncio.gather(first, second)
 
             assert process_calls == 1
-            assert first_ctx.str_mm_hashes == second_ctx.str_mm_hashes == ["41"]
+            assert (
+                first_ctx.str_mm_hashes
+                == second_ctx.str_mm_hashes
+                == [artifact.feature_identity]
+            )
             assert first_ctx.prepared_index_map == {0: 0}
             assert second_ctx.prepared_index_map is None
             assert encoder.mm_preprocess_cache.stats()["singleflight_joins"] == 1

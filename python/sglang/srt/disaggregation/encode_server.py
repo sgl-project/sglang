@@ -67,6 +67,7 @@ from sglang.srt.multimodal.cache import (
     build_artifact_key,
     build_feature_hash,
     build_feature_identity,
+    build_mm_global_cache_key,
     build_processor_fingerprint,
     parse_content_hash,
     snapshot_media,
@@ -1384,10 +1385,13 @@ class MMEncoder:
                 )
             str_mm_hashes = None
             if self.rank == 0:
-                keys = hashes or [
-                    artifact.feature_hash for artifact in cached_artifacts
+                str_mm_hashes = [
+                    build_mm_global_cache_key(
+                        artifact.feature_identity,
+                        None if hashes is None else hashes[index],
+                    )
+                    for index, artifact in enumerate(cached_artifacts)
                 ]
-                str_mm_hashes = [str(value) for value in keys]
             return GlobalCacheEncodeContext(
                 req_id=req_id,
                 modality=modality,
@@ -1522,7 +1526,7 @@ class MMEncoder:
         ]:
             raise InternalError("K3 cached grid metadata changed during fallback")
         if ctx.caller_hashes is None and self.rank == 0:
-            actual_hashes = [str(artifact.feature_hash) for artifact in artifacts]
+            actual_hashes = [artifact.feature_identity for artifact in artifacts]
             if actual_hashes != ctx.str_mm_hashes:
                 raise InternalError("K3 cached feature hashes changed during fallback")
         ctx.mm_inputs = mm_inputs
@@ -1587,7 +1591,7 @@ class MMEncoder:
                         ctx.str_mm_hashes[index] for index in materialize_indices
                     ]
                     actual_hashes = [
-                        str(artifact.feature_hash) for artifact in artifacts
+                        artifact.feature_identity for artifact in artifacts
                     ]
                     if actual_hashes != expected_hashes:
                         raise InternalError(

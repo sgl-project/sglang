@@ -21,6 +21,7 @@ from sglang.srt.multimodal.cache import (
     build_artifact_key,
     build_feature_hash,
     build_feature_identity,
+    build_mm_global_cache_key,
     build_mm_radix_cache_namespace,
     build_processor_fingerprint,
     estimate_cache_size_bytes,
@@ -284,6 +285,19 @@ class TestMediaIdentity(unittest.TestCase):
         self.assertNotEqual(
             build_mm_radix_cache_namespace(None, [("image", first)]),
             build_mm_radix_cache_namespace("caller", [("image", first)]),
+        )
+
+    def test_global_cache_caller_key_cannot_replace_feature_identity(self):
+        first = "sha256:" + "01" * 32
+        second = "sha256:" + "02" * 32
+        self.assertEqual(build_mm_global_cache_key(first), first)
+        self.assertNotEqual(
+            build_mm_global_cache_key(first, "caller"),
+            build_mm_global_cache_key(second, "caller"),
+        )
+        self.assertNotEqual(
+            build_mm_global_cache_key(first, "caller-a"),
+            build_mm_global_cache_key(first, "caller-b"),
         )
 
 

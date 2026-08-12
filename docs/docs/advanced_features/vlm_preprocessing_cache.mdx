@@ -52,6 +52,9 @@ feature identities. This prevents the legacy 30-bit multimodal pad sentinel
 from turning a collision into incorrect language-model KV reuse. Requests with
 different media therefore do not share a Radix namespace; repeated turns with
 the same ordered media still do.
+K3 global embedding-cache keys likewise retain the full feature identity. A
+caller-provided legacy cache key is namespaced by that identity and cannot
+replace it.
 Prompt text is intentionally excluded: every request rebuilds and validates its
 prompt tokens, image spans, grids, and offsets from the cached per-image
 metadata.
