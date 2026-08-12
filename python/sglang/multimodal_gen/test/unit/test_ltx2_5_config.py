@@ -328,5 +328,66 @@ class TestLTX25DurationHead(unittest.TestCase):
             self._head()(None, None)
 
 
+class TestLTX25DiffusionDecoder(unittest.TestCase):
+    """The 2.5 diffusion decoder: config shape and the geometry it implies."""
+
+    def _config(self):
+        from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_diffusion_decoder import (
+            LTX25DiffusionDecoderConfig,
+        )
+
+        return LTX25DiffusionDecoderConfig()
+
+    def test_stage_channels_match_upsample_reductions(self):
+        # Two views of the same thing; an inconsistent pair would only fail deep
+        # inside the first block.
+        arch = self._config().arch_config
+        for i, reduction in enumerate(arch.decoder_upsample_channel_reductions):
+            self.assertEqual(
+                arch.decoder_stage_channels[i + 1],
+                arch.decoder_stage_channels[i] // reduction,
+            )
+
+    def test_upsample_strides_compose_to_the_vae_ratios(self):
+        arch = self._config().arch_config
+        temporal = 1
+        spatial = 1
+        for stride_t, stride_h, _ in arch.decoder_upsample_strides:
+            temporal *= stride_t
+            spatial *= stride_h
+        self.assertEqual(temporal, arch.temporal_compression_ratio)
+        # The remaining spatial factor is the pixel patch size.
+        self.assertEqual(spatial * arch.patch_size, arch.spatial_compression_ratio)
+
+    def test_ships_as_a_single_step_x0_decoder(self):
+        arch = self._config().arch_config
+        self.assertEqual(arch.decoder_num_inference_steps, 1)
+        self.assertEqual(arch.decoder_model_output_type, "x0")
+
+    def test_builds_and_reports_expected_context_width(self):
+        import torch
+
+        from sglang.multimodal_gen.runtime.models.vaes.ltx_2_5_diffusion_decoder import (
+            LTX2VideoDiffusionDecoderModel,
+        )
+
+        config = self._config()
+        with torch.device("meta"):
+            model = LTX2VideoDiffusionDecoderModel(config)
+        self.assertEqual(
+            model.decoder.context_channels,
+            config.arch_config.decoder_stage_channels[-1],
+        )
+        # The window shifts inward at the border, so stages 1-4 carry replicated
+        # trailing frames that stage 4 crops.
+        self.assertEqual(model.decoder.trailing_pad_latent_frames, 2)
+
+    def test_class_name_resolves(self):
+        from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+
+        cls, _ = ModelRegistry.resolve_model_cls("LTX2VideoDiffusionDecoderModel")
+        self.assertEqual(cls.__name__, "LTX2VideoDiffusionDecoderModel")
+
+
 if __name__ == "__main__":
     unittest.main()

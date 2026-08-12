@@ -281,6 +281,8 @@ def _add_ltx2_decoding_stage(pipeline: ComposedPipelineBase):
             audio_vae=pipeline.get_module("audio_vae"),
             vocoder=pipeline.get_module("vocoder"),
             pipeline=pipeline,
+            # LTX-2.5 only; None elsewhere, which keeps the VAE decode path.
+            diffusion_decoder=pipeline.get_module("diffusion_decoder", None),
         )
     )
 
@@ -340,16 +342,17 @@ class _BaseLTX2Pipeline(LoRAPipeline):
         # LTX-2.3 checkpoints, so it can only be required when the model
         # actually declares it.
         modules = list(required_config_modules or self._required_config_modules)
-        if "duration_head" not in modules and self._declares_duration_head(
-            model_path, server_args
-        ):
-            modules.append("duration_head")
+        for optional in ("duration_head", "diffusion_decoder"):
+            if optional not in modules and self._declares_component(
+                model_path, optional
+            ):
+                modules.append(optional)
         super().__init__(
             model_path, server_args, required_config_modules=modules, **kwargs
         )
 
     @staticmethod
-    def _declares_duration_head(model_path: str, server_args: ServerArgs) -> bool:
+    def _declares_component(model_path: str, component_name: str) -> bool:
         index_path = os.path.join(str(model_path), "model_index.json")
         if not os.path.exists(index_path):
             return False
@@ -358,7 +361,7 @@ class _BaseLTX2Pipeline(LoRAPipeline):
                 model_index = json.load(f)
         except (OSError, ValueError):
             return False
-        entry = model_index.get("duration_head")
+        entry = model_index.get(component_name)
         # model_index.json records absent optional components as [null, null].
         return bool(entry) and entry[0] is not None
 

@@ -10,6 +10,9 @@ from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_duration_head import (
     LTX2DurationHeadConfig,
 )
+from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_diffusion_decoder import (
+    LTX25DiffusionDecoderConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -35,7 +38,7 @@ class AdapterLoader(ComponentLoader):
     2) Loads the safetensors state_dict (single-file or sharded).
     """
 
-    component_names = ["connectors", "duration_head"]
+    component_names = ["connectors", "duration_head", "diffusion_decoder"]
     expected_library = "diffusers"
 
     # Each adapter carries its own arch config; `update_model_arch` then fills it
@@ -43,6 +46,7 @@ class AdapterLoader(ComponentLoader):
     _CONFIG_CLASSES = {
         "connectors": LTX2ConnectorConfig,
         "duration_head": LTX2DurationHeadConfig,
+        "diffusion_decoder": LTX25DiffusionDecoderConfig,
     }
 
     def load_customized(

@@ -1,0 +1,727 @@
+# SPDX-License-Identifier: Apache-2.0
+"""LTX-2.5 diffusion video decoder.
+
+Replaces the convolutional VAE decoder with a small diffusion model: stages 1-4
+deterministically upsample the latent into a context volume using neighborhood
+attention, and stage 5 denoises patchified pixels conditioned on that context.
+As shipped (`model_output_type="x0"`, one step) stage 5 runs once and its
+prediction *is* the output.
+
+Attention here is 3D *neighborhood* attention: each query attends to a fixed
+window that shifts inward at the grid borders so it always covers exactly
+`kernel_size` positions. Upstream reaches for NATTEN's `na3d` kernel and falls
+back to a FlexAttention block mask; this port implements the FlexAttention path
+only, so it has no Hub-kernel dependency.
+"""
+
+import math
+
+import torch
+import torch.nn.functional as F
+from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbeddings
+from torch import nn
+
+from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_diffusion_decoder import (
+    LTX25DiffusionDecoderConfig,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+# Tokens per tile in the SwiGLU MLP. `w_gate(x)` and `w_up(x)` are both
+# hidden-width and their product makes a third, so evaluating a whole video at
+# once holds three hidden-width tensors live at the same time. Bounding a token
+# *count* keeps that independent of resolution. Tiling is exact: the MLP is
+# pointwise across tokens.
+_SWIGLU_TILE_SIZE = 16384
+
+_compiled_flex_attention = None
+
+
+def _flex_attention_fn():
+    """`flex_attention`, compiled.
+
+    Uncompiled it falls back to materializing the full `S x S` score matrix,
+    which is tens of GiB at these grids -- compiling is what makes the
+    neighborhood window actually sparse. Compiled once and cached; the handful
+    of distinct decoder-stage shapes each trigger one recompile.
+    """
+    global _compiled_flex_attention
+    if _compiled_flex_attention is None:
+        from torch.nn.attention.flex_attention import flex_attention
+
+        _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
+    return _compiled_flex_attention
+
+
+def _patchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Space-to-depth on H/W only: `(B,C,F,H,W)` -> `(B, C*p**2, F, H//p, W//p)`.
+
+    Channel packing order is `(channel, width_offset, height_offset)`.
+    """
+    batch_size, num_channels, num_frames, height, width = x.shape
+    x = x.reshape(
+        batch_size,
+        num_channels,
+        num_frames,
+        height // patch_size,
+        patch_size,
+        width // patch_size,
+        patch_size,
+    )
+    x = x.permute(0, 1, 6, 4, 2, 3, 5)
+    return x.reshape(
+        batch_size,
+        num_channels * patch_size * patch_size,
+        num_frames,
+        height // patch_size,
+        width // patch_size,
+    )
+
+
+def _unpatchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Depth-to-space on H/W only; the exact inverse of `_patchify`."""
+    batch_size, num_channels, num_frames, height, width = x.shape
+    num_channels = num_channels // (patch_size * patch_size)
+    x = x.reshape(
+        batch_size, num_channels, patch_size, patch_size, num_frames, height, width
+    )
+    x = x.permute(0, 1, 4, 5, 3, 6, 2)
+    return x.reshape(
+        batch_size, num_channels, num_frames, height * patch_size, width * patch_size
+    )
+
+
+def _neighborhood_block_mask(
+    num_frames: int,
+    height: int,
+    width: int,
+    kernel_size: tuple[int, int, int],
+    device: torch.device,
+):
+    """FlexAttention `BlockMask` for a 3D neighborhood window.
+
+    The window is centered where possible and shifted inward at the borders so
+    it always holds exactly `kernel_size` positions -- that inward shift, rather
+    than truncation, is what NATTEN's `na3d` does.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    kernel_t, kernel_h, kernel_w = kernel_size
+    kernel_t = min(kernel_t, num_frames)
+    kernel_h = min(kernel_h, height)
+    kernel_w = min(kernel_w, width)
+    hw = height * width
+
+    def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+        q_t, q_rem = q_idx // hw, q_idx % hw
+        q_h, q_w = q_rem // width, q_rem % width
+        k_t, k_rem = kv_idx // hw, kv_idx % hw
+        k_h, k_w = k_rem // width, k_rem % width
+
+        start_t = torch.clamp(q_t - kernel_t // 2, 0, num_frames - kernel_t)
+        start_h = torch.clamp(q_h - kernel_h // 2, 0, height - kernel_h)
+        start_w = torch.clamp(q_w - kernel_w // 2, 0, width - kernel_w)
+        window_t = (k_t >= start_t) & (k_t < start_t + kernel_t)
+        window_h = (k_h >= start_h) & (k_h < start_h + kernel_h)
+        window_w = (k_w >= start_w) & (k_w < start_w + kernel_w)
+        return window_t & window_h & window_w
+
+    seq_len = num_frames * hw
+    # `_compile=True` is not an optimisation here but a requirement: the eager
+    # path evaluates `mask_mod` over every (query, key) pair, which is O(S^2)
+    # booleans and tens of GiB at production grids.
+    return create_block_mask(
+        mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=device,
+        _compile=True,
+    )
+
+
+class LTX2VideoVaeRotaryPosEmbed3D(nn.Module):
+    """Absolute 3D rotary embedding over the (T, H, W) grid.
+
+    `head_dim` splits into (T, H, W) chunks, each rotated by its own axis
+    position. Positions are plain 0-based indices: attention is a local window
+    with no causal masking, so only relative offsets matter and a shared origin
+    shift is a no-op.
+    """
+
+    def __init__(self, head_dim: int, base: float = 10000.0) -> None:
+        super().__init__()
+        if head_dim % 8 != 0:
+            raise ValueError(f"head_dim must be a multiple of 8, got {head_dim}.")
+        # A quarter to T, the rest halved between H and W, both halves kept even
+        # so each holds whole rotation pairs.
+        dim_t = (head_dim // 4) // 2 * 2
+        dim_hw = (head_dim - dim_t) // 2
+        if dim_hw % 2 != 0:
+            dim_t -= 2
+            dim_hw = (head_dim - dim_t) // 2
+        self.rope_dim_split = (dim_t, dim_hw, dim_hw)
+        self.base = base
+
+    def _inv_freqs(self, dim: int, device: torch.device) -> torch.Tensor:
+        exponents = torch.arange(0, dim, 2, dtype=torch.float64, device=device) / dim
+        return (1.0 / self.base**exponents).to(torch.float32)
+
+    def _rotate_axis(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        inv_freqs: torch.Tensor,
+        axis: int,
+    ) -> torch.Tensor:
+        out_dtype = x.dtype
+        pairs = x.reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
+        even = pairs[..., 0].float()
+        odd = pairs[..., 1].float()
+        # Broadcast over (B, T, H, W, heads, dim // 2), varying only along `axis`.
+        shape = [1, 1, 1, 1, 1, inv_freqs.shape[0]]
+        shape[axis] = positions.shape[0]
+        angles = (positions[:, None] * inv_freqs[None, :]).reshape(shape)
+        cos, sin = angles.cos(), angles.sin()
+        rotated = torch.stack([even * cos - odd * sin, even * sin + odd * cos], dim=-1)
+        return rotated.reshape(x.shape).to(out_dtype)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """`hidden_states`: `(B, T, H, W, heads, head_dim)`."""
+        dim_t, dim_h, _ = self.rope_dim_split
+        num_frames, height, width = hidden_states.shape[1:4]
+        device = hidden_states.device
+        inv_t, inv_h, inv_w = (
+            self._inv_freqs(dim, device) for dim in self.rope_dim_split
+        )
+
+        positions_t = torch.arange(num_frames, dtype=torch.float32, device=device)
+        positions_h = torch.arange(height, dtype=torch.float32, device=device)
+        positions_w = torch.arange(width, dtype=torch.float32, device=device)
+        rotated_t = self._rotate_axis(
+            hidden_states[..., :dim_t], positions_t, inv_t, axis=1
+        )
+        rotated_h = self._rotate_axis(
+            hidden_states[..., dim_t : dim_t + dim_h], positions_h, inv_h, axis=2
+        )
+        rotated_w = self._rotate_axis(
+            hidden_states[..., dim_t + dim_h :], positions_w, inv_w, axis=3
+        )
+        return torch.cat([rotated_t, rotated_h, rotated_w], dim=-1)
+
+
+class LTX2VideoVaeNeighborhoodAttention(nn.Module):
+    """3D neighborhood attention over a channels-last `(B, T, H, W, C)` volume."""
+
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: tuple[int, int, int],
+        head_dim: int = 64,
+        rope_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        if dim % head_dim != 0:
+            raise ValueError(f"dim {dim} must be divisible by head_dim {head_dim}.")
+        self.heads = dim // head_dim
+        self.head_dim = head_dim
+        self.kernel_size = tuple(kernel_size)
+        self.scale = head_dim**-0.5
+
+        self.to_q = nn.Linear(dim, dim, bias=True)
+        self.to_k = nn.Linear(dim, dim, bias=True)
+        self.to_v = nn.Linear(dim, dim, bias=True)
+        self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=True), nn.Dropout(0.0)])
+        self.norm_q = nn.RMSNorm(head_dim, eps=1e-6)
+        self.norm_k = nn.RMSNorm(head_dim, eps=1e-6)
+        self.rope = LTX2VideoVaeRotaryPosEmbed3D(head_dim, base=rope_base)
+
+    def project_qkv(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Q/K/V as `(B, T, H, W, heads, head_dim)`: normed, query pre-scaled, rotated.
+
+        The query carries the `1/sqrt(head_dim)` factor so attention runs with
+        `scale=1.0` -- upstream's order is norm, scale, then rotate.
+        """
+        batch_size, num_frames, height, width, _ = hidden_states.shape
+        shape = (batch_size, num_frames, height, width, self.heads, self.head_dim)
+        query = self.to_q(hidden_states).view(shape)
+        key = self.to_k(hidden_states).view(shape)
+        value = self.to_v(hidden_states).view(shape)
+
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+        query = query * self.scale
+        return self.rope(query), self.rope(key), value
+
+    def build_block_mask(self, hidden_states: torch.Tensor):
+        """The window mask for this grid. Fixed within a stage, so built once."""
+        num_frames, height, width = hidden_states.shape[1:4]
+        return _neighborhood_block_mask(
+            num_frames, height, width, self.kernel_size, hidden_states.device
+        )
+
+    def forward(self, hidden_states: torch.Tensor, block_mask=None) -> torch.Tensor:
+        batch_size, num_frames, height, width, _ = hidden_states.shape
+        kernel_t, kernel_h, kernel_w = self.kernel_size
+        if num_frames < kernel_t or height < kernel_h or width < kernel_w:
+            raise ValueError(
+                "Neighborhood attention requires each dim to be at least its "
+                f"kernel size; got (T, H, W) = ({num_frames}, {height}, {width}) "
+                f"with kernel_size {self.kernel_size}."
+            )
+
+        query, key, value = self.project_qkv(hidden_states)
+        seq_len = num_frames * height * width
+        # flex_attention wants (B, heads, S, head_dim).
+        query = query.reshape(batch_size, seq_len, self.heads, self.head_dim).transpose(
+            1, 2
+        )
+        key = key.reshape(batch_size, seq_len, self.heads, self.head_dim).transpose(
+            1, 2
+        )
+        value = value.reshape(batch_size, seq_len, self.heads, self.head_dim).transpose(
+            1, 2
+        )
+
+        if block_mask is None:
+            block_mask = self.build_block_mask(hidden_states)
+
+        # scale=1.0: the query is already scaled in project_qkv.
+        hidden_states = _flex_attention_fn()(
+            query, key, value, block_mask=block_mask, scale=1.0
+        )
+        hidden_states = hidden_states.transpose(1, 2).reshape(
+            batch_size, num_frames, height, width, self.heads * self.head_dim
+        )
+        return self.to_out[0](hidden_states)
+
+
+class LTX2VideoVaeSwiGLU(nn.Module):
+    """`w_down(silu(w_gate(x)) * w_up(x))`, evaluated in token tiles."""
+
+    def __init__(self, dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.w_up = nn.Linear(dim, hidden_dim, bias=False)
+        self.w_gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.w_down = nn.Linear(hidden_dim, dim, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, *token_dims, channels = hidden_states.shape
+        num_tokens = math.prod(token_dims)
+        if num_tokens <= _SWIGLU_TILE_SIZE:
+            return self.w_down(
+                F.silu(self.w_gate(hidden_states)) * self.w_up(hidden_states)
+            )
+
+        flat = hidden_states.reshape(batch_size, num_tokens, channels)
+        out = torch.empty_like(flat)
+        for start in range(0, num_tokens, _SWIGLU_TILE_SIZE):
+            tile = flat[:, start : start + _SWIGLU_TILE_SIZE]
+            out[:, start : start + _SWIGLU_TILE_SIZE] = self.w_down(
+                F.silu(self.w_gate(tile)) * self.w_up(tile)
+            )
+        return out.reshape(hidden_states.shape)
+
+
+def _swiglu_hidden_dim(dim: int, mlp_ratio: float) -> int:
+    return (int(dim * mlp_ratio) + 15) // 16 * 16
+
+
+class LTX2VideoVaeNABlock(nn.Module):
+    """Pre-norm neighborhood-attention block used by the deterministic stages."""
+
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: tuple[int, int, int],
+        head_dim: int = 64,
+        mlp_ratio: float = 4.0,
+    ) -> None:
+        super().__init__()
+        self.norm1 = nn.RMSNorm(dim, eps=1e-6)
+        self.attn = LTX2VideoVaeNeighborhoodAttention(
+            dim, kernel_size, head_dim=head_dim
+        )
+        self.norm2 = nn.RMSNorm(dim, eps=1e-6)
+        self.mlp = LTX2VideoVaeSwiGLU(dim, _swiglu_hidden_dim(dim, mlp_ratio))
+
+    def forward(self, hidden_states: torch.Tensor, block_mask=None) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(self.norm1(hidden_states), block_mask)
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states
+
+
+class LTX2VideoVaeAdaLNZero(nn.Module):
+    """Timestep embedding to seven `(B, 1, 1, 1, C)` modulation chunks.
+
+    Seven is upstream's shape (scale/shift/gate for attention and MLP, plus a
+    context gate); only the four scale/shift chunks are consumed, since the
+    residuals here are ungated.
+    """
+
+    def __init__(self, dim: int, t_emb_dim: int, num_chunks: int = 7) -> None:
+        super().__init__()
+        self.num_chunks = num_chunks
+        self.proj = nn.Linear(t_emb_dim, num_chunks * dim, bias=True)
+
+    def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        chunks = self.proj(F.silu(t_emb)).chunk(self.num_chunks, dim=-1)
+        return tuple(chunk[:, None, None, None, :] for chunk in chunks)
+
+
+class LTX2VideoVaeDiffusionNABlock(nn.Module):
+    """Stage-5 block: neighborhood attention + SwiGLU under AdaLN-Zero modulation."""
+
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: tuple[int, int, int],
+        context_channels: int,
+        head_dim: int = 64,
+        mlp_ratio: float = 4.0,
+        num_mod_params: int = 7,
+    ) -> None:
+        super().__init__()
+        self.context_channels = context_channels
+        self.num_mod_params = num_mod_params
+        self.context_proj = nn.Linear(context_channels, dim, bias=True)
+        self.scale_shift_table = nn.Parameter(torch.zeros(num_mod_params, dim))
+
+        self.norm1 = nn.RMSNorm(dim, eps=1e-6)
+        self.attn = LTX2VideoVaeNeighborhoodAttention(
+            dim, kernel_size, head_dim=head_dim
+        )
+        self.norm2 = nn.RMSNorm(dim, eps=1e-6)
+        self.mlp = LTX2VideoVaeSwiGLU(dim, _swiglu_hidden_dim(dim, mlp_ratio))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        latent_context: torch.Tensor,
+        modulation: tuple[torch.Tensor, ...],
+        block_mask=None,
+    ) -> torch.Tensor:
+        scale_msa, shift_msa, _, scale_mlp, shift_mlp, _, _ = [
+            modulation[i] + self.scale_shift_table[i].view(1, 1, 1, 1, -1)
+            for i in range(self.num_mod_params)
+        ]
+
+        hidden_states = hidden_states + self.context_proj(latent_context)
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states) * (1 + scale_msa) + shift_msa, block_mask
+        )
+        hidden_states = hidden_states + self.mlp(
+            self.norm2(hidden_states) * (1 + scale_mlp) + shift_mlp
+        )
+        return hidden_states
+
+
+class LTX2VideoVaePixelShuffleUpsampler(nn.Module):
+    """Linear channel expansion then a channels-last pixel shuffle.
+
+    A temporal stride of 2 produces a duplicate leading frame, dropped to keep
+    the causal 1:2 (composed 1:8) frame mapping.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        stride: tuple[int, int, int],
+        out_channels_reduction_factor: int = 1,
+    ) -> None:
+        super().__init__()
+        self.stride = tuple(stride)
+        proj_out_channels = (
+            math.prod(self.stride) * in_channels // out_channels_reduction_factor
+        )
+        self.out_channels = proj_out_channels // math.prod(self.stride)
+        self.proj = nn.Linear(in_channels, proj_out_channels, bias=True)
+
+    def forward(
+        self, hidden_states: torch.Tensor, drop_leading_frame: bool = True
+    ) -> torch.Tensor:
+        batch_size, num_frames, height, width, _ = hidden_states.shape
+        stride_t, stride_h, stride_w = self.stride
+        hidden_states = self.proj(hidden_states)
+        hidden_states = hidden_states.reshape(
+            batch_size,
+            num_frames,
+            height,
+            width,
+            self.out_channels,
+            stride_t,
+            stride_h,
+            stride_w,
+        )
+        hidden_states = hidden_states.permute(0, 1, 5, 2, 6, 3, 7, 4)
+        hidden_states = hidden_states.reshape(
+            batch_size,
+            num_frames * stride_t,
+            height * stride_h,
+            width * stride_w,
+            self.out_channels,
+        )
+        if stride_t == 2 and drop_leading_frame:
+            hidden_states = hidden_states[:, 1:]
+        return hidden_states
+
+
+class LTX2VideoDiffusionDecoder3d(nn.Module):
+    """Stages 1-4 upsample the latent into a context volume; stage 5 denoises
+    patchified pixels conditioned on it."""
+
+    def __init__(self, config: LTX25DiffusionDecoderConfig) -> None:
+        super().__init__()
+        arch = config.arch_config
+        stage_channels = tuple(arch.decoder_stage_channels)
+        stage_depths = tuple(arch.decoder_stage_depths)
+        stage_kernels = tuple(tuple(k) for k in arch.decoder_stage_kernels)
+        upsample_strides = tuple(tuple(s) for s in arch.decoder_upsample_strides)
+        reductions = tuple(arch.decoder_upsample_channel_reductions)
+
+        if arch.decoder_model_output_type not in ("x0", "v"):
+            raise ValueError(
+                "decoder_model_output_type must be 'x0' or 'v', got "
+                f"{arch.decoder_model_output_type!r}."
+            )
+        # Stage widths and the reductions are two views of the same thing; an
+        # inconsistent pair would only fail deep inside the first block.
+        for stage_idx, reduction in enumerate(reductions):
+            expected = stage_channels[stage_idx] // reduction
+            if stage_channels[stage_idx + 1] != expected:
+                raise ValueError(
+                    f"decoder_stage_channels[{stage_idx + 1}] must be "
+                    f"{expected}, got {stage_channels[stage_idx + 1]}."
+                )
+
+        self.patch_size = arch.patch_size
+        self.out_channels = arch.out_channels
+        self.timestep_scale_multiplier = arch.decoder_timestep_scale_multiplier
+        self.model_output_type = arch.decoder_model_output_type
+        self.default_num_inference_steps = arch.decoder_num_inference_steps
+        self.temporal_compression_ratio = arch.temporal_compression_ratio
+        self.context_channels = stage_channels[-1]
+        # The window shifts inward at the grid border, so the last latent frame
+        # is replicated through stages 1-4 and cropped before stage 5, moving
+        # that border past the frames that are kept.
+        self.trailing_pad_latent_frames = (stage_kernels[0][0] // 2) * 2
+
+        self.conv_in = nn.Linear(arch.latent_channels, stage_channels[0], bias=True)
+
+        self.det_stages = nn.ModuleList()
+        self.upsamples = nn.ModuleList()
+        for stage_idx, stride in enumerate(upsample_strides):
+            channels = stage_channels[stage_idx]
+            self.det_stages.append(
+                nn.ModuleList(
+                    [
+                        LTX2VideoVaeNABlock(
+                            dim=channels,
+                            kernel_size=stage_kernels[stage_idx],
+                            head_dim=arch.decoder_head_dim,
+                        )
+                        for _ in range(stage_depths[stage_idx])
+                    ]
+                )
+            )
+            self.upsamples.append(
+                LTX2VideoVaePixelShuffleUpsampler(
+                    in_channels=channels,
+                    stride=stride,
+                    out_channels_reduction_factor=reductions[stage_idx],
+                )
+            )
+
+        self.t_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(
+            embedding_dim=arch.decoder_t_emb_dim, size_emb_dim=0
+        )
+
+        stage5_channels = stage_channels[-1]
+        noised_pixel_channels = arch.out_channels * arch.patch_size**2
+        self.conv_in_x_t = nn.Linear(noised_pixel_channels, stage5_channels, bias=True)
+        self.shared_adaln = LTX2VideoVaeAdaLNZero(
+            dim=stage5_channels, t_emb_dim=arch.decoder_t_emb_dim
+        )
+        self.diff_blocks = nn.ModuleList(
+            [
+                LTX2VideoVaeDiffusionNABlock(
+                    dim=stage5_channels,
+                    kernel_size=tuple(arch.decoder_stage5_kernel),
+                    context_channels=self.context_channels,
+                    head_dim=arch.decoder_head_dim,
+                    num_mod_params=self.shared_adaln.num_chunks,
+                )
+                for _ in range(stage_depths[-1])
+            ]
+        )
+        self.norm_out = nn.RMSNorm(stage5_channels, eps=1e-6)
+        self.conv_out = nn.Linear(stage5_channels, noised_pixel_channels, bias=True)
+
+    def forward_stages_1_to_3(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Latent `(B, C, T, H, W)` to a channels-last feature volume."""
+        num_pad = self.trailing_pad_latent_frames
+        if num_pad > 0:
+            trailing = hidden_states[:, :, -1:].expand(-1, -1, num_pad, -1, -1)
+            hidden_states = torch.cat([hidden_states, trailing], dim=2)
+
+        hidden_states = hidden_states.permute(0, 2, 3, 4, 1)
+        hidden_states = self.conv_in(hidden_states)
+        for blocks, upsample in zip(self.det_stages[:-1], self.upsamples[:-1]):
+            # Grid and kernel are fixed within a stage, so one mask serves all
+            # of its blocks.
+            block_mask = blocks[0].attn.build_block_mask(hidden_states)
+            for block in blocks:
+                hidden_states = block(hidden_states, block_mask)
+            hidden_states = upsample(hidden_states)
+        return hidden_states
+
+    def forward_stage_4(
+        self,
+        hidden_states: torch.Tensor,
+        drop_leading_frame: bool = True,
+        crop_trailing_ghost: bool = True,
+    ) -> torch.Tensor:
+        """Last deterministic stage -> context `(B, T5, H5, W5, C5)`."""
+        blocks = self.det_stages[-1]
+        block_mask = blocks[0].attn.build_block_mask(hidden_states)
+        for block in blocks:
+            hidden_states = block(hidden_states, block_mask)
+        hidden_states = self.upsamples[-1](
+            hidden_states, drop_leading_frame=drop_leading_frame
+        )
+
+        num_pad = self.trailing_pad_latent_frames
+        if crop_trailing_ghost and num_pad > 0:
+            hidden_states = hidden_states[
+                :, : -num_pad * self.temporal_compression_ratio
+            ]
+        return hidden_states
+
+    def forward_diffusion_step(
+        self, latent_context: torch.Tensor, x_t: torch.Tensor, timestep: torch.Tensor
+    ) -> torch.Tensor:
+        """One stage-5 step; returns a pixel-space prediction `(B, C, F, H, W)`."""
+        t_emb = self.t_embedder(
+            self.timestep_scale_multiplier * timestep,
+            resolution=None,
+            aspect_ratio=None,
+            batch_size=timestep.shape[0],
+            hidden_dtype=latent_context.dtype,
+        )
+        modulation = self.shared_adaln(t_emb)
+
+        hidden_states = _patchify(x_t, self.patch_size).permute(0, 2, 3, 4, 1)
+        hidden_states = self.conv_in_x_t(hidden_states)
+        block_mask = self.diff_blocks[0].attn.build_block_mask(hidden_states)
+        for block in self.diff_blocks:
+            hidden_states = block(hidden_states, latent_context, modulation, block_mask)
+
+        hidden_states = self.norm_out(hidden_states)
+        hidden_states = self.conv_out(hidden_states)
+        hidden_states = hidden_states.permute(0, 4, 1, 2, 3).contiguous()
+        return _unpatchify(hidden_states, self.patch_size)
+
+    def denoise(
+        self,
+        latent_context: torch.Tensor,
+        x_t: torch.Tensor,
+        num_inference_steps: int,
+    ) -> torch.Tensor:
+        batch_size = latent_context.shape[0]
+        timesteps = torch.linspace(
+            1.0,
+            1.0 / num_inference_steps,
+            num_inference_steps,
+            device=latent_context.device,
+            dtype=torch.float32,
+        )
+
+        # How LTX-2.5 ships: one step whose x0 prediction is the output.
+        if num_inference_steps == 1 and self.model_output_type == "x0":
+            return self.forward_diffusion_step(
+                latent_context, x_t, timesteps[:1].expand(batch_size)
+            )
+
+        for step_idx in range(num_inference_steps):
+            t_now = timesteps[step_idx].expand(batch_size)
+            t_next = (
+                timesteps[step_idx + 1]
+                if step_idx + 1 < num_inference_steps
+                else torch.zeros_like(t_now)
+            )
+            model_out = self.forward_diffusion_step(latent_context, x_t, t_now).float()
+            x_t_fp32 = x_t.float()
+            if self.model_output_type == "x0":
+                sigma = t_now.view(-1, *([1] * (x_t.ndim - 1)))
+                model_out = (x_t_fp32 - model_out) / sigma
+            dt = (t_now - t_next).view(-1, *([1] * (x_t.ndim - 1)))
+            x_t = (x_t_fp32 - dt * model_out).to(x_t.dtype)
+        return x_t
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        generator: torch.Generator | None = None,
+        num_inference_steps: int | None = None,
+    ) -> torch.Tensor:
+        num_inference_steps = num_inference_steps or self.default_num_inference_steps
+        latent_context = self.forward_stage_4(self.forward_stages_1_to_3(hidden_states))
+        # The context grid is the stage-5 token grid, so the pixel canvas is its
+        # shape times the patch size.
+        pixel_shape = (
+            hidden_states.shape[0],
+            self.out_channels,
+            latent_context.shape[1],
+            latent_context.shape[2] * self.patch_size,
+            latent_context.shape[3] * self.patch_size,
+        )
+        x_t = torch.randn(
+            pixel_shape,
+            generator=generator,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        return self.denoise(latent_context, x_t, num_inference_steps)
+
+
+class LTX2VideoDiffusionDecoderModel(nn.Module):
+    """Checkpoint-level wrapper: the decoder plus the latent statistics.
+
+    `diffusion_decoder/` stores `latents_mean` / `latents_std` alongside a
+    `decoder.` submodule, so this mirrors that layout rather than flattening it.
+    """
+
+    def __init__(self, config: LTX25DiffusionDecoderConfig) -> None:
+        super().__init__()
+        self.config = config
+        latent_channels = config.arch_config.latent_channels
+        self.decoder = LTX2VideoDiffusionDecoder3d(config)
+        self.register_buffer(
+            "latents_mean", torch.zeros(latent_channels), persistent=True
+        )
+        self.register_buffer(
+            "latents_std", torch.ones(latent_channels), persistent=True
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        generator: torch.Generator | None = None,
+        num_inference_steps: int | None = None,
+    ) -> torch.Tensor:
+        return self.decoder(hidden_states, generator, num_inference_steps)
+
+    def decode(
+        self,
+        hidden_states: torch.Tensor,
+        generator: torch.Generator | None = None,
+        num_inference_steps: int | None = None,
+    ) -> torch.Tensor:
+        return self.forward(hidden_states, generator, num_inference_steps)
+
+
+EntryClass = LTX2VideoDiffusionDecoderModel

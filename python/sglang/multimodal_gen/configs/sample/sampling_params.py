@@ -182,6 +182,10 @@ class SamplingParams:
 
     # LTX-2.5 duration head. Only the LTX-2.5 pipeline acts on these; other
     # models ignore them, so the CLI flag stays universally accepted.
+    # LTX-2.5 only: decode with the diffusion decoder instead of the
+    # convolutional VAE decoder. Ignored by models that ship no such decoder.
+    use_diffusion_decoder: bool = False
+
     auto_duration: bool = False
     auto_duration_min_seconds: float = 1.0
     auto_duration_max_seconds: float = 20.0
@@ -888,6 +892,7 @@ class SamplingParams:
         add_argument("--data-type", type=str, nargs="+")
         # LTX-2.5 duration head: predict the shot length from the caption and
         # override `--num-frames`. Ignored by checkpoints without the head.
+        add_argument("--use-diffusion-decoder", action="store_true")
         add_argument("--auto-duration", action="store_true")
         add_argument("--auto-duration-min-seconds", type=float)
         add_argument("--auto-duration-max-seconds", type=float)

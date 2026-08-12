@@ -24,10 +24,14 @@ class LTX2AVDecodingStage(DecodingStage):
     LTX-2 specific decoding stage that handles both video and audio decoding.
     """
 
-    def __init__(self, vae, audio_vae, vocoder, pipeline=None):
+    def __init__(self, vae, audio_vae, vocoder, pipeline=None, diffusion_decoder=None):
         super().__init__(vae, pipeline)
         self.audio_vae = audio_vae
         self.vocoder = vocoder
+        # LTX-2.5 only. When the request asks for it, this replaces the
+        # convolutional decoder; the latents and their denormalization are
+        # identical either way.
+        self.diffusion_decoder = diffusion_decoder
         # Add video processor for postprocessing
         from diffusers.video_processor import VideoProcessor
 
@@ -53,6 +57,18 @@ class LTX2AVDecodingStage(DecodingStage):
     def _ltx2_should_externally_denorm_video_latents(server_args: ServerArgs) -> bool:
         arch_config = server_args.pipeline_config.vae_config.arch_config
         return str(getattr(arch_config, "video_decoder_variant", "ltx_2")) != "ltx_2_3"
+
+    def _decode_with_diffusion_decoder(self, latents, batch, vae_dtype):
+        """Decode with the LTX-2.5 diffusion decoder.
+
+        It is a diffusion model in its own right, so it needs a generator; the
+        request's seed keeps a decode reproducible.
+        """
+        generator = torch.Generator(device=latents.device).manual_seed(int(batch.seed))
+        with temporary_module_dtype(
+            self.diffusion_decoder, vae_dtype, enabled=True
+        ) as decoder:
+            return decoder(latents.to(vae_dtype), generator=generator)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
@@ -90,10 +106,19 @@ class LTX2AVDecodingStage(DecodingStage):
                 should_cast_vae = not vae_autocast_enabled
                 if not vae_autocast_enabled:
                     latents = latents.to(vae_dtype)
-                with temporary_module_dtype(
-                    self.vae, vae_dtype, enabled=should_cast_vae
-                ) as vae:
-                    decode_output = vae.decode(latents)
+                use_diffusion_decoder = (
+                    bool(getattr(batch, "use_diffusion_decoder", False))
+                    and self.diffusion_decoder is not None
+                )
+                if use_diffusion_decoder:
+                    decode_output = self._decode_with_diffusion_decoder(
+                        latents, batch, vae_dtype
+                    )
+                else:
+                    with temporary_module_dtype(
+                        self.vae, vae_dtype, enabled=should_cast_vae
+                    ) as vae:
+                        decode_output = vae.decode(latents)
                 if isinstance(decode_output, tuple):
                     video = decode_output[0]
                 elif hasattr(decode_output, "sample"):
