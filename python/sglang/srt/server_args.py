@@ -2794,7 +2794,7 @@ class ServerArgs:
         "deployments (without disaggregation) use cuda_ipc; validated multi-node "
         "GB200/GB300 MNNVL models use cuda_vmm when an IMEX channel is available; "
         "all other deployments use cpu. GPU transports reserve "
-        "SGLANG_MM_FEATURE_CACHE_MB (default 512 MiB) on the base GPU and fall "
+        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
         "back to CPU transport when the pool is full.",
         NS("mm"),
     ] = None
