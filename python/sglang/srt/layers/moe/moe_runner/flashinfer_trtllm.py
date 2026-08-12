@@ -624,6 +624,32 @@ def get_activation_type(activation: str, is_gated: bool = True) -> int:
     return act.value
 
 
+def resolve_flashinfer_trtllm_routed_scaling_factor(
+    routing_method_type: int | None,
+    topk_routed_scaling_factor: float | None,
+    runner_config: MoeRunnerConfig,
+    default: float | None = None,
+) -> float | None:
+    """Resolve the scale for FlashInfer's ordinary routing kernel.
+
+    MiniMax keeps its routed scale on ``TopKConfig``. The ordinary TRT-LLM
+    backend bypasses SGLang's TopK implementation, so it must forward that
+    scale to FlashInfer together with the MiniMax2 routing method. Pre-routed
+    backends continue to use ``runner_config`` because their weights have
+    already passed through TopK.
+    """
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    if (
+        routing_method_type == RoutingMethodType.MiniMax2
+        and topk_routed_scaling_factor is not None
+    ):
+        return topk_routed_scaling_factor
+    if runner_config.routed_scaling_factor is not None:
+        return runner_config.routed_scaling_factor
+    return default
+
+
 @dataclass
 class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by FlashInfer TRT-LLM FP8 MoE kernels."""
@@ -798,10 +824,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 intermediate_size=quant_info.intermediate_size,
                 local_expert_offset=quant_info.local_expert_offset,
                 local_num_experts=quant_info.local_num_experts,
-                routed_scaling_factor=(
-                    runner_config.routed_scaling_factor
-                    if runner_config.routed_scaling_factor is not None
-                    else 1.0
+                routed_scaling_factor=resolve_flashinfer_trtllm_routed_scaling_factor(
+                    routing_method_type,
+                    topk_config.routed_scaling_factor,
+                    runner_config,
+                    default=1.0,
                 ),
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=use_shuffled_weight,
