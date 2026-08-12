@@ -155,7 +155,9 @@ class LoRAAdapter(Adapter):
                     local_start = distributed_rank * part_size
                     local_end = (distributed_rank + 1) * part_size
                     shards.append(
-                        self.lora_B[row_offset + local_start : row_offset + local_end, :]
+                        self.lora_B[
+                            row_offset + local_start : row_offset + local_end, :
+                        ]
                     )
                     row_offset += full_size
                 B = torch.cat(shards, dim=0)
