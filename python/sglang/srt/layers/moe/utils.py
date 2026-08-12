@@ -231,6 +231,7 @@ class DispatcherOutputDtype(Enum):
     NVFP4 = "nvfp4"
     MXFP8 = "mxfp8"
 
+
 class FlashinferA2ADispatchType(Enum):
     BF16 = "bf16"
     NVFP4 = "nvfp4"

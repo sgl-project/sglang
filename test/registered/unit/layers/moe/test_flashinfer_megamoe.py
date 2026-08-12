@@ -5,9 +5,14 @@ from pathlib import Path
 
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
 
 def _load_megamoe_module(monkeypatch):
     """Load the adapter with only its small import-time dependencies stubbed."""
+
     class MoeQuantInfo:
         pass
 
