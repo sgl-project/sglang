@@ -272,6 +272,16 @@ class PipelineConfig:
 
         del server_args
 
+    def supports_action_endpoint(self) -> bool:
+        """Whether this pipeline exposes the generic action generation API."""
+
+        return self.task_type.is_action_gen()
+
+    def supports_openpi_endpoint(self) -> bool:
+        """Whether this pipeline implements the OpenPI policy websocket."""
+
+        return False
+
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
 

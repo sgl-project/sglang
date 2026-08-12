@@ -61,10 +61,7 @@ class MlxPendingJob:
     batch_copy: ScheduleBatch
     schedule_batch: ScheduleBatch
     reqs: List[Req]
-    # False when the batch needs per-step CPU logit state (grammar vocab
-    # masks / custom logit processors under --mlx-enable-sampling): step
-    # N+1's mask needs token N materialized, so such batches must launch
-    # fresh every step instead of chaining.
+    # See SchedulerMlxOverlapMixin._mlx_batch_chain_safe.
     chain_safe: bool = True
     # Captured at launch when batch.return_logprob, exactly like
     # Scheduler.run_batch does for the CUDA paths (the live values mutate

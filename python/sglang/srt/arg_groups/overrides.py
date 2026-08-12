@@ -935,11 +935,9 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
         elif is_hip():
             overrides["attention_backend"] = "aiter"
         elif not (is_mps() and use_mlx()):
-            # No triton on macOS, but only the MLX runner can actually serve
-            # gpt-oss there -- it owns attention, so it keeps the platform
-            # default. macOS *without* MLX must still fall through to triton
-            # and fail fast below: torch_native has neither sliding-window nor
-            # attention-sink support, so accepting it would silently mis-serve.
+            # Exempt MLX only -- it owns attention in its own runner.  macOS
+            # without MLX still falls through to triton and fails fast below,
+            # rather than landing on torch_native (no sliding window, no sinks).
             overrides["attention_backend"] = "triton"
     if is_xpu():
         # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,
@@ -1932,6 +1930,14 @@ def _deepseek_v4_sm120_moe(view: Any) -> dict:
     return {}
 
 
+@_register_for("MuseGlimmerForConditionalGeneration", "MuseGlimmerForCausalLM")
+def _muse_glimmer_fp4_gemm_runner_overrides(server_args: Any, hf_config: Any) -> dict:
+    if is_sm120_supported() and server_args.fp4_gemm_runner_backend == "auto":
+        logger.info("Use marlin as FP4 GEMM runner backend on SM120 for Muse Glimmer")
+        return {"fp4_gemm_runner_backend": "marlin"}
+    return {}
+
+
 @register_post_process
 def _sparse_head_overlap_disable(view: Any) -> dict:
 
@@ -1949,6 +1955,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
     {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
         "GptOssForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Glm4MoeForCausalLM",
@@ -2043,6 +2050,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "Glm4MoeLiteForCausalLM",
         ]
     except Exception:
         return False
