@@ -86,6 +86,21 @@ def test_scheduler_admits_then_request_release_drops_lease():
     assert not cache.lease_contains("lease", 11)
 
 
+def test_chunk_lookup_keeps_lease_owned_by_request():
+    cache = MultiModalStaticCache(max_size=1024)
+    cache.set(11, _embedding(11))
+    cache.acquire_many("lease", [11], ttl_s=300)
+    cache.admit_lease("lease")
+    item = _featureless_item(11, "lease")
+
+    with patch.object(mm_schedule, "embedding_cache", cache):
+        assert mm_schedule._get_cached_embedding(item).embedding.item() == 11
+        assert mm_schedule._get_cached_embedding(item).embedding.item() == 11
+
+    assert item.model_specific_data[MM_EMBEDDING_CACHE_LEASE_ID_KEY] == "lease"
+    assert cache.lease_contains("lease", 11)
+
+
 def test_missing_lease_requests_one_internal_cold_retry():
     cache = MultiModalStaticCache(max_size=1024)
     scheduler = _scheduler()

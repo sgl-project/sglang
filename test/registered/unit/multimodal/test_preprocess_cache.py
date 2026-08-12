@@ -328,6 +328,19 @@ class TestMultimodalEmbeddingCacheLease(unittest.TestCase):
             self.assertTrue(cache.lease_contains("admitted", 1))
             self.assertEqual(cache.consume("admitted", 1).embedding.item(), 1)
 
+    def test_admitted_lease_stays_pinned_across_chunk_lookups(self):
+        cache = MultiModalStaticCache(max_size=8)
+        cache.set(1, self._embedding(1))
+        cache.acquire_many("admitted", [1], ttl_s=300)
+        self.assertTrue(cache.admit_lease("admitted"))
+
+        self.assertEqual(cache.get_leased("admitted", 1).embedding.item(), 1)
+        self.assertEqual(cache.get_leased("admitted", 1).embedding.item(), 1)
+        self.assertFalse(cache.set(2, self._embedding(2)))
+
+        cache.release_lease("admitted")
+        self.assertTrue(cache.set(2, self._embedding(2)))
+
 
 if __name__ == "__main__":
     unittest.main()

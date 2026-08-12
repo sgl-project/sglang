@@ -23,9 +23,9 @@ embedding_cache: Optional[MultiModalStaticCache] = None
 
 
 def _get_cached_embedding(item: MultimodalDataItem) -> Optional[EmbeddingResult]:
-    lease_id = item.model_specific_data.pop(MM_EMBEDDING_CACHE_LEASE_ID_KEY, None)
+    lease_id = item.model_specific_data.get(MM_EMBEDDING_CACHE_LEASE_ID_KEY)
     if lease_id is not None:
-        cached = embedding_cache.consume(lease_id, item.hash)
+        cached = embedding_cache.get_leased(lease_id, item.hash)
         if cached is None:
             raise RuntimeError(
                 "Multimodal embedding-cache lease expired after scheduler "

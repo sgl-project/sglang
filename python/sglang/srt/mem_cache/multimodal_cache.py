@@ -248,6 +248,18 @@ class MultiModalStaticCache(MultimodalCache):
                 self._leases.pop(lease_id, None)
             return embedding
 
+    def get_leased(self, lease_id: str, mm_hash: int) -> Optional[EmbeddingResult]:
+        """Return an admitted request's pinned embedding without releasing it.
+
+        Chunked prefill can revisit one image in more than one scheduler step.
+        The request lifecycle, rather than the first lookup, therefore owns the
+        pin and releases it through ``MultimodalInputs.release_features``.
+        """
+        with self._lock:
+            self._reap_expired_leases_locked()
+            lease = self._leases.get(lease_id)
+            return None if lease is None else lease.entries.get(mm_hash)
+
     def release_lease(self, lease_id: str) -> bool:
         with self._lock:
             return self._release_lease_locked(lease_id)
