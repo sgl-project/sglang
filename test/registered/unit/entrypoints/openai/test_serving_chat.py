@@ -2444,23 +2444,22 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertLess(plain_raw_idx, raw.index(named[0]))
 
     def _run_output_ids_stream_with_graceful_abort(
-        self, normal_chunks, abort_output_ids, incremental
+        self, normal_chunks, abort_output_ids, incremental, abort_completion_tokens
     ):
-        """Stream normal output_ids chunks then a graceful-abort chunk
-        (finish_reason type 'abort', no status_code) whose output_ids is the
-        producer's collapsed [last_token] (tokenizer_manager._handle_abort_req).
-        Returns the parsed sglext chunks."""
+        """Stream normal chunks then a graceful-abort chunk; return parsed sglext chunks."""
         self.tm.server_args.incremental_streaming_output = incremental
 
         async def _mock_generate():
+            generated = 0
             for ids in normal_chunks:
+                generated = generated + len(ids) if incremental else len(ids)
                 yield {
                     "text": "chunk",
                     "output_ids": list(ids),
                     "meta_info": {
                         "id": "chatcmpl-abort-ids-stream",
                         "prompt_tokens": 3,
-                        "completion_tokens": 1,
+                        "completion_tokens": generated,
                         "cached_tokens": 0,
                         "finish_reason": None,
                         "output_token_logprobs": None,
@@ -2477,7 +2476,7 @@ class ServingChatTestCase(unittest.TestCase):
                 "meta_info": {
                     "id": "chatcmpl-abort-ids-stream",
                     "prompt_tokens": 3,
-                    "completion_tokens": 1,
+                    "completion_tokens": abort_completion_tokens,
                     "cached_tokens": 0,
                     "finish_reason": {"type": "abort", "message": "Aborted."},
                     "output_token_logprobs": None,
@@ -2511,24 +2510,48 @@ class ServingChatTestCase(unittest.TestCase):
         return [c for c in self._parse_chunks(chunks) if "sglext" in c]
 
     def test_streaming_output_ids_incremental_ignores_abort_chunk(self):
-        # Deltas deliver 5,6,7; the abort chunk re-sends the last token
-        # ([output_ids[-1]]). It must not be appended again (no [[5, 6, 7, 7]]).
+        # Abort re-sends the last token; it must not be appended again.
         sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
             normal_chunks=[[5, 6], [7]],
             abort_output_ids=[7],
             incremental=True,
+            abort_completion_tokens=3,
         )
 
         self.assertEqual(len(sglext_chunks), 1)
         self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
 
+    def test_streaming_output_ids_incremental_keeps_coalesced_abort_deltas(self):
+        # Coalesced abort chunk: keep real deltas, drop the repeated last token.
+        sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
+            normal_chunks=[[5, 6]],
+            abort_output_ids=[7, 8, 8],
+            incremental=True,
+            abort_completion_tokens=4,
+        )
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7, 8]])
+
     def test_streaming_output_ids_non_incremental_ignores_abort_chunk(self):
-        # Cumulative chunks carry the full list; the abort chunk collapses to
-        # [last_token] and must not overwrite the accumulated prefix (no [[7]]).
+        # Abort collapses to [last_token]; do not overwrite the full list.
         sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
             normal_chunks=[[5, 6], [5, 6, 7]],
             abort_output_ids=[7],
             incremental=False,
+            abort_completion_tokens=3,
+        )
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
+
+    def test_streaming_output_ids_non_incremental_keeps_full_abort_chunk(self):
+        # Abort-only stream: the abort chunk is the full cumulative list.
+        sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
+            normal_chunks=[],
+            abort_output_ids=[5, 6, 7],
+            incremental=False,
+            abort_completion_tokens=3,
         )
 
         self.assertEqual(len(sglext_chunks), 1)

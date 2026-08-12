@@ -1555,21 +1555,31 @@ class OpenAIServingChat(OpenAIServingBase):
                     # The prompt is the full, shared prompt (same across choices
                     # and constant across chunks), so capture it once.
                     chunk_input_ids = content.get("prompt_token_ids")
-                    if chunk_input_ids is not None and finish_reason_type != "abort":
+                    if chunk_input_ids is not None:
                         input_ids = list(chunk_input_ids)
 
                 if return_output_ids:
                     chunk_output_ids = content.get("output_ids")
-                    if chunk_output_ids is not None and finish_reason_type != "abort":
+                    if chunk_output_ids is not None:
                         if (
                             self.tokenizer_manager.server_args.incremental_streaming_output
                         ):
-                            output_ids.setdefault(index, []).extend(chunk_output_ids)
-                        else:
-                            # Intermediate chunks deliberately share one live
-                            # list (the tokenizer manager's state.output_ids);
-                            # only the final chunk is a stable copy. The
-                            # reference is read once, after the stream ends.
+                            accumulated = output_ids.setdefault(index, [])
+                            if finish_reason_type == "abort":
+                                # Coalesce may glue real deltas onto the abort
+                                # chunk's repeated last token; keep only what
+                                # brings us up to completion_tokens.
+                                keep = completion_tokens[index] - len(accumulated)
+                                chunk_output_ids = chunk_output_ids[: max(keep, 0)]
+                            accumulated.extend(chunk_output_ids)
+                        elif (
+                            finish_reason_type != "abort"
+                            or len(chunk_output_ids) == completion_tokens[index]
+                        ):
+                            # Intermediate chunks share the live state.output_ids
+                            # list; the final chunk is a stable copy. Skip a
+                            # collapsed abort ([last_token]), but keep a full
+                            # abort payload.
                             output_ids[index] = chunk_output_ids
 
                 # Handle logprobs
