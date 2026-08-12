@@ -1724,10 +1724,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        self.assertTrue(args.dit_cpu_offload)
+        # Explicit FSDP selection must not freeze unrelated, implicit DiT
+        # residency decisions on a high-memory GPU.
+        self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
-        # explicit use_fsdp_inference skips the residency pass, but the layerwise
-        # filter still drops vae (kept resident); encoders stay offloaded
+        # The layerwise filter still drops VAE (kept resident); encoders stay
+        # offloaded.
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder"],
