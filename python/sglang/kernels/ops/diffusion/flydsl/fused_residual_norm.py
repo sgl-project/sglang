@@ -26,9 +26,16 @@ from flydsl._mlir.dialects import (
 )
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
+
+try:
+    from flydsl.expr import buffer_ops
+except ImportError:
+    # flydsl 0.3.0 removed flydsl.expr.buffer_ops and pushed the buffer-resource
+    # layer down to its consumers; AITER carries the same module, same API.
+    from aiter.ops.flydsl.kernels import buffer_ops
 
 WARP_SIZE = 64
 _VEC = 8
