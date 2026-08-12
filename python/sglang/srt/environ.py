@@ -731,6 +731,9 @@ class Envs:
     SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
     SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
+    # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
+    # Reorders the fp32 accumulation, so off by default.
+    SGLANG_MLA_DECODE_TUNE = EnvBool(False)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)

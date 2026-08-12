@@ -21,12 +21,14 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
 import logging
+from typing import NamedTuple, Optional
 
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
-from sglang.srt.utils import is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils import get_device_core_count, is_gfx95_supported, is_hip
 
 _is_hip = is_hip()
 
@@ -34,6 +36,171 @@ logger = logging.getLogger(__name__)
 
 
 _MIN_BLOCK_KV = 32
+
+# Heads per stage-1 tile. Shared so the head_tiles the split budget is divided by cannot
+# drift from the BLOCK_H the kernel is launched with.
+_MLA_BLOCK_H = 16
+
+
+class _MlaBucket(NamedTuple):
+    """Stage-1 launch geometry for one batch range. ``batch_max=None`` is the catch-all."""
+
+    block_n: int
+    num_warps: int
+    num_stages: int
+    max_splits: int
+    batch_max: Optional[int] = None
+
+
+# gfx950 MLA decode. The HIP path otherwise takes BLOCK_N=16, which leaves the first dot
+# a single 16x16 MFMA tile: its four warps can then only split along K=576 and pay a
+# cross-warp reduction every KV step, where BLOCK_N=32 gives two warps an N tile each.
+#
+# max_splits caps the small-batch buckets, where batch * kv_splits never fills the
+# machine anyway and the limit is instead where stage-2's merge traffic overtakes the
+# parallelism stage-1 buys.
+#
+# Measured at head_tiles == 1 on a 68k context (K3 at tp 8). The budget divides by
+# batch * head_tiles so it still holds when a smaller tp splits the heads, but the
+# bucket edges themselves were not tuned for that.
+_MLA_BUCKETS = (
+    _MlaBucket(block_n=64, num_warps=4, num_stages=2, max_splits=112, batch_max=5),
+    _MlaBucket(block_n=32, num_warps=2, num_stages=2, max_splits=256, batch_max=24),
+    _MlaBucket(block_n=32, num_warps=1, num_stages=1, max_splits=256),
+)
+
+# Used where the geometry must not depend on the batch; see _decode_grouped_att_m_fwd.
+# Deliberately the mid bucket's launch shape -- it is the one that holds over the widest
+# batch range -- so retuning that bucket also moves the numbers deterministic inference
+# produces; test_batch_free_geometry_is_pinned is what notices. That path never picks a
+# split count, so this bucket's max_splits is not consulted.
+_MLA_BUCKET_BATCH_FREE = _MLA_BUCKETS[1]
+
+_KEEP_SCHEDULER_SPLITS = None
+_CORE_COUNT = {}
+_LOGGED_TUNE = False
+
+
+def _keep_scheduler_splits() -> bool:
+    """Whether a caller depends on the per-sequence num_kv_splits the scheduler wrote.
+
+    ``--enable-deterministic-inference`` derives the split count from a fixed tile size
+    so that a request's reduction tree cannot depend on its batch mates; substituting a
+    batch-wide count would put back the very dependence that flag exists to remove.
+    ``SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS`` is the opposite request -- give every
+    sequence max_kv_splits -- but it is still the caller asking for a specific count.
+    """
+    global _KEEP_SCHEDULER_SPLITS
+    if _KEEP_SCHEDULER_SPLITS is None:
+        from sglang.srt.runtime_context import get_server_args
+
+        try:
+            server_args = get_server_args()
+        except ValueError:
+            return False  # not published yet, ask again on the next call
+        _KEEP_SCHEDULER_SPLITS = bool(
+            server_args.enable_deterministic_inference
+            or server_args.triton_attention_split_tile_size
+            or envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.get()
+        )
+        if _KEEP_SCHEDULER_SPLITS:
+            logger.info("MLA decode: keeping the scheduler's num_kv_splits")
+    return _KEEP_SCHEDULER_SPLITS
+
+
+def _mla_head_tiles(head_num: int, kv_group_num: int) -> int:
+    """Stage-1 grid extent along heads, i.e. the y of its launch grid."""
+    return triton.cdiv(head_num, min(_MLA_BLOCK_H, kv_group_num))
+
+
+def _mla_bucket(batch: int) -> _MlaBucket:
+    for bucket in _MLA_BUCKETS:
+        if bucket.batch_max is None or batch <= bucket.batch_max:
+            return bucket
+    return _MLA_BUCKETS[-1]  # only reachable if the last bucket grows a batch_max
+
+
+def _mla_split_budget(num_warps: int, core_count: int) -> int:
+    """Stage-1 workgroups that keep the machine about one wave deep.
+
+    Four-warp workgroups get one per CU and halving the warps doubles how many fit,
+    which is what moves the wave cliff out. Taking core_count rather than assuming a
+    whole MI355X matters under CPX, where a partition exposes 32 of the 256 CUs and
+    would otherwise be handed eight times the splits it can run.
+    """
+    return core_count * 4 // num_warps
+
+
+def _mla_core_count(device_index: Optional[int]) -> int:
+    count = _CORE_COUNT.get(device_index)
+    if count is None:
+        count = get_device_core_count(device_index if device_index is not None else 0)
+        _CORE_COUNT[device_index] = count
+    return count
+
+
+def _mla_kv_splits(
+    batch: int, head_tiles: int, max_kv_splits: int, core_count: int
+) -> int:
+    """Batch-wide split count for stage-1, or 0 to keep the scheduler's.
+
+    The budget is a ceiling rather than a rounding target because the cost of crossing
+    it is a whole wave, not a proportional slice: at batch 24 on a 68k context, 21
+    splits (504 blocks) takes 358 us while 22 splits (528 blocks) takes 528 us. Below
+    the ceiling the count is left exact -- each split shortens the KV every workgroup
+    walks, so rounding it down costs latency in proportion (68k context, batch 136:
+    7 splits 1628 us against 4 splits 2734 us).
+    """
+    if core_count <= 0 or _keep_scheduler_splits():
+        return 0
+    bucket = _mla_bucket(batch)
+    budget = _mla_split_budget(bucket.num_warps, core_count)
+    splits = min(max_kv_splits, bucket.max_splits, budget // max(1, batch * head_tiles))
+    return max(1, splits)
+
+
+def _mla_tuning_applies(has_mla: bool, head_dim: int) -> bool:
+    """Both gates matter: the tuning was measured on gfx950 and on the Lk=576 layout.
+
+    Ordered cheapest first, since this runs per layer per decode step: a CUDA build
+    pays one bool to find out the rest is inert. The env read stays last and uncached
+    so that overriding it in a test actually takes effect.
+    """
+    return (
+        _is_hip
+        and has_mla
+        and head_dim == 576
+        and is_gfx95_supported()
+        and envs.SGLANG_MLA_DECODE_TUNE.get()
+    )
+
+
+def _mla_forced_kv_splits(q, k_buffer, max_kv_splits: int, has_mla: bool) -> int:
+    """Split count to hand both stages, or 0 to leave them on the scheduler's.
+
+    Computed once by the caller that owns both launches rather than returned out of
+    stage-1: stage-2 has to merge exactly as many partials as stage-1 wrote, and a
+    mismatch is silent. Defaulting both launchers to 0 makes a forgotten argument
+    degrade to stock behaviour on both sides instead.
+    """
+    if not _mla_tuning_applies(has_mla, k_buffer.shape[-1]):
+        return 0
+    head_num = q.shape[1]
+    head_tiles = _mla_head_tiles(head_num, head_num // k_buffer.shape[-2])
+    splits = _mla_kv_splits(
+        q.shape[0], head_tiles, max_kv_splits, _mla_core_count(q.device.index)
+    )
+
+    global _LOGGED_TUNE
+    if splits and not _LOGGED_TUNE:
+        _LOGGED_TUNE = True
+        logger.info(
+            "MLA decode: using the gfx950 tuned stage-1 geometry "
+            "(SGLANG_MLA_DECODE_TUNE=0 to disable). The scheduler's per-sequence "
+            "num_kv_splits is replaced; --triton-attention-num-kv-splits is still "
+            "honoured as an upper bound."
+        )
+    return splits
 
 
 def _extract_kv_strides(buf, page_size: int):
@@ -425,6 +592,8 @@ def _fwd_grouped_kernel_stage1(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    forced_kv_splits=0,
+    USE_FORCED: tl.constexpr = False,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -448,7 +617,16 @@ def _fwd_grouped_kernel_stage1(
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    # Any count S still covers every sequence, mixed lengths included, because
+    # kv_len_per_split >= cdiv(L, S) below and hence S * kv_len_per_split >= L.
+    #
+    # The count only feeds the kv_len_per_split arithmetic below, so it stays a runtime
+    # value here -- making it a constexpr would compile one stage-1 variant per rung of
+    # the cuda-graph batch ladder. Stage-2 does need it at compile time; see there.
+    if USE_FORCED:
+        kv_splits = forced_kv_splits
+    else:
+        kv_splits = tl.load(num_kv_splits + cur_batch)
 
     if xai_temperature_len > 0:
         offs_qidx = cur_batch_seq_len - 1
@@ -626,10 +804,13 @@ def _decode_grouped_att_m_fwd(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    forced_kv_splits: int = 0,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
+
+    tune_mla = _mla_tuning_applies(has_mla, Lk)
 
     # [TODO] work around shmem limit on MI3xx
     if _is_hip and Lk >= 576:
@@ -652,21 +833,32 @@ def _decode_grouped_att_m_fwd(
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // kv_head_num
 
-    BLOCK_H = 16
+    BLOCK_H = _MLA_BLOCK_H
     MAX_KV_SPLITS = max_kv_splits
-    grid = (
-        batch,
-        triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
-        MAX_KV_SPLITS,
-    )
+    head_tiles = _mla_head_tiles(head_num, kv_group_num)
 
     extra_kargs = {}
     num_stages = 2
+    num_warps = 4
     if _is_hip:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
+
+    if tune_mla:
+        # BLOCK_N and num_warps reorder the fp32 accumulation, so keying the geometry off
+        # forced_kv_splits keeps both decisions on the same condition: whoever declined a
+        # batch-wide split count also gets a batch-independent geometry.
+        bucket = _mla_bucket(batch) if forced_kv_splits else _MLA_BUCKET_BATCH_FREE
+        BLOCK, num_warps, num_stages = (
+            bucket.block_n,
+            bucket.num_warps,
+            bucket.num_stages,
+        )
+
+    # Blocks at or above the split count return immediately, so the grid shrinks too.
+    grid = (batch, head_tiles, forced_kv_splits or MAX_KV_SPLITS)
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
         k_buffer, page_size
@@ -712,7 +904,7 @@ def _decode_grouped_att_m_fwd(
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
@@ -724,6 +916,8 @@ def _decode_grouped_att_m_fwd(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        forced_kv_splits=forced_kv_splits,
+        USE_FORCED=forced_kv_splits > 0,
         **extra_kargs,
     )
 
@@ -748,6 +942,7 @@ def _fwd_kernel_stage2(
     Lv: tl.constexpr,
     HAS_SINK: tl.constexpr,
     USE_PDL: tl.constexpr = False,
+    FORCED_KV_SPLITS: tl.constexpr = 0,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -760,7 +955,17 @@ def _fwd_kernel_stage2(
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(
         kv_indptr + cur_batch
     )
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    # Same count stage-1 used, or the two disagree about where split `i` starts.
+    # SPLIT_END has to stay a constexpr in both branches: stage-1 leaves the surplus
+    # splits masked out, so a dynamic bound would merge the same partials, but it also
+    # stops the loop unrolling, and reassociating the fp32 reduction moves the result
+    # a few ULP off the stock kernel.
+    if FORCED_KV_SPLITS > 0:
+        kv_splits = FORCED_KV_SPLITS
+        SPLIT_END: tl.constexpr = FORCED_KV_SPLITS
+    else:
+        kv_splits = tl.load(num_kv_splits + cur_batch)
+        SPLIT_END: tl.constexpr = MAX_KV_SPLITS
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
@@ -775,7 +980,7 @@ def _fwd_kernel_stage2(
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
 
-    for split_kv_id in tl.range(0, MAX_KV_SPLITS, num_stages=2):
+    for split_kv_id in tl.range(0, SPLIT_END, num_stages=2):
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
@@ -817,6 +1022,7 @@ def _decode_softmax_reducev_fwd(
     max_kv_splits,
     sinks=None,
     use_pdl=False,
+    forced_kv_splits: int = 0,
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
@@ -851,6 +1057,7 @@ def _decode_softmax_reducev_fwd(
         Lv=Lv,
         HAS_SINK=HAS_SINK,
         USE_PDL=use_pdl,
+        FORCED_KV_SPLITS=forced_kv_splits,
         num_warps=4,
         num_stages=2,
         **({"launch_pdl": True} if use_pdl else {}),
@@ -931,6 +1138,7 @@ def decode_attention_fwd_grouped(
     score_mod=None,
     aux_tensors=None,
 ):
+    forced_kv_splits = _mla_forced_kv_splits(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
         q,
         k_buffer,
@@ -949,6 +1157,7 @@ def decode_attention_fwd_grouped(
         page_size=page_size,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
+        forced_kv_splits=forced_kv_splits,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -962,6 +1171,7 @@ def decode_attention_fwd_grouped(
         max_kv_splits,
         sinks,
         use_pdl=use_pdl,
+        forced_kv_splits=forced_kv_splits,
     )
 
 
