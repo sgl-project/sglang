@@ -1123,7 +1123,10 @@ class KVCacheConfigurator:
         PoolCls = current_platform.get_dsa_kv_pool_cls()
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            # DSA kernels page at the base 64. A DCP draft spans the virtual
+            # loc space (loc_space_scale), but base-64 pages tile 64 * dcp
+            # allocations exactly, so the pool keeps the kernel page size.
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -1147,7 +1150,10 @@ class KVCacheConfigurator:
         PoolCls = current_platform.get_mla_kv_pool_cls()
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            # DSA kernels page at the base 64. A DCP draft spans the virtual
+            # loc space (loc_space_scale), but base-64 pages tile 64 * dcp
+            # allocations exactly, so the pool keeps the kernel page size.
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -1289,7 +1295,10 @@ class KVCacheConfigurator:
             PoolCls = DSATokenToKVPool
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            # DSA kernels page at the base 64. A DCP draft spans the virtual
+            # loc space (loc_space_scale), but base-64 pages tile 64 * dcp
+            # allocations exactly, so the pool keeps the kernel page size.
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
