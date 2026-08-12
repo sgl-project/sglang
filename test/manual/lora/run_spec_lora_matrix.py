@@ -246,9 +246,9 @@ def materialize_adapter(hf_path: str, repo_type: str) -> str:
 
 
 def check_adapter_supported(name: str, local_path: str) -> None:
-    """Fail early on adapters this feature rejects: the shared draft can
-    consume the target's lm_head module, so lm_head adapters are rejected by
-    the server (embed_tokens only warns)."""
+    """Report what each adapter exercises. Nothing here is a rejection: a
+    draft sharing the target's lm_head gets the unwrapped base layer, so
+    lm_head and embedding adapters cost accept rate, not correctness."""
     config_path = os.path.join(local_path, "adapter_config.json")
     try:
         with open(config_path) as f:
@@ -259,13 +259,9 @@ def check_adapter_supported(name: str, local_path: str) -> None:
     modules = config.get("target_modules")
     log(f"  {name}: r={config.get('r')} target_modules={modules}")
     if isinstance(modules, list):
-        blocked = {"lm_head", "output", "unembed_tokens"} & set(modules)
-        if blocked:
-            raise SystemExit(
-                f"adapter '{name}' targets {sorted(blocked)}, which the server "
-                "rejects with EAGLE-family speculative decoding (the draft can "
-                "share the target's lm_head module)."
-            )
+        shared = {"lm_head", "output", "unembed_tokens"} & set(modules)
+        if shared:
+            log(f"  {name}: targets {sorted(shared)} — shared-lm_head path")
         if {"embed_tokens", "vocab_emb", "word_embeddings"} & set(modules):
             log(f"  {name}: targets embeddings — expect a reduced accept rate")
     if config.get("modules_to_save"):
@@ -292,10 +288,9 @@ def write_adapter_variant(
 ) -> str:
     """Write a modified copy of an adapter.
 
-    ``drop_lm_head`` removes output-layer tensors: EAGLE/MTP drafts can share
-    the target's lm_head module, so the server refuses adapters that carry
-    lm_head weights. Dropping them keeps every other module's trained delta
-    and makes the adapter usable under speculation.
+    ``drop_lm_head`` removes output-layer tensors, isolating an adapter's
+    other modules from the shared-lm_head path. The server accepts lm_head
+    adapters, so this is for narrowing a failure, not a requirement.
 
     ``negate_b`` flips the sign of every lora_B tensor, producing a second
     adapter of identical shape whose outputs genuinely diverge from the
@@ -613,14 +608,9 @@ def resolve_adapters(config: dict, args):
         repo_type = entry[2] if len(entry) > 2 else "model"
         local_path = materialize_adapter(hf_path, repo_type)
 
-        # EAGLE-family drafts can share the target's lm_head module, so the
-        # server refuses adapters carrying lm_head weights. Several public
-        # test adapters do (via PEFT unembed_tokens keys under an
-        # "all-linear" config), so sanitize rather than skip the model.
-        # lm_head-carrying adapters are supported: a draft that shares the
-        # target's lm_head module is handed the unwrapped base layer, so the
-        # adapter costs accept rate, not correctness. Keep the weights as
-        # published so the run exercises that path.
+        # A draft sharing the target's lm_head gets the unwrapped base layer,
+        # so these adapters cost accept rate, not correctness. Keep the
+        # weights as published so the run exercises that path.
         lm_head_keys = adapter_lm_head_keys(local_path)
         if lm_head_keys:
             log(
