@@ -1476,6 +1476,14 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
 # config it derives from (always the process's, i.e. the target's).
 
 
+def server_world_size() -> int:
+    """The gpu count the whole server occupies, across every data-parallel
+    replica. Not ``get_parallel().world_size``, which is the live process
+    group: without dp attention each replica has a group of its own, so no
+    scheduler in it can see past its own ``tp_size * pp_size``."""
+    return get_server_args().world_size
+
+
 def mamba_cache_chunk_size() -> int:
     """The caching point granularity for mamba state: ``max(the model's mamba
     chunk size, page_size)``. Cached on the config after the first call."""

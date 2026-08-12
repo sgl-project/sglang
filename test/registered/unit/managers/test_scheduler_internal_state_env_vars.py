@@ -48,6 +48,8 @@ class TestSchedulerInternalStateEnvVars(unittest.TestCase):
         ), patch(
             "sglang.srt.managers.scheduler.get_exec",
             return_value=SimpleNamespace(moe=SimpleNamespace(elastic_ep_backend=None)),
+        ), patch(
+            "sglang.srt.managers.scheduler.server_world_size", return_value=1
         ):
             output = scheduler.get_internal_state(recv_req=GetInternalStateReq())
 

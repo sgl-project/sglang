@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    server_world_size,
 )
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -4371,6 +4372,7 @@ class Scheduler(
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
+        ret["world_size"] = server_world_size()
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage
