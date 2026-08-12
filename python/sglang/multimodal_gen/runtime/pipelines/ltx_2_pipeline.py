@@ -633,8 +633,14 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self.modules["spatial_upsampler"] = module
         self.memory_usages["spatial_upsampler"] = memory_usage
 
+        # LTX-2 / 2.3 two-stage merges a distilled LoRA onto the dev DiT per
+        # stage. LTX-2.5's shipped transformer is already distilled -- its
+        # two-stage recipe is stage 1, x2 latent upsample, then a 3-sigma tail,
+        # with no LoRA anywhere -- so the LoRA is optional there.
         distilled_lora_path = server_args.component_paths.get("distilled_lora")
-        if not distilled_lora_path:
+        if not distilled_lora_path and not self._transformer_is_predistilled(
+            server_args
+        ):
             raise ValueError(
                 f"{self.pipeline_name} requires --distilled-lora-path "
                 "(component_paths['distilled_lora'])."
@@ -649,6 +655,15 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         # once at init (see _merge_stage1_distilled_into_base).
         self._stage1_distilled_in_base = False
         self._stage1_distilled_base_strength: float | None = None
+
+    @staticmethod
+    def _transformer_is_predistilled(server_args: ServerArgs) -> bool:
+        """Whether the checkpoint's own transformer is already distilled.
+
+        True for LTX-2.5, whose `model_index.json` points at the distilled DiT
+        and which pins the distilled sigma schedule rather than shipping a LoRA.
+        """
+        return bool(server_args.pipeline_config.default_sigmas)
 
     def _initialize_premerged_stage2_transformer(self, server_args: ServerArgs) -> None:
         transformer_path = self._resolve_component_path(
@@ -791,6 +806,10 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         return False
 
     def should_skip_ltx2_lora_switch_stage(self) -> bool:
+        # Nothing to switch when the DiT is already distilled (LTX-2.5): there
+        # is no distilled LoRA, and both stages run the same weights.
+        if self._distilled_lora_path is None:
+            return True
         return (
             self._use_premerged_stage2_transformer
             and self._ltx2_residency.mode == "resident"
@@ -871,6 +890,12 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         return lora_nicknames, lora_paths, lora_strengths, lora_targets
 
     def switch_lora_phase(self, phase: str, batch: Req | None = None) -> None:
+        # A pre-distilled DiT (LTX-2.5) has no distilled LoRA to switch to, and
+        # both stages run the same weights. Guarding here rather than per-stage
+        # covers every caller, including the refinement stage.
+        if self._distilled_lora_path is None:
+            self._active_lora_phase = phase
+            return
         distilled_lora_strength = self._get_stage_distilled_lora_strength(phase, batch)
         phase_signature = (phase, distilled_lora_strength)
         if phase_signature == self._active_lora_signature:

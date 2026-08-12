@@ -389,5 +389,71 @@ class TestLTX25DiffusionDecoder(unittest.TestCase):
         self.assertEqual(cls.__name__, "LTX2VideoDiffusionDecoderModel")
 
 
+class TestLTX25LatentUpsampler(unittest.TestCase):
+    """LTX-2.5 turns the rational resampler off explicitly.
+
+    Earlier LTX configs only carry `rational_spatial_scale`, so the loader
+    inferred the resampler from its presence. LTX-2.5 states the choice, and
+    assuming True there builds a different module than the checkpoint holds.
+    """
+
+    LTX25_UPSAMPLER_CONFIG = {
+        "dims": 3,
+        "in_channels": 128,
+        "mid_channels": 1024,
+        "num_blocks_per_stage": 4,
+        "rational_spatial_scale": 2.0,
+        "spatial_upsample": True,
+        "temporal_upsample": False,
+        "use_rational_resampler": False,
+    }
+
+    def _normalize(self, raw):
+        from sglang.multimodal_gen.runtime.loader.component_loaders.upsampler_loader import (
+            _normalize_config,
+        )
+
+        return _normalize_config(raw)
+
+    def test_explicit_flag_is_honoured(self):
+        config = self._normalize(dict(self.LTX25_UPSAMPLER_CONFIG))
+        self.assertFalse(config["rational_resampler"])
+        self.assertEqual(config["spatial_scale"], 2.0)
+
+    def test_absent_flag_keeps_legacy_behaviour(self):
+        raw = {
+            k: v
+            for k, v in self.LTX25_UPSAMPLER_CONFIG.items()
+            if k != "use_rational_resampler"
+        }
+        self.assertTrue(self._normalize(raw)["rational_resampler"])
+
+    def test_flag_changes_the_module_it_builds(self):
+        # Guards the fix: the two settings are not interchangeable.
+        import torch
+
+        from sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler import (
+            LatentUpsampler,
+        )
+
+        kwargs = dict(
+            in_channels=128,
+            mid_channels=1024,
+            num_blocks_per_stage=4,
+            dims=3,
+            spatial_upsample=True,
+            temporal_upsample=False,
+            spatial_scale=2.0,
+        )
+        with torch.device("meta"):
+            without = set(
+                LatentUpsampler(**kwargs, rational_resampler=False).state_dict()
+            )
+            with_rr = set(
+                LatentUpsampler(**kwargs, rational_resampler=True).state_dict()
+            )
+        self.assertNotEqual(without, with_rr)
+
+
 if __name__ == "__main__":
     unittest.main()
