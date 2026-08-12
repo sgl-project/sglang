@@ -95,6 +95,7 @@ def _router_triton_kernel(
     M,
     routed_scaling_factor,
     moe_softcapping,
+    shared_const_weight,
     N: tl.constexpr,
     K: tl.constexpr,  # total topk (includes fused shared experts)
     K_ROUTED: tl.constexpr,  # K - num_fused_shared_experts
@@ -109,6 +110,7 @@ def _router_triton_kernel(
     HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
     RENORMALIZE: tl.constexpr,
     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
+    SHARED_CONST: tl.constexpr,  # shared slots get shared_const_weight verbatim
     USE_PDL: tl.constexpr,
     stride_sm,
     stride_sn,
@@ -223,13 +225,16 @@ def _router_triton_kernel(
     ]  # [BLOCK_M, 1]
 
     # Fill fused-shared-expert slots: weight = routed_sum / routed_scaling_factor,
-    # id = num_experts + (slot - K_ROUTED).
+    # id = num_experts + (slot - K_ROUTED). SHARED_CONST instead writes the
+    # constant weight after renorm/scale (the aiter append convention), so the
+    # shared slots bypass both.
     if K_ROUTED < K:
         is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
-        shared_weight = routed_sum / routed_scaling_factor  # [BLOCK_M, 1]
         shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]  # [1, BLOCK_K]
-        selected_vals = tl.where(is_shared, shared_weight, selected_vals)
         selected_idx = tl.where(is_shared, shared_idx, selected_idx)
+        if not SHARED_CONST:
+            shared_weight = routed_sum / routed_scaling_factor  # [BLOCK_M, 1]
+            selected_vals = tl.where(is_shared, shared_weight, selected_vals)
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -239,6 +244,9 @@ def _router_triton_kernel(
         selected_vals = selected_vals / norm
     if APPLY_SCALE:
         selected_vals = selected_vals * routed_scaling_factor
+    if SHARED_CONST and K_ROUTED < K:
+        is_shared_c = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
+        selected_vals = tl.where(is_shared_c, shared_const_weight, selected_vals)
 
     out_w_ptr = (
         out_weights_ptr + offs_m[:, None] * stride_wm + offs_k[None, :] * stride_wk
@@ -264,8 +272,13 @@ def moe_fused_gate(
     moe_softcapping: float = 0.0,
     num_expert_group: int = 1,
     topk_group: int = 1,
+    shared_const_weight: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
+
+    ``shared_const_weight`` switches the fused-shared-expert slots to the aiter
+    append convention: id = num_experts + slot, weight = the constant, written
+    after (and unaffected by) renormalization and output scaling.
 
     Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel).
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
@@ -302,6 +315,7 @@ def moe_fused_gate(
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
+        and shared_const_weight is None
     ):
         radix_args = (
             scores,
@@ -348,6 +362,7 @@ def moe_fused_gate(
         M,
         float(routed_scaling_factor),
         float(moe_softcapping),
+        0.0 if shared_const_weight is None else float(shared_const_weight),
         N=N,
         K=K,
         K_ROUTED=K_routed,
@@ -362,6 +377,7 @@ def moe_fused_gate(
         HAS_SOFTCAP=bool(moe_softcapping != 0.0),
         RENORMALIZE=bool(renormalize),
         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
+        SHARED_CONST=shared_const_weight is not None,
         USE_PDL=use_pdl,
         stride_sm=scores.stride(0),
         stride_sn=scores.stride(1),

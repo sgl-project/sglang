@@ -1235,6 +1235,7 @@ def biased_topk_jit_kernel_impl(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    shared_const_weight: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -1273,6 +1274,7 @@ def biased_topk_jit_kernel_impl(
             renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            shared_const_weight=shared_const_weight,
         )
         topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(
             torch.int32
@@ -1916,6 +1918,7 @@ def _post_process_topk_ids(
     layer_id: int,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    gate_appended_shared: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
@@ -1924,7 +1927,13 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    capture_routed_experts_if_allowed(
+        topk_config,
+        layer_id,
+        # keep recorder semantics (routed experts only) when the gate already
+        # appended the shared columns
+        topk_ids[:, :-num_fused_shared_experts] if gate_appended_shared else topk_ids,
+    )
     recorder_topk_ids = None
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
@@ -1988,7 +1997,9 @@ def _post_process_topk_ids(
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
 
-    _aiter_append = num_fused_shared_experts > 0 and _use_aiter
+    _aiter_append = (
+        num_fused_shared_experts > 0 and _use_aiter and not gate_appended_shared
+    )
 
     if _aiter_append and use_per_rank_shared_slots:
         # Fused path: append shared experts AND apply the per-rank shared-slot
@@ -2101,6 +2112,8 @@ def select_experts(
 
     # Set by the fused-gating+pack branch below; None everywhere else.
     packed_topk = None
+    # Set True when the Triton gate already wrote the shared-expert slots.
+    gate_appended_shared = False
 
     (
         router_logits,
@@ -2170,19 +2183,52 @@ def select_experts(
                 biased_topk_jit_kernel_impl if use_jit_fused_gate else biased_topk_impl
             )
 
-            topk_weights, topk_ids = _biased_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
-                renormalize=renormalize,
-                scoring_func=scoring_func,
-                num_fused_shared_experts=0 if _use_aiter else num_fused_shared_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            # Gate-side shared append (SGLANG_OPT_GATE_APPEND_SHARED): the
+            # Triton gate writes the constant-weight shared slots itself,
+            # replacing the fused_append_shared_experts launch in
+            # _post_process_topk_ids.
+            gate_appended_shared = (
+                envs.SGLANG_OPT_GATE_APPEND_SHARED.get()
+                and use_jit_fused_gate
+                and scoring_func == "sigmoid"
+                and _use_aiter
+                and num_fused_shared_experts > 0
+                and not has_per_rank_fused_shared_slots(num_fused_shared_experts)
+                and expert_location_dispatch_info is None
+                and num_token_non_padded is None
             )
+            if gate_appended_shared:
+                _shared_w = topk_config.fused_shared_experts_scaling_factor
+                topk_weights, topk_ids = _biased_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                    shared_const_weight=1.0 if _shared_w is None else _shared_w,
+                )
+            else:
+                topk_weights, topk_ids = _biased_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=num_routed_topk if _use_aiter else top_k,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    num_fused_shared_experts=(
+                        0 if _use_aiter else num_fused_shared_experts
+                    ),
+                    routed_scaling_factor=routed_scaling_factor,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
         elif (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"
@@ -2303,6 +2349,7 @@ def select_experts(
         num_token_non_padded=num_token_non_padded,
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
+        gate_appended_shared=gate_appended_shared,
     )
 
     get_global_expert_distribution_recorder().on_select_experts(

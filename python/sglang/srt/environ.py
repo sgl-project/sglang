@@ -707,6 +707,10 @@ class Envs:
     # producing Gemma fused-add-RMSNorm Triton kernel; the consumer GEMM picks
     # the (fp8, scale) pair off the norm output instead of re-quantizing.
     SGLANG_OPT_FUSE_NORM_FP8_QUANT = EnvBool(False)
+    # On the aiter fused-shared-experts path, let the Triton fused gate write
+    # the constant-weight shared-expert slots directly instead of running the
+    # separate fused_append_shared_experts kernel afterwards.
+    SGLANG_OPT_GATE_APPEND_SHARED = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
