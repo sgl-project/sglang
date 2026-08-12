@@ -797,7 +797,11 @@ jobs:
       max-parallel: 1
       matrix:
         runner: [linux-mi300-2gpu-sglang]
-        part: [0, 1, 2]  # run_suite.py load-balances the suite's parametrized cases and standalone files over these 3 partitions
+        # run_suite.py load-balances the suite's parametrized cases and
+        # standalone files over these partitions, so the count is free to
+        # choose. Two shards keep each one near the measured ~30 min of case
+        # time while halving the ~2h per-job container pull + install.
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -895,7 +899,7 @@ jobs:
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 3
+              --total-partitions 2
 
           # Post-test diagnostics
           echo "=== Post-test System Memory Status ==="

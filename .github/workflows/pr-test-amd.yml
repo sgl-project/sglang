@@ -827,7 +827,11 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        part: [0, 1, 2]  # run_suite.py load-balances the suite's parametrized cases and standalone files over these 3 partitions
+        # run_suite.py load-balances the suite's parametrized cases and
+        # standalone files over these partitions, so the count is free to
+        # choose. Two shards keep each one near the measured ~30 min of case
+        # time while halving the ~2h per-job container pull + install.
+        part: [0, 1]
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -924,7 +928,7 @@ jobs:
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 3 \
+              --total-partitions 2 \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
           # Post-test diagnostics
