@@ -124,7 +124,7 @@ class SpeculativeAlgorithm(Enum):
 
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
-    # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it
+    # If all algorithms can share the same datastructure of draft_input and verify_input, consider simplifying it
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     DFLASH_DRAFT = auto()

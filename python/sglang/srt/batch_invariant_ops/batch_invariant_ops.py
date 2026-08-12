@@ -18,7 +18,7 @@ if ENABLE_JIT_DEEPGEMM:
 _ENABLE_MM_DEEPGEMM = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
 )
-# If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
+# If true, allows falling back to batch variant gemm when the shape cannot be run in DeepGEMM
 _ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0"
 )
