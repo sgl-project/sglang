@@ -677,6 +677,12 @@ class Envs:
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
+    # Intel XPU
+    # Dispatch GDN (Gated DeltaNet) to the fused SYCL kernel from sgl-kernel-xpu
+    # (torch.ops.sgl_kernel.gdn_attention) instead of the Triton path. Default ON;
+    # set to False to fall back to the Triton path.
+    SGLANG_XPU_FUSED_GDN = EnvBool(True)
+
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)

@@ -1,14 +1,10 @@
 import torch
 from sgl_kernel import gdn_attention as sgl_kernel_gdn_attention
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import get_bool_env_var
-
-# Opt-in: dispatch GDN to the fused vLLM SYCL op in sgl-kernel-xpu
-# (torch.ops.sgl_kernel.gdn_attention). Default ON. Set to OFF to use the triton path.
-_xpu_fused_gdn_enabled = get_bool_env_var("SGLANG_XPU_FUSED_GDN", "True")
 
 
 class XpuGDNAttnBackend(GDNAttnBackend):
@@ -16,15 +12,15 @@ class XpuGDNAttnBackend(GDNAttnBackend):
 
     Adds an optional fused path that dispatches the whole conv1d + gating +
     delta-rule pipeline to the vendored vLLM SYCL kernel exposed as
-    ``torch.ops.sgl_kernel.gdn_attention`` (opt-in via
-    ``SGLANG_XPU_FUSED_GDN=1``). The inherited Triton path is unchanged and
-    remains the default for all other backends.
+    ``torch.ops.sgl_kernel.gdn_attention`` (``SGLANG_XPU_FUSED_GDN``, default
+    ON; set to False to fall back to the Triton path). The inherited Triton
+    path is unchanged and remains the default for all other backends.
     """
 
     def supports_fused_gdn(self, layer, forward_batch: ForwardBatch) -> bool:
         """Conservative guard: only the plain decode / non-prefix-cached,
         non-speculative extend cases are handled by the fused kernel."""
-        if not _xpu_fused_gdn_enabled:
+        if not envs.SGLANG_XPU_FUSED_GDN.get():
             return False
         if not hasattr(torch.ops.sgl_kernel, "gdn_attention"):
             return False

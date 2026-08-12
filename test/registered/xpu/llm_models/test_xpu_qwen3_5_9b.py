@@ -1,6 +1,8 @@
 """Qwen3.5-9B GSM8K accuracy on Intel XPU (TP=4).
 
-Scored by ``simple_eval_gsm8k.GSM8KEval``.
+Scored by ``simple_eval_gsm8k.GSM8KEval``. Covers both the default fused GDN
+SYCL kernel path (``SGLANG_XPU_FUSED_GDN`` defaults to True) and the Triton
+GDN fallback path (``SGLANG_XPU_FUSED_GDN=False``).
 """
 
 import unittest
@@ -18,7 +20,7 @@ register_xpu_ci(est_time=2400, suite="nightly-xpu-4-gpu", nightly=True)
     torch.xpu.is_available(),
     "Intel XPU not available (torch.xpu.is_available() returned False)",
 )
-class TestQwen3_5_9BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
+class Qwen3_5_9BXPUBase(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3.5-9B"
     tp_size = 4
     accuracy = 0.90
@@ -35,6 +37,23 @@ class TestQwen3_5_9BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
         "--mem-fraction-static",
         "0.85",
     ]
+
+
+class TestQwen3_5_9BXPUFusedGDN(Qwen3_5_9BXPUBase):
+    """Default path: fused SYCL GDN kernel from sgl-kernel-xpu."""
+
+
+class TestQwen3_5_9BXPUGDNFallback(Qwen3_5_9BXPUBase):
+    """Triton GDN fallback path (``SGLANG_XPU_FUSED_GDN=False``).
+
+    Small ``num_examples`` since this is a smoke check of the fallback
+    dispatch, not a full accuracy regression test (already covered by the
+    fused-path class above); accuracy threshold is left at 0 accordingly.
+    """
+
+    env = {"SGLANG_XPU_FUSED_GDN": "False"}
+    num_examples = 8
+    accuracy = 0.0
 
 
 if __name__ == "__main__":
