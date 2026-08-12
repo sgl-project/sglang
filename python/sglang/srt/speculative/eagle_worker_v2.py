@@ -176,7 +176,7 @@ def _aiter_draft_topk1_postprocess(
 
 def _use_draft_topk1_postprocess() -> bool:
     """Whether this backend may select topk=1 directly from raw draft logits."""
-    return _is_cuda or (_use_aiter and envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.get())
+    return _is_cuda or _use_aiter
 
 
 def _use_aiter_draft_topk1(
@@ -196,10 +196,7 @@ def _use_aiter_draft_topk1(
 
 def _prune_draft_extend_logits(server_args: ServerArgs) -> bool:
     """Whether draft-extend may project only its selected row per request."""
-    return (
-        envs.SGLANG_OPT_PRUNE_EAGLE_DRAFT_EXTEND_LM_HEAD.get()
-        and not require_gathered_buffer(server_args)
-    )
+    return not require_gathered_buffer(server_args)
 
 
 logger = logging.getLogger(__name__)

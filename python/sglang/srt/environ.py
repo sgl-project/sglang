@@ -959,14 +959,6 @@ class Envs:
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
-    # Experimental ROCm optimization: select greedy EAGLE topk=1 draft tokens
-    # directly from raw logits with AITER's greedy sampler. False keeps the
-    # established softmax + torch.max fallback.
-    SGLANG_OPT_USE_AITER_DRAFT_TOPK1 = EnvBool(False)
-    # Experimental EAGLE optimization: project only the selected draft-extend
-    # row through lm_head. False preserves the established full-row projection,
-    # whose output is the exactness reference for speculative decoding.
-    SGLANG_OPT_PRUNE_EAGLE_DRAFT_EXTEND_LM_HEAD = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.

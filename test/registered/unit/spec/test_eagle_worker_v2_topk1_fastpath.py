@@ -12,7 +12,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context
@@ -147,27 +146,22 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
 
-    def test_aiter_raw_logits_postprocess_is_opt_in(self):
-        self.assertFalse(envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.default)
+    def test_raw_logits_postprocess_tracks_local_backend(self):
         with patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", False), patch(
             "sglang.srt.speculative.eagle_worker_v2._use_aiter", True
         ):
-            with envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(False):
-                self.assertFalse(_use_draft_topk1_postprocess())
-            with envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(True):
-                self.assertTrue(_use_draft_topk1_postprocess())
+            self.assertTrue(_use_draft_topk1_postprocess())
 
         with patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", False), patch(
             "sglang.srt.speculative.eagle_worker_v2._use_aiter", False
-        ), envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(True):
+        ):
             self.assertFalse(_use_draft_topk1_postprocess())
 
     def test_cuda_raw_logits_postprocess_remains_enabled(self):
         with patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", True), patch(
             "sglang.srt.speculative.eagle_worker_v2._use_aiter", False
         ):
-            with envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(False):
-                self.assertTrue(_use_draft_topk1_postprocess())
+            self.assertTrue(_use_draft_topk1_postprocess())
 
     def test_aiter_postprocess_updates_indices_positions_and_draft_chain(self):
         logits = torch.zeros((3, 16), dtype=torch.float32, device=DEVICE)
@@ -241,7 +235,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
     def test_aiter_route_preserves_all_fallback_gates(self):
         with patch("sglang.srt.speculative.eagle_worker_v2._is_hip", True), patch(
             "sglang.srt.speculative.eagle_worker_v2._use_aiter", True
-        ), envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(True):
+        ):
             self.assertTrue(_use_aiter_draft_topk1(1, None, False))
             self.assertFalse(_use_aiter_draft_topk1(2, None, False))
             self.assertFalse(
@@ -252,8 +246,8 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             self.assertFalse(_use_aiter_draft_topk1(1, None, True))
 
         with patch("sglang.srt.speculative.eagle_worker_v2._is_hip", True), patch(
-            "sglang.srt.speculative.eagle_worker_v2._use_aiter", True
-        ), envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(False):
+            "sglang.srt.speculative.eagle_worker_v2._use_aiter", False
+        ):
             self.assertFalse(_use_aiter_draft_topk1(1, None, False))
 
     def test_draft_extend_row_pruning_keeps_full_hidden_capture(self):
@@ -294,16 +288,15 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 
     def test_draft_extend_pruning_and_graph_row_count_gates(self):
         server_args = object()
-        self.assertFalse(_prune_draft_extend_logits(server_args))
         with patch(
             "sglang.srt.speculative.eagle_worker_v2.require_gathered_buffer",
             return_value=False,
-        ), envs.SGLANG_OPT_PRUNE_EAGLE_DRAFT_EXTEND_LM_HEAD.override(True):
+        ):
             self.assertTrue(_prune_draft_extend_logits(server_args))
         with patch(
             "sglang.srt.speculative.eagle_worker_v2.require_gathered_buffer",
             return_value=True,
-        ), envs.SGLANG_OPT_PRUNE_EAGLE_DRAFT_EXTEND_LM_HEAD.override(True):
+        ):
             self.assertFalse(_prune_draft_extend_logits(server_args))
 
         runner = EAGLEDraftExtendCudaGraphRunner.__new__(
