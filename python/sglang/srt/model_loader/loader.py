@@ -3116,10 +3116,20 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        if load_config.model_loader_extra_config:
+        # The ModelExpress backend keeps the native loader as its fallback path
+        # (used on the first replica and whenever no peer holds the weights), so
+        # it consumes model_loader_extra_config. The nccl and transfer_engine
+        # backends have no such path and still reject it.
+        if (
+            load_config.model_loader_extra_config
+            and load_config.remote_instance_weight_loader_backend
+            != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+        ):
             raise ValueError(
                 f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
+                f"load format {load_config.load_format} with "
+                f"remote instance weight loader backend "
+                f"{load_config.remote_instance_weight_loader_backend}"
             )
         self.remote_instance_transfer_engine_weight_info = None
 
