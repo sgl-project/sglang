@@ -15,7 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -842,11 +842,19 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self._fused_ar_quant_format = _detect_fused_ar_quant_format(
             self.linear_attn.in_proj_qkvz
         )
-        # Emit the bf16 sidecar only for an unquantized ``in_proj_ba``; when it
-        # is already quantized, skip it and let the single kernel emit only
-        # (quant, scale) (a sidecar would just be re-quantized, a regression).
-        _ba_quantized = bool(_detect_fused_ar_quant_format(self.linear_attn.in_proj_ba))
-        self._emit_bf16_for_ba = bool(self._fused_ar_quant_format) and not _ba_quantized
+
+    @cached_property
+    def _emit_bf16_for_ba(self) -> bool:
+        """Whether the fused AR+RMSNorm+quant epilogue must emit the bf16 sidecar
+        for this GDN layer's ``in_proj_ba``.
+
+        Emit it only when ``in_proj_ba`` can't consume the ``(fp8, scale)`` tuple.
+        Resolved lazily (weights finalized by first forward) with the same
+        predicate the consumer uses, so producer and consumer can't disagree.
+        """
+        if not self._fused_ar_quant_format:
+            return False
+        return not _linear_accepts_quant_tuple(self.linear_attn.in_proj_ba)
 
     def forward(
         self,
