@@ -243,7 +243,7 @@ def _canonicalize(value: Any) -> Any:
             "type": "frozenset" if isinstance(value, frozenset) else "set",
             "items": items,
         }
-    raise TypeError(
+    raise ValueError(
         "Unsupported value in multimodal cache identity: "
         f"{_qualified_type_name(value)}"
     )
@@ -279,13 +279,18 @@ def build_feature_hash(artifact_key: str, processor_output_hash: int) -> int:
     if (
         isinstance(processor_output_hash, bool)
         or not isinstance(processor_output_hash, int)
-        or not 0 <= processor_output_hash < 1 << 64
+        or processor_output_hash < 0
     ):
-        raise ValueError("processor_output_hash must be an unsigned 64-bit integer")
+        raise ValueError("processor_output_hash must be a non-negative integer")
+    output_hash_bytes = processor_output_hash.to_bytes(
+        max(1, (processor_output_hash.bit_length() + 7) // 8),
+        byteorder="big",
+        signed=False,
+    )
     digest = _hash_parts(
         b"multimodal-feature-v1",
         bytes.fromhex(artifact_key[len(CONTENT_HASH_PREFIX) :]),
-        processor_output_hash.to_bytes(8, byteorder="big", signed=False),
+        output_hash_bytes,
     )
     return int.from_bytes(
         bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :])[:8],
