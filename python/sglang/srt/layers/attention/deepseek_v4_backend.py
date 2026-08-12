@@ -685,9 +685,17 @@ class DeepseekV4AttnBackend(
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
         self.trtllm_attn: bool = get_exec().kernel.dsv4_attn_backend == "trtllm"
+        # trtllm + speculative + DP attention prepares metadata on the host:
+        # in-graph prep degrades draft acceptance under DP's padded/idle-rank
+        # batches. Otherwise prep metadata in-graph. 
+        self._prep_in_cuda_graph: bool = envs.SGLANG_PREP_IN_CUDA_GRAPH.get() and not (
+            self.trtllm_attn
+            and self.mtp_enabled
+            and model_runner.server_args.enable_dp_attention
+        )
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda
-            or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
+            or not self._prep_in_cuda_graph
             or self.online_c128_mtp.enabled()
         )
 
@@ -816,7 +824,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self._prep_in_cuda_graph:
             return DSV4RawDecodeMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -966,7 +974,7 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self._prep_in_cuda_graph:
             assert out_cache_loc is not None
             bs = len(seq_lens)
             if self.needs_cpu_seq_lens:
