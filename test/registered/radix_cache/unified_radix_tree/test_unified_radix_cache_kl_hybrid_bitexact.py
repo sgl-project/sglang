@@ -92,8 +92,11 @@ def _base_args() -> list[str]:
         "0.1",
         "--mamba-full-memory-ratio",
         "0.1",
+        # 0.85 was carried over from the 4-GPU B200 test and OOMs an 80 GB card:
+        # the static pool leaves ~19 GB for the prefill graphs, the fa4 workspace
+        # and the chunked-prefill activations, which is what this config needs.
         "--mem-fraction-static",
-        "0.85",
+        "0.6",
         "--mamba-track-interval",
         str(TRACK_INTERVAL),
         "--enable-deterministic-inference",
