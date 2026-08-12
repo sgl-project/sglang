@@ -72,7 +72,9 @@ class AdapterLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        target_device = get_local_torch_device()
+        target_device = self.target_device(
+            server_args.should_cpu_offload_component("connectors")
+        )
         default_dtype = resolve_precision(
             server_args, component_name, precision_attr="dit_precision"
         )
