@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.perf_baseline import ThroughputBaseline, check_output_throughput
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -35,6 +36,22 @@ DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(
 )
 SERVER_LAUNCH_TIMEOUT = 3600
 FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
+
+_BASELINE_SOURCE = "median of 11 MI35x nightly runs, 2026-07-30..2026-08-11"
+
+# Output throughput (tok/s) per batch size at input_len=8192 output_len=1024,
+# one baseline per SGLANG_HACK_FLASHMLA_BACKEND the nightly job runs. A backend
+# with no entry here is reported without being gated.
+PERF_BASELINES = {
+    "unified_kv_triton": ThroughputBaseline(
+        {1: 106.5, 2: 211.4, 4: 403.5, 8: 759.7, 16: 1394.1, 32: 2657.3},
+        recorded_from=_BASELINE_SOURCE,
+    ),
+    "triton": ThroughputBaseline(
+        {1: 83.3, 2: 164.6, 4: 317.9, 8: 610.2, 16: 1142.9, 32: 2201.1},
+        recorded_from=_BASELINE_SOURCE,
+    ),
+}
 
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
@@ -192,8 +209,19 @@ class TestDeepseekV4Fp8(CustomTestCase):
                 f"in_tp={in_tp:.2f} tok/s out_tp={out_tp:.2f} tok/s ITL={itl:.2f}ms"
             )
 
+        check = check_output_throughput(
+            report_results,
+            PERF_BASELINES.get(FLASHMLA_BACKEND),
+            f"deepseek-v4-flash-fp8 ({FLASHMLA_BACKEND})",
+        )
+        summary_lines.extend(["", check.markdown])
+        print(check.markdown)
+
         if is_in_ci():
             write_github_step_summary("\n".join(summary_lines) + "\n")
+
+        if not check.ok:
+            self.fail(check.failure_message())
 
 
 if __name__ == "__main__":
