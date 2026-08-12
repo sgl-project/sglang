@@ -195,111 +195,6 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void fast_hadamard_transform_ke
   store_output<kNChunks, kNElts, input_t>(out, x_vals, params.dim, params.scale);
 }
 
-template <typename Ktraits, int kRowsPerBlock>
-__global__ __launch_bounds__(Ktraits::kNThreads* kRowsPerBlock) void fast_hadamard_transform_kernel_multirow(
-    HadamardParamsBase params) {
-  static_assert(Ktraits::kNThreads < 32, "Multi-row kernel only for sub-warp dims");
-  constexpr int kNThreads = Ktraits::kNThreads;
-  constexpr int kNElts = Ktraits::kNElts;
-  constexpr int kNChunks = Ktraits::kNChunks;
-  using input_t = typename Ktraits::input_t;
-  using vec_t = typename Ktraits::vec_t;
-
-  constexpr int kLogNElts = cilog2(Ktraits::kNElts);
-  static_assert(1 << kLogNElts == kNElts, "kNElts must be a power of 2");
-
-  constexpr int kWarpSize = kNThreads;
-  constexpr int kLogWarpSize = cilog2(kWarpSize);
-  static_assert(1 << kLogWarpSize == kWarpSize, "Warp size must be a power of 2");
-
-  const int local_tid = threadIdx.x % kNThreads;
-  const int group_id = threadIdx.x / kNThreads;
-  const int batch_id = blockIdx.x * kRowsPerBlock + group_id;
-  if (batch_id >= params.batch) return;
-
-  input_t* x = reinterpret_cast<input_t*>(params.x_ptr) + batch_id * params.x_batch_stride;
-  input_t* out = reinterpret_cast<input_t*>(params.out_ptr) + batch_id * params.out_batch_stride;
-
-  float x_vals[kNChunks][kNElts];
-  {
-    input_t x_vals_load[kNChunks][kNElts] = {0};
-#pragma unroll
-    for (int c = 0; c < kNChunks; ++c) {
-      if ((c * kNThreads + local_tid) * kNElts < params.dim) {
-        reinterpret_cast<vec_t*>(x_vals_load)[c] = reinterpret_cast<const vec_t*>(x)[c * kNThreads + local_tid];
-      }
-    }
-#pragma unroll
-    for (int c = 0; c < kNChunks; ++c) {
-#pragma unroll
-      for (int i = 0; i < kNElts; ++i) {
-        x_vals[c][i] = float(x_vals_load[c][i]);
-      }
-    }
-  }
-
-  hadamard_mult_thread<kLogNElts, kNChunks>(x_vals);
-  hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts>(x_vals);
-
-  if constexpr (kNChunks > 1) {
-    float x_vals_transposed[kNElts][kNChunks];
-#pragma unroll
-    for (int c = 0; c < kNChunks; ++c) {
-#pragma unroll
-      for (int i = 0; i < kNElts; ++i) {
-        x_vals_transposed[i][c] = x_vals[c][i];
-      }
-    }
-
-    if constexpr (kNChunks == 12) {
-      hadamard_mult_thread_chunk_12<kNElts>(x_vals_transposed);
-    } else if constexpr (kNChunks == 20) {
-      hadamard_mult_thread_chunk_20<kNElts>(x_vals_transposed);
-    } else if constexpr (kNChunks == 28) {
-      hadamard_mult_thread_chunk_28<kNElts>(x_vals_transposed);
-    } else if constexpr (kNChunks == 40) {
-      hadamard_mult_thread_chunk_40<kNElts>(x_vals_transposed);
-    } else {
-      constexpr int kLogNChunks = cilog2(kNChunks);
-      static_assert(1 << kLogNChunks == kNChunks, "kNChunks must be a power of 2");
-      hadamard_mult_thread<kLogNChunks, kNElts>(x_vals_transposed);
-    }
-
-#pragma unroll
-    for (int c = 0; c < kNChunks; ++c) {
-#pragma unroll
-      for (int i = 0; i < kNElts; ++i) {
-        x_vals[c][i] = x_vals_transposed[i][c];
-      }
-    }
-  }
-
-  {
-    input_t out_vals_store[kNChunks][kNElts];
-#pragma unroll
-    for (int c = 0; c < kNChunks; ++c) {
-#pragma unroll
-      for (int i = 0; i < kNElts; ++i) {
-        out_vals_store[c][i] = x_vals[c][i] * params.scale;
-      }
-    }
-#pragma unroll
-    for (int c = 0; c < kNChunks; ++c) {
-      if ((c * kNThreads + local_tid) * kNElts < params.dim) {
-        reinterpret_cast<vec_t*>(out)[c * kNThreads + local_tid] = reinterpret_cast<const vec_t*>(out_vals_store)[c];
-      }
-    }
-  }
-}
-
-template <typename Ktraits, int kRowsPerBlock>
-inline void launch_kernel_multirow(HadamardParamsBase& params, DLDevice device) {
-  int grid = (params.batch + kRowsPerBlock - 1) / kRowsPerBlock;
-  auto kernel = &fast_hadamard_transform_kernel_multirow<Ktraits, kRowsPerBlock>;
-  host::LaunchKernel(dim3(grid), dim3(Ktraits::kNThreads * kRowsPerBlock), device, 0)(kernel, params);
-  host::RuntimeDeviceCheck();
-}
-
 template <typename Ktraits>
 inline void set_max_dynamic_smem() {
   constexpr int kSmemSize = Ktraits::kSmemSize;
@@ -324,24 +219,18 @@ inline void fast_hadamard_transform_launch(HadamardParamsBase& params, DLDevice 
   launch_kernel<Ktraits>(params, device);
 }
 
-template <int kNThreads, int kLogN, int kRowsPerBlock, typename input_t>
-inline void fast_hadamard_transform_launch_multirow(HadamardParamsBase& params, DLDevice device) {
-  using Ktraits = FastHadamardKernelTraits<kNThreads, kLogN, input_t>;
-  launch_kernel_multirow<Ktraits, kRowsPerBlock>(params, device);
-}
-
 template <typename input_t>
 inline void fast_hadamard_transform_cuda(HadamardParamsBase& params, DLDevice device) {
   if (params.log_N == 3) {
-    fast_hadamard_transform_launch_multirow<1, 3, 256, input_t>(params, device);
+    fast_hadamard_transform_launch<1, 3, input_t>(params, device);
   } else if (params.log_N == 4) {
-    fast_hadamard_transform_launch_multirow<2, 4, 128, input_t>(params, device);
+    fast_hadamard_transform_launch<2, 4, input_t>(params, device);
   } else if (params.log_N == 5) {
-    fast_hadamard_transform_launch_multirow<4, 5, 64, input_t>(params, device);
+    fast_hadamard_transform_launch<4, 5, input_t>(params, device);
   } else if (params.log_N == 6) {
-    fast_hadamard_transform_launch_multirow<8, 6, 32, input_t>(params, device);
+    fast_hadamard_transform_launch<8, 6, input_t>(params, device);
   } else if (params.log_N == 7) {
-    fast_hadamard_transform_launch_multirow<16, 7, 16, input_t>(params, device);
+    fast_hadamard_transform_launch<16, 7, input_t>(params, device);
   } else if (params.log_N == 8) {
     fast_hadamard_transform_launch<32, 8, input_t>(params, device);
   } else if (params.log_N == 9) {
@@ -369,24 +258,18 @@ inline void fast_hadamard_transform_12N_launch(HadamardParamsBase& params, DLDev
   launch_kernel<Ktraits>(params, device);
 }
 
-template <int kNThreads, int kLogN, int kRowsPerBlock, typename input_t>
-inline void fast_hadamard_transform_12N_launch_multirow(HadamardParamsBase& params, DLDevice device) {
-  using Ktraits = FastHadamard12NTraits<kNThreads, kLogN, input_t>;
-  launch_kernel_multirow<Ktraits, kRowsPerBlock>(params, device);
-}
-
 template <typename input_t>
 inline void fast_hadamard_transform_12N_cuda(HadamardParamsBase& params, DLDevice device) {
   if (params.log_N == 2) {
-    fast_hadamard_transform_12N_launch_multirow<1, 2, 256, input_t>(params, device);
+    fast_hadamard_transform_12N_launch<1, 2, input_t>(params, device);
   } else if (params.log_N == 3) {
-    fast_hadamard_transform_12N_launch_multirow<2, 3, 128, input_t>(params, device);
+    fast_hadamard_transform_12N_launch<2, 3, input_t>(params, device);
   } else if (params.log_N == 4) {
-    fast_hadamard_transform_12N_launch_multirow<4, 4, 64, input_t>(params, device);
+    fast_hadamard_transform_12N_launch<4, 4, input_t>(params, device);
   } else if (params.log_N == 5) {
-    fast_hadamard_transform_12N_launch_multirow<8, 5, 32, input_t>(params, device);
+    fast_hadamard_transform_12N_launch<8, 5, input_t>(params, device);
   } else if (params.log_N == 6) {
-    fast_hadamard_transform_12N_launch_multirow<16, 6, 16, input_t>(params, device);
+    fast_hadamard_transform_12N_launch<16, 6, input_t>(params, device);
   } else if (params.log_N == 7) {
     fast_hadamard_transform_12N_launch<32, 7, input_t>(params, device);
   } else if (params.log_N == 8) {
@@ -406,24 +289,18 @@ inline void fast_hadamard_transform_20N_launch(HadamardParamsBase& params, DLDev
   launch_kernel<Ktraits>(params, device);
 }
 
-template <int kNThreads, int kLogN, int kRowsPerBlock, typename input_t>
-inline void fast_hadamard_transform_20N_launch_multirow(HadamardParamsBase& params, DLDevice device) {
-  using Ktraits = FastHadamard20NTraits<kNThreads, kLogN, input_t>;
-  launch_kernel_multirow<Ktraits, kRowsPerBlock>(params, device);
-}
-
 template <typename input_t>
 inline void fast_hadamard_transform_20N_cuda(HadamardParamsBase& params, DLDevice device) {
   if (params.log_N == 2) {
-    fast_hadamard_transform_20N_launch_multirow<1, 2, 256, input_t>(params, device);
+    fast_hadamard_transform_20N_launch<1, 2, input_t>(params, device);
   } else if (params.log_N == 3) {
-    fast_hadamard_transform_20N_launch_multirow<2, 3, 128, input_t>(params, device);
+    fast_hadamard_transform_20N_launch<2, 3, input_t>(params, device);
   } else if (params.log_N == 4) {
-    fast_hadamard_transform_20N_launch_multirow<4, 4, 64, input_t>(params, device);
+    fast_hadamard_transform_20N_launch<4, 4, input_t>(params, device);
   } else if (params.log_N == 5) {
-    fast_hadamard_transform_20N_launch_multirow<8, 5, 32, input_t>(params, device);
+    fast_hadamard_transform_20N_launch<8, 5, input_t>(params, device);
   } else if (params.log_N == 6) {
-    fast_hadamard_transform_20N_launch_multirow<16, 6, 16, input_t>(params, device);
+    fast_hadamard_transform_20N_launch<16, 6, input_t>(params, device);
   } else if (params.log_N == 7) {
     fast_hadamard_transform_20N_launch<32, 7, input_t>(params, device);
   } else if (params.log_N == 8) {
@@ -443,24 +320,18 @@ inline void fast_hadamard_transform_28N_launch(HadamardParamsBase& params, DLDev
   launch_kernel<Ktraits>(params, device);
 }
 
-template <int kNThreads, int kLogN, int kRowsPerBlock, typename input_t>
-inline void fast_hadamard_transform_28N_launch_multirow(HadamardParamsBase& params, DLDevice device) {
-  using Ktraits = FastHadamard28NTraits<kNThreads, kLogN, input_t>;
-  launch_kernel_multirow<Ktraits, kRowsPerBlock>(params, device);
-}
-
 template <typename input_t>
 inline void fast_hadamard_transform_28N_cuda(HadamardParamsBase& params, DLDevice device) {
   if (params.log_N == 2) {
-    fast_hadamard_transform_28N_launch_multirow<1, 2, 256, input_t>(params, device);
+    fast_hadamard_transform_28N_launch<1, 2, input_t>(params, device);
   } else if (params.log_N == 3) {
-    fast_hadamard_transform_28N_launch_multirow<2, 3, 128, input_t>(params, device);
+    fast_hadamard_transform_28N_launch<2, 3, input_t>(params, device);
   } else if (params.log_N == 4) {
-    fast_hadamard_transform_28N_launch_multirow<4, 4, 64, input_t>(params, device);
+    fast_hadamard_transform_28N_launch<4, 4, input_t>(params, device);
   } else if (params.log_N == 5) {
-    fast_hadamard_transform_28N_launch_multirow<8, 5, 32, input_t>(params, device);
+    fast_hadamard_transform_28N_launch<8, 5, input_t>(params, device);
   } else if (params.log_N == 6) {
-    fast_hadamard_transform_28N_launch_multirow<16, 6, 16, input_t>(params, device);
+    fast_hadamard_transform_28N_launch<16, 6, input_t>(params, device);
   } else if (params.log_N == 7) {
     fast_hadamard_transform_28N_launch<32, 7, input_t>(params, device);
   } else if (params.log_N == 8) {
@@ -480,24 +351,18 @@ inline void fast_hadamard_transform_40N_launch(HadamardParamsBase& params, DLDev
   launch_kernel<Ktraits>(params, device);
 }
 
-template <int kNThreads, int kLogN, int kRowsPerBlock, typename input_t>
-inline void fast_hadamard_transform_40N_launch_multirow(HadamardParamsBase& params, DLDevice device) {
-  using Ktraits = FastHadamard40NTraits<kNThreads, kLogN, input_t>;
-  launch_kernel_multirow<Ktraits, kRowsPerBlock>(params, device);
-}
-
 template <typename input_t>
 inline void fast_hadamard_transform_40N_cuda(HadamardParamsBase& params, DLDevice device) {
   if (params.log_N == 2) {
-    fast_hadamard_transform_40N_launch_multirow<1, 2, 256, input_t>(params, device);
+    fast_hadamard_transform_40N_launch<1, 2, input_t>(params, device);
   } else if (params.log_N == 3) {
-    fast_hadamard_transform_40N_launch_multirow<2, 3, 128, input_t>(params, device);
+    fast_hadamard_transform_40N_launch<2, 3, input_t>(params, device);
   } else if (params.log_N == 4) {
-    fast_hadamard_transform_40N_launch_multirow<4, 4, 64, input_t>(params, device);
+    fast_hadamard_transform_40N_launch<4, 4, input_t>(params, device);
   } else if (params.log_N == 5) {
-    fast_hadamard_transform_40N_launch_multirow<8, 5, 32, input_t>(params, device);
+    fast_hadamard_transform_40N_launch<8, 5, input_t>(params, device);
   } else if (params.log_N == 6) {
-    fast_hadamard_transform_40N_launch_multirow<16, 6, 16, input_t>(params, device);
+    fast_hadamard_transform_40N_launch<16, 6, input_t>(params, device);
   } else if (params.log_N == 7) {
     fast_hadamard_transform_40N_launch<32, 7, input_t>(params, device);
   } else if (params.log_N == 8) {
