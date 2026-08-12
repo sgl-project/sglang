@@ -236,17 +236,36 @@ html.dark table tbody tr:nth-child(even) td,
   --sgdb-ok: oklch(52% 0.11 153);
   --sgdb-warn: oklch(59% 0.12 78);
   --sgdb-error: oklch(53% 0.16 25);
+  /* Segmented-control pair. The selected option is marked by a raised thumb
+     against a recessed well, so `well` and `thumb` must keep a real lightness
+     gap — they are redeclared for dark, where `raised` alone lands on top of
+     the well and the selection disappears. */
+  --sgdb-well: color-mix(in oklch, var(--sgdb-ink) 7.5%, transparent);
+  --sgdb-thumb: white;
+  --sgdb-thumb-ring: color-mix(in oklch, var(--sgdb-ink) 8%, transparent);
+  --sgdb-thumb-cast: color-mix(in oklch, var(--sgdb-ink) 20%, transparent);
+  /* Hover tone for anything that sits inside a tinted well. */
+  --sgdb-pick-hover: color-mix(in oklch, var(--sgdb-ink) 4%, transparent);
+  /* Decelerating curve — motion settles rather than stopping flat. */
+  --sgdb-ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --sgdb-ease-dur: 200ms;
   max-width: 100%;
   margin: 24px 0 40px;
   overflow: clip;
   border: 1px solid var(--sgdb-line);
-  border-radius: 10px;
+  border-radius: 14px;
   background: var(--sgdb-surface);
   color: var(--sgdb-ink);
 }
 
 .sgd-command-builder *, .sgd-command-builder *::before, .sgd-command-builder *::after { box-sizing: border-box; }
-.sgd-command-builder button, .sgd-command-builder input, .sgd-command-builder select { font: inherit; }
+/* Form controls inherit the page typeface instead of the browser's. Wrapped in
+   :where() so the rule weighs (0,1,0) and every single-class control rule below
+   still wins on order. Written as `.sgd-command-builder button` it weighed
+   (0,1,1) and, being a `font` shorthand, silently reset the font-size and
+   font-weight of anything selected by one class — `.sgd-builder-copy` and
+   `.sgd-builder-text-action` asked for 11px/680 and rendered 16px/400. */
+.sgd-command-builder :where(button, input, select) { font: inherit; }
 
 .sgd-builder-scope-tabs {
   display: grid;
@@ -266,7 +285,7 @@ html.dark table tbody tr:nth-child(even) td,
   color: var(--sgdb-muted);
   cursor: pointer;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 590;
   white-space: nowrap;
 }
 
@@ -301,99 +320,116 @@ html.dark table tbody tr:nth-child(even) td,
 }
 .sgd-builder-recipe > div:first-child { display: grid; min-width: 0; gap: 3px; }
 .sgd-builder-recipe > div:first-child span { color: var(--sgdb-muted); font-size: 10.5px; }
-.sgd-builder-recipe > div:first-child strong { font-size: 12px; font-weight: 680; line-height: 1.4; }
+.sgd-builder-recipe > div:first-child strong { font-size: 12px; font-weight: 590; line-height: 1.4; }
 .sgd-builder-recipe > div:last-child { display: flex; flex: none; gap: 10px; align-items: center; }
 .sgd-builder-recipe > div:last-child > small { color: var(--sgdb-muted); font-size: 10px; }
 .sgd-builder-section { min-width: 0; padding: 16px 0; border-bottom: 1px solid var(--sgdb-line); }
 .sgd-builder-section:last-child { border-bottom: 0; }
 .sgd-builder-section-heading { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
-.sgd-builder-section-heading > span { font-size: 12px; font-weight: 700; }
+.sgd-builder-section-heading > span { font-size: 12px; font-weight: 590; }
 .sgd-builder-section-heading > small { color: var(--sgdb-muted); font-size: 11px; line-height: 1.35; text-align: right; }
 
-.sgd-builder-hardware-grid, .sgd-builder-choice-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+/* One tinted well per group instead of a border on every option. Thirteen
+   outlined boxes competed with each other and with the panel frame; the well
+   carries the grouping so each option only has to carry its own state. */
+.sgd-builder-hardware-grid, .sgd-builder-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px;
+  padding: 3px;
+  border-radius: 11px;
+  background: var(--sgdb-well);
+}
 .sgd-builder-hardware, .sgd-builder-choice {
   position: relative;
   display: grid;
   min-width: 0;
-  min-height: 44px;
-  padding: 8px 9px 8px 25px;
+  min-height: 38px;
+  padding: 7px 10px;
   overflow: hidden;
-  border: 1px solid var(--sgdb-line);
-  border-radius: 7px;
-  background: var(--sgdb-raised);
-  color: var(--sgdb-ink);
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  /* Unselected stays legible — a deselected option is still a real choice, so
+     it sits just below the ink, not down at the muted caption level. */
+  color: color-mix(in oklch, var(--sgdb-ink) 72%, transparent);
   cursor: pointer;
   font-size: 12px;
   line-height: 1.25;
   text-align: left;
-  transition: transform 150ms ease-out, border-color 150ms ease-out,
-    background-color 150ms ease-out, color 150ms ease-out;
+  transition: background-color var(--sgdb-ease-dur) var(--sgdb-ease),
+    color var(--sgdb-ease-dur) var(--sgdb-ease);
 }
 
-.sgd-builder-hardware strong { font-size: 13px; font-weight: 680; }
-.sgd-builder-hardware small, .sgd-builder-choice small { margin-top: 2px; color: var(--sgdb-muted); font-size: 10.5px; }
-.sgd-builder-choice-dot {
-  position: absolute;
-  top: 50%;
-  left: 9px;
-  width: 7px;
-  height: 7px;
-  border: 1px solid color-mix(in oklch, var(--sgdb-muted) 72%, transparent);
-  border-radius: 50%;
-  background: transparent;
-  transform: translateY(-50%);
-}
+.sgd-builder-hardware strong { font-size: 12.5px; font-weight: 590; letter-spacing: -0.01em; }
+.sgd-builder-hardware small, .sgd-builder-choice small { margin-top: 1px; color: var(--sgdb-muted); font-size: 10.5px; }
+
+/* The radio ring is gone — the fill is the affordance. Kept in the DOM (the
+   JSX renders it) but collapsed, so no markup change is needed. */
+.sgd-builder-choice-dot { display: none; }
 
 .sgd-builder-hardware[data-selected="true"], .sgd-builder-choice[data-selected="true"] {
-  border-color: color-mix(in oklch, var(--sgdb-brand) 55%, var(--sgdb-line));
-  background: color-mix(in oklch, var(--sgdb-brand) 7%, var(--sgdb-raised));
-}
-
-.sgd-builder-hardware[data-selected="true"] .sgd-builder-choice-dot,
-.sgd-builder-choice[data-selected="true"] .sgd-builder-choice-dot {
-  border-color: var(--sgdb-brand);
-  background: var(--sgdb-brand);
-  box-shadow: inset 0 0 0 1.5px var(--sgdb-raised);
+  background: var(--sgdb-thumb);
+  box-shadow: 0 1px 3px var(--sgdb-thumb-cast), 0 0 0 0.5px var(--sgdb-thumb-ring);
+  color: var(--sgdb-ink);
 }
 
 .sgd-builder-hardware:disabled, .sgd-builder-choice:disabled { cursor: not-allowed; opacity: 0.42; }
 .sgd-builder-resource-grid { display: grid; gap: 8px; }
 .sgd-builder-stepper-field {
   display: flex;
-  min-height: 48px;
-  padding: 6px 8px 6px 10px;
+  min-height: 42px;
+  padding: 5px 6px 5px 12px;
   align-items: center;
   justify-content: space-between;
-  border: 1px solid var(--sgdb-line);
-  border-radius: 7px;
-  background: var(--sgdb-raised);
+  border: 0;
+  border-radius: 10px;
+  background: var(--sgdb-well);
 }
 .sgd-builder-stepper-field > div:first-child { display: grid; gap: 2px; }
-.sgd-builder-stepper-field span { font-size: 12px; font-weight: 620; }
+.sgd-builder-stepper-field span { font-size: 12px; font-weight: 500; }
 .sgd-builder-stepper-field small { color: var(--sgdb-muted); font-size: 10px; }
-.sgd-builder-stepper { display: grid; grid-template-columns: 34px 30px 34px; align-items: center; }
+/* One integrated control: a single raised track with a hairline between the
+   two halves, rather than two separately outlined 34px blocks. */
+.sgd-builder-stepper {
+  display: grid;
+  grid-template-columns: 28px 32px 28px;
+  align-items: center;
+  border-radius: 8px;
+  background: var(--sgdb-thumb);
+  box-shadow: 0 1px 3px var(--sgdb-thumb-cast), 0 0 0 0.5px var(--sgdb-thumb-ring);
+}
 .sgd-builder-stepper button, .sgd-builder-request-stepper button {
-  min-width: 34px;
-  min-height: 34px;
+  min-width: 28px;
+  min-height: 30px;
   padding: 0;
-  border: 1px solid var(--sgdb-line);
-  border-radius: 6px;
-  background: var(--sgdb-surface);
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
   color: var(--sgdb-ink);
   cursor: pointer;
-  font-size: 17px;
+  font-size: 14px;
+  transition: background-color var(--sgdb-ease-dur) var(--sgdb-ease);
 }
-.sgd-builder-stepper button:disabled, .sgd-builder-request-stepper button:disabled { opacity: 0.35; cursor: not-allowed; }
-.sgd-builder-stepper output { font-size: 12px; font-weight: 700; text-align: center; }
-.sgd-builder-resource-total { display: flex; min-height: 48px; padding: 8px 10px; align-items: baseline; gap: 6px; }
-.sgd-builder-resource-total strong { font-size: 18px; font-weight: 680; }
+.sgd-builder-stepper output {
+  border-right: 0.5px solid color-mix(in oklch, var(--sgdb-ink) 10%, transparent);
+  border-left: 0.5px solid color-mix(in oklch, var(--sgdb-ink) 10%, transparent);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 590;
+  line-height: 30px;
+  text-align: center;
+}
+.sgd-builder-stepper button:disabled, .sgd-builder-request-stepper button:disabled { opacity: 0.32; cursor: not-allowed; }
+.sgd-builder-resource-total { display: flex; min-height: 42px; padding: 8px 10px; align-items: baseline; gap: 6px; }
+.sgd-builder-resource-total strong { font-size: 17px; font-weight: 590; letter-spacing: -0.02em; }
 .sgd-builder-resource-total span, .sgd-builder-resource-equation { color: var(--sgdb-muted); font-size: 11px; }
 .sgd-builder-resource-equation { margin: 8px 0 0; line-height: 1.4; }
 
 .sgd-builder-topology-summary { display: grid; gap: 10px; }
 .sgd-builder-topology-summary > div { display: grid; gap: 4px; }
 .sgd-builder-topology-summary > div > span { color: var(--sgdb-muted); font-size: 11px; }
-.sgd-builder-topology-summary strong { font-size: 13px; font-weight: 680; line-height: 1.4; }
+.sgd-builder-topology-summary strong { font-size: 13px; font-weight: 590; line-height: 1.4; }
 .sgd-builder-text-action {
   justify-self: start;
   min-height: 32px;
@@ -403,7 +439,7 @@ html.dark table tbody tr:nth-child(even) td,
   color: var(--sgdb-muted);
   cursor: pointer;
   font-size: 11px;
-  font-weight: 650;
+  font-weight: 500;
 }
 .sgd-builder-text-action:disabled { cursor: not-allowed; opacity: 0.4; }
 .sgd-builder-advanced { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--sgdb-line); }
@@ -432,20 +468,23 @@ html.dark table tbody tr:nth-child(even) td,
   display: grid;
   grid-template-columns: minmax(76px, auto) minmax(0, 1fr) auto auto;
   width: 100%;
-  min-height: 48px;
-  padding: 8px 2px;
+  min-height: 44px;
+  padding: 8px;
   gap: 8px;
   align-items: center;
   border: 0;
   border-bottom: 0;
+  border-radius: 8px;
   background: transparent;
+  transition: background-color var(--sgdb-ease-dur) var(--sgdb-ease),
+    color var(--sgdb-ease-dur) var(--sgdb-ease);
   color: var(--sgdb-ink);
   cursor: pointer;
   text-align: left;
 }
 .sgd-builder-setting-row > span:first-child { color: var(--sgdb-muted); font-size: 11px; }
-.sgd-builder-setting-row strong { overflow: hidden; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-.sgd-builder-setting-row small { color: var(--sgdb-ok); font-size: 10px; font-weight: 650; }
+.sgd-builder-setting-row strong { overflow: hidden; font-size: 12px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.sgd-builder-setting-row small { color: var(--sgdb-ok); font-size: 10px; font-weight: 500; }
 .sgd-builder-setting-row > span:last-child { color: var(--sgdb-muted); font-size: 17px; }
 .sgd-builder-setting-row[data-active="true"] { background: color-mix(in oklch, var(--sgdb-serve) 4%, transparent); color: var(--sgdb-serve); }
 
@@ -453,16 +492,16 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-context--inline { padding: 12px 4px 16px; border-top: 1px solid var(--sgdb-line); }
 .sgd-builder-context--rail { display: none; }
 .sgd-builder-context-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
-.sgd-builder-context-heading > div > span { font-size: 13px; font-weight: 700; }
+.sgd-builder-context-heading > div > span { font-size: 13px; font-weight: 590; }
 .sgd-builder-context-heading p { margin: 4px 0 0; color: var(--sgdb-muted); font-size: 11px; line-height: 1.45; }
 .sgd-builder-context-heading > small { flex: none; color: var(--sgdb-muted); font-size: 10px; }
 .sgd-builder-context-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
 .sgd-builder-context-note { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--sgdb-line); }
 .sgd-builder-context-note p { margin: 0; color: var(--sgdb-muted); font-size: 11px; line-height: 1.5; }
-.sgd-builder-context-note a { display: inline-block; margin-top: 6px; color: var(--sgdb-serve); font-size: 11px; font-weight: 650; text-decoration: none; }
+.sgd-builder-context-note a { display: inline-block; margin-top: 6px; color: var(--sgdb-serve); font-size: 11px; font-weight: 500; text-decoration: none; }
 .sgd-builder-scope-panel[data-scope="request"] .sgd-builder-context-note a { color: var(--sgdb-request); }
 .sgd-builder-request-stepper { display: grid; grid-template-columns: 40px 52px 40px auto; gap: 6px; align-items: center; margin-top: 14px; }
-.sgd-builder-request-stepper output { font-size: 18px; font-weight: 680; text-align: center; }
+.sgd-builder-request-stepper output { font-size: 18px; font-weight: 590; text-align: center; }
 .sgd-builder-request-stepper > span { margin-left: 4px; color: var(--sgdb-muted); font-size: 11px; }
 .sgd-builder-request-setting { border-bottom: 1px solid var(--sgdb-line); }
 .sgd-builder-request-setting:last-child { border-bottom: 0; }
@@ -484,16 +523,16 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-output[data-emphasized="true"] { border-color: color-mix(in oklch, var(--output-accent) 38%, var(--sgdb-line)); }
 .sgd-builder-output > header { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 8px; align-items: center; min-height: 50px; padding: 8px 10px; border-bottom: 1px solid var(--sgdb-line); }
 .sgd-builder-output[data-emphasized="true"] > header { background: color-mix(in oklch, var(--output-accent) 4%, var(--sgdb-raised)); }
-.sgd-builder-output-index { display: grid; width: 22px; height: 22px; place-items: center; border: 1px solid color-mix(in oklch, var(--output-accent) 32%, var(--sgdb-line)); border-radius: 50%; color: var(--output-accent); font-size: 10px; font-weight: 750; }
+.sgd-builder-output-index { display: grid; width: 20px; height: 20px; place-items: center; border: 0; border-radius: 50%; background: color-mix(in oklch, var(--output-accent) 13%, transparent); color: var(--output-accent); font-size: 10px; font-weight: 590; font-variant-numeric: tabular-nums; }
 .sgd-builder-output-title { display: flex; min-width: 0; gap: 7px; align-items: baseline; }
-.sgd-builder-output-title strong { font-size: 13px; font-weight: 700; }
+.sgd-builder-output-title strong { font-size: 13px; font-weight: 590; }
 .sgd-builder-output-title span { color: var(--sgdb-muted); font-size: 10.5px; }
 .sgd-builder-status { display: inline-flex; gap: 5px; align-items: center; color: var(--sgdb-muted); font-size: 10px; white-space: nowrap; }
 .sgd-builder-status > span { width: 6px; height: 6px; border-radius: 50%; background: var(--sgdb-warn); }
 .sgd-builder-status[data-status="verified"] > span { background: var(--sgdb-ok); }
 .sgd-builder-status[data-status="error"] > span { background: var(--sgdb-error); }
 .sgd-builder-output-tabs { display: flex; min-height: 38px; padding: 5px 10px; gap: 14px; align-items: center; border-bottom: 1px solid var(--sgdb-line); }
-.sgd-builder-output-tabs button { min-height: 28px; padding: 0; border: 0; border-bottom: 1px solid transparent; background: transparent; color: var(--sgdb-muted); cursor: pointer; font-size: 10.5px; font-weight: 620; }
+.sgd-builder-output-tabs button { min-height: 28px; padding: 0; border: 0; border-bottom: 1px solid transparent; background: transparent; color: var(--sgdb-muted); cursor: pointer; font-size: 10.5px; font-weight: 500; }
 .sgd-builder-output-tabs button[data-selected="true"] { border-bottom-color: var(--output-accent); color: var(--sgdb-ink); }
 .sgd-builder-node-fields { display: grid; grid-template-columns: minmax(0, 1fr) 84px; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--sgdb-line); }
 .sgd-builder-node-fields label { display: grid; min-width: 0; gap: 4px; color: var(--sgdb-muted); font-size: 10px; }
@@ -518,25 +557,44 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-output-error { padding: 8px 10px; border-top: 1px solid color-mix(in oklch, var(--sgdb-error) 35%, var(--sgdb-line)); background: color-mix(in oklch, var(--sgdb-error) 8%, transparent); color: var(--sgdb-error); font-size: 10.5px; line-height: 1.4; }
 .sgd-builder-output > footer { display: flex; min-height: 44px; padding: 5px 10px; align-items: center; justify-content: space-between; border-top: 1px solid var(--sgdb-line); }
 .sgd-builder-output > footer > div { display: flex; margin-left: auto; gap: 12px; align-items: center; }
-.sgd-builder-copy { min-height: 32px; padding: 0 11px; border: 1px solid color-mix(in oklch, var(--output-accent) 42%, var(--sgdb-line)); border-radius: 6px; background: color-mix(in oklch, var(--output-accent) 6%, var(--sgdb-raised)); color: var(--sgdb-ink); cursor: pointer; font-size: 11px; font-weight: 680; }
+/* Tinted, borderless — the primary action reads through colour, not through a
+   raised box. Keeps it in the same visual weight class as the text actions
+   next to it. */
+.sgd-builder-copy {
+  min-height: 26px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 7px;
+  background: color-mix(in oklch, var(--output-accent) 11%, transparent);
+  color: var(--output-accent);
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 590;
+  letter-spacing: -0.005em;
+  transition: background-color var(--sgdb-ease-dur) var(--sgdb-ease),
+    color var(--sgdb-ease-dur) var(--sgdb-ease);
+}
 .sgd-builder-copy:disabled { cursor: not-allowed; opacity: 0.38; }
 
+/* Hover only changes tone. Lifting the card on hover (translateY) made the
+   whole grid twitch as the pointer crossed it. */
 @media (hover: hover) and (pointer: fine) {
   .sgd-command-builder button:not(:disabled):hover { color: var(--sgdb-ink); }
-  .sgd-builder-scope-tabs button:not(:disabled):hover { background: color-mix(in oklch, var(--sgdb-brand) 5%, transparent); }
-  .sgd-builder-hardware:not(:disabled):hover, .sgd-builder-choice:not(:disabled):hover {
-    border-color: color-mix(in oklch, var(--sgdb-brand) 42%, var(--sgdb-line));
-    background: color-mix(in oklch, var(--sgdb-brand) 5%, var(--sgdb-raised));
-    transform: translateY(-1px);
+  .sgd-builder-scope-tabs button:not(:disabled):hover { background: var(--sgdb-pick-hover); }
+  .sgd-builder-hardware:not(:disabled):not([data-selected="true"]):hover,
+  .sgd-builder-choice:not(:disabled):not([data-selected="true"]):hover {
+    background: var(--sgdb-pick-hover);
   }
   .sgd-builder-setting-row:not(:disabled):hover { background: color-mix(in oklch, var(--sgdb-serve) 5%, transparent); }
-  .sgd-builder-stepper button:not(:disabled):hover, .sgd-builder-request-stepper button:not(:disabled):hover,
-  .sgd-builder-copy:not(:disabled):hover { border-color: var(--output-accent, var(--sgdb-brand)); background: color-mix(in oklch, var(--output-accent, var(--sgdb-brand)) 9%, var(--sgdb-raised)); transform: translateY(-1px); }
+  .sgd-builder-stepper button:not(:disabled):hover,
+  .sgd-builder-request-stepper button:not(:disabled):hover { background: var(--sgdb-pick-hover); }
+  .sgd-builder-copy:not(:disabled):hover { background: color-mix(in oklch, var(--output-accent) 18%, transparent); }
   .sgd-builder-text-action:not(:disabled):hover { color: var(--output-accent, var(--sgdb-brand)); }
 }
 
 .sgd-command-builder :where(button, input, select, a):focus-visible { outline: 2px solid color-mix(in oklch, var(--sgdb-brand) 76%, white); outline-offset: 2px; }
-.sgd-command-builder button:not(:disabled):active { transform: translateY(0) scale(0.985); }
+/* Press reads as the control yielding under the finger, not jumping. */
+.sgd-command-builder button:not(:disabled):active { transform: scale(0.97); transition-duration: 60ms; }
 
 @container builder-controls (min-width: 560px) {
   .sgd-builder-setting-layout { display: grid; grid-template-columns: minmax(240px, 0.9fr) minmax(0, 1.1fr); }
@@ -608,6 +666,14 @@ html.dark .sgd-command-builder, [data-theme="dark"] .sgd-command-builder {
   --sgdb-ok: oklch(72% 0.1 153);
   --sgdb-warn: oklch(75% 0.11 78);
   --sgdb-error: oklch(72% 0.14 25);
+  /* On dark, `raised` sits at the same lightness the well mixes to, so the
+     thumb needs its own step up. Cast goes to black (a light shadow would
+     glow), and the ring carries most of the edge definition. */
+  --sgdb-well: color-mix(in oklch, black 26%, transparent);
+  --sgdb-thumb: oklch(31% 0.015 255);
+  --sgdb-thumb-ring: color-mix(in oklch, white 11%, transparent);
+  --sgdb-thumb-cast: color-mix(in oklch, black 40%, transparent);
+  --sgdb-pick-hover: color-mix(in oklch, white 6%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {
