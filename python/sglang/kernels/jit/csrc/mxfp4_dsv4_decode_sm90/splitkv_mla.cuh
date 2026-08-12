@@ -21,31 +21,16 @@ static constexpr float MAX_INIT_VAL = -1e30;  // Prevent (-inf) - (-inf) = nan
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
 
-// The NoPE payload and RoPE are loaded with scalar u32 loads and assembled in
-// registers, keeping the producer independent of the page-block base
-// alignment.
-__device__ __forceinline__ uint32_t load_u32_evict_last(const void* address) {
-  uint32_t value;
-  asm volatile("ld.global.nc.L1::evict_last.L2::128B.u32 %0, [%1];" : "=r"(value) : "l"(address));
-  return value;
-}
-
-__device__ __forceinline__ uint64_t load_packed_e2m1x16_unaligned(const void* address) {
-  const auto* bytes = static_cast<const uint8_t*>(address);
-  const uint64_t lo = load_u32_evict_last(bytes);
-  const uint64_t hi = load_u32_evict_last(bytes + sizeof(uint32_t));
-  return lo | (hi << 32);
-}
-
-__device__ __forceinline__ bf16x8 load_bf16x8_unaligned(const void* address) {
-  const auto* bytes = static_cast<const uint8_t*>(address);
-  uint32_t words[4];
-  CUTE_UNROLL
-  for (int i = 0; i < 4; ++i) {
-    words[i] = load_u32_evict_last(bytes + i * sizeof(uint32_t));
-  }
+// Every 368-byte MXFP4 row (and its page-block stride) is a multiple of 16
+// bytes, so the NoPE and RoPE payloads can be loaded with single aligned
+// vector loads.
+__device__ __forceinline__ bf16x8 load_bf16x8(const void* address) {
+  uint4 value;
+  asm volatile("ld.global.nc.L1::evict_last.L2::128B.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+               : "l"(address));
   bf16x8 result;
-  *reinterpret_cast<uint4*>(&result) = make_uint4(words[0], words[1], words[2], words[3]);
+  *reinterpret_cast<uint4*>(&result) = value;
   return result;
 }
 
@@ -637,7 +622,7 @@ __device__ void KernelTemplate<NUM_HEADS>::devfunc(
             uint64_t packed = 0;
             uint8_t block_scale_bits = 0;
             if (token_is_valid) {
-              packed = load_packed_e2m1x16_unaligned(gK_base + logical_dim / 2);
+              packed = nvfp4::load_packed_e2m1x16(gK_base + logical_dim / 2);
               block_scale_bits =
                   mxfp4::load_scale_bits(gK_base + PACKED_NOPE_BYTES + logical_dim / SCALE_BLOCK_SIZE);
             }
@@ -667,7 +652,7 @@ __device__ void KernelTemplate<NUM_HEADS>::devfunc(
           for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE / 32; ++dim_idx) {
             bf16x8 rope = {};
             if (token_is_valid) {
-              rope = load_bf16x8_unaligned(gK_rope + dim_idx * 32 * sizeof(bf16));
+              rope = load_bf16x8(gK_rope + dim_idx * 32 * sizeof(bf16));
             }
             const int smem_offset = (HEAD_DIM_NOPE + dim_idx * 32) * TOPK_BLOCK_SIZE;
             *reinterpret_cast<__int128_t*>(sK_rope_base + smem_offset) = *reinterpret_cast<const __int128_t*>(&rope);

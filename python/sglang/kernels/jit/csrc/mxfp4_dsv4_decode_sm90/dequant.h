@@ -24,6 +24,12 @@
 
 namespace sm90::nvfp4 {
 
+__device__ __forceinline__ uint64_t load_packed_e2m1x16(const void* address) {
+  uint64_t value;
+  asm volatile("ld.global.nc.L1::evict_last.L2::128B.u64 %0, [%1];" : "=l"(value) : "l"(address));
+  return value;
+}
+
 struct E2M1Bf16Lut {
   // The low and high bytes of the eight positive E2M1 magnitudes, split into
   // two four-byte PRMT sources.  Keeping the table in registers is much
