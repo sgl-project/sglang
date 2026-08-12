@@ -307,14 +307,6 @@ class ModelConfig:
                 **kwargs,
             )
         )
-        # TeleChat4 checkpoints retain the DeepSeek-V3 architecture name for
-        # Transformers compatibility. Select the mHC-aware SGLang model when
-        # the checkpoint declares multiple residual streams.
-        if (
-            self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
-            and getattr(self.hf_config, "num_residual_streams", 1) > 1
-        ):
-            self.hf_config.architectures[0] = "TeleChat4ForCausalLM"
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
         self.embedding_model_spec = resolve_embedding_model_spec(
