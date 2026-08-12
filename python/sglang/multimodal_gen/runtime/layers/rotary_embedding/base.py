@@ -44,10 +44,6 @@ class RotaryEmbedding(CustomOp):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
         self.use_precomputed_cache = use_precomputed_cache
-
-        # Static per-instance gates: fixed for the lifetime of this object,
-        # so compute them once here instead of re-deriving them from
-        # is_neox_style/rotary_dim/head_size on every forward call.
         self._is_full_rotation = rotary_dim == head_size
         self._can_use_complex_style = not is_neox_style
         self._npu_rotary_mul_style_ok = (
@@ -94,11 +90,10 @@ class RotaryEmbedding(CustomOp):
         q_pass: torch.Tensor,
         k_pass: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Reattach the untouched tail (rotary_dim < head_size) if present.
+        """Reattach the untouched tail (rotary_dim < head_size), if any.
 
-        When rotary_dim == head_size, q_pass/k_pass are always empty and
-        torch.cat against an empty tensor still allocates + copies the
-        whole (large) q_rotated/k_rotated — skip it in that (common) case.
+        torch.cat against an empty q_pass/k_pass (rotary_dim == head_size)
+        still allocates + copies, so skip it in that common case.
         """
         if self._is_full_rotation:
             return q_rotated, k_rotated
@@ -163,10 +158,8 @@ class RotaryEmbedding(CustomOp):
             and cos.shape[0] == seq_len
         )
         if can_derive_complex_from_cos_sin:
-            # Interleaved (non-neox) rotation has no fused NPU kernel (always
-            # falls back to several elementwise ops in apply_rotary_embedding);
-            # the complex-multiply form is mathematically equivalent for this
-            # pairing convention and needs fewer kernel launches.
+            # No fused kernel for interleaved rotation here; complex-multiply
+            # is equivalent and needs fewer kernel launches.
             derived_complex_freqs = torch.complex(
                 cos.to(torch.float32), sin.to(torch.float32)
             ).unsqueeze(-2)
@@ -184,27 +177,14 @@ class RotaryEmbedding(CustomOp):
                 and num_heads < NPU_ROTARY_MUL_MAX_NUM_HEADS
             )
             if can_use_npu_rotary_mul:
-                # torch_npu.npu_rotary_mul, called directly on the natural
-                # BSND [batch, seq, heads, rotary_dim] layout instead of
-                # flattening to [batch*seq, heads, rotary_dim]: cos/sin get
-                # a batch dim of 1 and a heads dim of 1 and broadcast
-                # against query/key's real batch and heads dims — the
-                # documented "1S1D" pattern for BSND inputs — so no
-                # expand+reshape copy of cos/sin across the batch is
-                # needed (the previous version paid for that copy every
-                # call). heads/rotary_dim must stay under the same size
-                # limits apply_rotary_embedding_native's own gate uses;
-                # replicated here because if we called through with
-                # interleaved=False and that gate failed on the other
-                # side, apply_rotary_embedding_native would silently fall
-                # back to its always-interleaved generic path — wrong for
-                # neox-style data.
-                #
-                # EXPERIMENTAL: this batch/heads broadcast behavior is not
-                # independently verified on real hardware beyond the
-                # already-profiled single-batch case — validate
-                # numerically against the previous implementation (git
-                # history) before trusting it for real generations.
+                # Called directly on the BSND [batch, seq, heads, rotary_dim]
+                # layout (no batch*seq flatten): cos/sin get a batch dim and
+                # a heads dim of 1 and broadcast against query/key (the
+                # documented "1S1D" pattern), avoiding a per-call
+                # expand+copy of cos/sin across the batch. The size gate
+                # above mirrors apply_rotary_embedding_native's own gate —
+                # if that gate disagreed, that function would silently take
+                # its always-interleaved fallback, which is wrong here.
                 q_rot = query[..., : self.rotary_dim]
                 q_pass = query[..., self.rotary_dim :]
                 k_rot = key[..., : self.rotary_dim]
@@ -213,31 +193,18 @@ class RotaryEmbedding(CustomOp):
                 cos_prepared = cos.reshape(1, seq_len, 1, -1).to(query.dtype)
                 sin_prepared = sin.reshape(1, seq_len, 1, -1).to(query.dtype)
                 if cos_prepared.size(-1) * 2 == self.rotary_dim:
-                    cos_prepared = torch.cat(
-                        (cos_prepared, cos_prepared), dim=-1
-                    )
-                    sin_prepared = torch.cat(
-                        (sin_prepared, sin_prepared), dim=-1
-                    )
+                    cos_prepared = torch.cat((cos_prepared, cos_prepared), dim=-1)
+                    sin_prepared = torch.cat((sin_prepared, sin_prepared), dim=-1)
 
-                q_rotated = torch_npu.npu_rotary_mul(
-                    q_rot, cos_prepared, sin_prepared
-                )
-                k_rotated = torch_npu.npu_rotary_mul(
-                    k_rot, cos_prepared, sin_prepared
-                )
+                q_rotated = torch_npu.npu_rotary_mul(q_rot, cos_prepared, sin_prepared)
+                k_rotated = torch_npu.npu_rotary_mul(k_rot, cos_prepared, sin_prepared)
                 return self._combine_rotated_and_pass(
                     q_rotated, k_rotated, q_pass, k_pass
                 )
 
-            # Keep batch and sequence as separate axes (don't flatten to
-            # [batch*seq, ...]) so that cos/sin — shaped [seq_len,
-            # rotary_dim // 2] and shared across the batch — broadcast
-            # correctly for batch_size > 1. self.use_precomputed_cache is
-            # already False here (checked at the top of this method), so
-            # query/key are guaranteed to be the caller's original 4D
-            # [batch, seq, heads, head_dim] tensors, not the legacy
-            # positions-indexed [num_tokens, hidden] layout.
+            # No [batch*seq, ...] flatten: cos/sin are [seq_len,
+            # rotary_dim // 2], shared across the batch, and only
+            # broadcast correctly this way for batch_size > 1.
             q_rot = query[..., : self.rotary_dim]
             q_pass = query[..., self.rotary_dim :]
 
@@ -258,9 +225,7 @@ class RotaryEmbedding(CustomOp):
                 is_neox_style=self.is_neox_style,
                 interleaved=not self.is_neox_style,
             )
-            return self._combine_rotated_and_pass(
-                q_rotated, k_rotated, q_pass, k_pass
-            )
+            return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
 
         if cos_sin_cache is not None:
             return self.forward_native(
@@ -384,12 +349,10 @@ class RotaryEmbedding(CustomOp):
             and cos.shape[0] == query.shape[1]
         )
         if can_derive_complex_from_cos_sin:
-            # Interleaved (non-neox) rotation has no fused kernel on native
-            # backends (CPU/MPS/etc. always fall back to several elementwise
-            # ops in apply_rotary_embedding); the complex-multiply form is
-            # mathematically equivalent for this pairing convention and needs
-            # fewer kernel launches. CUDA already has a fused Triton kernel
-            # for this case and keeps using the cos/sin path below.
+            # No fused kernel for interleaved rotation on native backends;
+            # complex-multiply is equivalent and needs fewer kernel
+            # launches. CUDA has its own fused path (forward_cuda) and
+            # never reaches here for this case.
             derived_complex_freqs = torch.complex(
                 cos.to(torch.float32), sin.to(torch.float32)
             ).unsqueeze(-2)
@@ -400,12 +363,10 @@ class RotaryEmbedding(CustomOp):
 
         if cos is not None and sin is not None:
             if use_precomputed_cache:
-                # Legacy positions-indexed callers (e.g. llama/qwen3/gemma2/
-                # gemma3 via get_rope()) pass query/key as 3D [batch, seq,
-                # hidden], and cos/sin above were already index_select'd
-                # per-token via positions.flatten(), so they match
-                # num_tokens = batch*seq row-for-row. Flattening here is
-                # required to split the hidden dim into heads.
+                # Legacy callers (llama/qwen3/gemma2/gemma3 via get_rope())
+                # pass 3D [batch, seq, hidden]; cos/sin were already
+                # index_select'd per-token above, so they already match
+                # num_tokens = batch*seq row-for-row.
                 q_shape = query.shape
                 q_flat = query.reshape(num_tokens, -1, self.head_size)
                 q_rot = q_flat[..., : self.rotary_dim]
@@ -435,10 +396,8 @@ class RotaryEmbedding(CustomOp):
                 )
                 return q.reshape(q_shape), k.reshape(k_shape)
 
-            # Direct DiT-style call: keep batch and sequence as separate
-            # axes (don't flatten to [batch*seq, ...]) so that cos/sin —
-            # shaped [seq_len, rotary_dim // 2] and shared across the
-            # batch — broadcast correctly for batch_size > 1.
+            # Direct DiT-style call: same batch/seq broadcast reasoning as
+            # forward_npu's cos/sin path.
             q_rot = query[..., : self.rotary_dim]
             q_pass = query[..., self.rotary_dim :]
             k_rot = key[..., : self.rotary_dim]
@@ -458,9 +417,7 @@ class RotaryEmbedding(CustomOp):
                 is_neox_style=self.is_neox_style,
                 interleaved=not self.is_neox_style,
             )
-            return self._combine_rotated_and_pass(
-                q_rotated, k_rotated, q_pass, k_pass
-            )
+            return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
 
         if query.dim() != 4 or key.dim() != 4:
             raise ValueError(

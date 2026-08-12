@@ -63,12 +63,6 @@ if _is_xpu:
 if not _is_cpu:
     from sglang.kernels.ops.diffusion.triton.norm import norm_infer, rms_norm_fn
 
-# apply_qk_norm_rope is a plain function (no layer object to hold state on),
-# called on every forward pass — cache RotaryEmbedding instances by their
-# only two call-site-varying constructor args instead of rebuilding one
-# every call. Mirrors the _ROPE_DICT cache in rotary_embedding/factory.py.
-# Unbounded is fine: the key space is (head_dim, is_neox), a handful of
-# fixed values per process, not per-call/per-token data.
 _QK_NORM_ROPE_DICT: dict[tuple[int, bool], RotaryEmbedding] = {}
 
 
