@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-import sglang.srt.multimodal._core.inkling
+from sglang.srt.multimodal._core import inkling as _rs_inkling
 from sglang.srt.multimodal.inkling.image_processing import (
     IMAGE_MEAN,
     IMAGE_STD,
@@ -30,12 +30,12 @@ def rs_patchify(arr: np.ndarray) -> torch.Tensor:
     h, w, _ = arr.shape
     nph = (h + PS - 1) // PS
     npw = w // PS + 1
-    bits = sglang.srt.multimodal._core.inkling.patchify_rgb(arr, PS)
+    bits = _rs_inkling.patchify_rgb(arr, PS)
     return torch.from_numpy(bits).view(torch.bfloat16).reshape(nph * npw, PS, PS, 3)
 
 
 def rs_decode_patchify(data: bytes) -> torch.Tensor:
-    h, w, bits = sglang.srt.multimodal._core.inkling.decode_patchify(data, PS)
+    h, w, bits = _rs_inkling.decode_patchify(data, PS)
     nph = (h + PS - 1) // PS
     npw = w // PS + 1
     return torch.from_numpy(bits).view(torch.bfloat16).reshape(nph * npw, PS, PS, 3)
@@ -114,7 +114,7 @@ def bench():
         rescale_image_max_upscaled_long_edge=None,
     )
     rs_decode_patchify(jpeg)
-    sglang.srt.multimodal._core.inkling.decode_patchify_batch([jpeg] * 5, PS)
+    _rs_inkling.decode_patchify_batch([jpeg] * 5, PS)
 
     def run(label, fn, iters=n, images_per_call=1):
         t0, c0 = time.perf_counter(), time.process_time()
@@ -137,9 +137,7 @@ def bench():
     w_rs, c_rs = run("rust  decode_patchify", lambda: rs_decode_patchify(jpeg))
     w_rb, c_rb = run(
         "rust  decode_patchify_batch (5 imgs/call)",
-        lambda: sglang.srt.multimodal._core.inkling.decode_patchify_batch(
-            [jpeg] * 5, PS
-        ),
+        lambda: _rs_inkling.decode_patchify_batch([jpeg] * 5, PS),
         iters=max(n // 5, 5),
         images_per_call=5,
     )

@@ -242,7 +242,7 @@ export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/tmp/sglang_nixl_e2e_storage
 
 Expected behavior for this validated setup:
 
-- the server starts with `Attached hybrid Mamba pool stack to HiMambaRadixCache: pools=KV + MAMBA`
+- the server starts with `Attached hybrid pool stack to UnifiedRadixCache: pools=KV + MAMBA`
 - NIXL logs show `Backend POSIX was instantiated`
 - the server logs `HiCacheNixl: registered hybrid host pool mamba zero_copy=...`
 - the storage directory contains KV files plus Mamba sidecar files such as `..._0_2_mamba_temporal` and `..._0_2_mamba_conv_0`

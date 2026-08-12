@@ -31,9 +31,12 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    get_compress_state_ring_size,
+    get_compress_state_write_pad,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -71,6 +74,23 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
+
+
+def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
+    """Bytes/token the DFLASH draft KV pool adds to the target's budget, 0 if none.
+
+    Unlike an EAGLE draft, which reuses the target's attention config and is
+    therefore priced by layer count, a DFLASH draft has its own geometry and is
+    a flat additive term. Under DCP, the target pool is sharded while the draft
+    pool spans the allocator's widened virtual location space, so the draft
+    term is replicated across DCP ranks.
+    """
+    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+        return 0
+    cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
+    if cell_size is None or int(cell_size) <= 0:
+        return 0
+    return int(cell_size) * get_parallel().attn_dcp_size
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -119,6 +139,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -176,7 +197,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers),
+                    draft_num_layers=int(draft_num_layers)
+                    * get_parallel().attn_dcp_size,
+                    draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
@@ -194,6 +217,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
+        dcp_size = get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
             from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -287,8 +311,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes
         else:
+            n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (
-                model_config.get_num_kv_heads(tp_size)
+                n
                 * (model_config.head_dim + model_config.v_head_dim)
                 * effective_num_layers
                 * kv_size
@@ -297,16 +322,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
-                n = model_config.get_num_kv_heads(tp_size)
                 k = model_config.head_dim
                 cell_size = (cell_size // 2) + (
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
                 # FP4 prefill uses one shared FP8 dequant workspace across layers.
                 cell_size += n * k * 2 * kv_size
-            elif get_model().kv_cache_dtype == "mxfp8":
+            elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
-                n = model_config.get_num_kv_heads(tp_size)
                 cell_size += (
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
@@ -339,6 +362,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -368,7 +392,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
-        if get_model().kv_cache_dtype == "mxfp8":
+        if self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
                 model_config.get_num_kv_heads(tp_size)
@@ -406,6 +430,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 self._draft_swa_full_layers_num = banded_depths
                 self._draft_full_layers_num = draft_layers - banded_depths
 
+        self._draft_cell_size = _dflash_draft_cell_size(kvc)
+
         # Bytes per token of max_total_num_tokens.
         #
         # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
@@ -420,6 +446,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 self._swa_per_token * self._swa_layers_num
                 + self._full_per_token * self._draft_full_layers_num
                 + self._swa_per_token * self._draft_swa_full_layers_num
+                + self._draft_cell_size
             )
         else:
             self._cell_size = (
@@ -429,6 +456,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
+                + self._draft_cell_size
             )
 
     def _solve_pool_sizes(
@@ -501,6 +529,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         super().__init__(kvc)
         assert self._full_layers_num > 0
 
@@ -613,6 +642,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         cfg = kvc.model_config
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
@@ -662,6 +692,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
+        if self.is_speculative:
+            # Ring is sized once here, so it must serve the largest adaptive tier.
+            self._assert_ring_serves_draft_tokens(
+                kvc.server_args.max_speculative_num_draft_tokens or 0
+            )
+
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
             # Reserve memory for the speculative draft worker by inflating
@@ -701,6 +737,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 logger.info(
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
+
+    def _assert_ring_serves_draft_tokens(self, num_draft_tokens: int) -> None:
+        """A verify batch writes its whole optimistic tail into the ring, so ring
+        capacity bounds the draft count."""
+        for compress_ratio, ring_size, num_layers in (
+            (4, self.c4_ring_size, self.num_layers_ca4),
+            (128, self.c128_ring_size, self.num_layers_ca128),
+        ):
+            if num_layers == 0:
+                continue
+            if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+                # Online c128 keeps per-draft state instead of a ring; sized separately.
+                continue
+            max_draft_tokens = get_compress_state_write_pad(compress_ratio, ring_size)
+            assert num_draft_tokens <= max_draft_tokens, (
+                f"speculative_num_draft_tokens={num_draft_tokens} exceeds what the c{compress_ratio} "
+                f"compress state ring can keep resident (ring_size={ring_size} serves at most "
+                f"{max_draft_tokens} draft tokens). Lower the draft count, or grow the ring in "
+                f"get_compress_state_ring_size()."
+            )
 
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8

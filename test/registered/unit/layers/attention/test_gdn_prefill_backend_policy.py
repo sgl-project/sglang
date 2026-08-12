@@ -11,13 +11,14 @@ from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
-    maybe_set_default_flashinfer_gdn_prefill,
+    flashinfer_gdn_prefill_default,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -38,11 +39,6 @@ def make_runner(
         mamba_radix_cache_strategy="no_buffer",
         enable_dynamic_chunking=False,
         chunked_prefill_size=8192,
-    )
-    # The policy routes its load-time default through the audited mutation entry
-    # (server_args.override); mirror that on the stub so the write lands.
-    args.override = MagicMock(
-        side_effect=lambda _source, **fields: vars(args).update(fields)
     )
     for name, value in arg_overrides.items():
         setattr(args, name, value)
@@ -87,16 +83,10 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
                 return_value=flashinfer_available,
             ),
         ):
-            maybe_set_default_flashinfer_gdn_prefill(runner)
-        return runner.server_args.linear_attn_prefill_backend
+            return flashinfer_gdn_prefill_default(runner)
 
     def test_selects_flashinfer_for_supported_sm100_gdn(self):
-        runner = make_runner()
-        self.assertEqual(self.apply_policy(runner), "flashinfer")
-        runner.server_args.override.assert_called_once_with(
-            "gdn_backend.sm100_flashinfer_default",
-            linear_attn_prefill_backend="flashinfer",
-        )
+        self.assertEqual(self.apply_policy(make_runner()), "flashinfer")
 
     def test_selects_flashinfer_for_radix_cache_strategies(self):
         for strategy in ("no_buffer", "extra_buffer", "extra_buffer_lazy"):
@@ -107,11 +97,11 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
                 )
                 self.assertEqual(self.apply_policy(runner), "flashinfer")
 
-    def test_preserves_explicit_prefill_override(self):
+    def test_declines_when_the_prefill_backend_is_explicit(self):
         for backend in ("triton", "flashinfer", "cutedsl"):
             with self.subTest(backend=backend):
                 runner = make_runner(linear_attn_prefill_backend=backend)
-                self.assertEqual(self.apply_policy(runner), backend)
+                self.assertIsNone(self.apply_policy(runner))
 
     def test_rejects_unsupported_capability(self):
         cases = (
@@ -162,12 +152,12 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             track_ssm_h_dst=torch.empty(4),
         )
 
-        with patch(
-            "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
-            "get_server_args",
-            return_value=SimpleNamespace(mamba_cache_chunk_size=64),
-        ):
-            maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
+        # The chunk size is a derived config member; seed its private cache on a
+        # published config rather than patching an import binding.
+        override = get_context().override_server_args(_mamba_cache_chunk_size=64)
+        override.install()
+        self.addCleanup(override.restore)
+        maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
 
         torch.testing.assert_close(
             metadata.state_checkpoint_cu_starts,

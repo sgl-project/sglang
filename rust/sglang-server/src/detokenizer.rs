@@ -91,6 +91,21 @@ impl DetokenizerBackend {
         }
     }
 
+    /// Decode one complete sequence without creating request-scoped streaming
+    /// state. This runs on a pinned detokenizer worker, never on an API runtime
+    /// thread.
+    fn decode_once(&self, token_ids: &[u32]) -> Result<String, Error> {
+        match self {
+            DetokenizerBackend::Dynamo(tokenizer) => tokenizer
+                .decode(token_ids, true)
+                .map(String::from)
+                .map_err(|error| Error::Detokenize(error.to_string())),
+            DetokenizerBackend::Skip => Err(Error::Validation(
+                "echo for token-ID prompts is unavailable when skip_tokenizer_init=True".into(),
+            )),
+        }
+    }
+
     /// Decode each logprob token id to its own text (one id at a time, matching
     /// Python's `batch_decode([[id] for id in ids])`). Runs on this CPU-bound
     /// shard, not the api-server I/O threads. `Skip` mode (no tokenizer) yields
@@ -194,6 +209,9 @@ impl Runnable for DetokenizerWorker {
                         handle_chunk(&mut table, ev, &self.backend, &self.abort);
                     }
                 }
+                DetokMsg::Decode { rid, token_ids } => {
+                    handle_decode(&mut table, &rid, &token_ids, &self.backend)
+                }
                 DetokMsg::Result { rid, payload } => handle_result(&mut table, &rid, payload),
                 DetokMsg::Fail { rid, message } => {
                     handle_fail(&mut table, &rid, message, &self.abort)
@@ -203,6 +221,27 @@ impl Runnable for DetokenizerWorker {
                 }
             }
         }
+    }
+}
+
+/// The `RequestKind::Detokenize` backend stage: tm-ingress queued this rid's
+/// `Register` just before on this same channel, so the entry exists — deliver
+/// the decoded text (or the error) through the registered sink and drop it,
+/// like a one-result control request. No scheduler abort on failure: this kind
+/// never reaches the ring, so there is nothing to stop.
+fn handle_decode(
+    table: &mut HashMap<Rid, DetokState>,
+    rid: &Rid,
+    token_ids: &[u32],
+    backend: &DetokenizerBackend,
+) {
+    if let Some(mut st) = table.remove(rid) {
+        let item = match backend.decode_once(token_ids) {
+            Ok(text) => EgressItem::Data(text.into()),
+            Err(e) => EgressItem::Error(e),
+        };
+        let _ = st.sink.try_send(item);
+        st.fsm = RequestState::Completed;
     }
 }
 
@@ -461,6 +500,58 @@ mod tests {
         let mut t = "a STOP b STOP".to_string();
         trim_stop_str(&mut t, "STOP", true);
         assert_eq!(t, "a STOP");
+    }
+
+    #[test]
+    fn decode_once_rejects_skip_mode() {
+        let error = DetokenizerBackend::Skip.decode_once(&[1]).unwrap_err();
+        assert!(matches!(error, Error::Validation(_)));
+        assert!(error.to_string().contains("skip_tokenizer_init=True"));
+    }
+
+    /// A `Decode` job answers through the REGISTERED sink and consumes the
+    /// entry — the `RequestKind::Detokenize` egress contract. Uses the `Skip`
+    /// backend, whose decode error must arrive as an `Error` item (not vanish):
+    /// dropping it leaves the submitter awaiting a reply forever. (Unlike
+    /// `handle_fail` there is deliberately no abort lane in the signature —
+    /// this kind never reached the ring, so there is no scheduler work to stop.)
+    #[test]
+    fn decode_answers_via_registered_sink_and_consumes_the_entry() {
+        let (tx, mut rx) = mpsc::channel::<EgressItem>(4);
+        let mut table = HashMap::new();
+        table.insert(
+            Rid::from("d1"),
+            DetokState {
+                sink: EgressSink::Local(tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                decoder: None,
+                fsm: RequestState::Queued,
+            },
+        );
+
+        handle_decode(
+            &mut table,
+            &Rid::from("d1"),
+            &[1],
+            &DetokenizerBackend::Skip,
+        );
+
+        let Ok(EgressItem::Error(err)) = rx.try_recv() else {
+            panic!("the decode error must reach the sink, not vanish");
+        };
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(!table.contains_key(&Rid::from("d1")), "entry consumed");
+
+        // Unregistered rid (raced with an abort's Deregister): nothing to
+        // answer to — must be a no-op, not a panic.
+        handle_decode(
+            &mut table,
+            &Rid::from("d2"),
+            &[1],
+            &DetokenizerBackend::Skip,
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     /// Two requests on the SAME shard keep separate entries. This is what a

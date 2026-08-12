@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels.jit.utils import cache_once, load_jit, override_jit_cuda_arch
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -29,22 +29,21 @@ ROPE_DIM = 64  # qk_rope_head_dim
 def _jit_qprep_bf16_fp8_module() -> Module:
     if torch.cuda.get_device_capability()[0] != 9:
         raise RuntimeError("qprep_bf16_fp8_sm90 requires an SM90 (Hopper) GPU")
-    with override_jit_cuda_arch(9, 0, "a"):
-        return load_jit(
-            "qprep_bf16_fp8_sm90",
-            cuda_files=["qprep_bf16_fp8_sm90/entry.cuh"],
-            cuda_wrappers=[("dispatch", "qprep_bf16_fp8_dispatch")],
-            # Same minimal flag set as the sparse_mla_q8kv8_prefill_sm90 JIT
-            # build (per-flag ablation there showed the rest are no-ops).
-            extra_cuda_cflags=[
-                "-O3",
-                "-DNDEBUG",
-                "-DCUTE_USE_PACKED_TUPLE=1",
-                "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
-                "--use_fast_math",
-            ],
-            extra_dependencies=["cutlass"],
-        )
+    return load_jit(
+        "qprep_bf16_fp8_sm90",
+        cuda_files=["qprep_bf16_fp8_sm90/entry.cuh"],
+        cuda_wrappers=[("dispatch", "qprep_bf16_fp8_dispatch")],
+        # Same minimal flag set as the sparse_mla_q8kv8_prefill_sm90 JIT
+        # build (per-flag ablation there showed the rest are no-ops).
+        extra_cuda_cflags=[
+            "-O3",
+            "-DNDEBUG",
+            "-DCUTE_USE_PACKED_TUPLE=1",
+            "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+            "--use_fast_math",
+        ],
+        extra_dependencies=["cutlass"],
+    )
 
 
 # torch._C._cuda_getCurrentRawStream returns the cudaStream_t pointer expected

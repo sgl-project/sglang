@@ -8,6 +8,9 @@ from unittest.mock import patch
 
 
 class _FakeDBCacheConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
     def reset(self, **kwargs):
         return kwargs
 
@@ -21,8 +24,16 @@ class _FakeForwardPattern:
 
 def _install_cache_dit_stub():
     cache_dit = types.ModuleType("cache_dit")
+    cache_dit.enable_calls = []
+    cache_dit.disable_calls = []
     cache_dit.refresh_calls = []
     cache_dit.steps_mask_calls = []
+
+    def enable_cache(target, **kwargs):
+        cache_dit.enable_calls.append({"target": target, **kwargs})
+
+    def disable_cache(target):
+        cache_dit.disable_calls.append(target)
 
     def refresh_context(transformer, cache_config, verbose=False):
         cache_dit.refresh_calls.append(
@@ -39,6 +50,8 @@ def _install_cache_dit_stub():
         )
         return [1] * total_steps
 
+    cache_dit.enable_cache = enable_cache
+    cache_dit.disable_cache = disable_cache
     cache_dit.refresh_context = refresh_context
     cache_dit.steps_mask = steps_mask
     cache_dit.BlockAdapter = types.SimpleNamespace
@@ -50,9 +63,11 @@ def _install_cache_dit_stub():
     block_adapters = types.ModuleType("cache_dit.caching.block_adapters")
 
     class _FakeBlockAdapterRegister:
-        @staticmethod
-        def is_supported(_transformer):
-            return True
+        supported = True
+
+        @classmethod
+        def is_supported(cls, _transformer):
+            return cls.supported
 
     block_adapters.BlockAdapterRegister = _FakeBlockAdapterRegister
 
@@ -278,6 +293,35 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
             transformer_turbo, has_separate_cfg=False
         )
         self.assertFalse(adapter_turbo.has_separate_cfg)
+
+    def test_minimax_h3_uses_main_blocks_with_hidden_state_pattern(self):
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = blocks
+
+        adapter = module._build_custom_block_adapter(transformer)
+
+        self.assertEqual(adapter.blocks, blocks)
+        self.assertEqual(adapter.forward_pattern, "Pattern_3")
+        self.assertFalse(adapter.has_separate_cfg)
+
+    def test_custom_adapter_is_retained_until_disable(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
+
+        returned = module.enable_cache_on_transformer(transformer, config)
+
+        self.assertIs(returned, transformer)
+        adapter = transformer._sglang_cache_dit_adapter
+        self.assertIs(module.cache_dit.enable_calls[0]["target"], adapter)
+
+        self.assertIs(module.disable_cache_on_transformer(transformer), transformer)
+        self.assertEqual(module.cache_dit.disable_calls, [adapter])
+        self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
 
 
 if __name__ == "__main__":

@@ -94,6 +94,35 @@ class SDPAImpl(AttentionImpl):
         output = output.transpose(1, 2)
         return output
 
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del max_seqlen
+        bounds = (
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else tuple(int(item) for item in cu_seqlens.tolist())
+        )
+        output = torch.empty_like(query)
+        for start, stop in zip(bounds[:-1], bounds[1:]):
+            if start == stop:
+                continue
+            segment = self.forward(
+                query[start:stop].unsqueeze(0),
+                key[start:stop].unsqueeze(0),
+                value[start:stop].unsqueeze(0),
+                None,
+            )
+            output[start:stop].copy_(segment[0])
+        return output
+
 
 class CudnnSDPABackend(SDPABackend):
     @staticmethod
@@ -122,7 +151,7 @@ class DynamicCudnnSDPABackend(SDPABackend):
         return DynamicCudnnSDPAImpl
 
 
-class DynamicCudnnSDPAImpl(AttentionImpl):
+class DynamicCudnnSDPAImpl(SDPAImpl):
     def __init__(
         self,
         num_heads: int,
@@ -140,6 +169,12 @@ class DynamicCudnnSDPAImpl(AttentionImpl):
 
         self.causal = causal
         self.head_size = head_size
+        self._is_sm100 = (
+            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+        )
+        # Set once cuDNN SDPA raised for this layer; permanently pins the
+        # fail-safe FA path so we do not retry a failing kernel every step.
+        self._cudnn_failed = False
         if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
             set_fa_ver(4)
         self.cudnn_impl = CudnnSDPAImpl(
@@ -164,7 +199,7 @@ class DynamicCudnnSDPAImpl(AttentionImpl):
     def _use_cudnn_sdpa(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     ) -> bool:
-        if self.causal:
+        if self.causal or self._cudnn_failed:
             return False
         if query.device.type != "cuda":
             return False
@@ -172,6 +207,11 @@ class DynamicCudnnSDPAImpl(AttentionImpl):
             return False
         if query.shape[2] != key.shape[2]:
             return False
+        if self._is_sm100:
+            # B200/sm_100: cuDNN SDPA measured 1.25-1.5x faster than FA4 CuTe
+            # for dense non-causal diffusion attention, both self-attn
+            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
+            return True
         if query.shape[1] != key.shape[1]:
             return False
         return query.shape[-1] == 64 and query.shape[1] == 1024 and query.shape[0] >= 4
@@ -182,7 +222,21 @@ class DynamicCudnnSDPAImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        **kwargs,
     ) -> torch.Tensor:
-        if self._use_cudnn_sdpa(query, key, value):
-            return self.cudnn_impl.forward(query, key, value, attn_metadata)
-        return self.fa_impl.forward(query, key, value, attn_metadata)
+        # LSE is only produced by the FA impl (e.g. ring attention).
+        if not kwargs.get("return_softmax_lse") and self._use_cudnn_sdpa(
+            query, key, value
+        ):
+            try:
+                return self.cudnn_impl.forward(query, key, value, attn_metadata)
+            except RuntimeError as e:
+                # cuDNN raises "No available kernel" for some shapes; pin the
+                # FA fail-safe path for this layer and keep going.
+                logger.warning(
+                    "cuDNN SDPA failed (%s); falling back to FlashAttention " "for %s.",
+                    e,
+                    type(self).__name__,
+                )
+                self._cudnn_failed = True
+        return self.fa_impl.forward(query, key, value, attn_metadata, **kwargs)
