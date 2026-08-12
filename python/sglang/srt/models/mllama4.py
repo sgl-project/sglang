@@ -623,7 +623,7 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         def permute(w: torch.Tensor, n_heads: int):
             attn_in = self.language_model.config.head_dim * n_heads
-            attn_out = self.language_model.config.hidden_size
+            attn_out = w.shape[-1]
 
             return (
                 w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
@@ -632,15 +632,19 @@ class Llama4ForConditionalGeneration(nn.Module):
             )
 
         modules = name.split(".")
+        # 2D block scales share the weight's row layout. Per-tensor scales stay put.
+        is_permutable = modules[-1] == "weight" or (
+            modules[-1] == "weight_scale" and loaded_weight.dim() == 2
+        )
 
         # rotary embeds should be sliced
-        if ("wk" in modules or "k_proj" in modules) and modules[-1] == "weight":
+        if ("wk" in modules or "k_proj" in modules) and is_permutable:
             if _is_cpu:
                 dim = self.language_model.config.original_total_num_kv_heads
             else:
                 dim = self.language_model.config.num_key_value_heads
             loaded_weight = permute(loaded_weight, dim)
-        elif ("wq" in modules or "q_proj" in modules) and modules[-1] == "weight":
+        elif ("wq" in modules or "q_proj" in modules) and is_permutable:
             if _is_cpu:
                 dim = self.language_model.config.original_num_attention_heads
             else:
@@ -895,6 +899,24 @@ class Llama4ForConditionalGeneration(nn.Module):
             expert_id = int(expert_match.group(1))
             # For scale parameters, we can directly set the value
             param.data[expert_id] = loaded_weight
+        elif loaded_weight.dim() == 3:
+            # Fused scales are [E, in_groups, out], the param is [E, out, in_groups].
+            # Mirror _handle_expert_weight_params so gate/up split and sharding match.
+            _, _, shard_id_list = self._transform_expert_name(name)
+            if ".gate_up_proj" in name:
+                loaded_weight_list = loaded_weight.chunk(2, dim=-1)
+            else:  # down_proj
+                loaded_weight_list = [loaded_weight]
+            weight_loader = param.weight_loader
+            for weight_chunk, shard_id in zip(loaded_weight_list, shard_id_list):
+                for expert_id in range(num_experts):
+                    weight_loader(
+                        param,
+                        weight_chunk[expert_id].T,
+                        transformed_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
         else:
             # No expert ID found - this is a single scale for all experts
             # Load the same scale for all experts
