@@ -51,9 +51,16 @@ on:
         required: false
         type: string
         default: ""
+      full_jit_kernel_tests:
+        description: "Sweep jit_kernel tests over their full parameter grids, the way scheduled suites do. Off matches the per-commit stages, which is what a rerun resolves to when a file is registered on both."
+        required: false
+        type: boolean
+        default: false
 
 # Mirrors _pr-test-stage.yml's env, so a rerun validates what CI actually ran.
-# Where the stage derives a value from its suite, take the widest one here.
+# Where the stage's value depends on the suite, default to the per-commit one --
+# that is the registration a rerun resolves to when a file carries both -- and
+# expose a knob for the scheduled variant.
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_ENABLE_ASYNC_ASSERT: true
@@ -62,9 +69,7 @@ env:
   NCCL_NVLS_ENABLE: "0"
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 300
-  # Scheduled-only in the stage, but a file registered on both a per-commit and
-  # a nightly suite collapses to one rerun, so run the superset.
-  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.full_jit_kernel_tests && '1' || '0' }}
   # Hardware fact rather than a suite property, so it comes from the runner label.
   IS_H200: ${{ inputs.runs_on == '8-gpu-h200' && '1' || '0' }}
   # SGLANG_PRECISION_* stays out: that test pushes to the shared baseline on
