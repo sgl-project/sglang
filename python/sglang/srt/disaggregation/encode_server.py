@@ -92,6 +92,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
 )
 from sglang.srt.utils.common import configure_logger, maybe_reindex_device_id
+from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -341,7 +342,8 @@ class MMEncoder:
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
         self.use_image_processor_gpu = (
-            use_image_processor_gpu and not server_args.disable_fast_image_processor
+            use_image_processor_gpu
+            and resolve_image_processor_backend(server_args) != "pil"
         )
         self._build_vision_config(server_args.mm_process_config)
         self.model_audio_sr = self._resolve_audio_sr()
@@ -606,12 +608,18 @@ class MMEncoder:
         """
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
+        image_processor_backend = resolve_image_processor_backend(server_args)
+        image_processor_kwargs = (
+            {}
+            if image_processor_backend == "auto"
+            else {"backend": image_processor_backend}
+        )
         try:
             self.image_processor = AutoImageProcessor.from_pretrained(
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
+                **image_processor_kwargs,
             )
         except Exception as e:
             logger.warning(f"Failed to load image processor: {e}")
@@ -622,7 +630,6 @@ class MMEncoder:
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
             )
         except Exception as e:
             logger.warning(f"Failed to load video processor: {e}")
@@ -634,7 +641,6 @@ class MMEncoder:
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
             )
             if not hasattr(_audio_proc, "feature_extractor"):
                 logger.warning(
