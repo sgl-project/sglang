@@ -584,21 +584,41 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req.custom_logit_processor, ["processor1", "processor2"])
 
     def test_session_params_handling(self):
-        """Test handling of session_params."""
-        # Test with dict
-        req = GenerateReqInput(
+        shared = GenerateReqInput(
             text=["Hello", "World"], session_params={"id": "session1", "offset": 10}
         )
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.session_params, {"id": "session1", "offset": 10})
+        shared.normalize_batch_and_arguments()
+        self.assertEqual(shared[0].session_params, {"id": "session1", "offset": 10})
+        self.assertEqual(shared[1].session_params, {"id": "session1", "offset": 10})
 
-        # Test with list of dicts
-        req = GenerateReqInput(
+        per_sample = [{"id": "session1"}, {"id": "session2"}]
+        batched = GenerateReqInput(
             text=["Hello", "World"],
-            session_params=[{"id": "session1"}, {"id": "session2"}],
+            sampling_params={"n": 3},
+            session_params=per_sample,
         )
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.session_params, [{"id": "session1"}, {"id": "session2"}])
+        batched.normalize_batch_and_arguments()
+        self.assertEqual(batched.batch_size, 2)
+        self.assertEqual(
+            [batched[i].session_params for i in range(batched.batch_size)], per_sample
+        )
+
+        single = GenerateReqInput(text="Hello", session_params=[{"id": "session1"}])
+        single.normalize_batch_and_arguments()
+        self.assertEqual(single.session_params, {"id": "session1"})
+
+    def test_session_params_validation(self):
+        invalid_cases = [
+            ([], "length must equal"),
+            ([{"id": "session1"}], "length must equal"),
+            ([{"id": "session1"}, "invalid"], "dict or a list of dicts"),
+        ]
+        for session_params, error in invalid_cases:
+            with self.subTest(session_params=session_params):
+                with self.assertRaisesRegex(ValueError, error):
+                    GenerateReqInput(
+                        text=["Hello", "World"], session_params=session_params
+                    ).normalize_batch_and_arguments()
 
     def test_session_id_handling(self):
         req = GenerateReqInput(
