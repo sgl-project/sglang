@@ -35,7 +35,11 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    _drop_bootstrap_session,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -347,6 +351,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        # Deadline for /query_dp_ranks resolution, keyed by bootstrap_room:
+        # a room the prefill never registered resolves to nothing on every
+        # query, with no other timeout armed yet (init() has not run).
+        self._dp_rank_query_first_attempt: Dict[int, float] = {}
+        self._dp_rank_query_timeout: float = (
+            envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+        )
+        # Rooms missing past this grace period force a reconnect through
+        # current address resolution (see _drop_bootstrap_session): a
+        # draining replaced instance presents the expected id with the
+        # replacement's rooms simply absent, so no mismatch ever fires.
+        self._dp_rank_query_fresh_retry_grace: float = self._dp_rank_query_timeout / 2
+        self._dp_rank_query_last_fresh_retry: Dict[str, float] = {}
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -854,6 +871,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     # kv_receiver may be None from a prior self.queue cleanup
                     if decode_req.kv_receiver is not None:
                         decode_req.kv_receiver.abort()
+                        # abort() records a generic AbortReq reason; overwrite
+                        # it so the client sees why (same pattern as
+                        # _fail_prefill_recompute).
+                        self.kv_manager.record_failure(
+                            decode_req.req.bootstrap_room, error_msg
+                        )
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -864,6 +887,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
         if not self.pending_reqs:
+            # This early return must not strand deadline entries for
+            # externally removed requests.
+            self._dp_rank_query_first_attempt = {}
+            self._dp_rank_query_last_fresh_retry = {}
             return
 
         # Group pending requests by bootstrap_addr
@@ -888,22 +915,104 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Pass 2: resolve dp rank for addrs whose info is available
             if need_query:
                 rooms = [decode_req.req.bootstrap_room for decode_req in need_query]
-                room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                    bootstrap_addr, rooms
-                )
-                for decode_req in need_query:
-                    prefill_dp_rank = room_to_rank.get(
-                        str(decode_req.req.bootstrap_room)
+                # Locked read: the heartbeat thread evicts concurrently.
+                with self.kv_manager.connection_lock:
+                    prefill_info = self.kv_manager.prefill_info_table.get(
+                        bootstrap_addr
                     )
+                room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                    bootstrap_addr,
+                    rooms,
+                    expected_instance_id=(
+                        prefill_info.instance_id if prefill_info is not None else None
+                    ),
+                )
+                if room_to_rank is None:
+                    # Persistent id mismatch: the topology snapshot is the
+                    # stale side; evict it — retiring its in-flight rooms,
+                    # which cache-only eviction would leave to the waiting
+                    # timeout — so Pass 1 re-fetches next cycle.
+                    if prefill_info is not None:
+                        self.kv_manager.handle_instance_replacement(
+                            bootstrap_addr,
+                            expected_prefill_info=prefill_info,
+                            detected_by="dp-rank resolution",
+                        )
+                    room_to_rank = {}
+                now = time.monotonic()
+                stale_missing = False
+                for decode_req in need_query:
+                    room = decode_req.req.bootstrap_room
+                    prefill_dp_rank = room_to_rank.get(str(room))
                     if prefill_dp_rank is not None:
                         resolved.append((decode_req, int(prefill_dp_rank)))
-                    else:
+                        continue
+                    first_attempt = self._dp_rank_query_first_attempt.setdefault(
+                        room, now
+                    )
+                    if now - first_attempt <= self._dp_rank_query_timeout:
+                        if now - first_attempt > self._dp_rank_query_fresh_retry_grace:
+                            stale_missing = True
                         remaining.append(decode_req)
+                        continue
+                    error_msg = (
+                        f"Could not resolve prefill dp_rank for bootstrap_room "
+                        f"{room} from {bootstrap_addr} within "
+                        f"{self._dp_rank_query_timeout:.0f}s; the prefill "
+                        "instance that would have registered it was likely "
+                        "replaced. Failing the request so the client can retry."
+                    )
+                    logger.error(error_msg)
+                    # kv_receiver may be None from a prior self.queue cleanup
+                    if decode_req.kv_receiver is not None:
+                        decode_req.kv_receiver.abort()
+                        # abort() records a generic AbortReq reason; overwrite
+                        # it so the client sees why (same pattern as
+                        # _fail_prefill_recompute).
+                        self.kv_manager.record_failure(room, error_msg)
+
+                if stale_missing:
+                    last = self._dp_rank_query_last_fresh_retry.get(bootstrap_addr)
+                    if (
+                        last is None
+                        or now - last >= self._dp_rank_query_fresh_retry_grace
+                    ):
+                        # Rooms stayed missing from id-matching answers --
+                        # the draining-instance case; force a reconnect (see
+                        # _dp_rank_query_fresh_retry_grace).
+                        self._dp_rank_query_last_fresh_retry[bootstrap_addr] = now
+                        _drop_bootstrap_session(bootstrap_addr)
 
         self.pending_reqs = remaining
+        # Deadline and rate-limit state live only as long as something pends.
+        pending_rooms = {decode_req.req.bootstrap_room for decode_req in remaining}
+        self._dp_rank_query_first_attempt = {
+            room: first_attempt
+            for room, first_attempt in self._dp_rank_query_first_attempt.items()
+            if room in pending_rooms
+        }
+        pending_addrs = {_bootstrap_addr(decode_req.req) for decode_req in remaining}
+        self._dp_rank_query_last_fresh_retry = {
+            addr: last
+            for addr, last in self._dp_rank_query_last_fresh_retry.items()
+            if addr in pending_addrs
+        }
 
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
+
+    def _drop_failed_pending_reqs(self, failed_reqs: List[DecodeRequest]) -> None:
+        """Remove externally failed requests together with their resolution
+        deadlines: a request reusing the bootstrap_room before the next
+        resolution pass must not inherit an expired deadline."""
+        failed_ids = {id(r) for r in failed_reqs}
+        self.pending_reqs = [r for r in self.pending_reqs if id(r) not in failed_ids]
+        pending_rooms = {r.req.bootstrap_room for r in self.pending_reqs}
+        self._dp_rank_query_first_attempt = {
+            room: first_attempt
+            for room, first_attempt in self._dp_rank_query_first_attempt.items()
+            if room in pending_rooms
+        }
 
     def pop_preallocated(
         self,
@@ -980,10 +1089,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # DecodeRequest is shared between self.queue and self.pending_reqs;
         # drop failed reqs from both
         if failed_reqs:
-            failed_ids = {id(r) for r in failed_reqs}
-            self.pending_reqs = [
-                r for r in self.pending_reqs if id(r) not in failed_ids
-            ]
+            self._drop_failed_pending_reqs(failed_reqs)
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.

@@ -6,7 +6,9 @@ import dataclasses
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict
+from enum import Enum, auto
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -46,6 +48,14 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+BOOTSTRAP_INSTANCE_ID_HEADER = "X-SGLang-Disaggregation-Instance-ID"
+
+# How long a positive /health instance-id confirmation is trusted before
+# re-probing. Bounds the blocking probes on the scheduler thread; must stay
+# at or below the heartbeat interval (the TTL equals the interval's 2 s
+# floor, so an interval raised via env only widens the safety margin).
+INSTANCE_CONFIRM_TTL_SECONDS = 2.0
+
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
 # so we don't open a fresh TCP connection per query (that churns short-lived
@@ -71,6 +81,22 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
     return session
 
 
+def _drop_bootstrap_session(bootstrap_addr: str) -> None:
+    """Close and forget this thread's keep-alive session for bootstrap_addr.
+
+    During a draining replacement, a kept-alive socket can keep reaching the
+    replaced process while new connections reach its successor, so the old
+    process can keep answering queries (with its own instance id, or with
+    rooms silently missing). Dropping the session forces the next query to
+    reconnect through current address resolution."""
+    sessions = getattr(_bootstrap_sessions, "by_addr", None)
+    if sessions is None:
+        return
+    session = sessions.pop(bootstrap_addr, None)
+    if session is not None:
+        session.close()
+
+
 class KVTransferError(Exception):
     def __init__(
         self,
@@ -87,6 +113,22 @@ class KVTransferError(Exception):
         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
 
 
+class InstanceProbeVerdict(Enum):
+    """Outcome of a /health identity probe against a topology snapshot.
+
+    The two CONFIRMED verdicts carry opposite recovery obligations —
+    CONFIRMED_REPLACED retires the rooms in flight against the snapshot,
+    CONFIRMED_SAME vetoes any eviction — while INCONCLUSIVE (probe error,
+    unhealthy status, or an id disappearing) authorizes at most cache-only
+    invalidation: without a confirmed verdict, retiring every in-flight room
+    at the address would turn an overloaded-but-alive prefill into a mass
+    retry."""
+
+    CONFIRMED_SAME = auto()
+    CONFIRMED_REPLACED = auto()
+    INCONCLUSIVE = auto()
+
+
 @dataclasses.dataclass
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
@@ -98,6 +140,10 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+
+    # Changes when the prefill bootstrap service restarts. Delivered via
+    # response header only: older decodes crash on unknown topology keys.
+    instance_id: Optional[str] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -127,6 +173,12 @@ class PrefillServerInfo:
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
+
+
+# Topology keys added by a newer prefill are dropped, not crashed on.
+_PREFILL_SERVER_INFO_FIELDS = frozenset(
+    field.name for field in dataclasses.fields(PrefillServerInfo)
+)
 
 
 @dataclasses.dataclass
@@ -209,6 +261,10 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        # Serializes request_status transitions. Not connection_lock: the
+        # receiver constructor publishes its initial status while already
+        # holding it (non-reentrant).
+        self.status_lock = threading.Lock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
@@ -247,8 +303,10 @@ class CommonKVManager(BaseKVManager):
             self.required_prefill_response_num_table: Dict[int, int] = {}
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
             self.heartbeat_failures: Dict[str, int] = {}
-            self.session_pool: Dict = defaultdict(requests.Session)
-            self.session_pool_lock = threading.Lock()
+            # bootstrap_addr -> (confirmed instance_id, monotonic deadline).
+            # Scheduler thread inserts (unlocked but safe: entries are keyed
+            # to the confirmed id), eviction pops under connection_lock.
+            self._instance_confirm_cache: Dict[str, Tuple[str, float]] = {}
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
             # Heartbeat interval should be at least 2 seconds
@@ -315,21 +373,28 @@ class CommonKVManager(BaseKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            # Do not resurrect a cleared entry with Failed: once clear() has
-            # popped the room from request_status, any late update_status(Failed)
-            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
-            # pollute a future request that reuses the same bootstrap_room.
-            if status == KVPoll.Failed:
-                return
-            self.request_status[bootstrap_room] = status
-        else:
-            if status == KVPoll.Failed:
+        # One read under status_lock: a Failed landing between an
+        # unsynchronized check and the max() write would be overwritten
+        # (KVPoll.Failed is 0), resurrecting a retired room against
+        # evicted endpoints.
+        with self.status_lock:
+            current = self.request_status.get(bootstrap_room)
+            if current is None:
+                # Do not resurrect a cleared entry with Failed: once clear() has
+                # popped the room from request_status, any late update_status(Failed)
+                # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
+                # pollute a future request that reuses the same bootstrap_room.
+                if status == KVPoll.Failed:
+                    return
+                self.request_status[bootstrap_room] = status
+            elif status == KVPoll.Failed:
                 self.request_status[bootstrap_room] = KVPoll.Failed
+            elif current == KVPoll.Failed:
+                # Failed is terminal for a live entry; only clear()'s pop
+                # resets it.
+                return
             else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
+                self.request_status[bootstrap_room] = max(current, status)
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
@@ -520,7 +585,14 @@ class CommonKVManager(BaseKVManager):
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
-                info = PrefillServerInfo(**data)
+                info = PrefillServerInfo(
+                    **{
+                        k: v
+                        for k, v in data.items()
+                        if k in _PREFILL_SERVER_INFO_FIELDS
+                    }
+                )
+                info.instance_id = response.headers.get(BOOTSTRAP_INSTANCE_ID_HEADER)
             else:
                 logger.error(
                     f"Failed to get prefill server info: {response.status_code}, {response.text}"
@@ -560,6 +632,8 @@ class CommonKVManager(BaseKVManager):
                 )
 
         self._resolve_rank_mapping(info)
+        # Unlocked: only this thread writes here. A pop landing mid-fetch at
+        # worst reinstalls the replaced snapshot for one heartbeat tick.
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
@@ -977,69 +1051,259 @@ class CommonKVManager(BaseKVManager):
                 time.sleep(self.heartbeat_interval)
                 with self.connection_lock:
                     addresses = list(self.prefill_info_table.keys())
-
                 for bootstrap_addr in addresses:
-                    session = None
-                    try:
-                        with self.session_pool_lock:
-                            session = self.session_pool[bootstrap_addr]
-                        response = session.get(
-                            f"http://{bootstrap_addr}/health",
-                            timeout=(2, 3),
-                            headers={"Connection": "keep-alive"},
-                        )
-                        if response.status_code == 200:
-                            self.heartbeat_failures[bootstrap_addr] = 0
-                            self._on_heartbeat_success(bootstrap_addr)
-                        else:
-                            logger.info(
-                                f"Attempting to reconnect to {bootstrap_addr}..."
-                            )
-                            self.heartbeat_failures[bootstrap_addr] = (
-                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                            )
-                    except Exception:
-                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
-                        self.heartbeat_failures[bootstrap_addr] = (
-                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                        )
-
-                    if (
-                        self.heartbeat_failures.get(bootstrap_addr, 0)
-                        >= self.max_failures
-                    ):
-                        self._handle_node_failure(bootstrap_addr)
-                        with self.session_pool_lock:
-                            if bootstrap_addr in self.session_pool:
-                                del self.session_pool[bootstrap_addr]
+                    self._heartbeat_tick(bootstrap_addr)
 
         threading.Thread(target=heartbeat_checker, daemon=True).start()
+
+    def _heartbeat_tick(self, bootstrap_addr: str):
+        """One heartbeat probe of bootstrap_addr. The topology snapshot is
+        captured before the request and every verdict is gated on it: a
+        delayed response or timeout that raced with eviction plus recovery
+        must not indict the freshly installed generation."""
+        with self.connection_lock:
+            prefill_info = self.prefill_info_table.get(bootstrap_addr)
+        try:
+            # Each probe opens a fresh connection: a kept-alive socket keeps
+            # reaching a draining replaced process, which answers with the
+            # expected id and masks the replacement until it exits (see
+            # _drop_bootstrap_session).
+            response = requests.get(
+                f"http://{bootstrap_addr}/health",
+                timeout=(2, 3),
+                headers={"Connection": "close"},
+            )
+            if response.status_code == 200:
+                replaced_info = self._bootstrap_instance_replaced(
+                    prefill_info, response
+                )
+                if replaced_info is not None:
+                    failure_reason = (
+                        "Prefill instance was replaced "
+                        f"(bootstrap_addr: {bootstrap_addr})"
+                    )
+                    logger.warning(
+                        "%s; invalidating cached PD connections", failure_reason
+                    )
+                    self._handle_node_failure(
+                        bootstrap_addr,
+                        failure_reason=failure_reason,
+                        expected_prefill_info=replaced_info,
+                    )
+                    self.heartbeat_failures.pop(bootstrap_addr, None)
+                    return
+                # Success is a verdict too: credit it only while the table
+                # still holds the probed generation.
+                with self.connection_lock:
+                    credited = (
+                        prefill_info is not None
+                        and self.prefill_info_table.get(bootstrap_addr) is prefill_info
+                    )
+                    if credited:
+                        self.heartbeat_failures[bootstrap_addr] = 0
+                        # Hook implementations must stay cheap and lock-free
+                        # (NIXL: no-op; Mooncake: prunes completed rooms).
+                        self._on_heartbeat_success(bootstrap_addr)
+            else:
+                logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                self._record_heartbeat_failure(
+                    bootstrap_addr, prefill_info=prefill_info
+                )
+        except Exception:
+            logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+            self._record_heartbeat_failure(bootstrap_addr, prefill_info=prefill_info)
+
+        if self.heartbeat_failures.get(bootstrap_addr, 0) >= self.max_failures:
+            # With the snapshot gone there is nothing this verdict can indict.
+            if prefill_info is not None:
+                self._handle_node_failure(
+                    bootstrap_addr, expected_prefill_info=prefill_info
+                )
+            self.heartbeat_failures.pop(bootstrap_addr, None)
+
+    def _record_heartbeat_failure(
+        self,
+        bootstrap_addr: str,
+        prefill_info: Optional[PrefillServerInfo],
+    ) -> None:
+        """Charge a failed probe to the generation it was sent to; a miss
+        that raced with eviction plus recovery must not count against the
+        replacement."""
+        with self.connection_lock:
+            if (
+                prefill_info is not None
+                and self.prefill_info_table.get(bootstrap_addr) is prefill_info
+            ):
+                self.heartbeat_failures[bootstrap_addr] = (
+                    self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                )
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""
         pass
 
-    def _handle_node_failure(self, failed_bootstrap_addr: str):
-        """Handle failure of a prefill node."""
-        with self.connection_lock:
-            keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
-            ]
-            # Collect TCP endpoints from cached bootstrap_infos before deletion
-            stale_endpoints = set()
-            for k in keys_to_remove:
-                for info in self.connection_pool[k]:
-                    ip = info.get("rank_ip")
-                    port = info.get("rank_port")
-                    if ip and port:
-                        na = NetworkAddress(ip, int(port))
-                        stale_endpoints.add(na.to_tcp())
-            for k in keys_to_remove:
-                del self.connection_pool[k]
-            self.prefill_info_table.pop(failed_bootstrap_addr, None)
+    def _bootstrap_instance_replaced(
+        self,
+        prefill_info: Optional[PrefillServerInfo],
+        response: requests.Response,
+    ) -> Optional[PrefillServerInfo]:
+        """When a healthy response presents a different instance than the
+        snapshot captured before the request, return that snapshot (the
+        caller's eviction gate), else None. Compared against the pre-request
+        snapshot, not the live table: a delayed response from a replaced
+        instance must not indict a freshly recovered entry. An id appearing
+        over a headerless baseline is a replacement too (there is no
+        upgrade-in-place); only an id disappearing stays inconclusive."""
+        if prefill_info is None:
+            return None
+        observed_instance_id = response.headers.get(BOOTSTRAP_INSTANCE_ID_HEADER)
+        if observed_instance_id and observed_instance_id != prefill_info.instance_id:
+            return prefill_info
+        return None
 
-            possible_affected_rooms = self.addr_to_rooms_tracker.get(
-                failed_bootstrap_addr, []
+    def _probe_bootstrap_instance(
+        self,
+        bootstrap_addr: str,
+        expected_prefill_info: PrefillServerInfo,
+    ) -> InstanceProbeVerdict:
+        """Probe /health and compare the presented identity against the
+        caller's pre-failure topology snapshot (passed in, not re-read from
+        the table: the verdict must anchor to the snapshot the caller's
+        eviction would be gated on). A matching id — including a headerless
+        response over a headerless baseline, the only confirmation such a
+        baseline can ever get — is CONFIRMED_SAME; a healthy response
+        presenting a different id (or an id over a headerless baseline) is
+        CONFIRMED_REPLACED, per _bootstrap_instance_replaced; everything
+        else — probe error, unhealthy status, an id disappearing — is
+        INCONCLUSIVE. CONFIRMED_SAME is cached for
+        INSTANCE_CONFIRM_TTL_SECONDS because the probe blocks the scheduler
+        thread."""
+        expected_instance_id = expected_prefill_info.instance_id
+        cached = self._instance_confirm_cache.get(bootstrap_addr)
+        if (
+            cached is not None
+            and cached[0] == expected_instance_id
+            and time.monotonic() < cached[1]
+        ):
+            return InstanceProbeVerdict.CONFIRMED_SAME
+        try:
+            # Fresh connection on purpose: this must probe current address
+            # resolution, and the pooled sessions belong to the heartbeat
+            # thread.
+            response = requests.get(f"http://{bootstrap_addr}/health", timeout=(2, 3))
+        except Exception:
+            return InstanceProbeVerdict.INCONCLUSIVE
+        if response.status_code != 200:
+            return InstanceProbeVerdict.INCONCLUSIVE
+        if (
+            self._bootstrap_instance_replaced(expected_prefill_info, response)
+            is not None
+        ):
+            return InstanceProbeVerdict.CONFIRMED_REPLACED
+        if response.headers.get(BOOTSTRAP_INSTANCE_ID_HEADER) == expected_instance_id:
+            self._instance_confirm_cache[bootstrap_addr] = (
+                expected_instance_id,
+                time.monotonic() + INSTANCE_CONFIRM_TTL_SECONDS,
+            )
+            return InstanceProbeVerdict.CONFIRMED_SAME
+        return InstanceProbeVerdict.INCONCLUSIVE
+
+    def _evict_connections_locked(self, bootstrap_addr: str) -> set:
+        """Drop the connection_pool entries and topology snapshot for
+        bootstrap_addr. Caller holds connection_lock and disconnects the
+        returned endpoints after releasing it. Keys are
+        "{addr}_{dp}_{cp}_{tp}", hence the "_" delimiter in the prefix match."""
+        keys_to_remove = [
+            key for key in self.connection_pool if key.startswith(f"{bootstrap_addr}_")
+        ]
+        stale_endpoints = set()
+        for key in keys_to_remove:
+            for info in self.connection_pool[key]:
+                ip = info.get("rank_ip")
+                port = info.get("rank_port")
+                if ip and port:
+                    stale_endpoints.add(NetworkAddress(ip, int(port)).to_tcp())
+        for key in keys_to_remove:
+            del self.connection_pool[key]
+        # Per-address verdict state dies with the generation it was
+        # accumulated against.
+        self.prefill_info_table.pop(bootstrap_addr, None)
+        self._instance_confirm_cache.pop(bootstrap_addr, None)
+        self.heartbeat_failures.pop(bootstrap_addr, None)
+        return stale_endpoints
+
+    def invalidate_cached_connections(
+        self,
+        bootstrap_addr: str,
+        expected_prefill_info: Optional[PrefillServerInfo] = None,
+    ) -> None:
+        """Drop cached rank endpoints and the topology snapshot so the next
+        request re-fetches both from the bootstrap server. When
+        expected_prefill_info is given, evict only while the table still holds
+        that exact snapshot: a failure observed against an older generation
+        must not tear down a cache that was already refreshed."""
+        with self.connection_lock:
+            if (
+                expected_prefill_info is not None
+                and self.prefill_info_table.get(bootstrap_addr)
+                is not expected_prefill_info
+            ):
+                return
+            stale_endpoints = self._evict_connections_locked(bootstrap_addr)
+
+        for endpoint in stale_endpoints:
+            CommonKVReceiver.disconnect_endpoint(endpoint)
+
+    def handle_instance_replacement(
+        self,
+        bootstrap_addr: str,
+        expected_prefill_info: Optional[PrefillServerInfo],
+        detected_by: str,
+    ) -> None:
+        """Confirmed-replacement verdict from the query or failure path:
+        evict the cached connections AND retire the rooms in flight against
+        the evicted snapshot, exactly like the heartbeat's replacement
+        verdict. Cache-only invalidation would strand those rooms until the
+        waiting timeout — once the next request publishes the replacement's
+        topology, the heartbeat compares new against new and can never
+        indict them. Only INCONCLUSIVE probe verdicts stay cache-only
+        (see NixlKVReceiver.failure_exception)."""
+        failure_reason = (
+            f"Prefill instance was replaced (bootstrap_addr: {bootstrap_addr}, "
+            f"detected by {detected_by})"
+        )
+        logger.warning("%s; invalidating cached PD connections", failure_reason)
+        self._handle_node_failure(
+            bootstrap_addr,
+            failure_reason=failure_reason,
+            expected_prefill_info=expected_prefill_info,
+        )
+
+    def _handle_node_failure(
+        self,
+        failed_bootstrap_addr: str,
+        failure_reason: Optional[str] = None,
+        expected_prefill_info: Optional[PrefillServerInfo] = None,
+    ):
+        """Handle failure of a prefill node. When expected_prefill_info is
+        given, act only while the table still holds that exact snapshot."""
+        failure_reason = failure_reason or (
+            "Lost connection with prefill instance "
+            f"(bootstrap_addr: {failed_bootstrap_addr})"
+        )
+        with self.connection_lock:
+            if (
+                expected_prefill_info is not None
+                and self.prefill_info_table.get(failed_bootstrap_addr)
+                is not expected_prefill_info
+            ):
+                return
+            stale_endpoints = self._evict_connections_locked(failed_bootstrap_addr)
+
+            # Copy before leaving the lock: other threads mutate these sets,
+            # and set mutation mid-iteration raises RuntimeError.
+            possible_affected_rooms = list(
+                self.addr_to_rooms_tracker.get(failed_bootstrap_addr, ())
             )
             self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
 
@@ -1048,20 +1312,23 @@ class CommonKVManager(BaseKVManager):
 
         affected_rooms = []
         for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != KVPoll.Success
-            ):
-                self.record_failure(
-                    room,
-                    f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
-                )
-                self.update_status(room, KVPoll.Failed)
-                affected_rooms.append(room)
+            # One status_lock section per room: terminal cleanup pops rooms
+            # concurrently, and a check-then-index here would KeyError and
+            # kill the heartbeat thread. The record lands in the same
+            # section (failure_lock nests inside status_lock) so a racing
+            # cleanup cannot strand it for a reused room id.
+            with self.status_lock:
+                status = self.request_status.get(room)
+                if status is None or status == KVPoll.Success:
+                    continue
+                self.request_status[room] = KVPoll.Failed
+                self.record_failure(room, failure_reason)
+            affected_rooms.append(room)
 
         logger.error(
-            f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
-            f"{len(affected_rooms)} requests affected"
+            "%s, %d requests affected",
+            failure_reason,
+            len(affected_rooms),
         )
 
 
@@ -1232,7 +1499,11 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        # Locked pop: an unlocked pop can interleave with update_status's
+        # present-check, letting a late Failed write resurrect the entry the
+        # pop just cleared and pollute a reused bootstrap_room.
+        with self.kv_mgr.status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
@@ -1267,11 +1538,27 @@ class CommonKVReceiver(BaseKVReceiver):
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+        # True when _setup_bootstrap_infos reused connection_pool entries.
+        self._used_cached_bootstrap_infos: bool = False
+        self._aborted: bool = False
+        # None until init(); the failure path may read it before then.
+        self.prefill_info: Optional[PrefillServerInfo] = None
+        # One locked section for both publications: node-failure handling
+        # snapshots-and-pops this set under connection_lock and skips rooms
+        # absent from request_status, so an unlocked add (or a status write
+        # outside the section) leaves a room no retirement can ever reach.
+        with self.kv_mgr.connection_lock:
+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(
+                self.bootstrap_room
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
     def init(self, prefill_dp_rank: int):
-        if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
+        # Single locked read: the heartbeat thread evicts concurrently. The
+        # snapshot is also what the generation-gated eviction anchors to.
+        with self.kv_mgr.connection_lock:
+            prefill_info = self.kv_mgr.prefill_info_table.get(self.bootstrap_addr)
+        if prefill_info is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
                 f"Prefill server with bootstrap_addr: {self.bootstrap_addr} is healthy before, but now it is down. Request (bootstrap_room: {self.bootstrap_room}) has been marked as failed.",
@@ -1281,7 +1568,7 @@ class CommonKVReceiver(BaseKVReceiver):
             return
 
         # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
-        self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
+        self.prefill_info = prefill_info
         self.target_tp_rank = self.prefill_info.target_tp_rank
         self.target_tp_ranks = self.prefill_info.target_tp_ranks
         self.target_cp_ranks = self.prefill_info.target_cp_ranks
@@ -1313,7 +1600,11 @@ class CommonKVReceiver(BaseKVReceiver):
         for target_cp_rank in self.target_cp_ranks:
             bootstrap_key = f"{self.bootstrap_addr}_{self.prefill_dp_rank}_{target_cp_rank}_{self.target_tp_rank}"
 
-            if bootstrap_key not in self.kv_mgr.connection_pool:
+            # Locked read: the heartbeat thread evicts keys concurrently.
+            with self.kv_mgr.connection_lock:
+                cached_bootstrap_infos = self.kv_mgr.connection_pool.get(bootstrap_key)
+
+            if cached_bootstrap_infos is None:
                 bootstrap_infos = []
                 for target_tp_rank in self.target_tp_ranks:
                     # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
@@ -1357,9 +1648,21 @@ class CommonKVReceiver(BaseKVReceiver):
                 # registration does not leave a stale entry that later requests would reuse.
                 if not self._register_kv_args():
                     return
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
+                # Publish under the lock, and only while the table still
+                # holds this receiver's snapshot: a replacement can complete
+                # during the fetch, and publishing then would overwrite the
+                # new generation's endpoints with dead ones.
+                with self.kv_mgr.connection_lock:
+                    if (
+                        self.kv_mgr.prefill_info_table.get(self.bootstrap_addr)
+                        is self.prefill_info
+                    ):
+                        self.kv_mgr.connection_pool[bootstrap_key] = (
+                            self.bootstrap_infos
+                        )
             else:
-                self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
+                self.bootstrap_infos = cached_bootstrap_infos
+                self._used_cached_bootstrap_infos = True
 
             assert len(self.bootstrap_infos) > 0
             all_bootstrap_infos.extend(self.bootstrap_infos)
@@ -1369,42 +1672,127 @@ class CommonKVReceiver(BaseKVReceiver):
     def _get_bootstrap_info_from_server(
         self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
     ):
-        """Fetch the bootstrap info from the bootstrap server."""
+        """Fetch the bootstrap info from the bootstrap server.
+
+        An instance-id mismatch is ambiguous about which side is stale, the
+        keep-alive socket or the topology snapshot, so retry once on the
+        fresh connection the first mismatch forced open (see
+        _drop_bootstrap_session); a second mismatch means the snapshot is
+        the stale side and it is evicted (generation-gated)."""
+        url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
         try:
-            url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
             response = _get_bootstrap_session(self.bootstrap_addr).get(url, timeout=5)
             if response.status_code == 200:
-                bootstrap_info = response.json()
-                bootstrap_info["pp_rank"] = int(target_pp_rank)
-                return bootstrap_info
-            else:
-                logger.error(
-                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                if self._rank_response_matches_instance(response):
+                    bootstrap_info = response.json()
+                    bootstrap_info["pp_rank"] = int(target_pp_rank)
+                    return bootstrap_info
+                response = _get_bootstrap_session(self.bootstrap_addr).get(
+                    url, timeout=5
                 )
-                return None
+                if response.status_code == 200:
+                    if self._rank_response_matches_instance(response):
+                        bootstrap_info = response.json()
+                        bootstrap_info["pp_rank"] = int(target_pp_rank)
+                        return bootstrap_info
+                    self.kv_mgr.handle_instance_replacement(
+                        self.bootstrap_addr,
+                        expected_prefill_info=self.prefill_info,
+                        detected_by="rank endpoint fetch",
+                    )
+                    return None
+            logger.error(
+                f"Failed to get prefill server info: {response.status_code}, {response.text}"
+            )
+            # A draining replaced process can 404 new-topology ranks forever;
+            # don't pin the socket that produced the error.
+            _drop_bootstrap_session(self.bootstrap_addr)
+            return None
         except Exception as e:
             logger.error(f"Error fetching prefill info from bootstrap: {e}")
             return None
 
+    def _rank_response_matches_instance(self, response: requests.Response) -> bool:
+        """Reject a rank answer whose instance id disagrees with the topology
+        snapshot: accepting one from a draining replaced process would cache
+        dead endpoints under the fresh topology (see _drop_bootstrap_session).
+        Both ids absent is a pre-instance-id server -- nothing to compare."""
+        observed_instance_id = response.headers.get(BOOTSTRAP_INSTANCE_ID_HEADER)
+        if observed_instance_id == self.prefill_info.instance_id:
+            return True
+        logger.warning(
+            "Rank endpoint response from %s presents instance %s but the "
+            "topology snapshot came from instance %s; discarding the fetch "
+            "and the keep-alive connection that produced it.",
+            self.bootstrap_addr,
+            observed_instance_id,
+            self.prefill_info.instance_id,
+        )
+        _drop_bootstrap_session(self.bootstrap_addr)
+        return False
+
+    @staticmethod
+    def _dp_rank_response_matches_instance(
+        response: requests.Response,
+        expected_instance_id: Optional[str],
+        bootstrap_addr: str,
+    ) -> bool:
+        """Same contract as _rank_response_matches_instance."""
+        observed_instance_id = response.headers.get(BOOTSTRAP_INSTANCE_ID_HEADER)
+        if observed_instance_id == expected_instance_id:
+            return True
+        logger.warning(
+            "dp_rank query response from %s presents instance %s but the "
+            "topology snapshot came from instance %s; discarding the answer "
+            "and the keep-alive connection that produced it.",
+            bootstrap_addr,
+            observed_instance_id,
+            expected_instance_id,
+        )
+        _drop_bootstrap_session(bootstrap_addr)
+        return False
+
     @staticmethod
     def query_prefill_dp_ranks(
-        bootstrap_addr: str, bootstrap_rooms: List[int]
-    ) -> Dict[str, int]:
-        """Batch query prefill dp_ranks for given bootstrap_rooms."""
+        bootstrap_addr: str,
+        bootstrap_rooms: List[int],
+        expected_instance_id: Optional[str],
+    ) -> Optional[Dict[str, int]]:
+        """Batch query prefill dp_ranks for given bootstrap_rooms.
+
+        The response must present the topology snapshot's instance id: a
+        draining replaced process omits rooms it never registered, and an
+        accepted empty answer would park those requests with no timeout
+        armed. The first mismatch drops the session and the query retries
+        once on the fresh connection; a second mismatch returns None so the
+        caller evicts the stale snapshot. Transient failures return {} and
+        the rooms keep waiting under the caller's resolution deadline."""
+        url = f"http://{bootstrap_addr}/query_dp_ranks"
+        payload = {"bootstrap_rooms": bootstrap_rooms}
         try:
-            url = f"http://{bootstrap_addr}/query_dp_ranks"
             response = _get_bootstrap_session(bootstrap_addr).post(
-                url,
-                json={"bootstrap_rooms": bootstrap_rooms},
-                timeout=5,
+                url, json=payload, timeout=5
             )
             if response.status_code == 200:
-                return response.json()
-            else:
-                logger.error(
-                    f"Failed to query dp_ranks: {response.status_code}, {response.text}"
+                if CommonKVReceiver._dp_rank_response_matches_instance(
+                    response, expected_instance_id, bootstrap_addr
+                ):
+                    return response.json()
+                response = _get_bootstrap_session(bootstrap_addr).post(
+                    url, json=payload, timeout=5
                 )
-                return {}
+                if response.status_code == 200:
+                    if CommonKVReceiver._dp_rank_response_matches_instance(
+                        response, expected_instance_id, bootstrap_addr
+                    ):
+                        return response.json()
+                    return None
+            logger.error(
+                f"Failed to query dp_ranks: {response.status_code}, {response.text}"
+            )
+            # Don't pin the socket that produced an unusable answer.
+            _drop_bootstrap_session(bootstrap_addr)
+            return {}
         except Exception as e:
             logger.error(f"Error querying dp_ranks from bootstrap: {e}")
             return {}
@@ -1489,11 +1877,28 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        # Locked pop: an unlocked pop can interleave with update_status's
+        # present-check, letting a late Failed write resurrect the entry the
+        # pop just cleared and pollute a reused bootstrap_room.
+        with self.kv_mgr.status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        # Failure records survive this base cleanup: Mooncake and Mori
+        # consume theirs only after clear(), so a pop here would misreport
+        # every local failure as propagated. NIXL pops in its override.
+        # Failed rooms have no other exit from the tracker: the only removals
+        # besides this one are the NIXL success-path discard and the
+        # whole-address pop on node failure, so without this a terminally
+        # failed room stays tracked for the address's lifetime. .get(), not
+        # the defaultdict index: cleanup racing that whole-address pop must
+        # not recreate an empty entry for a retired address.
+        tracked_rooms = self.kv_mgr.addr_to_rooms_tracker.get(self.bootstrap_addr)
+        if tracked_rooms is not None:
+            tracked_rooms.discard(self.bootstrap_room)
 
     def abort(self):
+        self._aborted = True
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
@@ -1536,6 +1941,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
+        self.instance_id = uuid.uuid4().hex
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
@@ -1586,7 +1992,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
-        return web.Response(text="OK", status=200)
+        return web.Response(
+            text="OK",
+            status=200,
+            headers={BOOTSTRAP_INSTANCE_ID_HEADER: self.instance_id},
+        )
 
     async def _handle_route(self, request: web.Request):
         method = request.method
@@ -1715,7 +2125,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            payload = dataclasses.asdict(info)
+            del payload["instance_id"]
+            return web.json_response(
+                payload,
+                status=200,
+                headers={BOOTSTRAP_INSTANCE_ID_HEADER: self.instance_id},
+            )
 
         if not self._is_ready():
             return web.Response(
@@ -1737,7 +2153,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=404,
             )
 
-        return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
+        return web.json_response(
+            dataclasses.asdict(bootstrap_info),
+            status=200,
+            headers={BOOTSTRAP_INSTANCE_ID_HEADER: self.instance_id},
+        )
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()
@@ -1760,7 +2180,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 room_int = int(room)
                 if room_int in self.room_to_dp_rank:
                     result[str(room_int)] = self.room_to_dp_rank[room_int]["dp_rank"]
-        return web.json_response(result, status=200)
+        return web.json_response(
+            result,
+            status=200,
+            headers={BOOTSTRAP_INSTANCE_ID_HEADER: self.instance_id},
+        )
 
     async def _cleanup_expired_entries(self):
         """Remove entries older than cleanup interval from room_to_dp_rank."""

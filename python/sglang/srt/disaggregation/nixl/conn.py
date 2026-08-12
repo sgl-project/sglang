@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
+    InstanceProbeVerdict,
     KVTransferError,
 )
 from sglang.srt.disaggregation.common.staging_handler import STAGING_WATERMARK_WAIT_S
@@ -656,13 +657,21 @@ class NixlKVManager(CommonKVManager):
             return
 
         room_infos = self.transfer_infos.get(room, {})
-        needs_staging = any(
-            not tinfo.is_dummy()
-            and tinfo.agent_name in self.decode_kv_args_table
-            and self.decode_kv_args_table[tinfo.agent_name].decode_tp_size
-            != self.attn_tp_size
-            for tinfo in room_infos.values()
-        )
+
+        needs_staging = False
+        for tinfo in room_infos.values():
+            if tinfo.is_dummy():
+                continue
+            # Single get(): the bootstrap thread pops entries concurrently.
+            decode_kv_args = self.decode_kv_args_table.get(tinfo.agent_name)
+            if decode_kv_args is None:
+                # Peer mid-re-registration: leave the room unmarked so the
+                # next chunk re-evaluates, instead of concluding "no staging"
+                # and permanently skipping the STAGING_REQ.
+                return
+            if decode_kv_args.decode_tp_size != self.attn_tp_size:
+                needs_staging = True
+
         if not needs_staging:
             # Mark anyway so we don't re-evaluate the predicate every chunk.
             self._staging_ctx.prefetched_rooms.add(room)
@@ -1154,6 +1163,9 @@ class NixlKVManager(CommonKVManager):
                     if req.is_dummy():
                         continue
 
+                    # Can fire while the bootstrap thread re-registers the
+                    # peer; the worker's blanket handler fails the room and
+                    # the decode's retry re-registers.
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
@@ -1383,6 +1395,9 @@ class NixlKVManager(CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
+                # A last-chunk failure has no later pop; a stranded count
+                # would report a reused room as Transferring forever.
+                self._staging_outstanding.pop(room, None)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1445,15 +1460,46 @@ class NixlKVManager(CommonKVManager):
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         agent_name = decode_kv_args.agent_name
         if agent_name in self.decode_kv_args_table:
-            logger.info(f"Peer {agent_name} was already registered, ignoring.")
-            return
+            if self.agent.check_remote_metadata(agent_name):
+                logger.info(f"Peer {agent_name} was already registered, ignoring.")
+                return
+            # NIXL lost the metadata outside our control; re-register from
+            # scratch rather than keep a dead peer.
+            logger.info(
+                "Peer %s lost its NIXL remote metadata; registering it again.",
+                agent_name,
+            )
+            self._discard_remote_peer(agent_name)
+
         decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
             decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
         )
+        try:
+            self.agent.add_remote_agent(decode_kv_args.agent_metadata)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self._prepare_payload_xfer(decode_kv_args)
+        except Exception:
+            # Do not publish a half-registered peer: the decode's retry after
+            # eviction must not find a dead entry.
+            self._discard_remote_peer(agent_name)
+            raise
         self.decode_kv_args_table[agent_name] = decode_kv_args
-        self.agent.add_remote_agent(decode_kv_args.agent_metadata)
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prepare_payload_xfer(decode_kv_args)
+
+    def _discard_remote_peer(self, agent_name: str) -> None:
+        """Best-effort cleanup for a failed or invalidated NIXL peer. Not
+        synchronized with the transfer threads: the dict pops do not
+        invalidate references a transfer already holds."""
+        self.decode_kv_args_table.pop(agent_name, None)
+        self.prep_handles.pop(agent_name, None)
+        self.prep_handles_slice_dst.pop(agent_name, None)
+        try:
+            self.agent.remove_remote_agent(agent_name)
+        except Exception:
+            logger.debug(
+                "Failed to remove NIXL remote peer %s during cleanup",
+                agent_name,
+                exc_info=True,
+            )
 
     def _send_kvcache_generic(
         self,
@@ -1961,6 +2007,21 @@ class NixlKVManager(CommonKVManager):
                     f"chunk exceeds ring buffer total size "
                     f"(room={kv_chunk.room}). Increase "
                     f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
+                )
+            if (
+                kv_chunk.is_last_chunk
+                and kv_chunk.room not in self._staging_ctx.prefetched_rooms
+            ):
+                # No STAGING_REQ was ever sent (the prefetch bailed while the
+                # peer was re-registering). With the last chunk dequeued
+                # nothing re-runs the prefetch, so re-enqueueing would wait
+                # forever; earlier chunks may still requeue -- a later
+                # chunk's prefetch can cover them.
+                raise RuntimeError(
+                    f"[Staging] No staging request was sent for room "
+                    f"{kv_chunk.room} (the decode peer was re-registering "
+                    "when its chunks were enqueued); failing the room so the "
+                    "retry re-runs the staging prefetch."
                 )
             # Not ready yet: wait (bounded) for a watermark advance, then
             # re-enqueue to retry. A plain block-until-ready would head-of-line
@@ -2656,73 +2717,94 @@ class NixlKVManager(CommonKVManager):
 
         return True
 
+    def _handle_bootstrap_message(self, waiting_req_bytes: List[bytes]) -> None:
+        if not waiting_req_bytes:
+            raise ValueError("Received an empty NIXL bootstrap message")
+
+        logger.debug(
+            "Received multipart with total byte size %d",
+            sum(len(x) for x in waiting_req_bytes),
+        )
+
+        # Staging: decode reports consumption watermark back to prefill
+        if waiting_req_bytes[0] == b"WATERMARK":
+            if self.enable_staging:
+                from sglang.srt.disaggregation.common.staging_handler import (
+                    handle_watermark_msg,
+                )
+
+                handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+            return
+
+        # Staging: decode replies with allocated staging offset
+        if waiting_req_bytes[0] == b"STAGING_RSP":
+            if self.enable_staging:
+                from sglang.srt.disaggregation.common.staging_handler import (
+                    handle_staging_rsp,
+                )
+
+                handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+            return
+
+        if self._handle_abort_notification(waiting_req_bytes):
+            return
+
+        if waiting_req_bytes[0] != GUARD:
+            raise ValueError(f"First message should be {GUARD}. Foreign traffic?")
+        waiting_req_bytes = waiting_req_bytes[1:]
+        room = waiting_req_bytes[0].decode("ascii")
+        agent_name = waiting_req_bytes[3].decode("ascii")
+        if room == "None":
+            # Register new peer and save KV base pointers.
+            self._add_remote_peer(KVArgsRegisterInfo.from_zmq(waiting_req_bytes))
+            logger.debug(f"Register KVArgs from {agent_name} successfully")
+            return
+
+        room = int(room)
+        if room not in self.transfer_infos:
+            self.transfer_infos[room] = {}
+        self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(waiting_req_bytes)
+        required_dst_info_num = self.transfer_infos[room][
+            agent_name
+        ].required_dst_info_num
+        logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
+        if len(self.transfer_infos[room]) == required_dst_info_num:
+            self.resolve_kv_replica_factor(self.transfer_infos[room])
+            self.req_to_decode_prefix_len[room] = next(
+                (
+                    info.decode_prefix_len
+                    for info in self.transfer_infos[room].values()
+                    if info.decode_prefix_len is not None
+                ),
+                0,
+            )
+            logger.debug(f"{room=} is bootstrapped")
+            self.update_status(room, KVPoll.WaitingForInput)
+
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
             while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
-                logger.debug(
-                    f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
-                )
-
-                # Staging: decode reports consumption watermark back to prefill
-                if waiting_req_bytes[0] == b"WATERMARK":
-                    if self.enable_staging:
-                        from sglang.srt.disaggregation.common.staging_handler import (
-                            handle_watermark_msg,
-                        )
-
-                        handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                try:
+                    msg = self.server_socket.recv_multipart()
+                except zmq.ZMQError as e:
+                    if e.errno in (zmq.ETERM, zmq.ENOTSOCK):
+                        # Socket closed during shutdown; exit instead of spinning.
+                        logger.info("NIXL bootstrap socket closed; thread exiting.")
+                        return
+                    # Must not kill the only thread that accepts new peers.
+                    logger.exception("NIXL bootstrap recv failed; retrying.")
+                    time.sleep(0.1)
                     continue
-
-                # Staging: decode replies with allocated staging offset
-                if waiting_req_bytes[0] == b"STAGING_RSP":
-                    if self.enable_staging:
-                        from sglang.srt.disaggregation.common.staging_handler import (
-                            handle_staging_rsp,
-                        )
-
-                        handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                except Exception:
+                    logger.exception("NIXL bootstrap recv failed; retrying.")
+                    time.sleep(0.1)
                     continue
-
-                if self._handle_abort_notification(waiting_req_bytes):
-                    continue
-
-                assert (
-                    waiting_req_bytes[0] == GUARD
-                ), f"First message should be {GUARD}. Foreign traffic?"
-                waiting_req_bytes = waiting_req_bytes[1:]
-                room = waiting_req_bytes[0].decode("ascii")
-                agent_name = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
-                    continue
-                room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
-                )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                if len(self.transfer_infos[room]) == required_dst_info_num:
-                    self.resolve_kv_replica_factor(self.transfer_infos[room])
-                    self.req_to_decode_prefix_len[room] = next(
-                        (
-                            info.decode_prefix_len
-                            for info in self.transfer_infos[room].values()
-                            if info.decode_prefix_len is not None
-                        ),
-                        0,
-                    )
-                    logger.debug(f"{room=} is bootstrapped")
-                    self.update_status(room, KVPoll.WaitingForInput)
+                try:
+                    self._handle_bootstrap_message(msg)
+                except Exception:
+                    # Must not kill the only thread that accepts new peers.
+                    logger.exception("Failed to process NIXL bootstrap message")
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -2943,9 +3025,11 @@ class NixlKVReceiver(CommonKVReceiver):
         # deadline would otherwise lose to the timeout purely by poll ordering.
         self.kv_mgr.update_transfer_status()
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
-            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
-                self.bootstrap_room
-            )
+            # .get(): success racing a whole-address node-failure pop must
+            # not recreate an empty tracker entry for the retired address.
+            tracked_rooms = self.kv_mgr.addr_to_rooms_tracker.get(self.bootstrap_addr)
+            if tracked_rooms is not None:
+                tracked_rooms.discard(self.bootstrap_room)
             self.conclude_state = KVPoll.Success
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
@@ -3047,10 +3131,58 @@ class NixlKVReceiver(CommonKVReceiver):
                 return False
         return True
 
+    def clear(self) -> None:
+        super().clear()
+        # The record must not outlive the room: a confirmed replacement
+        # detected by this room's own probe re-records a failure after
+        # failure_exception consumed the original, and a reused room id
+        # would inherit it. Safe only on NIXL, which consumes the record
+        # before terminal cleanup (Mooncake and Mori consume theirs after).
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+
     def failure_exception(self):
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         is_propagated = failure_reason is None
+        # Invalidate only for failures observed on reused endpoints, and let
+        # /health veto first: a healthy-but-slow prefill presenting the same
+        # instance id must not lose sockets shared with in-flight requests.
+        if (
+            self._used_cached_bootstrap_infos
+            and not self._aborted
+            and not is_propagated
+            and self.prefill_info is not None
+        ):
+            # Gate before the probe: the probe blocks the scheduler thread,
+            # and a burst of stale failures must not serialize probes.
+            with self.kv_mgr.connection_lock:
+                is_current_generation = (
+                    self.kv_mgr.prefill_info_table.get(self.bootstrap_addr)
+                    is self.prefill_info
+                )
+            if is_current_generation:
+                verdict = self.kv_mgr._probe_bootstrap_instance(
+                    self.bootstrap_addr,
+                    expected_prefill_info=self.prefill_info,
+                )
+                if verdict is InstanceProbeVerdict.CONFIRMED_REPLACED:
+                    # Confirmed verdict: evict and retire the rooms in
+                    # flight, which cache-only invalidation would strand
+                    # until the waiting timeout.
+                    self.kv_mgr.handle_instance_replacement(
+                        self.bootstrap_addr,
+                        expected_prefill_info=self.prefill_info,
+                        detected_by="failure-path health probe",
+                    )
+                elif verdict is InstanceProbeVerdict.INCONCLUSIVE:
+                    # Unconfirmed: cache-only, since retiring every room at
+                    # the address would turn an overloaded-but-alive
+                    # prefill into a mass retry.
+                    self.kv_mgr.invalidate_cached_connections(
+                        self.bootstrap_addr,
+                        expected_prefill_info=self.prefill_info,
+                    )
         if is_propagated:
             failure_reason = "NIXL KVReceiver Exception"
         raise KVTransferError(

@@ -31,6 +31,7 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
             exceptions={room: expected_exc},
             failure_records={room: "transfer failed"},
             failure_lock=threading.Lock(),
+            status_lock=threading.Lock(),
         )
 
         with self.assertRaises(RuntimeError) as cm:
