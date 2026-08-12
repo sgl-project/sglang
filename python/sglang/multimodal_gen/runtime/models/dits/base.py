@@ -83,6 +83,17 @@ class BaseDiT(nn.Module, ABC):
         """Run model-specific post-load weight fixups after all parameters are materialized."""
         return None
 
+    def apply_torch_compile(self, *, compile_kwargs: dict[str, Any]) -> None:
+        """Apply ``torch.compile`` to this DiT for inference.
+
+        Default: compile the whole ``forward`` in place. DiTs whose ``forward``
+        contains per-step Python control flow that must stay outside the graph
+        (e.g. Spectrum step-skipping, which reads the forward context) override
+        this to compile only a pure sub-region and keep ``forward`` eager, so
+        the dynamic control flow neither splits nor invalidates the graph.
+        """
+        self.compile(**compile_kwargs)
+
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:
         return self._supported_attention_backends

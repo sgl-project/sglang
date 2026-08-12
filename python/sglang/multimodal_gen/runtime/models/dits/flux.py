@@ -93,6 +93,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.torch_compile import CallableModule
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
@@ -1272,6 +1273,10 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             "single_transformer_blocks",
         ]
 
+        # Set by apply_torch_compile: the block stack compiled as a single
+        # graph. None => run the block stack eagerly (torch.compile disabled).
+        self._compiled_run_blocks: Optional[CallableModule] = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1381,36 +1386,85 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         run_transformer_blocks = (
             self.begin_spectrum_step() if spectrum_enabled else True
         )
+        # The block stack is the sole torch.compile region (see _run_blocks /
+        # apply_torch_compile). The forward-context read and the Spectrum step
+        # decision above stay eager so their per-step Python control flow never
+        # splits or invalidates that graph.
+        run_blocks = (
+            self._run_blocks
+            if self._compiled_run_blocks is None
+            else self._compiled_run_blocks
+        )
         if run_transformer_blocks:
-            for block in self.transformer_blocks:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    freqs_cis=freqs_cis,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                    num_replicated_prefix=num_replicated_prefix,
-                )
-            for block in self.single_transformer_blocks:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    freqs_cis=singles_freqs_cis,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                    num_replicated_prefix=num_replicated_prefix,
-                )
+            hidden_states = run_blocks(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                freqs_cis=freqs_cis,
+                singles_freqs_cis=singles_freqs_cis,
+                joint_attention_kwargs=joint_attention_kwargs,
+                num_replicated_prefix=num_replicated_prefix,
+            )
             if spectrum_enabled:
                 self.spectrum_record_features(hidden_states)
-        else:
-            if spectrum_enabled:
-                hidden_states = self.spectrum_predict_features(hidden_states)
+        elif spectrum_enabled:
+            hidden_states = self.spectrum_predict_features(hidden_states)
 
         hidden_states = self.norm_out(hidden_states, temb)
 
         output, _ = self.proj_out(hidden_states)
 
         return output
+
+    def _run_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        freqs_cis: Optional[torch.Tensor],
+        singles_freqs_cis: Optional[torch.Tensor],
+        joint_attention_kwargs: Optional[Dict[str, Any]],
+        num_replicated_prefix: int,
+    ) -> torch.Tensor:
+        """The dual + single transformer block stack: the torch.compile region.
+
+        Kept free of forward-context reads and Spectrum control flow so it
+        traces to a single graph. Returns the post-block ``hidden_states`` (the
+        Spectrum-cached quantity); the block-threaded ``encoder_hidden_states``
+        is not needed downstream.
+        """
+        for block in self.transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                freqs_cis=freqs_cis,
+                joint_attention_kwargs=joint_attention_kwargs,
+                num_replicated_prefix=num_replicated_prefix,
+            )
+        for block in self.single_transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                freqs_cis=singles_freqs_cis,
+                joint_attention_kwargs=joint_attention_kwargs,
+                num_replicated_prefix=num_replicated_prefix,
+            )
+        return hidden_states
+
+    def apply_torch_compile(self, *, compile_kwargs: dict[str, Any]) -> None:
+        """Compile only the block stack, leaving ``forward`` eager.
+
+        FLUX's ``forward`` reads the forward context and runs the Spectrum step
+        schedule (stateful Python + host syncs). Compiling the whole forward
+        would break the graph mid-way and thrash recompiles as the run/skip
+        decision flips each step, so the compile region is narrowed to the pure
+        block stack (:meth:`_run_blocks`).
+        """
+        runner = CallableModule(self._run_blocks)
+        runner.compile(**compile_kwargs)
+        self._compiled_run_blocks = runner
 
 
 EntryClass = FluxTransformer2DModel
