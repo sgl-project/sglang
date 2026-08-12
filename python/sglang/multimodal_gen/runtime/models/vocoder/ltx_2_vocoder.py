@@ -707,7 +707,7 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
                 else nullcontext()
             )
             with autocast_ctx:
-                waveform = self.vocoder(hidden_states.float())
+                waveform = self.vocoder(hidden_states)
                 length_low_rate = waveform.shape[-1]
                 output_length = (
                     length_low_rate
