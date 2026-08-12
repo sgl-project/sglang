@@ -1136,7 +1136,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, num_chunked_reqs: int):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1215,6 +1215,15 @@ class PrefillAdder:
         ):
             return AddReqResult.OTHER
 
+        # The per-request ceiling composes with the ignore_eos path exactly as
+        # in add_one_req: applied before the chunked/non-chunked split, so a
+        # request under the ceiling still admits whole.
+        chunk_tokens_limit = self.rem_chunk_tokens
+        if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
+            chunk_tokens_limit = min(
+                chunk_tokens_limit, self.long_prefill_token_threshold
+            )
+
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
@@ -1226,8 +1235,8 @@ class PrefillAdder:
 
             self._add_dllm_req(req, 0)
         elif (
-            self.rem_chunk_tokens is None  # chunked prefill is disabled
-            or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+            chunk_tokens_limit is None  # chunked prefill is disabled
+            or cand_extend_input_len <= chunk_tokens_limit  # it is the last chunk
         ):
             if (
                 tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
@@ -1247,11 +1256,20 @@ class PrefillAdder:
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
         else:
-            if self.rem_chunk_tokens <= 0:
+            if chunk_tokens_limit <= 0:
                 return AddReqResult.OTHER
 
+            # This request would be left mid-prefill. The capacity rule is the
+            # same as in add_one_req, and likewise gated on the ceiling so the
+            # disabled path is byte-identical.
+            if (
+                self.long_prefill_token_threshold > 0
+                and num_chunked_reqs >= self.max_concurrent_chunked_reqs
+            ):
+                return AddReqResult.SKIP
+
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = chunk_tokens_limit
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1262,12 +1280,22 @@ class PrefillAdder:
             )
             self.can_run_list.append(req)
             self.new_chunked_reqs.append(req)
+            reserving = self.long_prefill_token_threshold > 0
             self._update_prefill_budget(
                 0,
                 trunc_len,
                 0,
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                # Reserve-to-completion, as in add_one_req: the lifetime
+                # budget carries the whole remaining prefill + decode
+                # headroom from the first chunk on.
+                reserve_total_len=cand_extend_input_len if reserving else None,
+                reserve_max_new_tokens=(
+                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                    if reserving
+                    else None
+                ),
             )
 
         return self.budget_state()
@@ -1295,7 +1323,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, num_chunked_reqs)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which

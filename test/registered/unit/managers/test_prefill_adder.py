@@ -1086,6 +1086,92 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(res, AddReqResult.OTHER)
         self.assertNotIn(req, adder.can_run_list)
 
+    # ---- ceiling composition with the ignore_eos path ----
+    # With the radix cache disabled, ignore_eos requests bypass add_one_req
+    # entirely (add_one_req_ignore_eos). The ceiling, the capacity check, and
+    # the completion reservation must hold there too, or two long ignore_eos
+    # prompts would overflow the mid-prefill capacity and trip the
+    # scheduler's adoption assert.
+
+    def _create_ignore_eos_adder(
+        self, *, kv_tokens, chunk_pool, threshold, capacity
+    ) -> PrefillAdder:
+        self.mock_tree_cache.disable = True
+        return self._create_concurrency_adder(
+            kv_tokens=kv_tokens,
+            chunk_pool=chunk_pool,
+            threshold=threshold,
+            capacity=capacity,
+        )
+
+    def _create_ignore_eos_req(self, rid, num_tokens, max_new_tokens=8):
+        req = self._create_long_req(rid, num_tokens, max_new_tokens)
+        req.sampling_params.ignore_eos = True
+        # add_req_state reads origin_input_ids, an instance attribute the
+        # spec=Req mock does not auto-provide.
+        req.origin_input_ids = list(range(num_tokens))
+        return req
+
+    def test_ignore_eos_chunked_at_ceiling(self):
+        adder = self._create_ignore_eos_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        req = self._create_ignore_eos_req("long", 5000)
+
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
+
+        req.set_extend_range.assert_called_once_with(0, 2048)
+        self.assertIn(req, adder.new_chunked_reqs)
+
+    def test_ignore_eos_under_ceiling_admits_whole(self):
+        adder = self._create_ignore_eos_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        req = self._create_ignore_eos_req("short", 1000)
+
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
+
+        req.set_extend_range.assert_called_once_with(0, 1000)
+        self.assertNotIn(req, adder.new_chunked_reqs)
+
+    def test_ignore_eos_capacity_full_skips(self):
+        adder = self._create_ignore_eos_adder(
+            kv_tokens=1_000_000, chunk_pool=16384, threshold=2048, capacity=2
+        )
+        for i in range(2):
+            req = self._create_ignore_eos_req(f"long{i}", 5000)
+            adder.add_one_req(req, num_chunked_reqs=i, truncation_align_size=None)
+        self.assertEqual(len(adder.new_chunked_reqs), 2)
+
+        third = self._create_ignore_eos_req("long2", 5000)
+        res = adder.add_one_req(third, num_chunked_reqs=2, truncation_align_size=None)
+        self.assertIs(res, AddReqResult.SKIP)
+        self.assertNotIn(third, adder.can_run_list)
+        third.set_extend_range.assert_not_called()
+
+    def test_ignore_eos_reserves_to_completion(self):
+        kv = 20_000
+        adder = self._create_ignore_eos_adder(
+            kv_tokens=kv, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        req = self._create_ignore_eos_req("a", 10_000, max_new_tokens=8)
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
+        self.assertIn(req, adder.new_chunked_reqs)
+        self.assertEqual(adder.rem_total_tokens, kv - 10_009)
+
+    def test_ignore_eos_threshold_disabled_takes_whole_pool(self):
+        # F=0 byte-identity on the ignore_eos path: one request takes the
+        # whole pool, exactly as stock.
+        adder = self._create_ignore_eos_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=0, capacity=1
+        )
+        req = self._create_ignore_eos_req("long", 9000)
+
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
+
+        req.set_extend_range.assert_called_once_with(0, 8192)
+        self.assertIn(req, adder.new_chunked_reqs)
+
 
 if __name__ == "__main__":
     unittest.main()
