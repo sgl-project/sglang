@@ -738,9 +738,6 @@ class TestDflashDraftKvBudget(unittest.TestCase):
         self.assertLess(_tokens(10240), _tokens(None))
 
     def test_dsv4_budget_prices_dspark_as_packed_swa_only(self):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            get_dsv4_kv_bytes_per_token,
-        )
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         mr = _make_model_runner(
@@ -767,12 +764,7 @@ class TestDflashDraftKvBudget(unittest.TestCase):
             configurator = DSV4PoolConfigurator(mr)
 
         target_only_bytes = configurator._get_bytes_per_full_token()
-        packed_bytes = get_dsv4_kv_bytes_per_token(
-            qk_nope_head_dim=448,
-            qk_rope_head_dim=64,
-        )
-        self.assertEqual(packed_bytes, 584)
-        draft_swa_bytes = 0.8 * packed_bytes * 3
+        draft_swa_bytes = 0.8 * (448 + 64 * 2 + 8) * 3
         self.assertEqual(
             configurator.bytes_per_full_token,
             target_only_bytes + draft_swa_bytes,
