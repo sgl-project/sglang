@@ -198,7 +198,7 @@ class TestMediaIdentity(unittest.TestCase):
 
     def test_artifact_key_rejects_lossy_unknown_values(self):
         digest = snapshot_media(b"image").content_digest
-        with self.assertRaisesRegex(TypeError, "Unsupported value"):
+        with self.assertRaisesRegex(ValueError, "Unsupported value"):
             build_artifact_key(
                 digest,
                 modality="image",
@@ -250,6 +250,7 @@ class TestMediaIdentity(unittest.TestCase):
         )
         self.assertNotEqual(build_feature_hash(first, 1), build_feature_hash(second, 1))
         self.assertNotEqual(build_feature_hash(first, 1), build_feature_hash(first, 2))
+        self.assertIsInstance(build_feature_hash(first, 1 << 128), int)
         with self.assertRaises(ValueError):
             build_feature_hash(first, -1)
 
