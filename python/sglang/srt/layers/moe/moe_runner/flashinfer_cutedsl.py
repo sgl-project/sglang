@@ -12,7 +12,10 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    cutedsl_moe_max_num_tokens,
+    get_parallel,
+)
 from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
@@ -256,14 +259,11 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             "Install with: pip install flashinfer"
         ) from e
 
-    from sglang.srt.runtime_context import get_server_args
-
     assert layer.intermediate_size_per_partition > 0, (
         f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
         f"got {layer.intermediate_size_per_partition}. Check EP/TP configuration."
     )
 
-    server_args = get_server_args()
     # CuteDSL wrapper preallocates CG buffers used by any captured graph
     # that routes through this MoE — decode and prefill alike.
     use_cuda_graph = not cuda_graph_fully_disabled()
@@ -277,9 +277,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     else:
         # Standard allgather path: the MoE sees up to dp_size local forwards
         # gathered together, so scale the per-rank forward bound by dp_size.
-        max_num_tokens = (
-            get_parallel().dp_size * server_args.cutedsl_moe_max_num_tokens()
-        )
+        max_num_tokens = get_parallel().dp_size * cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside

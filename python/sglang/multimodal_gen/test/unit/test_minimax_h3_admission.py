@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -14,6 +15,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
@@ -28,7 +32,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     partition_for_task,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args.server_args import Backend
 
 TARGET = {
@@ -208,6 +215,21 @@ def test_video_adapter_lowers_only_native_fields_and_rejects_cfg():
         )
 
 
+@pytest.mark.parametrize("bad_quality", ["ultra", "draft", "", 1])
+def test_video_adapter_rejects_invalid_quality(bad_quality):
+    request = VideoGenerationsRequest(
+        prompt="contract",
+        task="t2va",
+        conditions=[],
+        target=TARGET,
+        quality=bad_quality,
+    )
+    with pytest.raises(ValueError, match="quality must be one of"):
+        MiniMaxH3SamplingParams.lower_video_request_kwargs(
+            request, {"prompt": request.prompt, "seed": request.seed}
+        )
+
+
 class _HopperCapability:
     def to_int(self) -> int:
         return 90
@@ -286,10 +308,36 @@ def test_quality_admission_fails_closed_outside_validated_request():
     batch.sampling_params.quality = "lossless"
     batch.num_inference_steps = 50
     server_args.attention_backend = "sage_attn"
-    with pytest.raises(ValueError, match="does not support SageAttention"):
+    assert stage.forward(batch, server_args) is batch
+
+    batch.sampling_params.quality = "ultra"
+    server_args.attention_backend = None
+    with pytest.raises(ValueError, match="quality must be one of"):
         stage.forward(batch, server_args)
 
-    batch.sampling_params.quality = "unsupported"
-    server_args.attention_backend = None
-    with pytest.raises(ValueError, match="unsupported MiniMax-H3 quality profile"):
-        stage.forward(batch, server_args)
+
+def test_validate_server_args_requires_packed_varlen_backend():
+    config = SimpleNamespace(
+        vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),
+        dit_config=SimpleNamespace(arch_config=SimpleNamespace(attention_head_dim=128)),
+        _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
+    )
+    server_args = SimpleNamespace(
+        component_attention_backends={}, attention_backend="sage_attn"
+    )
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+    ) as get_attn_backend:
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+    get_attn_backend.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.SAGE_ATTN,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend",
+        side_effect=ValueError("does not implement packed varlen attention"),
+    ):
+        with pytest.raises(ValueError, match="does not implement packed varlen"):
+            MiniMaxH3PipelineConfig.validate_server_args(config, server_args)

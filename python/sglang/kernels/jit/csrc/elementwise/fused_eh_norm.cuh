@@ -10,7 +10,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-namespace {
+namespace sglang {
 
 struct FusedEHNormParams {
   const void* __restrict__ embeds;
@@ -110,4 +110,4 @@ struct FusedEHNormKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

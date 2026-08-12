@@ -14,6 +14,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 namespace device::distributed {
 
 // Peer-visible flag increment. `.sys` scope, relaxed: ordering is established by
@@ -66,3 +68,5 @@ SGL_DEVICE void multimem_red_add_release(uint32_t* mc_flag) {
 }
 
 }  // namespace device::distributed
+
+}  // namespace sglang

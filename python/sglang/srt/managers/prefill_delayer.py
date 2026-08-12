@@ -52,9 +52,11 @@ class PrefillDelayer:
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         device: Optional["torch.device"] = "cpu",
         device_group=None,
+        debug_log_enabled: bool = True,
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
+        self._debug_log_enabled = _DEBUG_LOG and debug_log_enabled
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
         # is explicitly set. Additive with the slot-based trigger.
         self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
@@ -358,6 +360,7 @@ class PrefillDelayerSinglePassExecutor:
             actual_execution=actual_prefill,
             output=self._result,
             metrics_collector=self._prefill_delayer._metrics_collector,
+            debug_log_enabled=self._prefill_delayer._debug_log_enabled,
         )
 
     def negotiate_should_allow_prefill(
@@ -384,8 +387,10 @@ def _record_single_pass_result(
     actual_execution: bool,
     output: _NegotiateOutput,
     metrics_collector: Optional["SchedulerMetricsCollector"],
+    *,
+    debug_log_enabled: bool,
 ) -> None:
-    if _DEBUG_LOG:
+    if debug_log_enabled:
         if output.output_allow and (output.output_reason == "wait_timeout"):
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "

@@ -27,6 +27,16 @@ sglang serve \
   --text-encoder-cpu-offload false
 ```
 
+### Optional KV-Cache Compression
+
+Long-running sessions can enable lossy int4 PRQ compression for completed
+causal KV-cache chunks by installing `quant-videogen` as described in the
+quantization guide and adding `--kv-cache-quant int4` to the server command.
+The current and most recent completed chunks remain in BF16. See
+[Causal KV-Cache Quantization](/docs/sglang-diffusion/quantization#causal-kv-cache-quantization)
+for the algorithm, tuning options, measured memory-latency tradeoff, and
+support limits.
+
 ## 3. Realtime WebUI
 
 The lightweight local WebUI is useful for validating latency, frame transport, and camera control behavior.

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
+from sglang.srt.mem_cache.embedding_cache_controller import (
     EmbeddingCacheController,
     EmbeddingCacheEntry,
     EmbeddingPool,
@@ -55,7 +55,7 @@ def _make_controller(num_pages=16, dim=4, page_size=2, enable_eviction=True):
     ctrl.element_size = torch.float32.itemsize
     ctrl.enable_eviction = enable_eviction
     ctrl.max_eviction_batch = 10
-    ctrl.mooncake_store = MagicMock()
+    ctrl.embedding_store = MagicMock()
     ctrl.total_pool_size_bytes = num_pages * page_size * dim * torch.float32.itemsize
     ctrl.vision_pool = _make_pool(num_pages, dim, page_size)
     ctrl.audio_pool = _make_pool(num_pages, dim, page_size, modality="audio")

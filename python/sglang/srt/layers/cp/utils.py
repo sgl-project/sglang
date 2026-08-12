@@ -34,6 +34,7 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
 )
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -219,6 +220,17 @@ def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
     return strategy.shard_position_ids(complete_position_ids, forward_batch)
 
 
+def cp_round_robin_input_ids_v2(input_ids: Any, forward_batch):
+    assert is_cp_v2_active(forward_batch)
+    if not get_moe_a2a_backend().is_none():
+        return cp_shard_hidden_states(input_ids, forward_batch)
+
+    physical_tokens = sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+    padded_input_ids = input_ids.new_zeros(physical_tokens)
+    padded_input_ids[: input_ids.shape[0]] = input_ids
+    return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()
+
+
 def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
     """Gather CP-v2 hidden states at the model boundary when this batch is active."""
     assert is_cp_v2_active(forward_batch)
@@ -226,16 +238,38 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
     assert strategy is not None
 
     if isinstance(x, tuple):
-        hidden_states, *rest = x
-        hidden_states = strategy.gather_hidden_states(
-            hidden_states, forward_batch, stream
+        gathered = tuple(
+            (
+                strategy.gather_hidden_states(item, forward_batch, stream)
+                if item is not None
+                else None
+            )
+            for item in x
         )
         # MiMo's text-only body returns (hidden_states, None); logits expects a tensor.
-        if len(rest) == 1 and rest[0] is None:
-            return hidden_states
-        return (hidden_states, *rest)
+        if len(gathered) == 2 and gathered[1] is None:
+            return gathered[0]
+        return gathered
 
     return strategy.gather_hidden_states(x, forward_batch, stream)
+
+
+def cp_materialize_global_token_order(
+    x: Any, forward_batch, stream: Optional[Any] = None
+):
+    """Materialize a CP tensor in the global logical token order."""
+    if is_cp_v2_active(forward_batch):
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        return strategy.gather_kv_cache(x, forward_batch, stream)
+
+    # TODO(hzh0425): Keep the legacy gather temporarily for CP-v1 compatibility. Remove it
+    # with the follow-up CP-v1 cleanup.
+    from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+
+    return cp_all_gather_rerange_output(
+        x, get_parallel().attn_cp_size, forward_batch, stream
+    )
 
 
 @contextmanager
@@ -293,6 +327,8 @@ __all__ = [
     "get_cp_strategy",
     "is_cp_v2_active",
     "cp_gather_after_forward",
+    "cp_materialize_global_token_order",
+    "cp_round_robin_input_ids_v2",
     "cp_shard_hidden_states",
     "cp_shard_model_inputs",
     "cp_shard_position_ids",

@@ -22,6 +22,8 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 class _ToyAdd(BaseFusedOp):
     op = "test.toy_add"
     priority = (KernelBackend.TRITON, KernelBackend.TORCH)
+    # Auto-selection requires backends to be declared (empty set = any device).
+    capabilities = {KernelBackend.TRITON: frozenset()}
 
     def forward_native(self, a, b):
         return a + b

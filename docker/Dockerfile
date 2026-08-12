@@ -1,18 +1,12 @@
-ARG CUDA_VERSION=13.0.1
+ARG CUDA_VERSION=13.0.3
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
-ARG GRACE_BLACKWELL=0
-ARG HOPPER_SBO=0
-
-ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
-ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
-ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.5
+ARG SGL_KERNEL_VERSION=0.4.6.post1
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.5
+ARG SGL_DEEP_GEMM_VERSION=0.1.5.post2
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
@@ -20,6 +14,9 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.15.post1
+ARG TRTLLM_GEN_MOE_CUBIN_URL="https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip"
+ARG TRTLLM_GEN_MOE_CUBIN_SHA256="4900501cbe782a76b08a5858f9f07152287b97cb68114466dac286366b66c192"
+ARG TRTLLM_GEN_MOE_CUBIN_ARCHIVE_ROOT="trtllm_gen_moe_cubin_pool_20260617_v0613rc1"
 ARG MOONCAKE_VERSION=0.3.12.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
@@ -28,7 +25,8 @@ ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=O
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    FLASHINFER_VERSION=${FLASHINFER_VERSION}
+    FLASHINFER_VERSION=${FLASHINFER_VERSION} \
+    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool
 
 # Add GKE default lib and bin locations
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -75,6 +73,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     build-essential \
     cmake \
     perl \
+    patch \
     patchelf \
     ccache \
     git-lfs \
@@ -160,12 +159,12 @@ ENV LANG=en_US.UTF-8 \
 #
 #   base
 #     |
-#     +-- torch_deps ------> deepep_builder (needs torch)
-#     |                  |-> flashinfer_cache (needs flashinfer)
+#     +-- torch_deps ------> flashinfer_cache (needs flashinfer)
 #     |                  \-> hpc_ops_builder (cmake-only build)
 #     |
 #     +-- devtools_builder (independent)
 #     +-- gateway_builder  (independent, only needs gateway source)
+#     +-- trtllm_cubin_builder (independent)
 #     |
 #     v
 #   framework (combines all artifacts)
@@ -194,19 +193,18 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && case "$CUDA_VERSION" in \
-        12.6.1) CUINDEX=126 ;; \
-        12.8.1) CUINDEX=128 ;; \
-        12.9.1) CUINDEX=129 ;; \
-        13.0.1) CUINDEX=130 ;; \
+        12.6.3) CUINDEX=126 ;; \
+        12.9.2) CUINDEX=129 ;; \
+        13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+    && if [ "$CUDA_VERSION" = "12.6.3" ]; then \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
-    elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+    elif [ "$CUDA_VERSION" = "12.9.2" ]; then \
+        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
-    elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
+    elif [ "$CUDA_VERSION" = "13.0.3" ]; then \
         # --no-deps prevents pip from pulling torch from default PyPI
         python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
     ; \
@@ -224,15 +222,16 @@ COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
 COPY proto                 /tmp/sglang_deps/proto
 
-# Install sglang dependencies (torch, transformers, etc.)
-# Generate constraints.txt to prevent reinstalling these deps in later stages
+# Install sglang dependencies (torch, transformers, etc.). CUDA 12 DeepEP
+# wheels live only on the SGLang index, so preinstall the local-version wheel;
+# it satisfies the public-version pyproject pin during the full dependency solve.
+# Generate constraints.txt to prevent reinstalling these deps in later stages.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/registry \
     case "$CUDA_VERSION" in \
-        12.6.1) CUINDEX=126 ;; \
-        12.8.1) CUINDEX=128 ;; \
-        12.9.1) CUINDEX=129 ;; \
-        13.0.1) CUINDEX=130 ;; \
+        12.6.3) CUINDEX=126 ;; \
+        12.9.2) CUINDEX=129 ;; \
+        13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && cd /tmp/sglang_deps/python \
@@ -241,6 +240,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
+    && SGL_DEEP_EP_VERSION="$(sed -n 's/^[[:space:]]*"sgl-deep-ep==\([^"]*\)",/\1/p' pyproject.toml)" \
+    && test -n "${SGL_DEEP_EP_VERSION}" \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           python3 -m pip install \
+               "sgl-deep-ep==${SGL_DEEP_EP_VERSION}+cu129" \
+               --index-url "https://docs.sglang.ai/whl/cu129/" \
+               --no-deps; \
+       fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' pyproject.toml && \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
@@ -251,7 +258,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-               torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --force-reinstall; \
+               torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --force-reinstall; \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
@@ -263,86 +270,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN python3 -m pip install --ignore-installed --no-deps distro
 
 ########################################################
-# PARALLEL STAGE 2: DeepEP Builder (needs torch_deps)
-########################################################
-FROM torch_deps AS deepep_builder
-
-ARG CUDA_VERSION
-ARG BUILD_AND_DOWNLOAD_PARALLEL
-ARG GRACE_BLACKWELL
-ARG HOPPER_SBO
-ARG HOPPER_SBO_DEEPEP_COMMIT
-ARG DEEPEP_COMMIT
-ARG GITHUB_ARTIFACTORY
-
-WORKDIR /build
-
-# Clone DeepEP
-RUN set -eux; \
-    if [ "$GRACE_BLACKWELL" = "1" ]; then \
-      if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-        git clone https://github.com/fzyzcjy/DeepEP.git && \
-        cd DeepEP && \
-        git checkout gb200_blog_part_2 && \
-        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
-        cd .. ; \
-      else \
-        git clone https://github.com/deepseek-ai/DeepEP.git -b hybrid-ep && \
-        cd DeepEP && \
-        git checkout d28bd676c2120573c9f1425f0c16c39faa4117e6 && \
-        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
-        cd .. ; \
-      fi; \
-    elif [ "$HOPPER_SBO" = "1" ]; then \
-      git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
-      cd DeepEP && \
-      git checkout ${HOPPER_SBO_DEEPEP_COMMIT} && \
-      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-      sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
-      cd .. ; \
-    else \
-        curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
-            https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
-        unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
-        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
-        cd .. ; \
-    fi
-
-# Build DeepEP wheel
-RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /build/DeepEP && \
-    case "$CUDA_VERSION" in \
-        12.6.1) \
-            CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
-            ;; \
-        12.8.1) \
-            CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
-            ;; \
-        12.9.1|13.0.1) \
-            CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
-            ;; \
-        *) \
-            echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
-            ;; \
-    esac && \
-    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-        sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
-    fi && \
-    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} \
-        python3 setup.py bdist_wheel -d /wheels
-
-########################################################
-# PARALLEL STAGE 3: HPC-Ops Builder (needs torch_deps)
+# PARALLEL STAGE 2: HPC-Ops Builder (needs torch_deps)
 ########################################################
 FROM torch_deps AS hpc_ops_builder
 
 # HPC-Ops (https://github.com/Tencent/hpc-ops, MIT): fused attention / MoE /
 # RoPE kernels from the Tencent Hunyuan AI Infra team, consumed by the opt-in
 # hpc_ops attention and MoE runner backends.
-ARG HPC_OPS_COMMIT=6e2ecede9d6d47b2e680e839cc7ad7422bc8d88b
+ARG HPC_OPS_COMMIT=ab1a402724635507037426068f6cddc3d30dc0a8
 
 WORKDIR /build
 
@@ -359,7 +294,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi
 
 ########################################################
-# PARALLEL STAGE 4: FlashInfer Cache (needs torch_deps)
+# PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
 ########################################################
 FROM torch_deps AS flashinfer_cache
 
@@ -370,10 +305,9 @@ ARG FLASHINFER_VERSION
 # Stage jit-cache/cubin artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
-        12.6.1) CUINDEX=126 ;; \
-        12.8.1) CUINDEX=128 ;; \
-        12.9.1) CUINDEX=129 ;; \
-        13.0.1) CUINDEX=130 ;; \
+        12.6.3) CUINDEX=126 ;; \
+        12.9.2) CUINDEX=129 ;; \
+        13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
@@ -467,6 +401,27 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
 
 ########################################################
+# PARALLEL STAGE 6: TRT-LLM Generated-MoE Cubin Pool
+########################################################
+FROM base AS trtllm_cubin_builder
+
+RUN cubin_archive="/tmp/trtllm_gen_moe_cubin_pool.zip" && \
+    cubin_extract_dir="/tmp/trtllm_gen_moe_cubin_extract" && \
+    wget --no-verbose --output-document="${cubin_archive}" \
+      "${TRTLLM_GEN_MOE_CUBIN_URL}" && \
+    echo "${TRTLLM_GEN_MOE_CUBIN_SHA256}  ${cubin_archive}" | \
+      sha256sum --check --strict - && \
+    mkdir -p "${cubin_extract_dir}" && \
+    unzip -q "${cubin_archive}" -d "${cubin_extract_dir}" && \
+    test ! -e "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" && \
+    mv "${cubin_extract_dir}/${TRTLLM_GEN_MOE_CUBIN_ARCHIVE_ROOT}" \
+      "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" && \
+    test "$(find "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" \
+      -type f -name '*.cubin' | wc -l)" -eq 1696 && \
+    rm -f "${cubin_archive}" && \
+    rm -rf "${cubin_extract_dir}"
+
+########################################################
 ########## Final Framework Image ######################
 ########################################################
 #
@@ -477,7 +432,6 @@ FROM torch_deps AS framework
 ARG BRANCH_TYPE
 ARG BUILD_TYPE
 ARG CUDA_VERSION
-ARG BUILD_AND_DOWNLOAD_PARALLEL
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
@@ -491,12 +445,6 @@ WORKDIR /sgl-workspace
 # Copy artifacts from parallel builders
 # =============================================================================
 
-# Copy DeepEP wheel and install
-COPY --from=deepep_builder /wheels /tmp/wheels/deepep
-COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
-
 # Copy HPC-Ops wheel and install (empty on non-x86_64; kernels are sm90a-only)
 COPY --from=hpc_ops_builder /wheels /tmp/wheels/hpc-ops
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -506,6 +454,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
+
+# Apply the FlashInfer CuTeDSL MLA decode-context-parallel runtime patch.
+# Exclude tests because they are not included in the installed wheel.
+COPY docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt /tmp/flashinfer-perkz-dcp-0.6.15.txt
+RUN FLASHINFER_DCP_PATCH=/tmp/flashinfer-perkz-dcp-0.6.15.txt && \
+    FLASHINFER_SITE_PACKAGES="$(python3 -c 'from pathlib import Path; import flashinfer; print(Path(flashinfer.__file__).resolve().parent.parent)')" && \
+    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
+      patch --dry-run --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
+    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
+      patch --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
+    rm -f "${FLASHINFER_DCP_PATCH}" && \
+    rm -rf /root/.cache/flashinfer /root/.cache/pip
+
+# Copy the pinned FlashInfer MXFP4 MoE runner cubin pool
+COPY --from=trtllm_cubin_builder /opt/trtllm_gen_moe_cubin_pool /opt/trtllm_gen_moe_cubin_pool
 
 # Copy dev tools
 COPY --from=devtools_builder /tools/diff-so-fancy /usr/local/bin/
@@ -616,10 +579,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # to avoid shipping wrong-CUDA libs on cu13 images.
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nixl nixl-cu12 --no-deps ; \
-    python3 -m pip install cuda-python==12.9 ; \
+    python3 -m pip install "cuda-python>=12,<13" ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nixl nixl-cu13 --no-deps ; \
-    python3 -m pip install cuda-python==13.2.0 ; \
+    python3 -m pip install "cuda-python>=13,<14" ; \
 fi
 
 # Add yank script
@@ -752,7 +715,7 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
 # PURPOSE: Production runtime environment with JIT support
 #
 # This stage creates a production-ready image containing:
-# - Pre-compiled SGLang and DeepEP components
+# - Pre-installed SGLang and CUDA dependencies
 # - Full CUDA toolchain for JIT compilation (DeepGEMM, Triton, FlashInfer)
 # - Optimized for inference workloads and deployment
 # - Smaller than framework (no dev tools like vim, tmux, nsight, etc.)
@@ -771,7 +734,8 @@ ARG GDRCOPY_VERSION=2.5.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/
+    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
+    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
@@ -856,6 +820,9 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
 
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
+
+# Copy the pinned FlashInfer MXFP4 MoE runner cubin pool
+COPY --from=framework_final /opt/trtllm_gen_moe_cubin_pool /opt/trtllm_gen_moe_cubin_pool
 
 # Copy SGLang workspace
 COPY --from=framework_final /sgl-workspace /sgl-workspace

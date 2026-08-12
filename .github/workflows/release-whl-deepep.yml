@@ -1,0 +1,261 @@
+name: Release sgl-deep-ep
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Public wheel version (for example, 0.1.0 or 0.1.1rc0)"
+        type: string
+        required: true
+      target:
+        description: "CUDA target"
+        type: choice
+        required: false
+        default: "all"
+        options:
+          - "all"
+          - "cu129"
+          - "cu130"
+      packaging-ref:
+        description: "DeepEP ref containing the shared sgl_deep_ep overlay"
+        type: string
+        required: false
+        default: "sgl-deepep-packaging"
+
+concurrency:
+  group: release-sgl-deep-ep
+  cancel-in-progress: false
+
+env:
+  TORCH_VERSION: "2.13.0"
+
+jobs:
+  build-cu129-matrix:
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (inputs.target == 'all' || inputs.target == 'cu129')
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: x64-kernel-build-node
+            source-branch: sgl-deepep-x86
+          - arch: aarch64
+            runner: arm-kernel-build-node
+            source-branch: sgl-deepep-cu12-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Clean workspace
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
+
+      - name: Checkout DeepEP implementation
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: ${{ matrix.source-branch }}
+          path: DeepEP-source
+          submodules: recursive
+
+      - name: Checkout DeepEP packaging overlay
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: ${{ inputs['packaging-ref'] || 'sgl-deepep-packaging' }}
+          path: DeepEP-packaging
+          sparse-checkout: sgl_deep_ep
+
+      - name: Set wheel version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          printf '%s' "${RELEASE_VERSION}" > DeepEP-packaging/sgl_deep_ep/VERSION
+
+      - name: Build wheel
+        run: |
+          chmod +x scripts/build_sgl_deepep.sh DeepEP-packaging/sgl_deep_ep/build_sgl_deep_ep.sh
+          scripts/build_sgl_deepep.sh \
+            "${{ matrix.python-version }}" \
+            "12.9" \
+            "${{ github.workspace }}/DeepEP-source" \
+            "${{ github.workspace }}/DeepEP-packaging/sgl_deep_ep" \
+            "${{ matrix.arch }}"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepep-wheel-cu129-py${{ matrix.python-version }}-${{ matrix.arch }}
+          path: DeepEP-source/dist/*.whl
+          if-no-files-found: error
+
+  build-cu130-matrix:
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (inputs.target == 'all' || inputs.target == 'cu130')
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: x64-kernel-build-node
+            source-branch: sgl-deepep-x86
+          - arch: aarch64
+            runner: arm-kernel-build-node
+            source-branch: sgl-deepep-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Clean workspace
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
+
+      - name: Checkout DeepEP implementation
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: ${{ matrix.source-branch }}
+          path: DeepEP-source
+          submodules: recursive
+
+      - name: Checkout DeepEP packaging overlay
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: ${{ inputs['packaging-ref'] || 'sgl-deepep-packaging' }}
+          path: DeepEP-packaging
+          sparse-checkout: sgl_deep_ep
+
+      - name: Set wheel version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          printf '%s' "${RELEASE_VERSION}" > DeepEP-packaging/sgl_deep_ep/VERSION
+
+      - name: Build wheels
+        run: |
+          chmod +x scripts/build_sgl_deepep.sh DeepEP-packaging/sgl_deep_ep/build_sgl_deep_ep.sh
+          scripts/build_sgl_deepep.sh \
+            "${{ matrix.python-version }}" \
+            "13.0" \
+            "${{ github.workspace }}/DeepEP-source" \
+            "${{ github.workspace }}/DeepEP-packaging/sgl_deep_ep" \
+            "${{ matrix.arch }}"
+
+      - name: Upload CUDA-tagged wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepep-wheel-cu130-py${{ matrix.python-version }}-${{ matrix.arch }}
+          path: DeepEP-source/dist/*.whl
+          if-no-files-found: error
+
+      - name: Upload PyPI wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepep-pypi-cu130-py${{ matrix.python-version }}-${{ matrix.arch }}
+          path: DeepEP-source/dist-pypi/*.whl
+          if-no-files-found: error
+
+  release-whl:
+    needs: [build-cu129-matrix, build-cu130-matrix]
+    if: |
+      always() &&
+      github.repository == 'sgl-project/sglang' &&
+      (
+        (inputs.target == 'cu129' && needs.build-cu129-matrix.result == 'success') ||
+        (inputs.target == 'cu130' && needs.build-cu130-matrix.result == 'success') ||
+        (
+          inputs.target == 'all' &&
+          needs.build-cu129-matrix.result == 'success' &&
+          needs.build-cu130-matrix.result == 'success'
+        )
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
+
+      - name: Download CUDA-tagged wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+          pattern: deepep-wheel-*
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          repository: sgl-project/whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          fail_on_unmatched_files: true
+          files: dist/*.whl
+
+      - name: Clone wheel index
+        env:
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+        run: |
+          git clone --branch gh-pages \
+            "https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git" sgl-whl
+
+      - name: Update wheel indexes
+        run: |
+          if [[ "${{ inputs.target }}" == "all" || "${{ inputs.target }}" == "cu129" ]]; then
+            python3 scripts/update_deepep_whl_index.py --cuda 129
+          fi
+          if [[ "${{ inputs.target }}" == "all" || "${{ inputs.target }}" == "cu130" ]]; then
+            python3 scripts/update_deepep_whl_index.py --cuda 130
+          fi
+
+      - name: Push wheel indexes
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          cd sgl-whl
+          git config --local user.name "sglang-bot"
+          git config --local user.email "sglangbot@gmail.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Wheel indexes are already up to date"
+          else
+            git commit -m "update sgl-deep-ep whl indexes for v${RELEASE_VERSION}"
+            git push origin gh-pages
+          fi
+
+  release-pypi:
+    needs: [build-cu129-matrix, build-cu130-matrix]
+    if: |
+      always() &&
+      github.repository == 'sgl-project/sglang' &&
+      needs.build-cu130-matrix.result == 'success' &&
+      (
+        inputs.target == 'cu130' ||
+        (inputs.target == 'all' && needs.build-cu129-matrix.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download PyPI wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-pypi
+          merge-multiple: true
+          pattern: deepep-pypi-cu130-*
+
+      - name: Upload to PyPI
+        env:
+          TWINE_PASSWORD: ${{ secrets.SGL_DEEP_EP_PYPI_TOKEN }}
+          TWINE_USERNAME: __token__
+        run: |
+          python3 -m pip install --upgrade twine "packaging>=24.2"
+          python3 -m twine upload --skip-existing dist-pypi/*.whl

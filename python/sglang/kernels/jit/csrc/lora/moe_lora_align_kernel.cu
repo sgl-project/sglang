@@ -17,6 +17,8 @@
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
+namespace sglang {
+
 namespace moe {
 
 template <typename scalar_t>
@@ -467,8 +469,6 @@ __global__ void moe_lora_align_block_size_small_batch_expert_kernel(
 
 }  // namespace moe
 
-namespace {
-
 template <typename scalar_t>
 struct MoeLoraAlignBlockSizeKernel {
   static void
@@ -617,4 +617,4 @@ struct MoeLoraAlignBlockSizeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

@@ -29,7 +29,7 @@ def _jit_add3_module() -> Module:
         "add3_bf16",
         *args,
         cuda_files=["elementwise/add3.cuh"],
-        cuda_wrappers=[("run", f"sglang::Add3Kernel<{args}>::launch")],
+        cuda_wrappers=[("run", f"Add3Kernel<{args}>::launch")],
         extra_cuda_cflags=["-O3", "--use_fast_math"],
     )
 

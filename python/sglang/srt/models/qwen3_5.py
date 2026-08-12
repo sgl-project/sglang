@@ -57,6 +57,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import (
+    is_shared_experts_fusion_disabled,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
@@ -137,9 +140,10 @@ cached_get_processor = lru_cache(get_processor)
 
 
 def _disable_shared_experts_fusion() -> bool:
-    # Resolved lazily: the global server args is not set at module import time
-    # (e.g. when this module is imported by unit tests).
-    return get_exec().moe.disable_shared_experts_fusion
+    # Resolved lazily: the flag is written by the owning model's gate before
+    # its layers build (per runner); models without a gate see the config
+    # intent through the accessor's fallback.
+    return is_shared_experts_fusion_disabled()
 
 
 if _is_cuda:
@@ -844,15 +848,20 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
+        # A Qwen3.5 draft is rewritten to the MTP arch (model_config._config_draft_model),
+        # so is_nextn marks it. Drafts are TP-sharded and do not replicate KV under DCP.
+        dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
+        self.kv_tp_size = self.attn_tp_size // dcp_size
+        self.kv_tp_rank = self.attn_tp_rank // dcp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= self.attn_tp_size:
-            assert self.total_num_kv_heads % self.attn_tp_size == 0
+        if self.total_num_kv_heads >= self.kv_tp_size:
+            assert self.total_num_kv_heads % self.kv_tp_size == 0
         else:
-            assert self.attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
+            assert self.kv_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.kv_tp_size)
         self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -882,6 +891,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
+        # Q stays sharded across attention TP ranks; K/V are replicated within
+        # each DCP group.
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
@@ -891,6 +902,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            kv_tp_rank=self.kv_tp_rank,
+            kv_tp_size=self.kv_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -1308,25 +1321,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 f"get_hidden_dim not implemented for {module_name}"
             )
 
-    def _maybe_autodisable_shared_experts_fusion(self, config, quant_config):
-        # Auto-disable fusion when the checkpoint can't fuse (e.g. MXFP4 Qwen3.5)
-        # so the model still gets the #25885 multi-streaming path. ROCm-only.
-        if (
-            config.model_type == "qwen3_5_moe_text"
-            and not get_exec().moe.disable_shared_experts_fusion
-            and not can_fuse_shared_expert(config, quant_config)
-        ):
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "Qwen3_5ForCausalLM._maybe_autodisable_shared_experts_fusion",
-                {"disable_shared_experts_fusion": True},
-            )
-            logger.info(
-                "Qwen3.5: shared-expert fusion not supported for this checkpoint; "
-                "auto-disabling (multi-streaming #25885 still applies)."
-            )
-
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1338,9 +1332,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
-
-        if _is_hip:
-            self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
@@ -1786,9 +1777,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
-        self.is_mrope_enabled = "mrope_section" in rope_config
+        self.is_mrope_enabled = (
+            not self.language_model_only and "mrope_section" in rope_config
+        )
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes if self.visual is not None else []
+        )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
@@ -1944,9 +1939,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
-        self.is_mrope_enabled = "mrope_section" in rope_config
+        self.is_mrope_enabled = (
+            not self.language_model_only and "mrope_section" in rope_config
+        )
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes if self.visual is not None else []
+        )
+
         self.num_fused_shared_experts = 0
         if _use_aiter and not _disable_shared_experts_fusion():
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
@@ -2314,6 +2314,40 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_logical_experts=text_config.num_experts,
             num_groups=None,
         )
+
+
+def _qwen3_5_shared_experts_fusion_disable_reason(hf_config, quant_config):
+    """Why this Qwen3.5 checkpoint cannot fuse its shared expert, or None.
+
+    ROCm-only: an MXFP4 checkpoint cannot fuse, and the model still wants the
+    #25885 multi-streaming path. Asked by the loader before any layer is built,
+    so it resolves the text config itself -- the loader hands over whichever
+    config the entry class takes.
+    """
+    if not _is_hip:
+        return None
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if getattr(text_config, "model_type", None) != "qwen3_5_moe_text":
+        return None
+    if can_fuse_shared_expert(text_config, quant_config):
+        return None
+    return (
+        "Qwen3.5: shared-expert fusion not supported for this checkpoint "
+        "(multi-streaming #25885 still applies)."
+    )
+
+
+# Every class the loader may instantiate for a Qwen3.5 checkpoint answers the
+# fusion question the same way.
+for _entry_class in (
+    Qwen3_5ForCausalLM,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForConditionalGeneration,
+):
+    _entry_class.shared_experts_fusion_disable_reason = staticmethod(
+        _qwen3_5_shared_experts_fusion_disable_reason
+    )
 
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

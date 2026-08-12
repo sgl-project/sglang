@@ -10,19 +10,15 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestResolveMinFreeSlots(unittest.TestCase):
-    """Unit tests for resolve_min_free_slots threshold resolution."""
 
     def test_unset_non_dflash_disables(self):
-        # Unset + not DFlash -> trigger stays disabled.
         self.assertIsNone(resolve_min_free_slots(None, 512, is_dflash_family=False))
 
     def test_unset_dflash_auto_enables(self):
-        # Unset + DFlash -> falls back to the legacy formula (full mapping).
         self.assertEqual(resolve_min_free_slots(None, 512, is_dflash_family=True), 4)
         self.assertEqual(resolve_min_free_slots(None, 8, is_dflash_family=True), 2)
 
     def test_unset_dflash_small_cluster_disables(self):
-        # DFlash auto-default still respects the < 8 guard.
         self.assertIsNone(resolve_min_free_slots(None, 7, is_dflash_family=True))
         self.assertIsNone(resolve_min_free_slots(None, 0, is_dflash_family=True))
 
@@ -31,27 +27,29 @@ class TestResolveMinFreeSlots(unittest.TestCase):
         self.assertIsNone(resolve_min_free_slots(1, 512))
         self.assertIsNone(resolve_min_free_slots(0, 512))
 
-    def test_small_cluster_disables(self):
-        # max_running_requests < 8 disables, matching DFlash.
-        self.assertIsNone(resolve_min_free_slots(4, 7))
+    def test_explicit_value_survives_small_cluster(self):
+        # The < 8 guard belongs to the DFlash auto-default, not explicit values.
+        self.assertEqual(resolve_min_free_slots(4, 7), 4)
+        self.assertEqual(resolve_min_free_slots(4, 7, is_dflash_family=True), 4)
 
-    def test_caps_to_formula(self):
-        # Capped down so it never delays more aggressively than DFlash.
-        self.assertEqual(resolve_min_free_slots(10, 512), 4)
-        self.assertEqual(resolve_min_free_slots(10, 8), 2)  # (8 + 5) // 6 = 2
-
-    def test_respects_smaller_user_value(self):
-        # Below the formula cap is taken as-is.
-        self.assertEqual(resolve_min_free_slots(3, 512), 3)
+    def test_non_dflash_uses_explicit_value(self):
         self.assertEqual(resolve_min_free_slots(2, 8), 2)
+        self.assertEqual(resolve_min_free_slots(3, 512), 3)
+        self.assertEqual(resolve_min_free_slots(8, 512), 8)
+        self.assertEqual(resolve_min_free_slots(16, 512), 16)
+
+    def test_explicit_value_is_capped_to_max_running_requests(self):
+        self.assertEqual(resolve_min_free_slots(16, 8), 8)
 
     def test_user_value_overrides_dflash_default(self):
-        # An explicit user value wins over the DFlash auto-default.
         self.assertEqual(resolve_min_free_slots(3, 512, is_dflash_family=True), 3)
+        self.assertEqual(resolve_min_free_slots(16, 512, is_dflash_family=True), 16)
+
+    def test_explicit_one_disables_dflash_default(self):
+        self.assertIsNone(resolve_min_free_slots(1, 512, is_dflash_family=True))
 
 
 class TestMinFreeSlotsDelayer(unittest.TestCase):
-    """Unit tests for the per-rank local should_delay decision."""
 
     def test_delays_below_threshold(self):
         delayer = MinFreeSlotsDelayer(min_free_slots=4)

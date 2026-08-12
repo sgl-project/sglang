@@ -6,6 +6,7 @@ crate whose Cargo.toml declares
     [package.metadata.sglang]
     python-module = "sglang.srt.<pkg>._core"   # import path inside the wheel
     debug = false                              # optional RustExtension knob
+    features = ["python"]                      # optional cargo features to enable
 
 is built as a PyO3 extension module at that import path. Adding a new extension
 crate therefore needs no pyproject changes — declare the metadata in the crate.
@@ -115,6 +116,9 @@ def _discovered_rust_extensions():
                 path=package["manifest_path"],
                 binding=Binding.PyO3,
                 debug=sglang_meta.get("debug"),
+                # Crates that gate their PyO3 bindings behind a non-default
+                # feature (so the pure-Rust core stays pyo3-free) declare it here.
+                features=sglang_meta.get("features"),
             )
         )
     if not extensions:

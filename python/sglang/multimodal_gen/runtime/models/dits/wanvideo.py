@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -857,9 +858,8 @@ class WanTransformerBlock_VSA(nn.Module):
 
 
 class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = WanVideoConfig()._compile_conditions
-    _supported_attention_backends = WanVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
@@ -1010,6 +1010,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.enable_teacache = (
             forward_batch is not None and forward_batch.enable_teacache
         )
+        enable_spectrum = forward_batch is not None and forward_batch.enable_spectrum
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
@@ -1143,12 +1144,14 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         assert encoder_hidden_states.dtype == orig_dtype
 
         # 4. Transformer blocks
-        # if caching is enabled, we might be able to skip the forward pass
+        run_transformer_blocks = self.begin_spectrum_step()
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
 
-        if should_skip_forward:
+        if enable_spectrum and not run_transformer_blocks:
+            hidden_states = self.spectrum_predict_features(hidden_states)
+        elif should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
         else:
             # if teacache is enabled, we need to cache the original hidden states
@@ -1162,6 +1165,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
+            if enable_spectrum:
+                self.spectrum_record_features(hidden_states)
         self.cnt += 1
 
         if sequence_shard_enabled:

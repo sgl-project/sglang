@@ -63,8 +63,24 @@ message SamplingParams {
   repeated int32 stop_token_ids = 11;
   optional bool ignore_eos = 12;
   optional int32 n = 13;
-  optional string json_schema = 14;
-  optional string regex = 15;
+  optional string json_schema = 14 [deprecated = true];
+  optional string regex = 15 [deprecated = true];
+  optional int64 seed = 16;
+  optional GuidedDecoding guided_decoding = 17;
+}
+
+message GuidedDecoding {
+  oneof constraint {
+    string json_schema = 1;
+    string regex = 2;
+    string ebnf = 3;
+    ChoiceConstraint choice = 4;
+    string structural_tag = 5;
+  }
+}
+
+message ChoiceConstraint {
+  repeated string values = 1;
 }
 
 // ---- Text-based generate (text in, text out) ----
@@ -84,6 +100,9 @@ message TextGenerateRequest {
   map<string, string> trace_headers = 12;
   optional string session_id = 13;
   optional DisaggregatedParams disaggregated_params = 14;
+  optional int32 priority = 15;
+  optional bool require_reasoning = 16;
+  optional uint32 max_thinking_tokens = 17;
 }
 
 message TextGenerateResponse {
@@ -108,6 +127,9 @@ message GenerateRequest {
   map<string, string> trace_headers = 11;
   optional string session_id = 12;
   optional DisaggregatedParams disaggregated_params = 13;
+  optional int32 priority = 14;
+  optional bool require_reasoning = 15;
+  optional uint32 max_thinking_tokens = 16;
 }
 
 message GenerateResponse {

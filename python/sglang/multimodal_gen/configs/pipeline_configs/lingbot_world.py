@@ -14,6 +14,9 @@ import torch
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import DiTConfig
 from sglang.multimodal_gen.configs.models.dits import LingBotWorldVideoConfig
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_I2V_A14B_Config
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
@@ -283,6 +286,9 @@ class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
     preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
         default_factory=lambda: (lingbot_prompt_clean,)
     )
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         kwargs = super().prepare_pos_cond_kwargs(batch, device, rotary_emb, dtype)

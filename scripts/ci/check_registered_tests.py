@@ -4,11 +4,11 @@ Pre-commit hook: validate CI registry calls under test/registered/.
 
 1. Every test file must contain a CI registry call (register_cuda_ci,
    register_amd_ci, etc.).
-2. A CUDA test must register its PR-test suite via the modern
+2. A CUDA test must register its suite via the modern
    `stage=`/`runner_config=` form. The legacy single-string `suite=` is reserved
-   for the nightly/stress/weekly families (and for AMD/CPU/NPU suites); any other
-   CUDA `suite=` resolves to a name no PR-test workflow invokes, so the test
-   silently never runs. Two shapes are rejected:
+   for the stress family (and for AMD/CPU/NPU suites); any other CUDA `suite=`
+   resolves to a name no workflow invokes, so the test silently never runs.
+   Two shapes are rejected:
      a. `{stage}-test-{runner_config}` -- the modern name stuffed back into the
         legacy form. Reported with the exact stage/runner split to use.
      b. an older `{stage}-{runner_config}` PR-test name (e.g. the pre-migration
@@ -33,11 +33,10 @@ import sys
 # shape is always expressible (and should be expressed) the modern way.
 _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 
-# The only suite families a CUDA registry may keep on the legacy single-string
-# `suite=` form. Everything else is a PR-test/base stage that must use the
-# modern stage=/runner_config= form (otherwise its effective_suite matches no
-# suite the PR-test workflows invoke, and the test silently never runs).
-_LEGACY_CUDA_PREFIXES = ("nightly", "stress", "weekly")
+# The only CUDA suite family still allowed on the legacy single-string `suite=`
+# form. Anything else needs stage=/runner_config=, or its effective_suite matches
+# no suite any workflow invokes and the test silently never runs.
+_LEGACY_CUDA_PREFIXES = ("stress",)
 
 
 def _defines_testcase(tree: ast.AST) -> bool:
@@ -118,8 +117,6 @@ def main() -> int:
                 and r.runner_config is None
             ):
                 continue
-            # nightly/stress/weekly are the only CUDA suites allowed to stay on
-            # the legacy single-string form.
             if r.suite.split("-", 1)[0] in _LEGACY_CUDA_PREFIXES:
                 continue
             m = _MODERN_SHAPE.match(r.suite)

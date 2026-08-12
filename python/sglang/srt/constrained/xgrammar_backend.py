@@ -38,6 +38,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_pin_memory_available
 
 _is_hip = is_hip()
 
@@ -58,14 +59,14 @@ MAX_ROLLBACK_TOKENS = 200
 
 
 def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
-    # Always allocate a pinned bitmask so the later H2D to the device can be a
-    # genuine non_blocking copy (a pageable source silently downgrades it to a
-    # blocking copy).
+    # Pin where pinning exists, so the later H2D can be a genuine non_blocking
+    # copy (a pageable source silently downgrades it).  MPS torch has no
+    # pin-memory kernel and asserts on pin_memory=True.
     return torch.full(
         get_bitmask_shape(batch_size, vocab_size),
         -1,
         dtype=bitmask_dtype,
-        pin_memory=True,
+        pin_memory=is_pin_memory_available(),
     )
 
 
@@ -132,6 +133,12 @@ class XGrammarGrammar(BaseGrammarObject):
             import sgl_kernel_npu  # noqa: F401
 
             torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+        elif logits.device.type == "cpu":
+            # Used by the MLX backend, which builds its additive mask rows
+            # on the CPU before inserting them into the lazy graph.
+            from xgrammar import apply_token_bitmask_inplace
+
+            apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 

@@ -18,6 +18,11 @@ from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
 )
+from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+    action_generation_response,
+    action_metadata,
+    build_action_sampling_params,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     VideoGenerationsRequest,
@@ -39,6 +44,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     compute_mrope_position_ids_vision,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    Cosmos3DecodingStage,
     Cosmos3ImagePreprocessStage,
     Cosmos3LatentPreparationStage,
     Cosmos3TimestepPreparationStage,
@@ -54,6 +60,24 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 def _apply(mapping_fn, key):
     """Return (target_key, merge_index, total_splits) for a diffusers weight key."""
     return mapping_fn(key)
+
+
+def _cosmos3_server_args(config=None):
+    return types.SimpleNamespace(
+        model_id=None,
+        model_path="nvidia/Cosmos3-Nano",
+        served_model_name="cosmos3-production",
+        backend=None,
+        pipeline_class_name=None,
+        output_path=None,
+        comfyui_mode=False,
+        num_gpus=1,
+        tp_size=1,
+        sp_degree=1,
+        ulysses_degree=1,
+        ring_degree=1,
+        pipeline_config=config or Cosmos3Config(),
+    )
 
 
 class TestCosmos3ParamNamesMapping(unittest.TestCase):
@@ -328,6 +352,168 @@ class TestCosmos3SamplingParamsDataType(unittest.TestCase):
         params._set_output_file_name()
         self.assertEqual(params.data_type, DataType.VIDEO)
 
+    def test_policy_adjusts_to_action_output(self):
+        params = Cosmos3SamplingParams(
+            prompt="test",
+            action_mode="policy",
+            num_frames=17,
+            image_path="observation.png",
+        )
+
+        params._adjust(_cosmos3_server_args())
+
+        self.assertEqual(params.data_type, DataType.ACTION)
+        self.assertFalse(params.save_output)
+        self.assertFalse(params.return_file_paths_only)
+        self.assertIsNone(params.output_file_name)
+        self.assertEqual(params.num_frames, 17)
+
+    def test_forward_dynamics_remains_video_output(self):
+        params = Cosmos3SamplingParams(
+            prompt="test",
+            action_mode="forward_dynamics",
+            num_frames=17,
+            image_path="observation.png",
+        )
+
+        params._adjust(_cosmos3_server_args())
+
+        self.assertEqual(params.data_type, DataType.VIDEO)
+
+
+class TestCosmos3ActionEndpoint(unittest.TestCase):
+    def test_policy_request_builds_action_sampling_params(self):
+        image = torch.zeros(8, 8, 3, dtype=torch.uint8).numpy()
+        payload = {
+            "request_id": "cosmos-action-1",
+            "input": {
+                "task": "pick up the block",
+                "observation": {
+                    "image": {
+                        "dtype": "uint8",
+                        "shape": [8, 8, 3],
+                        "values": image.tolist(),
+                    }
+                },
+            },
+            "parameters": {
+                "action_mode": "policy",
+                "action_horizon": 16,
+                "domain_name": "droid_lerobot",
+                "num_inference_steps": 30,
+                "height": 480,
+                "width": 832,
+                "fps": 5,
+                "seed": 7,
+            },
+        }
+
+        params = build_action_sampling_params(payload, _cosmos3_server_args())
+
+        self.assertIsInstance(params, Cosmos3SamplingParams)
+        self.assertEqual(params.data_type, DataType.ACTION)
+        self.assertEqual(params.prompt, "pick up the block")
+        self.assertEqual(params.action_mode, "policy")
+        self.assertEqual(params.domain_name, "droid_lerobot")
+        self.assertEqual(params.num_frames, 17)
+        self.assertEqual(params.num_inference_steps, 30)
+        self.assertEqual(params.seed, 7)
+        self.assertEqual(params.image_path.size, (8, 8))
+
+    def test_inverse_dynamics_maps_video_input(self):
+        payload = {
+            "input": {
+                "task": "infer the robot motion",
+                "observation": {"video": "observation.mp4"},
+            },
+            "parameters": {
+                "action_mode": "inverse_dynamics",
+                "num_frames": 61,
+                "domain_name": "av",
+            },
+        }
+
+        params = build_action_sampling_params(payload, _cosmos3_server_args())
+
+        self.assertEqual(params.data_type, DataType.ACTION)
+        self.assertEqual(params.video_path, "observation.mp4")
+        self.assertEqual(params.num_frames, 61)
+
+    def test_forward_dynamics_is_rejected_by_action_endpoint(self):
+        payload = {
+            "input": {
+                "task": "predict the next frames",
+                "observation": {"image": "observation.png"},
+            },
+            "parameters": {"action_mode": "forward_dynamics"},
+        }
+
+        with self.assertRaisesRegex(ValueError, "/v1/videos"):
+            build_action_sampling_params(payload, _cosmos3_server_args())
+
+    def test_metadata_describes_cosmos_action_contract(self):
+        metadata = action_metadata(_cosmos3_server_args())
+
+        self.assertEqual(metadata["model"], "cosmos3-production")
+        self.assertEqual(metadata["policy_family"], "cosmos3")
+        self.assertEqual(metadata["input"]["modalities"], ["image", "video"])
+        self.assertEqual(metadata["output"]["action_horizon"], 16)
+        self.assertEqual(metadata["output"]["padded_action_dim"], 64)
+        self.assertFalse(metadata["capabilities"]["openpi_websocket"])
+
+    def test_action_response_includes_cosmos_metadata(self):
+        output = {
+            "request_id": "cosmos-action-2",
+            "actions": torch.zeros(16, 10).numpy(),
+            "action_mode": "policy",
+            "domain_id": 8,
+            "raw_action_dim": 10,
+            "parameters": {"num_inference_steps": 30},
+        }
+
+        response = action_generation_response(output, _cosmos3_server_args())
+        action = response["data"][0]["action"]
+
+        self.assertEqual(action["shape"], [16, 10])
+        self.assertEqual(action["action_mode"], "policy")
+        self.assertEqual(action["domain_id"], 8)
+        self.assertEqual(action["raw_action_dim"], 10)
+        self.assertEqual(response["usage"]["denoise_steps"], 30)
+
+    def test_action_decode_skips_vae(self):
+        class FailIfDecoded:
+            def decode(self, _latents):
+                raise AssertionError("VAE decode must not run for action output")
+
+        stage = Cosmos3DecodingStage.__new__(Cosmos3DecodingStage)
+        stage.vae = FailIfDecoded()
+        stage.sound_tokenizer = None
+        stage._guardrails = False
+        stage.log_info = lambda *_args, **_kwargs: None
+        batch = types.SimpleNamespace(
+            data_type=DataType.ACTION,
+            action_latents=torch.arange(24, dtype=torch.float32).reshape(1, 4, 6),
+            extra={
+                "raw_action_dim": 3,
+                "action_domain_ids": torch.tensor([8]),
+            },
+            sampling_params=Cosmos3SamplingParams(
+                prompt="test",
+                action_mode="policy",
+                domain_name="droid_lerobot",
+            ),
+            request_id="cosmos-action-3",
+            num_inference_steps=30,
+            num_frames=5,
+            metrics=None,
+        )
+
+        output = stage.forward(batch, types.SimpleNamespace(vae_cpu_offload=False))
+
+        self.assertEqual(output.output[0]["actions"].shape, (4, 3))
+        self.assertEqual(output.output[0]["domain_id"], 8)
+        self.assertEqual(output.action_pred.shape, (1, 4, 3))
+
 
 class TestCosmos3ModelResolution(unittest.TestCase):
     """Verify Cosmos3 checkpoints resolve to the native SGLang pipeline."""
@@ -335,6 +521,7 @@ class TestCosmos3ModelResolution(unittest.TestCase):
     def test_hf_checkpoint_uses_registered_native_pipeline_config(self):
         for model_path in (
             "nvidia/Cosmos3-Nano",
+            "nvidia/Cosmos3-Nano-Policy-DROID",
             "nvidia/Cosmos3-Super",
             "nvidia/Cosmos3-Super-Text2Image",
             "nvidia/Cosmos3-Super-Image2Video",

@@ -12,11 +12,17 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.parser.inkling_tokenizer import (
+    CONTENT_THINKING,
+    END_MESSAGE,
+    INKLING_SPECIAL_TOKEN_IDS,
+)
 from sglang.srt.sampling.custom_logit_processor import (
     CustomLogitProcessor,
     DeepseekOCRNoRepeatNGramLogitProcessor,
     DeepSeekR1ThinkingBudgetLogitProcessor,
     DisallowedTokensLogitsProcessor,
+    InklingThinkingBudgetLogitProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
     _cache_from_str,
 )
@@ -224,20 +230,38 @@ class TestThinkingBudgetLogitProcessor(CustomTestCase):
         self.assertEqual(result[1, self.NL].item(), 0.0)
         self.assertTrue(torch.isinf(result[1, 0]) and result[1, 0] < 0)
 
-    def test_multiple_thinking_start_counts_from_first(self):
-        """Test that budget counts from the first THINKING_START occurrence."""
+    def test_multiple_thinking_start_counts_from_most_recent(self):
+        """Test that budget counts from the most recent THINKING_START occurrence."""
         req = _make_req(
             origin_input_ids=[self.START, 100, 101],
             output_ids=[self.START, 200, 201],  # second START in output
         )
         # cur_ids = [START, 100, 101, START, 200, 201]
-        # First START at index 0, tokens_after_start = 5
-        # Budget=10 → 5 < 10 → no modification
-        params = [{"thinking_budget": 10, "__req__": req}]
+        # Most recent START at index 3, tokens_after_start = 2
+        # Budget=4 → 2 < 4 → no modification (index 0 would have given 5)
+        params = [{"thinking_budget": 4, "__req__": req}]
         logits = self._logits()
         original = logits.clone()
         result = self.processor(logits, params)
         self.assertTrue(torch.equal(result, original))
+
+    def test_inkling_end_token_in_prompt_does_not_disable_budget(self):
+        proc = InklingThinkingBudgetLogitProcessor()
+        start, end = proc.THINKING_START_TOKEN_ID, proc.THINKING_END_TOKEN_ID
+        self.assertEqual(start, INKLING_SPECIAL_TOKEN_IDS[CONTENT_THINKING])
+        self.assertEqual(end, INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE])
+
+        req = _make_req(
+            origin_input_ids=[100, end, 101, end],
+            output_ids=[start] + [100] * 5,
+        )
+        params = [{"thinking_budget": 5, "__req__": req}]
+        for forced_token in (proc.NEW_LINE_TOKEN_ID, end):
+            result = proc(torch.zeros(1, end + 1), params)
+            self.assertEqual(
+                torch.isfinite(result[0]).nonzero().flatten().tolist(), [forced_token]
+            )
+            req.output_ids.append(forced_token)
 
     def test_deepseek_r1_variant_forces_end(self):
         """Test DeepSeekR1 variant with its own token IDs."""

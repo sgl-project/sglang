@@ -39,7 +39,8 @@ class DraftBackendFactory:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.seed_dsa_topk_from_draft_extend = seed_dsa_topk_from_draft_extend
-        self.draft_attn_backend = server_args.speculative_draft_attention_backend
+        # The draft runner's own backend, not the process-wide config.
+        self.draft_attn_backend = draft_model_runner.draft_attention_backend
 
     def _create_backend(
         self, backend_name: str, backend_map: dict, error_template: str

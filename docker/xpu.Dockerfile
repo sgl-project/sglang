@@ -17,14 +17,40 @@ ARG SG_LANG_KERNEL_BRANCH=main
 
 USER root
 
-# Install the latest UMD driver for SYCL-TLA
-RUN apt-get update && apt-get install -y software-properties-common && \
+# Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
+# Keep in lockstep with the host xe KMD; override via --build-arg.
+ARG COMPUTE_RUNTIME_VERSION=26.05.37020.3
+ARG IGC_VERSION=2.28.4+20760
+ARG GMM_VERSION=22.9.0
+RUN apt-get update && apt-get install -y software-properties-common curl && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
     apt-get update && \
+    # Loader + media/metrics from the PPA; the GPU driver is pinned below.
     apt-get install -y \
-        libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
+        libze1 intel-metrics-discovery clinfo intel-gsc \
         intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
-        libze-dev intel-ocloc && \
+        libze-dev && \
+    cd /tmp && \
+    igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}" && \
+    cr_url="https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}" && \
+    # IGC first: libze-intel-gpu1 / intel-opencl-icd depend on its exact version.
+    curl -fsSL -O "${igc_url}/intel-igc-core-2_${IGC_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${igc_url}/intel-igc-opencl-2_${IGC_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libigdgmm12_${GMM_VERSION}_amd64.deb" && \
+    apt-get install -y --allow-downgrades \
+        ./intel-igc-core-2_${IGC_VERSION}_amd64.deb \
+        ./intel-igc-opencl-2_${IGC_VERSION}_amd64.deb \
+        ./libigdgmm12_${GMM_VERSION}_amd64.deb \
+        ./libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
+        ./intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
+        ./intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb && \
+    rm -f /tmp/*.deb && \
+    # Hold so later apt upgrades can't pull the rolling PPA version back.
+    apt-mark hold libze-intel-gpu1 intel-opencl-icd intel-ocloc libigdgmm12 \
+        intel-igc-core-2 intel-igc-opencl-2 && \
     rm -rf /var/lib/apt/lists/*
 
 

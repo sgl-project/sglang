@@ -50,13 +50,12 @@ class TestStep3p5FlashChainMTP(GSM8KMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.83
     gsm8k_accept_length_thres = 2.6
 
-    def test_logprob_spec_v2_match(self):
-        """Verify spec v2 decode logprobs match prefill scoring logprobs.
+    def test_logprob_decode_match_prefill(self):
+        """Decode logprobs from the spec path must match prefill scoring.
 
-        Generate tokens with chain MTP spec v2, then score the same sequence
-        via prefill-only (no speculation). The two sets of logprobs should be
-        close, validating that spec v2 + multi-layer EAGLE computes logprobs
-        correctly.
+        Generate tokens with chain MTP, then score the same sequence via
+        prefill-only (no speculation). The two sets of logprobs should be
+        close, validating that multi-layer EAGLE computes logprobs correctly.
         """
         requests.get(self.base_url + "/flush_cache")
 

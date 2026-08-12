@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 GLM5_MODEL = "zai-org/GLM-5.2-FP8"
 GLM5_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=900, suite="nightly-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=690, stage="nightly", runner_config="8-gpu-h200")
 
 
 class AccuracyTwoPassMixin:
@@ -104,7 +104,8 @@ class AccuracyTwoPassMixin:
             )
             self.assertLessEqual(
                 diff,
-                self.max_accuracy_diff,
+                # Allow floating-point noise at the exact threshold (e.g. 0.98 - 0.96).
+                self.max_accuracy_diff + 1e-12,
                 f"{name} accuracy diff {diff:.3f} exceeds max {self.max_accuracy_diff} "
                 f"(pass1={acc1:.3f}, pass2={acc2:.3f})",
             )
@@ -175,6 +176,14 @@ class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
                 "page_first",
                 "--hicache-storage-backend",
                 "file",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
             ],
             env={
                 "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
@@ -223,6 +232,14 @@ class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
                 "page_first",
                 "--hicache-storage-backend",
                 "file",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
             ],
             env={
                 "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,

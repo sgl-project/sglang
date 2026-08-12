@@ -278,6 +278,8 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(cur_batch)
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         cur_batch,

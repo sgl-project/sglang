@@ -20,6 +20,9 @@ class TboAttnBackend(AttentionBackend):
         # reads through TboAttnBackend resolve to the underlying pool.
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            primary, "extend_dummy_seqs_capped_by_req_pool", False
+        )
 
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):

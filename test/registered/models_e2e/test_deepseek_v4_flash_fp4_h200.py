@@ -7,7 +7,7 @@ plus a GSM8K accuracy gate.
 Also covers SGLANG_DSV4_FP4_DEQUANT=1 (TP=8): FP4 experts dequantized to FP8
 during loading and served through the plain FP8 MoE path.
 
-Registry: base-c-test-deepep-8-gpu-h200 (per-commit, 8x H200)
+Registry: base-c-test-8-gpu-h200 (per-commit, 8x H200)
 """
 
 import unittest
@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=600, stage="base-c", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=600, stage="base-c", runner_config="8-gpu-h200")
 
 
 def _flashinfer_has_sm90_cutlass_mxfp4() -> bool:

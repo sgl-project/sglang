@@ -32,6 +32,8 @@
 // exactly one consumer. Anything cute already provides goes through cute
 // (`set_block_rank` below, the tensor-map driver wrapper in `w_maps`).
 
+namespace sglang {
+
 namespace ptx {
 
 // ---- generic → shared address conversion (PTX ISA §10.4) --------------------
@@ -1356,6 +1358,8 @@ struct Launcher {
 
 }  // namespace oproj_ar
 
+}  // namespace sglang
+
 // ================= sglang tvm-ffi adapter =================
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
@@ -1368,6 +1372,8 @@ struct Launcher {
 #include <array>
 #include <mutex>
 #include <unordered_map>
+
+namespace sglang {
 
 namespace oproj_ar_ffi {
 
@@ -1567,3 +1573,5 @@ struct GemmArKernel {
 }  // namespace oproj_ar_ffi
 
 using oproj_ar_ffi::GemmArKernel;
+
+}  // namespace sglang

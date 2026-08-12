@@ -85,7 +85,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.v_head_dim = model_runner.model_config.v_head_dim
-        self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim

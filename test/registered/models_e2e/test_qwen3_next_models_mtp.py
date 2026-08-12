@@ -7,7 +7,7 @@ from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=430, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=290, stage="base-c", runner_config="4-gpu-h100")
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
@@ -69,6 +69,11 @@ class TestQwen3NextMTPTopk(
     ]
 
 
+@unittest.skip(
+    "Manual-only: topk == 1 is covered by TestQwen3NextMTPLazyV2 and extra_buffer "
+    "by TestQwen3NextMTPTopk. Kept runnable locally for the plain (topk=1, "
+    "extra_buffer) baseline."
+)
 class TestQwen3NextMTPV2(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
     model = QWEN3_NEXT_MODEL
     gsm8k_accuracy_thres = 0.93

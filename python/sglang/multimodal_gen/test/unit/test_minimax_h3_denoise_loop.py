@@ -182,7 +182,7 @@ def test_rank_local_token_tags_match_reference_slice():
             for rank in range(world_size):
                 with patch(
                     "sglang.multimodal_gen.runtime.pipelines_core.stages."
-                    "model_specific_stages.minimax_h3.denoise_loop._ulysses_ctx",
+                    "model_specific_stages.minimax_h3.denoise_loop.get_ulysses_ctx",
                     return_value=(world_size, rank),
                 ):
                     branch = _branch(mode, token_tags=token_tags)

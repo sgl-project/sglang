@@ -23,7 +23,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
     raise_error_or_warn,
@@ -49,7 +49,6 @@ class SchedulerInvariantChecker:
     full_tokens_per_layer: Optional[int]
     swa_tokens_per_layer: Optional[int]
     max_total_num_tokens: int
-    server_args: ServerArgs
     tree_cache: BasePrefixCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     req_to_token_pool: ReqToTokenPool
@@ -106,7 +105,7 @@ class SchedulerInvariantChecker:
             total = self.max_total_num_tokens
         full_evictable_size = ps.full_evictable_size
         allocator = self.token_to_kv_pool_allocator
-        if getattr(self.server_args, "dcp_size", 1) > 1 and allocator.page_size > 1:
+        if get_parallel().dcp_enabled and allocator.page_size > 1:
             # DCP stores logical tokens in widened physical pages.  Prefix cache
             # counters are logical-token based, while the allocator frees whole
             # physical pages, so round cached tokens up to physical page units.
@@ -124,11 +123,7 @@ class SchedulerInvariantChecker:
             total,
             uncached,
         )
-        if (
-            leak
-            and getattr(self.server_args, "dcp_size", 1) > 1
-            and allocator.page_size > 1
-        ):
+        if leak and get_parallel().dcp_enabled and allocator.page_size > 1:
             # Radix/Mamba cache accounting is logical-token based while DCP full
             # KV allocation is physical-page based. Partial physical pages can
             # leave a small page-level slack even when all pages are owned by

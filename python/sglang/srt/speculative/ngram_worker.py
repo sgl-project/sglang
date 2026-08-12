@@ -84,6 +84,8 @@ class NGRAMWorker(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         self.server_args = server_args
         self.enable_overlap = not server_args.disable_overlap_schedule
         self._target_worker = target_worker

@@ -42,6 +42,10 @@ class CausalSelfAttentionKVCache:
         if self.attention_window_size == 0:
             self.attention_window_size = self.cache_size
 
+    @property
+    def num_cache_heads(self) -> int:
+        return self.k.shape[2]
+
     def reset_indices(self) -> None:
         self.global_end_index.zero_()
         self.local_end_index.zero_()

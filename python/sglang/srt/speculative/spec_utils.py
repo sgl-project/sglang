@@ -46,7 +46,13 @@ from sglang.srt.mem_cache.allocation import (
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_spec,
+    mamba_extra_buffer_enabled,
+    mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -250,16 +256,14 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
     record_stream_each(candidates, fwd_stream)
 
 
-def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
-    if server_args is None:
-        server_args = get_server_args()
-
+def spec_need_hidden_states() -> bool:
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
     # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
+    spec = get_spec()
+    if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
-    return not server_args.enable_multi_layer_eagle
+    return not spec.enable_multi_layer_eagle
 
 
 @torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
@@ -348,7 +352,7 @@ def select_top_k_tokens(
     )
 
 
-def _sample_simulated_acc_len(
+def sample_simulated_acc_len(
     simulate_acc_len: float,
     simulate_acc_method: str,
     max_len: int,
@@ -401,7 +405,7 @@ def generate_simulated_accept_index(
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
-    simulate_acc_len = _sample_simulated_acc_len(
+    simulate_acc_len = sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
     )
 
@@ -761,11 +765,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
     """
-    server_args = get_server_args()
-    if not server_args.enable_mamba_extra_buffer():
+    if not mamba_extra_buffer_enabled():
         return
     track_positions = None
-    if server_args.enable_mamba_extra_buffer_lazy():
+    if mamba_extra_buffer_lazy_enabled():
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
         assert track_positions is not None and len(track_positions) == len(
             batch.reqs
@@ -935,8 +938,70 @@ def commit_mamba_states_after_verify(
         # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
         # a device-side force-flush so `temporal` reflects the ring before a
         # snapshot; not wired for Part B (server_args forbids extra_buffer with
-        # --enable-gdn-replayssm-spec), so the per-track scatters are intentionally
+        # --enable-linear-replayssm-spec), so the per-track scatters are intentionally
         # skipped here.
+        return
+
+    # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
+    # for the OUTPUT, so we replay the accepted window into the fp32 checkpoint
+    # (`temporal`) here on commit -- `temporal` is always the current committed
+    # state. The draft window's raw inputs were written to the ring during verify
+    # by the KDA backend. Gate on the fold flag + is_kda (the cursor tensors are
+    # never allocated under fold, so they cannot serve as the signal).
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "replayssm_spec_fold", False)
+        and getattr(mamba_pool, "replayssm_is_kda", False)
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+            commit_kda_replayssm_after_verify,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        bs = accept_lens.shape[0]
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        accept_indices_offset = torch.arange(
+            0,
+            bs * draft_token_num,
+            step=draft_token_num,
+            dtype=accept_lens.dtype,
+            device=accept_lens.device,
+        )
+        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+        last_correct_step_indices = (
+            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+            - accept_indices_offset
+        )
+        # extra_buffer: the interval-crossing step whose state must snapshot into
+        # the track ping-pong slot (mirrors the regular commit's
+        # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
+        # `temporal` stays current and no device-side force-flush is needed.
+        mamba_track_indices = batch.mamba_track_indices
+        mamba_steps_to_track = None
+        if mamba_track_indices is not None:
+            ti = get_exec().mamba.mamba_track_interval
+            seq_pre = batch.seq_lens
+            seq_post = batch.seq_lens + accept_lens
+            to_track_mask = seq_pre // ti != seq_post // ti
+            tracking_point = seq_post // ti * ti
+            to_track_ith = torch.clamp(tracking_point - seq_pre - 1, min=0).to(
+                torch.int64
+            )
+            candidate = accept_index[req_idx, to_track_ith] - accept_indices_offset
+            mamba_steps_to_track = torch.where(
+                to_track_mask, candidate, torch.full_like(candidate, -1)
+            )
+        commit_kda_replayssm_after_verify(
+            spec_state=spec_state,
+            state_batch_indices=state_batch_indices,
+            accept_lens=accept_lens,  # incl. bonus token
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+        )
         return
 
     attn_backend = model_runner.attn_backend
@@ -965,12 +1030,11 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    server_args = get_server_args()
-    if server_args.enable_mamba_extra_buffer_lazy():
+    if mamba_extra_buffer_lazy_enabled():
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             get_exec().mamba.mamba_track_interval,
-            server_args.max_speculative_num_draft_tokens,
+            max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)

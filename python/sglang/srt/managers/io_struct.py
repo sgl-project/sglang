@@ -262,6 +262,11 @@ class GenerateReqInput:
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
+    # Deprecated alias for `routed_dp_rank`, still accepted because
+    # sgl-model-gateway's dp-aware mode injects this spelling into every
+    # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
+    # entrypoints and Engine.generate() accept it as well.
+    data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
@@ -276,6 +281,9 @@ class GenerateReqInput:
     background: bool = False
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
+    # Per-request thinking budget. Requires strict thinking so the runtime can
+    # enforce the limit rather than silently treating it as metadata.
+    max_thinking_tokens: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -356,6 +364,18 @@ class GenerateReqInput:
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        if self.data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.routed_dp_rank is None:
+                self.routed_dp_rank = self.data_parallel_rank
+            self.data_parallel_rank = None
+
         self._validate_inputs()
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
@@ -813,6 +833,8 @@ class GenerateReqInput:
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
+            require_reasoning=self.require_reasoning,
+            max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
@@ -1149,6 +1171,7 @@ class EmbeddingReqInput:
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
+                priority=self.priority,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
                 multi_item_delimiter_indices=(
@@ -1176,6 +1199,7 @@ class EmbeddingReqInput:
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
+                priority=self.priority,
                 dimensions=self.dimensions,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
@@ -2248,7 +2272,10 @@ def unwrap_from_pickle(obj: Optional[object]) -> Optional[object]:
         return None
     if _USE_PICKLE_IPC:
         return obj
-    assert isinstance(obj, PickleWrapper)
+    if not isinstance(obj, PickleWrapper):
+        # Already materialized: the embedded Rust server attaches in-process
+        # objects (native-MM `mm_inputs`) without a pickle hop.
+        return obj
     return pickle.loads(obj.data)
 
 

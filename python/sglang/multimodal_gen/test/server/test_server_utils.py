@@ -65,6 +65,17 @@ FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 80.0
 DECODING_STAGE_MIN_ABS_TOLERANCE_MS = 450.0
 VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 160.0
 
+
+def is_missing_diffusers_pipeline_error(message: str) -> bool:
+    """Return whether a server startup error is caused by a missing diffusers pipeline."""
+    normalized_message = message.lower()
+    return (
+        "not found in diffusers" in normalized_message
+        or "module 'diffusers' has no attribute" in normalized_message
+        or 'module "diffusers" has no attribute' in normalized_message
+    )
+
+
 # Tracks mesh output file paths from generate_mesh for later correctness validation.
 # Keyed by case_id, cleaned up after use.
 MESH_OUTPUT_PATHS: dict[str, str] = {}

@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 # Use a longer timeout than the default 600s.
 NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 
-register_cuda_ci(est_time=7200, suite="nightly-eval-vlm-2-gpu", nightly=True)
+register_cuda_ci(est_time=7200, stage="nightly", runner_config="2-gpu-large")
 
 MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples, especially for latency thresholds

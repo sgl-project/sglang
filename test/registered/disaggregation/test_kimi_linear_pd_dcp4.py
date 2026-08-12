@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1200, suite="nightly-8-gpu-b200", nightly=True)
+register_cuda_ci(est_time=450, stage="nightly", runner_config="8-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 PHYSICAL_PAGE_SIZE = 64

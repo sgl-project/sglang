@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    use_vae_fast_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -250,7 +253,22 @@ class DecodingStage(PipelineStage):
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
-                decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
+                try:
+                    decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
+                except Exception as error:
+                    if "out of memory" in str(error).lower():
+                        if not server_args.pipeline_config.vae_tiling:
+                            logger.warning(
+                                "OOM detected during VAE decoding. Please enable "
+                                "--vae-tiling to reduce peak memory usage."
+                            )
+                        else:
+                            logger.warning(
+                                "OOM detected during VAE decoding with tiling enabled. "
+                                "Please reduce the resolution or enable "
+                                "--vae-cpu-offload."
+                            )
+                    raise
                 image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range
@@ -297,34 +315,35 @@ class DecodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
+            with use_vae_fast_path(vae, batch.sampling_params.quality == "high"):
+                frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
 
-            # decode trajectory latents if needed
-            if batch.return_trajectory_decoded:
-                assert (
-                    batch.trajectory_latents is not None
-                ), "batch should have trajectory latents"
+                # decode trajectory latents if needed
+                if batch.return_trajectory_decoded:
+                    assert (
+                        batch.trajectory_latents is not None
+                    ), "batch should have trajectory latents"
 
-                # 1. Batch trajectory decoding to improve GPU utilization
-                # batch.trajectory_latents is [batch_size, timesteps, channels, frames, height, width]
-                B, T, C, F, H, W = batch.trajectory_latents.shape
-                flat_latents = batch.trajectory_latents.view(B * T, C, F, H, W)
+                    # 1. Batch trajectory decoding to improve GPU utilization
+                    # batch.trajectory_latents is [batch_size, timesteps, channels, frames, height, width]
+                    B, T, C, F, H, W = batch.trajectory_latents.shape
+                    flat_latents = batch.trajectory_latents.view(B * T, C, F, H, W)
 
-                logger.info("decoding %s trajectory latents in batch", B * T)
-                # Use the optimized batch decode
-                all_decoded = self.decode(
-                    flat_latents, server_args, vae_dtype=vae_dtype
-                )
+                    logger.info("decoding %s trajectory latents in batch", B * T)
+                    # Use the optimized batch decode
+                    all_decoded = self.decode(
+                        flat_latents, server_args, vae_dtype=vae_dtype
+                    )
 
-                # 2. Reshape back
-                # Keep on GPU to allow faster vectorized post-processing
-                decoded_tensor = all_decoded.view(B, T, *all_decoded.shape[1:])
+                    # 2. Reshape back
+                    # Keep on GPU to allow faster vectorized post-processing
+                    decoded_tensor = all_decoded.view(B, T, *all_decoded.shape[1:])
 
-                # Convert to list of tensors (per timestep) as expected by OutputBatch
-                # Each element in list is [B, channels, frames, H_out, W_out]
-                trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
-            else:
-                trajectory_decoded = None
+                    # Convert to list of tensors (per timestep) as expected by OutputBatch
+                    # Each element in list is [B, channels, frames, H_out, W_out]
+                    trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
+                else:
+                    trajectory_decoded = None
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
 
@@ -337,6 +356,7 @@ class DecodingStage(PipelineStage):
             trajectory_decoded=trajectory_decoded,
             metrics=batch.metrics,
             noise_pred=None,
+            usage=batch.usage,
         )
 
         return output_batch

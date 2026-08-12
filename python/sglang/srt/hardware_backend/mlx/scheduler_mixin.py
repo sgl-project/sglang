@@ -17,23 +17,20 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, List, Optional
 
 import mlx.core as mx
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import DynamicGradMode
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.mlx.model_runner import (
-        MlxPendingDecode,
-        MlxPendingExtend,
-        MlxPendingPrefill,
-    )
+    from sglang.srt.hardware_backend.mlx.tp_worker import MlxLaunch
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -43,23 +40,10 @@ class MlxPendingJob:
     """Unfinished MLX work and graphs queued on the GPU.
 
     Attributes:
-        lazy_tokens: Lazily evaluated token IDs produced by the forward
-            pass.  Unevaluated; calling ``.tolist()`` / ``.item()`` /
-            ``mx.eval`` on it will block until the Metal kernel finishes.
-            ``None`` for idle batches.
-        prefills: MLX prefill state returned by the model worker — one
-            entry per new request in an extend batch.  Used by
-            ``finalize_mlx_result`` to commit per-request caches.  Empty
-            list for pure-decode steps.
-        extends: Chunked-prefill-continuation state, one entry per
-            already-active request whose extend seq_len > 1.  Also empty
-            for pure-decode steps.
-        decode: Decode state covering full-decode mode AND mixed
-            single-token decodes inside an extend batch.  Used as the
-            chaining root by :meth:`async_chained_decode_mlx`.
-        mode: One of ``"decode"``, ``"extend"``, ``"idle"`` describing
-            which forward pass produced this job.  Drives finalise
-            dispatch and whether chaining is safe.
+        launch: The :class:`MlxLaunch` this job is waiting on — the lazy
+            token handle plus the prefill / extend / decode pendings the
+            forward produced, and the mode that drives finalise dispatch
+            and whether chaining is safe.
         batch_copy: Snapshot of the :class:`ScheduleBatch` at launch
             time.  Decoupled from the live batch so
             ``process_batch_result`` can update request state without
@@ -73,18 +57,37 @@ class MlxPendingJob:
             mutable batch object.
     """
 
-    lazy_tokens: Optional[mx.array]
-    prefills: list[MlxPendingPrefill]
-    extends: list[MlxPendingExtend]
-    decode: Optional[MlxPendingDecode]
-    mode: str
+    launch: MlxLaunch
     batch_copy: ScheduleBatch
     schedule_batch: ScheduleBatch
     reqs: List[Req]
+    # See SchedulerMlxOverlapMixin._mlx_batch_chain_safe.
+    chain_safe: bool = True
+    # Captured at launch when batch.return_logprob, exactly like
+    # Scheduler.run_batch does for the CUDA paths (the live values mutate
+    # before output processing).
+    extend_input_len_per_req: Optional[List[int]] = None
+    extend_logprob_start_len_per_req: Optional[List[int]] = None
 
 
 class SchedulerMlxOverlapMixin:
     """Mixin that adds MLX overlap scheduling to :class:`Scheduler`."""
+
+    def _mlx_batch_chain_safe(self: Scheduler, batch: ScheduleBatch) -> bool:
+        """False when per-step CPU logit state forbids chained decode.
+
+        Grammar vocab masks and custom logit processors depend on the
+        previous token being materialized; a chained step is built before
+        that, so those batches launch fresh every step.
+        """
+        if not get_device().mlx_enable_sampling:
+            return True
+        sampling_info = batch.sampling_info
+        if sampling_info is None:
+            return True
+        # batch.has_grammar, not sampling_info.grammars: the latter is only
+        # populated at forward launch (see _build_logit_edit_rows).
+        return not (batch.has_grammar or sampling_info.has_custom_logit_processor)
 
     def _prepare_mlx_launch(self: Scheduler, batch: ScheduleBatch):
         """Stamp scheduler bookkeeping before an MLX forward is launched."""
@@ -98,12 +101,10 @@ class SchedulerMlxOverlapMixin:
         self.profiler_manager._profile_batch_predicate(batch)
 
     def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
-        result = self.tp_worker.finalize_mlx_result(
-            pending.prefills,
-            pending.extends,
-            pending.decode,
-            pending.mode,
-            pending.reqs,
+        result = self.tp_worker.finalize_mlx_result(pending.launch, pending.reqs)
+        result.extend_input_len_per_req = pending.extend_input_len_per_req
+        result.extend_logprob_start_len_per_req = (
+            pending.extend_logprob_start_len_per_req
         )
         if result.next_token_ids is not None:
             pending.batch_copy.input_ids = result.next_token_ids
@@ -163,29 +164,31 @@ class SchedulerMlxOverlapMixin:
             # loop must do it too, otherwise async_forward_batch_generation_mlx
             # dereferences a None input_ids.
             resolve_forward_inputs(batch, self.future_map)
-            # run_batch stamps launch_ts on every scheduler-built forward; the
-            # MLX overlap loop bypasses run_batch, and process_batch_result ->
-            # _record_step_counters subtracts launch_ts unconditionally for
-            # prefill/decode batches. ScheduleBatch.copy() below carries the
-            # stamp to process_batch_result.
-            lazy_tokens, prefills, extends, decode, mode = (
-                self.tp_worker.async_forward_batch_generation_mlx(batch)
-            )
+            launch = self.tp_worker.async_forward_batch_generation_mlx(batch)
+            extend_input_len_per_req = None
+            extend_logprob_start_len_per_req = None
+            if batch.return_logprob:
+                # Mirror Scheduler.run_batch's launch-time copy.
+                extend_input_len_per_req = [
+                    req.extend_range.length if req.extend_range is not None else 0
+                    for req in batch.reqs
+                ]
+                extend_logprob_start_len_per_req = batch.extend_logprob_start_lens
             return MlxPendingJob(
-                lazy_tokens=lazy_tokens,
-                prefills=prefills,
-                extends=extends,
-                decode=decode,
-                mode=mode,
+                launch=launch,
                 batch_copy=batch.copy(),
                 schedule_batch=batch,
                 reqs=list(batch.reqs),
+                chain_safe=self._mlx_batch_chain_safe(batch),
+                extend_input_len_per_req=extend_input_len_per_req,
+                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             )
 
         def _launch_chained(prev: MlxPendingJob) -> MlxPendingJob:
-            assert prev.decode is not None
-            # Composition is identical to prev: reuse a fresh batch copy
-            # of the same underlying ScheduleBatch so process_batch_result
+            assert prev.launch.decode is not None
+            # Composition is identical to prev: every scheduler-side field
+            # carries over, and only a fresh batch copy of the same
+            # underlying ScheduleBatch is needed so process_batch_result
             # updates the same req objects with the new token.
             batch_copy = prev.batch_copy.copy()
             self._prepare_mlx_launch(batch_copy)
@@ -193,18 +196,10 @@ class SchedulerMlxOverlapMixin:
             # chain breaks, prepare_for_decode() may run SWA maintenance
             # before the next fresh launch gets a chance to re-stamp it.
             prev.schedule_batch.forward_iter = batch_copy.forward_iter
-            lazy_tokens, prefills, extends, decode, mode = (
-                self.tp_worker.async_chained_decode_mlx(prev.decode)
-            )
-            return MlxPendingJob(
-                lazy_tokens=lazy_tokens,
-                prefills=prefills,
-                extends=extends,
-                decode=decode,
-                mode=mode,
+            return replace(
+                prev,
+                launch=self.tp_worker.async_chained_decode_mlx(prev.launch.decode),
                 batch_copy=batch_copy,
-                schedule_batch=prev.schedule_batch,
-                reqs=prev.reqs,
             )
 
         while True:
@@ -224,8 +219,9 @@ class SchedulerMlxOverlapMixin:
             #    build pending_next on top of it NOW — before we block on curr.
             can_chain = (
                 pending_curr is not None
-                and pending_curr.mode == "decode"
-                and pending_curr.decode is not None
+                and pending_curr.launch.mode == "decode"
+                and pending_curr.launch.decode is not None
+                and pending_curr.chain_safe
                 and not self.waiting_queue
             )
             if can_chain and pending_next is None:

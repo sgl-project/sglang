@@ -19,8 +19,13 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse
+from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
+from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    generate_request_id,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
@@ -69,6 +74,11 @@ def _get_request_field_or_extra(request, field_name):
     if value is not None:
         return value
     return _get_extra_field(request, field_name)
+
+
+def _runtime_sampling_quality(quality: str | None) -> str | None:
+    """Keep OpenAI's automatic default out of SGLang's sampling contract."""
+    return None if quality in (None, "auto") else quality
 
 
 def _parse_extra_container(value: Any) -> dict[str, Any]:
@@ -170,6 +180,7 @@ def _build_image_response_kwargs(
     fallback_url: str | None = None,
     fallback_urls: list[str] | None = None,
     is_persistent: bool = True,
+    resize: str | None = None,
 ) -> dict:
     """Build ImageResponse data list.
 
@@ -186,6 +197,7 @@ def _build_image_response_kwargs(
                 b64_json=b64,
                 revised_prompt=prompt,
                 file_path=os.path.abspath(path) if is_persistent else None,
+                resize=resize,
             )
             for b64, path in zip(b64_list, save_file_path_list)
         ]
@@ -210,6 +222,7 @@ def _build_image_response_kwargs(
                     url=url,
                     revised_prompt=prompt,
                     file_path=os.path.abspath(path) if is_persistent else None,
+                    resize=resize,
                 )
             )
 
@@ -225,8 +238,32 @@ def _build_image_response_kwargs(
         )
 
     ret = add_common_data_to_response(ret, request_id=request_id, result=result)
+    if ret.get("usage") is not None:
+        ret["usage"]["image_count"] = len(save_file_path_list)
 
     return ret
+
+
+def _get_response_resize(
+    sampling_params: SamplingParams, output_path: str | None = None
+) -> str | None:
+    """Return a generated GLM-Image output's actual size as WIDTHxHEIGHT."""
+    if not isinstance(sampling_params, GlmImageSamplingParams):
+        return None
+
+    if output_path is not None:
+        try:
+            with Image.open(output_path) as output_image:
+                width, height = output_image.size
+            return f"{width}x{height}"
+        except (OSError, ValueError):
+            # Fall back to the aligned sampling canvas if the output cannot be
+            # inspected (for example, for a custom output transport).
+            pass
+
+    if sampling_params.width is None or sampling_params.height is None:
+        return None
+    return sampling_params.output_size_str()
 
 
 @router.post("/generations", response_model=ImageResponse)
@@ -277,6 +314,7 @@ async def generations(
             use_system_prompt=_get_extra_field(request, "use_system_prompt"),
             use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
+            quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
             diffusers_kwargs=request.diffusers_kwargs,
@@ -306,6 +344,7 @@ async def generations(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
+        response_resize = _get_response_resize(sampling, save_file_path)
         resp_format = (request.response_format or "b64_json").lower()
         if (
             is_cosmos3
@@ -357,6 +396,7 @@ async def generations(
             cloud_urls=cloud_urls,
             fallback_urls=fallback_urls,
             is_persistent=is_persistent,
+            resize=response_resize,
         )
 
     return ImageResponse(**response_kwargs)
@@ -384,6 +424,7 @@ async def edits(
     guidance_scale: Optional[float] = Form(None),
     true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
+    quality: Optional[str] = Form(None),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
@@ -444,6 +485,7 @@ async def edits(
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
             num_frames=num_frames,
+            quality=_runtime_sampling_quality(quality),
             output_compression=output_compression,
             output_quality=output_quality,
             enable_upscaling=enable_upscaling,
@@ -460,6 +502,7 @@ async def edits(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
+        response_resize = _get_response_resize(sampling, save_file_path)
         resp_format = (response_format or "b64_json").lower()
 
         # read b64 before cloud upload may delete the local file
@@ -508,6 +551,7 @@ async def edits(
             cloud_urls=cloud_urls,
             fallback_urls=fallback_urls,
             is_persistent=is_persistent,
+            resize=response_resize,
         )
 
     return ImageResponse(**response_kwargs)

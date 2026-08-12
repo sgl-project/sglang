@@ -73,6 +73,8 @@ class PoolName(str, Enum):
 
     # Draft KV pool
     DRAFT = "draft"
+    DRAFT_INDEXER = "draft_indexer"
+    DRAFT_SWA = "draft_swa"
 
     def __str__(self) -> str:
         return self.value

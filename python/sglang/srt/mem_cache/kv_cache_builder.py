@@ -32,7 +32,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -46,80 +46,83 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.tp_worker import BaseTpWorker
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-
-def get_draft_kv_pool(
-    *,
-    draft_worker: BaseTpWorker,
-    spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
-):
-    """Return the draft token-to-KV pool for the current draft worker,
-    or None when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
-        return None
-
-    # V2 workers nest the draft runner under `.draft_worker`.
-    if server_args.enable_multi_layer_eagle:
-        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-    else:
-        draft_runner = draft_worker.draft_worker.draft_runner
-    return draft_runner.token_to_kv_pool
 
 
 def maybe_register_hicache_draft(
     *,
-    tree_cache: BasePrefixCache,
-    draft_worker: BaseTpWorker,
-    spec_algorithm: SpeculativeAlgorithm,
+    tree_cache,
+    draft_plan: HiCacheDraftPlan,
     server_args: ServerArgs,
-    enable_hierarchical_cache: bool,
     page_size: int,
 ) -> None:
-    """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
-    if not enable_hierarchical_cache:
+    from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+
+    if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
 
-    draft_kv_pool = get_draft_kv_pool(
-        draft_worker=draft_worker,
-        spec_algorithm=spec_algorithm,
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    if not isinstance(tree_cache, UnifiedRadixCache):
+        _register_legacy_hicache_draft(
+            tree_cache=tree_cache,
+            draft_pool=draft_plan.device_pools[0],
+            server_args=server_args,
+            page_size=page_size,
+        )
+        return
+
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        build_hicache_draft_sidecars,
+    )
+
+    specs, entries = build_hicache_draft_sidecars(
+        draft_device_pools=draft_plan.device_pools,
+        tree_cache=tree_cache,
         server_args=server_args,
     )
-    if draft_kv_pool is None:
-        return
+    tree_cache.register_hicache_draft_pools(specs, entries)
 
+
+def _register_legacy_hicache_draft(
+    *,
+    tree_cache,
+    draft_pool,
+    server_args: ServerArgs,
+    page_size: int,
+) -> None:
     from sglang.srt.mem_cache.memory_pool import (
-        HybridLinearKVPool,
         MHATokenToKVPool,
         MLATokenToKVPool,
     )
     from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-    pool = draft_kv_pool
-    if isinstance(pool, HybridLinearKVPool):
-        pool = pool.full_kv_pool
+    pool = draft_pool
+    if pool.layer_num == 0:
+        return
 
     # Create host pool for draft with the same slot count as the target host pool,
     # so that host indices stay 1-to-1 between target and draft KV caches.
-    primary = tree_cache.cache_controller.mem_pool_host
-    kw = dict(
-        host_to_device_ratio=primary.size / pool.size,
+    primary_host_pool = tree_cache.cache_controller.mem_pool_host
+    host_pool_kwargs = dict(
+        host_to_device_ratio=primary_host_pool.size / pool.size,
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
+        pool_label="draft",
     )
     if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
+        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **host_pool_kwargs)
     elif isinstance(pool, MLATokenToKVPool):
-        draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
+        draft_host_pool = MLATokenToKVPoolHost(pool, **host_pool_kwargs)
     else:
         logger.warning(
-            "Draft pool type %s not supported for HiCache, skipping.",
+            "Draft pool type %s is not supported by the legacy HiCache path; "
+            "skipping draft KV registration.",
             type(pool).__name__,
         )
         return
@@ -143,6 +146,7 @@ def build_kv_cache(
     tp_group: GroupCoordinator,
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
+    hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -172,6 +176,7 @@ def build_kv_cache(
         )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
+    mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
 
     disable_radix_cache = server_args.disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
@@ -233,6 +238,7 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        mtp_draft_device_pools=mtp_draft_device_pools,
     )
 
     tree_cache = create_tree_cache(
@@ -253,6 +259,14 @@ def build_kv_cache(
             tp_group=tp_group,
         )
     )
+
+    if enable_hierarchical_cache and hicache_draft_plan is not None:
+        maybe_register_hicache_draft(
+            tree_cache=tree_cache,
+            draft_plan=hicache_draft_plan,
+            server_args=server_args,
+            page_size=page_size,
+        )
 
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)

@@ -64,12 +64,11 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     scheduler = object.__new__(Scheduler)
 
     server_args = MagicMock()
-    server_args.warmup = True
+    server_args.warmup_mode = "request"
     server_args.warmup_steps = 1
     server_args.warmup_resolutions = ["512x512"]
     server_args.enable_cfg_parallel = enable_cfg_parallel
     server_args.enable_torch_compile = False
-    server_args.server_warmup = False
     server_args.is_arg_explicitly_set.return_value = False
 
     task_type = MagicMock()
@@ -235,7 +234,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
     def test_req_based_warmup_remains_explicit_legacy_entry(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
         scheduler.server_args.warmup_resolutions = None
-        scheduler.server_args.server_warmup = False
+        scheduler.server_args.warmup_mode = "request"
 
         req = _make_generation_req()
         recv_reqs = [(b"0", req)]
@@ -253,7 +252,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
     def test_req_based_warmup_skips_default_server_warmup_path(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
         scheduler.server_args.warmup_resolutions = None
-        scheduler.server_args.server_warmup = True
+        scheduler.server_args.warmup_mode = "server"
 
         recv_reqs = [(b"0", _make_generation_req())]
         processed = scheduler.process_received_reqs_with_req_based_warmup(recv_reqs)
@@ -265,7 +264,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
     def test_diff_generator_runs_explicit_warmup_through_scheduler_client(self):
         generator = object.__new__(DiffGenerator)
         server_args = MagicMock()
-        server_args.warmup = True
+        server_args.warmup_mode = "request"
         server_args.warmup_resolutions = ["832x480"]
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
@@ -693,8 +692,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
     def test_action_pipeline_disables_synthetic_warmup(self):
         server_args = MagicMock()
-        server_args.warmup = True
-        server_args.server_warmup = True
+        server_args.warmup_mode = "server"
         server_args.warmup_resolutions = ["512x512"]
         server_args.pipeline_config.task_type = ModelTaskType.VLA_ACTION
 
@@ -704,8 +702,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
     def test_mesh_pipeline_builds_image_conditioned_warmup(self):
         server_args = MagicMock()
-        server_args.warmup = True
-        server_args.server_warmup = True
+        server_args.warmup_mode = "server"
         server_args.warmup_steps = 1
         server_args.warmup_resolutions = None
         server_args.enable_cfg_parallel = False

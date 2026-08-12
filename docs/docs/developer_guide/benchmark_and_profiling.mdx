@@ -296,6 +296,37 @@ The profile merger generates:
 - Individual rank trace files: `&#123;profile_id&#125;-TP-&#123;tp&#125;-DP-&#123;dp&#125;-PP-&#123;pp&#125;-EP-&#123;ep&#125;.trace.json.gz`
 - Merged trace file: `merged-&#123;profile_id&#125;.trace.json.gz`
 
+### Profile the CUDA graph capture phase
+
+The tools above profile the steady-state runtime (prefill / decode). To instead profile the **CUDA graph capture phase** that runs once at server startup, launch the server with `--enable-profile-cuda-graph`. This runs a PyTorch Profiler pass over the decode CUDA-graph capture, which is useful for diagnosing slow or memory-heavy graph capture.
+
+`--enable-profile-cuda-graph` (server arg) builds the capture profiler and always emits the per-kernel CPU/CUDA time summary tables and a CUDA memory snapshot. Persisting Chrome traces to disk is opt-in via one of two env vars (both no-ops unless `--enable-profile-cuda-graph` is also set):
+
+- `SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE=1` — writes **one combined trace per tensor-parallel rank** for the whole capture pass, named `cuda_graph_capture-&#123;runner&#125;-TP-&#123;tp_rank&#125;.json.gz`.
+- `SGLANG_GRAPH_BATCH_CAPTURE=1` — writes **one trace per captured batch size per rank**, named `&#123;runner&#125;_bs_&#123;bs&#125;_rank&#123;tp_rank&#125;.json.gz`. The profiler runs on a `wait=2, warmup=0, active=1` schedule (the two dummy runs before each capture are skipped) with `record_shapes`, `with_stack`, `with_flops`, and `profile_memory` enabled, giving per-shape kernel identities, input shapes, FLOPs, and memory.
+
+If both env vars are set, `SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE` (the single combined trace) takes precedence.
+
+```bash Command
+# set trace path
+export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+
+# opt in to per-batch-size capture traces (or set
+# SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE=1 for a single combined trace per rank)
+export SGLANG_GRAPH_BATCH_CAPTURE=1
+
+# launch the server with CUDA graph capture profiling enabled
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --enable-profile-cuda-graph
+```
+
+Behavior and output:
+
+- All traces are written to `$&#123;SGLANG_TORCH_PROFILER_DIR&#125;/graph_capture_profile/` (defaults to `/tmp/graph_capture_profile/` if the variable is unset). Files are namespaced by runner class and TP rank so concurrent capture passes (e.g. EAGLE target/draft/draft-extend) and ranks don't collide.
+- A CUDA memory snapshot (`cuda_graph_runner_memory_usage.pickle`) and per-kernel CPU/CUDA time summary tables are always emitted for the capture phase (independent of the env vars above).
+- Only the decode CUDA-graph runner is profiled.
+
+The capture traces are viewed the same way as other PyTorch Profiler traces (see [View traces](#view-traces)).
+
 ### Possible PyTorch bugs
 If in any cases you encounter the following error (for example, using qwen 2.5 VL):
 ```bash Command

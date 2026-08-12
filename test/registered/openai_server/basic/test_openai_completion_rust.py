@@ -26,13 +26,19 @@ class TestOpenAICompletionRustParity(CustomTestCase):
     api_key = "sk-123456"
 
     def _get_logprobs(self, *, rust_frontend):
+        # Prefill CUDA graph pads the batch, so numerics follow whichever
+        # requests share the forward pass; the assertions below need equality.
         process = popen_launch_server(
             self.model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=self.api_key,
             env={"SGLANG_RUST_SERVER": "1" if rust_frontend else "0"},
-            other_args=["--random-seed", "42"],
+            other_args=[
+                "--random-seed",
+                "42",
+                "--disable-prefill-cuda-graph",
+            ],
         )
         try:
             response = requests.post(

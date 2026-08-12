@@ -391,9 +391,6 @@ class FlexKVRadixCache(RadixCache):
             return
 
         # Compute the committed prefix mirroring LMCRadixCache's logic.
-        from sglang.srt.runtime_context import get_server_args
-
-        global_server_args = get_server_args()
         topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:

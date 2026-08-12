@@ -34,8 +34,10 @@ from .common import (
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
+    gguf_sidecar_dir,
     resolve_runai_obj_uri,
 )
+from .gguf_native import build_gguf_tokenizer, has_native_gguf_support
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
     is_bare_tekken_checkpoint,
@@ -144,7 +146,8 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
 
     if check_gguf_file(tokenizer_name):
         _ensure_gguf_version()
-        kwargs["gguf_file"] = tokenizer_name
+        if gguf_sidecar_dir(tokenizer_name, "tokenizer_config.json") is None:
+            kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
 
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
@@ -486,6 +489,17 @@ def get_tokenizer(
         # use_fast still matters. Set explicitly for those fallback paths.
         if "use_fast" not in kwargs:
             kwargs["use_fast"] = True
+
+    if (
+        check_gguf_file(tokenizer_name)
+        and gguf_sidecar_dir(tokenizer_name, "tokenizer_config.json") is None
+        and has_native_gguf_support(tokenizer_name)
+    ):
+        _ensure_gguf_version()
+        tokenizer = build_gguf_tokenizer(tokenizer_name)
+        _fix_special_tokens_pattern(tokenizer)
+        attach_additional_stop_token_ids(tokenizer)
+        return patch_tokenizer(tokenizer)
 
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 

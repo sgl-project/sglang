@@ -36,6 +36,7 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerContext,
     ServerManager,
     get_generate_fn,
+    is_missing_diffusers_pipeline_error,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
@@ -213,9 +214,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         # pipeline class.  This avoids hard failures when a model needs a
         # newer diffusers release than what is currently installed in CI.
         msg = str(exc)
-        if "not found in diffusers" in msg or (
-            "has no attribute" in msg and "diffusers" in msg.lower()
-        ):
+        if is_missing_diffusers_pipeline_error(msg):
             pytest.skip(
                 f"Skipping {case.id}: required diffusers pipeline class "
                 f"is not available in the installed version. "

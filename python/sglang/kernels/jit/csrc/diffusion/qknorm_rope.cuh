@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 struct QKNormRopeParams {
   void* __restrict__ q_ptr;
@@ -50,6 +50,96 @@ SGL_DEVICE CacheDType load_cache_value(const CacheDType* ptr, int64_t idx) {
   return ptr[idx];
 #else
   return __ldg(ptr + idx);
+#endif
+}
+
+template <typename T>
+SGL_DEVICE T rotary_mul_rn(T lhs, T rhs) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+  uint16_t lhs_bits;
+  uint16_t rhs_bits;
+  if constexpr (std::is_same_v<T, bf16_t>) {
+    lhs_bits = __bfloat16_as_ushort(lhs);
+    rhs_bits = __bfloat16_as_ushort(rhs);
+  } else {
+    lhs_bits = __half_as_ushort(lhs);
+    rhs_bits = __half_as_ushort(rhs);
+  }
+  uint16_t out_bits;
+  if constexpr (std::is_same_v<T, bf16_t>) {
+    asm volatile("mul.rn.bf16 %0, %1, %2;" : "=h"(out_bits) : "h"(lhs_bits), "h"(rhs_bits));
+  } else {
+    asm volatile("mul.rn.f16 %0, %1, %2;" : "=h"(out_bits) : "h"(lhs_bits), "h"(rhs_bits));
+  }
+  if constexpr (std::is_same_v<T, bf16_t>) {
+    return __ushort_as_bfloat16(out_bits);
+  } else {
+    return __ushort_as_half(out_bits);
+  }
+#else
+  return lhs * rhs;
+#endif
+}
+
+template <typename T>
+SGL_DEVICE T rotary_add(T x, T cos, T y, T sin) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+  // nvcc may contract the packed local expression on SM120 even though the
+  // reference RoPE kernel rounds both products to the activation dtype first.
+  const T lhs = rotary_mul_rn(x, cos);
+  const T rhs = rotary_mul_rn(y, sin);
+  uint16_t lhs_bits;
+  uint16_t rhs_bits;
+  if constexpr (std::is_same_v<T, bf16_t>) {
+    lhs_bits = __bfloat16_as_ushort(lhs);
+    rhs_bits = __bfloat16_as_ushort(rhs);
+  } else {
+    lhs_bits = __half_as_ushort(lhs);
+    rhs_bits = __half_as_ushort(rhs);
+  }
+  uint16_t out_bits;
+  if constexpr (std::is_same_v<T, bf16_t>) {
+    asm volatile("add.rn.bf16 %0, %1, %2;" : "=h"(out_bits) : "h"(lhs_bits), "h"(rhs_bits));
+  } else {
+    asm volatile("add.rn.f16 %0, %1, %2;" : "=h"(out_bits) : "h"(lhs_bits), "h"(rhs_bits));
+  }
+  if constexpr (std::is_same_v<T, bf16_t>) {
+    return __ushort_as_bfloat16(out_bits);
+  } else {
+    return __ushort_as_half(out_bits);
+  }
+#else
+  return x * cos + y * sin;
+#endif
+}
+
+template <typename T>
+SGL_DEVICE T rotary_sub(T x, T cos, T y, T sin) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+  const T lhs = rotary_mul_rn(x, cos);
+  const T rhs = rotary_mul_rn(y, sin);
+  uint16_t lhs_bits;
+  uint16_t rhs_bits;
+  if constexpr (std::is_same_v<T, bf16_t>) {
+    lhs_bits = __bfloat16_as_ushort(lhs);
+    rhs_bits = __bfloat16_as_ushort(rhs);
+  } else {
+    lhs_bits = __half_as_ushort(lhs);
+    rhs_bits = __half_as_ushort(rhs);
+  }
+  uint16_t out_bits;
+  if constexpr (std::is_same_v<T, bf16_t>) {
+    asm volatile("sub.rn.bf16 %0, %1, %2;" : "=h"(out_bits) : "h"(lhs_bits), "h"(rhs_bits));
+  } else {
+    asm volatile("sub.rn.f16 %0, %1, %2;" : "=h"(out_bits) : "h"(lhs_bits), "h"(rhs_bits));
+  }
+  if constexpr (std::is_same_v<T, bf16_t>) {
+    return __ushort_as_bfloat16(out_bits);
+  } else {
+    return __ushort_as_half(out_bits);
+  }
+#else
+  return x * cos - y * sin;
 #endif
 }
 
@@ -135,8 +225,8 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
               const auto half_idx = (lane_id % kHalfRotaryLanes) * kElemsPerThread + 2 * j + i;
               const auto cos = load_cache_value(cos_ptr, half_idx);
               const auto sin = load_cache_value(sin_ptr, half_idx);
-              values[i] = lane_id < kHalfRotaryLanes ? values[i] * cos - partner_values[i] * sin
-                                                     : values[i] * cos + partner_values[i] * sin;
+              values[i] = lane_id < kHalfRotaryLanes ? rotary_sub(values[i], cos, partner_values[i], sin)
+                                                     : rotary_add(values[i], cos, partner_values[i], sin);
             }
           }
         }
@@ -150,8 +240,8 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ 
             const auto sin = load_cache_value(sin_ptr, half_idx);
             const auto x = values[0];
             const auto y = values[1];
-            values[0] = x * cos - y * sin;
-            values[1] = y * cos + x * sin;
+            values[0] = rotary_sub(x, cos, y, sin);
+            values[1] = rotary_add(y, cos, x, sin);
           }
         }
       }
@@ -277,6 +367,7 @@ struct QKNormRopeKernel {
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
     const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
+    if (num_tokens == 0 || (num_qo_heads == 0 && num_kv_heads == 0)) return;
     const auto q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType));
     const auto k_stride_bytes = static_cast<int64_t>(Dk.unwrap() * sizeof(DType));
     const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
@@ -313,4 +404,4 @@ struct QKNormRopeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

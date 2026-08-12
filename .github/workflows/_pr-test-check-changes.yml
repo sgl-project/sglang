@@ -79,6 +79,7 @@ jobs:
           filters: |
             main_package:
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/_pr-test-*.yml"
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"

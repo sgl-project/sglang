@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ascend.test_ascend_utils import (
     DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH,
 )
@@ -15,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-16-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-16-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
 
 
@@ -64,7 +65,6 @@ class TestAscendDistTimeout(CustomTestCase):
         ]
 
     def test_a_gsm8k(self):
-        print(f"##=== Testing accuracy: {self.model} ===##")
         process = popen_launch_server(
             self.model,
             self.base_url,
@@ -74,23 +74,28 @@ class TestAscendDistTimeout(CustomTestCase):
         )
 
         try:
-            args = SimpleNamespace(
-                base_url=self.base_url,
-                eval_name="gsm8k",
-                api="completion",
-                num_examples=1319,
-                num_threads=128,
-                max_tokens=512,
-                num_shots=5,
-                temperature=0.0,
-            )
+            if _is_pr_pipeline:
+                run_npu_pr_smoke(self.base_url)
+            else:
+                print(f"##=== Testing accuracy: {self.model} ===##")
 
-            metrics = run_eval(args)
-            self.assertGreaterEqual(
-                metrics["score"],
-                self.accuracy,
-                f"GSM8K score {metrics['score']} below threshold {self.accuracy}",
-            )
+                args = SimpleNamespace(
+                    base_url=self.base_url,
+                    eval_name="gsm8k",
+                    api="completion",
+                    num_examples=1319,
+                    num_threads=128,
+                    max_tokens=512,
+                    num_shots=5,
+                    temperature=0.0,
+                )
+
+                metrics = run_eval(args)
+                self.assertGreaterEqual(
+                    metrics["score"],
+                    self.accuracy,
+                    f"GSM8K score {metrics['score']} below threshold {self.accuracy}",
+                )
         finally:
             kill_process_tree(process.pid)
 

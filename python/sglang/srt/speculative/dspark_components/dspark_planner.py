@@ -177,7 +177,7 @@ class DSparkVerifyPlanner:
                 and not get_schedule().disable_overlap_schedule
                 and not get_spec().speculative_skip_dp_mlp_sync
                 and get_disagg().disaggregation_mode == "null"
-                and self.server_args.pp_size == 1
+                and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
             if tp_rank == 0:
@@ -609,7 +609,7 @@ class DSparkVerifyPlanner:
             )
 
         broadcast_group, group_size = verify_lens_broadcast_group(
-            tp_size=self.server_args.tp_size
+            tp_size=get_parallel().tp_size
         )
         if group_size > 1:
             broadcast_group.broadcast(verify_lens, src=0)

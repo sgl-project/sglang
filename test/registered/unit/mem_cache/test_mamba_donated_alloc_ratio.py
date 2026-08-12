@@ -110,22 +110,22 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         from sglang.srt.environ import envs
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
-        server_args = SimpleNamespace(
-            disable_radix_cache=False,
-            disable_overlap_schedule=disable_overlap,
-            enable_mamba_extra_buffer=lambda: extra_buffer,
-            enable_mamba_extra_buffer_lazy=lambda: lazy,
+        fake = SimpleNamespace(server_args=SimpleNamespace())
+        # Every input is a published leaf now: the extra-buffer predicates read
+        # the radix-cache strategy off the bags, so the fixture publishes the
+        # strategy that produces the combination under test.
+        strategy = (
+            "extra_buffer_lazy"
+            if lazy
+            else "extra_buffer" if extra_buffer else "no_buffer"
         )
-        fake = SimpleNamespace(server_args=server_args)
-        # The bag reads (disable_radix_cache / disable_overlap_schedule) come
-        # from the published context; the derived-method calls stay on the
-        # injected stand-in.
         from sglang.srt import runtime_context as rc
 
         with envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip):
             with rc.get_context().override_server_args(
                 disable_radix_cache=False,
                 disable_overlap_schedule=disable_overlap,
+                mamba_radix_cache_strategy=strategy,
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
 
@@ -230,6 +230,85 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
         slot = component._alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(len(cache.prefix_nodes), N - 1)
+
+
+class TestPPMambaPoolSizing(unittest.TestCase):
+    """A PP rank only allocates mamba state for its own [start_layer, end_layer)
+    slice, so charging it for the whole model's layers starves the pool. Sizing
+    uses the largest per-stage share, which also keeps every rank on the same
+    pool size (and hence the same max_running_requests / pp_max_micro_batch_size)
+    without a collective."""
+
+    # Kimi-K3 shaped: 93 layers, linear attention everywhere except every 4th and
+    # the last, so the 69 mamba layers split unevenly over 8 stages (9 or 8 each).
+    TOTAL_LAYERS = 93
+    MAMBA_LAYERS = [i for i in range(93) if (i + 1) % 4 != 0 and i <= 90]
+    BUDGET_GB = 8.0
+
+    @classmethod
+    def _pool_size(cls, pp_rank, pp_size):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.configs.mamba_utils import (
+            Mamba2CacheParams,
+            Mamba2StateDType,
+            Mamba2StateShape,
+        )
+        from sglang.srt.distributed.utils import get_pp_indices
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.runtime_context import get_schedule
+
+        shape = Mamba2StateShape(
+            conv=[(4096, 3)],
+            temporal=(64, 128, 128),
+            intermediate_size=0,
+            conv_dim=0,
+            ssm_state_size=0,
+            num_heads=0,
+            head_dim=0,
+            state_size=0,
+            conv_kernel=0,
+            num_k_heads_per_tp=8,
+        )
+        params = Mamba2CacheParams(
+            shape=shape,
+            dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
+            layers=list(cls.MAMBA_LAYERS),
+        )
+        start, end = get_pp_indices(cls.TOTAL_LAYERS, pp_rank, pp_size)
+        fake = SimpleNamespace(
+            mambaish_config=SimpleNamespace(mamba2_cache_params=params),
+            server_args=SimpleNamespace(),
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            layer_info=SimpleNamespace(start_layer=start, end_layer=end),
+            ps=SimpleNamespace(attn_dp_size=1, pp_size=pp_size),
+            hybrid_gdn_config=None,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(), num_hidden_layers=cls.TOTAL_LAYERS
+            ),
+        )
+        with rc.get_context().override_server_args(
+            disable_radix_cache=False,
+            max_mamba_cache_size=None,
+            max_running_requests=None,
+            mamba_full_memory_ratio=0.5,
+            enable_linear_replayssm_spec=False,
+        ):
+            KVCacheConfigurator._handle_max_mamba_cache(fake, cls.BUDGET_GB)
+            return get_schedule().max_mamba_cache_size
+
+    def test_stage_is_not_charged_for_the_whole_model(self):
+        solo = self._pool_size(0, 1)
+        staged = self._pool_size(0, 8)
+        # The busiest stage holds 9 of the 69 mamba layers, so it should fit
+        # roughly 69/9 more slots than a rank holding all of them. pp_size=1 is
+        # unchanged: that rank does hold every layer.
+        self.assertGreater(staged, solo * 5)
+
+    def test_every_stage_agrees_on_the_pool_size(self):
+        sizes = {self._pool_size(r, 8) for r in range(8)}
+        self.assertEqual(
+            len(sizes), 1, f"per-rank pool sizes diverged: {sorted(sizes)}"
+        )
 
 
 if __name__ == "__main__":

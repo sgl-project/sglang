@@ -16,7 +16,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
+from sglang.srt.utils.common import direct_register_custom_op, is_gfx95_supported
 
 _is_hip = is_hip()
 if _is_hip:
@@ -180,7 +180,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.dequantization_config = dequantization_config
 
         if not self.is_checkpoint_mxfp4_serialized:
-            if not mxfp_supported():
+            if not is_gfx95_supported():
                 raise NotImplementedError(
                     "Online MXFP4 quantization requires an AMD ROCm device with "
                     "FP4 hardware support (gfx95x, e.g. MI355x)."

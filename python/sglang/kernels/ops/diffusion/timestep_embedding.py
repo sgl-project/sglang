@@ -21,7 +21,7 @@ def _jit_timestep_embedding_module(dtype: torch.dtype) -> Module:
         cuda_wrappers=[
             (
                 "timestep_embedding",
-                f"sglang_timestep_embedding::timestep_embedding<{args}>",
+                f"timestep_embedding::timestep_embedding<{args}>",
             )
         ],
     )

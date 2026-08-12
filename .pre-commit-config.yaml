@@ -103,6 +103,12 @@ repos:
         language: system
         files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
+      - id: check-rust-ext-cache-prefix
+        name: check rust-ext cache key prefix defaults match
+        entry: python3 scripts/ci/check_rust_ext_cache_prefix.py
+        language: system
+        files: ^(\.github/actions/download-rust-ext/action\.yml|\.github/workflows/_pr-test-rust-ext-build\.yml)$
+        pass_filenames: false
       - id: check-registered-tests
         name: validate registered test CI registries
         entry: python3 scripts/ci/check_registered_tests.py
@@ -130,10 +136,12 @@ repos:
         pass_filenames: false
       - id: clippy-rust-workspace
         name: clippy rust/ workspace (auto-fix)
-        # Two steps: apply machine-applicable fixes, then fail on anything left
-        # (combining --fix with -D warnings can abort the fix phase). protoc is
-        # not required: sglang-grpc's build.rs falls back to a vendored binary.
-        entry: bash -c 'cd rust && cargo clippy --workspace --fix --allow-dirty --allow-staged && cargo clippy --workspace -- -D warnings'
+        # Three steps: apply machine-applicable fixes, then fail on anything
+        # left (combining --fix with -D warnings can abort the fix phase), then
+        # cover sglang-mm's PyO3 bindings + rayon fan-out — both sit behind
+        # non-default features, so `--workspace` alone never compiles them. protoc
+        # is not required: sglang-grpc's build.rs falls back to a vendored binary.
+        entry: bash -c 'cd rust && cargo clippy --workspace --fix --allow-dirty --allow-staged && cargo clippy --workspace -- -D warnings && cargo clippy -p sglang-mm --features python,parallel --lib -- -D warnings'
         language: system
         files: ^rust/.*\.rs$
         pass_filenames: false

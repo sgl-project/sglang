@@ -85,7 +85,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_schedule,
-    get_server_args,
+    process_model_config,
 )
 
 # get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
@@ -431,10 +431,9 @@ class MiniMaxM2QKRMSNorm:
 
         props = torch.cuda.get_device_properties(device)
         # probe the maximum tokens for one prefill
-        server_args = get_server_args()
         max_tokens = get_schedule().chunked_prefill_size
         if max_tokens is None:
-            max_tokens = server_args.model_config.context_len
+            max_tokens = process_model_config().context_len
         max_tokens = max(max_tokens, get_schedule().max_prefill_tokens)
         logger.info(f"[AR] Using CustomAllReduceV2 for MiniMaxM2 with {max_tokens = }")
         ALIGN = 512

@@ -293,14 +293,23 @@ class RuntimeHandle:
 
     async def _run_generate(self, obj, chunk_callback, stream: bool, request):
         ready_event = None
+        gen = None
         try:
-            ready_event = self._install_on_ready(chunk_callback) if stream else None
+            ready_event = self._install_on_ready(chunk_callback)
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
+                completed_choices = set()
+                expected_choices = obj.batch_size * obj.parallel_sample_num
                 async for chunk in gen:
-                    finished = (
+                    choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
+                    if choice_finished:
+                        choice_id = chunk.get(
+                            "index", chunk.get("meta_info", {}).get("id")
+                        )
+                        completed_choices.add(choice_id)
+                    finished = len(completed_choices) >= expected_choices
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,
@@ -314,15 +323,26 @@ class RuntimeHandle:
                 self._safe_callback(chunk_callback, {}, finished=True)
             else:
                 result = await gen.__anext__()
-                self._safe_callback(chunk_callback, result, finished=True)
+                chunks = result if isinstance(result, list) else [result]
+                for index, chunk in enumerate(chunks):
+                    keep_going = await self._send_with_backpressure(
+                        chunk_callback,
+                        ready_event,
+                        chunk,
+                        finished=index == len(chunks) - 1,
+                        timeout_abort_rid=obj.rid,
+                    )
+                    if not keep_going:
+                        return
         except StopAsyncIteration:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
             self._send_native_error(chunk_callback, str(e))
         finally:
-            if stream:
-                self._uninstall_on_ready(chunk_callback)
+            if gen is not None:
+                await gen.aclose()
+            self._uninstall_on_ready(chunk_callback)
 
     async def _run_embed(self, obj, chunk_callback, request):
         try:

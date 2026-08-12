@@ -1229,12 +1229,12 @@
         },
         "wan2_2_ti2v_5b": {
             "stages_ms": {
-                "InputValidationStage": 380.0,
+                "InputValidationStage": 706.07,
                 "TextEncodingStage": 328.44,
                 "LatentPreparationStage": 0.13,
                 "TimestepPreparationStage": 2.32,
                 "DenoisingStage": 15171.58,
-                "DecodingStage": 1527.14
+                "DecodingStage": 1100.28
             },
             "denoise_step_ms": {
                 "0": 183.83,
@@ -2633,6 +2633,14 @@
             "expected_avg_denoise_ms": 800.0,
             "expected_median_denoise_ms": 800.0,
             "estimated_full_test_time_s": 149.4
+        },
+        "lingbot_video_moe_t2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 600.0
         },
         "lingbot_world_realtime_plastic_beach": {
             "stages_ms": {},

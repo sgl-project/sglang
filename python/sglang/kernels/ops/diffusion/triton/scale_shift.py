@@ -2,24 +2,8 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.ops.diffusion.triton.numerics import mul_rn_f32
 from sglang.multimodal_gen.runtime.platforms import current_platform
-
-
-@triton.jit
-def _fp32_mul_add_rn(x, scale, residual):
-    """Match separate CUDA FP32 multiply and add rounding (no FMA)."""
-    return tl.inline_asm_elementwise(
-        asm="""{
-            .reg .f32 product;
-            mul.rn.f32 product, $1, $2;
-            add.rn.f32 $0, $3, product;
-        }""",
-        constraints="=f,f,f,f",
-        args=(x, scale, residual),
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
 
 
 @triton.jit
@@ -37,7 +21,8 @@ def _fused_scaled_residual_add_exact_kernel(
     x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
     scale = tl.load(scale_ptr + offsets % width, mask=mask)
     residual = tl.load(residual_ptr + offsets, mask=mask)
-    output = _fp32_mul_add_rn(x, scale, residual)
+    # The opaque multiply keeps Triton from contracting this into an FMA.
+    output = residual + mul_rn_f32(x, scale)
     tl.store(output_ptr + offsets, output, mask=mask)
 
 

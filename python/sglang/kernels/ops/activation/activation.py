@@ -200,6 +200,17 @@ def silu_and_mul_with_activation_rounding_(input: torch.Tensor) -> torch.Tensor:
     return input[..., :hidden_size]
 
 
+def gelu_and_mul_with_activation_rounding(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    hidden_size = input.shape[-1] // 2
+    if out is None:
+        out = input.new_empty(*input.shape[:-1], hidden_size)
+    _run_activation_with_rounding_inplace("gelu", input, out)
+    return out
+
+
 def gelu_and_mul(
     input: torch.Tensor,
     out: Optional[torch.Tensor] = None,

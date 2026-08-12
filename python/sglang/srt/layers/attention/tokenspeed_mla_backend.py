@@ -55,6 +55,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
@@ -75,7 +76,8 @@ logger = logging.getLogger(__name__)
 
 # Workspace upper bound for tokenspeed_mla_decode:
 #   num_sms * num_heads * max_q_len * (kv_lora_rank + 1) * sizeof(float32)
-# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom.
+# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom. Larger
+# speculative widths grow the bound at backend initialization.
 _TOKENSPEED_MAX_Q_LEN = 8
 
 
@@ -401,7 +403,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
     ):
         if not get_parallel().dcp_enabled:
             return super()._apply_cuda_graph_metadata(
-                bs, req_pool_indices, seq_lens, forward_mode
+                bs,
+                req_pool_indices,
+                seq_lens,
+                forward_mode,
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
@@ -511,6 +516,25 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         parallel = get_parallel()
+        # FlashInfer autotunes MoE kernels with a synthetic full-model decode
+        # and discards the attention/logits result.  On multi-node GB300, the
+        # synthetic full-head DCP metadata can make both the TokenSpeed and
+        # TRTLLM decode kernels surface cudaErrorNvlinkUncorrectable.  Skip
+        # attention only inside that explicitly scoped dummy pass.  Real
+        # requests and CUDA graph capture continue through TokenSpeed below.
+        if parallel.dcp_enabled and get_in_autotune_dummy_run():
+            output = torch.zeros(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                dtype=self.q_data_type,
+                device=q.device,
+            )
+            lse = torch.zeros(
+                (q.shape[0], layer.tp_q_head_num),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            return output, lse
+
         if not parallel.dcp_enabled:
             return super().forward_decode(
                 q,
@@ -615,7 +639,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
         # Hybrid MLA models resolve the model-side hook through the outer
         # HybridLinearAttnBackend, so their fallback MHA path can pass V as a
-        # last-dimension slice of kv_b_proj (stride(-2) > size(-1)). The
+        # last-dimension slice of kv_b_proj (stride(-2) > size(-1)).  The
         # TokenSpeed prefill kernel requires dense Q/K/V layouts even though
         # the public wrapper accepts arbitrary torch tensors.
         q = q.contiguous()

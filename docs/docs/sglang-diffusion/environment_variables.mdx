@@ -69,6 +69,21 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Multiprocess context for workers (<code>fork</code> or <code>spawn</code>)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_IPC_A2A</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>true</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable CUDA-IPC all-to-all for eligible same-host, peer-accessible TP1 + two-rank Ulysses groups. Unsupported topology falls back to NCCL; set <code>0</code> to force NCCL.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>10000</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Peer-wait timeout in milliseconds. This is a hang backstop, not a per-step budget; raise it only for known long stalls such as layerwise offload.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>16</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum cached IPC staging-buffer shape pairs. Cap this for multi-resolution serving to bound permanent staging memory.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_RUNAI_MODEL_STREAMER</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>true</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use Run:AI model streamer for model loading</td>

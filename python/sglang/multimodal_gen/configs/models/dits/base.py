@@ -6,13 +6,16 @@ from typing import Any
 
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 @dataclass
 class DiTArchConfig(ArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=list)
-    _compile_conditions: list = field(default_factory=list)
+    """Static DiT architecture metadata and checkpoint mappings.
+
+    This object is populated from the source model configuration. It must not
+    contain runtime implementation capabilities or the backend selected for a
+    particular deployment.
+    """
 
     # convert weights name from HF-format to SGLang-dit-format
     param_names_mapping: dict = field(default_factory=dict)
@@ -23,24 +26,6 @@ class DiTArchConfig(ArchConfig):
 
     # Reverse mapping for saving checkpoints: custom -> hf
     reverse_param_names_mapping: dict = field(default_factory=dict)
-    _supported_attention_backends: set[AttentionBackendEnum] = field(
-        default_factory=lambda: {
-            AttentionBackendEnum.SLIDING_TILE_ATTN,
-            AttentionBackendEnum.SAGE_ATTN,
-            AttentionBackendEnum.FA,
-            AttentionBackendEnum.AITER,
-            AttentionBackendEnum.AITER_SAGE,
-            AttentionBackendEnum.TORCH_SDPA,
-            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
-            AttentionBackendEnum.VMOBA_ATTN,
-            AttentionBackendEnum.SAGE_ATTN_3,
-            AttentionBackendEnum.LASER_ATTN,
-            AttentionBackendEnum.BLOCK_SPARSE_ATTN,
-            AttentionBackendEnum.RAIN_FUSION_ATTN,
-        }
-    )
-
     hidden_size: int = 0
     num_attention_heads: int = 0
     num_channels_latents: int = 0
@@ -48,8 +33,7 @@ class DiTArchConfig(ArchConfig):
     boundary_ratio: float | None = None
 
     def __post_init__(self) -> None:
-        if not self._compile_conditions:
-            self._compile_conditions = self._fsdp_shard_conditions.copy()
+        pass
 
 
 @dataclass

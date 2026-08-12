@@ -4,6 +4,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sglang {
+
 namespace ngram {
 
 struct Result {
@@ -23,3 +25,5 @@ Result buildResultFromLeafPaths_(int last_token, int draft_token_num, const std:
 Result combineRootResults_(int last_token, int draft_token_num, const Result& primary, const Result& secondary);
 
 }  // namespace ngram
+
+}  // namespace sglang

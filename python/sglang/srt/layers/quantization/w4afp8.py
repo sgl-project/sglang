@@ -283,6 +283,17 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
+        if hasattr(layer, "dispatcher"):
+            # The normal kernel requantizes BF16 inputs with the checkpoint's
+            # static activation scale. The low-latency kernel instead consumes
+            # DeepEP's FP8 payload together with its per-token-group scales.
+            layer.dispatcher.set_quant_config(
+                {
+                    "normal_dispatcher_output_dtype": "bf16",
+                    "low_latency_dispatcher_output_dtype": "fp8",
+                }
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -331,10 +342,17 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
-
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
-
         hidden_states, hidden_scales, topk_ids, _, masked_m, _ = dispatch_output
+
+        if hidden_scales is None:
+            raise RuntimeError(
+                "W4AFP8 DeepEP low-latency requires FP8 dispatcher output "
+                "with per-token-group scales."
+            )
+
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+            cutlass_w4a8_moe_deepep_ll,
+        )
 
         output = cutlass_w4a8_moe_deepep_ll(
             hidden_states,
@@ -367,10 +385,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPNormalDispatchOutput,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
-            cutlass_w4a8_moe_deepep_normal,
-        )
-
         hidden_states, topk_idx, topk_weights = (
             dispatch_output.hidden_states,
             dispatch_output.topk_ids,
@@ -379,8 +393,18 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
 
+        if hidden_states.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "W4AFP8 DeepEP normal requires BF16 dispatcher output, "
+                f"but got {hidden_states.dtype}."
+            )
+
         num_tokens = hidden_states.shape[0]
         if num_tokens > 0:
+            from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+                cutlass_w4a8_moe_deepep_normal,
+            )
+
             return cutlass_w4a8_moe_deepep_normal(
                 hidden_states,
                 layer.w13_weight,

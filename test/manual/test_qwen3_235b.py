@@ -61,7 +61,7 @@ class TestQwen3235BFP8(unittest.TestCase):
             test_name="Qwen3-235B-FP8",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.88),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_qwen3_235b_fp8",
+                result_dir="performance_results_qwen3_235b_fp8",
             ),
         )
 

@@ -54,7 +54,7 @@ def test_sgl_kernel_npu_is_selected_on_npu(op_cls):
     with patch.object(
         fused_op_module, "_platform", return_value=PlatformInfo(device_type="npu")
     ):
-        backend = op_cls()._resolve_backend()
+        backend = op_cls().auto_selected_backend()
 
     assert backend is KernelBackend.SGL_KERNEL_NPU
 

@@ -16,9 +16,6 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
-    TransformerLoader,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -33,6 +30,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.component_load import (
+    load_transformer_if_needed,
+    register_loaded_transformer,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import export_to_trimesh
 
@@ -293,16 +294,11 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         cache_dit_num_inference_steps = batch.extra.get(
             "cache_dit_num_inference_steps", batch.num_inference_steps
         )
-        if not server_args.model_loaded["transformer"]:
-            loader = TransformerLoader()
-            self.transformer = loader.load(
-                server_args.model_paths["transformer"], server_args, "transformer"
-            )
+        freshly_loaded = load_transformer_if_needed(self, server_args)
+        if freshly_loaded:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
             self._maybe_torch_compile(self.transformer)
-            if pipeline:
-                pipeline.add_module("transformer", self.transformer)
-            server_args.model_loaded["transformer"] = True
+            register_loaded_transformer(self, server_args, pipeline)
         else:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
 

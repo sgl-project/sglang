@@ -44,6 +44,11 @@ export const config = {
           label: "Layerwise offload",
           showWhen: (s) => s.hw === "rtx5090",
         },
+        {
+          id: "cross_node",
+          label: "Cross-node (2 nodes)",
+          showWhen: (s) => s.hw === "h200",
+        },
       ],
     },
   ],
@@ -511,6 +516,24 @@ export const config = {
       ],
       warn:
         "FSDP reduces resident DiT memory but adds per-block parameter collectives. Prefer Resident when the full pipeline fits.",
+    },
+    {
+      match: { hw: "h200", profile: "cross_node" },
+      nnodes: 2,
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--num-gpus 16",
+        "--sp-degree 16",
+        "--ulysses-degree 8",
+        "--ring-degree 2",
+        "--encoder-parallel replicate",
+        "--performance-mode speed",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+      warn:
+        "Verified on 2 nodes of 8× H200 each (Ulysses8 within a node, Ring2 across nodes). Requires --encoder-parallel replicate: --encoder-parallel auto's fold decision is not yet node-boundary aware and will crash across nodes.",
     },
     {
       match: { hw: "b200", profile: "fsdp" },

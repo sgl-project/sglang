@@ -16,6 +16,9 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -37,6 +40,70 @@ def _logits_output(num_rows: int) -> SimpleNamespace:
 
 
 class TestMlpSyncPadUnpad(CustomTestCase):
+    def test_init_mlp_sync_metadata_scales_speculative_request_width(self):
+        spec_info = SimpleNamespace(
+            num_tokens_per_req=4,
+            num_tokens_for_logprob_per_req=2,
+        )
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            input_ids=torch.arange(8),
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([5, 6]),
+            out_cache_loc=torch.arange(8),
+            seq_lens_sum=11,
+            positions=torch.arange(8),
+            spec_info=spec_info,
+        )
+        batch = SimpleNamespace(
+            global_num_tokens=[2, 0, 3],
+            global_num_tokens_for_logprob=[2, 0, 3],
+            can_run_dp_cuda_graph=True,
+        )
+
+        fb.init_mlp_sync_metadata(batch, torch.device("cpu"))
+
+        self.assertEqual(fb.original_global_num_tokens_cpu, [2, 0, 3])
+        self.assertEqual(fb.global_num_tokens_cpu, [8, 0, 12])
+        self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [4, 0, 6])
+        torch.testing.assert_close(fb.global_num_tokens_gpu, torch.tensor([8, 0, 12]))
+        torch.testing.assert_close(
+            fb.global_num_tokens_for_logprob_gpu, torch.tensor([4, 0, 6])
+        )
+        self.assertTrue(fb.can_run_dp_cuda_graph)
+
+    def test_draft_input_without_hidden_states_can_be_padded(self):
+        spec_info = SimpleNamespace(
+            is_draft_input=lambda: True,
+            hidden_states=None,
+        )
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=1,
+            input_ids=torch.tensor([11]),
+            req_pool_indices=torch.tensor([5]),
+            seq_lens=torch.tensor([7]),
+            out_cache_loc=torch.tensor([0]),
+            seq_lens_sum=7,
+            positions=torch.tensor([6]),
+            seq_lens_cpu=torch.tensor([7]),
+            lora_ids=[None],
+            spec_info=spec_info,
+        )
+
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=2, bs=1)
+
+        self.assertIsNone(spec_info.hidden_states)
+
+    def test_dp_cuda_graph_batch_size_uses_raw_request_counts(self):
+        fb = SimpleNamespace(original_global_num_tokens_cpu=[3, 11, 7])
+        self.assertEqual(DecodeCudaGraphRunner._max_dp_batch_size(fb), 11)
+
+        fb.original_global_num_tokens_cpu = None
+        with self.assertRaisesRegex(RuntimeError, "raw per-rank request counts"):
+            DecodeCudaGraphRunner._max_dp_batch_size(fb)
+
     def test_decode_post_forward_unpads_per_request_tensors(self):
         fb = ForwardBatch(
             forward_mode=ForwardMode.DECODE,

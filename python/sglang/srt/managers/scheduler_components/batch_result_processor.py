@@ -37,7 +37,8 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_observability,
-    get_server_args,
+    mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
@@ -195,6 +196,7 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -360,6 +362,7 @@ class SchedulerBatchResultProcessor:
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+        self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req
         )
@@ -1013,9 +1016,45 @@ class SchedulerBatchResultProcessor:
         i: int,
         logits_output: LogitsProcessorOutput,
     ):
+        lazy = mamba_extra_buffer_lazy_enabled()
+        known_mamba_boundary = None
+        completed_mamba_boundary = None
+        lookahead = 0
+        if batch.mamba_track_mask_cpu is not None:
+            completed_mamba_boundary = bool(batch.mamba_track_mask_cpu[i])
+            lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
+            assert lookahead in (0, 1), (
+                f"mamba result lookahead={lookahead} for req {req.rid}; "
+                "overlap advanced more than one decode batch"
+            )
+            if lookahead == 0:
+                known_mamba_boundary = bool(batch.mamba_track_mask_cpu[i])
+            else:
+                known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
+
+            if completed_mamba_boundary and not lazy:
+                req.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
+                req.mamba_last_track_seqlen = req.kv_committed_len - lookahead
+            elif (
+                req.finished()
+                and lazy
+                and lookahead == 1
+                and known_mamba_boundary
+                and req.mamba_next_track_idx == req.mamba_last_track_idx
+            ):
+                req.mamba_lazy_is_insert = False
+
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
-        self._mamba_prefix_cache_update(req, batch, result, i)
+        should_update = completed_mamba_boundary if lazy else known_mamba_boundary
+        if should_update is None or should_update:
+            self._mamba_prefix_cache_update(
+                req,
+                batch,
+                result,
+                i,
+                known_boundary=not lazy and known_mamba_boundary is True,
+            )
 
         if (
             get_disagg().disaggregation_decode_enable_offload_kvcache
@@ -1052,7 +1091,7 @@ class SchedulerBatchResultProcessor:
                     prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
-                    if get_server_args().enable_mamba_extra_buffer_lazy()
+                    if mamba_extra_buffer_lazy_enabled()
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
@@ -1076,6 +1115,7 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
         i: int,
+        known_boundary: bool = False,
     ) -> None:
         """Update mamba track state at ping-pong boundaries.
 
@@ -1087,10 +1127,16 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        lazy = get_server_args().enable_mamba_extra_buffer_lazy()
-        at_boundary, track_seqlen = self._mamba_check_track_boundary(
-            req, batch, result, i
-        )
+        lazy = mamba_extra_buffer_lazy_enabled()
+        if known_boundary:
+            self._mamba_assert_committed_len_lookahead(req)
+            track_seqlen = req.kv_committed_len
+            assert track_seqlen % get_exec().mamba.mamba_track_interval == 0
+            at_boundary = True
+        else:
+            at_boundary, track_seqlen = self._mamba_check_track_boundary(
+                req, batch, result, i
+            )
 
         if lazy and not batch.spec_algorithm.is_none():
             # For spec, at_boundary means this step actually crossed an interval.
@@ -1100,14 +1146,18 @@ class SchedulerBatchResultProcessor:
         if not at_boundary:
             return
 
-        req.mamba_last_track_seqlen = track_seqlen
+        track_idx = req.mamba_next_track_idx
+        if not known_boundary and batch.mamba_track_buffer_indices is not None:
+            track_idx = batch.mamba_track_buffer_indices[i]
+        if not known_boundary:
+            req.mamba_last_track_seqlen = track_seqlen
         if lazy:
-            self.mamba_lazy_post_decode_at_boundary(req, batch)
+            self.mamba_lazy_post_decode_at_boundary(req, batch, track_idx)
         else:
+            if not known_boundary:
+                req.mamba_last_track_idx = track_idx
             req.mamba_next_track_idx = (
-                batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
+                batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
             )
 
     def _mamba_lazy_spec_update(
@@ -1134,7 +1184,6 @@ class SchedulerBatchResultProcessor:
             keep_written_by_this_step = (
                 crossed and planned_pos == req.mamba_next_track_idx
             )
-            server_args = get_server_args()
             other_idx = 1 - req.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
@@ -1143,7 +1192,7 @@ class SchedulerBatchResultProcessor:
             ].item() == -1 and mamba_lazy_spec_in_window(
                 req,
                 get_exec().mamba.mamba_track_interval,
-                server_args.max_speculative_num_draft_tokens,
+                max_speculative_num_draft_tokens(),
             )
             if (
                 planned_pos is None
@@ -1165,7 +1214,22 @@ class SchedulerBatchResultProcessor:
             req.mamba_next_track_idx = planned_pos
         # else: in-place fallback, or promoted by an earlier confirmation —
         # keep holds the track_seqlen state either way.
+        req.mamba_last_track_idx = planned_pos
         req.mamba_last_track_seqlen = track_seqlen
+
+    @staticmethod
+    def _mamba_assert_committed_len_lookahead(req: Req) -> None:
+        """Alarm if overlap advances beyond the scheduler's modeled window."""
+        assert req.output_ids, (
+            "mamba track boundary reached before a decode token was appended "
+            f"(req {req.rid}); output_ids is empty"
+        )
+        token_seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        assert (req.kv_committed_len - token_seq_len) in (0, 1), (
+            f"mamba track boundary: kv_committed_len={req.kv_committed_len} "
+            f"leads seq_len={token_seq_len} by more than one (req {req.rid}); "
+            "overlap lookahead wider than assumed"
+        )
 
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
@@ -1174,9 +1238,8 @@ class SchedulerBatchResultProcessor:
         matches what the forward's tracking mask used:
         ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
         ``kv_committed_len`` by 1, then checks
-        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
-        here reproduces that check exactly, and the value is always a
-        multiple of ``interval`` (hence page-aligned).
+        ``seq_lens_cpu % interval == 0``.  Subtracting the overlap
+        lookahead from ``kv_committed_len`` reproduces that check.
 
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
@@ -1184,8 +1247,10 @@ class SchedulerBatchResultProcessor:
         interval = get_exec().mamba.mamba_track_interval
 
         if batch.spec_algorithm.is_none():
-            if req.kv_committed_len % interval == 0:
-                return True, req.kv_committed_len
+            lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
+            committed_len = req.kv_committed_len - lookahead
+            if committed_len % interval == 0:
+                return True, committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
             prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
@@ -1194,19 +1259,13 @@ class SchedulerBatchResultProcessor:
 
         return False, 0
 
-    def mamba_lazy_post_decode_at_boundary(self, req: Req, batch: ScheduleBatch):
-        """Post-decode cleanup at a lazy-mode track boundary.
-
-        Finished reqs: if prealloc failed (other slot is -1), the forward
-        overwrote the only slot with corrupted state, so mark
-        is_insert=False to skip the cache insert.  If the other slot is
-        occupied (stale prealloc from an overlap extra forward), free it
-        so the prealloc assert in the next prepare_for_decode holds.
-
-        Running reqs: free the old ping-pong slot so we go back to
-        holding only 1 slot until the next boundary.
-        """
-        other_idx = 1 - req.mamba_next_track_idx
+    def mamba_lazy_post_decode_at_boundary(
+        self, req: Req, batch: ScheduleBatch, track_idx: int
+    ):
+        """Commit a completed lazy-mode boundary and free its old slot."""
+        req.mamba_last_track_idx = track_idx
+        req.mamba_next_track_idx = track_idx
+        other_idx = 1 - track_idx
         other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
         if other_val != -1:
             pool = batch.req_to_token_pool
@@ -1214,5 +1273,3 @@ class SchedulerBatchResultProcessor:
                 req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)
-        elif req.finished():
-            req.mamba_lazy_is_insert = False

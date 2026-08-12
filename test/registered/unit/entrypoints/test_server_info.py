@@ -57,6 +57,7 @@ def _call_server_info_with(
     tokenizer_manager.server_args = server_args
     tokenizer_manager.model_path = server_args.model_path
     tokenizer_manager.served_model_name = server_args.served_model_name
+    tokenizer_manager.startup_time = None
     tokenizer_manager._config_updates = (
         [("test", dict(config_updates))] if config_updates else []
     )

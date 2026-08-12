@@ -121,9 +121,17 @@ class DeepEPMoE(FusedMoE):
         elif (
             get_moe_runner_backend().is_flashinfer_cutedsl()
             and quant_config is not None
-            and quant_config.get_name()
-            in ("modelopt_fp4", "modelopt_mixed", "nvfp4_online")
+            and quant_config.get_name() in ("modelopt_fp4", "modelopt_mixed")
         ):
+            self.deprecate_flag = True
+        elif (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and get_moe_runner_backend().is_deep_gemm()
+            and quant_config is not None
+            and quant_config.get_name() == "mxfp4"
+        ):
+            # MXFP4 experts (e.g. Kimi K3) on the DeepGEMM fp8_fp4 W4A8 path:
+            # route through the modern FusedMoE runner (Mxfp4MoEMethod.apply).
             self.deprecate_flag = True
         elif (
             quant_config is None
@@ -322,7 +330,7 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPNormalDispatchOutput,
     ):
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
         return self.quant_method.apply_deepep_normal(
             layer=self,
@@ -333,7 +341,7 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPLLDispatchOutput,
     ):
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
         return self.quant_method.apply_deepep_ll(
             layer=self,

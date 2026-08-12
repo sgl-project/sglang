@@ -195,7 +195,7 @@ def validate_x(t: torch.Tensor, B: int, S: int, D: int):
     if t.shape != (B, S, D):
         raise ValueError(f"Validate failed: unsupported tensor shape: {t.shape}.")
     if t.stride()[-1] != 1:
-        raise ValueError(f"Validate failed: not contiguous on dim D.")
+        raise ValueError("Validate failed: not contiguous on dim D.")
 
 
 def validate_weight_bias(t: Optional[torch.Tensor], D: int):
@@ -206,7 +206,7 @@ def validate_weight_bias(t: Optional[torch.Tensor], D: int):
     if t.shape != (D,):
         raise ValueError(f"Validate failed: unsupported tensor shape: {t.shape}.")
     if t.stride()[-1] != 1:
-        raise ValueError(f"Validate failed: not contiguous on dim D.")
+        raise ValueError("Validate failed: not contiguous on dim D.")
 
 
 def validate_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
@@ -230,7 +230,7 @@ def validate_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
     if failed:
         raise ValueError(f"Validate failed: unsupported tensor shape: {t.shape}.")
     if t.stride()[-1] != 1:
-        raise ValueError(f"Validate failed: not contiguous on dim D.")
+        raise ValueError("Validate failed: not contiguous on dim D.")
 
 
 def validate_gate(t: Union[torch.Tensor, int], B: int, S: int, D: int):
@@ -311,7 +311,7 @@ def fused_norm_scale_shift(
         compiled_fn(*torch_tensors, eps, stream)
         return y
     else:
-        raise ValueError(f'norm_type must be one of "layer" and "rms"')
+        raise ValueError('norm_type must be one of "layer" and "rms"')
 
 
 @fused_norm_scale_shift.register_fake
@@ -401,7 +401,7 @@ def fused_scale_residual_norm_scale_shift(
         compiled_fn(*torch_tensors, eps, stream)
         return y, resi_out
     else:
-        raise ValueError(f'norm_type must be one of "layer" and "rms"')
+        raise ValueError('norm_type must be one of "layer" and "rms"')
 
 
 @fused_scale_residual_norm_scale_shift.register_fake

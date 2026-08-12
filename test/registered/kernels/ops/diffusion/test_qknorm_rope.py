@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=44, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(est_time=176, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=220, stage="nightly", runner_config="1-gpu-large")
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -81,6 +81,17 @@ def fused_qknorm_rope(
         positions,
         is_neox=is_neox,
         rope_dim=cos_sin_cache.shape[-1],
+    )
+
+
+def test_qknorm_rope_rejects_unsupported_dtypes() -> None:
+    from sglang.kernels.ops.diffusion.qknorm_rope import (
+        can_use_fused_inplace_qknorm_rope,
+    )
+
+    assert not can_use_fused_inplace_qknorm_rope(128, 128, False, torch.float32)
+    assert not can_use_fused_inplace_qknorm_rope(
+        128, 128, False, torch.bfloat16, torch.float64
     )
 
 
@@ -203,6 +214,29 @@ def test_qknorm_rope_preserves_split_bf16_rounding() -> None:
 
     assert torch.equal(q_ref, q_fused)
     assert torch.equal(k_ref, k_fused)
+
+
+def test_qknorm_rope_accepts_empty_token_dimension() -> None:
+    from sglang.kernels.ops.diffusion.qknorm_rope import fused_inplace_qknorm_rope
+
+    num_heads, head_dim = 8, 128
+    q = torch.empty(0, num_heads, head_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.empty_like(q)
+    weight = torch.ones(head_dim, device=DEVICE, dtype=DTYPE)
+    cache = create_cos_sin_cache(head_dim, 1)
+    positions = torch.empty(0, device=DEVICE, dtype=torch.int64)
+
+    fused_inplace_qknorm_rope(
+        q,
+        k,
+        weight,
+        weight,
+        cache,
+        positions,
+        is_neox=False,
+        rope_dim=head_dim,
+    )
+    assert q.numel() == k.numel() == 0
 
 
 if __name__ == "__main__":

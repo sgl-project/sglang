@@ -19,7 +19,9 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    mamba_cache_chunk_size,
+)
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -50,7 +52,7 @@ def maybe_build_flashinfer_checkpoint_plan(
     ):
         return
 
-    checkpoint_every_n_tokens = get_server_args().mamba_cache_chunk_size
+    checkpoint_every_n_tokens = mamba_cache_chunk_size()
     extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
     track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
     relative_track_lens = forward_batch.mamba_track_seqlens.to(

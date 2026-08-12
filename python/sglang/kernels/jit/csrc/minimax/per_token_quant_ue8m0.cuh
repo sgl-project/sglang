@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
@@ -277,4 +277,4 @@ void per_token_quant_ue8m0(tvm::ffi::TensorView x, tvm::ffi::TensorView x_q, tvm
       .enable_pdl(kUsePDL)(kernel, params);
 }
 
-}  // namespace
+}  // namespace sglang

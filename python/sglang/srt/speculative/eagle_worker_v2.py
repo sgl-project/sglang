@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -25,6 +26,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
 from sglang.srt.layers.moe.utils import (
+    draft_model_build_scope,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -132,6 +134,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
@@ -159,7 +163,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ctx = empty_context()
         with (
             ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -167,6 +171,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
+                # The draft runs at absolute target positions.
+                context_length=target_worker.model_runner.model_config.context_len,
             )
 
         # Alias for better readability
@@ -367,10 +373,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.target_worker.device
             ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            capture_time = time.perf_counter() - tic
+            self._specialized_graph_memory_usage["draft_decode"] = (
+                self._specialized_graph_memory_usage.get("draft_decode", 0.0)
+                + before_mem
+                - after_mem
+            )
+            self._specialized_graph_time_usage["draft_decode"] = (
+                self._specialized_graph_time_usage.get("draft_decode", 0.0)
+                + capture_time
+            )
             log_info_on_rank0(
                 logger,
                 "Capture draft decode CUDA graph end. "
-                f"elapsed={time.perf_counter() - tic:.2f} s, "
+                f"elapsed={capture_time:.2f} s, "
                 f"mem usage={(before_mem - after_mem):.2f} GB, "
                 f"avail mem={after_mem:.2f} GB.",
             )
@@ -452,10 +468,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # draft_extend is the step's last shared-buffer-reading phase; its
             # read-done event is what the scheduler's WAR barrier waits on.
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            capture_time = time.perf_counter() - tic
+            self._specialized_graph_memory_usage["draft_extend"] = (
+                self._specialized_graph_memory_usage.get("draft_extend", 0.0)
+                + before_mem
+                - after_mem
+            )
+            self._specialized_graph_time_usage["draft_extend"] = (
+                self._specialized_graph_time_usage.get("draft_extend", 0.0)
+                + capture_time
+            )
             log_info_on_rank0(
                 logger,
                 "Capture draft extend CUDA graph end. "
-                f"elapsed={time.perf_counter() - tic:.2f} s, "
+                f"elapsed={capture_time:.2f} s, "
                 f"mem usage={(before_mem - after_mem):.2f} GB, "
                 f"avail mem={after_mem:.2f} GB.",
             )
@@ -575,103 +601,96 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Forward multiple steps
         scores = None
-        if self.index_share_for_mtp_iteration:
-            forward_batch.reuse_dsa_topk_indices = True
-            # Keep the draft-extend seed so step 0 reuses it; else recompute it.
-            if not (
-                self.seed_dsa_topk_from_draft_extend
-                and spec_info.dsa_topk_indices is not None
-            ):
-                spec_info.dsa_topk_indices = None
-        for i in range(self.speculative_num_steps):
-            if draft_tokens_topk1 is not None:
-                input_ids = topk_index.flatten()
-            else:
-                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                    i, topk_p, topk_index, hidden_states, scores, self.topk
-                )
-                score_list.append(tree_info[0])
-                token_list.append(tree_info[1])
-                parents_list.append(tree_info[2])
-
-            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
-                break
-
-            # Set inputs
-            forward_batch.input_ids = input_ids
-            # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
-            # argument must be contiguous.
-            if (
-                self.draft_runner.model_config.hf_config.architectures[0]
-                == "Qwen3MoeForCausalLMMTP"
-            ):
-                out_cache_loc = out_cache_loc.contiguous()
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            spec_info.hidden_states = hidden_states
-
-            # Run forward under a per-step ForwardContext so the model layer
-            # reads attn_backends[i] for the i-th draft step, plus a canary
-            # index context so canary tracks which draft step is active.
-            canary_index_ctx = (
-                c.with_active_single_forward_manager(i)
-                if (c := self.draft_runner.canary_manager) is not None
-                else contextlib.nullcontext()
-            )
-            with (
-                forward_context(
-                    ForwardContext(
-                        attn_backend=self.draft_attn_backend.attn_backends[i]
-                    )
-                ),
-                canary_index_ctx,
-            ):
-                logits_output = self.draft_runner.forward(forward_batch).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if get_spec().speculative_use_rejection_sampling:
-                probs, topk_p, topk_index = sample_draft_proposal(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info.temperatures,
-                )
-                draft_probs_list.append(probs)
-                forward_batch.positions.add_(1)
-            elif self.topk == 1 and not _is_hip:
-                if _is_cuda:
-                    # The positions advance is fused into the kernel.
-                    topk_p, topk_index = draft_topk1_postprocess(
-                        logits_output.next_token_logits,
-                        forward_batch.positions,
-                        draft_tokens_topk1,
-                        i + 1,
-                    )
+        with IndexTopKShareState.mtp_iteration(
+            forward_batch,
+            enabled=self.index_share_for_mtp_iteration,
+            keep_carry_seed=self.seed_dsa_topk_from_draft_extend,
+        ):
+            for i in range(self.speculative_num_steps):
+                if draft_tokens_topk1 is not None:
+                    input_ids = topk_index.flatten()
                 else:
-                    topk_index = torch.argmax(
-                        logits_output.next_token_logits, dim=-1, keepdim=True
+                    input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                        i, topk_p, topk_index, hidden_states, scores, self.topk
                     )
-                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-                    forward_batch.positions.add_(1)
-            else:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    get_spec().speculative_use_rejection_sampling,
-                )
-                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-                forward_batch.positions.add_(1)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
-            )
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
+                    score_list.append(tree_info[0])
+                    token_list.append(tree_info[1])
+                    parents_list.append(tree_info[2])
 
-        if self.index_share_for_mtp_iteration:
-            spec_info.dsa_topk_indices = None
-            forward_batch.reuse_dsa_topk_indices = False
+                if i == self.speculative_num_steps - 1:
+                    break
+
+                forward_batch.input_ids = input_ids
+                # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
+                # argument must be contiguous.
+                if (
+                    self.draft_runner.model_config.hf_config.architectures[0]
+                    == "Qwen3MoeForCausalLMMTP"
+                ):
+                    out_cache_loc = out_cache_loc.contiguous()
+                forward_batch.out_cache_loc = out_cache_loc[i]
+                spec_info.hidden_states = hidden_states
+
+                canary_index_ctx = (
+                    c.with_active_single_forward_manager(i)
+                    if (c := self.draft_runner.canary_manager) is not None
+                    else contextlib.nullcontext()
+                )
+                with (
+                    forward_context(
+                        ForwardContext(
+                            attn_backend=self.draft_attn_backend.attn_backends[i]
+                        )
+                    ),
+                    canary_index_ctx,
+                ):
+                    logits_output = self.draft_runner.forward(
+                        forward_batch
+                    ).logits_output
+                maybe_detect_nan(
+                    logits_output.next_token_logits, f"draft_forward step {i}"
+                )
+                maybe_detect_inf(
+                    logits_output.next_token_logits, f"draft_forward step {i}"
+                )
+                if get_spec().speculative_use_rejection_sampling:
+                    probs, topk_p, topk_index = sample_draft_proposal(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info.temperatures,
+                    )
+                    draft_probs_list.append(probs)
+                    forward_batch.positions.add_(1)
+                elif self.topk == 1 and not _is_hip:
+                    if _is_cuda:
+                        topk_p, topk_index = draft_topk1_postprocess(
+                            logits_output.next_token_logits,
+                            forward_batch.positions,
+                            draft_tokens_topk1,
+                            i + 1,
+                        )
+                    else:
+                        topk_index = torch.argmax(
+                            logits_output.next_token_logits, dim=-1, keepdim=True
+                        )
+                        topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                        forward_batch.positions.add_(1)
+                else:
+                    probs = renorm_draft_probs(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info,
+                        get_spec().speculative_use_rejection_sampling,
+                    )
+                    topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                    forward_batch.positions.add_(1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                )
+                if self.hot_token_id is not None:
+                    topk_index = self.hot_token_id[topk_index]
+                hidden_states = logits_output.hidden_states
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
@@ -990,6 +1009,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         # Parse arguments
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
@@ -1305,11 +1326,28 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 TargetGraphRunnerCls = (
                     NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
                 )
+                target_graph_before_mem = get_available_gpu_memory(
+                    self.device, self.gpu_id
+                )
+                target_graph_tic = time.perf_counter()
                 target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
                     speculative_num_steps=speculative_num_steps,
                     speculative_num_draft_tokens=speculative_num_draft_tokens,
+                )
+                target_graph_after_mem = get_available_gpu_memory(
+                    self.device, self.gpu_id
+                )
+                target_graph_time = time.perf_counter() - target_graph_tic
+                self._additional_graph_memory_usage["target_verify"] = (
+                    self._additional_graph_memory_usage.get("target_verify", 0.0)
+                    + target_graph_before_mem
+                    - target_graph_after_mem
+                )
+                self._additional_graph_time_usage["target_verify"] = (
+                    self._additional_graph_time_usage.get("target_verify", 0.0)
+                    + target_graph_time
                 )
 
             state = SpecRuntimeState(

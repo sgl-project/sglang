@@ -9,18 +9,22 @@ import unittest
 import openai
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.vlm_utils import *
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    popen_launch_server,
+)
 from sglang.test.vlm_utils import (
+    IMAGE_MAN_IRONING_URL,
     AudioOpenAITestMixin,
     CustomTestCase,
     ImageOpenAITestMixin,
-    OmniOpenAITestMixin,
     TestOpenAIMLLMServerBase,
     VideoOpenAITestMixin,
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=560, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
@@ -43,17 +47,10 @@ class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     extra_args = ["--cuda-graph-max-bs-decode=4"]
 
 
-class TestQwen3OmniServer(OmniOpenAITestMixin):
-    model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-    extra_args = [  # workaround to fit into H100
-        "--mem-fraction-static=0.90",
-        "--disable-cuda-graph",
-        "--disable-fast-image-processor",
-        "--grammar-backend=none",
-    ]
-
-
 class TestQwen2VLContextLengthServer(CustomTestCase):
+    # --context-length 300 is calibrated to this model's mm-token expansion:
+    # it must sit above the warmup image's expanded length but below the test
+    # image's. A cheaper VLM needs the bound recalibrated, not just swapped.
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
@@ -149,7 +146,8 @@ class TestKimiVLServer(ImageOpenAITestMixin):
     extra_args = [
         "--context-length=8192",
         "--dtype=bfloat16",
-        "--mem-fraction-static=0.40",
+        # Weights alone need ~0.39; 0.40 left <0.001 headroom and flaked at load.
+        "--mem-fraction-static=0.42",
     ]
 
     def test_video_images_chat_completion(self):
@@ -237,7 +235,6 @@ del (
     ImageOpenAITestMixin,
     VideoOpenAITestMixin,
     AudioOpenAITestMixin,
-    OmniOpenAITestMixin,
 )
 
 

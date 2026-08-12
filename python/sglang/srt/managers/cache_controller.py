@@ -163,6 +163,11 @@ class HiCacheAck(NamedTuple):
     node_ids: List[int]
     num_tokens: int = 0
     timing_enabled: bool = False
+    # Tokens transferred per host pool (PoolName value -> count).
+    num_tokens_by_pool: Optional[dict[str, int]] = None
+    # Total bytes moved by the op across all pools, including draft piggyback
+    # and sidecar transfers that the per-pool token counts exclude.
+    num_bytes: int = 0
 
 
 class StorageOperation:
@@ -269,6 +274,8 @@ class HiCacheController:
         self.mem_pool_host_draft = None
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        self.has_mtp_draft = False
+        self.mtp_draft_device_pools = ()
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -375,7 +382,6 @@ class HiCacheController:
         self.backup_queue = Queue()
 
         self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
-        self.prefetch_revoke_queue: Queue[str] = Queue()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
@@ -652,7 +658,6 @@ class HiCacheController:
             self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
-            self.prefetch_revoke_queue.queue.clear()
             self.prefetch_hit_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
@@ -714,11 +719,12 @@ class HiCacheController:
         self.write_queue.clear()
 
         start_event = device_module.Event()
-        finish_event = device_module.Event()
+        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
+            ack_start_event.record()
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
@@ -729,7 +735,7 @@ class HiCacheController:
                     device_indices,
                     self.io_backend,
                 )
-            finish_event.record()
+            ack_finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
@@ -738,7 +744,25 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
 
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self.ack_write_queue.append(
+            HiCacheAck(
+                start_event=ack_start_event,
+                finish_event=ack_finish_event,
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=timing_enabled,
+                num_tokens_by_pool={PoolName.KV.value: len(op.device_indices)},
+                num_bytes=self._transfer_num_bytes(op),
+            )
+        )
+
+    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+        """Total bytes moved by a merged transfer op (draft piggyback included)."""
+        num_tokens = len(op.device_indices)
+        num_bytes = num_tokens * self.mem_pool_host.size_per_token
+        if self.has_draft:
+            num_bytes += num_tokens * self.mem_pool_host_draft.size_per_token
+        return num_bytes
 
     def load(
         self,
@@ -830,6 +854,8 @@ class HiCacheController:
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
                 timing_enabled=timing_enabled,
+                num_tokens_by_pool={PoolName.KV.value: len(op.device_indices)},
+                num_bytes=self._transfer_num_bytes(op),
             )
         )
         return producer_id
@@ -859,6 +885,11 @@ class HiCacheController:
         # If storage is already attached, wire up the draft I/O path now.
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
+
+    def set_mtp_draft_pools(self, device_pools) -> None:
+        """Register MTP device pools used for L2 load-back."""
+        self.mtp_draft_device_pools = tuple(device_pools)
+        self.has_mtp_draft = bool(self.mtp_draft_device_pools)
 
     def _maybe_register_draft_with_storage(self) -> None:
         """Pick the draft L3 IO implementation."""
@@ -1070,19 +1101,13 @@ class HiCacheController:
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
-                if storage_hit_count < self.prefetch_threshold:
-                    # not to prefetch if not enough benefits
-                    self.prefetch_revoke_queue.put(operation.request_id)
-                    logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
-                    )
-                else:
-                    # Record hit count, so the scheduler thread will know the exact memory to allocate
-                    operation.hash_value = hash_value[
-                        : (storage_hit_count // self.page_size)
-                    ]
-                    operation.storage_hit_count = storage_hit_count
-                    self.prefetch_hit_queue.put(operation)
+                # Record the TP-synced hit count; the scheduler thread decides
+                # at drain time whether to revoke (below threshold) or allocate.
+                operation.hash_value = hash_value[
+                    : (storage_hit_count // self.page_size)
+                ]
+                operation.storage_hit_count = storage_hit_count
+                self.prefetch_hit_queue.put(operation)
 
             except Empty:
                 continue

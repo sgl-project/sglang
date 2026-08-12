@@ -43,6 +43,13 @@ class Qwen3_5ForCausalLM(nn.Module):
     packed_modules_mapping = qwen3_5.Qwen3_5ForCausalLM.packed_modules_mapping
     supported_lora_modules = qwen3_5.Qwen3_5ForCausalLM.supported_lora_modules
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # The body decides; it is handed this config and quantization verbatim.
+        return cls.body_cls.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
+
     def __init__(
         self,
         config,

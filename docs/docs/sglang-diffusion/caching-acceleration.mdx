@@ -3,11 +3,11 @@ title: "Caching Acceleration"
 description: "Compare caching acceleration strategies for diffusion models."
 tag: "approx"
 ---
-SGLang provides two complementary caching strategies for Diffusion Transformer (DiT) models. Both reduce denoising cost by skipping redundant computation, but they operate at different levels.
+SGLang provides three complementary caching strategies for Diffusion Transformer (DiT) models. All reduce denoising cost by skipping redundant computation, but they operate at different levels.
 
 ## Overview
 
-SGLang supports two complementary caching approaches:
+SGLang supports three complementary caching approaches:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -36,6 +36,12 @@ SGLang supports two complementary caching approaches:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timestep-level</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Skip entire denoising steps based on L1 similarity</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Simple, built-in</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Spectrum</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timestep-level</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Forecast DiT features to skip selected denoising steps</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental, model-validated tuning</td>
     </tr>
   </tbody>
 </table>
@@ -85,6 +91,14 @@ See [TeaCache](./teacache) for detailed documentation.
 - HunyuanVideo: not supported yet
 
 For Flux and Qwen models, TeaCache is automatically disabled when CFG is enabled.
+
+## Spectrum
+
+Spectrum forecasts DiT features and skips selected denoising steps. It is
+approximate and currently applies only to selected native implementation paths.
+
+See [Spectrum Acceleration](./spectrum) for supported model families,
+constraints, and request controls.
 
 
 ## References

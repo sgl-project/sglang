@@ -12,6 +12,8 @@
 #include <memory>
 #include <optional>
 
+namespace sglang {
+
 namespace host::ffi {
 
 using tvm::ffi::Tensor, tvm::ffi::TensorView, tvm::ffi::ShapeView;
@@ -102,3 +104,5 @@ inline Tensor from_blob_like(
 }
 
 }  // namespace host::ffi
+
+}  // namespace sglang

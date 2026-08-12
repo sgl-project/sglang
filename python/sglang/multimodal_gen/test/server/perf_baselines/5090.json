@@ -101,6 +101,28 @@
             "expected_avg_denoise_ms": 246.97,
             "expected_median_denoise_ms": 273.01,
             "estimated_full_test_time_s": 329.8
+        },
+        "lingbot_video_moe_t2v": {
+            "stages_ms": {
+                "InputValidationStage": 0.1,
+                "LingBotVideoTextEncodingStage": 270.0,
+                "LatentPreparationStage": 1.2,
+                "TimestepPreparationStage": 0.2,
+                "DenoisingStage": 26414.5,
+                "DecodingStage": 628.3
+            },
+            "denoise_step_ms": {
+                "0": 2200.8,
+                "2": 2200.8,
+                "4": 2200.8,
+                "7": 2200.8,
+                "9": 2200.8,
+                "11": 2200.8
+            },
+            "expected_e2e_ms": 27740.0,
+            "expected_avg_denoise_ms": 2200.8,
+            "expected_median_denoise_ms": 2200.8,
+            "estimated_full_test_time_s": 90.0
         }
     }
 }

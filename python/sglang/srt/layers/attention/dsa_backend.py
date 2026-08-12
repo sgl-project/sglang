@@ -285,6 +285,10 @@ _DSA_IMPL_T: TypeAlias = Literal[
 class DeepseekSparseAttnBackend(
     DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
+
+    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
+    # can never carry more seqs than the pool.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
     # Decode/verify/draft graph replay rebuilds metadata from static buffers
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.

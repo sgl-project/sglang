@@ -51,6 +51,15 @@ LEAK_FILLER = (
     "We promptly judged antique ivory buckles for the next prize. "
 ) * 20
 
+SWA_MODEL = "openai/gpt-oss-20b"
+
+# Common gpt-oss-20b launch args. Matches TestSessionLatency/TestSWARadixCacheKL.
+SWA_COMMON_ARGS = [
+    "--mem-fraction-static",
+    "0.70",
+    "--cuda-graph-backend-prefill=disabled",
+]
+
 ABORT_REPRO_CONTEXT_LEN = 512
 ABORT_REPRO_PAGE_SIZE = 256
 ABORT_REPRO_GEN_LEN = 4

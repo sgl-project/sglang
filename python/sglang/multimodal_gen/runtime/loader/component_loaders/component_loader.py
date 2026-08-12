@@ -422,6 +422,9 @@ class ComponentLoader(ABC):
         ):
             transformers_or_diffusers = "diffusers"
 
+        if transformers_or_diffusers.startswith("lingbot_video"):
+            transformers_or_diffusers = "diffusers"
+
         return transformers_or_diffusers
 
     @classmethod
@@ -477,7 +480,9 @@ class ImageProcessorLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
-        return AutoImageProcessor.from_pretrained(component_model_path, use_fast=True)
+        return AutoImageProcessor.from_pretrained(
+            component_model_path, backend="torchvision"
+        )
 
 
 class AutoProcessorLoader(ComponentLoader):

@@ -110,6 +110,7 @@ class TestVerifyMaskGate(CustomTestCase):
 class _FakeAttnBackend:
     def __init__(self, verify_mask):
         self.needs_cpu_seq_lens = False
+        self.extend_dummy_seqs_capped_by_req_pool = False
         self.verify_mask = verify_mask
 
 

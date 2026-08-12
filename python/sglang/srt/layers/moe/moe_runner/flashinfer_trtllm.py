@@ -646,6 +646,9 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     weight_block_k: int | None = None
     w13_weight_scale_inv: torch.Tensor | None = None
     w2_weight_scale_inv: torch.Tensor | None = None
+    gemm1_alpha: torch.Tensor | None = None
+    gemm1_beta: torch.Tensor | None = None
+    gemm1_clamp_limit: torch.Tensor | None = None
 
     # Per-tensor path
     w13_input_scale: torch.Tensor | None = None
@@ -744,6 +747,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 hidden_states_scale=a_sf_t,
                 gemm1_weights=quant_info.w13_weight,
                 gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 num_experts=quant_info.global_num_experts,
@@ -779,6 +785,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 hidden_states_scale=a_sf_t,
                 gemm1_weights=quant_info.w13_weight,
                 gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 output=symm_output,
@@ -1130,13 +1139,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
             gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
-            # FIXME(kpham-sgl): flashinfer sizes this buffer from routing_logits
-            # dtype (fp32 in DSv3 decode) but always writes bf16 weights into it.
-            # Reinterpret the live bf16 prefix. Fix upstream alloc to drop this,
-            # tracking in https://github.com/flashinfer-ai/flashinfer/issues/3595
-            if expert_weights.dtype == torch.float32:
-                n, k = expert_weights.shape
-                expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
             result = FlashInferTrtllmDeferredFinalizeOutput(
                 gemm2_out=gemm2_out,
                 expert_weights=expert_weights,
