@@ -85,12 +85,12 @@ class LlavaOnevisionForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-        self.image_newline = nn.Parameter(
-            torch.empty(config.text_config.hidden_size)
-        )
+        self.image_newline = nn.Parameter(torch.empty(config.text_config.hidden_size))
 
         # Init-static values (see general-code-style.md).
-        self._patches_per_side = self.vision_config.image_size // self.vision_config.patch_size
+        self._patches_per_side = (
+            self.vision_config.image_size // self.vision_config.patch_size
+        )
         self._base_num_tokens = self._patches_per_side * self._patches_per_side
         self._max_num_patches = int(
             self.config.vision_aspect_ratio.removeprefix("anyres_max_")
@@ -188,7 +188,7 @@ class LlavaOnevisionForConditionalGeneration(nn.Module):
         unpadded = curr_h * curr_w
         newline = curr_h
         ratio = math.sqrt(
-            curr_h * curr_w / (self._max_num_patches * self._patches_per_side ** 2)
+            curr_h * curr_w / (self._max_num_patches * self._patches_per_side**2)
         )
         if ratio > 1.1:
             unpadded = int(curr_h // ratio) * int(curr_w // ratio)
@@ -213,7 +213,9 @@ class LlavaOnevisionForConditionalGeneration(nn.Module):
         numpy until it reaches the model. ``torch.as_tensor`` is a zero-copy
         view when possible.
         """
-        tensor = feature if isinstance(feature, torch.Tensor) else torch.as_tensor(feature)
+        tensor = (
+            feature if isinstance(feature, torch.Tensor) else torch.as_tensor(feature)
+        )
         params = self.vision_tower.parameters()
         first = next(params)
         return tensor.to(device=first.device, dtype=first.dtype, non_blocking=True)
@@ -283,9 +285,7 @@ class LlavaOnevisionForConditionalGeneration(nn.Module):
             raise ValueError("Patch count mismatch vs. vision config.")
 
         if patch_embeddings.shape[0] == 1:
-            return torch.cat(
-                (base, self.image_newline[None].to(base.device)), dim=0
-            )
+            return torch.cat((base, self.image_newline[None].to(base.device)), dim=0)
 
         others = patch_embeddings[1:]
         best_h, best_w = select_best_resolution(
@@ -295,12 +295,10 @@ class LlavaOnevisionForConditionalGeneration(nn.Module):
         n_h = best_h // image_size
         n_w = best_w // image_size
         others = others[: n_h * n_w].view(n_h, n_w, s, s, -1)
-        others = (
-            others.permute(4, 0, 2, 1, 3).contiguous().flatten(1, 2).flatten(2, 3)
-        )
+        others = others.permute(4, 0, 2, 1, 3).contiguous().flatten(1, 2).flatten(2, 3)
         others = unpad_image(others, (orig_h, orig_w))
         _, ch, cw = others.shape
-        ratio = math.sqrt(ch * cw / (self._max_num_patches * s ** 2))
+        ratio = math.sqrt(ch * cw / (self._max_num_patches * s**2))
         if ratio > 1.1:
             others = nn.functional.interpolate(
                 others[None],
@@ -333,9 +331,7 @@ class LlavaOnevisionForConditionalGeneration(nn.Module):
             positions=positions,
         )
 
-    def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]]
-    ) -> set:
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_sglang_mapper)
 

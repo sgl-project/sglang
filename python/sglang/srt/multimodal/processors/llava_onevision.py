@@ -100,7 +100,10 @@ class LlavaOnevisionProcessor(LlavaImageProcessor):
             pixel_values, image_sizes = [pixel_v], [image_s]
 
         modality = Modality.IMAGE
-        if isinstance(request_obj.modalities, list) and request_obj.modalities[0] == "video":
+        if (
+            isinstance(request_obj.modalities, list)
+            and request_obj.modalities[0] == "video"
+        ):
             modality = Modality.VIDEO
 
         mm_items = []
