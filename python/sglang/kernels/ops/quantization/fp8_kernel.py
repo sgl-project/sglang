@@ -1269,7 +1269,9 @@ def get_w8a8_channelwise_fp8_configs(N: int, K: int) -> Optional[Dict[int, Any]]
     caller must fall back. A missing file / shape likewise means "keep the
     default".
     """
-    # Skip config lookup during torch.compile to avoid non-Tensor ops (e.g. device name).
+    # Intentional: the tuned lookup (host-side device name + file I/O) isn't
+    # traceable, so under torch.compile return None and fall back to CUTLASS --
+    # same as mainline's block-FP8 get_w8a8_block_fp8_configs.
     if torch._dynamo.is_compiling():
         return None
 
