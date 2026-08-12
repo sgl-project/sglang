@@ -6,7 +6,6 @@ import re
 
 import torch
 
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -98,15 +97,59 @@ class SolAttnImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        del num_heads, num_kv_heads, extra_impl_args
+        del extra_impl_args
         if head_size != _SOL_ATTN_HEAD_DIM:
             raise ValueError(
                 f"Sol-Attn requires head_size={_SOL_ATTN_HEAD_DIM}, got {head_size}"
             )
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.prefix = prefix
         self.layer_idx = self._parse_layer_idx(prefix)
+        self._dense_impl: AttentionImpl | None = None
+
+    def _get_dense_impl(self) -> AttentionImpl:
+        """Dense attention, used wherever the schedule excludes sparsity.
+
+        Resolved through the selector rather than bound to one kernel entry
+        point. Calling the raw varlen op directly took its ``ver=3`` default
+        instead of the version the platform resolved, which on sm_100 fell
+        through FA3's arch guard into an FA2 import that no longer exists there.
+        Asking the selector for the platform's preferred dense backend also
+        keeps the skipped steps on the same kernel a dense reference render
+        uses, so they do not diverge before any sparsity applies.
+
+        Built on first use, so constructing an impl does not require a platform
+        that can resolve a dense backend.
+        """
+        if self._dense_impl is not None:
+            return self._dense_impl
+
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            get_attn_backend,
+        )
+
+        backend = get_attn_backend(
+            self.head_size,
+            torch.bfloat16,
+            supported_attention_backends={
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            },
+            selected_attention_backend=AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+        )
+        self._dense_impl = backend.get_impl_cls()(
+            num_heads=self.num_heads,
+            head_size=self.head_size,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+            num_kv_heads=self.num_kv_heads,
+            prefix=f"{self.prefix}.dense",
+        )
+        return self._dense_impl
 
     @staticmethod
     def _parse_layer_idx(prefix: str) -> int | None:
@@ -140,16 +183,12 @@ class SolAttnImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        output = flash_attn_varlen_func(
+        output = self._get_dense_impl().forward_varlen(
             query,
             key,
             value,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            softmax_scale=self.softmax_scale,
-            causal=self.causal,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
         return output[0] if isinstance(output, tuple) else output
 

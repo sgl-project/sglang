@@ -246,7 +246,15 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             )
 
     def _build_dense_impl(self, *, causal: bool) -> AttentionImpl:
-        """Flash attention, used wherever the schedule excludes sparsity."""
+        """Dense attention, used wherever the schedule excludes sparsity.
+
+        Asks for the same backend an unmodified run would have picked rather
+        than pinning FA: on sm_100 that is cuDNN SDPA, which the platform
+        prefers over the FA4 CuTe kernels for dense diffusion attention. Pinning
+        FA left the skipped steps on the slower kernel *and* computed them with a
+        different kernel than a dense reference render, so the two trajectories
+        separated before any sparsity applied.
+        """
         from sglang.multimodal_gen.runtime.layers.attention.selector import (
             get_attn_backend,
         )
@@ -258,7 +266,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
             },
-            selected_attention_backend=AttentionBackendEnum.FA,
+            selected_attention_backend=AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
         )
         return backend.get_impl_cls()(
             num_heads=self.num_heads,
