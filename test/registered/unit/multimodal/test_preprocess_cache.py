@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +66,23 @@ class TestMediaIdentity(unittest.TestCase):
             path.write_bytes(b"second")
             second = snapshot_media(str(path))
         self.assertNotEqual(first.content_digest, second.content_digest)
+
+    def test_relative_local_path_uses_file_bytes(self):
+        payload = b"relative-image-bytes"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.png"
+            path.write_bytes(payload)
+            previous = Path.cwd()
+            try:
+                os.chdir(directory)
+                snapshot = snapshot_media("image.png")
+            finally:
+                os.chdir(previous)
+
+        self.assertEqual(snapshot.data, payload)
+        self.assertEqual(
+            snapshot.content_digest, snapshot_media(payload).content_digest
+        )
 
     def test_same_url_with_new_contents_misses(self):
         with patch(

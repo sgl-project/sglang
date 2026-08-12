@@ -34,12 +34,16 @@ class KimiK3ResizeConfig:
 
 @dataclass(frozen=True)
 class KimiK3DeferredConfig:
+    backend: str
+    feature_layout: str
     image_mean: tuple[float, ...]
     image_std: tuple[float, ...]
     transparent_bg_config: Optional[dict]
 
     def as_dict(self, resize_config: KimiK3ResizeConfig) -> dict:
         return {
+            "backend": self.backend,
+            "feature_layout": self.feature_layout,
             "image_mean": list(self.image_mean),
             "image_std": list(self.image_std),
             "transparent_bg_config": self.transparent_bg_config,

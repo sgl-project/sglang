@@ -22,12 +22,16 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.mem_cache.multimodal_cache import MM_EMBEDDING_CACHE_LEASE_ID_KEY
+from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.models.kimi_k25 import (
     KimiK25ForConditionalGeneration,
     mm_projection_auto,
 )
 from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
 from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    DEFERRED_PREPROCESSING_KEY,
+)
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
@@ -38,6 +42,7 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
     _expand_k3_image_prompt_token_ids,
 )
 from sglang.srt.multimodal.processors.kimi_k3_artifact import (
+    KimiK3DeferredConfig,
     KimiK3ImageArtifact,
     KimiK3ResizeConfig,
 )
@@ -765,6 +770,83 @@ def test_kimi_k3_featureless_artifact_requires_lease():
 
     with pytest.raises(ValueError, match="embedding lease"):
         processor.compose_request([1, 99, 2], [artifact], featureless_hit_mask=[True])
+
+
+def test_kimi_k3_cached_deferred_artifact_has_model_contract():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.keep_mm_features_on_device = False
+    feature = torch.zeros((3, 2, 2), dtype=torch.uint8)
+
+    artifact = processor._make_artifact(
+        content_digest="sha256:" + "ab" * 32,
+        artifact_key="artifact",
+        original_size=(2, 2),
+        resize_config={
+            "num_tokens": 1,
+            "new_width": 2,
+            "new_height": 2,
+            "pad_width": 0,
+            "pad_height": 0,
+        },
+        grid_thw=(1, 1, 1),
+        feature=feature,
+        deferred=KimiK3DeferredConfig(
+            backend="gpu",
+            feature_layout="chw",
+            image_mean=(0.5, 0.5, 0.5),
+            image_std=(0.5, 0.5, 0.5),
+            transparent_bg_config=None,
+        ),
+    )
+
+    config = artifact.deferred.as_dict(artifact.resize_config)
+    assert config["backend"] == "gpu"
+    assert config["feature_layout"] == "chw"
+
+
+def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
+    class _Tower(nn.Module):
+        device = torch.device("cpu")
+        patch_size = 2
+
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = SimpleNamespace(
+                proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32))
+            )
+
+        def forward(self, pixel_values, _grid_thws):
+            return pixel_values
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.use_data_parallel = False
+    model.vision_tower = _Tower()
+    model.mm_projector = _Projector()
+    eager = _image_item(torch.ones((1, 3)), [[1, 1, 1]])
+    deferred = _image_item(torch.zeros((3, 2, 2), dtype=torch.uint8), [[1, 1, 1]])
+    deferred.model_specific_data[DEFERRED_PREPROCESSING_KEY] = {
+        "backend": "gpu",
+        "feature_layout": "chw",
+        "image_mean": [0.5, 0.5, 0.5],
+        "image_std": [0.5, 0.5, 0.5],
+        "transparent_bg_config": None,
+        "resize_config": {
+            "num_tokens": 1,
+            "new_width": 2,
+            "new_height": 2,
+            "pad_width": 0,
+            "pad_height": 0,
+        },
+    }
+
+    with patch(
+        "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+        return_value=(torch.full((1, 3), 2.0), torch.tensor([[1, 1, 1]])),
+    ):
+        output = model.get_image_feature([eager, deferred])
+
+    torch.testing.assert_close(output, torch.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]))
 
 
 def test_kimi_k3_trusted_hot_hit_skips_media_read():
