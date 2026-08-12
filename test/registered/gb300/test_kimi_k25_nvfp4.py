@@ -63,8 +63,19 @@ class TestKimiK25Nvfp4(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="Kimi-K2.5-NVFP4",
+            # Sampling is pinned to what the previous NeMo-Skills harness sent
+            # implicitly, so the baseline carries over unchanged: `ns eval
+            # --benchmarks=mmmu-pro:1` defaults to temperature 0.7 (only `:0`
+            # or a bare name means greedy) with seed 0, and sends no
+            # chat_template_kwargs.thinking.
             accuracy_params=AccuracyTestParams(
-                dataset="mmmu-pro", baseline_accuracy=0.69, repeat=1, max_tokens=32768
+                dataset="mmmu_pro_vision",
+                baseline_accuracy=0.69,
+                repeat=1,
+                max_tokens=32768,
+                temperature=0.7,
+                seed=0,
+                sgl_eval_thinking=False,
             ),
             performance_params=PerformanceTestParams(
                 result_dir="performance_results_gb300",
