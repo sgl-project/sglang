@@ -4209,6 +4209,46 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "search")
 
+    def test_good_call_survives_unparsable_block(self):
+        """A genuinely ambiguous nested quote makes the whole block a
+        SyntaxError, so no call list exists and the parseable sibling died
+        with the block, leaving the agent loop with no tool result."""
+        text = (
+            "<|tool_call_start|>[search(query='ok'), "
+            "get_weather(city='x 'y', unit='c')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "ok"})
+
+    def test_swallowing_reading_rejected(self):
+        """Closing the broken string late makes the text parse by absorbing
+        the sibling call into the argument value, so the tool would run with
+        corrupted arguments. Rejecting readings that lose calls leaves the
+        correct early close and recovers both calls."""
+        text = (
+            "<|tool_call_start|>[search(query='x 'y'), "
+            "get_weather(city='p 'q')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual([c.name for c in result.calls], ["search", "get_weather"])
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "x 'y"})
+        self.assertEqual(json.loads(result.calls[1].parameters), {"city": "p 'q"})
+
+    def test_unrecoverable_block_reports_no_calls(self):
+        """Splitting must not fabricate calls: when no segment parses, the
+        block yields no tool calls at all."""
+        text = (
+            "<|tool_call_start|>[search(query='x 'y' 'z), "
+            "get_weather(city='p 'q' 'r)]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+
     def test_streaming_recovers_multiline(self):
         """Streaming buffers the block and delegates to detect_and_parse;
         an incremental rewrite of the streaming path would bypass the
