@@ -20,6 +20,12 @@ if TYPE_CHECKING:
 
 _NUM_EXPERTS = 896
 _TOPK = 16
+# One block per token, so the grid outgrows the machine somewhere past a
+# thousand tokens and the kernel turns throughput-bound, where spreading a token
+# over four waves is a cost rather than a win. Measured break-even is ~1.5k
+# tokens; below 1k the kernel still leads by 1.2x or more, and prefill-sized
+# batches are far above either number.
+_MAX_TOKENS = 1024
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +70,7 @@ def covered(
     """
     return (
         scores.dim() == 2
+        and scores.size(0) <= _MAX_TOKENS
         and scores.size(1) == _NUM_EXPERTS
         and int(topk) == _TOPK
         and scores.dtype in (torch.bfloat16, torch.float32)

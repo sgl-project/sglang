@@ -284,8 +284,6 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   }
 }
 
-}  // namespace sglang
-
 struct RouteRadix4Kernel {
   static void
   run(const tvm::ffi::TensorView scores,
@@ -315,13 +313,13 @@ struct RouteRadix4Kernel {
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device_).verify(out_i);
 
     RuntimeCheck(
-        N_.unwrap() == sglang::kRadix4NumExperts && K_.unwrap() == sglang::kRadix4TopK && topk == sglang::kRadix4TopK,
+        N_.unwrap() == kRadix4NumExperts && K_.unwrap() == kRadix4TopK && topk == kRadix4TopK,
         "route_radix4 is specialized for N=896, K=16");
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
 
-    const auto params = sglang::RouteRadix4Params{
+    const auto params = RouteRadix4Params{
         .scores = scores.data_ptr(),
         .bias = bias.data_ptr(),
         .out_w = static_cast<fp32_t*>(out_w.data_ptr()),
@@ -332,14 +330,16 @@ struct RouteRadix4Kernel {
         .renormalize = renormalize,
     };
 
-    constexpr auto kExperts = static_cast<int>(sglang::kRadix4NumExperts);
-    constexpr auto kTopK = static_cast<int>(sglang::kRadix4TopK);
-    constexpr auto kBlock = static_cast<int>(sglang::kRadix4Block);
+    constexpr auto kExperts = static_cast<int>(kRadix4NumExperts);
+    constexpr auto kTopK = static_cast<int>(kRadix4TopK);
+    constexpr auto kBlock = static_cast<int>(kRadix4Block);
     const auto device = device_.unwrap();
     if (score_dtype.is_type<bf16_t>()) {
-      LaunchKernel(M, kBlock, device)(sglang::route_radix4_kernel<bf16_t, kExperts, kTopK, kBlock>, params);
+      LaunchKernel(M, kBlock, device)(route_radix4_kernel<bf16_t, kExperts, kTopK, kBlock>, params);
     } else {
-      LaunchKernel(M, kBlock, device)(sglang::route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock>, params);
+      LaunchKernel(M, kBlock, device)(route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock>, params);
     }
   }
 };
+
+}  // namespace sglang
