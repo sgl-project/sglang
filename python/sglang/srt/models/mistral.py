@@ -122,18 +122,6 @@ class Mistral3ForConditionalGeneration:
             image_outputs = self.vision_tower(
                 pixel_values, image_sizes, output_hidden_states=True
             )
-            if torch.xpu.is_available():
-                # Pixtral processes images at native (untiled) resolution, so
-                # pixel_values shape varies per request. XPU's caching allocator
-                # can't reuse blocks across the resulting variety of activation
-                # shapes, so reserved memory grows monotonically across requests
-                # until the device genuinely OOMs (independent of concurrency).
-                # A threshold-gated flush (only calling empty_cache() once
-                # fragmentation exceeds N bytes) was tried and measured to still
-                # crash, just later -- reserved-minus-allocated undercounts the
-                # real external fragmentation, so only an unconditional flush
-                # after every image reliably prevents it.
-                torch.xpu.empty_cache()
             selected_image_feature = image_outputs.hidden_states[
                 self.vision_feature_layer
             ]
