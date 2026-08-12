@@ -337,7 +337,14 @@ class _BaseLTX2Pipeline(LoRAPipeline):
         "connectors",
     ]
 
+    # LTX-2.5 ships two DiTs: the distilled one `model_index.json` points at, and
+    # `transformer_full/`, the full / SFT weights, which the index deliberately
+    # omits. `--model-variant dev` selects the latter.
+    _DEV_VARIANTS = frozenset({"dev", "full", "sft"})
+    _DEV_TRANSFORMER_SUBFOLDER = "transformer_full"
+
     def __init__(self, model_path, server_args, required_config_modules=None, **kwargs):
+        self._maybe_route_dev_transformer(model_path, server_args)
         # The duration head ships from LTX-2.5 onward and is absent from LTX-2 /
         # LTX-2.3 checkpoints, so it can only be required when the model
         # actually declares it.
@@ -350,6 +357,29 @@ class _BaseLTX2Pipeline(LoRAPipeline):
         super().__init__(
             model_path, server_args, required_config_modules=modules, **kwargs
         )
+
+    @classmethod
+    def _is_dev_variant(cls, server_args: ServerArgs) -> bool:
+        return str(server_args.model_variant or "").lower() in cls._DEV_VARIANTS
+
+    @classmethod
+    def _maybe_route_dev_transformer(cls, model_path: str, server_args: ServerArgs):
+        """Point the transformer at `transformer_full/` for the dev variant."""
+        if not cls._is_dev_variant(server_args):
+            return
+        if server_args.component_paths.get("transformer"):
+            return
+        full_path = os.path.join(str(model_path), cls._DEV_TRANSFORMER_SUBFOLDER)
+        if not os.path.isdir(full_path):
+            raise ValueError(
+                f"--model-variant {server_args.model_variant} requires "
+                f"'{cls._DEV_TRANSFORMER_SUBFOLDER}' in the checkpoint, but "
+                f"{full_path} does not exist. It is excluded from "
+                "`model_index.json`, so a partial snapshot download may have "
+                "skipped it."
+            )
+        server_args.component_paths["transformer"] = full_path
+        logger.info("Serving the LTX-2.5 dev transformer from %s", full_path)
 
     @staticmethod
     def _declares_component(model_path: str, component_name: str) -> bool:
@@ -367,7 +397,23 @@ class _BaseLTX2Pipeline(LoRAPipeline):
 
     def initialize_pipeline(self, server_args: ServerArgs):
         orig = self.get_module("scheduler")
-        self.modules["scheduler"] = LTX2FlowMatchScheduler.from_config(orig.config)
+        scheduler_overrides: dict = {}
+        if self._is_dev_variant(server_args):
+            # `scheduler/` is configured for the distilled DiT, which wants the
+            # schedule exactly as given. The full DiT needs the shifting back.
+            scheduler_overrides = {
+                "use_dynamic_shifting": True,
+                "shift_terminal": 0.1,
+            }
+            # It is also driven by a step count, not the distilled sigma list.
+            server_args.pipeline_config.default_sigmas = None
+            logger.info(
+                "LTX-2.5 dev variant: re-enabled dynamic shifting and dropped the "
+                "pinned distilled sigma schedule."
+            )
+        self.modules["scheduler"] = LTX2FlowMatchScheduler.from_config(
+            orig.config, **scheduler_overrides
+        )
         sync_ltx23_runtime_vae_markers(
             server_args.pipeline_config.vae_config.arch_config,
             getattr(self.get_module("vae"), "config", None),

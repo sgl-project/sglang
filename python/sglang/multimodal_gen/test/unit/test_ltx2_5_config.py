@@ -455,5 +455,44 @@ class TestLTX25LatentUpsampler(unittest.TestCase):
         self.assertNotEqual(without, with_rr)
 
 
+class TestLTX25DevVariant(unittest.TestCase):
+    """`--model-variant dev` serves `transformer_full/`, which the index omits."""
+
+    def _pipeline_cls(self):
+        from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
+            _BaseLTX2Pipeline,
+        )
+
+        return _BaseLTX2Pipeline
+
+    def _args(self, variant):
+        class _Args:
+            model_variant = variant
+            component_paths: dict = {}
+
+        return _Args()
+
+    def test_variant_aliases(self):
+        cls = self._pipeline_cls()
+        for variant in ("dev", "full", "sft", "DEV"):
+            self.assertTrue(cls._is_dev_variant(self._args(variant)), variant)
+        for variant in (None, "", "distilled"):
+            self.assertFalse(cls._is_dev_variant(self._args(variant)), variant)
+
+    def test_missing_weights_raises_a_clear_error(self):
+        cls = self._pipeline_cls()
+        with self.assertRaises(ValueError) as ctx:
+            cls._maybe_route_dev_transformer("/nonexistent/model", self._args("dev"))
+        self.assertIn("transformer_full", str(ctx.exception))
+
+    def test_explicit_component_path_wins(self):
+        cls = self._pipeline_cls()
+        args = self._args("dev")
+        args.component_paths = {"transformer": "/some/other/transformer"}
+        # Must not raise, and must not overwrite the caller's choice.
+        cls._maybe_route_dev_transformer("/nonexistent/model", args)
+        self.assertEqual(args.component_paths["transformer"], "/some/other/transformer")
+
+
 if __name__ == "__main__":
     unittest.main()
