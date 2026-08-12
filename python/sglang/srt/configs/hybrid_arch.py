@@ -129,9 +129,10 @@ def mamba2_config(model_config: ModelConfig):
             )
         return config
 
-    # Pure Mamba-1 (Falcon-Mamba); the flag is set in ModelConfig. Mamba-1 uses
-    # the Mamba2 backend via a full-rank (head_dim==1) state layout.
-    if getattr(config, "_is_pure_falcon_mamba", False):
+    # Pure Mamba-1 (Falcon-Mamba, state-spaces Mamba); the flag is set in
+    # ModelConfig. Mamba-1 uses the Mamba2 backend via a full-rank (head_dim==1)
+    # state layout.
+    if getattr(config, "_is_pure_mamba1", False):
         # Mamba2AttnBackend reads mamba_chunk_size; keep the conv window below it.
         if not hasattr(config, "mamba_chunk_size"):
             config.mamba_chunk_size = 256
