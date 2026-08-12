@@ -587,6 +587,9 @@ class DeepseekV4AttnBackend(
         # scheduler generation runs inside the graph exactly once per key.
         self._mxfp4_sched_meta: dict = {}
         self._mxfp4_sched_meta_capture: dict = {}
+        # Tracks whether the last call was inside a CUDA-graph capture, to
+        # detect the start of a new capture session (see forward()).
+        self._mxfp4_capture_active = False
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
@@ -1824,7 +1827,15 @@ class DeepseekV4AttnBackend(
             swa_indices_3d.shape[-1],
             extra_indices_3d.shape[-1] if have_extra else 0,
         )
-        if torch.cuda.is_current_stream_capturing():
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and not self._mxfp4_capture_active:
+            # A new capture session: drop scheduler instances from previous
+            # sessions so each graph records its own scheduler generation —
+            # a later capture with the same geometry must not reuse another
+            # graph's (stale) metadata buffers.
+            self._mxfp4_sched_meta_capture.clear()
+        self._mxfp4_capture_active = capturing
+        if capturing:
             # During capture the scheduler generation must run inside the
             # graph (topk lengths are replayed device inputs) so it tracks
             # replayed lengths; share one metadata per key so the generation

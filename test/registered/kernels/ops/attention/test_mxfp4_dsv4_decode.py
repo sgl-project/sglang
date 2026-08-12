@@ -478,6 +478,93 @@ def test_flashmla_dsv4_mxfp4_clamps_graph_replayed_lengths() -> None:
     torch.testing.assert_close(graph_lse, lse_ref, atol=_LSE_ATOL, rtol=_LSE_RTOL)
 
 
+def _widen_primary_indices(case: _DecodeCase) -> _DecodeCase:
+    """Double the primary top-k width (128 -> 256) so lengths can cross a
+    second 64-token block boundary while reusing one FlashMLASchedMeta."""
+    capacity = case.kv.shape[0] * case.kv.shape[1]
+    wide = torch.cat(
+        [case.indices, (case.indices + capacity) % capacity], dim=-1
+    ).contiguous()
+    case.indices = wide
+    return case
+
+
+@pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
+@torch.inference_mode()
+def test_flashmla_dsv4_mxfp4_eager_refreshes_stale_scheduler() -> None:
+    """Eager (non-graph) calls with one FlashMLASchedMeta re-run the scheduler.
+
+    The split assignment depends on the per-call top-k lengths; a growing
+    sequence crossing a 64-token block boundary must not reuse the previous
+    call's assignment (regression: the scheduler only ran on a fresh buffer,
+    so the newly added KV block was silently dropped).
+    """
+    native = _require_native()
+    assert FlashMLASchedMeta is not None
+    case = _widen_primary_indices(_build_case(h_q=64, batch_size=2))
+    assert case.indices.shape[-1] == 256
+    device = case.q.device
+
+    meta = FlashMLASchedMeta()
+    case.topk_length.copy_(torch.tensor([128, 96], dtype=torch.int32, device=device))
+    out1, _ = _run_native(native, case, meta)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out1, _reference(case)[0], atol=_OUTPUT_ATOL, rtol=_OUTPUT_RTOL
+    )
+
+    # Same scheduler instance, lengths now spanning three 64-token blocks.
+    case.topk_length.copy_(torch.tensor([192, 160], dtype=torch.int32, device=device))
+    out2, _ = _run_native(native, case, meta)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out2, _reference(case)[0], atol=_OUTPUT_ATOL, rtol=_OUTPUT_RTOL
+    )
+
+
+@pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
+@torch.inference_mode()
+def test_flashmla_dsv4_mxfp4_fresh_meta_per_capture() -> None:
+    """A second CUDA-graph capture with the same geometry gets a fresh
+    scheduler (regression: the backend's capture dict reused the first
+    graph's instance, so the second graph never recorded the scheduler
+    kernel and replayed with a stale split assignment)."""
+    native = _require_native()
+    assert FlashMLASchedMeta is not None
+    case = _widen_primary_indices(_build_case(h_q=64, batch_size=2))
+    device = case.q.device
+
+    # Warm lazy extension state (as the backend does before capture).
+    _run_native(native, case, FlashMLASchedMeta())
+    torch.cuda.synchronize()
+
+    graph1 = torch.cuda.CUDAGraph()
+    meta1 = FlashMLASchedMeta()
+    case.topk_length.copy_(torch.tensor([128, 96], dtype=torch.int32, device=device))
+    with torch.cuda.graph(graph1):
+        _run_native(native, case, meta1)
+
+    # The backend clears its capture dict at the start of a new capture
+    # session, so the second graph records its own scheduler generation.
+    graph2 = torch.cuda.CUDAGraph()
+    meta2 = FlashMLASchedMeta()
+    case.topk_length.copy_(torch.tensor([128, 96], dtype=torch.int32, device=device))
+    with torch.cuda.graph(graph2):
+        graph2_out, graph2_lse = _run_native(native, case, meta2)
+
+    # Replay the second graph with lengths crossing the 64-block boundary.
+    case.topk_length.copy_(torch.tensor([192, 160], dtype=torch.int32, device=device))
+    graph2.replay()
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(case)
+    torch.testing.assert_close(
+        graph2_out, out_ref, atol=_OUTPUT_ATOL, rtol=_OUTPUT_RTOL
+    )
+    torch.testing.assert_close(
+        graph2_lse, lse_ref, atol=_LSE_ATOL, rtol=_LSE_RTOL
+    )
+
+
 @pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
 @pytest.mark.parametrize(
     ("name", "h_q", "extra_page_size", "extra_topk"),

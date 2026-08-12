@@ -266,12 +266,8 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
 
     device = q.device
     b, s_q, h_q = q.shape[0], q.shape[1], q.shape[2]
-    # A fresh metadata buffer needs the scheduler-generation kernel this call.
-    # Subsequent calls (steady-state decode, graph replays) reuse it; during
-    # CUDA-graph capture the caller supplies a fresh buffer so the generation
-    # kernel is captured into the graph and re-runs with replayed lengths.
-    generate_sched_meta = sched_meta.tile_scheduler_metadata is None
-    if generate_sched_meta:
+    need_buffer = sched_meta.tile_scheduler_metadata is None
+    if need_buffer:
         num_sm_parts = _num_sm_parts(b, s_q, h_q, device)
         # DecodingSchedMeta is 8 int32 (32 bytes, 4*8 aligned).
         sched_meta.tile_scheduler_metadata = torch.empty(
@@ -279,6 +275,13 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
         )
         sched_meta.num_splits = torch.empty((b + 1,), dtype=torch.int32, device=device)
     num_sm_parts = sched_meta.tile_scheduler_metadata.shape[0]
+    # The split assignment depends on the per-call top-k lengths, which in
+    # eager mode change every step (a growing sequence crosses 64-token block
+    # boundaries), so the scheduler re-runs on every eager call with the
+    # buffers reused. During CUDA-graph capture the caller supplies a fresh
+    # buffer, so the generation kernel is recorded once and re-executed on
+    # every replay with the replayed lengths.
+    generate_sched_meta = need_buffer or not torch.cuda.is_current_stream_capturing()
 
     # Outputs are per-call (returned to the caller); split-K accumulators are
     # internal scratch reused across calls of the same geometry. The scheduler
