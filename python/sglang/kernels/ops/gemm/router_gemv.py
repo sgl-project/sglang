@@ -19,7 +19,7 @@ import triton.language as tl
 
 _BLOCK_N = 16
 _BLOCK_K = 512
-_SPLIT_K = 8
+_SPLIT_K = 4
 _MAX_M = 64
 
 
@@ -116,6 +116,6 @@ def router_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         BLOCK_K=_BLOCK_K,
         BLOCK_N=_BLOCK_N,
         SPLIT_K=_SPLIT_K,
-        num_warps=2,
+        num_warps=16,
     )
     return out
