@@ -25,10 +25,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
     KVTransferError,
 )
-from sglang.srt.disaggregation.common.staging_handler import (
-    STAGING_WATERMARK_WAIT_S,
-    StagingRegisterInfo,
-)
+from sglang.srt.disaggregation.common.staging_handler import STAGING_WATERMARK_WAIT_S
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
@@ -44,6 +41,7 @@ from sglang.srt.disaggregation.utils import (
     resolve_dcp_dst_entry_indices,
 )
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 
 try:
@@ -232,9 +230,8 @@ class KVArgsRegisterInfo:
     dst_state_layer_ids: List[List[int]] = dataclasses.field(default_factory=list)
     dst_homogeneous_mem_kind: Optional[str] = None
     kv_xfer_segments: Optional[List[_KVXferPreparedSegment]] = None
-    # Keep last: optional, parsed from a variable-length tail of the ZMQ
-    # frame in from_zmq() below, so positional construction stays stable.
-    staging: Optional[StagingRegisterInfo] = None
+    staging_base_ptr: int = 0
+    staging_total_size: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -303,7 +300,14 @@ class KVArgsRegisterInfo:
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             dst_state_layer_ids=dst_state_layer_ids,
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            staging_base_ptr=(
+                struct.unpack("Q", msg[14])[0]
+                if len(msg) > 14 and len(msg[14]) == 8
+                else 0
+            ),
+            staging_total_size=(
+                int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
+            ),
         )
 
 
@@ -480,6 +484,9 @@ class NixlKVManager(CommonKVManager):
                 FastQueue() for _ in range(transfer_queue_size)
             ]
             self.exceptions: Dict[int, Exception] = {}
+            # Per-room count of chunks not yet transferred; teardown waits for
+            # zero so a deferred chunk is not dropped by an early conclude.
+            self._staging_outstanding = defaultdict(int)
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -505,7 +512,6 @@ class NixlKVManager(CommonKVManager):
             if self.enable_staging:
                 self._init_staging_decode_ctx()
                 self._staging_handler = None
-                self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
                 self._start_decode_staging_thread()
             self._start_heartbeat_checker_thread()
         else:
@@ -538,7 +544,7 @@ class NixlKVManager(CommonKVManager):
             lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
             self.kv_args,
             count,
-            self.server_args.chunked_prefill_size,
+            get_schedule().chunked_prefill_size,
         )
 
     def _init_staging_allocator(self):
@@ -670,7 +676,7 @@ class NixlKVManager(CommonKVManager):
             room,
             self.transfer_infos,
             self.kv_buffer_tensors,
-            self.server_args.chunked_prefill_size,
+            get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
         )
@@ -1114,9 +1120,15 @@ class NixlKVManager(CommonKVManager):
             handles: List[Any] = []
             try:
                 if self.check_status(room) == KVPoll.Failed:
+                    self._staging_outstanding.pop(room, None)
                     continue
 
                 assert room in self.transfer_infos
+
+                # Count each chunk once; the flag survives re-enqueue on defer.
+                if not kv_chunk.staging_counted:
+                    self._staging_outstanding[room] += 1
+                    kv_chunk.staging_counted = True
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -1194,7 +1206,10 @@ class NixlKVManager(CommonKVManager):
                             and not self.is_mla_backend
                             and not self.is_hybrid_mla_backend
                             and decode_tp_size != self.attn_tp_size
-                            and dst_info.staging is not None
+                            and (
+                                dst_info.staging_base_ptr != 0
+                                or dst_info.staging_total_size != 0
+                            )
                         )
 
                         kv_xfer_handle = None
@@ -1328,10 +1343,26 @@ class NixlKVManager(CommonKVManager):
                         break
                     time.sleep(0)
 
+                self._staging_outstanding[room] -= 1
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
-                    # Drop per-room state on Success (parity with mooncake
-                    # transfer_worker; staging prefetch sets are NIXL-only).
+                elif self.check_status(room) != KVPoll.Success:
+                    # A deferred earlier chunk can complete after the last chunk
+                    # already concluded Success; don't regress the status.
+                    self.update_status(room, KVPoll.Transferring)
+
+                # Drop per-room state only when no chunk is still outstanding and
+                # the room has concluded: Success, or a Failed *last* chunk. A
+                # non-last Failed chunk keeps the room (more chunks may follow); a
+                # late chunk for an already-Failed room is skipped at loop top.
+                if self._staging_outstanding.get(room, 0) <= 0 and (
+                    self.check_status(room) == KVPoll.Success
+                    or (
+                        kv_chunk.is_last_chunk
+                        and self.check_status(room) == KVPoll.Failed
+                    )
+                ):
+                    self._staging_outstanding.pop(room, None)
                     self.transfer_infos.pop(room, None)
                     self.req_to_decode_prefix_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
@@ -1340,8 +1371,6 @@ class NixlKVManager(CommonKVManager):
                         for k in list(self._staging_ctx.prefetch_requested):
                             if k[0] == room:
                                 self._staging_ctx.prefetch_requested.discard(k)
-                else:
-                    self.update_status(room, KVPoll.Transferring)
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
@@ -1949,8 +1978,8 @@ class NixlKVManager(CommonKVManager):
         handle = self.send_kvcache_staged(
             req.agent_name,
             src_prefill_kv_indices,
-            dst_info.staging.base_ptr + c_offset,
-            dst_info.staging.total_size - c_offset,
+            dst_info.staging_base_ptr + c_offset,
+            dst_info.staging_total_size - c_offset,
             dst_info.gpu_id,
             dst_info.decode_tp_rank,
             dst_info.decode_tp_size,
@@ -2460,10 +2489,12 @@ class NixlKVManager(CommonKVManager):
         page_start = int(components[6])
         num_pages = int(components[7])
         agent_name = components[8] if len(components) > 8 else ""
-        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
+        # Count this notif's own arrival BEFORE _track_kv_arrival, which can
+        # conclude the transfer and record all-ranks Success.
         self._handle_staging_chunk_arrived(
             room, chunk_idx, page_start, num_pages, agent_name
         )
+        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
 
     def _handle_aux_notification(self, room: int, components: List[str]):
         """Handle an aux notification and trigger last scatter if staging is complete.
@@ -2566,7 +2597,6 @@ class NixlKVManager(CommonKVManager):
             page_start,
             num_pages,
             agent_name,
-            self._chunk_writer_counts,
         )
 
     def _maybe_submit_last_scatter(self, room: int):
@@ -2586,7 +2616,6 @@ class NixlKVManager(CommonKVManager):
         handler = self._staging_handler
         if handler is not None and handler.is_staging_room(room):
             handler.submit_last_scatter_async(room)
-            self._chunk_writer_counts.pop(room, None)
 
     def check_transfer_done(self, room: int):
         if room not in self.transfer_statuses:
@@ -2761,6 +2790,13 @@ class NixlKVSender(CommonKVSender):
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        # Hold Success until all staging chunks transferred: a deferred chunk
+        # can still be pending, and concluding now would drop it.
+        if (
+            status == KVPoll.Success
+            and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+        ):
+            return KVPoll.Transferring  # type: ignore
         if (
             status == KVPoll.Success
             and self._transfer_start_time is not None

@@ -36,7 +36,7 @@ def qkv_proj_lora_forward(self, input_: torch.Tensor):
     AND base_output, so it runs after the rejoin on the main stream.
     """
     if (
-        not self.set_lora
+        not self.lora_active
         or not is_two_stream_active(input_)
         or not supports_two_stream_dense_lora(self.A_buffer_qkv, self.B_buffer_qkv)
     ):
@@ -104,7 +104,7 @@ def row_parallel_lora_forward(
         input_parallel = splitted_input[tp_rank].contiguous()
 
     if (
-        not self.set_lora
+        not self.lora_active
         or not is_two_stream_active(input_parallel)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
     ):
@@ -176,7 +176,7 @@ def column_parallel_lora_forward(self, input_: torch.Tensor):
     for non-decode batches or when LoRA isn't set on this layer.
     """
     if (
-        not self.set_lora
+        not self.lora_active
         or not is_two_stream_active(input_)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
     ):
@@ -231,7 +231,7 @@ def replicated_lora_forward(self, x: torch.Tensor):
     the main after the rejoin. Falls back to the saved-original otherwise.
     """
     if (
-        not self.set_lora
+        not self.lora_active
         or not is_two_stream_active(x)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
     ):

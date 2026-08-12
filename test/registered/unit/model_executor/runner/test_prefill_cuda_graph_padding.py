@@ -39,6 +39,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             global_num_tokens_cpu=None,
             return_logprob=False,
             input_ids=list(range(num_tokens)),
+            extend_prefix_lens_cpu=[0],
         )
 
     def test_rejects_more_than_two_x_token_padding(self):

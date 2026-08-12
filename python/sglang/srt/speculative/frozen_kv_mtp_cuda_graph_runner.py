@@ -32,7 +32,7 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_spec
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
@@ -96,7 +96,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.tp_size = self.model_runner.ps.tp_size
         self.attn_dp_size = self.model_runner.ps.attn_dp_size
         self.pp_size = model_runner.server_args.pp_size
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.draft_attn_backend = frozen_kv_mtp_worker.draft_attn_backend
         self.enable_profile_cuda_graph = (
@@ -125,7 +125,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 
-        self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self.draft_attn_backend.init_cuda_graph_state(
+            self.max_bs * self.topk, self.max_num_token
+        )
         self.seq_len_fill_value = (
             self.draft_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -361,7 +363,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                     self,
                     run_once,
                     post_warmup_hook=post_warmup_hook,
-                    skip_logits=False,
+                    run_lm_head=True,
                 )
                 self.backend.capture_one(
                     shape_key,
