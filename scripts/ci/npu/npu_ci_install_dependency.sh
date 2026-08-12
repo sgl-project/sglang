@@ -84,3 +84,10 @@ rm -rf cann-custom-ops
 ### Install SGLang
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
 ${UV_PIP_INSTALL} -v -e "python[dev_npu]"
+
+### Install sgl-eval
+# mmlu evals shell out to the sgl-eval CLI; the pinned commit is shared with
+# every other CI variant.
+# shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
+${UV_PIP_INSTALL} "$SGL_EVAL_SPEC"

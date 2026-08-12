@@ -682,13 +682,8 @@ stabilize_flashinfer_jit_paths() {
 install_extra_deps() {
     MOONCAKE_VERSION="0.3.12.post1"
     NIXL_VERSION="1.3.0"
-    # sgl-eval is git-only and cannot be declared in python/pyproject.toml (see
-    # the note there). Every eval that shells out to the sgl-eval CLI fails
-    # without it, and a bump moves scoring for all of them at once -- so
-    # re-baseline MODEL_SCORE_THRESHOLDS in
-    # test/registered/eval/test_text_models_gsm8k_eval.py, and the mmlu
-    # thresholds of run_eval's other callers, before changing this.
-    SGL_EVAL_REF="6690895609dcbc5df1e7b00dd57c9502b868ec4d"
+    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -724,7 +719,7 @@ install_extra_deps() {
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
-    $PIP_CMD install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}" $PIP_INSTALL_SUFFIX
+    $PIP_CMD install "$SGL_EVAL_SPEC" $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
