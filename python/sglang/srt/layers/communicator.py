@@ -61,7 +61,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
-    materialize_bpreshuffle_fp8_scale_tuple,
+    view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
@@ -646,11 +646,22 @@ class LayerCommunicator:
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
                             output_unquantized_inp1=_dsa_needs_bf16,
-                            transpose_scale=False,
+                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
                         )
                         if _use_aiter_bpreshuffle_gfx95:
-                            hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
-                                hidden_states
+                            # transpose_scale=True already wrote the M-major
+                            # bytes the bpreshuffle GEMM wants, so no copy is
+                            # needed -- but aiter hands them back through a
+                            # [M, G] view whose row-major strides describe a
+                            # different layout than the storage. Restride here,
+                            # at the producer, so every downstream consumer
+                            # (all-gather, DSA 3-tuple packing, torch.compile
+                            # stride asserts, the GEMM itself) sees a
+                            # self-consistent tensor.
+                            hidden_states = (
+                                view_aiter_fused_rms_transposed_fp8_scale_tuple(
+                                    hidden_states
+                                )
                             )
                         if _dsa_needs_bf16:
                             hidden_states = (
@@ -696,12 +707,17 @@ class LayerCommunicator:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=residual,
                                 output_unquantized_inp1=_dsa_needs_bf16,
-                                transpose_scale=False,
+                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
                             )
                         )
                         if _use_aiter_bpreshuffle_gfx95:
-                            hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
-                                hidden_states
+                            # See the no-residual branch above: restride the
+                            # transpose_scale=True output so its strides match
+                            # the storage layout.
+                            hidden_states = (
+                                view_aiter_fused_rms_transposed_fp8_scale_tuple(
+                                    hidden_states
+                                )
                             )
                         if _dsa_needs_bf16:
                             hidden_states = (

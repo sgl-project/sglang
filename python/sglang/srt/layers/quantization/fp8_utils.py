@@ -122,6 +122,21 @@ def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tens
     return torch.as_strided(scale, scale.shape, (1, scale.shape[0]))
 
 
+def view_aiter_fused_rms_transposed_fp8_scale_tuple(
+    value: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, ...]:
+    """Restride the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples.
+
+    Zero-copy counterpart of :func:`materialize_bpreshuffle_fp8_scale_tuple` for
+    producers already invoked with ``transpose_scale=True``.
+    """
+    return (
+        value[0],
+        view_aiter_fused_rms_transposed_fp8_scale(value[1]),
+        *value[2:],
+    )
+
+
 def materialize_bpreshuffle_fp8_scale_tuple(
     value: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, ...]:
