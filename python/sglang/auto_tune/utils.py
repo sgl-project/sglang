@@ -31,15 +31,27 @@ def get_model_config(model_path: str, tp_size: int, ep_size: int = 1) -> Dict:
         block_shape = [0, group_size]
 
     if hasattr(config, "text_config"):
+        from types import SimpleNamespace
         text_config = config.get_text_config()
         if isinstance(text_config, dict):
-            from types import SimpleNamespace
-
             config = SimpleNamespace(**text_config)
         else:
             config = text_config
 
     hidden_size = config.hidden_size
+    architecture = getattr(config, "architectures", [architecture])[0]
+
+    moe_attrs = ["num_experts", "num_local_experts", "n_routed_experts", "moe_intermediate_size"]
+    has_moe = any(hasattr(config, attr) for attr in moe_attrs)
+
+    if not has_moe:
+        return {
+            "num_experts": 0, "topk": 0, "hidden_size": hidden_size,
+            "shard_intermediate_size": 0,
+            "dtype": getattr(config, "torch_dtype", None) or torch.bfloat16,
+            "block_shape": block_shape, "architecture": architecture, "is_moe": False,
+        }
+
     if architecture == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts // ep_size
         topk = config.ffn_config.moe_top_k
@@ -64,16 +76,11 @@ def get_model_config(model_path: str, tp_size: int, ep_size: int = 1) -> Dict:
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-    elif architecture in [
-        "Llama4ForConditionalGeneration", "Grok1ForCausalLM",
-        "Grok1ImgGen", "Grok1AForCausalLM",
-    ]:
+    elif architecture in ["Llama4ForConditionalGeneration", "Grok1ForCausalLM", "Grok1ImgGen", "Grok1AForCausalLM"]:
         E = config.num_local_experts // ep_size
         topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size if architecture == "Llama4ForConditionalGeneration" else config.moe_intermediate_size
-    elif architecture in [
-        "BailingMoEForCausalLM", "BailingMoeForCausalLM", "BailingMoeV2ForCausalLM",
-    ]:
+        intermediate_size = config.moe_intermediate_size if architecture != "Llama4ForConditionalGeneration" else config.intermediate_size
+    elif architecture in ["BailingMoEForCausalLM", "BailingMoeForCausalLM", "BailingMoeV2ForCausalLM"]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
@@ -103,29 +110,27 @@ def get_model_config(model_path: str, tp_size: int, ep_size: int = 1) -> Dict:
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
     else:
-        E = config.num_local_experts // ep_size
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
+        if hasattr(config, "num_local_experts"):
+            E = config.num_local_experts // ep_size
+        elif hasattr(config, "num_experts"):
+            E = config.num_experts // ep_size
+        else:
+            E = 0
+        topk = getattr(config, "num_experts_per_tok", 0)
+        intermediate_size = getattr(config, "moe_intermediate_size", getattr(config, "intermediate_size", 0))
 
-    shard_intermediate_size = calculate_shard_intermediate_size(
-        intermediate_size, tp_size, ep_size
-    )
+    shard_intermediate_size = calculate_shard_intermediate_size(intermediate_size, tp_size, ep_size)
     torch_dtype = getattr(config, "torch_dtype", None) or torch.bfloat16
 
     return {
-        "num_experts": E,
-        "topk": topk,
-        "hidden_size": hidden_size,
+        "num_experts": E, "topk": topk, "hidden_size": hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
-        "dtype": torch_dtype,
-        "block_shape": block_shape,
-        "architecture": architecture,
+        "dtype": torch_dtype, "block_shape": block_shape,
+        "architecture": architecture, "is_moe": True,
     }
 
 
-def calculate_shard_intermediate_size(
-    intermediate_size: int, tp_size: int, ep_size: int = 1
-) -> int:
+def calculate_shard_intermediate_size(intermediate_size: int, tp_size: int, ep_size: int = 1) -> int:
     assert tp_size % ep_size == 0
     moe_tp_size = tp_size // ep_size
     assert intermediate_size % moe_tp_size == 0
@@ -145,11 +150,7 @@ def get_configs_compute_bound() -> List[Dict]:
                     for block_n in [16, 32, 64, 128, 256]:
                         for num_warps in [1, 2, 4, 8]:
                             for group_size in [1, 4, 8, 16, 32]:
-                                configs.append({
-                                    "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n,
-                                    "BLOCK_SIZE_K": block_k, "GROUP_SIZE_M": group_size,
-                                    "num_warps": num_warps, "num_stages": num_stages,
-                                })
+                                configs.append({"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k, "GROUP_SIZE_M": group_size, "num_warps": num_warps, "num_stages": num_stages})
     else:
         for num_stages in [2, 3, 4, 5]:
             for block_m in [16, 32, 64, 128, 256]:
@@ -157,39 +158,20 @@ def get_configs_compute_bound() -> List[Dict]:
                     for block_n in [32, 64, 128, 256]:
                         for num_warps in [4, 8]:
                             for group_size in [1, 16, 32, 64]:
-                                configs.append({
-                                    "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n,
-                                    "BLOCK_SIZE_K": block_k, "GROUP_SIZE_M": group_size,
-                                    "num_warps": num_warps, "num_stages": num_stages,
-                                })
+                                configs.append({"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k, "GROUP_SIZE_M": group_size, "num_warps": num_warps, "num_stages": num_stages})
     return configs
 
 
 def sort_config(config: Dict) -> Dict:
-    result = {
-        "BLOCK_SIZE_M": config["BLOCK_SIZE_M"],
-        "BLOCK_SIZE_N": config["BLOCK_SIZE_N"],
-        "BLOCK_SIZE_K": config["BLOCK_SIZE_K"],
-        "GROUP_SIZE_M": config["GROUP_SIZE_M"],
-        "num_warps": config["num_warps"],
-        "num_stages": config["num_stages"],
-    }
+    result = {"BLOCK_SIZE_M": config["BLOCK_SIZE_M"], "BLOCK_SIZE_N": config["BLOCK_SIZE_N"], "BLOCK_SIZE_K": config["BLOCK_SIZE_K"], "GROUP_SIZE_M": config["GROUP_SIZE_M"], "num_warps": config["num_warps"], "num_stages": config["num_stages"]}
     for k in ("waves_per_eu", "USE_TMA"):
         if k in config:
             result[k] = config[k]
     return result
 
 
-def get_config_filename(
-    num_experts: int, shard_intermediate_size: int, hidden_size: int, topk: int,
-    dtype: torch.dtype, use_fp8_w8a8=False, use_int8_w8a8=False,
-    use_int8_w8a16=False, use_int4_w4a16=False, per_channel_quant=False,
-    block_shape=None,
-) -> str:
-    dtype_str = get_config_dtype_str(
-        dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8, use_int4_w4a16=use_int4_w4a16,
-    )
+def get_config_filename(num_experts: int, shard_intermediate_size: int, hidden_size: int, topk: int, dtype: torch.dtype, use_fp8_w8a8=False, use_int8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False, per_channel_quant=False, block_shape=None) -> str:
+    dtype_str = get_config_dtype_str(dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8, use_int8_w8a8=use_int8_w8a8, use_int4_w4a16=use_int4_w4a16)
     N = shard_intermediate_size // 2
     if use_int4_w4a16:
         N = N // 2
@@ -203,7 +185,7 @@ def save_configs(configs: Dict[int, Dict], filename: str, output_dir: str = None
         filepath = os.path.join(output_dir, filename)
     else:
         filepath = filename
-    print(f"Writing best config to {filepath}...")
+    print("Writing best config to", filepath, "...")
     with open(filepath, "w") as f:
         json.dump(configs, f, indent=4)
         f.write("\n")
