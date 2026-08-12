@@ -274,6 +274,8 @@ class HiCacheController:
         self.mem_pool_host_draft = None
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        self.has_mtp_draft = False
+        self.mtp_draft_device_pools = ()
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -380,7 +382,6 @@ class HiCacheController:
         self.backup_queue = Queue()
 
         self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
-        self.prefetch_revoke_queue: Queue[str] = Queue()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
@@ -657,7 +658,6 @@ class HiCacheController:
             self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
-            self.prefetch_revoke_queue.queue.clear()
             self.prefetch_hit_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
@@ -886,6 +886,11 @@ class HiCacheController:
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
 
+    def set_mtp_draft_pools(self, device_pools) -> None:
+        """Register MTP device pools used for L2 load-back."""
+        self.mtp_draft_device_pools = tuple(device_pools)
+        self.has_mtp_draft = bool(self.mtp_draft_device_pools)
+
     def _maybe_register_draft_with_storage(self) -> None:
         """Pick the draft L3 IO implementation."""
         self.draft_page_get_func = None
@@ -1096,19 +1101,13 @@ class HiCacheController:
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
-                if storage_hit_count < self.prefetch_threshold:
-                    # not to prefetch if not enough benefits
-                    self.prefetch_revoke_queue.put(operation.request_id)
-                    logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
-                    )
-                else:
-                    # Record hit count, so the scheduler thread will know the exact memory to allocate
-                    operation.hash_value = hash_value[
-                        : (storage_hit_count // self.page_size)
-                    ]
-                    operation.storage_hit_count = storage_hit_count
-                    self.prefetch_hit_queue.put(operation)
+                # Record the TP-synced hit count; the scheduler thread decides
+                # at drain time whether to revoke (below threshold) or allocate.
+                operation.hash_value = hash_value[
+                    : (storage_hit_count // self.page_size)
+                ]
+                operation.storage_hit_count = storage_hit_count
+                self.prefetch_hit_queue.put(operation)
 
             except Empty:
                 continue

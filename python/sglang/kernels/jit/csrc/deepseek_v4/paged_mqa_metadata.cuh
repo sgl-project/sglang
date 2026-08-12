@@ -7,7 +7,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-namespace {
+namespace sglang {
 
 constexpr uint32_t kBlockSize = 1024;
 constexpr uint32_t kSplitKV = 256;  // const for both SM90 and SM100
@@ -116,4 +116,4 @@ struct IndexerMetadataKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
