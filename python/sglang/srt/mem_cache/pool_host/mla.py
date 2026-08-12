@@ -629,16 +629,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """One page's latent KV as a (layer, page_size, 1, dim) strided view.
 
         The unified MLA order is (layer, token, dim); page_first_direct
-        page blocks already store exactly that, so their slabs are direct.
+        page blocks already store exactly that, so every slab is direct and
+        MLA is zero-copy for any layer partition. page_first stores
+        (token, layer, dim) and so stages.
         """
-        if self.layout == "layer_first":
-            return self.kv_buffer[:, index : index + self.page_size]
         if self.layout == "page_first":
             return self.kv_buffer[index : index + self.page_size].permute(1, 0, 2, 3)
         if self.layout == "page_first_direct":
             return self.kv_buffer[index // self.page_size]
         raise ValueError(
-            f"KV layout adapter does not support the {self.layout!r} layout."
+            f"the unified key scheme does not support the {self.layout!r} host "
+            f"layout; use page_first or page_first_direct."
         )
 
     def unified_bytes_per_page(self, layer_ranges, head_ranges=None) -> int:

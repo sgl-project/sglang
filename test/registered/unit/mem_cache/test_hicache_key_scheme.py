@@ -34,7 +34,7 @@ def _gqa_namespace(**overrides) -> KVCacheNamespace:
         rank_replicated=False,
         total_kv_heads=8,
         head_group=2,
-        object_layout="page_head",
+        object_layout="page_first",
     )
     fields.update(overrides)
     return KVCacheNamespace(**fields)
@@ -73,7 +73,7 @@ def _gqa_suffixes(
         page_size=64,
         model_id="meta-llama/Llama-3-70B",
         rank_replicated=False,
-        object_layout="page_head",
+        object_layout="page_first",
     )
     kwargs.update(overrides)
     return build_unified_suffixes(_gqa_namespace(), **kwargs)
@@ -109,7 +109,7 @@ class TestNamespaceDigest(CustomTestCase):
             {"total_kv_heads": 16},
             {"model_id": "other/model"},
             {"numerics_id": "buildX"},
-            {"object_layout": "page_first"},
+            {"object_layout": "page_first_direct"},
         ):
             self.assertNotEqual(
                 namespace_digest(base),
@@ -133,7 +133,7 @@ class TestNamespaceDigest(CustomTestCase):
                     "rank_replicated": False,
                     "total_kv_heads": 8,
                     "head_group": 2,
-                    "object_layout": "page_head",
+                    "object_layout": "page_first",
                 },
                 f,
             )
@@ -226,7 +226,7 @@ class TestNamespaceDigest(CustomTestCase):
                 page_size=64,
                 model_id="meta-llama/Llama-3-70B",
                 rank_replicated=False,
-                object_layout="page_head",
+                object_layout="page_first",
             )
 
 
@@ -306,7 +306,7 @@ class TestUnifiedSuffixes(CustomTestCase):
             ({"page_size": 32}, "page_size"),
             ({"model_id": "other/model"}, "model_id"),
             ({"rank_replicated": True}, "rank_replicated"),
-            ({"object_layout": "page_first"}, "object_layout"),
+            ({"object_layout": "page_first_direct"}, "object_layout"),
         ]
         for deployment_override, expected_msg in cases:
             with self.assertRaisesRegex(ValueError, expected_msg):
@@ -330,7 +330,7 @@ class TestUnifiedSuffixes(CustomTestCase):
                 page_size=64,
                 model_id="meta-llama/Llama-3-70B",
                 rank_replicated=False,
-                object_layout="page_head",
+                object_layout="page_first",
             )
 
     def test_wrong_namespace_head_count_fails(self):
@@ -349,7 +349,7 @@ class TestDeriveNamespace(CustomTestCase):
             rank_replicated=False,
             total_kv_heads=8,
             head_group=4,
-            object_layout="page_head",
+            object_layout="page_first",
         )
         suffixes = build_unified_suffixes(
             namespace,
@@ -363,7 +363,7 @@ class TestDeriveNamespace(CustomTestCase):
             page_size=64,
             model_id="m/1B",
             rank_replicated=False,
-            object_layout="page_head",
+            object_layout="page_first",
         )
         self.assertEqual(len(suffixes), 1)
         self.assertTrue(suffixes[0].endswith("_L0-16_H1"))
@@ -379,8 +379,8 @@ class TestDeriveNamespace(CustomTestCase):
             rank_replicated=False,
             total_kv_heads=8,
         )
-        tp2 = derive_namespace(head_group=2, object_layout="page_head", **common)
-        tp4 = derive_namespace(head_group=2, object_layout="page_head", **common)
+        tp2 = derive_namespace(head_group=2, object_layout="page_first", **common)
+        tp4 = derive_namespace(head_group=2, object_layout="page_first", **common)
         self.assertEqual(namespace_digest(tp2), namespace_digest(tp4))
 
     def test_different_head_grids_derive_disjoint_namespaces(self):
@@ -393,10 +393,10 @@ class TestDeriveNamespace(CustomTestCase):
         )
         self.assertNotEqual(
             namespace_digest(
-                derive_namespace(head_group=4, object_layout="page_head", **common)
+                derive_namespace(head_group=4, object_layout="page_first", **common)
             ),
             namespace_digest(
-                derive_namespace(head_group=2, object_layout="page_head", **common)
+                derive_namespace(head_group=2, object_layout="page_first", **common)
             ),
         )
 
@@ -409,8 +409,9 @@ class TestDeriveNamespace(CustomTestCase):
 
 
 class TestUnifiedKVPlan(CustomTestCase):
-    """plan_unified_kv: any partition knob selects the adapter, whose
-    unified byte order makes the namespace layout-neutral (unified-v1)."""
+    """plan_unified_kv: any partition knob selects the adapter, which stores
+    chunks in page_first_direct's page-block order and keeps the host layout
+    in the namespace identity (unified-v2:{layout})."""
 
     def _plan(self, **overrides):
         kwargs = dict(
@@ -442,7 +443,7 @@ class TestUnifiedKVPlan(CustomTestCase):
         # head knob alone: adapter, single layer window, head chunks.
         plan = self._plan(head_group_knob=2)
         self.assertTrue(plan.adapter)
-        self.assertEqual(plan.namespace.object_layout, "unified-v1")
+        self.assertEqual(plan.namespace.object_layout, "unified-v2:page_first")
         self.assertEqual(plan.layer_ranges, [(0, 61)])
         self.assertEqual(plan.head_ranges, [(0, 2), (2, 4)])
         self.assertEqual(len(plan.suffixes), 2)
@@ -462,33 +463,45 @@ class TestUnifiedKVPlan(CustomTestCase):
         plan = self._plan(
             rank_replicated=True,
             local_kv_heads=0,
-            pool_layout="layer_first",
+            pool_layout="page_first_direct",
             layer_partition=30,
         )
         self.assertTrue(plan.adapter)
-        self.assertEqual(plan.namespace.object_layout, "unified-v1")
+        self.assertEqual(plan.namespace.object_layout, "unified-v2:page_first_direct")
         self.assertIsNone(plan.head_ranges)
         self.assertEqual(plan.layer_ranges, [(0, 30), (30, 60), (60, 61)])
         # head_group alone is a no-op for replicated pools (no head axis).
         plan = self._plan(rank_replicated=True, local_kv_heads=0, head_group_knob=2)
         self.assertFalse(plan.adapter)
 
-    def test_adapter_digest_is_layout_neutral(self):
-        digests = {
+    def test_host_layout_partitions_the_keyspace(self):
+        """page_first and page_first_direct serialize a page differently and we
+        do not reuse objects across them, so the layout stays in the identity
+        with or without a partition knob."""
+        adapter = {
             namespace_digest(self._plan(layer_partition=30, pool_layout=lay).namespace)
-            for lay in ("layer_first", "page_first", "page_first_direct", "page_head")
+            for lay in ("page_first", "page_first_direct")
         }
-        self.assertEqual(len(digests), 1)
-        # Without a knob the layout stays in the identity: disjoint keyspaces.
+        self.assertEqual(len(adapter), 2)
         raw = {
             namespace_digest(self._plan(pool_layout=lay).namespace)
-            for lay in ("page_first", "page_head")
+            for lay in ("page_first", "page_first_direct")
         }
         self.assertEqual(len(raw), 2)
+        # ...and adapter chunks never collide with the raw-layout objects an
+        # unpartitioned deployment writes for the SAME layout, even when the
+        # knob is a no-op on the grid.
+        self.assertNotEqual(
+            namespace_digest(self._plan(head_group_knob=4).namespace),
+            namespace_digest(self._plan().namespace),
+        )
 
     def test_plan_validation(self):
-        with self.assertRaisesRegex(ValueError, "layout adapter"):
+        with self.assertRaisesRegex(ValueError, "does not support"):
             self._plan(pool_layout="page_first_kv_split", layer_partition=30)
+        for unsupported in ("layer_first", "page_head"):
+            with self.assertRaisesRegex(ValueError, "does not support"):
+                self._plan(pool_layout=unsupported, layer_partition=30)
         with self.assertRaisesRegex(ValueError, "divide"):
             self._plan(head_group_knob=3)
         with self.assertRaisesRegex(ValueError, "positive"):
@@ -588,7 +601,7 @@ class TestControllerGuards(CustomTestCase):
 
         stub = self._stub_controller(HiCacheController, "mooncake")
         stub.mem_pool_host = self._StubHostPool("page_first_kv_split")
-        with self.assertRaisesRegex(ValueError, "layout adapter"):
+        with self.assertRaisesRegex(ValueError, "does not support"):
             self._build(
                 stub,
                 is_rank_replicated=False,
@@ -889,7 +902,7 @@ class TestMlaLayoutAdapter(CustomTestCase):
             for L in logical
             for l0, l1 in self._RANGES
         )
-        for layout in ("layer_first", "page_first", "page_first_direct"):
+        for layout in ("page_first", "page_first_direct"):
             pool = self._pool(layout, logical)
             staging = torch.zeros(
                 self._PAGES * pool.unified_bytes_per_page(self._RANGES),
@@ -914,7 +927,7 @@ class TestMlaLayoutAdapter(CustomTestCase):
         src_ptrs, src_sizes = writer.gather_unified_chunks(
             indices, self._RANGES, None, None
         )
-        reader = self._pool("layer_first", [torch.zeros_like(l) for l in logical])
+        reader = self._pool("page_first", [torch.zeros_like(l) for l in logical])
         self.assertFalse(reader.unified_zero_copy(self._RANGES))
         staging = torch.zeros(
             self._PAGES * reader.unified_bytes_per_page(self._RANGES), dtype=torch.uint8
@@ -996,9 +1009,18 @@ class TestMhaDirectChunks(CustomTestCase):
             [2 * layer_stride, 2 * layer_stride, 4 * layer_stride, 4 * layer_stride],
         )
 
-    def test_multi_head_chunks_stage(self):
+    def test_whole_head_shard_chunks_are_direct(self):
+        """Under the (layer, token, head, dim) order a layer-range chunk over
+        the rank's whole head shard is one contiguous range on
+        page_first_direct — the case cross-PP reuse needs."""
         pool = self._pool(head_num=2)
-        self.assertFalse(pool.unified_zero_copy([(0, 2)], [(0, 2)]))
+        self.assertTrue(pool.unified_zero_copy([(0, 2), (2, 6)], [(0, 2)]))
+
+    def test_head_subgroup_chunks_stage(self):
+        """Cutting the head axis is what forces the staging copy: it breaks
+        contiguity at the token axis on every host layout."""
+        pool = self._pool(head_num=2)
+        self.assertFalse(pool.unified_zero_copy([(0, 2)], [(0, 1), (1, 2)]))
 
     def test_rejects_split_kv_pools(self):
         import torch
@@ -1100,7 +1122,7 @@ class TestLayoutAdapterGatherScatter(CustomTestCase):
                 pool.kv_buffer[:, p] = L.permute(0, 1, 3, 2, 4)
         return pool
 
-    _LAYOUTS = ("layer_first", "page_first", "page_first_direct", "page_head")
+    _LAYOUTS = ("page_first", "page_first_direct")
 
     def _grid(self):
         return [(0, 2), (2, 6)], [(0, 2), (2, 4)]  # layer ranges, head ranges
@@ -1114,9 +1136,18 @@ class TestLayoutAdapterGatherScatter(CustomTestCase):
         layer_ranges, head_ranges = self._grid()
         indices = torch.arange(self._PAGES * self._PS)
         # Unified-order bytes computed straight from the logical tensor:
-        # page-major, layer-range, head-range, K then V.
+        # page-major, layer-range, head-range, K then V. The logical tensor is
+        # (kv, head, layer, token, dim); the stored order is
+        # (layer, token, head, dim), hence the permute.
         expected = b"".join(
-            bytes(L[kv, h0:h1, l0:l1].contiguous().view(torch.uint8).flatten().tolist())
+            bytes(
+                L[kv, h0:h1, l0:l1]
+                .permute(1, 2, 0, 3)
+                .contiguous()
+                .view(torch.uint8)
+                .flatten()
+                .tolist()
+            )
             for L in logical
             for l0, l1 in layer_ranges
             for h0, h1 in head_ranges
@@ -1144,7 +1175,7 @@ class TestLayoutAdapterGatherScatter(CustomTestCase):
         logical = self._logical()
         layer_ranges, head_ranges = self._grid()
         indices = torch.arange(self._PAGES * self._PS)
-        writer = self._pool("page_head", logical)
+        writer = self._pool("page_first_direct", logical)
         staging_w = torch.zeros(
             self._PAGES * writer.unified_bytes_per_page(layer_ranges, head_ranges),
             dtype=torch.uint8,
@@ -1155,7 +1186,7 @@ class TestLayoutAdapterGatherScatter(CustomTestCase):
 
         # Emulate a fetch into an EMPTY pool of a different layout, then
         # scatter; the covered rectangles must reproduce the writer's values.
-        for layout in ("layer_first", "page_first_direct"):
+        for layout in ("page_first",):
             reader = self._pool(layout, [torch.zeros_like(l) for l in logical])
             staging_r = torch.zeros_like(staging_w)
             dst_ptrs, dst_sizes = reader.get_unified_chunk_meta(
@@ -1169,10 +1200,13 @@ class TestLayoutAdapterGatherScatter(CustomTestCase):
             )
             for p, L in enumerate(logical):
                 got = reader._page_kv_view_unified(p * self._PS)
+                want = L.permute(0, 2, 3, 1, 4)  # -> (kv, layer, token, head, dim)
                 for l0, l1 in layer_ranges:
                     for h0, h1 in head_ranges:
                         self.assertTrue(
-                            torch.equal(got[:, h0:h1, l0:l1], L[:, h0:h1, l0:l1])
+                            torch.equal(
+                                got[:, l0:l1, :, h0:h1], want[:, l0:l1, :, h0:h1]
+                            )
                         )
 
 
@@ -1243,7 +1277,9 @@ class TestLayoutAdapterStaging(CustomTestCase):
         config = self._config(
             suffixes, layer_ranges, head_ranges, extra={"staging_buffer_mb": 0}
         )
-        writer = self._UnpinnedLayoutAdapter(gs._pool("page_head", logical), config)
+        writer = self._UnpinnedLayoutAdapter(
+            gs._pool("page_first_direct", logical), config
+        )
         self.assertEqual(writer.staging_pages, 1)
         self.assertEqual(writer.keys_per_page, 8)
 
@@ -1271,10 +1307,11 @@ class TestLayoutAdapterStaging(CustomTestCase):
             reader.scatter(sub_indices, [True] * len(sub_keys))
         for p, L in enumerate(logical):
             got = reader.pool._page_kv_view_unified(p * gs._PS)
+            want = L.permute(0, 2, 3, 1, 4)  # -> (kv, layer, token, head, dim)
             for l0, l1 in layer_ranges:
                 for h0, h1 in head_ranges:
                     self.assertTrue(
-                        torch.equal(got[:, h0:h1, l0:l1], L[:, h0:h1, l0:l1])
+                        torch.equal(got[:, l0:l1, :, h0:h1], want[:, l0:l1, :, h0:h1])
                     )
 
 

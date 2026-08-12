@@ -611,28 +611,29 @@ class MHATokenToKVPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
     def _page_kv_view_unified(self, index: int):
-        """One page's KV as a (2, head, layer, page_size, dim) strided view.
+        """One page's KV as a (2, layer, page_size, head, dim) strided view.
 
-        The unified byte order — (head, layer, token, dim) per K/V half —
-        is the page_head_layer_direct order, so chunks gathered here
-        stay byte-compatible with a future zero-copy layout. Works for every
-        host layout (layer_first included) because torch handles the strided
-        permute.
+        The unified byte order — (layer, token, head, dim) per K/V half — is
+        exactly ``page_first_direct``'s page block, so there a chunk covering
+        the rank's whole head shard is a single contiguous range and transfers
+        straight from pool memory: every layer partition, including a model's
+        short trailing chunk at a prime layer count, is zero-copy.
+        ``page_first`` stores (token, layer, head, dim) and so stages.
+
+        Cutting the head axis costs on both: a head subgroup breaks
+        contiguity at the token axis, leaving runs of
+        ``head_group x head_dim``. A single linear order can make only one
+        axis outermost; this one buys the layer axis — the axis
+        ``page_first_direct`` already stores, and the only axis MLA has.
         """
-        if self.layout == "layer_first":
-            page = self.kv_buffer[:, :, index : index + self.page_size]
-            return page.permute(0, 3, 1, 2, 4)
         if self.layout == "page_first":
             page = self.kv_buffer[:, index : index + self.page_size]
-            return page.permute(0, 3, 2, 1, 4)
+            return page.permute(0, 2, 1, 3, 4)
         if self.layout == "page_first_direct":
-            page = self.kv_buffer[:, index // self.page_size]
-            return page.permute(0, 3, 1, 2, 4)
-        if self.layout == "page_head":
-            page = self.kv_buffer[:, index // self.page_size]
-            return page.permute(0, 1, 3, 2, 4)
+            return self.kv_buffer[:, index // self.page_size]
         raise ValueError(
-            f"KV layout adapter does not support the {self.layout!r} layout."
+            f"the unified key scheme does not support the {self.layout!r} host "
+            f"layout; use page_first or page_first_direct."
         )
 
     def unified_bytes_per_page(self, layer_ranges, head_ranges) -> int:
@@ -654,7 +655,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         Order: layer-range-major, head-range-minor, K then V — matching the
         key suffix list. ``direct`` marks slabs whose unified-order view is
         already contiguous in the pool (same strides on every page), so the
-        adapter can skip the staging copy for them.
+        adapter can skip the staging copy for them. On page_first_direct
+        that is every slab whenever the head axis is not cut.
         """
         sample = self._page_kv_view_unified(0)
         itemsize = self.dtype.itemsize
@@ -665,7 +667,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     (h1 - h0) * (l1 - l0) * self.page_size * self.head_dim * itemsize
                 )
                 for kv in range(2):
-                    direct = sample[kv, h0:h1, l0:l1].is_contiguous()
+                    direct = sample[kv, l0:l1, :, h0:h1].is_contiguous()
                     slabs.append((l0, l1, h0, h1, kv, nbytes, direct))
         return slabs
 
@@ -689,12 +691,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         for index in indices.tolist()[:: self.page_size]:
             view = self._page_kv_view_unified(index)
             for l0, l1, h0, h1, kv, nbytes, direct in slabs:
-                src = view[kv, h0:h1, l0:l1]
+                src = view[kv, l0:l1, :, h0:h1]
                 if direct:
                     ptrs.append(src.data_ptr())
                 else:
                     dst = staging[cursor : cursor + nbytes].view(self.dtype)
-                    dst.view(h1 - h0, l1 - l0, self.page_size, self.head_dim).copy_(src)
+                    dst.view(l1 - l0, self.page_size, h1 - h0, self.head_dim).copy_(src)
                     ptrs.append(staging.data_ptr() + cursor)
                 sizes.append(nbytes)
                 cursor += nbytes
@@ -712,7 +714,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             view = self._page_kv_view_unified(index)
             for l0, l1, h0, h1, kv, nbytes, direct in slabs:
                 if direct:
-                    ptrs.append(view[kv, h0:h1, l0:l1].data_ptr())
+                    ptrs.append(view[kv, l0:l1, :, h0:h1].data_ptr())
                 else:
                     ptrs.append(staging.data_ptr() + cursor)
                 sizes.append(nbytes)
@@ -742,9 +744,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                     src = (
                         staging[cursor : cursor + nbytes]
                         .view(self.dtype)
-                        .view(h1 - h0, l1 - l0, self.page_size, self.head_dim)
+                        .view(l1 - l0, self.page_size, h1 - h0, self.head_dim)
                     )
-                    view[kv, h0:h1, l0:l1].copy_(src)
+                    view[kv, l0:l1, :, h0:h1].copy_(src)
                 cursor += nbytes
         return cursor
 

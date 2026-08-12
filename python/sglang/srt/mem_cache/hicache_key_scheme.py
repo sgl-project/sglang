@@ -31,11 +31,14 @@ range, its head shard) and objects keep the raw pool-layout bytes. Setting
 chunk) in the extra config switches the namespace to the **layout adapter**
 (:func:`plan_unified_kv`): a rank owns the (layer window x head group)
 cross product of chunks, and every object carries the same unified byte
-order — (head, layer, token, dim) per K/V half — regardless of the host
-pool layout (``object_layout`` becomes the constant ``unified-v1``). The
-pool adapters convert on the fly and skip the copy for slabs that already
-sit in that order contiguously (e.g. MLA on page_first_direct stays
-zero-copy).
+order — (layer, token, head, dim) per K/V half, MLA (layer, token, dim) —
+which is ``page_first_direct``'s own page block. Only the page-first pair
+is supported (``ADAPTER_LAYOUTS``), and the host layout stays part of the
+namespace identity (``object_layout`` becomes ``unified-v2:{layout}``), so
+``page_first`` and ``page_first_direct`` deployments never share objects.
+The pool adapters skip the copy for slabs already contiguous in that order —
+on ``page_first_direct`` that is every slab whenever the fleet grid does not
+cut the kv-head axis, MLA included.
 
 The namespace digest prefixes every key: deployments share objects iff every
 identity field matches, so configuration differences partition into disjoint
@@ -366,8 +369,10 @@ class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
     head_ranges: Optional[list[tuple[int, int]]] = None
 
 
-# Host layouts the adapter can present in the unified byte order.
-ADAPTER_LAYOUTS = ("layer_first", "page_first", "page_first_direct", "page_head")
+# Host layouts the adapter can present in the unified byte order. Deliberately
+# only the page-first pair: their page blocks are the two orders worth storing,
+# and both are what the server-arg resolution already steers L3 deployments to.
+ADAPTER_LAYOUTS = ("page_first", "page_first_direct")
 
 
 def plan_unified_kv(
@@ -390,16 +395,18 @@ def plan_unified_kv(
     """Derive the namespace and this rank's chunk plan from deployment facts.
 
     Any partition knob switches the namespace to adapter mode: objects carry
-    the unified byte order (object_layout "unified-v1"), so the pool layout
-    never constrains which fleets can share.
+    the unified byte order (object_layout "unified-v2:{pool_layout}"), which
+    keeps adapter chunks in their own keyspace, per host layout.
     """
     adapter = layer_partition is not None or (
         head_group_knob is not None and not rank_replicated
     )
     if adapter and pool_layout not in ADAPTER_LAYOUTS:
         raise ValueError(
-            f"the KV layout adapter does not support the {pool_layout!r} host "
-            f"layout; use one of {ADAPTER_LAYOUTS}."
+            f"the unified key scheme does not support the {pool_layout!r} host "
+            f"layout; use one of {ADAPTER_LAYOUTS}. Objects are stored in "
+            f"page_first_direct's page-block order, and the host layout is part "
+            f"of the namespace identity, so the two do not share a keyspace."
         )
 
     head_group = local_kv_heads
@@ -426,7 +433,12 @@ def plan_unified_kv(
             "--hicache-storage-key-scheme rank-suffix."
         )
 
-    object_layout = "unified-v1" if adapter else pool_layout
+    # The host layout stays part of the namespace identity even under the
+    # adapter: page_first and page_first_direct serialize a page differently,
+    # and we do not reuse objects across them. The "unified-v2:" prefix keeps
+    # adapter-written chunks in a different keyspace from the raw-layout
+    # objects an unpartitioned deployment writes for the same layout.
+    object_layout = f"unified-v2:{pool_layout}" if adapter else pool_layout
     namespace = derive_namespace(
         model_id=model_id,
         dtype=dtype,
@@ -484,7 +496,7 @@ class KVCacheLayoutAdapter:
 
     The host pools expose the unified gather/scatter primitives; this
     class owns everything else a backend needs to serve a partitioned
-    (unified-v1) namespace: the per-chunk key fan-out, the sub-batch
+    (unified-v2:*) namespace: the per-chunk key fan-out, the sub-batch
     geometry, and one pinned staging buffer per IO direction (backup and
     prefetch run on concurrent controller threads). A backend brings only
     its own pointer-based batch put/get and, for RDMA transports, a
