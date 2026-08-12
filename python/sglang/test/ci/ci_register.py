@@ -8,6 +8,7 @@ __all__ = [
     "HWBackend",
     "CIRegistry",
     "collect_tests",
+    "is_registered_test_file",
     "auto_partition",
     "register_cpu_ci",
     "register_cuda_ci",
@@ -27,6 +28,20 @@ _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
 _KWARG_ONLY = ("stage", "runner_config")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
+_REGISTERED_NON_TEST_FILES = frozenset(
+    {
+        "cpu/utils.py",
+        "unit/layers/utils.py",
+    }
+)
+
+
+def is_registered_test_file(relative_path: str) -> bool:
+    relative_path = relative_path.replace("\\", "/")
+    basename = relative_path.rsplit("/", 1)[-1]
+    return basename not in {"conftest.py", "__init__.py", "run_tests.py"} and (
+        relative_path not in _REGISTERED_NON_TEST_FILES
+    )
 
 
 class HWBackend(Enum):

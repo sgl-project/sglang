@@ -209,9 +209,12 @@ jobs:
               source "${venv}/bin/activate"
               uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
               (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
+              # Run once while PyO3's interpreter and target fingerprints match.
+              if [ "${minor}" = "3.12" ]; then
+                  bash scripts/ci/run_rust_workspace_tests.sh
+              fi
               deactivate
           done
-          bash scripts/ci/run_rust_workspace_tests.sh
 
       - name: Verify modules and stage for upload
         env:

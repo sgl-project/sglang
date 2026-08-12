@@ -35,12 +35,34 @@ if __name__ == "__main__":
 """
         self.assertIsNone(self.check_source(source))
 
-    def test_accepts_assigned_result(self):
+    def test_rejects_assigned_result(self):
         source = """
 if "__main__" == __name__:
     exit_code = pytest.main([__file__])
 """
+        self.assertEqual(self.check_source(source), 3)
+
+    def test_rejects_nested_discarded_result(self):
+        source = """
+if __name__ == "__main__":
+    if enabled:
+        pytest.main([__file__])
+"""
+        self.assertEqual(self.check_source(source), 4)
+
+    def test_accepts_raised_system_exit(self):
+        source = """
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
+"""
         self.assertIsNone(self.check_source(source))
+
+    def test_rejects_unraised_system_exit(self):
+        source = """
+if __name__ == "__main__":
+    error = SystemExit(pytest.main([__file__]))
+"""
+        self.assertEqual(self.check_source(source), 3)
 
     def test_ignores_call_outside_main_guard(self):
         self.assertIsNone(self.check_source("pytest.main([__file__])\n"))

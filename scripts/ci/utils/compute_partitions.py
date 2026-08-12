@@ -31,6 +31,7 @@ _ci_register = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_ci_register)
 collect_tests = _ci_register.collect_tests
 HWBackend = _ci_register.HWBackend
+is_registered_test_file = _ci_register.is_registered_test_file
 
 # pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
 _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
@@ -83,12 +84,11 @@ def per_shard_target_seconds(suite: str, run_timeouts: dict) -> float:
 
 def discover_files(repo_root: str) -> list[str]:
     test_dir = os.path.join(repo_root, "test")
+    registered_dir = os.path.join(test_dir, "registered")
     files = [
         f
-        for f in glob.glob(
-            os.path.join(test_dir, "registered", "**", "*.py"), recursive=True
-        )
-        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+        for f in glob.glob(os.path.join(registered_dir, "**", "*.py"), recursive=True)
+        if is_registered_test_file(os.path.relpath(f, registered_dir))
     ]
     jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
     files += glob.glob(

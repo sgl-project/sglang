@@ -7,11 +7,11 @@ agree with the reference path to floating-point tolerance, with identical
 top-k indices, across chunk splits and heterogeneous per-sequence params.
 """
 
-import itertools
 import unittest
 from types import SimpleNamespace
 
 import torch
+from utils import coverage_cases
 
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
@@ -27,6 +27,9 @@ VOCAB = 11
 TOPK_CYCLE = [2, 0, 3]
 # [] is a valid probe set distinct from None (opt-out).
 TOKEN_IDS_CYCLE = [[0, 3], None, [1], []]
+# start == extend_len is the zero-logprob-row shape. Order determines the cyclic
+# width-3 heterogeneous coverage cases.
+SEQ_SPEC_MENU = ((1, 1), (3, 0), (4, 1), (5, 5), (6, 2))
 
 
 def _build_batch(seq_specs, dtype, vocab=VOCAB):
@@ -91,15 +94,6 @@ def _run(proc, batch, fast, chunk_size):
     )
 
 
-def _coverage_cases(menu, max_seqs):
-    yield from ((item,) for item in menu)
-    yield from itertools.product(menu, repeat=2)
-    for width in range(3, max_seqs + 1):
-        for offset in range(len(menu)):
-            yield tuple(menu[(offset + step) % len(menu)] for step in range(width))
-            yield tuple(menu[(offset - step) % len(menu)] for step in range(width))
-
-
 def _assert_nested_close(test, ref, got, label, rtol, atol):
     test.assertEqual(_shape_of(ref), _shape_of(got), label)
     ref_flat = _flatten(ref)
@@ -130,11 +124,8 @@ class TestFastInputLogprobs(CustomTestCase):
     def _sweep(self, dtype, rtol, atol):
         torch.manual_seed(0)
         proc = InputLogprobProcessor()
-        # (extend_len, start); start == extend_len is the degenerate
-        # zero-logprob-row shape.
-        menu = [(1, 1), (3, 0), (4, 1), (5, 5), (6, 2)]
         tried = 0
-        for combo in _coverage_cases(menu, max_seqs=3):
+        for combo in coverage_cases(SEQ_SPEC_MENU, max_seqs=3):
             batch = _build_batch(list(combo), dtype)
             for chunk_size in (None, 1, 2, 3, 5):
                 tried += 1
@@ -184,8 +175,7 @@ class TestFastInputLogprobs(CustomTestCase):
         # sits much closer to the truth than bf16 resolution.
         torch.manual_seed(0)
         proc = InputLogprobProcessor()
-        menu = [(1, 1), (3, 0), (4, 1), (5, 5), (6, 2)]
-        for combo in _coverage_cases(menu, max_seqs=3):
+        for combo in coverage_cases(SEQ_SPEC_MENU, max_seqs=3):
             batch = _build_batch(list(combo), torch.bfloat16)
             pruned_states, _, input_logprob_indices, _, metadata = batch
             truth = torch.log_softmax(pruned_states.double(), dim=-1)[

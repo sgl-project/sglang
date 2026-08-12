@@ -80,11 +80,11 @@ def main() -> int:
     spec.loader.exec_module(ci_register)
     cuda = ci_register.HWBackend.CUDA
 
-    # Same filter as run_suite.py: skip conftest.py, __init__.py, and utils.py
+    is_registered_test_file = ci_register.is_registered_test_file
     files = sorted(
         f
         for f in glob.glob("test/registered/**/*.py", recursive=True)
-        if os.path.basename(f) not in ("conftest.py", "__init__.py", "utils.py")
+        if is_registered_test_file(os.path.relpath(f, "test/registered"))
     )
     if not files:
         return 0

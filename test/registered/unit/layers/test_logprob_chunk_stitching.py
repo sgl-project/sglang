@@ -6,11 +6,11 @@ were skipped or double-emitted, drifting the per-request entry counts that
 the scheduler asserts on.
 """
 
-import itertools
 import unittest
 from types import SimpleNamespace
 
 import torch
+from utils import coverage_cases
 
 from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,6 +23,9 @@ VOCAB = 11
 TOPK_CYCLE = [2, 0, 3]
 # [] is a valid probe set distinct from None (opt-out).
 TOKEN_IDS_CYCLE = [[0, 3], None, [1], []]
+# start == extend_len is the zero-logprob-row shape. Order determines the cyclic
+# width-3/4 heterogeneous coverage cases.
+SEQ_SPEC_MENU = ((1, 1), (2, 2), (3, 0), (4, 1), (5, 5), (2, 0), (6, 2))
 
 
 def _build_batch(seq_specs, with_token_ids):
@@ -88,24 +91,12 @@ def _run(proc, batch, chunked, chunk_size):
     )
 
 
-def _coverage_cases(menu, max_seqs):
-    yield from ((item,) for item in menu)
-    yield from itertools.product(menu, repeat=2)
-    for width in range(3, max_seqs + 1):
-        for offset in range(len(menu)):
-            yield tuple(menu[(offset + step) % len(menu)] for step in range(width))
-            yield tuple(menu[(offset - step) % len(menu)] for step in range(width))
-
-
 class TestLogprobChunkStitching(CustomTestCase):
     def _sweep(self, with_token_ids):
         torch.manual_seed(0)
         proc = InputLogprobProcessor()
-        # (extend_len, start); start == extend_len is the degenerate
-        # zero-logprob-row shape.
-        menu = [(1, 1), (2, 2), (3, 0), (4, 1), (5, 5), (2, 0), (6, 2)]
         tried = 0
-        for combo in _coverage_cases(menu, max_seqs=4):
+        for combo in coverage_cases(SEQ_SPEC_MENU, max_seqs=4):
             batch = _build_batch(list(combo), with_token_ids)
             # Same unit as the production gate: grid rows, not logprob rows.
             total_rows = batch[0].shape[0]

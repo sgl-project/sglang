@@ -12,6 +12,7 @@ from sglang.test.ci.ci_register import (
     HWBackend,
     auto_partition,
     collect_tests,
+    is_registered_test_file,
 )
 from sglang.test.ci.ci_utils import run_unittest_files
 
@@ -311,17 +312,13 @@ def run_a_suite(args):
     # Use absolute paths so the script works from any working directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(script_dir)
+    registered_dir = os.path.join(script_dir, "registered")
 
     # Registered tests under test/registered/
     files = [
         f
-        for f in glob.glob(
-            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
-        )
-        if not f.endswith("/conftest.py")
-        and not f.endswith("/__init__.py")
-        and not f.endswith("/cpu/utils.py")
-        and not f.endswith("/run_tests.py")
+        for f in glob.glob(os.path.join(registered_dir, "**", "*.py"), recursive=True)
+        if is_registered_test_file(os.path.relpath(f, registered_dir))
     ]
 
     # Strict: all discovered files must have proper registration

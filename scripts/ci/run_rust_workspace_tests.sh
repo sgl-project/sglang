@@ -3,4 +3,4 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../../rust"
-cargo test --workspace
+timeout 300 cargo test --workspace

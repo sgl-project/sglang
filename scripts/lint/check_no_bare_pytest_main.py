@@ -23,16 +23,47 @@ def is_main_guard(node: ast.expr) -> bool:
     return has_name and has_main
 
 
-def is_bare_pytest_main_call(node: ast.stmt) -> bool:
-    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+def is_pytest_main_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
         return False
-    func = node.value.func
+    func = node.func
     return (
         isinstance(func, ast.Attribute)
         and func.attr == "main"
         and isinstance(func.value, ast.Name)
         and func.value.id == "pytest"
     )
+
+
+def propagates_exit_code(node: ast.Call, parents: dict[int, ast.AST]) -> bool:
+    parent = parents.get(id(node))
+    if not isinstance(parent, ast.Call) or node not in parent.args:
+        return False
+    func = parent.func
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "exit"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "sys"
+    ):
+        return True
+    grandparent = parents.get(id(parent))
+    return (
+        isinstance(func, ast.Name)
+        and func.id == "SystemExit"
+        and isinstance(grandparent, ast.Raise)
+        and grandparent.exc is parent
+    )
+
+
+def runtime_nodes(node: ast.AST):
+    yield node
+    if isinstance(
+        node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+    ):
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from runtime_nodes(child)
 
 
 def find_bare_pytest_main(path: pathlib.Path) -> int | None:
@@ -51,8 +82,17 @@ def find_bare_pytest_main(path: pathlib.Path) -> int | None:
         if not isinstance(node, ast.If) or not is_main_guard(node.test):
             continue
         for statement in node.body:
-            if is_bare_pytest_main_call(statement):
-                return statement.lineno
+            nodes = list(runtime_nodes(statement))
+            parents = {
+                id(child): parent
+                for parent in nodes
+                for child in ast.iter_child_nodes(parent)
+            }
+            for candidate in nodes:
+                if is_pytest_main_call(candidate) and not propagates_exit_code(
+                    candidate, parents
+                ):
+                    return candidate.lineno
     return None
 
 
@@ -69,7 +109,7 @@ def main(paths: list[str]) -> int:
 
     print(
         "ERROR: pytest.main(...) in an __main__ block must propagate its exit "
-        "code with sys.exit(...):"
+        "code with sys.exit(...) or raise SystemExit(...):"
     )
     for offender in offenders:
         print(f"  {offender}")

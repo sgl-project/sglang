@@ -104,10 +104,8 @@ _FILE_EXTENSIONS = (
     ".onnx",
 )
 
-# Non-test helper files under test/registered/ (skipped by basename, matching
-# scripts/ci/check_registered_tests.py). run_suite.py skips `cpu/utils.py` by
-# path; excluding every `utils.py` by basename is a superset that drops no
-# CUDA-registered test (the other `utils.py` registers CPU only).
+# This model scanner can skip every `utils.py`: the only registered one is
+# CPU-only, while the others are non-test helpers.
 _NON_TEST_BASENAMES = frozenset({"conftest.py", "__init__.py", "utils.py"})
 
 
