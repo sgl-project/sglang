@@ -26,6 +26,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_observability
 
 if TYPE_CHECKING:
+    from sglang.srt.kv_hints import KvHints
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -261,6 +262,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Kernel-side unpinning during process reclaim can stall teardown for
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
+
+    def kv_hint_capabilities(self) -> list[str]:
+        """Return the versioned KV hint handlers installed by this cache."""
+        return []
+
+    def on_kv_hints(self, req: Req, hints: KvHints) -> None:
+        """Pass request-scoped KV hints to the cache's hint manager."""
+        pass
 
     @abstractmethod
     def reset(self):

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.kv_hints import DerefApplyOn, DerefHint, KvHints
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -195,6 +196,75 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
 
         self.cache.release_radix_session("s1")
         self.assertEqual(self.full.session_ref(leaf), 0)
+
+    def test_current_success_dereferences_without_closing_session(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        req = SimpleNamespace(
+            session_id="s1",
+            session_generation=generation,
+            session=None,
+            kv_hints=None,
+        )
+        self.cache.on_kv_hints(
+            req,
+            KvHints(deref=DerefHint(apply_on=DerefApplyOn.CURRENT_SUCCESS)),
+        )
+
+        self.cache.kv_hint_manager.on_request_success(req, has_reusable_leaf=False)
+
+        self.assertEqual(self.full.session_ref(leaf), 0)
+        self.assertGreater(self.cache.ensure_session_generation("s1"), generation)
+
+    def test_next_success_replaces_old_session_references(self):
+        old_leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+
+        compaction_tokens = [1, 2, 3, 4, 5, 6]
+        compaction_leaf = insert(self.cache, compaction_tokens)
+        compaction_req = SimpleNamespace(
+            session_id="s1",
+            session_generation=generation,
+            session=None,
+            kv_hints=None,
+            last_node=compaction_leaf.id,
+            origin_input_ids=array("q", compaction_tokens),
+            output_ids=array("q"),
+            kv_committed_len=len(compaction_tokens),
+            extra_key=None,
+        )
+        self.cache.on_kv_hints(
+            compaction_req,
+            KvHints(deref=DerefHint(apply_on=DerefApplyOn.NEXT_SUCCESS)),
+        )
+        self.cache.kv_hint_manager.on_request_success(
+            compaction_req, has_reusable_leaf=True
+        )
+
+        self.assertEqual(self.full.session_ref(old_leaf), 1)
+        self.assertEqual(self.full.session_ref(compaction_leaf), 1)
+
+        next_tokens = [1, 2, 9, 10]
+        next_leaf = insert(self.cache, next_tokens)
+        next_req = SimpleNamespace(
+            session_id="s1",
+            session_generation=generation,
+            session=None,
+            kv_hints=None,
+            last_node=next_leaf.id,
+            origin_input_ids=array("q", next_tokens),
+            output_ids=array("q"),
+            kv_committed_len=len(next_tokens),
+            extra_key=None,
+        )
+        self.cache.kv_hint_manager.on_request_success(next_req, has_reusable_leaf=True)
+
+        self.assertGreater(next_req.session_generation, generation)
+        self.assertEqual(self.full.session_ref(compaction_leaf), 0)
+        self.assertEqual(self.full.session_ref(next_leaf), 1)
+        self.assertEqual(self.full._session_leaves["s1"], {next_leaf})
 
     def test_reopen_rejects_stale_generation(self):
         leaf = insert(self.cache, [1, 2, 3, 4])

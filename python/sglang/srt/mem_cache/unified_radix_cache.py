@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.kv_hints import KvHintManager, KvHints
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -189,6 +190,9 @@ class UnifiedRadixCache(BasePrefixCache):
             components=self._components_tuple,
             tree_core=self.tree_core,
             enable_session_radix_cache=self.enable_session_radix_cache,
+        )
+        self.kv_hint_manager = KvHintManager(
+            self.session_refs if self.enable_session_radix_cache else None
         )
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
@@ -728,13 +732,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
-        if self.enable_session_radix_cache and result is not None:
+        if self.enable_session_radix_cache:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
             if req.finished_reason is not None and not isinstance(
                 req.finished_reason, FINISH_ABORT
             ):
-                self.session_refs.register_session_ref(req)
+                self.kv_hint_manager.on_request_success(
+                    req, has_reusable_leaf=result is not None
+                )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -2095,6 +2101,12 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.is_mamba_enabled
 
     # ---- Session radix cache API (delegates to composed UnifiedSessionRefTracker) ----
+
+    def kv_hint_capabilities(self) -> list[str]:
+        return self.kv_hint_manager.capabilities()
+
+    def on_kv_hints(self, req: Req, hints: KvHints) -> None:
+        self.kv_hint_manager.on_request(req, hints)
 
     def open_radix_session(self, session_id: str) -> Optional[int]:
         return self.session_refs.open_radix_session(session_id)

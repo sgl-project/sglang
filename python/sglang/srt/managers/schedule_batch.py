@@ -878,6 +878,7 @@ class Req(ReqDllmMixin):
 
         self.session = session
         self.session_id = session_id
+        self.kv_hints = None
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds

@@ -274,6 +274,9 @@ class RayDataParallelController(DataParallelController):
         if scheduler_infos:
             self.max_total_num_tokens = scheduler_infos[0]["max_total_num_tokens"]
             self.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+            self.kv_hint_capabilities = scheduler_infos[0].get(
+                "kv_hint_capabilities", []
+            )
             self.startup_time = aggregate_scheduler_startup_times(
                 [self.startup_time]
                 + [info.get("startup_time") for info in scheduler_infos]

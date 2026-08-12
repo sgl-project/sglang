@@ -1389,6 +1389,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
                 session_params=session_params,
+                kv_hints=obj.kv_hints,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,

@@ -51,6 +51,7 @@ import zmq.asyncio
 from pydantic import PlainValidator
 
 from sglang.srt.environ import envs
+from sglang.srt.kv_hints import KvHints
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import (
@@ -164,6 +165,8 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
+    # Versioned KV-cache actions attached by an upstream dispatcher.
+    kv_hints: Optional[KvHints] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -326,6 +329,10 @@ class GenerateReqInput:
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+
+    def __post_init__(self):
+        if isinstance(self.kv_hints, dict):
+            self.kv_hints = msgspec.convert(self.kv_hints, type=KvHints, strict=True)
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -774,6 +781,7 @@ class GenerateReqInput:
         sub = GenerateReqInput(
             rid=self.rid[i],
             session_id=self.session_id,
+            kv_hints=self.kv_hints,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -894,6 +902,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Session info for continual prompting
     session_id: Optional[str] = None
     session_params: Optional[SessionParams] = None
+    kv_hints: Optional[KvHints] = None
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
