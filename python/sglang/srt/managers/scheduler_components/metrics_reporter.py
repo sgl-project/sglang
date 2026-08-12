@@ -578,7 +578,7 @@ class SchedulerMetricsReporter:
             msg += f"#optimistic-req: {num_optimistic}, "
 
         if (
-            self.scheduler.server_args.encoder_client
+            self.scheduler.server_args.language_only
             and self.scheduler.server_args.encoder_transfer_backend
             == "zmq_to_scheduler"
         ):
@@ -827,7 +827,7 @@ class SchedulerMetricsReporter:
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         if (
-            self.scheduler.server_args.encoder_client
+            self.scheduler.server_args.language_only
             and self.scheduler.server_args.encoder_transfer_backend
             == "zmq_to_scheduler"
         ):

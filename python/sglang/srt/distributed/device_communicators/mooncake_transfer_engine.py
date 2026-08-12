@@ -326,7 +326,7 @@ def maybe_init_shared_mooncake_transfer_engine(
             and server_args.encoder_transfer_backend == "mooncake"
         )
         or (
-            server_args.encoder_client
+            server_args.language_only
             and server_args.encoder_transfer_backend == "mooncake"
         )
         or (

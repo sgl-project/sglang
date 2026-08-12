@@ -365,6 +365,31 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
+_VISION_TOWER_ATTRS = ("visual", "vision_tower", "vision_model", "vision_encoder")
+
+
+def _require_local_encoder(multimodal_model, items, modality) -> None:
+    """Reaching an embedder means nobody precomputed these items.
+
+    A server started with --language-only has no tower to run one on, so say
+    that instead of dereferencing None somewhere inside the model.
+    """
+    if multimodal_model is None:
+        return
+    towers = [
+        getattr(multimodal_model, name)
+        for name in _VISION_TOWER_ATTRS
+        if hasattr(multimodal_model, name)
+    ]
+    if not towers or any(t is not None for t in towers):
+        return
+    raise ValueError(
+        f"This server has no local vision tower (--language-only, or a "
+        f"checkpoint declaring language_model_only=True) and no encoder "
+        f"supplied embeddings for these {modality.name.lower()} inputs."
+    )
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -420,6 +445,7 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
+            _require_local_encoder(multimodal_model, items, modality)
             placeholder_tensor = torch.as_tensor(
                 [item.pad_value for item in items],
                 device=input_ids.device,
@@ -702,7 +728,7 @@ def general_mm_embed_routine(
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_disagg().encoder_client:
+                            if get_disagg().language_only:
                                 precomputed_embeddings = getattr(
                                     mm_item, "precomputed_embeddings", None
                                 )

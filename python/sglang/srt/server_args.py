@@ -3123,16 +3123,14 @@ class ServerArgs:
     ] = False
     language_only: A[
         bool,
-        "Serve the language half of a VLM only: on models that support it the "
-        "vision tower is not built at all, freeing that memory for KV cache. "
+        "Serve the language half of a VLM only. On architectures that support "
+        "it the vision tower is not built at all, freeing that memory for KV "
+        "cache; on the rest only its weights are skipped. "
         "This says nothing about where image features come from -- name an "
         "encoder with --encoder-urls to receive them from an encoder server. "
         "Without one, multimodal requests are rejected.",
         NS("disagg"),
     ] = False
-    # Derived in __post_init__: this replica consumes image features from
-    # encoder servers. Not a flag -- naming an encoder is what opts you in.
-    encoder_client: A[bool, Arg(help="", no_cli=True), NS("disagg")] = False
     encoder_transfer_backend: A[
         str,
         Arg(
@@ -7565,12 +7563,6 @@ class ServerArgs:
             return False
 
     def _handle_encoder_disaggregation(self):
-        if self.language_only and self.enable_adaptive_dispatch_to_encoder:
-            raise ValueError(
-                "--enable-adaptive-dispatch-to-encoder processes single-image "
-                "requests locally, which --language-only leaves no vision tower "
-                "for. Drop one of the two."
-            )
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
                 "--enable-prefix-mm-cache requires --encoder-only to be enabled"
@@ -7583,19 +7575,20 @@ class ServerArgs:
             )
 
         if self.language_only:
-            arch = self.get_model_config().hf_config.architectures[0]
-            if arch not in TOWER_SKIPPING_ARCHITECTURES:
-                logger.warning(
-                    "%s does not implement the --language-only tower skip; its "
-                    "vision weights are left unloaded but the tower is still "
-                    "built and still holds memory.",
-                    arch,
+            architectures = self.get_model_config().hf_config.architectures or []
+            if not any(a in TOWER_SKIPPING_ARCHITECTURES for a in architectures):
+                logger.info(
+                    "%s keeps its vision tower under --language-only; only the "
+                    "architectures that implement the skip free that memory.",
+                    architectures,
                 )
 
-        # Naming an encoder is what opts into encoder disaggregation; further
-        # encoders may join later via the EncoderBootstrapServer, but one has to
-        # be known up front for the machinery to start at all.
-        self.encoder_client = self.language_only and len(self.encoder_urls) > 0
+        if self.language_only and len(self.encoder_urls) == 0:
+            logger.info(
+                "--language-only is set without --encoder-urls. Encoders are "
+                "expected to register dynamically via the "
+                "EncoderBootstrapServer."
+            )
 
         # Validate IB devices when mooncake backend is used
         if (
@@ -7613,14 +7606,14 @@ class ServerArgs:
             self.encoder_transfer_backend = resolve_encoder_transfer_backend(
                 self.encoder_transfer_backend, model_arch, self.tp_size
             )
-            if self.encoder_only or self.encoder_client:
+            if self.encoder_only or self.language_only:
                 logger.info(
                     "Encoder transfer backend auto-resolved to %s for %s at TP%d.",
                     self.encoder_transfer_backend,
                     model_arch,
                     self.tp_size,
                 )
-        if (self.encoder_only or self.encoder_client) and model_arch not in [
+        if (self.encoder_only or self.language_only) and model_arch not in [
             "Qwen2VLForConditionalGeneration",
             "Qwen3VLForConditionalGeneration",
             "Qwen2_5_VLForConditionalGeneration",
@@ -8575,7 +8568,7 @@ class ServerArgs:
         parser.add_argument(
             "--language-model-only",
             action=DeprecatedStoreTrueAction,
-            dest="language_only",
+            dest="language_model_only",
             new_flag="--language-only",
             help="[Deprecated] Use --language-only instead.",
         )
@@ -8781,7 +8774,10 @@ class ServerArgs:
         attrs = [
             attr.name for attr in dataclasses.fields(cls) if hasattr(args, attr.name)
         ]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        kwargs = {attr: getattr(args, attr) for attr in attrs}
+        if getattr(args, "language_model_only", False):
+            kwargs["language_only"] = True
+        return cls(**kwargs)
 
     def get_tokenizer_worker_class(self):
         from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker

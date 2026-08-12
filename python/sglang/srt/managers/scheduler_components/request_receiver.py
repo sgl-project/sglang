@@ -232,7 +232,7 @@ class SchedulerRequestReceiver:
         # Process MM requests under EPD-disaggregation mode
         if (
             self.ps.pp_rank == 0
-            and get_disagg().encoder_client
+            and get_disagg().language_only
             and get_disagg().encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
         ):
