@@ -585,7 +585,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
+                batch, chunked_reqs=self.chunked_reqs
             )
             self.cur_batch_for_debug = batch
 
@@ -624,7 +624,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
+                batch, chunked_reqs=self.chunked_reqs
             )
             self.cur_batch_for_debug = batch
 
@@ -774,10 +774,10 @@ class SchedulerDisaggregationPrefillMixin:
                 req.inflight_middle_chunks -= 1
 
                 # Still chunking iff its next chunk was launched: either it is
-                # still self.chunked_req, or its final chunk (extend_range
-                # reaching the end of the input) is in flight. A yielded req
-                # is neither, so do its deferred release here.
-                still_chunking = self.chunked_req is req or (
+                # still mid-prefill, or its final chunk (extend_range reaching
+                # the end of the input) is in flight. A yielded req is neither,
+                # so do its deferred release here.
+                still_chunking = req in self.chunked_reqs or (
                     req.extend_range is not None
                     and req.extend_range.end >= len(req.origin_input_ids)
                 )
@@ -1060,17 +1060,18 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
     ) -> None:
         chunked_req_to_exclude = set()
-        if (req := self.chunked_req) is not None:
+        yielded: List[Req] = []
+        for req in self.chunked_reqs:
             chunked_req_to_exclude.add(req)
             maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
                     # bootstrap failed
-                    self.chunked_req = None
+                    yielded.append(req)
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
-                    self.chunked_req = None
+                    yielded.append(req)
                     if not self.enable_overlap:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
@@ -1083,14 +1084,16 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self.send_kv_chunk(req)
 
-            if self.chunked_req is not None:
-                running_batch.batch_is_full = False
+        if yielded:
+            self.chunked_reqs = [r for r in self.chunked_reqs if r not in yielded]
+        if self.chunked_reqs:
+            running_batch.batch_is_full = False
 
         if last_batch and last_batch.forward_mode.is_extend():
-            if last_batch.chunked_req:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(last_batch.chunked_req)
+            if last_batch.chunked_reqs:
+                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked reqs.
+                # We need to discard them.
+                chunked_req_to_exclude.update(last_batch.chunked_reqs)
 
             last_bs = last_batch.batch_size()
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))

@@ -59,6 +59,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Collection,
     Dict,
     List,
     Literal,
@@ -1968,21 +1969,41 @@ def compute_extend_logprob_start_len(
     return min(resolved_start - prefix_len, extend_len)
 
 
-def _compute_chunked_req_next_prompt_token(
-    chunked_req: Optional[Req],
-    vocab_size: int,
-) -> Optional[int]:
+def _next_prompt_token_after_fill(req: Req, vocab_size: int) -> Optional[int]:
     """Return the next real prompt token after the fill boundary, skipping
     multimodal placeholder (hash) tokens that lie outside the model vocab."""
-    if chunked_req is None:
-        return None
-    fill_len = chunked_req.extend_range.end
-    origin_ids = chunked_req.origin_input_ids
+    fill_len = req.extend_range.end
+    origin_ids = req.origin_input_ids
     if fill_len >= len(origin_ids):
         return None
     if origin_ids[fill_len] < vocab_size:
         return int(origin_ids[fill_len])
     return None
+
+
+def _compute_chunked_next_prompt_tokens(
+    reqs: List[Req],
+    chunked_reqs: Optional[Collection[Req]],
+    vocab_size: int,
+) -> Optional[List[Optional[int]]]:
+    """Per-batch-row next prompt token, positionally aligned with ``reqs``.
+
+    Only mid-prefill requests get an entry; every other row is ``None``. EAGLE
+    uses it to keep the draft model's chain consistent across chunk boundaries
+    (see ``_eagle_prefill_tail_tokens`` and PR #26329): for a middle chunk the
+    true next token is the next *prompt* token, not the sampled one.
+
+    Returns ``None`` when no row needs a substitution, so the consumer can skip
+    the whole path.
+    """
+    if not chunked_reqs:
+        return None
+    mid_prefill = set(chunked_reqs)
+    tokens: List[Optional[int]] = [
+        _next_prompt_token_after_fill(req, vocab_size) if req in mid_prefill else None
+        for req in reqs
+    ]
+    return tokens if any(t is not None for t in tokens) else None
 
 
 @dataclasses.dataclass
@@ -2014,9 +2035,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    # For chunked prefill in PP
-    chunked_req: Optional[Req] = None
-    chunked_req_next_prompt_token: Optional[int] = None
+    # For chunked prefill in PP. `chunked_reqs` holds the requests in this
+    # batch whose prefill does not finish here; `chunked_next_prompt_tokens` is
+    # positionally aligned with `reqs` (None on rows that need no substitution,
+    # and None entirely when no row does).
+    chunked_reqs: Collection[Req] = ()
+    chunked_next_prompt_tokens: Optional[List[Optional[int]]] = None
     contains_last_prefill_chunk: bool = True
 
     # For DP attention
@@ -2183,7 +2207,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
-        chunked_req: Optional[Req] = None,
+        chunked_reqs: Optional[Collection[Req]] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -2204,9 +2228,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=return_hidden_states_mode.need_capture(),
             return_hidden_states_mode=return_hidden_states_mode,
             is_prefill_only=all(req.is_prefill_only for req in reqs),
-            chunked_req=chunked_req,
-            chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
-                chunked_req,
+            chunked_reqs=tuple(chunked_reqs or ()),
+            chunked_next_prompt_tokens=_compute_chunked_next_prompt_tokens(
+                reqs,
+                chunked_reqs,
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,

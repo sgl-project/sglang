@@ -5,13 +5,13 @@ exposed to the peer from the moment its address is published until the transfer
 concludes, and for part of that lifetime the request sits in NEITHER end's
 queue. Both cases below are exactly those windows: an earlier version of the
 predicates looked only at `disagg_prefill_inflight_queue` /
-`disagg_decode_transfer_queue` (plus `scheduler.chunked_req`) and returned True
+`disagg_decode_transfer_queue` (plus `scheduler.chunked_reqs`) and returned True
 here, letting compaction move pages under in-flight RDMA -- silent KV
 corruption with no crash.
 """
 
 import unittest
-from typing import List, Optional, Set
+from typing import List, Set
 
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -51,7 +51,7 @@ class _FakePreallocQueue:
 class _FakeScheduler:
     def __init__(self, mode: DisaggregationMode):
         self.disaggregation_mode = mode
-        self.chunked_req: Optional[object] = None
+        self.chunked_reqs: List[object] = []
         self.disagg_prefill_inflight_queue: List[object] = []
         self.disagg_prefill_pending_chunk_rids: Set[str] = set()
         self.disagg_decode_transfer_queue = _FakeTransferQueue()
@@ -86,22 +86,22 @@ class TestDecodeMoveGate(CustomTestCase):
 
 class TestPrefillMoveGate(CustomTestCase):
     def test_closed_after_final_chunk_clears_chunked_req(self):
-        """Scheduling the final chunk clears `scheduler.chunked_req`, but the
+        """Scheduling the final chunk clears `scheduler.chunked_reqs`, but the
         request only reaches `disagg_prefill_inflight_queue` later in the result
         path. Earlier middle chunks may still be draining in that window, so the
-        gate must not key off `chunked_req` alone.
+        gate must not key off `chunked_reqs` alone.
         """
         scheduler = _FakeScheduler(DisaggregationMode.PREFILL)
         gate = unified_memory_disagg_move_gate(scheduler)
         self.assertTrue(gate(), "idle prefill node should allow compaction")
 
         # A middle chunk went out for rid "r0".
-        scheduler.chunked_req = object()
+        scheduler.chunked_reqs = [object()]
         scheduler.disagg_prefill_pending_chunk_rids.add("r0")
         self.assertFalse(gate())
 
-        # Final chunk scheduled: chunked_req cleared, not yet inflight-queued.
-        scheduler.chunked_req = None
+        # Final chunk scheduled: chunked_reqs cleared, not yet inflight-queued.
+        scheduler.chunked_reqs = []
         self.assertFalse(scheduler.disagg_prefill_inflight_queue)
         self.assertFalse(gate())
 
@@ -123,12 +123,12 @@ class TestPrefillMoveGate(CustomTestCase):
         scheduler = _FakeScheduler(DisaggregationMode.PREFILL)
         gate = unified_memory_disagg_move_gate(scheduler)
 
-        scheduler.chunked_req = object()
+        scheduler.chunked_reqs = [object()]
         scheduler.disagg_prefill_pending_chunk_rids.add("r0")
         self.assertFalse(gate())
 
-        # Aborted mid-chunking: chunked_req dropped, no final send, never queued.
-        scheduler.chunked_req = None
+        # Aborted mid-chunking: chunked_reqs dropped, no final send, never queued.
+        scheduler.chunked_reqs = []
         scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
         self.assertTrue(gate(), "abort cleanup must let compaction resume")
 

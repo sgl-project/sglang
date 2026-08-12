@@ -23,6 +23,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_pin_memory_available,
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -87,16 +88,25 @@ def _eagle_prefill_tail_tokens(
     """Per-seq tail token for EAGLE prefill rotation; uses next prompt token for
     non-final chunks (chunked-prefill chain consistency, see PR #26329)."""
     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
-    next_prompt_token = batch.chunked_req_next_prompt_token
-    if next_prompt_token is not None:
-        for i, r in enumerate(batch.reqs):
-            if r is batch.chunked_req:
-                tail_tokens = tail_tokens.clone()
-                # Keep the scalar as a kernel argument. Assigning a Python scalar
-                # through scalar indexing issues a pageable H2D copy and
-                # synchronizes the current CUDA stream before draft extend.
-                tail_tokens[i : i + 1].fill_(next_prompt_token)
-                break
+    next_prompt_tokens = batch.chunked_next_prompt_tokens
+    if next_prompt_tokens is not None:
+        rows = [i for i, tok in enumerate(next_prompt_tokens) if tok is not None]
+        if rows:
+            tail_tokens = tail_tokens.clone()
+            # One pinned, non-blocking H2D copy for all substituted rows.
+            # Assigning Python scalars through indexing would issue a pageable
+            # copy per row and synchronize the current CUDA stream before draft
+            # extend.
+            pin = is_pin_memory_available(tail_tokens.device)
+            index = torch.tensor(rows, dtype=torch.int64, pin_memory=pin).to(
+                tail_tokens.device, non_blocking=True
+            )
+            values = torch.tensor(
+                [next_prompt_tokens[i] for i in rows],
+                dtype=tail_tokens.dtype,
+                pin_memory=pin,
+            ).to(tail_tokens.device, non_blocking=True)
+            tail_tokens.index_copy_(0, index, values)
     return tail_tokens
 
 

@@ -104,8 +104,10 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     )
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     s.tree_cache = tree_cache
-    s.chunked_req = chunked_req
-    s._pending_chunked_abort_req = None
+    s.chunked_reqs = [chunked_req] if chunked_req is not None else []
+    s.max_concurrent_chunked_reqs = 1
+    s.enable_dynamic_chunking = False
+    s._pending_chunked_abort_reqs = []
     return s
 
 
@@ -166,8 +168,8 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         self.assertTrue(torch.equal(req.prefix_indices, expected))
 
     def test_no_chunked_req_never_mutates_state(self):
-        # The outer `if chunked_req is not None` guard must hold on the retract
-        # path that clears chunked_req.
+        # The outer `if chunked_reqs` guard must hold on the retract
+        # path that clears chunked_reqs.
         pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
         cache = _make_chunk_cache(pool)
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
@@ -175,7 +177,7 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         Scheduler.get_next_batch_to_run(
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
-        self.assertIsNone(s.chunked_req)
+        self.assertEqual(s.chunked_reqs, [])
 
 
 if __name__ == "__main__":

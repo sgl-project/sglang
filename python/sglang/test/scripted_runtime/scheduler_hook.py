@@ -49,7 +49,7 @@ class ScriptedBatchRecord:
     mode: Optional[str]
     rids: Tuple[str, ...]
     extend_rids: Tuple[str, ...]
-    chunked_rid: Optional[str]
+    chunked_rids: Tuple[str, ...]
 
 
 def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
@@ -185,7 +185,6 @@ class ScriptedSchedulerHook:
     def on_run_batch(self, batch) -> None:
         if not self._is_driver:
             return
-        chunked = self.scheduler.chunked_req
         self._batch_log.append(
             ScriptedBatchRecord(
                 forward_iter=batch.forward_iter,
@@ -200,7 +199,7 @@ class ScriptedSchedulerHook:
                     if batch.forward_mode is not None and batch.forward_mode.is_extend()
                     else ()
                 ),
-                chunked_rid=chunked.rid if chunked is not None else None,
+                chunked_rids=tuple(r.rid for r in self.scheduler.chunked_reqs),
             )
         )
 

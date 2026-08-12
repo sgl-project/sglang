@@ -449,18 +449,18 @@ class TestAbortBasic(ScriptedTestCase):
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=250
         )
         yield from run_until(r, lambda h: h.is_chunking)
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 1
+        assert (len(t.scheduler.chunked_reqs)) == 1
 
         t.abort(r)
         yield from _drain_until_released(t, r)
 
         for _ in range(12):
-            if t.scheduler.chunked_req is None and t.is_idle:
+            if not t.scheduler.chunked_reqs and t.is_idle:
                 break
             yield
 
         assert r.kv_pages == 0
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 0
+        assert (len(t.scheduler.chunked_reqs)) == 0
         assert t.is_idle, "engine must be idle after the only chunked req is aborted"
 
     def test_chunked_req_then_abort_then_new_short_in_one_yield(self):
@@ -475,19 +475,17 @@ class TestAbortBasic(ScriptedTestCase):
         )
         yield from run_until(r1, lambda h: h.is_chunking)
         assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
+            t.scheduler.chunked_reqs[0].rid if t.scheduler.chunked_reqs else None
         ) == r1.rid, (
             f"r1 should hold the chunked slot before abort; got "
-            f"{(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
+            f"{(t.scheduler.chunked_reqs[0].rid if t.scheduler.chunked_reqs else None)!r}"
         )
 
         t.abort(r1)
         r2 = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from _drain_until_released(t, r1)
 
-        cur = (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
-        )
+        cur = t.scheduler.chunked_reqs[0].rid if t.scheduler.chunked_reqs else None
         assert cur != r1.rid, f"chunked slot still points to aborted r1; got {cur!r}"
         assert r1.kv_pages == 0
         yield from run_until_finished(r2)
@@ -533,7 +531,7 @@ class TestAbortBasic(ScriptedTestCase):
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=281
         )
         yield from run_until(r1, lambda h: h.is_chunking)
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 1
+        assert (len(t.scheduler.chunked_reqs)) == 1
 
         t.abort(r1)
         yield from _drain_until_released(t, r1)

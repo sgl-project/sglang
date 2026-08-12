@@ -408,7 +408,7 @@ class TestPrefillAdder(CustomTestCase):
         req1.sampling_params.ignore_eos = False
 
         result1 = adder.add_one_req(
-            req1, has_chunked_req=False, truncation_align_size=None
+            req1, num_chunked_reqs=0, truncation_align_size=None
         )
 
         self.assertEqual(len(adder.can_run_list), 1)
@@ -441,7 +441,7 @@ class TestPrefillAdder(CustomTestCase):
         req2.sampling_params.ignore_eos = False
 
         result2 = adder2.add_one_req(
-            req2, has_chunked_req=False, truncation_align_size=None
+            req2, num_chunked_reqs=0, truncation_align_size=None
         )
 
         self.assertEqual(len(adder2.can_run_list), 1)
@@ -457,7 +457,7 @@ class TestPrefillAdder(CustomTestCase):
         req3.sampling_params.ignore_eos = False
 
         result3 = adder2.add_one_req(
-            req3, has_chunked_req=False, truncation_align_size=None
+            req3, num_chunked_reqs=0, truncation_align_size=None
         )
 
         self.assertEqual(len(adder2.can_run_list), 2)
@@ -601,15 +601,13 @@ class TestPrefillAdder(CustomTestCase):
         # Pre-fix: a constant sliding-window reservation rejects the resume.
         with patch.object(adder, "_swa_reserved_tokens", return_value=WINDOW + PAGE):
             self.assertIs(
-                adder.add_one_req(
-                    req, has_chunked_req=False, truncation_align_size=None
-                ),
+                adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None),
                 AddReqResult.NO_TOKEN,
             )
         self.assertEqual(len(adder.can_run_list), 0)
 
         # Fix: min(extend + decode, window) reservation admits it.
-        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
         self.assertIn(req, adder.can_run_list)
 
     def test_swa_new_tokens_clamps_remaining_not_total(self):
@@ -652,7 +650,7 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_one_req(
             self._create_delayer_req(50),
-            has_chunked_req=False,
+            num_chunked_reqs=0,
             truncation_align_size=None,
         )
 
@@ -682,7 +680,7 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_one_req(
             self._create_delayer_req(50),
-            has_chunked_req=False,
+            num_chunked_reqs=0,
             truncation_align_size=None,
         )
 
@@ -699,7 +697,7 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_one_req(
             self._create_delayer_req(50),
-            has_chunked_req=False,
+            num_chunked_reqs=0,
             truncation_align_size=None,
         )
 
@@ -714,9 +712,7 @@ class TestPrefillAdder(CustomTestCase):
         adder = self._create_delayer_adder(available_tokens=100_000, delayer=delayer)
         req = self._create_delayer_req(50)
 
-        result = adder.add_one_req(
-            req, has_chunked_req=False, truncation_align_size=None
-        )
+        result = adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
 
         self.assertEqual(result, AddReqResult.CONTINUE)
         self.assertEqual(delayer.calls, [True])

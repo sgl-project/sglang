@@ -42,10 +42,10 @@ class _Batch:
         self.return_logprob = False
 
 
-def _flag(chunked_req, can_run_list) -> bool:
+def _flag(chunked_reqs, can_run_list) -> bool:
     """Run the scheduler's real derivation."""
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.chunked_req = chunked_req
+    scheduler.chunked_reqs = list(chunked_reqs)
     return Scheduler._contains_last_prefill_chunk(scheduler, can_run_list)
 
 
@@ -54,15 +54,15 @@ class TestContainsLastPrefillChunk(CustomTestCase):
         # The only member is the chunked request: nothing consumes the token,
         # which is the case the PP skip exists for.
         chunked = _Req("chunked")
-        self.assertFalse(_flag(chunked, [chunked]))
+        self.assertFalse(_flag([chunked], [chunked]))
 
     def test_chunked_req_alongside_others_is_true(self):
         chunked, other = _Req("chunked"), _Req("other")
-        self.assertTrue(_flag(chunked, [chunked, other]))
+        self.assertTrue(_flag([chunked], [chunked, other]))
 
     def test_no_chunked_req_is_true(self):
-        self.assertTrue(_flag(None, [_Req("a")]))
-        self.assertTrue(_flag(None, [_Req("a"), _Req("b")]))
+        self.assertTrue(_flag([], [_Req("a")]))
+        self.assertTrue(_flag([], [_Req("a"), _Req("b")]))
 
     def test_parked_chunked_req_is_true(self):
         # Regression. `chunked_req` is set but was parked -- it is not in the
@@ -71,7 +71,7 @@ class TestContainsLastPrefillChunk(CustomTestCase):
         # False here, so PP would skip output comm and leave that request with
         # placeholder zeros instead of its token.
         chunked, present = _Req("parked"), _Req("present")
-        self.assertTrue(_flag(chunked, [present]))
+        self.assertTrue(_flag([chunked], [present]))
 
     def test_matches_size_derivation_except_when_parked(self):
         # Equivalence sweep against the previous derivation, showing the only
@@ -90,12 +90,13 @@ class TestContainsLastPrefillChunk(CustomTestCase):
         ]:
             with self.subTest(chunked=chunked_req, batch=can_run_list):
                 self.assertEqual(
-                    old(chunked_req, can_run_list), _flag(chunked_req, can_run_list)
+                    old(chunked_req, can_run_list),
+                    _flag([] if chunked_req is None else [chunked_req], can_run_list),
                 )
 
         # The single divergence: parked, exactly one other request.
         self.assertFalse(old(chunked, [a]))
-        self.assertTrue(_flag(chunked, [a]))
+        self.assertTrue(_flag([chunked], [a]))
 
 
 class TestPPSkipOutputComm(CustomTestCase):

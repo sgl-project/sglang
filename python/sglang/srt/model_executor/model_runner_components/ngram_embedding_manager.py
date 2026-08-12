@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Collection, Optional
 
 import torch
 
@@ -91,7 +91,7 @@ class NgramEmbeddingManager:
         self,
         batch: Optional[ScheduleBatch],
         *,
-        chunked_req: Optional[Req],
+        chunked_reqs: Collection[Req] = (),
     ) -> Optional[ScheduleBatch]:
         """Fill the token table for ngram embedding before a forward pass."""
         if batch is None or not self.enabled:
@@ -131,12 +131,13 @@ class NgramEmbeddingManager:
                 ),
                 ignore_tokens=None,
             )
-            # Mark the chunked (not-yet-finished) prefill request so sample()
-            # skips writing its pseudo next-token into the ngram token table.
-            # Use self.chunked_req identity (not req.is_chunked) to avoid
+            # Mark the chunked (not-yet-finished) prefill requests so sample()
+            # skips writing their pseudo next-token into the ngram token table.
+            # Use scheduler-tracked identity (not req.is_chunked) to avoid
             # overlap-scheduling timing issues.
-            if chunked_req is not None:
-                skip_token_table_update = [req is chunked_req for req in batch.reqs]
+            if chunked_reqs:
+                mid_prefill = set(chunked_reqs)
+                skip_token_table_update = [req in mid_prefill for req in batch.reqs]
                 batch.ne_skip_token_table_update = (
                     torch.tensor(
                         skip_token_table_update, dtype=torch.bool, device=device

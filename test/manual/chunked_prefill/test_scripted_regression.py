@@ -285,7 +285,7 @@ class TestRegressionBasic(ScriptedTestCase):
             f"f38e69f87d: pause(retract) must re-queue the retracted "
             f"chunked-resume req; got status={r.status!r}"
         )
-        assert t.scheduler.chunked_req is None
+        assert not t.scheduler.chunked_reqs
         assert t.scheduler.running_batch.is_empty()
 
         t.continue_generation()
@@ -311,7 +311,7 @@ class TestRegressionBasic(ScriptedTestCase):
             f"{len(t.scheduler.running_batch.reqs)}"
         )
         assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
+            t.scheduler.chunked_reqs[0].rid if t.scheduler.chunked_reqs else None
         ) is None
         for r in (r1, r2):
             assert r.status == "waiting"

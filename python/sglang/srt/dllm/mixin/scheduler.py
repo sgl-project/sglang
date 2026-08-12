@@ -327,7 +327,9 @@ class SchedulerDllmMixin:
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
-                has_chunked_req=True,
+                # DLLM manages its own staging queue and never claims a
+                # chunked slot from the adder.
+                num_chunked_reqs=1,
                 truncation_align_size=self.truncation_align_size,
             )
 

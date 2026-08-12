@@ -197,7 +197,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-200")
         yield from run_until_finished(r1)
         for _ in range(200):
-            assert (1 if t.scheduler.chunked_req is not None else 0) == 0
+            assert (len(t.scheduler.chunked_reqs)) == 0
             yield
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-200")
         yield from run_until_finished(r2)
@@ -234,9 +234,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=16, max_new_tokens=4)
         for _ in range(DEFAULT_MAX_STEPS):
             assert (
-                t.scheduler.chunked_req.rid
-                if t.scheduler.chunked_req is not None
-                else None
+                t.scheduler.chunked_reqs[0].rid if t.scheduler.chunked_reqs else None
             ) is None
             if r1.finished and r2.finished:
                 break
@@ -251,7 +249,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         chunked = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         shorts = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(5)]
         for _ in range(DEFAULT_MAX_STEPS * 5):
-            assert (1 if t.scheduler.chunked_req is not None else 0) <= 1
+            assert (len(t.scheduler.chunked_reqs)) <= 1
             if chunked.finished and all(s.finished for s in shorts):
                 break
             yield
@@ -317,11 +315,9 @@ class TestMultiReqBasic(ScriptedTestCase):
         reqs = [t.start_req(prompt_len=4, max_new_tokens=8) for _ in range(10)]
         for _ in range(DEFAULT_MAX_STEPS * 3):
             assert (
-                t.scheduler.chunked_req.rid
-                if t.scheduler.chunked_req is not None
-                else None
+                t.scheduler.chunked_reqs[0].rid if t.scheduler.chunked_reqs else None
             ) is None, "pure decode workload must never populate chunked_req"
-            assert (1 if t.scheduler.chunked_req is not None else 0) == 0
+            assert (len(t.scheduler.chunked_reqs)) == 0
             if all(r.finished for r in reqs):
                 return
             yield
@@ -358,7 +354,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS * 5):
             s = t.scheduler
-            chunked = s.chunked_req
+            chunked = s.chunked_reqs[0] if s.chunked_reqs else None
             running = s.running_batch
             if chunked is not None and running is not None:
                 assert chunked not in running.reqs, (

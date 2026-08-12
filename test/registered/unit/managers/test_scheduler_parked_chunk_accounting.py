@@ -97,7 +97,7 @@ def _count_via_scheduler(adder: PrefillAdder, chunked_req: Req) -> None:
     logic, so deleting the parked-chunk guard fails these tests.
     """
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.chunked_req = chunked_req
+    scheduler.chunked_reqs = [chunked_req]
     Scheduler._count_inflight_chunk(scheduler, set(adder.can_run_list))
 
 
