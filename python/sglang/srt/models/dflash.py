@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
     """Honor explicit causality while preserving legacy layer defaults."""
-    text_config = getattr(config, "text_config", None) or config
+    text_config = config.get_text_config()
     is_causal = getattr(text_config, "is_causal", None)
     if is_causal is None:
         return default
