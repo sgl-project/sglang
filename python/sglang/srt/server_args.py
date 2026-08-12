@@ -31,7 +31,6 @@ import uuid
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
-from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
@@ -41,7 +40,12 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
-from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
+    mamba_extra_buffer_lazy_of,
+    mamba_extra_buffer_of,
+    resolved_view,
+)
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -68,7 +72,6 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
-    get_int_env_var,
     get_quantization_config,
     human_readable_int,
     is_blackwell_supported,
@@ -263,6 +266,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+    "megamoe",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -1195,6 +1199,25 @@ class ServerArgs:
         NS("device"),
     ] = 1
     random_seed: A[Optional[int], "The random seed.", NS("device")] = None
+    mlx_enable_sampling: A[
+        bool,
+        (
+            "MLX backend only: sample decode tokens (temperature / top-k / "
+            "top-p / min-p) instead of greedy argmax. Sampling runs inside "
+            "the lazy MLX graph, so it works with the overlap scheduler; "
+            "first tokens from prefill/extend are sampled too. Greedy "
+            "requests keep exact argmax behavior. Also enables on the MLX "
+            "path: grammar vocab masks and custom logit processors (these "
+            "break decode chaining per step; custom processors run on "
+            "pure-decode steps only), logit_bias, output logprobs (sampled "
+            "token / top-k / token_ids; prompt input logprobs are not "
+            "computed), NaN sanitization (SGLANG_SANITIZE_NAN_LOGITS), and "
+            "per-request sampling_seed under "
+            "--enable-deterministic-inference (deterministic within MLX "
+            "only). Penalties are not applied."
+        ),
+        NS("device"),
+    ] = False
     watchdog_timeout: A[
         float,
         "Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
@@ -1724,13 +1747,14 @@ class ServerArgs:
             help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
+            resolvable=True,
         ),
         NS("exec.kernel"),
     ] = "auto"
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),
@@ -2135,6 +2159,20 @@ class ServerArgs:
         "Attention backend for speculative decoding drafting.",
         NS("spec"),
     ] = None
+    speculative_draft_kv_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help="KV cache dtype for the speculative draft model only. The draft pool is "
+            "allocated with one slot per target token (draft and target share a slot index "
+            "space), so for a small draft it can still rival the target pool: a 5-layer "
+            "DFLASH draft costs 10240 bytes/token in bf16. Setting fp8_e4m3 halves the draft "
+            "pool; the saving shows up as free device memory, so raise "
+            "--mem-fraction-static to convert it into KV capacity. Default follows "
+            "--kv-cache-dtype.",
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+        ),
+        NS("spec"),
+    ] = None
     speculative_draft_window_size: A[
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
@@ -2165,6 +2203,12 @@ class ServerArgs:
             choices=QUANTIZATION_CHOICES,
         ),
         NS("spec"),
+    ] = None
+    # Internal provenance used after the public draft quantization inherits the
+    # target value. It is a dataclass field so ServerArgs round-trips preserve
+    # whether the user explicitly set the draft option; it has no CLI surface.
+    _speculative_draft_quantization_explicitly_set: A[
+        Optional[bool], Arg(no_cli=True), NS("spec")
     ] = None
     speculative_skip_dp_mlp_sync: A[
         bool,
@@ -2737,16 +2781,36 @@ class ServerArgs:
         "Enable global multimodal embedding cache to skip redundant ViT inference.",
         NS("mm"),
     ] = False
+    image_processor_backend: A[
+        Literal["auto", "torchvision", "pil"],
+        "Image processor backend. 'auto' lets Transformers select the best "
+        "available backend.",
+        NS("mm"),
+    ] = "auto"
+    mm_global_cache_backend: A[
+        str,
+        Arg(
+            help="Storage backend for the multimodal global embedding cache. "
+            "Used when --enable-mm-global-cache is set.",
+            choices=["mooncake"],
+        ),
+        NS("mm"),
+    ] = "mooncake"
     disable_fast_image_processor: A[
-        bool, "Adopt base image processor instead of fast image processor.", NS("mm")
+        bool,
+        "Deprecated. Use --image-processor-backend=pil instead.",
+        NS("mm"),
     ] = False
     mm_feature_transport: A[
-        Optional[Literal["cpu", "cuda_ipc"]],
-        "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
-        "Unset resolves automatically: single-node CUDA deployments (without "
-        "disaggregation) use cuda_ipc, everything else uses cpu. CUDA IPC reserves "
-        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and falls "
-        "back to CPU transport per tensor when the pool is full.",
+        Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
+        "Transport multimodal features through CPU memory, a bounded CUDA IPC "
+        "pool, or a bounded CUDA VMM pool. "
+        "Unset resolves automatically: multimodal models on single-node CUDA "
+        "deployments (without disaggregation) use cuda_ipc; validated multi-node "
+        "GB200/GB300 MNNVL models use cuda_vmm when an IMEX channel is available; "
+        "all other deployments use cpu. GPU transports reserve "
+        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
+        "back to CPU transport when the pool is full.",
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
@@ -3044,6 +3108,14 @@ class ServerArgs:
     language_only: A[
         bool, "For VLM, load weights for the language model only.", NS("disagg")
     ] = False
+    language_model_only: A[
+        bool,
+        "Skip the multimodal encoder entirely: its weights are never loaded and the "
+        "tower is never built, freeing that GPU memory for KV cache. Multimodal "
+        "requests are rejected. Unlike --language-only this is a standalone mode, "
+        "not part of encoder/decoder disaggregation.",
+        NS("disagg"),
+    ] = False
     encoder_transfer_backend: A[
         str,
         Arg(
@@ -3234,10 +3306,11 @@ class ServerArgs:
             "Hold new prefills until at least N running-request slots have freed "
             "up, so they are admitted in one batch instead of one at a time. "
             "Useful when each admission is disproportionately expensive, e.g. "
-            "speculative decoding with a separate draft prefill pass. Capped to "
-            "the DFlash formula (disabled when max-running-requests < 8; "
-            "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
-            "this with the formula when unset; other workloads stay disabled."
+            "speculative decoding with a separate draft prefill pass. An "
+            "explicit value always wins, capped by max-running-requests "
+            "(1 disables). When unset, DFlash workloads auto-enable the "
+            "formula; other workloads stay disabled. Not supported with "
+            "pipeline parallelism."
         ),
         NS("schedule"),
     ] = None
@@ -3463,6 +3536,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -3498,6 +3572,7 @@ class ServerArgs:
         # resolution (the declarative registry materializes too late to affect
         # it). Inkling opts into full-graph prefill capture here.
         self._apply_inkling_prefill_cuda_graph_default()
+        self._apply_muse_glimmer_prefill_cuda_graph_max_bs_default()
 
         # must run before _handle_cuda_graph_config and _handle_data_parallelism
         self._handle_dwdp()
@@ -3630,6 +3705,20 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_moe_runner_backend_alias(self):
+        if self.moe_runner_backend != "megamoe":
+            return
+
+        if self.moe_a2a_backend not in ("none", "megamoe"):
+            logger.warning(
+                "--moe-runner-backend megamoe is an alias for "
+                "--moe-a2a-backend megamoe; overriding "
+                "--moe-a2a-backend %s.",
+                self.moe_a2a_backend,
+            )
+        self.moe_runner_backend = "auto"
+        self.moe_a2a_backend = "megamoe"
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
@@ -3787,6 +3876,8 @@ class ServerArgs:
 
     def _handle_model_source_paths(self):
         """Prepare metadata for model paths backed by remote object stores."""
+        self._resolve_hf_gguf_model_path()
+
         seen_paths = set()
         for model_path in (
             self.model_path,
@@ -3933,6 +4024,18 @@ class ServerArgs:
                     )
 
     def _handle_deprecated_args(self):
+        if self.disable_fast_image_processor:
+            if self.image_processor_backend not in {"auto", "pil"}:
+                raise ValueError(
+                    "--disable-fast-image-processor conflicts with "
+                    f"--image-processor-backend={self.image_processor_backend}."
+                )
+            logger.warning(
+                "--disable-fast-image-processor is deprecated; use "
+                "--image-processor-backend=pil instead."
+            )
+            self.image_processor_backend = "pil"
+
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
         if self.tool_call_parser in deprecated_tool_call_parsers:
@@ -4072,6 +4175,10 @@ class ServerArgs:
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
         # - Otherwise, the draft model defaults to the same quantization as the target model.
+        if self._speculative_draft_quantization_explicitly_set is None:
+            self._speculative_draft_quantization_explicitly_set = (
+                self.speculative_draft_model_quantization is not None
+            )
         if self.speculative_draft_model_quantization is None:
             self.speculative_draft_model_quantization = self.quantization
 
@@ -4222,6 +4329,16 @@ class ServerArgs:
         ):
             self.cuda_graph_backend_prefill = Backend.FULL
 
+    def _apply_muse_glimmer_prefill_cuda_graph_max_bs_default(self):
+        if (
+            self.cuda_graph_max_bs_prefill is not None
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+        arch = self.get_model_config().hf_config.architectures[0]
+        if arch in ("MuseGlimmerForCausalLM", "MuseGlimmerForConditionalGeneration"):
+            self.cuda_graph_max_bs_prefill = 512
+
     def _handle_cuda_graph_config(self):
         from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
 
@@ -4346,6 +4463,9 @@ class ServerArgs:
         if (
             self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
             and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+            # Keep trtllm_mla on the preferred breakable path, which now serves
+            # MLA by falling back to the flashinfer MLA impl for extend.
+            and self._resolved_attention_backends()[0] != "trtllm_mla"
         ):
             logger.info(
                 "Using tc_piecewise CUDA graph for validated multimodal "
@@ -4448,22 +4568,10 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import (
-            is_deepseek_dsa,
-            is_deepseek_v4,
-            is_nemotron_h,
-        )
+        from sglang.srt.configs.model_config import is_deepseek_v4, is_nemotron_h
         from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
-            # MLA prefill under BCG takes forward_mha, which has no eager
-            # breaks. DSA is exempt: BCG forces the sparse path, whose
-            # indexer already splits eagerly.
-            (
-                "MLA attention (non-DSA)",
-                lambda: self.use_mla_backend()
-                and not is_deepseek_dsa(self.get_model_config().hf_config),
-            ),
             # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
             # state-track write is not wired into the captured buffers, so a
             # replay can commit a cache slot it never wrote.
@@ -4789,6 +4897,7 @@ class ServerArgs:
             if (
                 model_config.is_multimodal
                 and not self.language_only
+                and not self.language_model_only
                 and self.disaggregation_mode != "decode"
             ):
                 self.adjust_mem_fraction_for_vlm(model_config)
@@ -5044,8 +5153,20 @@ class ServerArgs:
             self._resolved_overrides = []
             return
 
-        hf_config = self.get_model_config().hf_config
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
+
+        if model_arch == "InternS2MobiusForConditionalGeneration":
+            unsupported = []
+            if self.pp_size != 1:
+                unsupported.append("pipeline parallelism (--pp-size must be 1)")
+            if self.ep_size != 1:
+                unsupported.append("expert parallelism (--ep-size must be 1)")
+            if unsupported:
+                raise ValueError(
+                    "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
+                )
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
@@ -5324,28 +5445,32 @@ class ServerArgs:
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
             # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
-
-            supported_backends = [
-                "triton",
-                "trtllm_mha",
-                "fa3",
-                "fa4",
-                "ascend",
-                "intel_amx",
-                "intel_xpu",
-                "aiter",
-            ]
-            prefill_attn_backend, decode_attn_backend = (
-                self._resolved_attention_backends()
-            )
-            assert (
-                prefill_attn_backend in supported_backends
-                and decode_attn_backend in supported_backends
-            ), (
-                f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got the following backends\n"
-                f"- Prefill: {prefill_attn_backend}\n"
-                f"- Decode: {decode_attn_backend}\n"
-            )
+            # Exempt MLX only: none of these backends exist on MPS, and MLX runs
+            # attention inside its own runner, so attention_backend is still
+            # unset here.  Plain macOS stays on the list -- torch_native has
+            # neither sliding window nor attention sinks.
+            if not (is_mps() and use_mlx()):
+                supported_backends = [
+                    "triton",
+                    "trtllm_mha",
+                    "fa3",
+                    "fa4",
+                    "ascend",
+                    "intel_amx",
+                    "intel_xpu",
+                    "aiter",
+                ]
+                prefill_attn_backend, decode_attn_backend = (
+                    self._resolved_attention_backends()
+                )
+                assert (
+                    prefill_attn_backend in supported_backends
+                    and decode_attn_backend in supported_backends
+                ), (
+                    f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got the following backends\n"
+                    f"- Prefill: {prefill_attn_backend}\n"
+                    f"- Decode: {decode_attn_backend}\n"
+                )
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
@@ -5998,7 +6123,7 @@ class ServerArgs:
 
     def _handle_int8_mamba_checkpoint(self):
         # The int8 mamba checkpoint pool is only wired into the built-in
-        # MambaRadixCache. The host-offload variant (HiMambaRadixCache, enabled by
+        # MambaRadixCache. The host-offload path (enabled by
         # --enable-hierarchical-cache) and custom radix-cache backends are NOT
         # int8-aware: they would read int8 checkpoint slots as bf16 active slots
         # (wrong pool / out-of-range). Reject the combination up front rather than
@@ -6009,7 +6134,7 @@ class ServerArgs:
             raise ValueError(
                 "--enable-int8-mamba-checkpoint is not supported together with "
                 "--enable-hierarchical-cache: the host-offload path "
-                "(HiMambaRadixCache) is not int8-aware. Disable one of them."
+                "is not int8-aware. Disable one of them."
             )
         if self.radix_cache_backend is not None:
             raise ValueError(
@@ -6304,7 +6429,11 @@ class ServerArgs:
                     raise ValueError(
                         "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
                     )
-                if model_config.is_multimodal and not self.language_only:
+                if (
+                    model_config.is_multimodal
+                    and not self.language_only
+                    and not self.language_model_only
+                ):
                     raise ValueError(
                         "MiMo V2 CP-v2 only supports text inference; add "
                         "--language-only."
@@ -6625,8 +6754,8 @@ class ServerArgs:
         ):
             return
         required_tokens = self.cutedsl_moe_max_num_tokens()
-        max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
+        max_dispatch_tokens_per_rank = (
+            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() or 1024
         )
         max_cutedsl_tokens = max_dispatch_tokens_per_rank * view.ep_size
         if max_cutedsl_tokens < required_tokens:
@@ -7232,6 +7361,32 @@ class ServerArgs:
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
 
+    def _resolve_hf_gguf_model_path(self):
+        """Turn a Hub reference to a .gguf into a local file path."""
+        from sglang.srt.utils.hf_transformers_utils import resolve_hf_gguf_reference
+
+        resolved = resolve_hf_gguf_reference(self.model_path, revision=self.revision)
+        if resolved is not None:
+            logger.info("Resolved GGUF %s -> %s", self.model_path, resolved)
+            if self.tokenizer_path == self.model_path:
+                self.tokenizer_path = resolved
+            self.model_path = resolved
+
+        # A speculative draft can be a .gguf too, and it is loaded by path, so it
+        # needs the same Hub-reference resolution as the target.
+        if self.speculative_draft_model_path:
+            resolved_draft = resolve_hf_gguf_reference(
+                self.speculative_draft_model_path,
+                revision=self.speculative_draft_model_revision,
+            )
+            if resolved_draft is not None:
+                logger.info(
+                    "Resolved draft GGUF %s -> %s",
+                    self.speculative_draft_model_path,
+                    resolved_draft,
+                )
+                self.speculative_draft_model_path = resolved_draft
+
     def _handle_load_format(self):
         # The quantization side of the gguf coupling moved to the pipeline
         # (arg_groups/overrides.py: _gguf_quantization); load_format itself is
@@ -7329,7 +7484,7 @@ class ServerArgs:
         """True iff the checkpoint requires load_format=mistral.
 
         Looks for consolidated*.safetensors with no competing
-        model-*.safetensors; when both weight formats ship in the
+        model*.safetensors; when both weight formats ship in the
         same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
         preferred to avoid loading Mistral-named weights into an
         HF-named architecture.
@@ -7362,7 +7517,7 @@ class ServerArgs:
                     )
                 ),
                 has_hf_weights=bool(
-                    glob.glob(os.path.join(self.model_path, "model-*.safetensors"))
+                    glob.glob(os.path.join(self.model_path, "model*.safetensors"))
                 ),
             )
 
@@ -7377,13 +7532,48 @@ class ServerArgs:
                     for f in files
                 ),
                 has_hf_weights=any(
-                    f.startswith("model-") and f.endswith(".safetensors") for f in files
+                    f.startswith("model")
+                    and f.endswith(".safetensors")
+                    and "/" not in f
+                    for f in files
                 ),
             )
         except Exception:
             return False
 
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+
+    def _handle_language_model_only(self):
+        if not self.language_model_only:
+            return
+        for flag, name in (
+            (self.encoder_only, "--encoder-only"),
+            (self.language_only, "--language-only"),
+            (self.enable_prefix_mm_cache, "--enable-prefix-mm-cache"),
+            (
+                self.enable_broadcast_mm_inputs_process,
+                "--enable-broadcast-mm-inputs-process",
+            ),
+            (self.mm_enable_dp_encoder, "--mm-enable-dp-encoder"),
+        ):
+            if flag:
+                raise ValueError(
+                    f"--language-model-only cannot be combined with {name}"
+                )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "--language-model-only is incompatible with --disaggregation-mode "
+                "prefill/decode"
+            )
+        architectures = self.get_model_config().hf_config.architectures
+        if not any(a in self.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures):
+            raise ValueError(
+                f"--language-model-only does not support {architectures}. "
+                f"Supported: {list(self.LANGUAGE_MODEL_ONLY_ARCHITECTURES)}."
+            )
+
     def _handle_encoder_disaggregation(self):
+        self._handle_language_model_only()
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
                 "--enable-prefix-mm-cache requires --encoder-only to be enabled"
@@ -7558,20 +7748,20 @@ class ServerArgs:
     def _handle_multimodal_feature_transport(self):
         """Resolve multimodal feature transport before tokenizer workers start.
 
-        CUDA IPC is deliberately opt-in: its fixed pool lives on ``base_gpu_id``
-        and reduces the memory left for model/KV-cache allocations.  The legacy
-        flag and environment variable remain supported so existing deployments
-        continue to work, but both map to this single policy.
+        GPU transports use a fixed pool on ``base_gpu_id`` and therefore reduce
+        the memory left for model/KV-cache allocations. The legacy CUDA IPC flag
+        and environment variable remain supported so existing deployments map
+        to this single policy.
         """
         requested_transport = self.mm_feature_transport
         legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
         legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 
         if self.keep_mm_feature_on_device:
-            if requested_transport == "cpu":
+            if requested_transport not in (None, "cuda_ipc"):
                 raise ValueError(
                     "--keep-mm-feature-on-device conflicts with "
-                    "--mm-feature-transport=cpu. Use only "
+                    f"--mm-feature-transport={requested_transport}. Use only "
                     "--mm-feature-transport=cuda_ipc."
                 )
             requested_transport = "cuda_ipc"
@@ -7595,19 +7785,51 @@ class ServerArgs:
                     "encoder-only serving; encoder outputs use "
                     "--encoder-transfer-backend instead."
                 )
-            elif is_cuda() and self.nnodes == 1 and self.disaggregation_mode == "null":
-                # Auto policy: single-node CUDA serving defaults to the bounded
-                # CUDA-IPC pool. The pool is only allocated when a multimodal
-                # processor exists, so text-only deployments are unaffected; a
-                # full pool degrades to CPU transport per tensor. Multi-node
-                # (IPC handles are intra-node) and PD-disaggregated deployments
-                # keep CPU transport.
-                requested_transport = "cuda_ipc"
-                logger.info(
-                    "Multimodal feature transport auto-resolved to cuda_ipc "
-                    "(single-node CUDA). Pass --mm-feature-transport=cpu to "
-                    "opt out."
-                )
+            elif (
+                self.get_model_config().is_multimodal
+                and is_cuda()
+                and self.disaggregation_mode == "null"
+            ):
+                # A full GPU pool always degrades to CPU transport per tensor.
+                # CUDA IPC is intra-node; multi-node auto-selection is limited
+                # to GB200/GB300 systems where the runtime already enables the
+                # MNNVL/IMEX communication stack.
+                if self.nnodes == 1:
+                    requested_transport = "cuda_ipc"
+                    logger.info(
+                        "Multimodal feature transport auto-resolved to cuda_ipc "
+                        "(single-node CUDA). Pass --mm-feature-transport=cpu to "
+                        "opt out."
+                    )
+                elif is_mnnvl_fabric_device() and os.path.exists(
+                    "/dev/nvidia-caps-imex-channels/channel0"
+                ):
+                    from sglang.srt.model_loader.utils import (
+                        supports_cuda_vmm_feature_transport,
+                    )
+
+                    if supports_cuda_vmm_feature_transport(self.get_model_config()):
+                        requested_transport = "cuda_vmm"
+                        logger.info(
+                            "Multimodal feature transport auto-resolved to "
+                            "cuda_vmm (multi-node GB200/GB300 MNNVL). Pass "
+                            "--mm-feature-transport=cpu to opt out."
+                        )
+                    else:
+                        requested_transport = "cpu"
+                        logger.info(
+                            "Multimodal feature transport auto-resolved to cpu: "
+                            "the model has not opted into CUDA VMM transport."
+                        )
+                else:
+                    requested_transport = "cpu"
+                    if is_mnnvl_fabric_device():
+                        logger.info(
+                            "Multimodal feature transport auto-resolved to cpu: "
+                            "GB200/GB300 was detected but no IMEX channel is "
+                            "mounted. Configure the MNNVL compute domain or pass "
+                            "--mm-feature-transport=cuda_vmm after doing so."
+                        )
             else:
                 requested_transport = "cpu"
         elif legacy_ipc_is_set and legacy_ipc_enabled != (
@@ -7620,13 +7842,42 @@ class ServerArgs:
                 int(legacy_ipc_enabled),
             )
 
-        if self.encoder_only and requested_transport == "cuda_ipc":
+        if self.encoder_only and requested_transport in ("cuda_ipc", "cuda_vmm"):
             logger.warning(
-                "--mm-feature-transport=cuda_ipc does not control encoder-only "
+                "--mm-feature-transport=%s does not control encoder-only "
                 "output transfer; using cpu for this inactive transport. Select "
-                "--encoder-transfer-backend for encoder outputs."
+                "--encoder-transfer-backend for encoder outputs.",
+                requested_transport,
             )
             requested_transport = "cpu"
+
+        if requested_transport == "cuda_vmm":
+            if not is_cuda():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm requires NVIDIA CUDA."
+                )
+            if self.pp_size != 1:
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm does not support pipeline "
+                    "parallelism."
+                )
+            if envs.SGLANG_RUST_SERVER.get():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm is not supported with "
+                    "SGLANG_RUST_SERVER."
+                )
+            pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+            handle_kind = "CUDA FABRIC" if self.nnodes > 1 else "POSIX FD"
+            logger.info(
+                "Using CUDA VMM for multimodal features with %s sharing: "
+                "reserving up to %d MiB on base GPU %d across %d tokenizer "
+                "worker(s). This reduces KV cache headroom; a full pool falls "
+                "back to inline CPU transport.",
+                handle_kind,
+                pool_budget_mb,
+                self.base_gpu_id,
+                self.tokenizer_worker_num,
+            )
 
         if requested_transport == "cuda_ipc":
             if not is_cuda():
@@ -7874,20 +8125,71 @@ class ServerArgs:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
                     self.disable_custom_all_reduce = True
+                    # should_torch_symm_mem_allreduce() takes the
+                    # symmetric-memory path only below a byte threshold, so
+                    # which reduce runs would follow the token count.
+                    self.enable_torch_symm_mem = False
+                    # Each channel carries a differently shaped tree and the
+                    # channel count is picked from the message size, so a
+                    # token's reduction order would follow the token count.
+                    nchannels = str(envs.SGLANG_DETERMINISTIC_NCCL_NCHANNELS.get())
+                    os.environ["NCCL_MIN_NCHANNELS"] = nchannels
+                    os.environ["NCCL_MAX_NCHANNELS"] = nchannels
                     logger.warning(
-                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                        "NCCL_ALGO is set to 'allreduce:tree', the NCCL channel count is pinned, and custom and symmetric-memory all reduce are disabled for deterministic inference when TP size > 1."
                     )
 
     def _handle_unified_memory_pool(self):
         if not self.enable_unified_memory:
             return
-        assert self.disaggregation_mode == "null", (
-            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
+        if self.disaggregation_mode != "null":
+            # Constraints of the whole-envelope transfer; see
+            # UnifiedMLATokenToKVPool.get_contiguous_buf_infos.
+            assert self.disaggregation_transfer_backend == "mooncake", (
+                "--enable-unified-memory with PD disaggregation supports only "
+                "the mooncake transfer backend; got "
+                f"{self.disaggregation_transfer_backend!r}."
+            )
+            assert self.pp_size == 1, (
+                "--enable-unified-memory with PD disaggregation does not support "
+                "pipeline parallelism (whole-envelope transfer has no per-layer "
+                "entries to subset)."
+            )
+            assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+                "--enable-unified-memory with PD disaggregation requires lazy "
+                "compaction; unset SGLANG_DISABLE_LAZY_COMPACTION."
+            )
+            assert not self.enable_hisparse, (
+                "--enable-unified-memory with PD disaggregation is not compatible "
+                "with --enable-hisparse: the decode-side HiSparse prealloc path "
+                "ships host/C4 rows straight from the allocator, bypassing the "
+                "virtual->physical translation the unified pool needs."
+            )
+        assert self.speculative_algorithm in (None, "DSPARK"), (
+            "--enable-unified-memory only supports --speculative-algorithm "
+            "DSPARK (chain draft); other speculative algorithms are not yet "
+            "audited for the unified pool's virtual/dense loc translation. Got "
+            f"--speculative-algorithm={self.speculative_algorithm!r}."
         )
-        assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
-        )
+        if self.speculative_algorithm == "DSPARK":
+            assert self.speculative_eagle_topk in (None, 1), (
+                "--enable-unified-memory + DSPARK supports a linear draft "
+                "chain only (--speculative-eagle-topk in {None, 1}); tree "
+                "verify is not audited for the unified pool. Got "
+                f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
+            )
+            # Both roles: verify routes to either backend depending on
+            # --speculative-attention-mode.
+            spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+            spec_backends = set(self._resolved_attention_backends())
+            spec_backends.discard(None)
+            assert spec_backends <= spec_allowed, (
+                "--enable-unified-memory + DSPARK requires spec-verify-audited "
+                f"attention backends {sorted(spec_allowed)} for both prefill "
+                f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
+                "not translate speculative verify indices to the unified "
+                "pool's dense space yet."
+            )
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
@@ -8545,56 +8847,33 @@ class ServerArgs:
 
         return resolved_view(self)
 
-    def override(self, source: str, **fields) -> None:
-        """The single post-resolution mutation point.
+    def _late_resolution(self, source: str, **fields) -> None:
+        """Resolve fields at the launcher's validation stage (pre-publish).
 
-        After ``__post_init__`` the configuration is resolved; the audited
-        runtime adjustments (load-resolved values, control-plane
-        reconfiguration, deployment wiring) go through here instead of
-        assigning fields. Whitelisted resolvable fields also join the
-        declaration stash, so a republish resolves the same values;
-        everything is recorded with its ``source`` for provenance.
+        See ``arg_groups.overrides.declare_late_resolution``: in place, because
+        every holder of this instance must see the resolved value, and refused
+        outright once the config is published.
         """
-        from sglang.srt.arg_groups.arg_utils import resolvable_fields
+        from sglang.srt.arg_groups.overrides import declare_late_resolution
 
-        whitelist = resolvable_fields(type(self))
-        declared = {k: v for k, v in fields.items() if k in whitelist}
-        rest = {k: v for k, v in fields.items() if k not in whitelist}
-        if declared:
-            stash = getattr(self, "_resolved_overrides", None)
-            if stash is None:
-                stash = []
-                object.__setattr__(self, "_resolved_overrides", stash)
-            stash.append((source, dict(declared)))
-        if rest:
-            log = getattr(self, "_runtime_mutations", None)
-            if log is None:
-                log = []
-                object.__setattr__(self, "_runtime_mutations", log)
-            log.append((source, dict(rest)))
-        object.__setattr__(self, "_in_override", True)
-        try:
-            for field, value in fields.items():
-                setattr(self, field, value)
-        finally:
-            object.__setattr__(self, "_in_override", False)
+        declare_late_resolution(self, source, **fields)
 
     def __setattr__(self, name, value):
-        # after materialization the fields are the resolved startup
-        # configuration -- the pristine, READ-ONLY record. A bare assignment
-        # outside ServerArgs.override() (and the resolution pipeline, which runs
-        # before materialization) always raises; resolved config is mutated on
-        # the context bags via get_context().override(...), not here. (Formerly
-        # gated on SGLANG_STRICT_CONFIG_MUTATION; now unconditional.)
+        # After materialization the fields are the resolved startup
+        # configuration -- the pristine, READ-ONLY record that the config bags
+        # were projected from. Resolved config changes go to the bags via
+        # get_context().override(source, ...); a value one runner or worker
+        # owns travels as a constructor argument to it.
         if (
             not name.startswith("_")
             and getattr(self, "_declarations_materialized", False)
-            and not getattr(self, "_in_override", False)
+            and not getattr(self, "_internal_write", False)
         ):
             raise AttributeError(
                 f"server_args.{name} assigned after resolution; server_args is "
                 "read-only -- use get_context().override(source, ...) to change "
-                "resolved config."
+                "resolved config; a value one runner owns travels as a "
+                "constructor argument."
             )
         object.__setattr__(self, name, value)
 
@@ -8608,17 +8887,7 @@ class ServerArgs:
         return attention_backends_of(resolved_view(self))
 
     def get_attention_backends(self):
-        prefill_attention_backend_str = (
-            self.prefill_attention_backend
-            if self.prefill_attention_backend
-            else self.attention_backend
-        )
-        decode_attention_backend_str = (
-            self.decode_attention_backend
-            if self.decode_attention_backend
-            else self.attention_backend
-        )
-        return prefill_attention_backend_str, decode_attention_backend_str
+        return attention_backends_of(self)
 
     def use_mla_backend(self):
         from sglang.srt.configs.model_config import AttentionArch
@@ -8634,16 +8903,10 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
-        return (
-            self.disable_radix_cache is False
-            and self.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
-        )
+        return mamba_extra_buffer_of(self)
 
     def enable_mamba_extra_buffer_lazy(self) -> bool:
-        return (
-            self.disable_radix_cache is False
-            and self.mamba_radix_cache_strategy == "extra_buffer_lazy"
-        )
+        return mamba_extra_buffer_lazy_of(self)
 
     @cached_property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:
@@ -8670,6 +8933,14 @@ class ServerArgs:
         # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
         if not hasattr(self, "_mamba_cache_chunk_size"):
+
+            try:
+                from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+                    CHUNK_SIZE as FLA_CHUNK_SIZE,
+                )
+            except ImportError:
+                # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
+                FLA_CHUNK_SIZE = 64
 
             hf_config = self.get_model_config().hf_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
@@ -8722,6 +8993,11 @@ class ServerArgs:
             assert (
                 self.disable_overlap_schedule and self.speculative_algorithm is None
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.min_free_slots_delay is None, (
+                "--min-free-slots-delay is not supported with pipeline "
+                "parallelism: allocatable slots per microbatch are bounded by "
+                "pp-max-micro-batch-size, so the threshold may never be reached"
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
@@ -8899,7 +9175,7 @@ class ServerArgs:
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
             if self.enable_lora is None:
-                self.override("check_lora_server_args", enable_lora=True)
+                self._late_resolution("check_lora_server_args", enable_lora=True)
                 logger.warning(
                     "--enable-lora is set to True because --lora-paths is provided."
                 )
@@ -8910,7 +9186,7 @@ class ServerArgs:
 
         if self.enable_lora:
             if self.enable_lora_overlap_loading is None:
-                self.override(
+                self._late_resolution(
                     "check_lora_server_args", enable_lora_overlap_loading=False
                 )
 
@@ -8969,9 +9245,11 @@ class ServerArgs:
                             "Expected a string or a dictionary."
                         )
                     parsed_lora_paths.append(lora_ref)
-                self.override("check_lora_server_args", lora_paths=parsed_lora_paths)
+                self._late_resolution(
+                    "check_lora_server_args", lora_paths=parsed_lora_paths
+                )
             elif isinstance(self.lora_paths, dict):
-                self.override(
+                self._late_resolution(
                     "check_lora_server_args",
                     lora_paths=[
                         LoRARef(
@@ -8984,7 +9262,7 @@ class ServerArgs:
                     ],
                 )
             elif self.lora_paths is None:
-                self.override("check_lora_server_args", lora_paths=[])
+                self._late_resolution("check_lora_server_args", lora_paths=[])
             else:
                 raise ValueError(
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
@@ -8994,7 +9272,7 @@ class ServerArgs:
             # Normalize target modules to a set; keep {"all"} as a sentinel
             # that gets resolved model-awarely in lora_manager.init_lora_shapes().
             if self.lora_target_modules:
-                self.override(
+                self._late_resolution(
                     "check_lora_server_args",
                     lora_target_modules=set(self.lora_target_modules),
                 )
@@ -9159,12 +9437,14 @@ class ServerArgs:
         """Transport backend for modelexpress."""
         return self._parsed_modelexpress_config.get("transport", "nixl")
 
-    def remote_instance_weight_loader_use_transfer_engine(self):
+    def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
+        """``load_format`` overrides the seed's: a draft runner loading under
+        ``--speculative-draft-load-format`` needs its own transfer engine."""
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
         # Use TransferEngine as client backend.
-        if self.load_format == "remote_instance" and (
+        if (load_format or self.load_format) == "remote_instance" and (
             self.remote_instance_weight_loader_backend == "transfer_engine"
             or (
                 self.remote_instance_weight_loader_backend == "modelexpress"

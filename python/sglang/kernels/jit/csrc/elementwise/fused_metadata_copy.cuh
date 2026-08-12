@@ -41,6 +41,8 @@
 #include <hip/hip_runtime.h>
 #endif
 
+namespace sglang {
+
 // Forward mode enum (must match Python ForwardMode in sglang/srt/layers/attention/dsa_backend.py)
 enum ForwardModeEnum { DECODE = 0, TARGET_VERIFY = 1, DRAFT_EXTEND = 2 };
 
@@ -371,8 +373,6 @@ __global__ void fused_metadata_copy_multi_kernel(const FusedMetadataCopyMultiPar
 // ============================================================================
 // Host-side launcher wrappers for JIT compilation
 // ============================================================================
-
-namespace {
 
 // Launch configuration constants
 constexpr int THREADS_PER_BLOCK = 256;
@@ -723,4 +723,4 @@ struct FusedMetadataCopyMultiKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

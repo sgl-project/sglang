@@ -112,6 +112,7 @@ from sglang.srt.model_executor.model_runner_components.attention_backend_setup i
     build_attention_backends,
     configure_aux_hidden_state_capture,
     get_attention_backend,
+    resolve_attention_backend_strs,
 )
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_cuda_graphs,
@@ -166,6 +167,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils import make_war_read_done_event
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -175,6 +177,9 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_schedule,
+    get_spec,
+    is_ep_joiner,
+    is_ep_scale_joiner,
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -259,6 +264,24 @@ class ModelRunnerOutput:
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
+def resolve_draft_attention_backend(
+    *,
+    draft_attention_backend: Optional[str],
+    server_args: ServerArgs,
+    is_draft_worker: bool,
+) -> Optional[str]:
+    """The attention backend a runner uses because it is a draft runner.
+
+    ``None`` for a target runner. For a draft: the backend the algorithm that
+    built it resolved (the supported-backend fallback in
+    ``build_draft_tp_worker``), else ``--speculative-draft-attention-backend``.
+    It belongs to the runner, not the process: target and draft coexist.
+    """
+    if not is_draft_worker:
+        return None
+    return draft_attention_backend or server_args.speculative_draft_attention_backend
+
+
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
@@ -275,6 +298,7 @@ class ModelRunner:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
+        draft_attention_backend: Optional[str] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -284,13 +308,20 @@ class ModelRunner:
         self.memory_pool_config = memory_pool_config
         self.device = server_args.device
         self.gpu_id = gpu_id
-        self.dcp_size = server_args.dcp_size
-        self.dcp_rank = ps.tp_rank % self.dcp_size
         self.ps = ps
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.draft_attention_backend = resolve_draft_attention_backend(
+            draft_attention_backend=draft_attention_backend,
+            server_args=server_args,
+            is_draft_worker=is_draft_worker,
+        )
+        # This runner's own load format, resolved before anything keys off it:
+        # the remote-instance transfer engine is initialized at the top of
+        # initialize(), long before the weights are loaded.
+        self.draft_load_format = self._resolve_draft_load_format()
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -304,6 +335,7 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.mtp_draft_device_pools = ()
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
@@ -374,6 +406,10 @@ class ModelRunner:
         # load_batch; the scheduler's WAR barrier waits on it (then clears it)
         # instead of the whole-forward wait_stream. None -> whole-forward fallback.
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
+        # Graph runners record this persistent event after shared-state reads.
+        self.war_read_done_event = make_war_read_done_event(
+            torch.get_device_module(self.device)
+        )
 
         # CPU offload
         set_offloader(
@@ -424,10 +460,7 @@ class ModelRunner:
         self.graph_time_usage: dict[str, float] = {}
 
     def _initialize_elastic_ep_joiner(self) -> None:
-        if not (
-            get_exec().moe.elastic_ep_backend is not None
-            and self.server_args.is_ep_scale_joiner
-        ):
+        if not (get_exec().moe.elastic_ep_backend is not None and is_ep_scale_joiner()):
             return
 
         join_effective_ep_size = get_parallel().ep_join_rank_offset + self.ps.tp_size
@@ -634,16 +667,16 @@ class ModelRunner:
         )
 
     def maybe_init_remote_instance_transfer_engine(self):
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine(
+            load_format=self.draft_load_format
+        ):
             self.remote_instance_weight_transporter.init_engine()
 
     def maybe_init_expert_location_metadata(self):
         if self.is_draft_worker:
             return
         expert_rank = self.ps.moe_ep_rank + (
-            get_parallel().ep_join_rank_offset
-            if self.server_args.is_ep_scale_joiner
-            else 0
+            get_parallel().ep_join_rank_offset if is_ep_scale_joiner() else 0
         )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
@@ -689,6 +722,11 @@ class ModelRunner:
             ElasticEPStateManager.init(self.server_args)
 
     def init_token_oracle(self):
+        # The oracle sampler is process-wide, so a draft would overwrite the
+        # target's with its own vocab -- which a DFlash draft does not have.
+        if self.is_draft_worker:
+            self._token_oracle_manager = None
+            return
         self._token_oracle_manager = install_token_oracle_from_env(
             server_args=self.server_args,
             vocab_size=self.model_config.vocab_size,
@@ -814,7 +852,10 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.managers.hisparse_coordinator import (
+            HiSparseCoordinator,
+            resolve_shared_index_layers,
+        )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
@@ -834,6 +875,11 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            shared_index_layers=resolve_shared_index_layers(
+                hf_text_config=self.model_config.hf_text_config,
+                pp_size=self.ps.pp_size,
+                is_speculative=self.spec_algorithm.is_speculative(),
+            ),
         )
 
     def post_capture_resize_kv_pool(self):
@@ -890,14 +936,17 @@ class ModelRunner:
             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
             is_dspark=self.spec_algorithm.is_dspark(),
         )
+        # Resolve before building: backends read the pair off the runner while
+        # they construct (the FlashInfer KV-access check).
+        resolved = resolve_attention_backend_strs(model_runner=self)
+        self.prefill_attention_backend_str = resolved.prefill
+        self.decode_attention_backend_str = resolved.decode
         backends = build_attention_backends(model_runner=self)
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
-        self.prefill_attention_backend_str = backends.prefill_attention_backend_str
-        self.decode_attention_backend_str = backends.decode_attention_backend_str
 
-        if self.server_args.dcp_size > 1 and get_parallel().dcp_replicate_q_proj:
+        if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
     def _prepare_replicated_q_proj(self) -> None:
@@ -961,7 +1010,7 @@ class ModelRunner:
             RoutedExpertsCapturer.create(
                 model=self.model,
                 model_config=self.model_config,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -971,7 +1020,7 @@ class ModelRunner:
         set_global_indexer_capturer(
             create_indexer_capturer(
                 model_config=self.model_config,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1022,8 +1071,10 @@ class ModelRunner:
 
         set_cuda_arch()
 
+        draft_load_format = self.draft_load_format
         self.load_config = build_load_config(
             server_args=self.server_args,
+            load_format=draft_load_format,
             tp_rank=self.ps.tp_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
@@ -1047,18 +1098,21 @@ class ModelRunner:
             )
 
         maybe_trigger_remote_instance_nccl_send_group(
-            server_args=self.server_args, tp_rank=self.ps.tp_rank
+            server_args=self.server_args,
+            tp_rank=self.ps.tp_rank,
+            load_format=draft_load_format,
         )
 
-        loaded = load_model_with_memory_saver(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            load_config=self.load_config,
-            device=self.device,
-            gpu_id=self.gpu_id,
-            memory_saver_adapter=self.memory_saver_adapter,
-            is_draft_worker=self.is_draft_worker,
-        )
+        with self._load_format_scope(draft_load_format):
+            loaded = load_model_with_memory_saver(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                load_config=self.load_config,
+                device=self.device,
+                gpu_id=self.gpu_id,
+                memory_saver_adapter=self.memory_saver_adapter,
+                is_draft_worker=self.is_draft_worker,
+            )
         self.loader = loaded.loader
         self.model = loaded.model
         if loaded.remote_instance_weight_info is not None:
@@ -1076,7 +1130,15 @@ class ModelRunner:
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        load_kv_cache_scales(model=self.model, server_args=self.server_args)
+        # Same leaf `configure_kv_cache_dtype` reads: the bag, not the startup
+        # record, so the FP8 gate and the pool cannot disagree after an
+        # override. (The runner's own stamp is not set yet -- load_model runs
+        # before configure_kv_cache_dtype.)
+        load_kv_cache_scales(
+            model=self.model,
+            server_args=self.server_args,
+            kv_cache_dtype=get_model().kv_cache_dtype,
+        )
 
         self.sliding_window_size = resolve_sliding_window_size(
             self.model, self.model_config
@@ -1132,7 +1194,7 @@ class ModelRunner:
         dist_barrier_after_load(
             elastic_ep_backend=get_exec().moe.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
-            is_ep_joiner=self.server_args.is_ep_joiner,
+            is_ep_joiner=is_ep_joiner(),
         )
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
@@ -1195,11 +1257,46 @@ class ModelRunner:
         else:
             return self.max_total_num_tokens
 
+    @property
+    def max_token_pool_size(self):
+        """Return the max token pool size considering hybrid swa and hisparse settings."""
+        if self.enable_hisparse:
+            # HiSparse uses the host-backed full pool capacity.
+            size_full = getattr(self.token_to_kv_pool_allocator, "size_full", None)
+            if size_full is not None:
+                return size_full
+        return self.effective_max_total_num_tokens
+
+    def _load_format_scope(self, load_format: Optional[str]):
+        """Make this runner's load format the published one while it loads.
+
+        Model code reads it off the bag during construction (Inkling replaces
+        per-element noise in its shared-expert scales under dummy loading), so a
+        draft loading a different way than the target needs its own value live
+        for the load, and the target's back afterwards.
+        """
+        if load_format is None:
+            return contextlib.nullcontext()
+        return get_model().override(load_format=load_format)
+
+    def _resolve_draft_load_format(self) -> Optional[str]:
+        """``--speculative-draft-load-format``, for a draft runner only.
+
+        The draft loads its own checkpoint, so its load format is this runner's
+        own resolved value; the target keeps ``--load-format``.
+        """
+        if not self.is_draft_worker:
+            return None
+        load_format = get_spec().speculative_draft_load_format
+        if load_format is not None:
+            logger.info(f"Using draft model load_format: '{load_format}'")
+        return load_format
+
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
-                server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
+                server_args_kv_cache_dtype=get_model().kv_cache_dtype,
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
@@ -1208,9 +1305,8 @@ class ModelRunner:
                     if spec_algorithm is not None
                     else False
                 ),
-                speculative_draft_attention_backend=getattr(
-                    self.server_args, "speculative_draft_attention_backend", None
-                ),
+                speculative_draft_attention_backend=self.draft_attention_backend,
+                speculative_draft_kv_cache_dtype=self.server_args.speculative_draft_kv_cache_dtype,
             )
         )
         # This runner's OWN resolved dtype string (target or draft). Attention
@@ -1220,7 +1316,7 @@ class ModelRunner:
         self.kv_cache_dtype_str = (
             resolved_kv_cache_dtype
             if resolved_kv_cache_dtype is not None
-            else self.server_args.kv_cache_dtype
+            else get_model().kv_cache_dtype
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
@@ -1768,7 +1864,7 @@ class ModelRunner:
         self._rearm_eplb_after_elastic_scale()
 
     def _report_elastic_scale_failure(self, error: str, effective_size: int) -> None:
-        if self.ps.tp_rank != 0 or self.server_args.is_ep_scale_joiner:
+        if self.ps.tp_rank != 0 or is_ep_scale_joiner():
             return
         from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
@@ -1848,12 +1944,12 @@ class ModelRunner:
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
             target_size=target_size,
-            log_tag="JOINER" if self.server_args.is_ep_scale_joiner else "PRIMARY",
+            log_tag="JOINER" if is_ep_scale_joiner() else "PRIMARY",
         )
         ElasticEPStateManager.commit_scale()
         self._rearm_eplb_after_elastic_scale()
 
-        if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+        if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
             self._pending_elastic_scale_update = ElasticScaleUpdateReq(
@@ -1886,7 +1982,7 @@ class ModelRunner:
                 )
                 ElasticEPStateManager.fail_recovery(error)
                 self._report_elastic_scale_failure(error, effective_size)
-                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
                     logger.error("[Elastic EP] %s", error)
                 return
 
@@ -1912,7 +2008,7 @@ class ModelRunner:
             ElasticEPStateManager.fail_scale(error)
             self._reset_eplb_after_elastic_scale_failure()
             self._report_elastic_scale_failure(error, effective_size)
-            if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+            if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
                 logger.error("[Elastic EP] %s", error)
             return
 
@@ -1928,7 +2024,7 @@ class ModelRunner:
                 ElasticEPStateManager.fail_scale(error)
                 self._reset_eplb_after_elastic_scale_failure()
                 self._report_elastic_scale_failure(error, effective_size)
-                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
                     logger.error("[Elastic EP] %s", error)
                 return
             if not ElasticEPStateManager.begin_scale():
@@ -1973,9 +2069,12 @@ class ModelRunner:
         load_config: LoadConfig,
     ) -> None:
         self.model = new_model
-        get_context().override(
-            "model_runner.update_model_fields",
-            model_path=model_path,
-            load_format=load_format,
-        )
+        # The record says what model this PROCESS serves; a draft's weight
+        # update is not that (its own state is on the runner).
+        if not self.is_draft_worker:
+            get_context().override(
+                "model_runner.update_model_fields",
+                model_path=model_path,
+                load_format=load_format,
+            )
         self.load_config = load_config
