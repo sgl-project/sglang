@@ -248,6 +248,19 @@ DOCKERFILE="docker/rocm.Dockerfile"
 GPU_ARCH="${GPU_ARCH:-mi30x}"
 echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
+# ROCm 7.0 keeps the Triton its base image ships; later ROCm images run on the
+# Triton AITER pins, so a rebuilt AITER has to bring its own along.
+IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
+case "${IMAGE_HIP_VERSION}" in
+    7.0*) INSTALL_AITER_TRITON="false" ;;
+    7.*)  INSTALL_AITER_TRITON="true" ;;
+    *)
+        echo "[CI-AITER-CHECK] ERROR: Unsupported or empty HIP version: '${IMAGE_HIP_VERSION}'"
+        exit 1
+        ;;
+esac
+echo "[CI-AITER-CHECK] Container HIP=${IMAGE_HIP_VERSION}, install AITER's Triton on rebuild=${INSTALL_AITER_TRITON}"
+
 #############################################
 # 1. Extract AITER_COMMIT from correct Dockerfile block
 #############################################
@@ -302,7 +315,6 @@ else
     NEED_REBUILD="true"
 fi
 
-
 #############################################
 # 4. Rebuild AITER if needed
 #############################################
@@ -339,18 +351,18 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
-    AITER_TRITON_MODE=$(docker exec ci_sglang bash -c 'printf "%s" "${AITER_USE_SYSTEM_TRITON:-1}"')
-    if [[ -n "${AITER_COMMIT_OVERRIDE:-}" ]]; then
-        case "${IMAGE_HIP_VERSION}" in
-            7.2*) AITER_TRITON_MODE="0" ;;
-            7.0*) AITER_TRITON_MODE="1" ;;
-            *)
-                echo "[CI-AITER-CHECK] ERROR: unsupported HIP version for AITER override: ${IMAGE_HIP_VERSION}"
-                exit 1
-                ;;
-        esac
+    # Run the installer here rather than letting setup.py do it: setup.py
+    # swallows its errors, and the AITER_USE_SYSTEM_TRITON=1 below then keeps
+    # whatever Triton is already installed. Doing it up front fails closed.
+    if [[ "${INSTALL_AITER_TRITON}" == "true" ]]; then
+        docker exec ci_sglang bash -c "
+            set -euo pipefail
+            cd /sgl-workspace/aiter
+            test -f .github/scripts/install_triton.sh
+            bash .github/scripts/install_triton.sh
+        "
     fi
-    echo "[CI-AITER-CHECK] AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE}"
+    AITER_TRITON_MODE="1"
 
     # build AITER
     docker exec ci_sglang bash -c "
@@ -358,7 +370,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE} GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
 
-    if [[ "${AITER_TRITON_MODE}" == "0" ]]; then
+    if [[ "${INSTALL_AITER_TRITON}" == "true" ]]; then
         docker exec -i ci_sglang python3 - <<'PY'
 import importlib.metadata as metadata
 import pathlib

@@ -708,9 +708,6 @@ class Envs:
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
-    # Unpacked cubin pool for the JIT-built trtllm-gen fused MoE (cubins + flat
-    # ABI headers + overlay/). Unset means the path is unavailable, not empty.
-    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -1299,12 +1296,6 @@ class Envs:
 
     # ====================================================================
     # Kimi-K3
-
-    # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to an unpacked SiTU
-    # cubin pool (cubins + flat ABI headers + overlay/; distributed as a
-    # single downloadable archive). Needs the public flashinfer package
-    # installed for the unmodified JIT sources. Unset = feature off.
-    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
 
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for

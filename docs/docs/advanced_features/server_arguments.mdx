@@ -1448,9 +1448,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--bf16-gemm-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects <code>cutedsl</code> on SM100/SM103 (Blackwell), otherwise uses cuBLAS via `torch.nn.functional.linear`), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the backend for unquantized BF16 GEMM operations. Options: <code>auto</code> (default; selects <code>cutedsl</code> on SM10x GPUs, except deterministic inference selects <code>torch</code>; otherwise uses cuBLAS via <code>torch.nn.functional.linear</code>), <code>cutedsl</code> (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the CuTe DSL kernel and cuBLAS), <code>torch</code> (always uses cuBLAS via <code>torch.nn.functional.linear</code>).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>cutedsl</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>cutedsl</code>, <code>torch</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-flashinfer-autotune`</td>
