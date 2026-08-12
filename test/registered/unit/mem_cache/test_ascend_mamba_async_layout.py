@@ -1,7 +1,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -32,20 +32,116 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
         "_ascend_hicache_mamba_io_mode",
         return_value="async",
     )
-    @patch.object(memory_pool_host, "transfer_state_dim_exchange", None)
+    @patch.object(
+        memory_pool_host, "transfer_state_per_layer_direct_pf_lf", None
+    )
+    @patch.object(
+        memory_pool_host, "transfer_state_all_layer_direct_lf_pf", None
+    )
     def test_async_requires_native_operator(self, _mock_mode):
         pool = MambaPoolHost.__new__(MambaPoolHost)
 
         with self.assertRaisesRegex(
-            RuntimeError, "transfer_state_dim_exchange from sgl-kernel-npu"
+            RuntimeError, "per-layer PF->LF and all-layer LF->PF"
         ):
             pool._configure_ascend_mamba_io()
 
-    def test_conv_only_components_skip_empty_temporal_state(self):
+    def test_async_h2d_is_dispatched_per_component_from_copy_helper(self):
         pool = MambaPoolHost.__new__(MambaPoolHost)
+        pool.ascend_mamba_async_enabled = True
+        host = torch.empty(4, 3, 1, 2, 4)
+        device_layers = torch.empty(3, 5, 2, 4)
+        host_indices = torch.tensor([1, 3])
+        device_indices = torch.tensor([0, 4])
+
+        transfer_op = MagicMock()
+        with patch.object(
+            memory_pool_host,
+            "transfer_state_per_layer_direct_pf_lf",
+            transfer_op,
+        ):
+            pool._copy_tensor_pf_lf(
+                src=host,
+                dst=device_layers[2],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=2,
+                num_layers=3,
+                io_backend="kernel_ascend",
+                device_layers=device_layers,
+            )
+
+        transfer_op.assert_called_once_with(
+            device_states=[device_layers],
+            host_states=[host],
+            device_indices=device_indices,
+            host_indices=host_indices,
+            layer_id=2,
+        )
+
+    def test_async_d2h_is_dispatched_per_component_from_copy_helper(self):
+        pool = MambaPoolHost.__new__(MambaPoolHost)
+        pool.ascend_mamba_async_enabled = True
+        device_layers = torch.empty(3, 5, 2, 4)
+        host = torch.empty(4, 3, 1, 2, 4)
+        device_indices = torch.tensor([0, 4])
+        host_indices = torch.tensor([1, 3])
+
+        transfer_op = MagicMock()
+        with patch.object(
+            memory_pool_host,
+            "transfer_state_all_layer_direct_lf_pf",
+            transfer_op,
+        ):
+            pool._copy_tensor_all_layers_lf_pf(
+                src_layers=device_layers,
+                dst=host,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                num_layers=3,
+                io_backend="kernel_ascend",
+                src_ptrs=torch.empty(0),
+            )
+
+        transfer_op.assert_called_once_with(
+            device_states=[device_layers],
+            host_states=[host],
+            device_indices=device_indices,
+            host_indices=host_indices,
+        )
+
+    def test_sync_h2d_torch_fallback_is_preserved(self):
+        pool = MambaPoolHost.__new__(MambaPoolHost)
+        pool.ascend_mamba_async_enabled = False
+        host = torch.arange(4 * 3 * 1 * 2, dtype=torch.float32).reshape(4, 3, 1, 2)
+        device_layers = torch.zeros(3, 5, 2)
+        host_indices = torch.tensor([1, 3])
+        device_indices = torch.tensor([0, 4])
+
+        pool._copy_tensor_pf_lf(
+            src=host,
+            dst=device_layers[2],
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            layer_id=2,
+            num_layers=3,
+            io_backend="kernel_ascend",
+            device_layers=device_layers,
+        )
+
+        torch.testing.assert_close(
+            device_layers[2, device_indices], host[host_indices, 2, 0]
+        )
+
+    def test_conv_only_load_skips_empty_temporal_component(self):
+        pool = MambaPoolHost.__new__(MambaPoolHost)
+        pool.layout = "page_first_direct"
         pool.temporal_state_elem_size = 0
+        pool.num_mamba_layers = 3
         pool.temporal_buffer = torch.empty(4, 3, 1, 0)
+        pool.conv_state_shapes = [torch.Size([2, 4])]
         pool.conv_buffer = [torch.empty(4, 3, 1, 2, 4)]
+        pool._copy_tensor_pf_lf = MagicMock()
         device_pool = SimpleNamespace(
             mamba_cache=SimpleNamespace(
                 temporal=torch.empty(3, 4, 0),
@@ -53,12 +149,18 @@ class TestAscendMambaAsyncConfig(unittest.TestCase):
             )
         )
 
-        device_states, host_states = pool._state_components(device_pool)
+        pool.load_to_device_per_layer(
+            device_pool=device_pool,
+            host_indices=torch.tensor([1]),
+            device_indices=torch.tensor([2]),
+            layer_id=1,
+            io_backend="kernel_ascend",
+        )
 
-        self.assertEqual(len(device_states), 1)
-        self.assertEqual(len(host_states), 1)
-        self.assertIs(device_states[0], device_pool.mamba_cache.conv[0])
-        self.assertIs(host_states[0], pool.conv_buffer[0])
+        pool._copy_tensor_pf_lf.assert_called_once()
+        call = pool._copy_tensor_pf_lf.call_args.kwargs
+        self.assertIs(call["src"], pool.conv_buffer[0])
+        self.assertIs(call["device_layers"], device_pool.mamba_cache.conv[0])
 
 
 if __name__ == "__main__":

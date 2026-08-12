@@ -29,7 +29,8 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-transfer_state_dim_exchange = None
+transfer_state_per_layer_direct_pf_lf = None
+transfer_state_all_layer_direct_lf_pf = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -46,10 +47,13 @@ if _is_cuda:
         transfer_kv_mamba_pf_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+    from sgl_kernel_npu.kvcacheio import transfer_kv_dim_exchange
 
     try:
-        from sgl_kernel_npu.kvcacheio import transfer_state_dim_exchange
+        from sgl_kernel_npu.kvcacheio import (
+            transfer_state_all_layer_direct_lf_pf,
+            transfer_state_per_layer_direct_pf_lf,
+        )
     except ImportError:
         pass
 
@@ -157,7 +161,6 @@ class MambaPoolHost(HostKVCache):
             requested_bytes / 1e9,
             self.layout,
         )
-
         self.temporal_device_ptrs = torch.tensor(
             [
                 device_pool.mamba_cache.temporal[i].data_ptr()
@@ -181,16 +184,6 @@ class MambaPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
-    def _state_components(
-        self, device_pool
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        device_states = list(device_pool.mamba_cache.conv)
-        host_states = list(self.conv_buffer)
-        if self.temporal_state_elem_size > 0:
-            device_states.insert(0, device_pool.mamba_cache.temporal)
-            host_states.insert(0, self.temporal_buffer)
-        return device_states, host_states
-
     def _configure_ascend_mamba_io(self) -> None:
         self.ascend_mamba_io_mode = "sync"
         self.ascend_mamba_async_enabled = False
@@ -204,42 +197,25 @@ class MambaPoolHost(HostKVCache):
             )
             return
 
-        if transfer_state_dim_exchange is None or not hasattr(
-            torch.ops.npu, "transfer_state_dim_exchange"
+        required_ops = (
+            transfer_state_per_layer_direct_pf_lf,
+            transfer_state_all_layer_direct_lf_pf,
+        )
+        required_torch_ops = (
+            "transfer_state_per_layer_direct_pf_lf",
+            "transfer_state_all_layer_direct_lf_pf",
+        )
+        if any(op is None for op in required_ops) or any(
+            not hasattr(torch.ops.npu, op_name) for op_name in required_torch_ops
         ):
             raise RuntimeError(
                 "Ascend HiCache Mamba async state transfer requires "
-                "torch.ops.npu.transfer_state_dim_exchange from sgl-kernel-npu."
+                "the per-layer PF->LF and all-layer LF->PF direct operators "
+                "from sgl-kernel-npu."
             )
 
         self.ascend_mamba_async_enabled = True
         logger.info("Ascend HiCache Mamba state transfer mode: native async.")
-
-    def _transfer_state_async(
-        self,
-        device_pool,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
-        direction,
-        layer_begin: int,
-        layer_count: int,
-    ) -> None:
-        device_states, host_states = self._state_components(device_pool)
-        transfer_op = transfer_state_dim_exchange
-        if transfer_op is None:
-            raise RuntimeError(
-                "Ascend HiCache Mamba async transfer was enabled without "
-                "the native state transfer operator."
-            )
-        transfer_op(
-            device_states=device_states,
-            host_states=host_states,
-            device_indices=device_indices,
-            host_indices=host_indices,
-            direction=direction,
-            layer_begin=layer_begin,
-            layer_count=layer_count,
-        )
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -424,8 +400,8 @@ class MambaPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
-    @staticmethod
     def _copy_tensor_pf_lf(
+        self,
         src: torch.Tensor,
         dst: torch.Tensor,
         src_indices: torch.Tensor,
@@ -433,6 +409,7 @@ class MambaPoolHost(HostKVCache):
         layer_id: int,
         num_layers: int,
         io_backend: str,
+        device_layers: Optional[torch.Tensor] = None,
     ) -> None:
         if src_indices.numel() == 0:
             return
@@ -462,16 +439,34 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            host_indices = src_indices.to(dtype=torch.int64, device=src.device)
-            device_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
-            # Host: [slot, layer, 1, *state]; device: [slot, *state].
-            values = src.select(1, layer_id).index_select(0, host_indices).select(1, 0)
-            dst.index_copy_(0, device_indices, values.to(device=dst.device))
+            if self.ascend_mamba_async_enabled:
+                if device_layers is None:
+                    raise ValueError(
+                        "Ascend async Mamba H2D transfer requires the complete "
+                        "layer-first device tensor."
+                    )
+                transfer_state_per_layer_direct_pf_lf(
+                    device_states=[device_layers],
+                    host_states=[src],
+                    device_indices=dst_indices,
+                    host_indices=src_indices,
+                    layer_id=layer_id,
+                )
+            else:
+                host_indices = src_indices.to(dtype=torch.int64, device=src.device)
+                device_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+                # Host: [slot, layer, 1, *state]; device: [slot, *state].
+                values = (
+                    src.select(1, layer_id)
+                    .index_select(0, host_indices)
+                    .select(1, 0)
+                )
+                dst.index_copy_(0, device_indices, values.to(device=dst.device))
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
-    @staticmethod
     def _copy_tensor_all_layers_lf_pf(
+        self,
         src_layers: torch.Tensor,
         dst: torch.Tensor,
         src_indices: torch.Tensor,
@@ -511,17 +506,27 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            device_indices = src_indices.to(dtype=torch.int64, device=src_layers.device)
-            host_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
-            # Device: [layer, slot, *state]; host: [slot, layer, 1, *state].
-            values = (
-                src_layers.index_select(1, device_indices)
-                .movedim(0, 1)
-                .unsqueeze(2)
-                .contiguous()
-                .to(device=dst.device)
-            )
-            dst.index_copy_(0, host_indices, values)
+            if self.ascend_mamba_async_enabled:
+                transfer_state_all_layer_direct_lf_pf(
+                    device_states=[src_layers],
+                    host_states=[dst],
+                    device_indices=src_indices,
+                    host_indices=dst_indices,
+                )
+            else:
+                device_indices = src_indices.to(
+                    dtype=torch.int64, device=src_layers.device
+                )
+                host_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+                # Device: [layer, slot, *state]; host: [slot, layer, 1, *state].
+                values = (
+                    src_layers.index_select(1, device_indices)
+                    .movedim(0, 1)
+                    .unsqueeze(2)
+                    .contiguous()
+                    .to(device=dst.device)
+                )
+                dst.index_copy_(0, host_indices, values)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -533,18 +538,6 @@ class MambaPoolHost(HostKVCache):
         layer_id,
         io_backend="kernel",
     ):
-        if io_backend == "kernel_ascend" and getattr(
-            self, "ascend_mamba_async_enabled", False
-        ):
-            self._transfer_state_async(
-                device_pool=device_pool,
-                host_indices=host_indices,
-                device_indices=device_indices,
-                direction=TransferDirection.H2D,
-                layer_begin=layer_id,
-                layer_count=1,
-            )
-            return
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: nothing to transfer
             if self.temporal_state_elem_size > 0:
@@ -556,6 +549,7 @@ class MambaPoolHost(HostKVCache):
                     layer_id=layer_id,
                     num_layers=self.num_mamba_layers,
                     io_backend=io_backend,
+                    device_layers=device_pool.mamba_cache.temporal,
                 )
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor_pf_lf(
@@ -566,6 +560,7 @@ class MambaPoolHost(HostKVCache):
                     layer_id=layer_id,
                     num_layers=self.num_mamba_layers,
                     io_backend=io_backend,
+                    device_layers=device_pool.mamba_cache.conv[conv_idx],
                 )
         else:
             self._copy_tensor(
@@ -587,18 +582,6 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
-        if io_backend == "kernel_ascend" and getattr(
-            self, "ascend_mamba_async_enabled", False
-        ):
-            self._transfer_state_async(
-                device_pool=device_pool,
-                host_indices=host_indices,
-                device_indices=device_indices,
-                direction=TransferDirection.D2H,
-                layer_begin=0,
-                layer_count=self.num_mamba_layers,
-            )
-            return
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: a 0-size batched memcpy errors
             if self.temporal_state_elem_size > 0:
