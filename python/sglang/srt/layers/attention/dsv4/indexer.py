@@ -26,7 +26,11 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.dsa.utils import (
+    aiter_can_use_preshuffle_paged_mqa,
+    can_dsa_prefill_cp_round_robin_split,
+    dsa_cp_round_robin_split_q_seqs_cpu,
+)
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -485,8 +489,9 @@ class C4IndexerBackendMixin:
         c4_indexer: C4Indexer,
         forward_batch: ForwardBatch,
         indexer_metadata: PagedIndexerMetadata,
+        shared_staging: bool = False,
     ) -> bool:
-        if not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
+        if not shared_staging and not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
             return False
         # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
@@ -510,7 +515,7 @@ class C4IndexerBackendMixin:
         ):
             return False
         if (
-            get_parallel().attn_cp_size != 1
+            (not shared_staging and get_parallel().attn_cp_size != 1)
             or self.hisparse_coordinator is not None
             or is_in_tc_piecewise_cuda_graph()
             or is_in_breakable_cuda_graph()
@@ -527,13 +532,19 @@ class C4IndexerBackendMixin:
         page_table: torch.Tensor,
         c4_seq_lens: torch.Tensor,
         query_rows: int,
+        shared_staging: bool = False,
     ) -> Optional[NonPagedIndexerPlan]:
-        if query_rows < envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.get():
+        if (
+            not shared_staging
+            and query_rows
+            < envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.get()
+        ):
             return None
         if not self._can_use_nonpaged_indexer(
             c4_indexer=c4_indexer,
             forward_batch=forward_batch,
             indexer_metadata=indexer_metadata,
+            shared_staging=shared_staging,
         ):
             return None
         if indexer_metadata.nonpaged_plan is not None:
@@ -568,9 +579,19 @@ class C4IndexerBackendMixin:
             return None
 
         actual_queries = extend_lens_cpu[0]
+        expected_query_rows = actual_queries
+        cp_round_robin_split = False
+        if shared_staging and actual_queries != query_rows:
+            if not can_dsa_prefill_cp_round_robin_split(forward_batch):
+                return None
+            local_query_lens, _ = dsa_cp_round_robin_split_q_seqs_cpu(extend_lens_cpu)
+            if len(local_query_lens) != 1:
+                return None
+            expected_query_rows = local_query_lens[0]
+            cp_round_robin_split = True
         if (
-            actual_queries != query_rows
-            or int(forward_batch.extend_num_tokens) != query_rows
+            expected_query_rows != query_rows
+            or int(forward_batch.extend_num_tokens) != actual_queries
             or forward_batch.seq_lens.numel() != 1
             or forward_batch.extend_seq_lens.numel() != 1
             or forward_batch.extend_start_loc.numel() != 1
@@ -586,7 +607,9 @@ class C4IndexerBackendMixin:
 
         request_page_table = page_table[:1].contiguous()
         ke = c4_seq_lens[:query_rows].reshape(-1).to(torch.int32).contiguous()
-        gather_seq_lens = ke[-1:]
+        gather_seq_lens = (
+            torch.full_like(ke[-1:], final_c4_len) if cp_round_robin_split else ke[-1:]
+        )
         ks = torch.zeros_like(ke)
         c4_page_size = indexer_metadata.c4_page_size
         max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
@@ -631,6 +654,30 @@ class C4IndexerBackendMixin:
             plan.ke,
             clean_logits=False,
             max_seqlen_k=plan.max_seqlen_k,
+        )
+
+    @staticmethod
+    def _stage_shared_paged_indexer(
+        *,
+        shared_access,
+        indexer_metadata: PagedIndexerMetadata,
+        layer_id: int,
+        logical_page_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        stage_plan = getattr(indexer_metadata, "_shared_indexer_page_stage_plan", None)
+        if stage_plan is None:
+            stage_plan = shared_access.prepare_indexer_pages(
+                logical_page_table,
+                fixed_shape=(
+                    indexer_metadata.use_prefill_cuda_graph
+                    or torch.cuda.is_current_stream_capturing()
+                ),
+            )
+            indexer_metadata._shared_indexer_page_stage_plan = stage_plan
+        physical_pages, compact_page_table = stage_plan
+        return (
+            shared_access.stage_indexer_pages(layer_id, physical_pages),
+            compact_page_table,
         )
 
     def forward_c4_indexer(
@@ -759,6 +806,7 @@ class C4IndexerBackendMixin:
             page_table=page_table,
             c4_seq_lens=c4_seq_lens,
             query_rows=query_rows,
+            shared_staging=shared_access is not None,
         )
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
@@ -770,9 +818,20 @@ class C4IndexerBackendMixin:
                 plan=nonpaged_plan,
             )
         else:
-            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=c4_indexer.layer_id,
-            )
+            if shared_access is not None:
+                c4_indexer_kv_cache, indexer_read_page_table = (
+                    self._stage_shared_paged_indexer(
+                        shared_access=shared_access,
+                        indexer_metadata=indexer_metadata,
+                        layer_id=c4_indexer.layer_id,
+                        logical_page_table=page_table,
+                    )
+                )
+            else:
+                c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+                    layer_id=c4_indexer.layer_id,
+                )
+                indexer_read_page_table = page_table
             assert c4_indexer_kv_cache.dim() == 2
             head_dim_with_sf = 68 if use_fp4_indexer else 132
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
@@ -783,7 +842,7 @@ class C4IndexerBackendMixin:
                 c4_indexer_kv_cache,
                 weights,
                 _c4sl,
-                page_table,
+                indexer_read_page_table,
                 indexer_metadata.deep_gemm_metadata,
                 indexer_metadata.max_c4_seq_len,
                 False,

@@ -85,6 +85,8 @@ class TestDSV4SharedPageLayout(CustomTestCase):
             "publish_writes",
             "flashmla_prefill_demand_kwargs",
             "translate_slots",
+            "prepare_indexer_pages",
+            "stage_indexer_pages",
             "kv_owner_write_target",
             "compressor_state_layout",
         }
@@ -161,6 +163,27 @@ class TestDSV4SharedPageLayout(CustomTestCase):
             DSV4SharedCacheAccess.compressor_state_layout(state_pool),
             (0, 1, 0),
         )
+
+    def test_adapter_plans_and_stages_indexer_pages_locally(self):
+        pool = MagicMock()
+        pages = torch.tensor([[-1, 0, 7]], dtype=torch.int32)
+        physical = torch.tensor([12, 3], dtype=torch.int64)
+        remapped = torch.tensor([[-1, 0, 1]], dtype=torch.int32)
+        staged = torch.empty((2, 8448), dtype=torch.uint8)
+        pool.prepare_indexer_pages_for_read.return_value = (physical, remapped)
+        pool.stage_indexer_pages_with_plan.return_value = staged
+        access = DSV4SharedCacheAccess(pool)
+
+        actual_plan = access.prepare_indexer_pages(pages, fixed_shape=True)
+        actual_stage = access.stage_indexer_pages(17, physical)
+
+        self.assertEqual(actual_plan, (physical, remapped))
+        self.assertIs(actual_stage, staged)
+        pool.prepare_indexer_pages_for_read.assert_called_once_with(
+            pages, fixed_shape=True
+        )
+        pool.stage_indexer_pages_with_plan.assert_called_once_with(17, physical)
+        self.assertNotIn("translate_indexer_pages", DSV4SharedCacheAccess.__dict__)
 
     def test_attention_and_model_call_sites_do_not_probe_shared_pool_methods(self):
         attention_dir = Path(__file__).parents[5] / "python/sglang/srt/layers/attention"

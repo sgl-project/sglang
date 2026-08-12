@@ -555,7 +555,7 @@ def test_dsv4_main_transfer_descriptors_follow_wire_pointer_order():
     indexer = torch.zeros((3, 24), dtype=torch.uint8)
     c128 = torch.zeros((3, 32), dtype=torch.uint8)
     pool.c4_kv_pool = SimpleNamespace(local_kv_buffer=[c4])
-    pool.c4_indexer_kv_pool = SimpleNamespace(index_k_with_scale_buffer=[indexer])
+    pool.c4_indexer_kv_pool = SimpleNamespace(local_index_k_with_scale_buffer=[indexer])
     pool.c128_kv_pool = SimpleNamespace(local_kv_buffer=[c128])
     pool.get_contiguous_buf_infos = lambda: ([1, 2, 3], [], [])
 
@@ -567,7 +567,7 @@ def test_dsv4_main_transfer_descriptors_follow_wire_pointer_order():
     )
     assert [descriptor.item_bytes for descriptor in descriptors] == [16, 24, 32]
     assert all(descriptor.owner_pages_per_item == 1 for descriptor in descriptors)
-    assert descriptors[1].replicated_source
+    assert not descriptors[1].replicated_source
     assert not descriptors[1].aggregate_all_owners
 
 
@@ -586,7 +586,7 @@ def test_dsv4_rank_aggregated_descriptors_use_global_views_and_rank_stride():
         )
 
     pool.c4_kv_pool = shared_pool(c4, 3)
-    pool.c4_indexer_kv_pool = SimpleNamespace(index_k_with_scale_buffer=[indexer])
+    pool.c4_indexer_kv_pool = shared_pool(indexer, 4)
     pool.c128_kv_pool = shared_pool(c128, 5)
     pool.get_contiguous_buf_infos = lambda: ([1, 2, 3], [], [])
 
@@ -598,11 +598,11 @@ def test_dsv4_rank_aggregated_descriptors_use_global_views_and_rank_stride():
     )
     assert [descriptor.rank_stride_owner_pages for descriptor in descriptors] == [
         3,
-        None,
+        4,
         5,
     ]
-    assert descriptors[1].replicated_source
-    assert descriptors[1].aggregate_all_owners
+    assert not descriptors[1].replicated_source
+    assert not descriptors[1].aggregate_all_owners
 
 
 def test_mooncake_rank_aggregation_selects_only_matching_decode_tp_rank():
@@ -636,20 +636,13 @@ def test_dsv4_state_transfer_descriptors_capture_family_geometry():
             ring_size=ring_size,
         )
 
-    def replicated_state_pool(tensor, ratio, ring_size):
-        return SimpleNamespace(
-            kv_score_buffer=SimpleNamespace(kv_score=tensor),
-            ratio=ratio,
-            ring_size=ring_size,
-        )
-
     pool.swa_kv_pool = SimpleNamespace(local_kv_buffer=[swa])
     pool.compress_state_pools = [
         state_pool(c4_attn, 4, 8),
         state_pool(c128, 128, 128),
     ]
     pool.indexer_compress_state_pools = [
-        replicated_state_pool(c4_indexer, 4, 8),
+        state_pool(c4_indexer, 4, 8),
         None,
     ]
     pool.get_state_buf_infos = lambda: ([1, 2, 3], [], [])
@@ -676,4 +669,4 @@ def test_dsv4_state_transfer_descriptors_capture_family_geometry():
             c128_state[0].owner_pages_per_item,
         )
     ] == [(1152, 1152, 1)]
-    assert state[2].replicated_source
+    assert not state[2].replicated_source

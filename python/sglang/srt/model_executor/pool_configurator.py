@@ -810,29 +810,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            (
-                self.swa_ratio * kv_bytes * self.num_layers_total
-                + c4_frac * kv_bytes * self.num_layers_ca4
-                + 1 / 128 * kv_bytes * self.num_layers_ca128
-            )
-            / self.shared_cache_size
-            # Indexer KV remains a complete rank-local replica under Shared KV.
+            self.swa_ratio * kv_bytes * self.num_layers_total
+            + c4_frac * kv_bytes * self.num_layers_ca4
+            + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * indexer_bytes * self.num_layers_ca4
-            + self.swa_ratio
-            * c4_state_ratio
-            * c4_state_bytes
-            * self.num_layers_ca4
-            / self.shared_cache_size
-            + c128_state_ratio
-            * c128_state_bytes
-            * self.num_layers_ca128
-            / self.shared_cache_size
-            # Indexer compressor state is rank-local for the same reason.
+            + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
+            + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
             + self.swa_ratio
             * c4_state_ratio
             * c4_indexer_state_bytes
             * self.num_layers_ca4
-        )
+        ) / self.shared_cache_size
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size

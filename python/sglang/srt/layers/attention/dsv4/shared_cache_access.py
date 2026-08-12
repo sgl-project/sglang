@@ -60,6 +60,16 @@ class DSV4SharedCacheAccess:
             return self._pool.translate_extra_slots_for_read(layer_id, slots)
         raise ValueError(f"unknown DSV4 Shared slot family: {family}")
 
+    def prepare_indexer_pages(
+        self, pages: torch.Tensor, *, fixed_shape: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._pool.prepare_indexer_pages_for_read(pages, fixed_shape=fixed_shape)
+
+    def stage_indexer_pages(
+        self, layer_id: int, physical_pages: torch.Tensor
+    ) -> torch.Tensor:
+        return self._pool.stage_indexer_pages_with_plan(layer_id, physical_pages)
+
     def shared_dequant_params(self, family: str, *, layer_id: int) -> tuple[int, int]:
         if family == "swa":
             return self._pool.get_swa_shared_dequant_params(layer_id)

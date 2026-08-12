@@ -614,7 +614,7 @@ class TestDSV4SharedStateCapacity(unittest.TestCase):
         cfg.online_c128_mtp_max_draft_tokens = 0
         return cfg
 
-    def test_flash_attention_families_scale_but_indexer_stays_replicated(self):
+    def test_all_persistent_families_scale_with_shared_cache_size(self):
         replicated = self._configurator(1)
         shared = self._configurator(8)
 
@@ -626,23 +626,23 @@ class TestDSV4SharedStateCapacity(unittest.TestCase):
             ),
             (43, 21, 20),
         )
-        self.assertAlmostEqual(shared._get_bytes_per_full_token(), 1804.75625, places=5)
+        self.assertAlmostEqual(shared._get_bytes_per_full_token(), 963.18125, places=5)
         self.assertEqual(
             replicated._get_c128_state_fixed_bytes(1),
             shared._get_c128_state_fixed_bytes(1) * 8,
         )
 
-    def test_flash_persistent_bytes_include_replicated_indexer(self):
+    def test_all_persistent_bytes_are_owner_sharded(self):
         replicated = self._configurator(1)
         shared = self._configurator(8)
 
         self.assertAlmostEqual(
             replicated._get_bytes_per_full_token(), 7705.45, places=2
         )
-        self.assertAlmostEqual(shared._get_bytes_per_full_token(), 1804.75625, places=5)
+        self.assertAlmostEqual(shared._get_bytes_per_full_token(), 963.18125, places=5)
         self.assertAlmostEqual(
             replicated._get_bytes_per_full_token() / shared._get_bytes_per_full_token(),
-            4.269522,
+            8.0,
             places=5,
         )
 

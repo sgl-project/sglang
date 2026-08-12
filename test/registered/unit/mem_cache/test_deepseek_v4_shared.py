@@ -161,7 +161,7 @@ class TestDeepSeekV4SharedPageLayout(CustomTestCase):
         configurator.shared_cache_size = shared_cache_size
         return configurator
 
-    def test_capacity_shards_attention_but_keeps_indexer_replicated(self):
+    def test_capacity_shards_all_persistent_families(self):
         replicated = self._make_dsv4_capacity_configurator(1)
         shared = self._make_dsv4_capacity_configurator(8)
 
@@ -180,8 +180,8 @@ class TestDeepSeekV4SharedPageLayout(CustomTestCase):
             shared_bytes = shared._get_bytes_per_full_token()
 
         self.assertAlmostEqual(replicated_bytes, 7705.45, places=5)
-        self.assertAlmostEqual(shared_bytes, 1804.75625, places=5)
-        self.assertAlmostEqual(replicated_bytes / shared_bytes, 4.269522, places=5)
+        self.assertAlmostEqual(shared_bytes, 963.18125, places=5)
+        self.assertAlmostEqual(replicated_bytes / shared_bytes, 8.0, places=5)
 
     def test_demand_cache_is_limited_to_pure_prefill_modes(self):
         self.assertTrue(
@@ -603,12 +603,18 @@ class TestDeepSeekV4SharedOwnerWrites(CustomTestCase):
         self.assertEqual(kwargs["owner_rank"], 3)
         self.assertEqual(kwargs["owner_size"], 8)
 
-    def test_shared_pool_builds_an_ordinary_replicated_indexer(self):
+    def test_shared_pool_builds_owner_sharded_indexer(self):
         token_pool = object.__new__(SharedDeepSeekV4TokenToKVPool)
         expected = object()
+        shared_indexer_cls = getattr(dsv4_shared, "SharedDeepSeekV4IndexerPool", None)
+        self.assertIsNotNone(shared_indexer_cls)
+        token_pool.shared_rank = 3
+        token_pool.shared_size = 8
+        cpu_group = object()
+        token_pool._get_cp_group = lambda: SimpleNamespace(cpu_group=cpu_group)
 
         with patch.object(
-            dsv4_shared, "DeepSeekV4IndexerPool", return_value=expected
+            dsv4_shared, "SharedDeepSeekV4IndexerPool", return_value=expected
         ) as constructor:
             actual = token_pool._make_indexer_pool(
                 1024, 64, torch.bfloat16, 128, 21, "cuda", False
@@ -616,8 +622,140 @@ class TestDeepSeekV4SharedOwnerWrites(CustomTestCase):
 
         self.assertIs(actual, expected)
         constructor.assert_called_once_with(
-            1024, 64, torch.bfloat16, 128, 21, "cuda", False
+            1024,
+            64,
+            torch.bfloat16,
+            128,
+            21,
+            "cuda",
+            False,
+            shared_rank=3,
+            shared_size=8,
+            shared_cpu_group=cpu_group,
         )
+
+    def test_indexer_write_keeps_one_owner_writer(self):
+        shared_indexer_cls = getattr(dsv4_shared, "SharedDeepSeekV4IndexerPool", None)
+        self.assertIsNotNone(shared_indexer_cls)
+        pool = object.__new__(shared_indexer_cls)
+        pool.page_size = 64
+        pool.start_layer = 0
+        pool.shared_rank = 5
+        pool.shared_size = 8
+        local_cache = torch.empty((4, 64), dtype=torch.uint8)
+        pool.local_index_k_with_scale_buffer = [local_cache]
+        loc = torch.tensor([64 * 5, 64 * 13], dtype=torch.int64)
+        cache_k = torch.empty((2, 128), dtype=torch.bfloat16)
+
+        with patch(
+            "sglang.srt.mem_cache.deepseek_v4_shared.fused_store_cache_shared"
+        ) as store:
+            pool.set_index_fused(0, loc, cache_k)
+
+        kwargs = store.call_args.kwargs
+        self.assertIs(kwargs["input"], cache_k)
+        self.assertIs(kwargs["cache"], local_cache)
+        self.assertIs(kwargs["indices"], loc)
+        self.assertEqual(kwargs["page_size"], 64)
+        self.assertEqual(kwargs["type"], "indexer")
+        self.assertEqual(kwargs["owner_rank"], 5)
+        self.assertEqual(kwargs["owner_size"], 8)
+
+    def test_indexer_pages_translate_relative_to_current_rank(self):
+        shared_indexer_cls = getattr(dsv4_shared, "SharedDeepSeekV4IndexerPool", None)
+        self.assertIsNotNone(shared_indexer_cls)
+        pool = object.__new__(shared_indexer_cls)
+        pool.shared_rank = 3
+        pool.shared_family = SimpleNamespace(
+            layout=build_dsv4_shared_page_layout(
+                logical_size=64 * 17,
+                page_size=64,
+                cp_size=8,
+            )
+        )
+        logical_pages = torch.tensor([-1, 0, 3, 4, 11], dtype=torch.int32)
+
+        translated = pool.translate_pages_for_read(logical_pages)
+
+        self.assertEqual(translated.tolist(), [-1, 20, 0, 4, 1])
+
+    def test_indexer_get_k_and_s_hides_rank_relative_translation(self):
+        shared_indexer_cls = getattr(dsv4_shared, "SharedDeepSeekV4IndexerPool")
+        pool = object.__new__(shared_indexer_cls)
+        pool.shared_rank = 3
+        pool.page_size = 64
+        pool.index_head_dim = 128
+        pool.shared_family = SimpleNamespace(
+            layout=build_dsv4_shared_page_layout(
+                logical_size=64 * 17,
+                page_size=64,
+                cp_size=8,
+            )
+        )
+        rank_local_cache = torch.empty((24, 64 * 132), dtype=torch.uint8)
+        pool.index_k_with_scale_buffer = [rank_local_cache]
+        logical_pages = torch.tensor([[0, 3, 4, 11]], dtype=torch.int32)
+        original_pages = logical_pages.clone()
+        seq_lens = torch.tensor([193], dtype=torch.int32)
+        expected = (object(), object())
+
+        with patch(
+            "sglang.srt.mem_cache.deepseek_v4_memory_pool."
+            "index_buf_accessor.GetKAndS.execute",
+            return_value=expected,
+        ) as gather:
+            actual = pool.get_index_k_scale_buffer(
+                0,
+                seq_len_tensor=seq_lens,
+                page_indices=logical_pages,
+                seq_len_sum=193,
+                max_seq_len=193,
+            )
+
+        self.assertIs(actual, expected)
+        gather.assert_called_once()
+        args, kwargs = gather.call_args
+        self.assertIs(args[0], pool)
+        self.assertIs(args[1], rank_local_cache)
+        self.assertEqual(kwargs["page_indices"].tolist(), [[20, 0, 4, 1]])
+        self.assertIs(kwargs["seq_len_tensor"], seq_lens)
+        self.assertEqual(kwargs["seq_len_sum"], 193)
+        self.assertEqual(kwargs["max_seq_len"], 193)
+        torch.testing.assert_close(logical_pages, original_pages)
+
+    def test_indexer_paged_stage_compacts_peer_pages_into_local_hbm(self):
+        shared_indexer_cls = getattr(dsv4_shared, "SharedDeepSeekV4IndexerPool")
+        pool = object.__new__(shared_indexer_cls)
+        pool.shared_family = SimpleNamespace(
+            layout=build_dsv4_shared_page_layout(
+                logical_size=64 * 17,
+                page_size=64,
+                cp_size=8,
+            ),
+            global_views=[torch.arange(24 * 8448, dtype=torch.int64).view(24, 8448)],
+        )
+        logical_pages = torch.tensor(
+            [[0, 3, 4, -1], [4, 11, -1, -1]], dtype=torch.int32
+        )
+        original_pages = logical_pages.clone()
+
+        physical_pages, remapped = pool.prepare_pages_for_read(
+            logical_pages, fixed_shape=False
+        )
+        staged = pool.stage_pages_with_plan(0, physical_pages)
+
+        self.assertEqual(physical_pages.tolist(), [0, 12, 13, 16])
+        self.assertEqual(remapped.tolist(), [[0, 1, 3, -1], [3, 2, -1, -1]])
+        torch.testing.assert_close(
+            staged, pool.shared_family.global_views[0].index_select(0, physical_pages)
+        )
+        torch.testing.assert_close(logical_pages, original_pages)
+
+        graph_pages, graph_remapped = pool.prepare_pages_for_read(
+            logical_pages, fixed_shape=True
+        )
+        self.assertEqual(graph_pages.tolist(), [0, 12, 16, 0, 16, 13, 0, 0])
+        self.assertEqual(graph_remapped.tolist(), [[0, 1, 2, -1], [4, 5, -1, -1]])
 
     def test_read_indices_translate_to_rank_major_shared_alias(self):
         pool = object.__new__(SharedDeepSeekV4SingleKVPool)
@@ -637,12 +775,54 @@ class TestDeepSeekV4SharedOwnerWrites(CustomTestCase):
 
 
 class TestDeepSeekV4SharedTokenPool(CustomTestCase):
+    def test_indexer_compressor_write_targets_owner_local_cache(self):
+        pool = object.__new__(SharedDeepSeekV4TokenToKVPool)
+        pool.shared_rank = 3
+        pool.shared_size = 8
+        owner_local = object()
+        pool.layer_mapping = {
+            11: SimpleNamespace(compress_layer_id=1, compress_kv_pool=None)
+        }
+        pool.c4_indexer_kv_pool = SimpleNamespace(
+            start_layer=0,
+            local_index_k_with_scale_buffer=[object(), owner_local],
+        )
+
+        self.assertEqual(
+            pool.get_compressor_write_info(11, is_indexer=True),
+            (owner_local, 3, 8),
+        )
+
+    def test_kv_size_counts_shared_indexer_family_once(self):
+        pool = object.__new__(SharedDeepSeekV4TokenToKVPool)
+        pool.swa_kv_pool = SimpleNamespace(
+            shared_family=SimpleNamespace(physical_bytes=10)
+        )
+        pool.c4_kv_pool = SimpleNamespace(
+            shared_family=SimpleNamespace(physical_bytes=20)
+        )
+        pool.c128_kv_pool = SimpleNamespace(
+            shared_family=SimpleNamespace(physical_bytes=30)
+        )
+        pool.c4_indexer_kv_pool = SimpleNamespace(
+            shared_family=SimpleNamespace(physical_bytes=40)
+        )
+        pool.shared_state_families = {
+            "c4_attn_state": SimpleNamespace(physical_bytes=50),
+            "c4_indexer_state": SimpleNamespace(physical_bytes=60),
+        }
+
+        self.assertEqual(pool.get_kv_size_bytes(), 210)
+
     def test_explicit_close_is_idempotent_and_closes_each_family_once(self):
         family = Mock()
         kv_pool = SimpleNamespace(
             shared_family=family,
             kv_buffer=[object()],
             local_kv_buffer=[object()],
+            index_k_with_scale_buffer=[object()],
+            local_index_k_with_scale_buffer=[object()],
+            rank_local_index_k_with_scale_buffer=[object()],
         )
         state_pool = SimpleNamespace(
             shared_family=family,
@@ -666,6 +846,9 @@ class TestDeepSeekV4SharedTokenPool(CustomTestCase):
         family.close.assert_called_once_with()
         self.assertEqual(kv_pool.kv_buffer, [])
         self.assertEqual(kv_pool.local_kv_buffer, [])
+        self.assertEqual(kv_pool.index_k_with_scale_buffer, [])
+        self.assertEqual(kv_pool.local_index_k_with_scale_buffer, [])
+        self.assertEqual(kv_pool.rank_local_index_k_with_scale_buffer, [])
         self.assertIsNone(kv_pool.shared_family)
         self.assertIsNone(state_pool._shared_buffer)
         self.assertIsNone(state_pool.kv_score_buffer)
@@ -848,7 +1031,7 @@ class TestDeepSeekV4SharedTokenPool(CustomTestCase):
         ]
         pool.c4_indexer_kv_pool = SimpleNamespace(
             start_layer=0,
-            index_k_with_scale_buffer=[indexer_local],
+            local_index_k_with_scale_buffer=[indexer_local],
         )
 
         self.assertEqual(
@@ -857,7 +1040,7 @@ class TestDeepSeekV4SharedTokenPool(CustomTestCase):
         )
         self.assertEqual(
             pool.get_compressor_write_info(0, is_indexer=True),
-            (indexer_local, 0, 1),
+            (indexer_local, 3, 8),
         )
 
     def test_main_norm_rope_store_keeps_one_owner_writer(self):

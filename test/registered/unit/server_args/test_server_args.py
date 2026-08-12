@@ -736,7 +736,8 @@ class TestDeepSeekV4SharedCacheArgs(unittest.TestCase):
         values.update(overrides)
         args = ServerArgs(**values)
         args.cuda_graph_config = CudaGraphConfig(
-            prefill=PhaseConfig(backend=Backend.DISABLED)
+            decode=PhaseConfig(backend=Backend.DISABLED),
+            prefill=PhaseConfig(backend=Backend.DISABLED),
         )
         hf_config = SimpleNamespace(
             architectures=["DeepseekV4ForCausalLM"],
@@ -771,11 +772,30 @@ class TestDeepSeekV4SharedCacheArgs(unittest.TestCase):
         self.assertTrue(args.enable_dsa_shared_kv_cache)
         self.assertEqual(args.attn_cp_size, 8)
 
+    def test_rejects_non_fused_or_fp4_indexer_storage(self):
+        with self.subTest("non-fused"):
+            with (
+                envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.override(False),
+                self.assertRaisesRegex(ValueError, "fused FP8 Indexer storage"),
+            ):
+                self._adjust(self._make_args())
+
+        with self.subTest("fp4"):
+            with self.assertRaisesRegex(ValueError, "fused FP8 Indexer storage"):
+                self._adjust(self._make_args(enable_deepseek_v4_fp4_indexer=True))
+
     def test_rejects_prefill_cuda_graph_for_transient_demand_cache(self):
         args = self._make_args()
         args.cuda_graph_config.prefill.backend = Backend.FULL
 
         with self.assertRaisesRegex(ValueError, "Prefill CUDA graph"):
+            self._adjust(args)
+
+    def test_rejects_decode_cuda_graph_until_shared_indexer_replay_is_validated(self):
+        args = self._make_args()
+        args.cuda_graph_config.decode.backend = Backend.FULL
+
+        with self.assertRaisesRegex(ValueError, "Decode CUDA graph"):
             self._adjust(args)
 
     def test_accepts_flash_0731_profile(self):

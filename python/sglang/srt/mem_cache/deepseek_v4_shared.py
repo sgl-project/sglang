@@ -183,6 +183,34 @@ def _translate_shared_slots_fused(
     return physical_slots
 
 
+def _build_shared_page_stage_plan(
+    layout: DSV4SharedPageLayout,
+    logical_pages: torch.Tensor,
+    *,
+    fixed_shape: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a compact eager or fixed-shape graph-safe local page workspace."""
+    remapped = logical_pages.clone()
+    valid = logical_pages >= 0
+    if logical_pages.numel() == 0:
+        return logical_pages.reshape(-1).long(), remapped
+    if not fixed_shape:
+        physical_pages = layout.translate_pages(logical_pages[valid]).long()
+        unique_pages, inverse = torch.unique(
+            physical_pages, sorted=True, return_inverse=True
+        )
+        remapped[valid] = inverse.to(remapped.dtype)
+        return unique_pages, remapped
+
+    remapped = torch.arange(
+        logical_pages.numel(), dtype=logical_pages.dtype, device=logical_pages.device
+    ).reshape_as(logical_pages)
+    safe_pages = torch.where(valid, logical_pages, 0)
+    physical_pages = layout.translate_pages(safe_pages).reshape(-1).long()
+    remapped = torch.where(valid, remapped, logical_pages)
+    return physical_pages, remapped
+
+
 @dataclass
 class SharedDeepSeekV4Family:
     """One page-sharded DSV4 tensor family with per-layer VMM aliases."""
@@ -334,6 +362,118 @@ class SharedDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
             indices=loc,
             page_size=self.page_size,
             type="flashmla",
+            owner_rank=self.shared_rank,
+            owner_size=self.shared_size,
+        )
+
+
+class SharedDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
+    """Packed C4 Indexer cache with one physical page across CP ranks."""
+
+    def __init__(
+        self,
+        *args,
+        shared_rank: int,
+        shared_size: int,
+        shared_cpu_group: ProcessGroup,
+        **kwargs,
+    ):
+        self.shared_rank = shared_rank
+        self.shared_size = shared_size
+        self.shared_cpu_group = shared_cpu_group
+        self.shared_family: SharedDeepSeekV4Family | None = None
+        self.local_index_k_with_scale_buffer: list[torch.Tensor] = []
+        self.rank_local_index_k_with_scale_buffer: list[torch.Tensor] = []
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            self._clear_shared_family()
+            raise
+
+    def _clear_shared_family(self) -> None:
+        family = self.shared_family
+        self.index_k_with_scale_buffer = []
+        self.local_index_k_with_scale_buffer = []
+        self.rank_local_index_k_with_scale_buffer = []
+        self.shared_family = None
+        if family is not None:
+            family.close()
+
+    def close(self) -> None:
+        self._clear_shared_family()
+
+    def _create_buffer(self) -> None:
+        page_bytes = self.page_size * self.get_bytes_per_token()
+        self.shared_family = SharedDeepSeekV4Family.create(
+            name="c4_indexer",
+            logical_size=self.size,
+            page_size=self.page_size,
+            layer_num=self.layer_num,
+            dtype=self.index_k_with_scale_buffer_dtype,
+            row_shape=(page_bytes,),
+            rows_per_page=1,
+            cp_size=self.shared_size,
+            cpu_group=self.shared_cpu_group,
+        )
+        self.local_index_k_with_scale_buffer = self.shared_family.local_views
+        self.rank_local_index_k_with_scale_buffer = self.shared_family.rank_local_views
+        if not self.rank_local_index_k_with_scale_buffer:
+            raise RuntimeError("DSV4 shared indexer requires rank-local VMM aliases")
+        # DeepGEMM derives the CUDA device from the cache base pointer. Keep
+        # this rank's owner segment first and translate page ids relative to it.
+        self.index_k_with_scale_buffer = self.rank_local_index_k_with_scale_buffer
+
+    def translate_pages_for_read(self, pages: torch.Tensor) -> torch.Tensor:
+        assert self.shared_family is not None
+        layout = self.shared_family.layout
+        slots = pages * layout.page_size
+        translated = layout.translate_slots_for_rank(slots, rank=self.shared_rank)
+        valid = pages >= 0
+        return torch.where(valid, translated // layout.page_size, pages)
+
+    def prepare_pages_for_read(
+        self, pages: torch.Tensor, *, fixed_shape: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.shared_family is not None
+        return _build_shared_page_stage_plan(
+            self.shared_family.layout, pages, fixed_shape=fixed_shape
+        )
+
+    def stage_pages_with_plan(
+        self, layer_id: int, physical_pages: torch.Tensor
+    ) -> torch.Tensor:
+        assert self.shared_family is not None
+        return self.shared_family.global_views[layer_id].index_select(0, physical_pages)
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather logical Indexer pages through this rank's unified VMM alias."""
+        return super().get_index_k_scale_buffer(
+            layer_id,
+            seq_len_tensor=seq_len_tensor,
+            page_indices=self.translate_pages_for_read(page_indices),
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
+        )
+
+    def set_index_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        return fused_store_cache_shared(
+            input=cache_k,
+            cache=self.local_index_k_with_scale_buffer[layer_id - self.start_layer],
+            indices=loc,
+            page_size=self.page_size,
+            type="indexer",
             owner_rank=self.shared_rank,
             owner_size=self.shared_size,
         )
@@ -514,6 +654,8 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
                 "kv_buffer",
                 "local_kv_buffer",
                 "index_k_with_scale_buffer",
+                "local_index_k_with_scale_buffer",
+                "rank_local_index_k_with_scale_buffer",
             ):
                 buffer = getattr(pool, buffer_name, None)
                 if isinstance(buffer, list):
@@ -579,8 +721,8 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
         buffers = [
             *(self._page_transfer_buffer(t) for t in self.c4_kv_pool.local_kv_buffer),
             *(
-                self._page_transfer_buffer(t, replicated_source=True)
-                for t in self.c4_indexer_kv_pool.index_k_with_scale_buffer
+                self._page_transfer_buffer(t)
+                for t in self.c4_indexer_kv_pool.local_index_k_with_scale_buffer
             ),
             *(self._page_transfer_buffer(t) for t in self.c128_kv_pool.local_kv_buffer),
         ]
@@ -605,14 +747,7 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
 
         buffers = [
             *family_buffers(self.c4_kv_pool.shared_family),
-            *(
-                self._page_transfer_buffer(
-                    tensor,
-                    replicated_source=True,
-                    aggregate_all_owners=True,
-                )
-                for tensor in self.c4_indexer_kv_pool.index_k_with_scale_buffer
-            ),
+            *family_buffers(self.c4_indexer_kv_pool.shared_family),
             *family_buffers(self.c128_kv_pool.shared_family),
         ]
         if len(buffers) != len(self.get_contiguous_buf_infos()[0]):
@@ -661,7 +796,7 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
                 if pool is not None and pool.ratio == 4
             ),
             *(
-                self._replicated_state_transfer_buffer(pool)
+                self._state_transfer_buffer(pool)
                 for pool in self.indexer_compress_state_pools
                 if pool is not None and pool.ratio == 4
             ),
@@ -690,6 +825,7 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
             self.swa_kv_pool.shared_family,
             self.c4_kv_pool.shared_family,
             self.c128_kv_pool.shared_family,
+            self.c4_indexer_kv_pool.shared_family,
             *self.shared_state_families.values(),
         ]
         total_mapped_bytes = 0
@@ -778,7 +914,7 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
         device: str,
         enable_memory_saver: bool,
     ) -> DeepSeekV4IndexerPool:
-        return DeepSeekV4IndexerPool(
+        return SharedDeepSeekV4IndexerPool(
             size,
             page_size,
             dtype,
@@ -786,6 +922,27 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            shared_rank=self.shared_rank,
+            shared_size=self.shared_size,
+            shared_cpu_group=self._get_cp_group().cpu_group,
+        )
+
+    def translate_indexer_pages_for_read(self, pages: torch.Tensor) -> torch.Tensor:
+        return self.c4_indexer_kv_pool.translate_pages_for_read(pages)
+
+    def prepare_indexer_pages_for_read(
+        self, pages: torch.Tensor, *, fixed_shape: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.c4_indexer_kv_pool.prepare_pages_for_read(
+            pages, fixed_shape=fixed_shape
+        )
+
+    def stage_indexer_pages_with_plan(
+        self, layer_id: int, physical_pages: torch.Tensor
+    ) -> torch.Tensor:
+        item = self.layer_mapping[layer_id]
+        return self.c4_indexer_kv_pool.stage_pages_with_plan(
+            item.compress_layer_id, physical_pages
         )
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
@@ -836,6 +993,13 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
             layer_num=c4_layers,
             dtype=self.c4_state_dtype,
         )
+        c4_indexer = make_family(
+            name="c4_indexer_state",
+            ratio=4,
+            head_dim=self.indexer_head_dim,
+            layer_num=c4_layers,
+            dtype=self.c4_state_dtype,
+        )
         c128_attn = make_family(
             name="c128_attn_state",
             ratio=128,
@@ -866,8 +1030,19 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
                 shared_rank=self.shared_rank,
             )
             if ratio == 4:
-                self.indexer_compress_state_pools[layer_id] = (
-                    self._make_indexer_state_pool(4, False)
+                self.indexer_compress_state_pools[layer_id] = SharedCompressStatePool(
+                    size=self._state_pool_size(4),
+                    ring_size=self.get_ring_size(4),
+                    overlap=True,
+                    head_dim=self.indexer_head_dim,
+                    dtype=self.c4_state_dtype,
+                    device=self.device,
+                    enable_memory_saver=False,
+                    ratio=4,
+                    swa_page_size=self.swa_page_size,
+                    shared_family=c4_indexer,
+                    shared_layer_id=c4_id,
+                    shared_rank=self.shared_rank,
                 )
                 c4_id += 1
             else:
@@ -969,8 +1144,7 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
         if is_indexer:
             pool = self.c4_indexer_kv_pool
             local_layer_id = compress_layer_id - pool.start_layer
-            cache = pool.index_k_with_scale_buffer[local_layer_id]
-            return cache, 0, 1
+            cache = pool.local_index_k_with_scale_buffer[local_layer_id]
         else:
             pool = item.compress_kv_pool
             assert pool is not None
@@ -986,18 +1160,7 @@ class SharedDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
             self.swa_kv_pool.shared_family,
             self.c4_kv_pool.shared_family,
             self.c128_kv_pool.shared_family,
+            self.c4_indexer_kv_pool.shared_family,
         ]
         families.extend(self.shared_state_families.values())
-        shared_bytes = sum(
-            family.physical_bytes for family in families if family is not None
-        )
-        indexer_kv_bytes = sum(
-            tensor.nbytes
-            for tensor in self.c4_indexer_kv_pool.index_k_with_scale_buffer
-        )
-        indexer_state_bytes = sum(
-            pool.kv_score_buffer.kv_score.nbytes
-            for pool in self.indexer_compress_state_pools
-            if pool is not None
-        )
-        return shared_bytes + indexer_kv_bytes + indexer_state_bytes
+        return sum(family.physical_bytes for family in families if family is not None)

@@ -142,10 +142,22 @@ def validate_deepseek_v4_shared_release(server_args: ServerArgs, hf_config) -> N
         raise ValueError(
             "--enable-dsa-shared-kv-cache does not support online C128 compression yet."
         )
+    if (
+        server_args.enable_deepseek_v4_fp4_indexer
+        or not envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
+    ):
+        raise ValueError(
+            "DeepSeek V4 Shared KV currently requires fused FP8 Indexer storage."
+        )
     if server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
         raise ValueError(
             "DeepSeek V4 Shared KV does not support Prefill CUDA graph; "
             "the transient Demand-cache epoch must advance on every layer call."
+        )
+    if server_args.cuda_graph_config.decode.backend != Backend.DISABLED:
+        raise ValueError(
+            "DeepSeek V4 Shared KV currently requires Decode CUDA graph to be "
+            "disabled until Shared Indexer paged replay is validated."
         )
 
 
