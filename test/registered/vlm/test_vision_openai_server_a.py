@@ -44,10 +44,7 @@ class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
 
 class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-    extra_args = [
-        "--cuda-graph-max-bs-decode=4",
-        "--mm-feature-transport=cpu",
-    ]
+    extra_args = ["--cuda-graph-max-bs-decode=4"]
 
 
 class TestQwen2VLContextLengthServer(CustomTestCase):
