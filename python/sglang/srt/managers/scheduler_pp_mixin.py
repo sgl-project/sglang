@@ -6,7 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -62,6 +63,22 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+
+
+class PPBootstrapDecision(NamedTuple):
+    """An immutable bootstrap-queue commit ordered by PP0.
+
+    Candidate good/bad lists are still reduced stage by stage. They become a
+    decision only after returning to PP0, which merges PP0's pending aborts and
+    assigns the sequence number. Every stage then applies and forwards this
+    exact value; no stage is allowed to rewrite the committed RID sets. It is a
+    tuple value because the existing PP Python-object transport requires a
+    sized container.
+    """
+
+    sequence: int
+    good_rids: Tuple[str, ...]
+    bad_rids: Tuple[str, ...]
 
 
 class SchedulerPPMixin:
@@ -217,7 +234,7 @@ class SchedulerPPMixin:
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
-        consensus_bootstrapped_rids: Optional[List[str]] = None
+        consensus_bootstrapped_rids: Optional[PPBootstrapDecision] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
         send_bootstrapped_work = []
@@ -581,6 +598,12 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        # Bootstrap candidates can be in flight concurrently. PP0 is the
+        # single sequencer for decisions returning around the ring; every rank
+        # applies exactly the next decision and never replays one.
+        self._pp_bootstrap_next_decision_sequence = 0
+        self._pp_bootstrap_expected_decision_sequence = 0
+        self._pp_deferred_abort_reqs = deque()
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -802,25 +825,253 @@ class SchedulerPPMixin:
 
         return predicted_size
 
-    def process_bootstrapped_queue(
-        self: Scheduler, bootstrapped_rids: Optional[List[str]]
-    ):
-        # finished consensus bootstrapped reqs and prepare the waiting queue
-        if bootstrapped_rids is not None:
-            (
-                good_consensus_bootstrapped_rids,
-                bad_consensus_bootstrapped_rids,
-            ) = bootstrapped_rids
-            good_reqs, failed_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                    return_failed_reqs=True,
-                    pp_good_rids=good_consensus_bootstrapped_rids,
-                    pp_bad_rids=bad_consensus_bootstrapped_rids,
+    def _pp_ensure_bootstrap_decision_state(self: Scheduler) -> None:
+        """Initialize sequencing state for direct/unit-test callers as well."""
+        if not hasattr(self, "_pp_bootstrap_next_decision_sequence"):
+            self._pp_bootstrap_next_decision_sequence = 0
+        if not hasattr(self, "_pp_bootstrap_expected_decision_sequence"):
+            self._pp_bootstrap_expected_decision_sequence = 0
+        if not hasattr(self, "_pp_deferred_abort_reqs"):
+            self._pp_deferred_abort_reqs = deque()
+        if not hasattr(self, "_pp_pending_bootstrap_failures"):
+            self._pp_pending_bootstrap_failures = {}
+
+    def _pp_record_pending_bootstrap_failure(
+        self: Scheduler, req: Req, message: str
+    ) -> None:
+        """Record a local KV failure without changing request scheduling state.
+
+        A bootstrap good decision may already be in flight when a rank observes
+        KVPoll.Failed. Setting finished_reason here would let that rank veto the
+        immutable decision and select a different microbatch. Instead, retain a
+        local proposal that is unioned into a later bad decision. The good
+        decision, if any, is still applied identically on every rank; the later
+        bad decision then aborts the RID wherever it has progressed.
+        """
+        self._pp_ensure_bootstrap_decision_state()
+        if req.rid in self._pp_pending_bootstrap_failures:
+            return
+        self._pp_pending_bootstrap_failures[req.rid] = message
+        logger.info(
+            "Local KV failure observed for rid=%s bootstrap_room=%s; "
+            "proposed for ordered PP abort",
+            req.rid,
+            req.bootstrap_room,
+        )
+
+    def _pp_order_or_defer_abort_request(self: Scheduler, recv_req) -> bool:
+        """Put an AbortReq on the same logical timeline as bootstrap commits.
+
+        PP0 stamps the newest already-frozen decision. A downstream rank that
+        has not applied through that decision defers the entire AbortReq. This
+        makes an abort observed after decision N take effect only after N on
+        every stage, even if the request and decision use differently phased
+        PP control-message slots.
+
+        Returns True when the caller must stop processing the request for now.
+        """
+        self._pp_ensure_bootstrap_decision_state()
+        boundary = recv_req.pp_bootstrap_abort_after_sequence
+
+        if self.pp_group.is_first_rank:
+            if boundary is None:
+                boundary = self._pp_bootstrap_next_decision_sequence - 1
+                recv_req.pp_bootstrap_abort_after_sequence = boundary
+            return False
+
+        if boundary is None or self._pp_bootstrap_expected_decision_sequence > boundary:
+            return False
+
+        self._pp_deferred_abort_reqs.append(recv_req)
+        logger.info(
+            "Deferred PP AbortReq rid=%s abort_all=%s "
+            "after_sequence=%d expected_sequence=%d",
+            recv_req.rid,
+            recv_req.abort_all,
+            boundary,
+            self._pp_bootstrap_expected_decision_sequence,
+        )
+        return True
+
+    def _pp_drain_deferred_abort_requests(self: Scheduler) -> None:
+        """Execute AbortReqs whose PP0 decision boundary has been crossed."""
+        if not self._pp_deferred_abort_reqs:
+            return
+
+        remaining = deque()
+        while self._pp_deferred_abort_reqs:
+            recv_req = self._pp_deferred_abort_reqs.popleft()
+            boundary = recv_req.pp_bootstrap_abort_after_sequence
+            if (
+                boundary is not None
+                and self._pp_bootstrap_expected_decision_sequence <= boundary
+            ):
+                remaining.append(recv_req)
+                continue
+            logger.info(
+                "Applying deferred PP AbortReq rid=%s abort_all=%s "
+                "after_sequence=%s expected_sequence=%d",
+                recv_req.rid,
+                recv_req.abort_all,
+                boundary,
+                self._pp_bootstrap_expected_decision_sequence,
+            )
+            self.abort_request(recv_req)
+        self._pp_deferred_abort_reqs = remaining
+
+    def _pp_freeze_bootstrap_decision(
+        self: Scheduler, candidate_rids: List[List[str]]
+    ) -> PPBootstrapDecision:
+        """Merge PP0-local aborts and turn a reduced candidate into a commit."""
+        if not self.pp_group.is_first_rank:
+            raise RuntimeError("Only PP0 may freeze a PP bootstrap decision")
+
+        self._pp_ensure_bootstrap_decision_state()
+        good_rids, bad_rids = candidate_rids
+        aborted_rids = {
+            req.rid
+            for req in self.disagg_prefill_bootstrap_queue.queue
+            if isinstance(req.finished_reason, FINISH_ABORT)
+        }
+        aborted_rids.update(self._pp_pending_bootstrap_failures)
+        fenced_good_rids = [rid for rid in good_rids if rid in aborted_rids]
+        good_rids, bad_rids = self._route_aborts_to_bad(
+            good_rids, bad_rids, aborted_rids
+        )
+
+        # Bad wins if a stale candidate contains the RID in both sets. Stable
+        # de-duplication also makes the commit log byte-for-byte comparable
+        # across ranks.
+        bad_rids = list(dict.fromkeys(bad_rids))
+        bad_rid_set = set(bad_rids)
+        good_rids = list(
+            dict.fromkeys(rid for rid in good_rids if rid not in bad_rid_set)
+        )
+
+        sequence = self._pp_bootstrap_next_decision_sequence
+        self._pp_bootstrap_next_decision_sequence += 1
+        decision = PPBootstrapDecision(
+            sequence=sequence,
+            good_rids=tuple(good_rids),
+            bad_rids=tuple(bad_rids),
+        )
+        if fenced_good_rids:
+            logger.info(
+                "PP0 fenced locally aborted RIDs from bootstrap decision "
+                "sequence=%d rids=%s",
+                sequence,
+                tuple(fenced_good_rids),
+            )
+        return decision
+
+    def _pp_apply_bootstrap_decision(
+        self: Scheduler, decision: PPBootstrapDecision
+    ) -> None:
+        """Apply one ordered decision exactly once on this PP stage."""
+        self._pp_ensure_bootstrap_decision_state()
+        expected = self._pp_bootstrap_expected_decision_sequence
+        if decision.sequence < expected:
+            logger.warning(
+                "Ignoring duplicate PP bootstrap decision sequence=%d expected=%d",
+                decision.sequence,
+                expected,
+            )
+            return
+        if decision.sequence > expected:
+            raise RuntimeError(
+                "PP bootstrap decision sequence gap: "
+                f"expected={expected}, received={decision.sequence}"
+            )
+
+        # A sequenced AbortReq that happened after this decision is deferred
+        # until the decision is applied. Therefore, a FINISH_ABORT here means an
+        # unsequenced control event violated the protocol. Local KV failures do
+        # not use finished_reason: they stay in _pp_pending_bootstrap_failures
+        # and are proposed to a later ordered bad decision.
+        good_rid_set = set(decision.good_rids)
+        conflicting_aborts = tuple(
+            req.rid
+            for req in self.disagg_prefill_bootstrap_queue.queue
+            if req.rid in good_rid_set and isinstance(req.finished_reason, FINISH_ABORT)
+        )
+        if conflicting_aborts:
+            raise RuntimeError(
+                "PP bootstrap decision ordering violation: "
+                f"sequence={decision.sequence} committed good RIDs already "
+                f"aborted locally: {conflicting_aborts}"
+            )
+
+        late_local_failures = tuple(
+            rid
+            for rid in decision.good_rids
+            if rid in self._pp_pending_bootstrap_failures
+        )
+        if late_local_failures:
+            logger.info(
+                "Applying frozen PP bootstrap good decision sequence=%d for RIDs "
+                "with a later local KV failure proposal: %s",
+                decision.sequence,
+                late_local_failures,
+            )
+
+        good_reqs, failed_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+            return_failed_reqs=True,
+            pp_good_rids=decision.good_rids,
+            pp_bad_rids=decision.bad_rids,
+        )
+        self.waiting_queue.extend(good_reqs)
+        self._pp_bootstrap_expected_decision_sequence = decision.sequence + 1
+
+        # A bad candidate can overtake the request's physical queue state: an
+        # earlier good decision may already have moved it to waiting/running/
+        # inflight while the later failure proposal traversed the PP ring. The
+        # bad commit therefore applies to the whole scheduler, not only to the
+        # bootstrap queue. Reuse the normal abort machinery with an already-
+        # crossed sequence boundary so every rank performs the same safe cleanup
+        # at this commit point.
+        failed_in_bootstrap = {req.rid for req in failed_reqs}
+        for rid in decision.bad_rids:
+            self._pp_pending_bootstrap_failures.pop(rid, None)
+            if rid in failed_in_bootstrap:
+                continue
+            self.abort_request(
+                AbortReq(
+                    rid=rid,
+                    pp_bootstrap_abort_after_sequence=decision.sequence,
                 )
             )
-            self.waiting_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
-        return None
+        self._pp_drain_deferred_abort_requests()
+
+        logger.debug(
+            "PP bootstrap decision commit sequence=%d good_rids=%s bad_rids=%s",
+            decision.sequence,
+            decision.good_rids,
+            decision.bad_rids,
+        )
+
+    def process_bootstrapped_queue(self: Scheduler, bootstrapped_message):
+        """Freeze at PP0, then apply and forward one immutable decision."""
+        if bootstrapped_message is None:
+            return None
+
+        if self.pp_group.is_first_rank:
+            if isinstance(bootstrapped_message, PPBootstrapDecision):
+                raise RuntimeError(
+                    "PP0 expected a reduced bootstrap candidate from the last "
+                    "stage, but received an already-frozen decision"
+                )
+            decision = self._pp_freeze_bootstrap_decision(bootstrapped_message)
+        else:
+            if not isinstance(bootstrapped_message, PPBootstrapDecision):
+                raise RuntimeError(
+                    "Non-first PP stage expected a sequenced bootstrap decision, "
+                    f"but received {type(bootstrapped_message).__name__}"
+                )
+            decision = bootstrapped_message
+
+        self._pp_apply_bootstrap_decision(decision)
+        # Forward the frozen decision, not locally observed/applied RID lists.
+        return decision
 
     def _pp_filter_hicache_ready_rids(
         self: Scheduler, candidate_rids: List[str]
@@ -887,6 +1138,9 @@ class SchedulerPPMixin:
             bad_bootstrapped_rids = list(
                 dict.fromkeys(prev_bad_bootstrapped_rids + curr_bad_bootstrapped_rids)
             )
+        good_bootstrapped_rids = self._pp_filter_metadata_ready_rids(
+            good_bootstrapped_rids
+        )
         # Route locally-aborted reqs through the bad-union consensus so every PP
         # rank flushes them in the same consensus round, regardless of when the
         # AbortReq reaches each rank and regardless of whether
@@ -896,10 +1150,27 @@ class SchedulerPPMixin:
             for req in self.disagg_prefill_bootstrap_queue.queue
             if isinstance(req.finished_reason, FINISH_ABORT)
         }
+        self._pp_ensure_bootstrap_decision_state()
+        aborted_rids.update(self._pp_pending_bootstrap_failures)
         good_bootstrapped_rids, bad_bootstrapped_rids = self._route_aborts_to_bad(
             good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
+
+    def _pp_filter_metadata_ready_rids(
+        self: Scheduler, candidate_rids: List[str]
+    ) -> List[str]:
+        if not candidate_rids:
+            return candidate_rids
+        req_by_rid = {req.rid: req for req in self.disagg_prefill_bootstrap_queue.queue}
+        return [
+            rid
+            for rid in candidate_rids
+            if rid in req_by_rid
+            and self.disagg_prefill_bootstrap_queue.ensure_metadata_buffer(
+                req_by_rid[rid]
+            )
+        ]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
@@ -928,12 +1199,14 @@ class SchedulerPPMixin:
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
-        bmbs: List[List[str]],
-        next_first_rank_mb_id: int,
-        consensus_bootstrapped_rids: List[str],
-        bootstrapped_rids: List[str],
+        bmbs,
+        next_first_rank_mb_id,
+        consensus_bootstrapped_rids,
+        bootstrapped_rids,
     ):
-        # 3 (Release): send the release rids from last stage to the first stage
+        # This ring helper is shared by prefill bootstrap and decode-side
+        # retract/preallocation consensus. The last stage closes the reduction
+        # ring; other stages forward the value returned by their processor.
         send_consensus_bootstrapped_work = []
         if self.pp_group.is_last_rank:
             if bmbs[next_first_rank_mb_id] is not None:
@@ -941,7 +1214,6 @@ class SchedulerPPMixin:
                 send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                     consensus_bootstrapped_rids, async_send=True
                 )
-        # 4 (Release): send the release rids from non last rank to the next rank
         else:
             if consensus_bootstrapped_rids is not None:
                 send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
@@ -1443,7 +1715,7 @@ class SchedulerPPMixin:
         if not aborted_rids:
             return good_rids, bad_rids
         good_rids = [rid for rid in good_rids if rid not in aborted_rids]
-        bad_rids = list(set(bad_rids) | set(aborted_rids))
+        bad_rids = list(dict.fromkeys([*bad_rids, *sorted(aborted_rids)]))
         return good_rids, bad_rids
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):

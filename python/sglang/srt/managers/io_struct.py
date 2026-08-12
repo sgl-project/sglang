@@ -1921,6 +1921,11 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    # In PP disaggregated prefill, PP0 stamps the newest bootstrap decision
+    # that was already frozen when this abort was observed. Downstream stages
+    # must apply through this sequence before executing the abort, so a late
+    # abort cannot retroactively rewrite an earlier immutable decision.
+    pp_bootstrap_abort_after_sequence: Optional[int] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

@@ -419,8 +419,27 @@ class PrefillBootstrapQueue:
                     self.scheduler.attn_tp_cpu_group,
                 )
                 for i, local_poll in zip(uncovered, local_polls):
+                    req = self.queue[i]
                     if local_poll == KVPoll.Failed:
-                        polls[i] = KVPoll.Failed
+                        if isinstance(req.finished_reason, FINISH_ABORT):
+                            continue
+                        self.scheduler._pp_record_pending_bootstrap_failure(
+                            req,
+                            "KV transfer failed before bootstrap consensus.",
+                        )
+                    elif local_poll in (
+                        KVPoll.Bootstrapping,
+                        KVPoll.WaitingForInput,
+                    ):
+                        # These are non-terminal local observations. The RID
+                        # stays queued until a later PP consensus decision
+                        # explicitly admits or rejects it.
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected local KV poll state {local_poll} for "
+                            f"bootstrap request {req.rid}"
+                        )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],
@@ -454,6 +473,12 @@ class PrefillBootstrapQueue:
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
                 elif not self.finalize_bootstrap(req):
+                    if pp_good_rids is not None:
+                        raise RuntimeError(
+                            f"PP consensus admitted {req.rid} but finalize_bootstrap "
+                            "failed locally; metadata buffer must be reserved at "
+                            "report time"
+                        )
                     continue
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)

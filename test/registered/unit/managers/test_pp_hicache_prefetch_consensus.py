@@ -15,7 +15,9 @@ class TestPPHiCachePrefetchConsensus(unittest.TestCase):
         scheduler.ps = SimpleNamespace(pp_rank=pp_rank, pp_size=8)
         scheduler.pp_group = SimpleNamespace(is_first_rank=pp_rank == 0)
         scheduler.enable_hicache_storage = True
-        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=reqs)
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            queue=reqs, ensure_metadata_buffer=MagicMock(return_value=True)
+        )
         scheduler.tree_cache = SimpleNamespace(
             check_prefetch_progress=MagicMock(side_effect=lambda rid: readiness[rid])
         )
