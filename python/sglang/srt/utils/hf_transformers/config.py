@@ -74,6 +74,47 @@ def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
+    """Recognize the original state-spaces Mamba-1 checkpoints.
+
+    The raw `state-spaces/mamba-*` repos (e.g. mamba-130m/790m/2.8b, as opposed
+    to the `-hf` conversions) ship a minimal `config.json` with `d_model` /
+    `n_layer` / `ssm_cfg` and NO `model_type` / `architectures`, so
+    `AutoConfig.from_pretrained` rejects them with "Unrecognized model ...".
+    Detect that shape and build a transformers `MambaConfig` (model_type
+    `mamba`, arch `MambaForCausalLM`) with the field-name mapping the SGLang
+    Mamba model expects. Uses `get_config_dict` (which does not require a
+    model_type) so this runs before the failing `AutoConfig` path.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    # Raw state-spaces Mamba: has d_model + ssm_cfg, and no model_type/arch.
+    if config_dict.get("model_type") or config_dict.get("architectures"):
+        return None
+    if "d_model" not in config_dict or "ssm_cfg" not in config_dict:
+        return None
+
+    from transformers import MambaConfig
+
+    d_model = config_dict["d_model"]
+    # The embedding is padded up to a multiple of pad_vocab_size_multiple; match
+    # the checkpoint (e.g. 50277 -> 50280) so weight shapes line up.
+    pad = config_dict.get("pad_vocab_size_multiple", 1)
+    vocab_size = config_dict.get("vocab_size", 50280)
+    if pad > 1:
+        vocab_size = ((vocab_size + pad - 1) // pad) * pad
+    return MambaConfig(
+        vocab_size=vocab_size,
+        hidden_size=d_model,
+        num_hidden_layers=config_dict["n_layer"],
+        state_size=config_dict.get("ssm_cfg", {}).get("d_state", 16),
+        layer_norm_epsilon=config_dict.get("layer_norm_epsilon", 1e-5),
+        residual_in_fp32=config_dict.get("residual_in_fp32", True),
+        architectures=["MambaForCausalLM"],
+    )
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -84,6 +125,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         **kwargs,
     ):
         config = _try_load_longcat_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,
