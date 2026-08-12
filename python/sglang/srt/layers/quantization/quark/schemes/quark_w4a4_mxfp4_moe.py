@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -614,7 +615,23 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            # The AITER MXFP4 per-1x32 kernel keys its q_dtype_a / kernel
+            # selection on activation == Swiglu. Clamped-SwiGLU checkpoints
+            # (e.g. MiniMax-M3) declare activation="silu" together with a
+            # gemm1_clamp_limit, so translate it to "swiglu" here, mirroring
+            # Mxfp4MoEMethod (gpt-oss). Without this the runner quantizes
+            # activations on the plain-SiLU branch and produces garbage.
+            # Plain-SwiGLU Quark MXFP4 models (no clamp) keep activation="silu"
+            # so their existing path is untouched.
+            aiter_config = moe_runner_config
+            swiglu_limit = (
+                moe_runner_config.gemm1_clamp_limit
+                or moe_runner_config.swiglu_limit
+                or 0.0
+            )
+            if swiglu_limit > 0:
+                aiter_config = replace(moe_runner_config, activation="swiglu")
+            self.runner = MoeRunner(moe_runner_backend, aiter_config)
         else:
             # TODO(cwan): refactor other backends
             pass
@@ -647,5 +664,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu,
+            # Forward the GPT-OSS-style clamped-SwiGLU limit so the AITER MoE
+            # runner enters the clamped-SwiGLU path (gate_mode + swiglu_limit)
+            # instead of plain SiLU. Mirrors Mxfp4MoEMethod; checkpoints without
+            # a clamp resolve to 0.0 and keep the previous behavior.
+            swiglu_limit=(
+                self.moe_runner_config.gemm1_clamp_limit
+                or self.moe_runner_config.swiglu_limit
+                or 0.0
+            ),
         )
         return self.runner.run(dispatch_output, quant_info)
