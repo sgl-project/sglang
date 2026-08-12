@@ -13,22 +13,6 @@ _MARKER_MODULE = "sglang.srt.distributed.device_communicators.symm_mem_marker"
 
 
 class TestSymmMemGather(unittest.TestCase):
-    def test_slot_reuse_waits_for_ack(self):
-        gatherer, marker = self._gatherer(ready_values=[1])
-        gatherer._generation = 2
-        gatherer._slot_generations = [1, 2]
-        gatherer._wait_for_acks = MagicMock()
-
-        with (
-            patch.dict(sys.modules, {_MARKER_MODULE: marker}),
-            patch("torch.cuda.stream", return_value=nullcontext()),
-        ):
-            gatherer.gather(MagicMock())
-
-        gatherer._wait_for_acks.assert_called_once_with(0, 1)
-        self.assertEqual(gatherer._slot_generations[0], 3)
-        marker.publish_value.assert_called_once()
-
     def test_incomplete_snapshot_retries(self):
         gatherer, marker = self._gatherer(ready_values=[0, 1])
 
@@ -39,33 +23,28 @@ class TestSymmMemGather(unittest.TestCase):
             gatherer.gather(MagicMock())
 
         self.assertEqual(marker.snapshot_rows_acquire.call_count, 2)
-        marker.publish_value.assert_called_once()
 
     @staticmethod
     def _gatherer(ready_values):
         gatherer = object.__new__(SymmMemGather)
         gatherer._slot = 0
         gatherer._generation = 0
-        gatherer._slot_generations = [None, None]
         gatherer._stream = MagicMock()
         gatherer._host_in = MagicMock()
         gatherer._staging = MagicMock()
         gatherer._host_out = MagicMock()
         gatherer._host_ready = MagicMock()
-        gatherer._host_ready.item.side_effect = ready_values
+        gatherer._host_ready.all.return_value.item.side_effect = ready_values
         gatherer._region = [MagicMock()]
         gatherer._marker_region = [MagicMock()]
         gatherer._row_snapshot = MagicMock()
         gatherer._ready = MagicMock()
         gatherer._peer_row_ptrs = [[MagicMock()]]
         gatherer._peer_marker_ptrs = [[MagicMock()]]
-        gatherer._peer_ack_ptrs = [[MagicMock()]]
 
         marker = ModuleType(_MARKER_MODULE)
         marker.copy_row_and_publish = MagicMock()
         marker.snapshot_rows_acquire = MagicMock()
-        marker.publish_value = MagicMock()
-        marker.all_values_acquire = MagicMock()
         return gatherer, marker
 
 

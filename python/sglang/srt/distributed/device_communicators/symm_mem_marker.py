@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""System-scope publication and reuse markers for fixed-width DP metadata."""
+"""System-scope publication markers for fixed-width DP metadata."""
 
 import torch
 import triton
@@ -61,92 +61,53 @@ def copy_row_and_publish(
 
 
 @triton.jit
-def _publish_value(dst_ptrs, value):
+def _snapshot_row_acquire(src_rows, markers, dst_rows, ready, generation):
     peer = tl.program_id(0)
-    dst = tl.load(dst_ptrs + peer)
+    src = src_rows + peer * 7
+    marker = markers + peer
+    dst = dst_rows + peer * 7
+    peer_ready = ready + peer
     tl.inline_asm_elementwise(
         """
         {
-            .reg .pred p;
-            .reg .u32 tid;
+            .reg .pred p, incomplete;
+            .reg .u32 tid, observed, is_ready;
+            .reg .u64 value;
             mov.u32 tid, %tid.x;
             setp.ne.u32 p, tid, 0;
             @p bra done;
-            atom.global.release.sys.exch.b32 tid, [$1], $2;
+            mov.u32 is_ready, 0;
+            atom.global.acquire.sys.cas.b32 observed, [$2], 0xffffffff, 0xffffffff;
+            setp.ne.u32 incomplete, observed, $5;
+            @incomplete bra publish;
+            fence.proxy.alias;
+            ld.relaxed.sys.global.u64 value, [$1 + 0];
+            st.relaxed.gpu.global.u64 [$3 + 0], value;
+            ld.relaxed.sys.global.u64 value, [$1 + 8];
+            st.relaxed.gpu.global.u64 [$3 + 8], value;
+            ld.relaxed.sys.global.u64 value, [$1 + 16];
+            st.relaxed.gpu.global.u64 [$3 + 16], value;
+            ld.relaxed.sys.global.u64 value, [$1 + 24];
+            st.relaxed.gpu.global.u64 [$3 + 24], value;
+            ld.relaxed.sys.global.u64 value, [$1 + 32];
+            st.relaxed.gpu.global.u64 [$3 + 32], value;
+            ld.relaxed.sys.global.u64 value, [$1 + 40];
+            st.relaxed.gpu.global.u64 [$3 + 40], value;
+            ld.relaxed.sys.global.u64 value, [$1 + 48];
+            st.relaxed.gpu.global.u64 [$3 + 48], value;
+            mov.u32 is_ready, 1;
+            publish:
+            st.relaxed.gpu.global.u32 [$4], is_ready;
             done:
             mov.u32 $0, 0;
         }
         """,
-        "=r,l,r",
-        args=[dst, value],
+        "=r,l,l,l,l,r",
+        args=[src, marker, dst, peer_ready, generation],
         dtype=tl.int32,
         is_pure=False,
         pack=1,
     )
-
-
-def publish_value(dst_ptrs: torch.Tensor, value: int):
-    _publish_value[(dst_ptrs.numel(),)](dst_ptrs, value, num_warps=1)
-
-
-@triton.jit
-def _load_acquire(ptr, mask):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .pred p;
-            setp.eq.s32 p, $2, 1;
-            mov.u32 $0, 0;
-            @p atom.global.acquire.sys.cas.b32 $0, [$1], 0xffffffff, 0xffffffff;
-        }
-        """,
-        "=r,l,r",
-        args=[ptr, mask.to(tl.int32)],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _load_relaxed_sys(ptr, mask):
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .pred p;
-            setp.eq.s32 p, $2, 1;
-            mov.u64 $0, 0;
-            @p fence.proxy.alias;
-            @p ld.relaxed.sys.global.u64 $0, [$1];
-        }
-        """,
-        "=l,l,r",
-        args=[ptr, mask.to(tl.int32)],
-        dtype=tl.uint64,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _snapshot_rows_acquire(
-    src_rows,
-    markers,
-    dst_rows,
-    ready,
-    generation,
-    world_size: tl.constexpr,
-    numel: tl.constexpr,
-    block_size: tl.constexpr,
-):
-    offsets = tl.arange(0, block_size)
-    active = offsets < numel
-    complete = active
-    for peer in range(world_size):
-        complete &= _load_acquire(markers + peer, active) == generation
-    values = _load_relaxed_sys(src_rows + offsets, complete)
-    tl.store(dst_rows + offsets, values, mask=complete)
-    tl.store(ready + offsets, complete.to(tl.uint32), mask=offsets == 0)
 
 
 def snapshot_rows_acquire(
@@ -156,40 +117,11 @@ def snapshot_rows_acquire(
     ready: torch.Tensor,
     generation: int,
 ):
-    _snapshot_rows_acquire[(1,)](
+    _snapshot_row_acquire[(markers.numel(),)](
         src_rows,
         markers,
         dst_rows,
         ready,
         generation,
-        markers.numel(),
-        src_rows.numel(),
-        triton.next_power_of_2(src_rows.numel()),
-        num_warps=4,
-    )
-
-
-@triton.jit
-def _all_values_acquire(
-    src,
-    ready,
-    expected,
-    numel: tl.constexpr,
-    block_size: tl.constexpr,
-):
-    offsets = tl.arange(0, block_size)
-    active = offsets < numel
-    values = _load_acquire(src + offsets, active)
-    complete = tl.sum((values == expected).to(tl.int32), axis=0) == numel
-    tl.store(ready, complete.to(tl.uint32))
-
-
-def all_values_acquire(src: torch.Tensor, ready: torch.Tensor, expected: int):
-    _all_values_acquire[(1,)](
-        src,
-        ready,
-        expected,
-        src.numel(),
-        triton.next_power_of_2(src.numel()),
         num_warps=1,
     )

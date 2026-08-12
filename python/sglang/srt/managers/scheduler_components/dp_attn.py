@@ -29,7 +29,7 @@ from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.common import is_cuda, require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -44,7 +44,12 @@ _SYMM_GATHERERS: dict = {}
 
 def _maybe_symm_gatherer(group, device, width: int):
     """Symmetric-memory gatherer for this group, or None to use the collective."""
-    if not envs.SGLANG_USE_SYMM_MEM_DP_SYNC.get() or device == "cpu":
+    if (
+        not envs.SGLANG_USE_SYMM_MEM_DP_SYNC.get()
+        or device == "cpu"
+        or not is_cuda()
+        or torch.cuda.get_device_capability(device)[0] < 7
+    ):
         return None
     key = id(group)
     if key not in _SYMM_GATHERERS:
