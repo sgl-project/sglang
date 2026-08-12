@@ -1386,7 +1386,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return self.runner.run(dispatch_output, quant_info)
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+        # deepep/mori dispatch outputs carry topk_ids/topk_weights directly and
+        # have no `.topk_output`. The runner branches above consume the dispatch
+        # output as-is; only the standard-only branches below (cpu/marlin/
+        # flashinfer) need it, and those never run with an a2a backend.
+        topk_output = getattr(dispatch_output, "topk_output", None)
         if _is_cpu:
             if use_intel_amx_backend(layer):
                 from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
