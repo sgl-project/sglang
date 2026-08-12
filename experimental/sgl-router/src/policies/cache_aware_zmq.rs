@@ -59,12 +59,33 @@ use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
 use crate::policies::{request_tokens_for, Policy, SelectionContext};
-use crate::server::metrics::MetricsRegistry;
+use crate::server::metrics::{CacheAwareDecision, MetricsRegistry};
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::Worker;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+/// Two of the min-load fallbacks are reachable in steady state rather than
+/// being invariant violations, and `select` runs once per *evaluation* — which
+/// admission repeats on a claim race. Logging them per evaluation lets a client
+/// (empty-content messages) or a single misconfigured model flood the log and
+/// bury the genuinely-never-fires `error!` diagnostics beside them.
+///
+/// `sgl_router_cache_aware_decisions_total` already carries the exact volume,
+/// so these logs only need to name the cause: emit the first occurrence, then
+/// roughly 1-in-`FALLBACK_LOG_SAMPLE`. Separate counters so a flood of one
+/// cause cannot starve the other's visibility.
+const FALLBACK_LOG_SAMPLE: u64 = 64;
+static TOKENIZATION_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static HASH_CONFIG_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn should_log(counter: &AtomicU64) -> bool {
+    counter
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(FALLBACK_LOG_SAMPLE)
+}
 
 /// Selection policy that scores candidates by tree-overlap with the
 /// request's prefix and falls back to load-based picking when the tree
@@ -203,8 +224,24 @@ impl CacheAwareZmqPolicy {
     /// form used by tests; production wiring goes through the
     /// `Policy::attach_metrics` hook.
     pub fn with_metrics(self, metrics: Arc<MetricsRegistry>) -> Self {
-        let _ = self.metrics.set(metrics);
+        self.attach_metrics_once(metrics);
         self
+    }
+
+    fn attach_metrics_once(&self, metrics: Arc<MetricsRegistry>) {
+        if self.metrics.set(metrics).is_ok() {
+            tracing::info!("cache-aware-zmq metrics attached");
+        } else {
+            tracing::warn!(
+                "cache-aware-zmq metrics attached more than once; second registry ignored"
+            );
+        }
+    }
+
+    fn record_decision(&self, model_id: &str, decision: CacheAwareDecision) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.record_cache_aware_decision(model_id, decision);
+        }
     }
 
     /// Lowest-load worker by the per-selection load lookup — ties broken by
@@ -250,7 +287,9 @@ impl CacheAwareZmqPolicy {
 
 impl Policy for CacheAwareZmqPolicy {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+        let model_id = ctx.model().0.as_str();
         if workers.is_empty() {
+            self.record_decision(model_id, CacheAwareDecision::NoWorkers);
             return None;
         }
 
@@ -278,6 +317,7 @@ impl Policy for CacheAwareZmqPolicy {
             "cache-aware-zmq: load-balance check considered",
         );
         if balance.imbalanced {
+            self.record_decision(model_id, CacheAwareDecision::LoadImbalance);
             let chosen = Self::pick_min_load(workers, &loads);
             if let Some(w) = &chosen {
                 tracing::info!(
@@ -307,12 +347,35 @@ impl Policy for CacheAwareZmqPolicy {
             _ => {
                 let body = match ctx.request_body() {
                     Some(b) if !b.is_empty() => b,
-                    _ => return Self::pick_min_load(workers, &loads),
+                    _ => {
+                        self.record_decision(model_id, CacheAwareDecision::RequestBodyUnavailable);
+                        tracing::error!(
+                            model = %ctx.model(),
+                            "cache-aware-zmq: policy reached without request tokens or a request body; ingress validation invariant broken",
+                        );
+                        return Self::pick_min_load(workers, &loads);
+                    }
                 };
-                let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-                    return Self::pick_min_load(workers, &loads);
+                let value = match serde_json::from_slice::<serde_json::Value>(body) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.record_decision(model_id, CacheAwareDecision::RequestJsonInvalid);
+                        tracing::error!(
+                            model = %ctx.model(),
+                            error = %error,
+                            "cache-aware-zmq: policy received invalid JSON after ingress validation; invariant broken",
+                        );
+                        return Self::pick_min_load(workers, &loads);
+                    }
                 };
                 let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
+                    self.record_decision(model_id, CacheAwareDecision::TokenizationUnavailable);
+                    if should_log(&TOKENIZATION_LOG_COUNTER) {
+                        tracing::warn!(
+                            model = %ctx.model(),
+                            "cache-aware-zmq: routing tokens unavailable, routing by min-load; check tokenizer and chat encoder configuration. Also expected for requests whose messages carry no text",
+                        );
+                    }
                     return Self::pick_min_load(workers, &loads);
                 };
                 fallback_ids = rt.ids;
@@ -321,37 +384,45 @@ impl Policy for CacheAwareZmqPolicy {
         };
 
         // 3. Hash + match.
-        // Source block_size from the worker — the router can only hash
-        // prompts at the block size the workers publish at. If no worker
-        // has registered yet (oracle empty), cache-aware routing has no
-        // ground truth to score against; fall back to min-load.
-        let Some(block_size) = self.block_size_oracle.get() else {
-            tracing::debug!(
-                model = %ctx.model(),
-                "cache-aware-zmq: block size unknown (no worker page_size yet), falling back to min-load",
-            );
+        // Source both hashing properties from the worker. Reading them as one
+        // published configuration avoids a first-registration window where
+        // block_size is visible but an EAGLE bigram flag is not.
+        let Some((block_size, is_bigram)) = self.block_size_oracle.hash_config() else {
+            self.record_decision(model_id, CacheAwareDecision::HashConfigUnknown);
+            // Not necessarily the startup window: `KvEventIndex::add_worker`
+            // returns before it reaches the oracle when a worker publishes no
+            // KV events, so a fleet where no engine publishes leaves this
+            // permanently unset and the configured policy silently degrades to
+            // min-load for the process lifetime. Warn (sampled) so that state
+            // cannot hide at debug level.
+            if should_log(&HASH_CONFIG_LOG_COUNTER) {
+                tracing::warn!(
+                    model = %ctx.model(),
+                    "cache-aware-zmq: no worker has published a complete block-hashing config, routing by min-load. Transient while workers register; if it persists, no engine is publishing KV events",
+                );
+            }
             return Self::pick_min_load(workers, &loads);
         };
-        // EAGLE-family workers hash KV blocks over token bigrams; the query
-        // hashes must match the worker's stored hashes or the tree lookup
-        // always misses (overlap stays 0). The oracle carries the worker-
-        // reported flag.
-        let is_bigram = self.block_size_oracle.is_bigram();
+        // EAGLE-family workers hash KV blocks over token bigrams; query hashes
+        // must use the same worker-reported mode or overlap always stays zero.
         let block_hashes = if is_bigram {
             compute_block_hashes_bigram(tokens, block_size as usize)
         } else {
             compute_block_hashes(tokens, block_size as usize)
         };
         if block_hashes.is_empty() {
+            self.record_decision(model_id, CacheAwareDecision::NoHashBlocks);
             return Self::pick_min_load(workers, &loads);
         }
         let matched = self.tree.match_prefix(None, &block_hashes);
+        debug_assert!(matched.matched_blocks <= block_hashes.len());
         let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
         tracing::debug!(
             model = %ctx.model(),
             hashing = if is_bigram { "bigram" } else { "unigram" },
             n_blocks = block_hashes.len(),
             matched_blocks = matched.matched_blocks,
+            matched_workers = matched.workers.len(),
             match_rate,
             cache_threshold = self.config.cache_threshold,
             "cache-aware-zmq match_prefix",
@@ -362,14 +433,30 @@ impl Policy for CacheAwareZmqPolicy {
         // min-load. This is the quantitative signal that cache-aware routing
         // is matching prefixes at all.
         if let Some(m) = self.metrics.get() {
-            m.observe_overlap_blocks(ctx.model().0.as_str(), matched.matched_blocks as u64);
+            m.observe_overlap_blocks(model_id, matched.matched_blocks as u64);
+            m.add_cache_aware_query_blocks(model_id, block_hashes.len() as u64);
         }
-        if match_rate <= self.config.cache_threshold || matched.workers.is_empty() {
+        if match_rate <= self.config.cache_threshold {
+            self.record_decision(model_id, CacheAwareDecision::BelowThreshold);
             tracing::debug!(
                 model = %ctx.model(),
+                n_blocks = block_hashes.len(),
+                matched_blocks = matched.matched_blocks,
+                matched_workers = matched.workers.len(),
                 match_rate,
                 cache_threshold = self.config.cache_threshold,
                 "cache-aware-zmq: overlap below threshold, falling back to min-load",
+            );
+            return Self::pick_min_load(workers, &loads);
+        }
+        if matched.workers.is_empty() {
+            self.record_decision(model_id, CacheAwareDecision::MatchedNodeUnowned);
+            tracing::debug!(
+                model = %ctx.model(),
+                n_blocks = block_hashes.len(),
+                matched_blocks = matched.matched_blocks,
+                match_rate,
+                "cache-aware-zmq: matched prefix has no worker owners, falling back to min-load",
             );
             return Self::pick_min_load(workers, &loads);
         }
@@ -381,16 +468,25 @@ impl Policy for CacheAwareZmqPolicy {
             .filter(|w| matched_urls.contains(w.url.as_str()))
             .min_by_key(|w| loads.load_of(w))
             .map(Arc::clone);
-        let chosen = best_matched.or_else(|| Self::pick_min_load(workers, &loads));
-        if let Some(w) = &chosen {
+        let Some(chosen) = best_matched else {
+            self.record_decision(model_id, CacheAwareDecision::MatchedWorkersIneligible);
             tracing::debug!(
                 model = %ctx.model(),
-                worker = %w.url,
+                n_blocks = block_hashes.len(),
                 matched_blocks = matched.matched_blocks,
-                "cache-aware-zmq: selected worker by cache overlap",
+                matched_workers = matched.workers.len(),
+                "cache-aware-zmq: matched workers are not eligible, falling back to min-load",
             );
-        }
-        chosen
+            return Self::pick_min_load(workers, &loads);
+        };
+        self.record_decision(model_id, CacheAwareDecision::CacheHit);
+        tracing::debug!(
+            model = %ctx.model(),
+            worker = %chosen.url,
+            matched_blocks = matched.matched_blocks,
+            "cache-aware-zmq: selected worker by cache overlap",
+        );
+        Some(chosen)
     }
 
     fn needs_request_tokens(&self) -> bool {
@@ -398,7 +494,7 @@ impl Policy for CacheAwareZmqPolicy {
     }
 
     fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
-        let _ = self.metrics.set(metrics);
+        self.attach_metrics_once(metrics);
     }
 }
 
@@ -428,6 +524,7 @@ mod tests {
         let o = BlockSizeOracle::new();
         o.try_set(block_size)
             .expect("fresh oracle accepts first set");
+        o.set_bigram(false);
         o
     }
 
@@ -623,6 +720,26 @@ mod tests {
             rendered.contains("sgl_router_overlap_blocks_count{model_id=\"tiny\"}"),
             "overlap_blocks histogram must be observed on a cache-aware selection; got:\n{rendered}"
         );
+        assert!(
+            rendered.contains(&format!(
+                "sgl_router_cache_aware_query_blocks_total{{model_id=\"tiny\"}} {}",
+                hashes.len()
+            )),
+            "query-block denominator must be recorded; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "sgl_router_overlap_blocks_sum{{model_id=\"tiny\"}} {}",
+                hashes.len()
+            )),
+            "matched-block numerator must use overlap_blocks_sum; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit\"} 1"
+            ),
+            "cache-overlap selection must record its terminal decision; got:\n{rendered}"
+        );
     }
 
     /// Production wiring path: the policy is stored as `Arc<dyn Policy>` in a
@@ -673,6 +790,16 @@ mod tests {
         assert!(
             rendered.contains("sgl_router_overlap_blocks_count{model_id=\"tiny\"}"),
             "PolicyRegistry::attach_metrics must wire overlap recording through the trait; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("sgl_router_cache_aware_query_blocks_total{model_id=\"tiny\"}"),
+            "production metrics injection must wire the lookup denominator; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit\"} 1"
+            ),
+            "production metrics injection must wire policy decisions; got:\n{rendered}"
         );
     }
 
@@ -727,6 +854,145 @@ mod tests {
         assert!(
             rendered.contains("sgl_router_overlap_blocks_count{model_id=\"tiny\"}"),
             "overlap must be recorded even on the below-threshold fallback; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"below_threshold\"} 1"
+            ),
+            "below-threshold fallback reason must be visible; got:\n{rendered}"
+        );
+    }
+
+    /// A full hash match can land on an intermediate tree node whose worker
+    /// owners were removed while a descendant keeps the node alive. This is
+    /// not a renderer/hash miss and must not be counted as below-threshold.
+    #[test]
+    fn full_match_without_owner_records_unowned_node() {
+        let tree = Arc::new(HashTree::new());
+        let tokens: Vec<u32> = (1..=12).collect();
+        let hashes = compute_block_hashes(&tokens, 4);
+        assert_eq!(hashes.len(), 3);
+        let owner = KvWorkerId::new("http://w0:30000".into(), 0);
+        tree.insert(&owner, None, &hashes);
+        tree.remove(&owner, &[hashes[1]]);
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            cfg_default(),
+            Arc::clone(&tree),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let query_tokens = &tokens[..8];
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(query_tokens));
+        let _ = policy.select(&workers, &ctx).expect("min-load fallback");
+
+        let rendered = metrics.render();
+        assert!(rendered.contains(
+            "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"matched_node_unowned\"} 1"
+        ));
+        assert!(
+            !rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"below_threshold\"}"
+            ),
+            "a full hash match with no owner is not a below-threshold parity miss; got:\n{rendered}",
+        );
+    }
+
+    /// A matched tree owner can be absent from the eligible worker slice
+    /// because admission filters workers at their in-flight cap before policy
+    /// selection. Keep that designed load behavior distinct from an unowned
+    /// tree node, which points to tree lifecycle state.
+    #[test]
+    fn matched_owner_outside_candidates_records_ineligible_worker() {
+        let tree = Arc::new(HashTree::new());
+        let tokens: Vec<u32> = (1..=8).collect();
+        let hashes = compute_block_hashes(&tokens, 4);
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            cfg_default(),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let eligible_workers = vec![worker("http://w1:30000", "tiny")];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&tokens));
+        let chosen = policy
+            .select(&eligible_workers, &ctx)
+            .expect("min-load fallback");
+
+        assert_eq!(chosen.url, "http://w1:30000");
+        assert!(metrics.render().contains(
+            "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"matched_workers_ineligible\"} 1"
+        ));
+    }
+
+    /// Each policy evaluation emits exactly one terminal decision even though
+    /// different admission attempts for one request may evaluate the policy
+    /// more than once.
+    #[test]
+    fn each_policy_evaluation_records_exactly_one_decision() {
+        fn decision_total(rendered: &str) -> u64 {
+            rendered
+                .lines()
+                .filter(|line| {
+                    line.starts_with(
+                        "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=",
+                    )
+                })
+                .filter_map(|line| line.split_whitespace().last()?.parse::<u64>().ok())
+                .sum()
+        }
+
+        let tree = Arc::new(HashTree::new());
+        let tokens: Vec<u32> = (1..=8).collect();
+        let hashes = compute_block_hashes(&tokens, 4);
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            cfg_default(),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![worker("http://w0:30000", "tiny")];
+        let model = ModelId("tiny".into());
+
+        let no_workers = SelectionContext::new(&model, None);
+        assert!(policy.select(&[], &no_workers).is_none());
+
+        let no_body = SelectionContext::new(&model, None);
+        let _ = policy
+            .select(&workers, &no_body)
+            .expect("min-load fallback");
+
+        let cache_hit = SelectionContext::new(&model, None).with_request_tokens(Some(&tokens));
+        let _ = policy.select(&workers, &cache_hit).expect("cache hit");
+
+        let rendered = metrics.render();
+        for decision in ["no_workers", "request_body_unavailable", "cache_hit"] {
+            assert!(
+                rendered.contains(&format!(
+                    "sgl_router_cache_aware_decisions_total{{model_id=\"tiny\",decision=\"{decision}\"}} 1"
+                )),
+                "expected exactly one {decision} decision; got:\n{rendered}",
+            );
+        }
+        assert_eq!(
+            decision_total(&rendered),
+            3,
+            "three policy evaluations must emit three total decisions; got:\n{rendered}",
         );
     }
 
@@ -803,7 +1069,7 @@ mod tests {
             );
         }
 
-        // Unigram router (default is_bigram == false) vs the SAME bigram tree:
+        // Unigram router vs the SAME bigram tree:
         // query hashes never match -> overlap recorded as 0.
         {
             let tree = Arc::new(HashTree::new());
@@ -814,6 +1080,7 @@ mod tests {
             );
             let oracle = BlockSizeOracle::new();
             oracle.try_set(block_size).unwrap();
+            oracle.set_bigram(false);
             let metrics = MetricsRegistry::new();
             let policy = new_policy(
                 CacheAwareConfig {

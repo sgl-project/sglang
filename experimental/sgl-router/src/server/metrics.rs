@@ -24,6 +24,8 @@
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
+//! | `sgl_router_cache_aware_query_blocks_total` | Counter | `model_id` |
+//! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
 //! | `sgl_router_worker_health` | Gauge | `worker_url` |
@@ -34,11 +36,12 @@
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
-//! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
-//! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
-//! [`MetricsRegistry::render_with_workers`]) rather than pushed — there is no
-//! health-check loop to push from, and pull-on-scrape means a removed worker
-//! stops emitting series immediately instead of leaving a stale gauge.
+//! The three worker health/state/in-flight gauges and `sgl_router_workers` are
+//! sampled at scrape time from the live [`crate::workers::WorkerRegistry`]
+//! (passed to [`MetricsRegistry::render_with_workers`]) rather than pushed.
+//! `sgl_router_worker_itl_ms` is rendered separately from the current
+//! [`crate::policies::itl::ItlTable`] snapshot via
+//! [`MetricsRegistry::render_worker_itl`].
 //!
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
@@ -200,6 +203,46 @@ impl ActiveLoadKind {
     }
 }
 
+/// Terminal cache-aware policy-evaluation decision. Every invocation of
+/// `CacheAwareZmqPolicy::select` records exactly one of these while bounding
+/// label cardinality.
+///
+/// This is deliberately not a request counter: admission may evaluate the
+/// policy more than once after a claim race, while a parked request handed a
+/// freed worker does not evaluate it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAwareDecision {
+    CacheHit,
+    LoadImbalance,
+    NoWorkers,
+    RequestBodyUnavailable,
+    RequestJsonInvalid,
+    TokenizationUnavailable,
+    HashConfigUnknown,
+    NoHashBlocks,
+    BelowThreshold,
+    MatchedNodeUnowned,
+    MatchedWorkersIneligible,
+}
+
+impl CacheAwareDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CacheHit => "cache_hit",
+            Self::LoadImbalance => "load_imbalance",
+            Self::NoWorkers => "no_workers",
+            Self::RequestBodyUnavailable => "request_body_unavailable",
+            Self::RequestJsonInvalid => "request_json_invalid",
+            Self::TokenizationUnavailable => "tokenization_unavailable",
+            Self::HashConfigUnknown => "hash_config_unknown",
+            Self::NoHashBlocks => "no_hash_blocks",
+            Self::BelowThreshold => "below_threshold",
+            Self::MatchedNodeUnowned => "matched_node_unowned",
+            Self::MatchedWorkersIneligible => "matched_workers_ineligible",
+        }
+    }
+}
+
 /// The shared metrics registry, held on `AppContext`. Cheap to clone — all
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
 #[derive(Debug, Default)]
@@ -220,6 +263,8 @@ pub struct MetricsRegistry {
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
     overlap_blocks: Mutex<HashMap<String, Histogram>>,
+    cache_aware_query_blocks_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -272,6 +317,12 @@ pub struct WorkerSnapshot {
 struct ActiveLoadKey {
     worker_url: String,
     kind: &'static str,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct CacheAwareDecisionKey {
+    model_id: String,
+    decision: &'static str,
 }
 
 #[derive(Debug)]
@@ -373,6 +424,35 @@ impl MetricsRegistry {
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
         hist.observe(blocks as f64);
+    }
+
+    /// Add the query block count from one cache-aware tree lookup.
+    ///
+    /// The match numerator already exists as
+    /// `sgl_router_overlap_blocks_sum`; this counter supplies its denominator.
+    pub fn add_cache_aware_query_blocks(&self, model_id: &str, query: u64) {
+        let mut guard = self.cache_aware_query_blocks_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(query, Ordering::Relaxed);
+    }
+
+    /// Increment the terminal decision for one cache-aware policy evaluation.
+    pub fn record_cache_aware_decision(&self, model_id: &str, decision: CacheAwareDecision) {
+        let key = CacheAwareDecisionKey {
+            model_id: model_id.to_owned(),
+            decision: decision.as_str(),
+        };
+        let mut guard = self.cache_aware_decisions_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Observe end-to-end request latency (seconds) for
@@ -647,6 +727,47 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // cache_aware_query_blocks_total — denominator for overlap_blocks_sum
+        out.push_str(
+            "# HELP sgl_router_cache_aware_query_blocks_total Query blocks considered by cache-aware policy tree lookups.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_aware_query_blocks_total counter\n");
+        let guard = self.cache_aware_query_blocks_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_cache_aware_query_blocks_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // cache_aware_decisions_total — one terminal outcome per policy evaluation
+        out.push_str(
+            "# HELP sgl_router_cache_aware_decisions_total Cache-aware policy evaluations by terminal decision; evaluations are not requests.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_aware_decisions_total counter\n");
+        let guard = self.cache_aware_decisions_total.lock();
+        let mut entries: Vec<(&CacheAwareDecisionKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.decision).cmp(&(&b.0.model_id, b.0.decision)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_cache_aware_decisions_total{{model_id=\"{}\",decision=\"{}\"}} {}\n",
+                escape_label(&key.model_id),
+                key.decision,
+                value,
+            ));
+        }
+        drop(guard);
+
         // active_load gauge
         out.push_str(
             "# HELP sgl_router_active_load Per-worker active load (prefill_tokens or decode_blocks).\n",
@@ -862,6 +983,8 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_ttft_seconds histogram"));
         assert!(out.contains("# TYPE sgl_router_responses_total counter"));
         assert!(out.contains("# TYPE sgl_router_overlap_blocks histogram"));
+        assert!(out.contains("# TYPE sgl_router_cache_aware_query_blocks_total counter"));
+        assert!(out.contains("# TYPE sgl_router_cache_aware_decisions_total counter"));
         assert!(out.contains("# TYPE sgl_router_active_load gauge"));
         assert!(out.contains("# TYPE sgl_router_workers gauge"));
         assert!(out.contains("# TYPE sgl_router_worker_health gauge"));
@@ -1116,6 +1239,30 @@ mod tests {
             out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="tiny",le="4"} 1"#),
             "bucket le=4 should be 1; got:\n{out}",
         );
+    }
+
+    #[test]
+    fn cache_aware_query_blocks_expose_match_ratio_denominator() {
+        let reg = MetricsRegistry::new();
+        reg.add_cache_aware_query_blocks("tiny", 10);
+        reg.add_cache_aware_query_blocks("tiny", 6);
+        let out = reg.render();
+        assert!(out.contains(r#"sgl_router_cache_aware_query_blocks_total{model_id="tiny"} 16"#,));
+    }
+
+    #[test]
+    fn cache_aware_decisions_emit_bounded_reason_labels() {
+        let reg = MetricsRegistry::new();
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::CacheHit);
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::BelowThreshold);
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::BelowThreshold);
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="cache_hit"} 1"#,
+        ));
+        assert!(out.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="below_threshold"} 2"#,
+        ));
     }
 
     #[test]
