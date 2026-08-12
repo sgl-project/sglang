@@ -203,17 +203,31 @@ def rocm_absorb_v_bmm(
     else:
         _bmm_buf = None
         if _use_aiter_gfx95 and attn.w_kc.dtype == torch.float8_e4m3fn:
-            attn_bmm_output = (
-                batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                    X=attn_output,
-                    WQ=attn.w_vc.transpose(-1, -2),
-                    w_scale=attn.w_scale,
-                    group_size=128,
-                    YQ=None,
-                    transpose_bm=False,
-                    transpose_bm_in=True,
-                    dtype=torch.bfloat16,
-                )
+            # Emit the a8w8 GEMM output already in (batch=tokens, heads,
+            # vdim) layout via transpose_bm=True + a preallocated _bmm_buf,
+            # so the downstream epilogue flatten(1, 2) is a free view instead
+            # of the transpose(0, 1).flatten(1, 2) copy that otherwise fires
+            # for per-channel fp8 o_proj (the direct_copy_kernel bf16 seen in
+            # the profile). Mirrors the uint8/MXFP4 _bmm_buf path above.
+            x = attn_output.transpose(0, 1)
+            B_heads, M_batch = x.shape[0], x.shape[1]
+            N_vdim = attn.w_vc.shape[2]
+            _bmm_buf = torch.empty(
+                M_batch,
+                B_heads,
+                N_vdim,
+                device=x.device,
+                dtype=torch.bfloat16,
+            )
+            batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                X=attn_output,
+                WQ=attn.w_vc.transpose(-1, -2),
+                w_scale=attn.w_scale,
+                group_size=128,
+                YQ=_bmm_buf,
+                transpose_bm=True,
+                transpose_bm_in=True,
+                dtype=torch.bfloat16,
             )
         else:
             attn_bmm_output = torch.bmm(
