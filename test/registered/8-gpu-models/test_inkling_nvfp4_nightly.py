@@ -6,11 +6,7 @@ from sglang.test.cache_consistency_jitter import get_jitter_engine, run_jitter_t
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import (
-    LARGE_MODEL_LAUNCH_TIMEOUT,
-    ModelLaunchSettings,
-    is_blackwell_system,
-)
+from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # NVFP4 needs Blackwell FP4 kernels, so this runs on the Blackwell leg of the
 # common 8-GPU suite (Hopper is skipped below).
@@ -59,7 +55,6 @@ class TestInklingNVFP4Nightly(unittest.TestCase):
                 tp_size=8,
                 extra_args=NVFP4_ARGS,
                 variant="TP8",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
         ]
 

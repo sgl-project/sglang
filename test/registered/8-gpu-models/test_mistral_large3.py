@@ -6,11 +6,7 @@ from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import (
-    LARGE_MODEL_LAUNCH_TIMEOUT,
-    ModelLaunchSettings,
-    is_blackwell_system,
-)
+from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # Runs on both H200 and B200: registered once per runner_config below
 # Note: trtllm_mla backend may have hardware-specific behavior
@@ -73,7 +69,6 @@ class TestMistralLarge3(unittest.TestCase):
                 tp_size=8,
                 extra_args=base_args,
                 variant="TP8",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
             # Variant: "eagle" - FP8 model + TP=8 + trtllm_mla + EAGLE with draft model
             ModelLaunchSettings(
@@ -81,7 +76,6 @@ class TestMistralLarge3(unittest.TestCase):
                 tp_size=8,
                 extra_args=base_args + eagle_args,
                 variant="TP8+MTP",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
             # Variant: "nvfp4" - NVFP4 model + TP=8 + trtllm_mla backend
             ModelLaunchSettings(
@@ -89,7 +83,6 @@ class TestMistralLarge3(unittest.TestCase):
                 tp_size=8,
                 extra_args=base_args,
                 variant="NVFP4",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
         ]
 

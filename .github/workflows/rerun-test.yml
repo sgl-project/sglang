@@ -65,6 +65,8 @@ env:
   # Scheduled-only in the stage, but a file registered on both a per-commit and
   # a nightly suite collapses to one rerun, so run the superset.
   SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+  # Hardware fact rather than a suite property, so it comes from the runner label.
+  IS_H200: ${{ inputs.runs_on == '8-gpu-h200' && '1' || '0' }}
   # SGLANG_PRECISION_* stays out: that test pushes to the shared baseline on
   # every run, so a rerun holding the write token could become everyone's next
   # comparison baseline. Without the repo var it fails fast instead.

@@ -84,6 +84,10 @@ env:
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.scheduled && '1' || '0' }}
+  # is_h200_system() (test_utils.py) raises the server-launch ceiling from 600s
+  # to 3600s. Only the scheduled 8-gpu-h200 suites load models that need it;
+  # per-commit stages keep the short ceiling so a hung launch fails fast.
+  IS_H200: ${{ (inputs.scheduled && inputs.runner_config == '8-gpu-h200') && '1' || '0' }}
   # Scheduled suites pull hundreds of GB of checkpoints; the hub's 10s etag
   # default times out on a cold cache.
   HF_HUB_DOWNLOAD_TIMEOUT: 300

@@ -79,7 +79,6 @@ def run_performance_test(
             other_args=model.extra_args,
             variant=model.variant or "",
             extra_bench_args=extra_bench_args,
-            timeout=model.launch_timeout,
             env=model.env,
         )
 

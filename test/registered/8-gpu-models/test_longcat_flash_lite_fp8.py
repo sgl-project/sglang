@@ -4,7 +4,7 @@ from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import LARGE_MODEL_LAUNCH_TIMEOUT, ModelLaunchSettings
+from sglang.test.test_utils import ModelLaunchSettings
 
 register_cuda_ci(est_time=1200, stage="nightly", runner_config="8-gpu-h200")
 
@@ -69,7 +69,6 @@ class TestLongCatFlashLiteFp8(unittest.TestCase):
                 tp_size=8,
                 extra_args=COMMON_ARGS + ["--ep=8"],
                 variant="TP8+EP8+none",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             )
         )
 
@@ -84,7 +83,6 @@ class TestLongCatFlashLiteFp8(unittest.TestCase):
                 tp_size=8,
                 extra_args=COMMON_ARGS + ["--ep=8", "--moe-a2a-backend=deepep"],
                 variant="TP8+EP8+deepep",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             )
         )
 

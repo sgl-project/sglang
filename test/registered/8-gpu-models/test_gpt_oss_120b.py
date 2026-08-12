@@ -3,7 +3,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import LARGE_MODEL_LAUNCH_TIMEOUT, ModelLaunchSettings
+from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200: registered once per runner_config below
 # Higher est_time due to 6 variants with both performance and accuracy tests
@@ -59,7 +59,6 @@ class TestGptOss120B(unittest.TestCase):
                 tp_size=8,
                 extra_args=base_args,
                 variant="MXFP4",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
             # Variant 2: MXFP4 + Parsers + EAGLE3 (full featured quantized, lower batch size)
             ModelLaunchSettings(
@@ -68,7 +67,6 @@ class TestGptOss120B(unittest.TestCase):
                 extra_args=base_args_eagle3 + parser_args + eagle3_args,
                 env=eagle3_env,
                 variant="MXFP4+Parsers+EAGLE3",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
         ]
 

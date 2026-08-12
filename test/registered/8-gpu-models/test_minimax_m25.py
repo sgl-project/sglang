@@ -4,7 +4,7 @@ from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import LARGE_MODEL_LAUNCH_TIMEOUT, ModelLaunchSettings
+from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200: registered once per runner_config below
 register_cuda_ci(est_time=1860, stage="nightly", runner_config="8-gpu-h200")
@@ -41,14 +41,12 @@ class TestMiniMaxM25(unittest.TestCase):
                 tp_size=8,
                 extra_args=base_args,
                 variant="TP8+EP8",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
             ModelLaunchSettings(
                 MINIMAX_M25_MODEL_PATH,
                 tp_size=8,
                 extra_args=dp_attn_args,
                 variant="TP8+DP8+EP8+DPAttn",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
         ]
 

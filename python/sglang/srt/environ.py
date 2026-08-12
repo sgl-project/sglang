@@ -314,6 +314,7 @@ class Envs:
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
+    IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
@@ -1440,8 +1441,6 @@ def redirect_third_party_caches():
 
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_GC_LOG", "SGLANG_LOG_GC")
-    # Superseded by per-test launch_timeout (test_utils.LARGE_MODEL_LAUNCH_TIMEOUT).
-    _print_deprecated_env("IS_H200")
     _print_deprecated_env(
         "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "SGLANG_MOE_NVFP4_DISPATCH"
     )

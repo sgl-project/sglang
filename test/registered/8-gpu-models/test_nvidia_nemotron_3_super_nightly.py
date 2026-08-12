@@ -5,11 +5,7 @@ from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import (
-    LARGE_MODEL_LAUNCH_TIMEOUT,
-    ModelLaunchSettings,
-    is_blackwell_system,
-)
+from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # Runs on both Hopper and Blackwell: registered once per runner_config below
 register_cuda_ci(est_time=3360, stage="nightly", runner_config="8-gpu-h200")
@@ -73,14 +69,12 @@ class TestNvidiaNemotron3SuperNightly(unittest.TestCase):
                 tp_size=8,
                 extra_args=BASE_ARGS + BF16_LOADER_ARGS,
                 variant="TP8",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
             ModelLaunchSettings(
                 NEMOTRON_3_SUPER_BF16_MODEL,
                 tp_size=8,
                 extra_args=BASE_ARGS + BF16_LOADER_ARGS + MTP_ARGS,
                 variant="TP8+MTP",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
         ]
 
@@ -112,14 +106,12 @@ class TestNvidiaNemotron3SuperNightly(unittest.TestCase):
                 tp_size=8,
                 extra_args=BASE_ARGS + NVFP4_LOADER_ARGS,
                 variant="TP8",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
             ModelLaunchSettings(
                 NEMOTRON_3_SUPER_NVFP4_MODEL,
                 tp_size=8,
                 extra_args=BASE_ARGS + NVFP4_LOADER_ARGS + MTP_ARGS,
                 variant="TP8+MTP",
-                launch_timeout=LARGE_MODEL_LAUNCH_TIMEOUT,
             ),
         ]
 
