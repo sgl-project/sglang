@@ -53,6 +53,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu, make_layers
 from sglang.srt.utils.custom_op import register_custom_op
 
+_is_npu = is_npu()
+
 
 def _mhc_pre_fake(
     residual: torch.Tensor,
@@ -99,7 +101,7 @@ def mhc_pre(
     n_splits: int,
     n_splits_pre: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if is_npu():
+    if _is_npu:
         hc_mult = residual.shape[1]
         if hc_sinkhorn_eps != hc_pre_eps:
             raise ValueError(
@@ -146,7 +148,7 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    if is_npu():
+    if _is_npu:
         return torch.ops.npu.hc_post(
             x, residual, post_layer_mix.squeeze(-1), comb_res_mix
         )
@@ -1006,7 +1008,7 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        if is_npu():
+        if _is_npu:
             torch.npu.empty_cache()
             torch.npu.synchronize()
         else:
