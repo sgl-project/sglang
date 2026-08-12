@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -49,7 +50,7 @@ def _init_guardrails(offload_to_cpu: bool = False) -> None:
         "Initializing Cosmos3 guardrails (offload_to_cpu=%s) ...", offload_to_cpu
     )
     _checker = CosmosSafetyChecker()
-    idle_device = "cpu" if offload_to_cpu else "cuda"
+    idle_device = "cpu" if offload_to_cpu else current_platform.device_type
     for runner in (_checker.text_guardrail, _checker.video_guardrail):
         if runner is None or not hasattr(runner, "models"):
             continue
