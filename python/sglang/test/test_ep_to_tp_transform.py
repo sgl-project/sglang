@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import contextlib
 import unittest
-from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -30,7 +29,7 @@ from sglang.srt.layers.moe.ep_to_tp_transform import (
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, initialize_moe_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.runtime_context import get_exec, get_flags
+from sglang.srt.runtime_context import get_flags, get_model, override_platform
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
@@ -171,10 +170,9 @@ def _generate_checkpoint_weights(
     return weights
 
 
-_MOCK_BLACKWELL = patch(
-    "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
-    return_value=True,
-)
+# NVFP4 weight creation takes the Blackwell path; assert the fact rather than
+# the machine, so the test is not silently skipped-by-shape off Blackwell.
+_MOCK_BLACKWELL = override_platform(is_blackwell=True)
 
 
 class _FakeMoEMlp(torch.nn.Module):
@@ -219,25 +217,15 @@ def _mock_flashinfer_trtllm():
 def _force_shared_experts_fusion():
     """Enable fused shared experts for the enclosed block.
 
-    Two independent gates have to be opened:
-
-    * ``DeepseekV2ForCausalLM.determine_num_fused_shared_experts`` only fuses
-      for an allow-list of ``n_routed_experts`` (256 / 384) that the tiny test
-      config is not in. On refusal it also *declares a load-time override*
-      forcing ``disable_shared_experts_fusion=True``, which would clobber the
-      bag override below — so it has to be patched out, not just overridden.
-    * ``DeepseekV2MoE.__init__`` reads ``disable_shared_experts_fusion`` from
-      the resolved ``exec.moe`` bag (not from the ServerArgs record), so that
-      leaf must independently say False for the extra expert slot to appear.
+    The ACTIVE decision lives in the runtime-flags tier: the loader calls
+    install_shared_experts_fusion_decision() once per runner, and the model
+    classes are pure readers via is_shared_experts_fusion_disabled(). These
+    tests construct the model directly, so that installer never runs and the
+    flag keeps whatever initialize_moe_config() seeded — hence the override
+    goes on the flags leaf, not the exec.moe bag (the bag is only consulted
+    when the flag is still None).
     """
-    from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-
-    def _force_fuse(self_model, architecture="DeepseekV3ForCausalLM"):
-        self_model.num_fused_shared_experts = self_model.config.n_shared_experts
-
-    with patch.object(
-        DeepseekV3ForCausalLM, "determine_num_fused_shared_experts", _force_fuse
-    ), get_exec().moe.override(disable_shared_experts_fusion=False):
+    with get_flags().moe.override(disable_shared_experts_fusion=False):
         yield
 
 
@@ -505,20 +493,15 @@ def _snapshot_moe_params(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return snapshot
 
 
-@contextlib.contextmanager
 def _load_tp_by_experts_config(enabled: bool):
-    """Temporarily set load_tp_by_experts in the global server args."""
-    from sglang.srt.server_args import get_global_server_args
+    """Set load_tp_by_experts for the enclosed block.
 
-    server_args = get_global_server_args()
-    old_value = server_args.model_loader_extra_config
-    server_args.model_loader_extra_config = (
-        '{"load_tp_by_experts": true}' if enabled else "{}"
+    The published record is read-only, so the extra-config leaf is moved on
+    the model config bag, which is what is_load_tp_by_experts_enabled() reads.
+    """
+    return get_model().override(
+        model_loader_extra_config=('{"load_tp_by_experts": true}' if enabled else "{}")
     )
-    try:
-        yield
-    finally:
-        server_args.model_loader_extra_config = old_value
 
 
 def _create_model_and_load(
@@ -554,10 +537,9 @@ class TestEpToTpTransform(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.disable_shared_experts_fusion = True
+        server_args = ServerArgs(model_path="dummy", disable_shared_experts_fusion=True)
         set_global_server_args_for_scheduler(server_args)
-        initialize_moe_config(server_args)
+        initialize_moe_config()
 
         init_distributed_environment(
             world_size=-1,
@@ -579,7 +561,6 @@ class TestEpToTpTransform(unittest.TestCase):
         dp_attn._ATTN_DP_RANK = 0
         dp_attn._LOCAL_ATTN_DP_SIZE = 1
         dp_attn._LOCAL_ATTN_DP_RANK = 0
-        dp_attn._ENABLE_DP_ATTENTION_FLAG = False
 
     @classmethod
     def tearDownClass(cls):
