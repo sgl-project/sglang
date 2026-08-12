@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import struct
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -138,8 +139,11 @@ def snapshot_media(media: Any) -> MediaSnapshot:
 
     if isinstance(media, ImageData):
         media = media.url
-    elif isinstance(media, Mapping) and "url" in media and "format" not in media:
-        media = media["url"]
+    elif isinstance(media, Mapping) and "format" not in media:
+        if "url" in media:
+            media = media["url"]
+        elif "image" in media:
+            media = media["image"]
 
     if isinstance(media, (str, bytes)):
         payload = _read_media_bytes(media)
@@ -153,27 +157,96 @@ def snapshot_media(media: Any) -> MediaSnapshot:
     raise TypeError(f"Unsupported media identity input: {type(media).__name__}")
 
 
+def _qualified_type_name(value: Any) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _canonical_sort_key(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 def _canonicalize(value: Any) -> Any:
+    """Encode cache-key inputs without collapsing distinct Python values."""
     if dataclasses.is_dataclass(value):
-        return _canonicalize(dataclasses.asdict(value))
-    if isinstance(value, Enum):
-        return _canonicalize(value.value)
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, Mapping):
         return {
-            str(key): _canonicalize(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            "type": "dataclass",
+            "class": _qualified_type_name(value),
+            "fields": [
+                [field.name, _canonicalize(getattr(value, field.name))]
+                for field in dataclasses.fields(value)
+            ],
         }
-    if isinstance(value, (list, tuple)):
-        return [_canonicalize(item) for item in value]
-    if isinstance(value, set):
-        return sorted((_canonicalize(item) for item in value), key=repr)
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
+    if isinstance(value, Enum):
+        return {
+            "type": "enum",
+            "class": _qualified_type_name(value),
+            "value": _canonicalize(value.value),
+        }
+    if isinstance(value, Path):
+        return {"type": "path", "value": str(value)}
+    if value is None:
+        return {"type": "none"}
+    if isinstance(value, bool):
+        return {"type": "bool", "value": value}
+    if isinstance(value, int):
+        return {"type": "int", "value": str(value)}
+    if isinstance(value, float):
+        return {"type": "float64", "bits": struct.pack("!d", value).hex()}
+    if isinstance(value, str):
+        return {"type": "str", "value": value}
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"type": "bytes", "value": bytes(value).hex()}
     if isinstance(value, torch.dtype):
-        return str(value)
-    return f"{type(value).__module__}.{type(value).__qualname__}"
+        return {"type": "torch_dtype", "value": str(value)}
+    if isinstance(value, torch.Tensor):
+        snapshot = value.detach().to("cpu").contiguous()
+        payload = snapshot.view(torch.uint8).numpy().tobytes()
+        return {
+            "type": "torch_tensor",
+            "dtype": str(snapshot.dtype),
+            "shape": list(snapshot.shape),
+            "digest": _digest_bytes(payload),
+        }
+    if isinstance(value, np.generic):
+        scalar = np.asarray(value)
+        return {
+            "type": "numpy_scalar",
+            "dtype": scalar.dtype.str,
+            "value": scalar.tobytes().hex(),
+        }
+    if isinstance(value, np.ndarray):
+        snapshot = np.ascontiguousarray(value)
+        return {
+            "type": "numpy_array",
+            "dtype": snapshot.dtype.str,
+            "shape": list(snapshot.shape),
+            "digest": _digest_bytes(snapshot.view(np.uint8).tobytes()),
+        }
+    if isinstance(value, Mapping):
+        items = [
+            [_canonicalize(key), _canonicalize(item)] for key, item in value.items()
+        ]
+        items.sort(key=lambda pair: _canonical_sort_key(pair[0]))
+        return {
+            "type": "mapping",
+            "items": items,
+        }
+    if isinstance(value, list):
+        return {"type": "list", "items": [_canonicalize(item) for item in value]}
+    if isinstance(value, tuple):
+        return {"type": "tuple", "items": [_canonicalize(item) for item in value]}
+    if isinstance(value, (set, frozenset)):
+        items = [_canonicalize(item) for item in value]
+        items.sort(key=_canonical_sort_key)
+        return {
+            "type": "frozenset" if isinstance(value, frozenset) else "set",
+            "items": items,
+        }
+    raise TypeError(
+        "Unsupported value in multimodal cache identity: "
+        f"{_qualified_type_name(value)}"
+    )
 
 
 def _canonical_json(value: Any) -> bytes:

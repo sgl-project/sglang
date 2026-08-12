@@ -4,8 +4,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -13,6 +15,7 @@ from sglang.srt.multimodal.cache import (
     CacheReservation,
     MultimodalPreprocessCache,
     build_artifact_key,
+    build_processor_fingerprint,
     estimate_cache_size_bytes,
     parse_content_hash,
     snapshot_media,
@@ -55,6 +58,12 @@ class TestMediaIdentity(unittest.TestCase):
             ]
         self.assertEqual(len({item.content_digest for item in snapshots}), 1)
         self.assertTrue(all(item.data == payload for item in snapshots))
+
+    def test_wrapped_image_input_snapshots_the_image_not_the_wrapper(self):
+        image = Image.new("RGB", (2, 2), (1, 2, 3))
+        direct = snapshot_media(image)
+        wrapped = snapshot_media({"type": "image", "image": image})
+        self.assertEqual(direct.content_digest, wrapped.content_digest)
 
     def test_same_path_with_new_contents_misses(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -101,6 +110,16 @@ class TestMediaIdentity(unittest.TestCase):
         self.assertTrue(tensor_snapshot.data.is_contiguous())
         self.assertTrue(torch.equal(tensor_snapshot.data, tensor))
 
+        same_bytes_new_shape = tensor.contiguous().reshape(2, 2, 6)
+        self.assertNotEqual(
+            tensor_snapshot.content_digest,
+            snapshot_media(same_bytes_new_shape).content_digest,
+        )
+        self.assertNotEqual(
+            snapshot_media(torch.tensor([1], dtype=torch.int32)).content_digest,
+            snapshot_media(torch.tensor([1], dtype=torch.int64)).content_digest,
+        )
+
     def test_pil_palette_and_transparency_are_part_of_identity(self):
         first = Image.new("P", (2, 2), color=0)
         second = first.copy()
@@ -145,6 +164,72 @@ class TestMediaIdentity(unittest.TestCase):
                 preprocess_kwargs={"antialias": False},
             ),
         )
+
+    def test_artifact_key_canonicalization_is_type_preserving(self):
+        digest = snapshot_media(b"image").content_digest
+
+        def key(kwargs):
+            return build_artifact_key(
+                digest,
+                modality="image",
+                processor_fingerprint="processor",
+                preprocess_kwargs=kwargs,
+            )
+
+        # These pairs used to collapse to the same JSON representation. A
+        # processor is allowed to distinguish them, so sharing an artifact
+        # would be a correctness bug rather than a harmless cache collision.
+        self.assertNotEqual(key({1: "value"}), key({"1": "value"}))
+        self.assertNotEqual(key({"value": [1, 2]}), key({"value": (1, 2)}))
+        self.assertNotEqual(key({"value": 1}), key({"value": True}))
+        self.assertNotEqual(
+            key({"value": np.array([1, 2], dtype=np.int32)}),
+            key({"value": np.array([1, 3], dtype=np.int32)}),
+        )
+        self.assertEqual(
+            key({"first": 1, "second": 2}),
+            key({"second": 2, "first": 1}),
+        )
+
+    def test_artifact_key_rejects_lossy_unknown_values(self):
+        digest = snapshot_media(b"image").content_digest
+        with self.assertRaisesRegex(TypeError, "Unsupported value"):
+            build_artifact_key(
+                digest,
+                modality="image",
+                processor_fingerprint="processor",
+                preprocess_kwargs={"value": object()},
+            )
+
+    def test_processor_fingerprint_changes_with_output_affecting_config(self):
+        class Processor:
+            def __init__(self, backend):
+                self.backend = backend
+
+            def preprocess_fingerprint_payload(self):
+                return {"backend": self.backend, "antialias": True}
+
+        config = SimpleNamespace(model_type="vlm", architectures=["VLM"])
+        args = SimpleNamespace(
+            revision="model-revision",
+            tokenizer_revision="tokenizer-revision",
+            disable_fast_image_processor=False,
+            mm_process_config={"image": {"max_pixels": 1024}},
+        )
+        base = build_processor_fingerprint(Processor("gpu"), config, args)
+
+        changed_backend = build_processor_fingerprint(Processor("cpu"), config, args)
+        changed_args = SimpleNamespace(
+            **{
+                **vars(args),
+                "mm_process_config": {"image": {"max_pixels": 2048}},
+            }
+        )
+        changed_config = build_processor_fingerprint(
+            Processor("gpu"), config, changed_args
+        )
+        self.assertNotEqual(base, changed_backend)
+        self.assertNotEqual(base, changed_config)
 
 
 class TestMultimodalPreprocessCache(unittest.TestCase):
