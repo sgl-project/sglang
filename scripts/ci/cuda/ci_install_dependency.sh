@@ -683,11 +683,12 @@ install_extra_deps() {
     MOONCAKE_VERSION="0.3.12.post1"
     NIXL_VERSION="1.3.0"
     # sgl-eval is git-only and cannot be declared in python/pyproject.toml (see
-    # the note there). The nightly GSM8K eval shells out to the sgl-eval CLI and
-    # fails without it. Bumping the SHA can change zero-shot \boxed{} grading, so
-    # re-baseline MODEL_SCORE_THRESHOLDS in
+    # the note there). The nightly GSM8K eval and the GB300 mmmu_pro_vision eval
+    # both shell out to the sgl-eval CLI and fail without it. Bumping the SHA can
+    # change zero-shot \boxed{} grading, so re-baseline MODEL_SCORE_THRESHOLDS in
     # test/registered/eval/test_text_models_gsm8k_eval.py first.
-    SGL_EVAL_REF="b2a2703c42cae379bbcb8b7ff092df6601a61694"
+    # This SHA is the first to carry the mmmu_pro_vision benchmark.
+    SGL_EVAL_REF="df70958ce1414236b161df37a670f5f0c9334b30"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
