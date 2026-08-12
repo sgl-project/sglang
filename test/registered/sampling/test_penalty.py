@@ -29,6 +29,7 @@ class TestPenalty(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--enable-deterministic-inference"],
         )
 
     @classmethod
