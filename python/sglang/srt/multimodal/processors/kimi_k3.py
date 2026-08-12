@@ -23,7 +23,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.mem_cache.multimodal_cache import MM_EMBEDDING_CACHE_LEASE_ID_KEY
+from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_IDENTITY_KEY,
+    MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+)
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.cache import (
     CacheLookup,
@@ -860,6 +863,14 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 )
                 for lookup in resolved
             ),
+            feature_identities=tuple(
+                (
+                    lookup.cached_artifact.artifact_key
+                    if lookup.cached_artifact is not None
+                    else None
+                )
+                for lookup in resolved
+            ),
             identity_sources=tuple(
                 "trusted" if lookup.snapshot is None else "server_computed"
                 for lookup in resolved
@@ -911,6 +922,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 model_specific_data[MM_EMBEDDING_CACHE_LEASE_ID_KEY] = (
                     embedding_lease_id
                 )
+            model_specific_data[MM_EMBEDDING_CACHE_IDENTITY_KEY] = artifact.artifact_key
             item = MultimodalDataItem(
                 modality=Modality.IMAGE,
                 feature=None if featureless else artifact.feature,

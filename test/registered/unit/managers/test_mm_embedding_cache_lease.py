@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_manager import _can_omit_mm_features
 from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_IDENTITY_KEY,
     MM_EMBEDDING_CACHE_LEASE_ID_KEY,
     EmbeddingResult,
     MultiModalStaticCache,
@@ -25,8 +26,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _embedding(value: int) -> EmbeddingResult:
-    return EmbeddingResult(embedding=torch.tensor([value], dtype=torch.int64))
+def _embedding(value: int, identity: str = None) -> EmbeddingResult:
+    return EmbeddingResult(
+        embedding=torch.tensor([value], dtype=torch.int64), identity=identity
+    )
 
 
 def _scheduler(*, world_size: int = 1) -> Scheduler:
@@ -37,11 +40,16 @@ def _scheduler(*, world_size: int = 1) -> Scheduler:
     return scheduler
 
 
-def _featureless_item(mm_hash: int, lease_id: str) -> MultimodalDataItem:
+def _featureless_item(
+    mm_hash: int, lease_id: str, identity: str = None
+) -> MultimodalDataItem:
+    metadata = {MM_EMBEDDING_CACHE_LEASE_ID_KEY: lease_id}
+    if identity is not None:
+        metadata[MM_EMBEDDING_CACHE_IDENTITY_KEY] = identity
     item = MultimodalDataItem(
         modality=Modality.IMAGE,
         feature=None,
-        model_specific_data={MM_EMBEDDING_CACHE_LEASE_ID_KEY: lease_id},
+        model_specific_data=metadata,
     )
     item.hash = mm_hash
     return item
@@ -72,6 +80,63 @@ def test_acquire_requires_every_tp_rank_and_unpins_rejected_items():
     assert output.routed_dp_rank == 2
     assert cache.lease_contains("lease", 11)
     assert not cache.lease_contains("lease", 22)
+
+
+def test_acquire_rejects_a_matching_64_bit_hash_with_a_different_identity():
+    cache = MultiModalStaticCache(max_size=1024)
+    cache.set(11, _embedding(11, identity="artifact-a"))
+    scheduler = _scheduler()
+    request = MMEmbeddingCacheAcquireReqInput(
+        rid="lease",
+        feature_hashes=[11],
+        feature_identities=["artifact-b"],
+        input_ids=[1],
+    )
+
+    with patch.object(mm_schedule, "embedding_cache", cache):
+        output = scheduler.acquire_mm_embedding_cache(request)
+
+    assert output.hit_mask == [False]
+    assert output.lease_id is None
+
+
+def test_scheduler_lookup_rejects_a_hash_collision_after_feature_materialization():
+    cache = MultiModalStaticCache(max_size=1024)
+    cache.set(11, _embedding(11, identity="artifact-a"))
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=torch.tensor([1]),
+        model_specific_data={MM_EMBEDDING_CACHE_IDENTITY_KEY: "artifact-b"},
+    )
+    item.hash = 11
+
+    with patch.object(mm_schedule, "embedding_cache", cache):
+        assert mm_schedule._get_cached_embedding(item) is None
+
+
+def test_admission_rejects_a_lease_with_a_different_strong_identity():
+    cache = MultiModalStaticCache(max_size=1024)
+    cache.set(11, _embedding(11, identity="artifact-a"))
+    cache.acquire_many("lease", [11], ttl_s=300, identities=["artifact-a"])
+    scheduler = _scheduler()
+    item = _featureless_item(11, "lease", identity="artifact-b")
+    request = SimpleNamespace(rid="request", mm_inputs=SimpleNamespace(mm_items=[item]))
+
+    with patch.object(mm_schedule, "embedding_cache", cache):
+        output = scheduler._validate_mm_embedding_leases(request)
+
+    assert output.lease_id == "lease"
+    assert not cache.lease_contains("lease", 11)
+
+
+def test_cache_replaces_an_unpinned_hash_collision_with_the_new_identity():
+    cache = MultiModalStaticCache(max_size=1024)
+    cache.set(11, _embedding(11, identity="artifact-a"))
+
+    assert cache.set(11, _embedding(22, identity="artifact-b"))
+    replacement = cache.get_single(11)
+    assert replacement.identity == "artifact-b"
+    assert replacement.embedding.item() == 22
 
 
 def test_scheduler_admits_then_request_release_drops_lease():

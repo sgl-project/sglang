@@ -1602,6 +1602,7 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
 class MMEmbeddingCacheAcquireReqInput(BaseReq, kw_only=True):
     feature_hashes: List[Optional[int]]
     input_ids: List[int]
+    feature_identities: Optional[List[Optional[str]]] = None
     routed_dp_rank: Optional[int] = None
     bootstrap_room: Optional[int] = None
     ttl_s: float = 300.0

@@ -466,7 +466,9 @@ def test_kimi_k3_epd_embedding_hit_skips_decode_processor_and_vit():
         )
         embedding = torch.arange(4, dtype=torch.float32).reshape(1, 4)
         encoder.mm_preprocess_cache.put(key, artifact)
-        encoder.mm_cache.set(23, EmbeddingResult(embedding=embedding))
+        encoder.mm_cache.set(
+            23, EmbeddingResult(embedding=embedding, identity=artifact.artifact_key)
+        )
         encoder._process_mm_items = AsyncMock(
             side_effect=AssertionError("embedding hit ran processor")
         )

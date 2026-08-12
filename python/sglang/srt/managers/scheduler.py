@@ -1634,7 +1634,10 @@ class Scheduler(
             hit_mask = [False] * len(recv_req.feature_hashes)
         else:
             local_mask = cache.acquire_many(
-                lease_id, recv_req.feature_hashes, recv_req.ttl_s
+                lease_id,
+                recv_req.feature_hashes,
+                recv_req.ttl_s,
+                recv_req.feature_identities,
             )
             mask_tensor = torch.tensor(local_mask, dtype=torch.int32)
             if self.dp_tp_cpu_group is not None and self.dp_tp_group.world_size > 1:
@@ -1673,6 +1676,7 @@ class Scheduler(
         """Reject a featureless request before it enters scheduler queues."""
         from sglang.srt.managers import mm_schedule
         from sglang.srt.mem_cache.multimodal_cache import (
+            MM_EMBEDDING_CACHE_IDENTITY_KEY,
             MM_EMBEDDING_CACHE_LEASE_ID_KEY,
         )
 
@@ -1696,7 +1700,11 @@ class Scheduler(
                 item.feature is not None
                 or item.hash is None
                 or cache is None
-                or not cache.lease_contains(lease_id, item.hash)
+                or not cache.lease_contains(
+                    lease_id,
+                    item.hash,
+                    item.model_specific_data.get(MM_EMBEDDING_CACHE_IDENTITY_KEY),
+                )
             ):
                 invalid_lease_id = lease_id
                 break

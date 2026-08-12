@@ -65,6 +65,7 @@ from sglang.srt.multimodal.cache import (
     EncoderPreprocessArtifact,
     MultimodalPreprocessCache,
     build_artifact_key,
+    build_feature_hash,
     build_processor_fingerprint,
     parse_content_hash,
     snapshot_media,
@@ -1467,20 +1468,21 @@ class MMEncoder:
         artifacts = []
         for index, (lookup, item) in enumerate(zip(lookups, model_items)):
             item.set_pad_value()
+            feature_hash = build_feature_hash(lookup.artifact_key, item.hash)
             if (
                 lookup.artifact is not None
-                and lookup.artifact.feature_hash != item.hash
+                and lookup.artifact.feature_hash != feature_hash
             ):
                 self.mm_preprocess_cache.pop(lookup.artifact_key)
                 raise InternalError(
                     "K3 encoder feature hash changed for identical artifact "
                     f"{lookup.artifact_key}: "
-                    f"{lookup.artifact.feature_hash} != {item.hash}"
+                    f"{lookup.artifact.feature_hash} != {feature_hash}"
                 )
             artifact = EncoderPreprocessArtifact(
                 content_digest=lookup.content_digest,
                 artifact_key=lookup.artifact_key,
-                feature_hash=item.hash,
+                feature_hash=feature_hash,
                 grid_thw=tuple(int(value) for value in grid_thw[index]),
                 original_size=tuple(int(value) for value in original_sizes[index]),
             )
@@ -2375,7 +2377,9 @@ class MMEncoder:
                 if artifact is None:
                     continue
                 cached = self.mm_cache.get_single(artifact.feature_hash)
-                if cached is not None:
+                if cached is not None and self.mm_cache.matches_identity(
+                    cached, artifact.artifact_key
+                ):
                     embeddings[index] = cached.embedding
 
         missing_indices = [
@@ -2527,17 +2531,18 @@ class MMEncoder:
                 item = model_items[position]
                 lookup = lookups[request_index]
                 prior = artifacts[request_index]
-                if prior is not None and prior.feature_hash != item.hash:
+                feature_hash = build_feature_hash(lookup.artifact_key, item.hash)
+                if prior is not None and prior.feature_hash != feature_hash:
                     self.mm_preprocess_cache.pop(lookup.artifact_key)
                     raise InternalError(
                         "K3 encoder feature hash changed for identical artifact "
                         f"{lookup.artifact_key}: "
-                        f"{prior.feature_hash} != {item.hash}"
+                        f"{prior.feature_hash} != {feature_hash}"
                     )
                 artifact = EncoderPreprocessArtifact(
                     content_digest=lookup.content_digest,
                     artifact_key=lookup.artifact_key,
-                    feature_hash=item.hash,
+                    feature_hash=feature_hash,
                     grid_thw=tuple(int(value) for value in grid_thw[position]),
                     original_size=tuple(
                         int(value) for value in original_sizes[position]
@@ -2559,7 +2564,9 @@ class MMEncoder:
                     self.mm_preprocess_cache.put(key, artifact)
                     self.mm_cache.set(
                         artifact.feature_hash,
-                        EmbeddingResult(embedding=embedding),
+                        EmbeddingResult(
+                            embedding=embedding, identity=artifact.artifact_key
+                        ),
                     )
             return owner_results
         return {}

@@ -10,6 +10,7 @@ import torch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 MM_EMBEDDING_CACHE_LEASE_ID_KEY = "mm_embedding_cache_lease_id"
+MM_EMBEDDING_CACHE_IDENTITY_KEY = "mm_embedding_cache_identity"
 
 
 class MultimodalCache(abc.ABC):
@@ -75,6 +76,7 @@ def _get_tensor_size(embedding: torch.Tensor):
 @dataclass(kw_only=True)
 class EmbeddingResult:
     embedding: torch.Tensor
+    identity: Optional[str] = None
 
 
 @dataclass
@@ -148,8 +150,18 @@ class MultiModalStaticCache(MultimodalCache):
         with self._lock:
             self._reap_expired_leases_locked()
             if mm_hash in self.mm_cache:
-                self.mm_cache.move_to_end(mm_hash)
-                return True
+                existing = self.mm_cache[mm_hash]
+                if (
+                    embedding.identity is not None
+                    and existing.identity != embedding.identity
+                ):
+                    if self._pin_counts.get(mm_hash, 0):
+                        return False
+                    self.mm_cache.pop(mm_hash)
+                    self.current_size -= _get_tensor_size(existing.embedding)
+                else:
+                    self.mm_cache.move_to_end(mm_hash)
+                    return True
             data_size = _get_tensor_size(embedding.embedding)
             while self.current_size + data_size > self.max_size:
                 evictable_hash = next(
@@ -174,29 +186,49 @@ class MultiModalStaticCache(MultimodalCache):
                 self.mm_cache.move_to_end(mm_hash)
             return embedding
 
+    @staticmethod
+    def matches_identity(
+        embedding: EmbeddingResult, expected_identity: Optional[str]
+    ) -> bool:
+        return expected_identity is None or embedding.identity == expected_identity
+
     def acquire_many(
         self,
         lease_id: str,
         mm_hashes: List[Optional[int]],
         ttl_s: float,
+        identities: Optional[List[Optional[str]]] = None,
     ) -> List[bool]:
         """Atomically pin every currently available per-item embedding."""
         if ttl_s <= 0:
             raise ValueError("lease ttl must be positive")
+        if identities is None:
+            identities = [None] * len(mm_hashes)
+        if len(identities) != len(mm_hashes):
+            raise ValueError("embedding identities must align with hashes")
         with self._lock:
             self._reap_expired_leases_locked()
             self._release_lease_locked(lease_id)
+            hit_mask = [
+                mm_hash is not None
+                and mm_hash in self.mm_cache
+                and self.matches_identity(self.mm_cache[mm_hash], identity)
+                for mm_hash, identity in zip(mm_hashes, identities)
+            ]
             entries = {
                 mm_hash: self.mm_cache[mm_hash]
-                for mm_hash in mm_hashes
-                if mm_hash is not None and mm_hash in self.mm_cache
+                for mm_hash, hit in zip(mm_hashes, hit_mask)
+                if hit
             }
             for mm_hash in entries:
                 self._pin_counts[mm_hash] = self._pin_counts.get(mm_hash, 0) + 1
                 self.mm_cache.move_to_end(mm_hash)
             if entries:
                 remaining = {
-                    mm_hash: sum(value == mm_hash for value in mm_hashes)
+                    mm_hash: sum(
+                        value == mm_hash and hit
+                        for value, hit in zip(mm_hashes, hit_mask)
+                    )
                     for mm_hash in entries
                 }
                 self._leases[lease_id] = _EmbeddingLease(
@@ -204,7 +236,7 @@ class MultiModalStaticCache(MultimodalCache):
                     remaining=remaining,
                     expires_at=time.monotonic() + ttl_s,
                 )
-            return [mm_hash is not None and mm_hash in entries for mm_hash in mm_hashes]
+            return hit_mask
 
     def release_lease_hashes(self, lease_id: str, mm_hashes: List[int]) -> None:
         with self._lock:
@@ -248,7 +280,12 @@ class MultiModalStaticCache(MultimodalCache):
                 self._leases.pop(lease_id, None)
             return embedding
 
-    def get_leased(self, lease_id: str, mm_hash: int) -> Optional[EmbeddingResult]:
+    def get_leased(
+        self,
+        lease_id: str,
+        mm_hash: int,
+        identity: Optional[str] = None,
+    ) -> Optional[EmbeddingResult]:
         """Return an admitted request's pinned embedding without releasing it.
 
         Chunked prefill can revisit one image in more than one scheduler step.
@@ -258,17 +295,29 @@ class MultiModalStaticCache(MultimodalCache):
         with self._lock:
             self._reap_expired_leases_locked()
             lease = self._leases.get(lease_id)
-            return None if lease is None else lease.entries.get(mm_hash)
+            if lease is None:
+                return None
+            embedding = lease.entries.get(mm_hash)
+            if embedding is None or not self.matches_identity(embedding, identity):
+                return None
+            return embedding
 
     def release_lease(self, lease_id: str) -> bool:
         with self._lock:
             return self._release_lease_locked(lease_id)
 
-    def lease_contains(self, lease_id: str, mm_hash: int) -> bool:
+    def lease_contains(
+        self,
+        lease_id: str,
+        mm_hash: int,
+        identity: Optional[str] = None,
+    ) -> bool:
         with self._lock:
             self._reap_expired_leases_locked()
             lease = self._leases.get(lease_id)
-            return lease is not None and lease.remaining.get(mm_hash, 0) > 0
+            if lease is None or lease.remaining.get(mm_hash, 0) <= 0:
+                return False
+            return self.matches_identity(lease.entries[mm_hash], identity)
 
     def admit_lease(self, lease_id: str) -> bool:
         """Transfer a live lease to an admitted request's lifecycle.

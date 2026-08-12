@@ -1142,7 +1142,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ):
                     try:
                         acquire = await self._acquire_mm_embedding_cache(
-                            obj, input_ids, preprocess_cache_lookup.feature_hashes
+                            obj,
+                            input_ids,
+                            preprocess_cache_lookup.feature_hashes,
+                            preprocess_cache_lookup.feature_identities,
                         )
                     except Exception as error:
                         acquire = None
@@ -1358,6 +1361,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: GenerateReqInput,
         input_ids,
         feature_hashes: tuple[Optional[int], ...],
+        feature_identities: tuple[Optional[str], ...],
     ) -> MMEmbeddingCacheAcquireReqOutput:
         acquire_id = f"{obj.rid}:mm-cache:{uuid.uuid4().hex}"
         future = asyncio.get_running_loop().create_future()
@@ -1365,6 +1369,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         request = MMEmbeddingCacheAcquireReqInput(
             rid=acquire_id,
             feature_hashes=list(feature_hashes),
+            feature_identities=list(feature_identities),
             input_ids=list(input_ids or []),
             routed_dp_rank=obj.routed_dp_rank,
             bootstrap_room=obj.bootstrap_room,
