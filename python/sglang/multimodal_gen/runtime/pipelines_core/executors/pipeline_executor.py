@@ -6,6 +6,7 @@ Base class for all pipeline executors.
 """
 
 import contextlib
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, List
 
@@ -152,6 +153,21 @@ class PipelineExecutor(ABC):
                 batches = self.execute_group(stages, batches, server_args)
         return batches
 
+    def execute_group_sequentially_with_profiling(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Run the AR stage as a group, then yield each completed DiT request."""
+        with self.profile_execution(batches[0], dump_rank=0):
+            with current_platform.inference_mode():
+                yield from self.execute_group_sequentially(
+                    stages,
+                    batches,
+                    server_args,
+                )
+
     @staticmethod
     @contextlib.contextmanager
     def _stage_execution_context(stage: "PipelineStage", server_args: ServerArgs):
@@ -244,6 +260,43 @@ class PipelineExecutor(ABC):
         for stage in stages:
             batches = stage.run_grouped_requests(batches, server_args)
         return batches
+
+    def execute_group_sequentially(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Yield outputs after batched AR and sequential DiT/VAE inference."""
+        batches = self.execute_group(stages[:1], batches, server_args)
+
+        remaining_stages = stages[1:]
+        sequential_start_time = time.monotonic()
+        for parent_batch in batches:
+            for batch in stages[0].iter_sequential_requests(parent_batch, server_args):
+                if batch.metrics is not None:
+                    batch.metrics.record_stage(
+                        "PipelineExecutor.sequential_wait",
+                        time.monotonic() - sequential_start_time,
+                    )
+                try:
+                    output = self.execute(remaining_stages, batch, server_args)
+                except Exception as e:
+                    logger.error(
+                        "Sequential DiT/VAE inference failed for request %s: %s",
+                        batch.request_id,
+                        e,
+                        exc_info=True,
+                    )
+                    output = OutputBatch(
+                        error=f"Error executing grouped request {batch.request_id}: {e}",
+                        metrics=batch.metrics,
+                    )
+                yield output
+                del output
+                del batch
+                if current_platform.is_npu():
+                    torch.get_device_module().empty_cache()
 
     @contextlib.contextmanager
     def profile_execution(self, batch: Req, dump_rank: int = 0):

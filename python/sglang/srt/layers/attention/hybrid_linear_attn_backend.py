@@ -11,6 +11,7 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
+    track_mamba_states_all_layers,
     track_mamba_states_if_needed,
 )
 from sglang.srt.configs.hybrid_arch import mamba2_config
@@ -24,7 +25,11 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    mamba_cache_chunk_size,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -118,7 +123,7 @@ class MambaAttnBackendBase(AttentionBackend):
             # The ring cursor is a per-slot decode counter shared by all GDN layers;
             # manage it once here (snapshot, hand to layers, advance mod L), not per-layer.
             # Gate on the linear_replayssm FLAG, not on cursor-tensor presence: the
-            # spec-verify ring (--enable-gdn-replayssm-spec) shares the write_pos
+            # spec-verify ring (--enable-linear-replayssm-spec) shares the write_pos
             # allocation but owns it exclusively via commit_gdn_replayssm_spec
             # (advance-by-accept-count once per verify step). Advancing it here as
             # well inserts one phantom/stale ring entry per step and cumulatively
@@ -178,13 +183,18 @@ class MambaAttnBackendBase(AttentionBackend):
                 # skip mamba metadata.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
-                query_start_loc = torch.arange(
-                    0,
-                    forward_batch.input_ids.shape[0] + 1,
-                    step=forward_batch.spec_info.draft_token_num,
-                    dtype=torch.int32,
-                    device=forward_batch.input_ids.device,
-                )
+                ragged_layout = forward_batch.spec_info.ragged_verify_layout
+                if ragged_layout is not None:
+                    # Compact ragged verify: variable per-request verify lens.
+                    query_start_loc = ragged_layout.qo_indptr_device
+                else:
+                    query_start_loc = torch.arange(
+                        0,
+                        forward_batch.input_ids.shape[0] + 1,
+                        step=forward_batch.spec_info.draft_token_num,
+                        dtype=torch.int32,
+                        device=forward_batch.input_ids.device,
+                    )
 
                 if self.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
@@ -291,8 +301,8 @@ class MambaAttnBackendBase(AttentionBackend):
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
         )
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
-        aligned_len = (lens_to_track // mamba_cache_chunk_size) * mamba_cache_chunk_size
+        chunk_size = mamba_cache_chunk_size()
+        aligned_len = (lens_to_track // chunk_size) * chunk_size
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
         start_indices = start_indices[forward_batch.mamba_track_mask]
 
@@ -310,7 +320,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        chunk_size = mamba_cache_chunk_size()
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -320,9 +330,9 @@ class MambaAttnBackendBase(AttentionBackend):
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
         if isinstance(self, Mamba2AttnBackend):
-            num_h_states = extend_seq_lens // mamba_cache_chunk_size
+            num_h_states = extend_seq_lens // chunk_size
         else:
-            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
+            num_h_states = (extend_seq_lens - 1) // chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -332,17 +342,17 @@ class MambaAttnBackendBase(AttentionBackend):
         offset_masked = track_ssm_src_offset[mamba_track_mask]
         dst_masked = mamba_track_indices[mamba_track_mask]
 
-        is_aligned = (lens_masked % mamba_cache_chunk_size) == 0
+        is_aligned = (lens_masked % chunk_size) == 0
 
         # Aligned: last_recurrent_state from ssm_states.
         track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
         track_ssm_final_dst = dst_masked[is_aligned]
 
         # Unaligned: intermediate state from h.
-        # TODO: handle mamba_cache_chunk_size % page size != 0
+        # TODO: handle chunk_size % page size != 0
         not_aligned = ~is_aligned
         track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // mamba_cache_chunk_size
+            lens_masked[not_aligned] // chunk_size
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
@@ -371,7 +381,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """True iff --enable-linear-replayssm is on for this pool.
 
         Gate on the FLAG, not on ``replayssm_write_pos is not None``: the
-        spec-verify ring (--enable-gdn-replayssm-spec) also allocates the
+        spec-verify ring (--enable-linear-replayssm-spec) also allocates the
         cursor tensor but owns it exclusively via commit_gdn_replayssm_spec.
         The decode-ring metadata machinery gated here (per-bs static cursor
         buffers, the per-replay snapshot + advance-by-one in _replay_metadata,
@@ -485,9 +495,16 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+            ragged_layout = (
+                spec_info.ragged_verify_layout if spec_info is not None else None
             )
+            if ragged_layout is not None:
+                # Ragged capture: qsl from the runner's synthetic layout.
+                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+            else:
+                self.query_start_loc_list[bs - 1].copy_(
+                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -654,7 +671,19 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            if num_padding == 0:
+            ragged_layout = (
+                spec_info.ragged_verify_layout if spec_info is not None else None
+            )
+            if ragged_layout is not None:
+                # Mamba kernels index dense [bs, N] scratch, so they need the
+                # capped variant (see padded_to_bucket). Padding rows carry
+                # mamba slot -1 and are skipped.
+                if ragged_layout.bs != bs or ragged_layout.cap is None:
+                    ragged_layout = ragged_layout.padded_to_bucket(
+                        padded_bs=bs, cap=spec_info.draft_token_num
+                    )
+                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+            elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
@@ -705,26 +734,73 @@ class MambaAttnBackendBase(AttentionBackend):
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
 
+    def _track_pools(self):
+        """Full [num_layers, pool_size, ...] conv/ssm pools plus the pool index
+        of the last mamba layer, for the fused all-layers track launch. None if
+        the pool shape is not the expected layout."""
+        cached = getattr(self, "_track_pools_cache", False)
+        if cached is False:
+            pools = None
+            try:
+                mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+                conv_pool = mamba_cache.conv[0]
+                ssm_pool = mamba_cache.temporal
+                last_pool_idx = max(self.req_to_token_pool.mamba_map.values())
+                if (
+                    conv_pool.dim() >= 3
+                    and ssm_pool.dim() >= 3
+                    and conv_pool.shape[0] == ssm_pool.shape[0] == last_pool_idx + 1
+                ):
+                    pools = (conv_pool, ssm_pool, last_pool_idx)
+            except (AttributeError, IndexError):
+                pools = None
+            self._track_pools_cache = pools
+            cached = pools
+        return cached
+
     def _track_mamba_state_decode(
         self,
         forward_batch: ForwardBatch,
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        layer_id: Optional[int] = None,
     ):
         """Copy decode conv/SSM states to track slots for prefix caching. Track
         dests come from the metadata (under cuda-graph: the static buffer), so the
-        InputBuffer registry slot is never mutated."""
-        if forward_batch.mamba_track_mask is not None:
-            track_mamba_states_if_needed(
-                conv_states,
-                ssm_states,
-                cache_indices,
-                forward_batch.mamba_track_mask,
-                self.forward_metadata.mamba_track_indices,
-                forward_batch.batch_size,
-                check_freed_slots=self.enable_unified_memory,
-            )
+        InputBuffer registry slot is never mutated.
+
+        With a known layer_id, the per-layer launches collapse into ONE
+        all-layers launch fired at the last mamba layer: the mask/src/dst
+        indices are shared across layers and every layer's state is final by
+        then, so the result is identical."""
+        if forward_batch.mamba_track_mask is None:
+            return
+        if layer_id is not None:
+            pools = self._track_pools()
+            if pools is not None:
+                conv_pool, ssm_pool, last_pool_idx = pools
+                if self.req_to_token_pool.mamba_map.get(layer_id) != last_pool_idx:
+                    return
+                track_mamba_states_all_layers(
+                    conv_pool,
+                    ssm_pool,
+                    cache_indices,
+                    forward_batch.mamba_track_mask,
+                    self.forward_metadata.mamba_track_indices,
+                    forward_batch.batch_size,
+                    check_freed_slots=self.enable_unified_memory,
+                )
+                return
+        track_mamba_states_if_needed(
+            conv_states,
+            ssm_states,
+            cache_indices,
+            forward_batch.mamba_track_mask,
+            self.forward_metadata.mamba_track_indices,
+            forward_batch.batch_size,
+            check_freed_slots=self.enable_unified_memory,
+        )
 
     def _track_mamba_state_extend(
         self,
@@ -890,10 +966,23 @@ class HybridLinearAttnBackend(AttentionBackend):
             full_attn_backend.needs_cpu_seq_lens
             or linear_attn_backend.needs_cpu_seq_lens
         )
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
+        ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     @property
     def data_type(self):
+        # KV-cache dtype readers (e.g. the trtllm_mla fused-rope check) reach the
+        # wrapper since split backends are wrapped once (#31439); the full-attn
+        # side owns the KV cache, so its dtype is authoritative.
         return self.full_attn_backend.data_type
+
+    @property
+    def supports_ragged_verify_graph(self) -> bool:
+        return (
+            self.full_attn_backend.supports_ragged_verify_graph
+            and self.linear_attn_backend.supports_ragged_verify_graph
+        )
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
@@ -1115,15 +1204,44 @@ class HybridLinearAttnBackend(AttentionBackend):
         del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
 
+        # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
+        if mamba_track_indices is not None:
+            mamba_track_indices = self.linear_attn_backend._translate_mamba_indices(
+                mamba_track_indices
+            )
+
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
                 :request_number
             ]
         )
 
-        mamba_caches = (
-            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        )
+        req_pool = self.linear_attn_backend.req_to_token_pool
+        mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
+
+        # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
+        # during verify); no intermediate_ssm is allocated. Replay the accepted
+        # prefix into `temporal` instead of scattering an intermediate state.
+        # dspark/dflash call this method directly; the generic spec_utils commit
+        # handles replayssm before reaching here (returns early), so this branch is
+        # only hit by the direct callers. Chain layout only (topk <= 1), so
+        # accept_lens == last_correct_step_indices + 1.
+        mamba_pool = req_pool.mamba_pool
+        if getattr(mamba_pool, "replayssm_is_kda", False):
+            from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+                commit_kda_replayssm_after_verify,
+            )
+
+            commit_kda_replayssm_after_verify(
+                spec_state=mamba_caches,
+                state_batch_indices=state_indices_tensor,
+                accept_lens=last_correct_step_indices + 1,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
+            )
+            return
 
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,

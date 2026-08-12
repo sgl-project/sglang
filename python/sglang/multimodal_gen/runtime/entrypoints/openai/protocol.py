@@ -13,6 +13,20 @@ class ImageResponseData(BaseModel):
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
     file_path: Optional[str] = None
+    resize: Optional[str] = None
+
+
+class ImagePromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
+class ImageUsage(BaseModel):
+    prompt_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    prompt_tokens_details: Optional[ImagePromptTokensDetails] = None
+    reasoning_tokens: Optional[int] = 0
+    image_count: Optional[int] = None
 
 
 class ImageResponse(BaseModel):
@@ -21,6 +35,7 @@ class ImageResponse(BaseModel):
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    usage: Optional[ImageUsage] = None
 
 
 class ImageGenerationsRequest(BaseModel):

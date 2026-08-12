@@ -23,9 +23,18 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import AbortReq, BatchStrOutput, GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
-from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    AbortReq,
+    BatchStrOutput,
+    GenerateReqInput,
+)
+from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
+    ReqState,
+    TokenizerManager,
+)
+from sglang.srt.observability.req_time_stats import (  # noqa: E402
+    APIServerReqTimeStats,
+)
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -409,6 +418,7 @@ def _make_tm_for_generate() -> TokenizerManager:
     tm = _make_tokenizer_manager()
     tm.server_args.language_only = False
     tm.server_args.tokenizer_worker_num = 1
+    tm.server_args.enable_strict_thinking = False
     tm.auto_create_handle_loop = Mock()
     tm._set_default_priority = Mock()
     tm.request_logger = Mock()
@@ -429,6 +439,7 @@ def _make_generate_obj(rid, is_single):
     obj.received_time = 0.0
     obj.external_trace_header = None
     obj.bootstrap_room = None
+    obj.max_thinking_tokens = None
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
         obj.__getitem__.side_effect = lambda i: Mock()
@@ -469,6 +480,60 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj.rid = ["p1", "already_gone"]
         tm._discard_pending_req_states(obj)  # must not raise
         self.assertNotIn("p1", tm.rid_to_state)
+
+
+class TestParallelStreamTaskCleanup(CustomTestCase):
+    def test_failing_choice_cancels_and_closes_sibling_waiters(self):
+        tm = _make_tokenizer_manager()
+
+        async def drive():
+            sibling_closed = asyncio.Event()
+
+            async def failing_choice():
+                await asyncio.sleep(0)
+                raise RuntimeError("choice failed")
+                yield  # pragma: no cover
+
+            async def blocked_choice():
+                try:
+                    await asyncio.Event().wait()
+                    yield  # pragma: no cover
+                finally:
+                    sibling_closed.set()
+
+            stream = tm._stream_batch_responses(
+                [failing_choice(), blocked_choice()],
+                ["choice-0", "choice-1"],
+            )
+            with self.assertRaisesRegex(RuntimeError, "choice failed"):
+                await stream.__anext__()
+            self.assertTrue(sibling_closed.is_set())
+
+        asyncio.run(drive())
+
+    def test_failing_non_stream_choice_cancels_and_closes_sibling_waiters(self):
+        tm = _make_tokenizer_manager()
+
+        async def drive():
+            sibling_closed = asyncio.Event()
+
+            async def failing_choice():
+                await asyncio.sleep(0)
+                raise RuntimeError("choice failed")
+                yield  # pragma: no cover
+
+            async def blocked_choice():
+                try:
+                    await asyncio.Event().wait()
+                    yield  # pragma: no cover
+                finally:
+                    sibling_closed.set()
+
+            with self.assertRaisesRegex(RuntimeError, "choice failed"):
+                await tm._collect_batch_responses([failing_choice(), blocked_choice()])
+            self.assertTrue(sibling_closed.is_set())
+
+        asyncio.run(drive())
 
 
 class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
@@ -521,6 +586,23 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         # All sub-request entries created by _init_req_state are cleaned up.
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
+
+    def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
+        tm = _make_tm_for_generate()
+        obj = GenerateReqInput(
+            text="hello",
+            rid="thinking-budget",
+            sampling_params={},
+            max_thinking_tokens=32,
+        )
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaisesRegex(ValueError, "--enable-strict-thinking"):
+            asyncio.run(drive())
+
+        self.assertFalse(tm.rid_to_state)
 
 
 if __name__ == "__main__":

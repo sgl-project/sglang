@@ -570,13 +570,21 @@ def tpool_patch_merger(
     x: torch.Tensor,
     grid_thws: torch.Tensor,
     merge_kernel_size: tuple[int, int] = (2, 2),
+    *,
+    grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
 ) -> List[torch.Tensor]:
-    """Group spatial patches and average only across real video frames."""
+    """Group spatial patches and average only across real video frames.
+
+    ``grid_thw_list`` lets a graph-aware tower pass the host grid it already
+    has instead of paying a device sync for ``grid_thws.tolist()``.
+    """
 
     d_model = x.size(-1)
     outputs = []
     pre_sum = 0
-    for t, h, w in grid_thws.tolist():
+    shapes = grid_thws.tolist() if grid_thw_list is None else grid_thw_list
+    for t, h, w in shapes:
+        t, h, w = int(t), int(h), int(w)
         seq = x[pre_sum : pre_sum + t * h * w]
         kernel_height, kernel_width = merge_kernel_size
         new_height, new_width = h // kernel_height, w // kernel_width
