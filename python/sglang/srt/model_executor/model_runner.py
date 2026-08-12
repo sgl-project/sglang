@@ -722,6 +722,11 @@ class ModelRunner:
             ElasticEPStateManager.init(self.server_args)
 
     def init_token_oracle(self):
+        # The oracle sampler is process-wide, so a draft would overwrite the
+        # target's with its own vocab -- which a DFlash draft does not have.
+        if self.is_draft_worker:
+            self._token_oracle_manager = None
+            return
         self._token_oracle_manager = install_token_oracle_from_env(
             server_args=self.server_args,
             vocab_size=self.model_config.vocab_size,
@@ -1301,6 +1306,7 @@ class ModelRunner:
                     else False
                 ),
                 speculative_draft_attention_backend=self.draft_attention_backend,
+                speculative_draft_kv_cache_dtype=self.server_args.speculative_draft_kv_cache_dtype,
             )
         )
         # This runner's OWN resolved dtype string (target or draft). Attention
