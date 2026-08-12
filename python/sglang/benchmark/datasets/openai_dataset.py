@@ -3,7 +3,7 @@ from argparse import Namespace
 from dataclasses import dataclass
 from typing import List, Optional
 
-import numpy as npƒ
+import numpy as np
 from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
