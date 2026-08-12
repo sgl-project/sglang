@@ -2,7 +2,6 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_block
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
@@ -10,11 +9,8 @@ MINIMAX_H3_ADALN_MODALITY_NUM = 3
 
 @dataclass
 class MiniMaxH3DiTArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
-
-    # Accept the Diffusers/PEFT aliases in the same source-to-native mapping
-    # used by the model loader. H3 fuses Q/K/V, so split PEFT projections are
-    # stacked and consumed by MergedColumnParallelLinearWithLoRA.
+    # accept Diffusers/PEFT aliases in the source-to-native model mapping
+    # H3 fuses Q/K/V, so split projections are stacked for the fused LoRA layer
     param_names_mapping: dict = field(
         default_factory=lambda: {
             r"^(.*\.lora_[AB])\.[^.]+$": r"\1",
