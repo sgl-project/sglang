@@ -665,6 +665,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
+# Install the EIC SDK used by the EIC HiCache backend.
+RUN python3 -m pip install --force-reinstall \
+    https://eic-sdk-release.tos-cn-beijing.volces.com/python/eic-1.5.2-py3-none-any.whl \
+    --no-cache-dir
+
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
