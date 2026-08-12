@@ -54,19 +54,10 @@ class MlxLaunch:
 
     Produced by :meth:`MlxTpModelWorker.async_forward_batch_generation_mlx`
     and :meth:`MlxTpModelWorker.async_chained_decode_mlx`, consumed by
-    :meth:`MlxTpModelWorker.finalize_mlx_result`.
-
-    Attributes:
-        lazy_tokens: an ``mx.array`` that, when evaluated, forces
-            materialisation of the whole batch's outputs.  ``None`` for
-            idle batches.
-        prefills: one :class:`MlxPendingPrefill` per new request in an
-            extend batch; empty for pure-decode steps.
-        extends: one :class:`MlxPendingExtend` per chunked-prefill
-            continuation; also empty for pure-decode steps.
-        decode: the :class:`MlxPendingDecode` covering full decode mode
-            AND mixed single-token decodes inside an extend batch.
-        mode: one of ``"idle"``, ``"decode"``, ``"extend"``.
+    :meth:`MlxTpModelWorker.finalize_mlx_result`.  Evaluating ``lazy_tokens``
+    materialises the whole batch.  ``decode`` covers both full decode mode and
+    single-token decodes mixed into an extend batch; ``mode`` is one of
+    ``"idle"``, ``"decode"``, ``"extend"``.
     """
 
     lazy_tokens: Optional[mx.array]
@@ -99,6 +90,7 @@ class MlxTpModelWorker(TpModelWorker):
             disable_radix_cache=get_memory().disable_radix_cache,
             mem_fraction_static=get_schedule().mem_fraction_static,
             quantization=get_model().quantization,
+            revision=get_model().revision,
             enable_sampling=get_device().mlx_enable_sampling,
             sampling_rng_seed=get_device().random_seed,
             deterministic_seeding=(
@@ -389,13 +381,9 @@ class MlxTpModelWorker(TpModelWorker):
         Reachable only under ``--disable-overlap-schedule``: the default MLX
         loop drives :meth:`async_forward_batch_generation_mlx` /
         :meth:`finalize_mlx_result` directly and never calls ``run_batch``.
-        Launching and finalising back-to-back IS the synchronous path — the
-        lazy graph is built exactly the same way, then blocked on
-        immediately — so routing, logit edits, logprob collection and
-        chunk-head skipping have one implementation rather than two that
-        must be kept in step.  It is also strictly cheaper than evaluating
-        each request as it is queued: one ``mx.async_eval`` covers the whole
-        batch.
+        Launching and finalising back-to-back builds the same lazy graph, so
+        routing, logit edits, logprob collection and chunk-head skipping keep
+        one implementation instead of two.
         """
         launch = self.async_forward_batch_generation_mlx(batch)
         return self.finalize_mlx_result(launch, batch.reqs)

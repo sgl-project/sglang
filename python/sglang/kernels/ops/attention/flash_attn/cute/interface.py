@@ -1,6 +1,4 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
-
 import math
 import os
 from dataclasses import dataclass
@@ -707,6 +705,10 @@ def _flash_attn_fwd(
             num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
         else:
             num_splits = 1
+
+    if qv is not None:
+        # The qv kernel has no split-KV variant.
+        num_splits = 1
 
     is_split_kv = num_splits > 1
     if is_split_kv:

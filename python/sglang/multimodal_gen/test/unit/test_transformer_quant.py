@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     _default_quantized_attention_backend,
+    _resolve_checkpoint_load_device,
     _warn_if_expected_param_dtype_missing,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
@@ -118,6 +119,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             quantization_ignored_layers=None,
             tp_size=1,
             dit_cpu_offload=False,
+            direct_gpu_weight_loading=False,
             text_encoder_cpu_offload=False,
         )
         defaults.update(overrides)
@@ -253,6 +255,46 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(plan.checkpoint_load_device, device)
         self.assertEqual(plan.weight_postprocess_device, device)
         self.assertTrue(plan.defer_component_cpu_offload)
+        self.assertFalse(plan.load_full_state_dict_on_device)
+
+    def test_weight_load_plan_can_keep_full_state_dict_on_device(self):
+        plan = WeightLoadPlan.for_component(
+            checkpoint_load_device=torch.device("cuda:0"),
+            needs_device_weight_postprocess=False,
+            component_cpu_offload=False,
+            load_full_state_dict_on_device=True,
+        )
+
+        self.assertTrue(plan.load_full_state_dict_on_device)
+
+    def test_unquantized_cpu_offload_loads_checkpoint_on_cpu(self):
+        device = _resolve_checkpoint_load_device(
+            torch.device("cuda:0"),
+            component_cpu_offload=True,
+            runtime_quant_config=None,
+        )
+
+        self.assertEqual(device, torch.device("cpu"))
+
+    def test_quantized_cpu_offload_keeps_checkpoint_on_runtime_device(self):
+        runtime_device = torch.device("cuda:0")
+        device = _resolve_checkpoint_load_device(
+            runtime_device,
+            component_cpu_offload=True,
+            runtime_quant_config=object(),
+        )
+
+        self.assertEqual(device, runtime_device)
+
+    def test_resident_transformer_loads_checkpoint_on_runtime_device(self):
+        runtime_device = torch.device("cuda:0")
+        device = _resolve_checkpoint_load_device(
+            runtime_device,
+            component_cpu_offload=False,
+            runtime_quant_config=None,
+        )
+
+        self.assertEqual(device, runtime_device)
 
     def test_mixed_model_with_expected_dtype_does_not_warn(self):
         model = torch.nn.Module()
