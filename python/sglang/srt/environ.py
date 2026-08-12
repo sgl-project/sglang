@@ -348,6 +348,9 @@ class Envs:
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
+    SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
+    SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
+    SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
@@ -670,6 +673,13 @@ class Envs:
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    # Keep K3 shared experts and dense MLPs sharded over attention TP.
+    SGLANG_K3_SHARED_EXPERTS_ATTN_TP = EnvBool(False)
+    SGLANG_K3_DENSE_MLP_ATTN_TP = EnvBool(False)
+    # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
+    SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
+    )
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
