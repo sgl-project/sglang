@@ -195,6 +195,8 @@ emit("ACC_ENABLED", 1 if acc.get("enabled") else 0)
 emit("ACC_SHOTS", acc.get("num_shots", 8))
 emit("ACC_NQ", acc.get("num_questions", 1319))
 emit("ACC_THR", acc.get("threshold", 0.91))
+emit("ACC_MAXTOK", acc.get("max_new_tokens", 512))
+emit("ACC_METHOD", acc.get("method", "few_shot"))
 PY
 )"
 if [[ -z "$RECIPE_VARS" ]]; then
@@ -828,11 +830,20 @@ $PREFILL_WAIT_ROUTER
       echo "=== GSM8K accuracy gate (num_questions=$ACC_NQ shots=$ACC_SHOTS) ==="
       DP_ARG=""
       [ -s \$CIDIR/gsm8k_test.jsonl ] && DP_ARG="--data-path \$CIDIR/gsm8k_test.jsonl"
-      python3 -m sglang.test.few_shot_gsm8k \
-        --num-shots $ACC_SHOTS --num-questions $ACC_NQ --parallel $MAXREQ \
-        --max-new-tokens 512 --host http://127.0.0.1 --port $LBPORT \
-        \$DP_ARG 2>&1 | tee \$CIDIR/gsm8k.log
-      ACC=\$(grep -oE "Accuracy: [0-9.]+" \$CIDIR/gsm8k.log | tail -1 | cut -d" " -f2)
+      if [ "$ACC_METHOD" = "run_eval" ]; then
+        python3 -m sglang.test.run_eval \
+          --host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \
+          --eval-name gsm8k --num-examples $ACC_NQ --num-threads $MAXREQ \
+          --max-tokens $ACC_MAXTOK --chat-template-kwargs '"'"'{"enable_thinking": false}'"'"' \
+          2>&1 | tee \$CIDIR/gsm8k.log
+        ACC=\$(grep -oE "Score: [0-9.]+" \$CIDIR/gsm8k.log | tail -1 | cut -d" " -f2)
+      else
+        python3 -m sglang.test.few_shot_gsm8k \
+          --num-shots $ACC_SHOTS --num-questions $ACC_NQ --parallel $MAXREQ \
+          --max-new-tokens $ACC_MAXTOK --host http://127.0.0.1 --port $LBPORT \
+          \$DP_ARG 2>&1 | tee \$CIDIR/gsm8k.log
+        ACC=\$(grep -oE "Accuracy: [0-9.]+" \$CIDIR/gsm8k.log | tail -1 | cut -d" " -f2)
+      fi
       [ -n "\$ACC" ] || { echo "[gsm8k] could not parse accuracy from harness output"; exit 1; }
       python3 \$CIDIR/check_acc.py "\$ACC" "$ACC_THR" || { echo "[gsm8k] accuracy below threshold -- failing before sweep"; exit 1; }
     fi

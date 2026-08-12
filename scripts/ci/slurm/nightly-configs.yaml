@@ -604,3 +604,67 @@ glm52-fp4-mi355x-dp8ep8-mtp-sglang:
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/1p1d-dp8ep8-mtp.yaml
+
+# AMD MI355X Qwen3.5-397B-A17B (MXFP4) 2-node 1P1D disaggregation. GDN hybrid
+# linear-attn MoE. Accuracy gate uses run_eval (max_new_tokens=2048) per recipe
+# -- few_shot_gsm8k truncates Qwen's answer at 512 tokens.
+qwen35-fp4-mi355x-sglang:
+  model: amd/Qwen3.5-397B-A17B-MXFP4
+  model-prefix: qwen35
+  model_path: /it-share/model_coverage/models--amd--Qwen3.5-397B-A17B-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/qwen35/1k1k/1p1d.yaml
+qwen35-fp4-mi355x-mtp-sglang:
+  model: amd/Qwen3.5-397B-A17B-MXFP4
+  model-prefix: qwen35
+  model_path: /it-share/model_coverage/models--amd--Qwen3.5-397B-A17B-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/qwen35/1k1k/1p1d-mtp.yaml
+qwen35-fp4-mi355x-dp8ep8-sglang:
+  model: amd/Qwen3.5-397B-A17B-MXFP4
+  model-prefix: qwen35
+  model_path: /it-share/model_coverage/models--amd--Qwen3.5-397B-A17B-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/qwen35/1k1k/1p1d-dp8ep8.yaml
+qwen35-fp4-mi355x-dp8ep8-mtp-sglang:
+  model: amd/Qwen3.5-397B-A17B-MXFP4
+  model-prefix: qwen35
+  model_path: /it-share/model_coverage/models--amd--Qwen3.5-397B-A17B-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/qwen35/1k1k/1p1d-dp8ep8-mtp.yaml
