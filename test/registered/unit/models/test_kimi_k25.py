@@ -926,6 +926,44 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
     assert key not in processor.mm_preprocess_cache
 
 
+def test_kimi_k3_feature_hash_is_namespaced_by_artifact_identity():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
+    feature = torch.zeros((4, 3), dtype=torch.float32)
+    digest = "sha256:" + "ab" * 32
+
+    first = processor._make_artifact(
+        content_digest=digest,
+        artifact_key="sha256:" + "01" * 32,
+        original_size=(2, 2),
+        resize_config={
+            "num_tokens": 1,
+            "new_width": 2,
+            "new_height": 2,
+            "pad_width": 0,
+            "pad_height": 0,
+        },
+        grid_thw=(1, 1, 1),
+        feature=feature,
+    )
+    second = processor._make_artifact(
+        content_digest=digest,
+        artifact_key="sha256:" + "02" * 32,
+        original_size=(4, 1),
+        resize_config={
+            "num_tokens": 1,
+            "new_width": 4,
+            "new_height": 1,
+            "pad_width": 0,
+            "pad_height": 1,
+        },
+        grid_thw=(1, 1, 1),
+        feature=feature,
+    )
+
+    assert first.feature_hash != second.feature_hash
+
+
 def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.processor_fingerprint = "processor"

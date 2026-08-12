@@ -273,6 +273,27 @@ def build_artifact_key(
     return _digest_bytes(_canonical_json(payload))
 
 
+def build_feature_hash(artifact_key: str, processor_output_hash: int) -> int:
+    """Namespace a processor-output hash by its complete artifact identity."""
+    artifact_key = parse_content_hash(artifact_key)
+    if (
+        isinstance(processor_output_hash, bool)
+        or not isinstance(processor_output_hash, int)
+        or not 0 <= processor_output_hash < 1 << 64
+    ):
+        raise ValueError("processor_output_hash must be an unsigned 64-bit integer")
+    digest = _hash_parts(
+        b"multimodal-feature-v1",
+        bytes.fromhex(artifact_key[len(CONTENT_HASH_PREFIX) :]),
+        processor_output_hash.to_bytes(8, byteorder="big", signed=False),
+    )
+    return int.from_bytes(
+        bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :])[:8],
+        byteorder="big",
+        signed=False,
+    )
+
+
 def build_processor_fingerprint(
     processor: Any,
     hf_config: Any,
