@@ -28,6 +28,30 @@ tokens and image offsets while reusing image work. `mm_hashes` remains the
 processor-output/embedding identity; `mm_content_hashes` identifies input media.
 Do not substitute one for the other.
 
+## Correctness contract
+
+An artifact hit is valid only when the decoder input and every setting that can
+change processor output are identical. SGLang therefore hashes:
+
+- the actual media bytes, or an immutable PIL/tensor snapshot including its
+  mode, shape, dtype, palette, transparency, and contents;
+- the model and processor revisions, decode and preprocessing backends, resize,
+  antialias, normalization, alpha handling, pixel limits, transport mode, and
+  per-image options.
+
+The key encoder preserves Python types and rejects unsupported values instead
+of reducing them to a lossy string. The artifact stores the processor-output
+feature hash, so embedding and prefix caches continue to use the existing
+post-processor identity. Prompt text is intentionally excluded: every request
+rebuilds and validates its prompt tokens, image spans, grids, and offsets from
+the cached per-image metadata.
+
+Except for the explicit trusted mode below, a path, URL, caller object, mtime,
+or caller-provided digest is never accepted as proof that media is unchanged.
+SHA-256 cryptographic collisions remain theoretically possible; operational
+false hits from incomplete or lossy key construction are what this contract
+and its negative tests prevent.
+
 ## Data flow
 
 On a cold request, SGLang reads and snapshots the input, calculates its SHA-256,
@@ -106,7 +130,9 @@ output = llm.generate(
 `--trust-mm-content-hashes` lets a metadata hit skip reading the source. Enable
 it only when the caller computes SHA-256 from immutable media bytes. A cold miss
 still reads and verifies the media. Invalid format, count, or content is rejected;
-SGLang does not silently fall back.
+SGLang does not silently fall back. On a trusted hot hit the source cannot be
+verified, so a stale or incorrect caller digest can return a stale artifact;
+that correctness responsibility belongs to the caller.
 
 ## Configuration
 
