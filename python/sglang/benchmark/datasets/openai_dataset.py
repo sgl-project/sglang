@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as npƒ
-from transformers import PreTrainedTokenizerBaseƒ
+from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 
