@@ -103,8 +103,10 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         self.assertEqual(len(result.calls), 2)
 
     def test_parse_error_neither_swallows_nor_duplicates(self):
-        """An unexpected parse error must not empty the turn, and the dropped
-        buffer must not come back on the next delta."""
+        """An unexpected parse error must retain the buffer for retry; only
+        the preamble (text before the first DSML tag) is emitted as
+        normal_text so the tool-call text is neither swallowed permanently
+        nor duplicated across deltas."""
         detector = DeepSeekV4Detector()
 
         with patch.object(
@@ -113,14 +115,18 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             side_effect=RuntimeError("boom"),
         ):
             first = detector.parse_streaming_increment(_weather_call(), self.tools)
-            self.assertEqual(detector._buffer, "")
-            second = detector.parse_streaming_increment(" tail", self.tools)
+            # Buffer is retained for retry — NOT cleared
+            self.assertNotEqual(detector._buffer, "")
 
-        self.assertIn("get_weather", first.normal_text)
-        self.assertNotIn("get_weather", second.normal_text)
-        # No half-formed call: the failure can land between a tool's name and its
-        # arguments, so an argument-less named call must not reach the client.
+        # Mock removed — the retained buffer should now parse successfully
+        # on the next delta, proving the retry works.
+        second = detector.parse_streaming_increment(" tail", self.tools)
+
+        # _weather_call() has no preamble, so first.normal_text is empty.
         self.assertEqual(first.calls, [])
+        # The tool call is emitted as a call, NOT as normal_text
+        self.assertNotIn("get_weather", second.normal_text)
+        self.assertTrue(any(c.name == "get_weather" for c in second.calls))
 
 
 if __name__ == "__main__":

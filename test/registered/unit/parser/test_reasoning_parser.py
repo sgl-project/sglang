@@ -246,7 +246,7 @@ class TestDeepSeekV4Detector(CustomTestCase):
         """Without tool_start_token the DSML block stays in reasoning_content and
         the tool call detector never sees it."""
         detector = ReasoningParser(model_type="deepseek-v4").detector
-        self.assertEqual(detector.tool_start_token, "<｜DSML｜")
+        self.assertEqual(detector.tool_start_token, "<｜DSML｜tool_calls")
 
         result = detector.parse_streaming_increment(
             '<think>pick a tool<｜DSML｜tool_calls><｜DSML｜invoke name="s">'
