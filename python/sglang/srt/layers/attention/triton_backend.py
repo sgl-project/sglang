@@ -188,30 +188,24 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        # The MLA verify kernel (verify_mla_fwd) is tuned and validated for the
-        # Kimi-K3 absorbed-MLA shape; gate it on K3.
+        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
+        # GQA with exactly one TP-local KV head.
         self.use_verify_mla = (
             is_gfx95_supported()
             and self.topk == 1
-            and self.use_mla
-            and is_kimi_k3(model_runner.model_config.hf_config)
+            and (
+                (self.use_mla and is_kimi_k3(model_runner.model_config.hf_config))
+                or (
+                    self.use_verify_splitkv
+                    and not self.use_mla
+                    and is_qwen3_5(model_runner.model_config.hf_config)
+                    and model_runner.model_config.get_num_kv_heads(
+                        get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                    )
+                    == 1
+                )
+            )
         )
-        # Qwen3.5 has multiple local Q heads sharing one replicated KV head.
-        # Prefer the grouped-head kernel; its runtime shape guard falls back
-        # when a layout exposes multiple local KV heads.
-        self.use_qwen3_5_shared_kv_verify = (
-            is_gfx95_supported()
-            and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
-            and self.topk == 1
-            and not self.use_mla
-            and is_qwen3_5(model_runner.model_config.hf_config)
-        )
-        verify_fwd_candidates = []
-        if self.use_verify_mla or self.use_qwen3_5_shared_kv_verify:
-            verify_fwd_candidates.append(self.verify_mla_fwd)
-        if self.use_verify_splitkv:
-            verify_fwd_candidates.append(self.verify_splitkv_fwd)
-        self.verify_fwd_candidates = tuple(verify_fwd_candidates)
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
@@ -1425,40 +1419,44 @@ class TritonAttnBackend(AttentionBackend):
         # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
-        # Try the grouped-head implementation first when enabled, then the
-        # established per-query-head split-KV implementation. Each candidate
-        # has a conservative static-shape guard and no-ops on unsupported cases.
+        # Route target-verify to the grouped-head kernel when eligible, else the
+        # per-head split-KV kernel.
+        if self.use_verify_mla:
+            verify_fwd = self.verify_mla_fwd
+        elif self.use_verify_splitkv:
+            verify_fwd = self.verify_splitkv_fwd
+        else:
+            verify_fwd = None
         if (
-            self.verify_fwd_candidates
+            verify_fwd is not None
             and score_mod is None
             and forward_batch.forward_mode.is_target_verify()
+            and verify_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.custom_mask,
+                causal,
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sliding_window_size=sliding_window_size,
+                sinks=sinks,
+                window_kv_offsets=window_kv_offsets,
+                xai_temperature_len=layer.xai_temperature_len,
+                max_bs=self.req_to_token_pool.size,
+            )
         ):
-            for verify_fwd in self.verify_fwd_candidates:
-                if verify_fwd(
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k.contiguous(),
-                    v.contiguous(),
-                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                    self.forward_metadata.qo_indptr,
-                    kv_indptr,
-                    kv_indices,
-                    self.forward_metadata.custom_mask,
-                    causal,
-                    self.forward_metadata.mask_indptr,
-                    self.forward_metadata.max_extend_len,
-                    k_descale,
-                    v_descale,
-                    layer.scaling,
-                    logit_cap=logits_soft_cap,
-                    sliding_window_size=sliding_window_size,
-                    sinks=sinks,
-                    window_kv_offsets=window_kv_offsets,
-                    xai_temperature_len=layer.xai_temperature_len,
-                    max_bs=self.req_to_token_pool.size,
-                ):
-                    return o
+            return o
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

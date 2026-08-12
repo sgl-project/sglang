@@ -355,7 +355,9 @@ class VerifyMLA:
         self.nope_dim = v_head_dim
         self.pe_dim = head_dim - v_head_dim
         self.l_ext = l_ext
-        self.l_pad = triton.next_power_of_2(l_ext)
+        # tl.dot requires BLOCK_H * L_EXT to cover at least 16 rows.
+        min_l_pad = triton.next_power_of_2(triton.cdiv(16, block_h))
+        self.l_pad = max(min_l_pad, triton.next_power_of_2(l_ext))
         self.device = device
         self.block_h = block_h
         self.block_n = block_n

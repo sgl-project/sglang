@@ -58,8 +58,8 @@ class TestVerifySharedKV(CustomTestCase):
         cache_dtype=torch.bfloat16,
         k_scale=1.0,
         v_scale=1.0,
+        l_ext=4,
     ):
-        l_ext = 4
         inputs = _build_inputs(
             prefix_lens=[512, 2048],
             l_ext=l_ext,
@@ -122,6 +122,11 @@ class TestVerifySharedKV(CustomTestCase):
         for h_q in (4, 8, 16):
             with self.subTest(h_q=h_q):
                 self._run_parity(head_dim=256, v_head_dim=256, h_q=h_q)
+
+    def test_qwen3_5_short_verify_widths(self):
+        for l_ext in (1, 2, 3):
+            with self.subTest(l_ext=l_ext):
+                self._run_parity(head_dim=256, v_head_dim=256, l_ext=l_ext)
 
     def test_qwen3_5_fp8_kv_cache(self):
         self._run_parity(

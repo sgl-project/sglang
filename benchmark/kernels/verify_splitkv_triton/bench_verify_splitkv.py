@@ -1,8 +1,10 @@
-"""Micro-benchmark: target-verify attention implementations.
+"""Micro-benchmark: split-KV EAGLE-verify kernel vs extend_attention_fwd.
 
-Times the grouped-head shared-KV implementation and ``verify_splitkv_fwd``
-against ``extend_attention_fwd``. Defaults model Qwen3.5-397B at TP4, where
-eight local query heads share one local KV head.
+Times ``verify_splitkv_fwd`` against the baseline ``extend_attention_fwd`` on
+the verify shape (a few draft-token queries over a long prefix KV) across
+context lengths and head dims, and reports the per-kernel latency, the speedup,
+and the achieved KV-read bandwidth. Model-independent (head_dim is just a shape
+parameter).
 
 NOTE: this benchmark targets AMD MI35x (gfx950). The verify kernel's block config
 and its CDNA-only Triton launch hints (waves_per_eu, matrix_instr_nonkdim) are
@@ -20,7 +22,6 @@ import triton
 from sglang.kernels.ops.attention.extend_attention import (
     extend_attention_fwd,
 )
-from sglang.kernels.ops.attention.verify_mla import verify_mla_fwd
 from sglang.kernels.ops.attention.verify_splitkv import verify_splitkv_fwd
 from sglang.srt.utils import is_gfx95_supported
 
@@ -44,8 +45,8 @@ def build_inputs(prefix_len, l_ext, h_q, h_kv, head_dim, v_head_dim, dtype, devi
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--l-ext", type=int, default=4, help="draft tokens per seq")
-    ap.add_argument("--h-q", type=int, default=8)
-    ap.add_argument("--h-kv", type=int, default=1)
+    ap.add_argument("--h-q", type=int, default=16)
+    ap.add_argument("--h-kv", type=int, default=2)
     ap.add_argument("--head-dim", type=int, default=256)
     args = ap.parse_args()
 
@@ -59,20 +60,17 @@ def main():
 
     if not torch.cuda.is_available():
         raise SystemExit("GPU required")
-    if args.h_kv != 1:
-        raise SystemExit("The grouped-head implementation requires --h-kv 1")
     device, dtype = "cuda", torch.bfloat16
     hd, vhd = args.head_dim, args.head_dim
     sm_scale = 1.0 / (hd**0.5)
     kv_bytes_per_tok = 2 * args.h_kv * hd * torch.tensor([], dtype=dtype).element_size()
 
     print(
-        f"target-verify attention  "
+        f"verify-split-KV vs extend_attention_fwd  "
         f"(l_ext={args.l_ext}, H_Q={args.h_q}, H_KV={args.h_kv}, head_dim={hd}, bf16)\n"
     )
     print(
-        f"{'ctx':>8} {'extend(ms)':>12} {'splitkv(ms)':>12} "
-        f"{'shared(ms)':>12} {'vs splitkv':>11} {'shared GB/s':>12}"
+        f"{'ctx':>8} {'extend(ms)':>12} {'splitkv(ms)':>12} {'speedup':>9} {'splitkv GB/s':>13}"
     )
     for ctx in (1024, 2048, 4096, 8192, 16384):
         q, k, v, kb, vb, qo, kvp, kvi, mle = build_inputs(
@@ -120,26 +118,6 @@ def main():
                 sm_scale=sm_scale,
             )
 
-        def run_shared():
-            verify_mla_fwd(
-                q,
-                k,
-                v,
-                o,
-                kb,
-                vb,
-                qo,
-                kvp,
-                kvi,
-                None,
-                True,
-                None,
-                mle,
-                1.0,
-                1.0,
-                sm_scale=sm_scale,
-            )
-
         # Ensure the split-KV path actually handled this shape before timing it
         # (verify_splitkv_fwd returns False + no-ops on unsupported cases).
         assert verify_splitkv_fwd(
@@ -160,33 +138,13 @@ def main():
             1.0,
             sm_scale=sm_scale,
         ), "verify_splitkv_fwd did not handle the verify shape"
-        assert verify_mla_fwd(
-            q,
-            k,
-            v,
-            o,
-            kb,
-            vb,
-            qo,
-            kvp,
-            kvi,
-            None,
-            True,
-            None,
-            mle,
-            1.0,
-            1.0,
-            sm_scale=sm_scale,
-        ), "verify_mla_fwd did not handle the shared-KV verify shape"
 
         t_ext = triton.testing.do_bench(run_extend)
         t_spl = triton.testing.do_bench(run_split)
-        t_shared = triton.testing.do_bench(run_shared)
         kv_bytes = int(kv_bytes_per_tok) * ctx
-        gbs = kv_bytes / (t_shared * 1e-3) / 1e9
+        gbs = kv_bytes / (t_spl * 1e-3) / 1e9
         print(
-            f"{ctx:>8} {t_ext:>12.3f} {t_spl:>12.3f} "
-            f"{t_shared:>12.3f} {t_spl / t_shared:>10.2f}x {gbs:>11.0f}"
+            f"{ctx:>8} {t_ext:>12.3f} {t_spl:>12.3f} {t_ext / t_spl:>8.2f}x {gbs:>12.0f}"
         )
 
 
