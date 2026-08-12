@@ -7418,6 +7418,14 @@ class ServerArgs:
         return self.url(port=self.engine_info_bootstrap_port)
 
     @property
+    def world_size(self) -> int:
+        return (
+            (1 if self.enable_dp_attention else self.dp_size)
+            * self.tp_size
+            * self.pp_size
+        )
+
+    @property
     def is_ep_joiner(self) -> bool:
         """True for processes launched as elastic-EP joiners."""
         return self.ep_join_mode in ("scale", "recover")
