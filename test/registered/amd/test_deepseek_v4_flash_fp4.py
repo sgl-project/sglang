@@ -219,9 +219,8 @@ class TestDeepseekV4Fp4(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary("\n".join(summary_lines) + "\n")
-
-        if not check.ok:
-            self.fail(check.failure_message())
+            if not check.ok:
+                self.fail(check.failure_message())
 
 
 if __name__ == "__main__":
