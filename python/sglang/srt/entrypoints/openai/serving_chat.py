@@ -2038,12 +2038,28 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason["matched"] = None
             try:
                 tool_call_data = orjson.loads(text)
+                # Models frequently emit a single call object instead of the
+                # array the json_schema constraint asks for. Accept it — the
+                # old code iterated the dict's keys and crashed below with
+                # "string indices must be integers".
+                if isinstance(tool_call_data, dict):
+                    tool_call_data = [tool_call_data]
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
+                    if not isinstance(tool, dict) or not isinstance(
+                        tool.get("name"), str
+                    ):
+                        raise ValueError(
+                            f"tool call entry {i} is not an object with a "
+                            f"'name' field (got {type(tool).__name__})"
+                        )
+                    arguments = json.dumps(
+                        tool.get("parameters") or {}, ensure_ascii=False
+                    )
                     call_info = ToolCallItem(
                         tool_index=i,
                         name=tool["name"],
-                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                        parameters=arguments,
                     )
                     tool_id = self._process_tool_call_id(
                         call_info, history_tool_calls_cnt
@@ -2054,9 +2070,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=i,
                             function=FunctionResponse(
                                 name=tool["name"],
-                                arguments=json.dumps(
-                                    tool["parameters"], ensure_ascii=False
-                                ),
+                                arguments=arguments,
                             ),
                         )
                     )
