@@ -26,6 +26,7 @@ export const config = {
     { id: "flash", label: "Flash", subtitle: "284B" },
     { id: "flash-official", label: "Flash Official", subtitle: "284B · 0731" },
     { id: "pro",   label: "Pro",   subtitle: "1.6T" },
+    { id: "pro-official", label: "Pro Official", subtitle: "1.6T · 0813" },
   ],
   quantizations: [
     { id: "fp8", label: "FP8" },
@@ -48,6 +49,7 @@ export const config = {
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
     "flash-official|fp4": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "pro-official|fp4": "deepseek-ai/DeepSeek-V4-Pro-0813",
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
@@ -116,6 +118,14 @@ sgl-eval run gpqa \\
   --temperature 1.0 --top-p 1.0 --thinking \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+        "pro-official":
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gpqa \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 400000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
       },
       aime25_pct: {
         "flash-official":
@@ -142,6 +152,14 @@ sgl-eval run aime25 \\
   --temperature 1.0 --top-p 1.0 --thinking \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+        "pro-official":
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run aime25 \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 400000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
       },
     },
     numPromptsByConc: { 1: 32, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
@@ -151,6 +169,7 @@ sgl-eval run aime25 \\
   defaultAccuracy: {
     flash: { gpqa_pct: 88.1, aime25_pct: 95,   gsm8k_pct: 96.13 },
     pro:   { gpqa_pct: 90.1, aime25_pct: 97.5, gsm8k_pct: 96.13 },
+    "pro-official": {},
   },
 
   // The eval set rendered in the benchmark card + "⚡ Reproduce" (the engine
@@ -203,8 +222,8 @@ sgl-eval run aime25 \\
       knobs: [
         { id: "tp", label: "TP", values: [
           null,
-          { value: 1, hide: { variant: ["pro"] } },
-          { value: 2, hide: { variant: ["pro"] } },
+          { value: 1, hide: { variant: ["pro", "pro-official"] } },
+          { value: 2, hide: { variant: ["pro", "pro-official"] } },
           4,
           8,
           { value: 16, disable: { nodes: ["single"] },
@@ -220,8 +239,8 @@ sgl-eval run aime25 \\
           values: [
             null,
             false,
-            { value: 1, hide: { variant: ["pro"] } },
-            { value: 2, hide: { variant: ["pro"] } },
+            { value: 1, hide: { variant: ["pro", "pro-official"] } },
+            { value: 2, hide: { variant: ["pro", "pro-official"] } },
             4,
             8,
             { value: 16, disable: { nodes: ["single"] },
@@ -264,8 +283,8 @@ sgl-eval run aime25 \\
       },
       ep: { label: "EP", values: [
         null,
-        { value: 1, hide: { variant: ["pro"] } },
-        { value: 2, hide: { variant: ["pro"] } },
+        { value: 1, hide: { variant: ["pro", "pro-official"] } },
+        { value: 2, hide: { variant: ["pro", "pro-official"] } },
         4,
         8,
         { value: 16, disable: { nodes: ["single"] },
@@ -289,14 +308,14 @@ sgl-eval run aime25 \\
         { id: "mtp-314",    label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
-          hide: { variant: ["flash-official"] } },
+          hide: { variant: ["flash-official", "pro-official"] } },
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
-          hide: { variant: ["flash-official"] } },
+          hide: { variant: ["flash-official", "pro-official"] } },
         { id: "dspark",     label: "DSpark",
           flags: ["--speculative-algorithm DSPARK"],
-          hide: { variant: ["flash", "pro"] },
+          hide: { variant: ["flash", "pro"], hw: ["mi300x", "mi355x"] },
           disable: [
             { when: { dpAttnOn: [true] },
               reason: "DSpark is not compatible with DP Attention on the current release." },
@@ -421,7 +440,7 @@ sgl-eval run aime25 \\
       {
         id: "dsparkDraftTokens",
         title: "DSpark Proposed Draft Tokens",
-        showWhen: (base) => base.variant === "flash-official" && base.specAlgorithm === "DSPARK",
+        showWhen: (base) => (base.variant === "flash-official" || base.variant === "pro-official") && base.specAlgorithm === "DSPARK",
         control: "slider",
         stripPrefixes: ["--speculative-dspark-block-size"],
         options: [
@@ -791,6 +810,27 @@ sgl-eval run aime25 \\
     },
 
     // ====================================================================
+    // B200 + FP4 — Pro Official (0813, DSPARK)
+    // ====================================================================
+    {
+      match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
     // B200 + NVFP4
     // ====================================================================
     {
@@ -870,6 +910,27 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 4",
         "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // B300 + FP4 — Pro Official (0813, DSPARK)
+    // ====================================================================
+    {
+      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
         "--swa-full-tokens-ratio 0.1",
         "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
@@ -1275,6 +1336,27 @@ sgl-eval run aime25 \\
       ],
     },
     // ====================================================================
+    // GB300 + FP4 — Pro Official (0813, DSPARK)
+    // ====================================================================
+    {
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.90",
+        "--chunked-prefill-size 8192",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
     // GB200 + NVFP4
     // ====================================================================
     {
@@ -1590,6 +1672,21 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--moe-runner-backend flashinfer_mxfp4",
         "--mem-fraction-static 0.88",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

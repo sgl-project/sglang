@@ -127,7 +127,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. The 0731 Flash refresh adds a checkpoint with a bundled DSpark draft head:
+**DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. The 0731 Flash and 0813 Pro refresh checkpoints each bundle a DSpark draft head:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -158,6 +158,12 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flash Official (0731), with a bundled DSpark draft head; verified on 8×B200, 4×GB300, and 4×H200</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813">DeepSeek-V4-Pro-0813</a></strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>1.6T</strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>49B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pro Official (0813), with a bundled DSpark draft head; B200 / B300 (TP=8) · GB300 (TP=4) · H200 FP4 (TP=8)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>1.6T</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>49B</td>
@@ -172,7 +178,7 @@ The Instruct checkpoints ship as **FP4 MoE experts + FP8 attention / dense** (on
 
 **Recommended generation:** `temperature=1.0`, `top_p=1.0`.
 
-**Resources:** HuggingFace · [Flash Official (0731)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
+**Resources:** HuggingFace · [Flash Official (0731)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Pro Official (0813)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
 
 ## 2. Configuration Tips
 
@@ -186,7 +192,7 @@ The generator currently picks values on the **conservative** side (mirroring an 
 
 **Speculative decoding**
 
-The original Flash and Pro recipes use EAGLE. Flash Official (0731) uses the bundled DSpark draft head; see [DSpark](#3-4-dspark-speculative-decoding) for its launch and tuning notes.
+The original Flash and Pro recipes use EAGLE. Flash Official (0731) and Pro Official (0813) use the bundled DSpark draft head; see [DSpark](#3-4-dspark-speculative-decoding) for launch and tuning notes.
 
 For the original Flash and Pro checkpoints:
 
@@ -562,7 +568,7 @@ For more details, see the [HiCache documentation](../../../docs/advanced_feature
 
 ### 3.4 DSpark (Speculative Decoding)
 
-Flash Official (0731) bundles a DSpark draft head in `deepseek-ai/DeepSeek-V4-Flash-0731`. The target and draft weights therefore come from the same checkpoint: enable DSpark with `--speculative-algorithm DSPARK` and do not set a separate `--speculative-draft-model-path`.
+Flash Official (0731) and Pro Official (0813) each bundle a DSpark draft head in `deepseek-ai/DeepSeek-V4-Flash-0731` and `deepseek-ai/DeepSeek-V4-Pro-0813`. The target and draft weights therefore come from the same checkpoint: enable DSpark with `--speculative-algorithm DSPARK` and do not set a separate `--speculative-draft-model-path`.
 
 Unlike the EAGLE recipes for the original Flash and Pro checkpoints, this recipe omits `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. SGLang reads the DSpark shape from the checkpoint.
 
@@ -578,6 +584,22 @@ sglang serve \
   --mem-fraction-static 0.90 \
   --chunked-prefill-size 4096 \
   --swa-full-tokens-ratio 0.1 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+The Pro Official (0813) low-latency recipes swap only the model path and parallelism — 8×B200 / 8×B300 (`--tp 8`) or 4×GB300 (`--tp 4`):
+
+```bash Command
+sglang serve \
+  --trust-remote-code \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --tp 8 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --speculative-algorithm DSPARK \
+  --chunked-prefill-size 8192 \
+  --swa-full-tokens-ratio 0.1 \
+  --mem-fraction-static 0.90 \
   --host 0.0.0.0 \
   --port 30000
 ```
