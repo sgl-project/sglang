@@ -189,7 +189,7 @@ The PD role selector adds the role and transfer flags to the selected base recip
 | NVFP4, high throughput | 2 × TP1 / PP6 | DP2-attention / TP4 / EP8, FlashInfer one-sided A2A | Prefill MRR 128 per worker; decode MRR 512; frontend concurrency 1536 |
 | NVFP4, low latency | TP4 / PP2 | TP16 | Decode MRR 1 and frontend concurrency 1 at the latency endpoint |
 
-For NVFP4 with NEXTN, use the 3/1/4 settings on both roles so the prefill worker transfers the draft state. Enable ReplaySSM on the decode role. The generated router command explicitly sets the main, prefill, and decode policies to `round_robin`; the server-side `--load-balance-method` does not configure router worker selection. Round robin is the measured choice for the fixed-shape throughput runs above. For agentic workloads with substantial repeated-prefix reuse, consider cache-aware routing, especially on the prefill side, and validate the cache-locality versus load-balance tradeoff on the target workload.
+For NVFP4 with NEXTN, use the 3/1/4 settings on both roles so the prefill worker transfers the draft state. Enable ReplaySSM on the decode role. The generated router command sets the main policy to `round_robin`, which applies to prefill, and keeps the decode policy explicit; the server-side `--load-balance-method` does not configure router worker selection. Round robin is the measured choice for the fixed-shape throughput runs above. For agentic workloads with substantial repeated-prefix reuse, consider cache-aware routing, especially on the prefill side, and validate the cache-locality versus load-balance tradeoff on the target workload.
 
 ### AllReduce fusion
 
