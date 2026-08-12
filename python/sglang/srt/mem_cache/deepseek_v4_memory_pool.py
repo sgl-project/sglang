@@ -228,20 +228,27 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        use_mxfp4: bool = False,
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
+        if use_mxfp4:
+            raise ValueError(
+                "MXFP4 KV cache is not supported with HiSparse; "
+                "disable HiSparse or use the FP8 KV cache."
+            )
         super().__init__(
-            size,
-            page_size,
-            dtype,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            layer_num,
-            device,
-            enable_memory_saver,
-            start_layer,
-            end_layer,
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            use_mxfp4=use_mxfp4,
+            start_layer=start_layer,
+            end_layer=end_layer,
         )
 
         self.data_ptrs = torch.tensor(
