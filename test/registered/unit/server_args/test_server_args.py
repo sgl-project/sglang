@@ -565,8 +565,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
             server_args._handle_pd_disaggregation()
 
     def test_pd_dspark_rejects_nixl_transfer_backend(self):
-        # nixl's maybe_send_extra has no DSPARK_DRAFT_KV branch, so it hits its
-        # unknown-state-type raise and fails every request at transfer time.
         for mode in ("prefill", "decode"):
             with self.subTest(mode=mode):
                 server_args = ServerArgs(

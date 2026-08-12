@@ -1261,9 +1261,6 @@ class SchedulerDisaggregationPrefillMixin:
             )
 
             def _dspark_draft_kv_payload():
-                # Replicated draft pool: rows are addressed by the target's
-                # physical locs, so send them verbatim and let the state channel
-                # match by position against the decode side's virtual locs.
                 return (
                     self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, :transfer_input_len

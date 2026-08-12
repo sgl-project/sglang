@@ -1229,9 +1229,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     clear_c128_state(int(decode_req.req.req_pool_idx))
 
             def _dspark_draft_kv_payload():
-                # Replicated draft pool: rows are addressed by the target's
-                # virtual locs, so send them verbatim and let the state channel
-                # match by position.
                 return (
                     self.req_to_token_pool.req_to_token[
                         decode_req.req.req_pool_idx, :seq_len
