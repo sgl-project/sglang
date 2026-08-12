@@ -256,6 +256,12 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             reqs=[self._make_req(seed) for seed in wire_positions],
             device="cpu",
             enable_overlap=False,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    index_share_for_mtp_iteration=True,
+                    index_topk=3,
+                )
+            ),
             req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),
