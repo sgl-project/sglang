@@ -57,7 +57,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestQwen3(TestNpuAccuracyTestCaseBase):
+class TestGLM4_6V_Flash_MMMU(TestNpuAccuracyTestCaseBase):
     model = GLM_4_6V_FLASH_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS

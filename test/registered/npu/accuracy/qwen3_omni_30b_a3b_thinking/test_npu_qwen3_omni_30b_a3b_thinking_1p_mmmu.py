@@ -85,7 +85,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestQwen3(TestNpuAccuracyTestCaseBase):
+class TestQwen3_Omni_30B_A3B_Thinking_MMMU(TestNpuAccuracyTestCaseBase):
     model = QWEN3_OMNI_30B_A3B_THINKING_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
