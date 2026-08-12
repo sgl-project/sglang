@@ -7592,10 +7592,9 @@ class ServerArgs:
                     arch,
                 )
 
-        # Naming an encoder is what turns this into the language side of encoder
-        # disaggregation; --language-only alone just drops the local tower.
-        # Encoders may still join later via the EncoderBootstrapServer, but at
-        # least one has to be known up front for the machinery to start.
+        # Naming an encoder is what opts into encoder disaggregation; further
+        # encoders may join later via the EncoderBootstrapServer, but one has to
+        # be known up front for the machinery to start at all.
         self.encoder_client = self.language_only and len(self.encoder_urls) > 0
 
         # Validate IB devices when mooncake backend is used

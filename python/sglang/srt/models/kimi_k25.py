@@ -667,7 +667,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         # Create vision tower
-        # No local tower: an encoder sends features already embedded.
         self.vision_tower = (
             None
             if not getattr(config, "has_local_vision_tower", True)

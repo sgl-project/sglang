@@ -1241,8 +1241,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         self.language_model_only = getattr(config, "language_model_only", False)
-        # Absent here does not mean absent everywhere: an EPD language replica
-        # has no tower but still receives features from the encoder server.
+        # Distinct from language_model_only above: an EPD replica has no tower
+        # of its own yet still consumes the encoder's features.
         if not getattr(config, "has_local_vision_tower", True):
             self.visual = None
         else:
@@ -1592,11 +1592,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
 
 def _require_vision(model, items=None) -> None:
-    """Raise unless this model can turn *items* into image features.
-
-    A server without a local tower can still serve items an encoder already
-    embedded for it, so precomputed items are always allowed.
-    """
+    """Raise unless this model can turn *items* into image features. Items an
+    encoder already embedded need no local tower, so they always pass."""
     if getattr(model, "visual", None) is not None:
         return
     if items and all(

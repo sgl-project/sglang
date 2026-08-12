@@ -64,7 +64,6 @@ class DotsVLMForCausalLM(nn.Module):
             )
 
         # Initialize vision tower (matching transformers naming for weight compatibility)
-        # No local tower: an encoder sends features already embedded.
         self.vision_tower = (
             None
             if not getattr(config, "has_local_vision_tower", True)

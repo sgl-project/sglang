@@ -535,10 +535,9 @@ class ModelConfig:
 
         self.hf_config.encoder_only = encoder_only
         self.hf_config.language_only = language_only
-        # Two different questions. language_model_only is the checkpoint saying it
-        # never processes images, and drives the model's forward pipeline. Whether
-        # a tower exists *here* is separate: an EPD language replica has none but
-        # still consumes image features an encoder computed for it.
+        # Two different questions: language_model_only is the checkpoint saying it
+        # never processes images (it drives the forward pipeline), while a tower
+        # can be absent *here* and an EPD replica still consume remote features.
         self.hf_config.has_local_vision_tower = not (language_only or self.is_lm_only)
 
         # matryoshka embeddings
