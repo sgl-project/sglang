@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.dllm.mixin.scheduler import DllmManager
+from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
+from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -55,6 +56,12 @@ class _FakeTreeCache:
 
     def is_chunk_cache(self):
         return True
+
+
+class _SchedulerHarness:
+    process_dllm_staging_reqs = SchedulerDllmMixin.process_dllm_staging_reqs
+    _cleanup_dllm_req = SchedulerDllmMixin._cleanup_dllm_req
+    _abort_dllm_req_exact = SchedulerDllmMixin._abort_dllm_req_exact
 
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
@@ -213,6 +220,98 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         )
         self.assertEqual(manager.waiting_queue, [keep])
         self.assertEqual(manager.staging_queue, [])
+
+    def test_staging_no_token_aborts_only_exact_request_id(self):
+        manager = DllmManager(SimpleNamespace(max_running_requests=4))
+        exact = _make_req("job_1", [1], self.block_size)
+        keep = _make_req("job_10", [2], self.block_size)
+        manager.waiting_queue = [exact, keep]
+        manager.staging_queue = [exact]
+
+        outputs = []
+        scheduler = _SchedulerHarness()
+        scheduler.enable_hicache_storage = False
+        scheduler.dllm_manager = manager
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(
+                send_output=lambda msg, req: outputs.append((msg, req))
+            )
+        )
+        adder = SimpleNamespace(
+            can_run_list=[],
+            running_batch=SimpleNamespace(is_empty=lambda: True),
+            add_dllm_staging_req=lambda req: AddReqResult.NO_TOKEN,
+        )
+
+        result = scheduler.process_dllm_staging_reqs(adder, [exact])
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(manager.waiting_queue, [keep])
+        self.assertEqual(manager.staging_queue, [])
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0][0].rid, "job_1")
+        self.assertIs(outputs[0][1], exact)
+
+    def test_exact_abort_cleans_stashed_fdfo_before_pop_and_response(self):
+        events = []
+        manager = DllmManager(SimpleNamespace(max_running_requests=4))
+        req = _make_req("job_1", [10, 11, 12, 13], self.block_size)
+        keep = _make_req("job_10", [20], self.block_size)
+        req.cache_protected_len = 2
+        req.last_node = object()
+        req.kv = SimpleNamespace(kv_allocated_len=4)
+        manager.waiting_queue = [req, keep]
+        manager.staging_queue = [req]
+
+        original_pop = manager.pop_aborted_reqs
+
+        def tracked_pop(abort_all, rid, *, exact=False):
+            events.append("pop")
+            return original_pop(abort_all, rid, exact=exact)
+
+        manager.pop_aborted_reqs = tracked_pop
+
+        freed = []
+
+        def free(indices):
+            events.append("free_kv")
+            freed.append(indices.clone())
+
+        unlocked = []
+
+        def dec_lock_ref(node):
+            events.append("unlock")
+            unlocked.append(node)
+
+        outputs = []
+
+        def send_output(msg, output_req):
+            events.append("send")
+            outputs.append((msg, output_req))
+
+        scheduler = _SchedulerHarness()
+        scheduler.enable_hicache_storage = False
+        scheduler.dllm_manager = manager
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(free=free)
+        scheduler.tree_cache = SimpleNamespace(dec_lock_ref=dec_lock_ref)
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=send_output)
+        )
+
+        last_node = req.last_node
+        scheduler._abort_dllm_req_exact(req)
+
+        self.assertEqual(events, ["free_kv", "unlock", "pop", "send"])
+        self.assertEqual(len(freed), 1)
+        self.assertEqual(freed[0].tolist(), [12, 13])
+        self.assertEqual(unlocked, [last_node])
+        self.assertIsNone(req.last_node)
+        self.assertIsNone(req.kv)
+        self.assertEqual(manager.waiting_queue, [keep])
+        self.assertEqual(manager.staging_queue, [])
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0][0].rid, "job_1")
+        self.assertIs(outputs[0][1], req)
 
 
 if __name__ == "__main__":
