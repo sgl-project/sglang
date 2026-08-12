@@ -1013,7 +1013,7 @@ class Envs:
     # Reuse the mapping for the already-allocated bounded CUDA IPC pool. This
     # has no effect unless CUDA IPC feature transport is explicitly selected.
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(True)
-    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
+    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(512)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
     # Mamba

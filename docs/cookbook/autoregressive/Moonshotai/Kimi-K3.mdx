@@ -300,7 +300,7 @@ point, not a claim that one configuration is fastest for every workload.
 | Auto · PD or other topologies | CPU |
 | CPU | CPU, with no GPU feature pool |
 
-CUDA IPC and CUDA VMM reserve up to `SGLANG_MM_FEATURE_CACHE_MB` (1 GiB by
+CUDA IPC and CUDA VMM reserve up to `SGLANG_MM_FEATURE_CACHE_MB` (512 MiB by
 default) on the base GPU and fall back to CPU per tensor when full. This setting
 does not control EPD encoder output or PD KV/KDA transfer. K3 already defaults to
 2 processor workers and 16 I/O workers; leave those flags unset unless tuning.
