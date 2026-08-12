@@ -16,6 +16,10 @@ Strategy:
 2. Otherwise, find the highest version tag across all branches
    and describe relative to it. This handles local dev installs
    from main where release tags only exist on release branches.
+
+`--tag-only --remote` reads the tag names straight off the remote instead of
+the local ref store, so a caller that only needs the latest release number
+does not have to fetch tag objects into a shallow clone first.
 """
 
 import re
@@ -136,20 +140,48 @@ def get_version_describe() -> str:
     return get_latest_version_tag_describe()
 
 
-def get_latest_version_tag() -> str:
-    """Return just the highest version tag (PEP 440 ordered), or empty string."""
-    tags_raw = run_git("tag", "--list", "v*.*.*")
-    if not tags_raw:
+def list_remote_version_tags(remote: str) -> list:
+    """Return version tag names on `remote`, or an empty list if none resolve.
+
+    `ls-remote` transfers refs only, never objects, so this stays cheap on a
+    shallow clone that has no tags of its own. `--refs` drops the peeled
+    `<tag>^{}` entries that annotated tags would otherwise add.
+    """
+    raw = run_git("ls-remote", "--tags", "--refs", remote, "v*.*.*")
+    prefix = "refs/tags/"
+    tags = []
+    for line in raw.splitlines():
+        _, _, ref = line.partition("\t")
+        if ref.startswith(prefix):
+            tags.append(ref[len(prefix) :])
+    return tags
+
+
+def get_latest_version_tag(remote: str = "") -> str:
+    """Return just the highest version tag (PEP 440 ordered), or empty string.
+
+    With `remote` set, the remote's tags are preferred and the local ref store
+    is only consulted if the remote cannot be reached.
+    """
+    tags = list_remote_version_tags(remote) if remote else []
+    if not tags:
+        tags = run_git("tag", "--list", "v*.*.*").splitlines()
+    if not tags:
         return ""
-    tag_list = sorted(tags_raw.splitlines(), key=parse_version_tuple, reverse=True)
-    return tag_list[0] if tag_list else ""
+    return sorted(tags, key=parse_version_tuple, reverse=True)[0]
 
 
 def main() -> None:
     # --tag-only: print just the latest version tag (for CI scripts)
     tag_only = "--tag-only" in sys.argv
+    # --remote: resolve those tags from origin rather than the local ref store.
+    # Describe mode needs local objects, so the two are not combinable.
+    remote = "origin" if "--remote" in sys.argv else ""
+    if remote and not tag_only:
+        print("ERROR: --remote is only supported with --tag-only", file=sys.stderr)
+        sys.exit(2)
     if tag_only:
-        result = get_latest_version_tag()
+        result = get_latest_version_tag(remote)
     else:
         result = get_version_describe()
     if not result:
