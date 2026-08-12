@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    get_dsa_index_head_dim,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
 
@@ -35,8 +39,9 @@ def is_sparsity_driven_kv_offload_enabled(
         and is_deepseek_dsa(model_config.hf_config)
     ):
         raise ValueError(
-            f"{_ENABLE_ENV_VAR} requires an NPU DeepSeek DSA model using "
-            "the Ascend MLA attention backend."
+            f"{_ENABLE_ENV_VAR} requires an NPU DSA-family MLA model "
+            "(for example DeepSeek V3.2 or GLM-5.x) using the Ascend MLA "
+            "attention backend."
         )
     if server_args.max_running_requests is None:
         raise ValueError(
@@ -44,6 +49,36 @@ def is_sparsity_driven_kv_offload_enabled(
             "--max-running-requests to bound the per-process host KV allocation."
         )
     return True
+
+
+def get_sparsity_driven_kv_offload_sparse_context_len(
+    *,
+    model_config: ModelConfig,
+) -> int:
+    """Return the per-request on-device sparse KV window size."""
+    sparse_context_len = int(get_dsa_index_topk(model_config.hf_config))
+    if sparse_context_len <= 0:
+        raise ValueError(
+            "Sparsity-driven KV offload requires a positive DSA index_topk, "
+            f"got {sparse_context_len}."
+        )
+    return sparse_context_len
+
+
+def get_sparsity_driven_kv_offload_index_head_dim(
+    *,
+    model_config: ModelConfig,
+) -> int:
+    index_head_dim = getattr(model_config, "index_head_dim", None)
+    if index_head_dim is None:
+        index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
+    index_head_dim = int(index_head_dim)
+    if index_head_dim <= 0:
+        raise ValueError(
+            "Sparsity-driven KV offload requires a positive DSA index_head_dim, "
+            f"got {index_head_dim}."
+        )
+    return index_head_dim
 
 
 def get_sparsity_driven_kv_offload_cell_size(
@@ -61,7 +96,7 @@ def get_sparsity_driven_kv_offload_cell_size(
     ):
         return None
 
-    index_head_dim = model_config.index_head_dim
-    if index_head_dim is None:
-        raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
+    index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
+        model_config=model_config
+    )
     return index_head_dim * num_layers * element_size
