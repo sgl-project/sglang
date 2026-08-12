@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 # mxfp4 is the canonical lighter gpt-oss-20b variant and runs on SM90 (H100).
 GPT_OSS_20B_MODEL = "openai/gpt-oss-20b"
 
-register_cuda_ci(est_time=180, suite="base-b-test-1-gpu-large")
+register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestResponsesStreamingLogprobsGptOss(CustomTestCase):
