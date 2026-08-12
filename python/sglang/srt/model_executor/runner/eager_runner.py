@@ -49,6 +49,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
+from sglang.srt.model_executor.runner_utils import (
+    maybe_publish_prefill_shared_read_done,
+)
 from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
@@ -305,6 +308,11 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
+            maybe_publish_prefill_shared_read_done(
+                model_runner,
+                forward_batch,
+                torch.get_device_module(model_runner.device),
+            )
 
         if not cp_v2_active:
             forward_batch.attn_cp_metadata = None
