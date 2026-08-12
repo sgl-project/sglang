@@ -323,6 +323,73 @@ def concat_and_cast_q_fp8_pad(q_fp8_pad, q_nope, q_rope, num_heads):
 
 
 @triton.jit
+def cast_q_nope_to_fp8_kernel(
+    q_fp8_ptr,  # [num_tokens, H, NOPE+ROPE] fp8 (dst; nope prefix only)
+    q_nope_ptr,  # [num_tokens, H, NOPE] bf16
+    q_fp8_s0,
+    q_fp8_s1,
+    q_nope_s0,
+    q_nope_s1,
+    H: tl.constexpr,
+    NOPE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+):
+    """Cast q-nope into an FP8 query prefix without touching its RoPE tail."""
+    token = tl.program_id(0)
+    head = tl.arange(0, BLOCK_H)
+    col = tl.arange(0, BLOCK_NOPE)
+    mask = (head[:, None] < H) & (col[None, :] < NOPE)
+    value = tl.load(
+        q_nope_ptr
+        + token * q_nope_s0
+        + head[:, None] * q_nope_s1
+        + col[None, :],
+        mask=mask,
+    )
+    tl.store(
+        q_fp8_ptr
+        + token * q_fp8_s0
+        + head[:, None] * q_fp8_s1
+        + col[None, :],
+        value,
+        mask=mask,
+    )
+
+
+def cast_q_nope_to_fp8(q_fp8: torch.Tensor, q_nope: torch.Tensor) -> None:
+    """Cast ``q_nope`` into ``q_fp8[..., :q_nope.shape[-1]]``.
+
+    The destination may reserve a tail for a separate RoPE kernel. Both source
+    and destination may use arbitrary token/head strides, but their feature
+    dimensions must be contiguous.
+    """
+    num_tokens, num_heads, nope_dim = q_nope.shape
+    assert q_fp8.shape[:2] == (num_tokens, num_heads)
+    assert q_fp8.shape[-1] >= nope_dim
+    assert q_fp8.dtype == torch.float8_e4m3fn
+    assert q_nope.dtype in (torch.float16, torch.bfloat16)
+    assert q_fp8.stride(-1) == q_nope.stride(-1) == 1
+    if num_tokens == 0:
+        return
+    block_h = triton.next_power_of_2(num_heads)
+    block_nope = triton.next_power_of_2(nope_dim)
+    cast_q_nope_to_fp8_kernel[(num_tokens,)](
+        q_fp8,
+        q_nope,
+        q_fp8.stride(0),
+        q_fp8.stride(1),
+        q_nope.stride(0),
+        q_nope.stride(1),
+        H=num_heads,
+        NOPE=nope_dim,
+        BLOCK_H=block_h,
+        BLOCK_NOPE=block_nope,
+        num_warps=8,
+    )
+
+
+@triton.jit
 def absorbed_bmm_concat_cast_q_fp8_kernel(
     qout_ptr,  # [num_tokens, pad_heads, N+ROPE] fp8 (dst; only [:, :H, :] written)
     a_ptr,  # q_nope (pre-absorb) [num_tokens, H, K] bf16

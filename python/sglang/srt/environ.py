@@ -1248,6 +1248,11 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt-in B200 TRTLLM sparse-prefill path: split MLA RoPE/FP8 conversion so
+    # the large absorbed q-nope tensor is converted by a dedicated strided
+    # cast and FlashInfer only processes the 64-d RoPE components. The split
+    # is byte-identical to the fused RopeQuantize path.
+    SGLANG_ENABLE_DSA_TRTLLM_SPLIT_ROPE_QUANTIZE = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel

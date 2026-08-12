@@ -16,6 +16,9 @@ from sglang.kernels.ops.attention.pad import (
     seqlens_expand_triton as seqlens_expand_triton,
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
+    cast_q_nope_to_fp8 as cast_q_nope_to_fp8,
+)
+from sglang.kernels.ops.kvcache.cache_ops import (
     concat_and_cast_mha_k_kernel as concat_and_cast_mha_k_kernel,
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
@@ -177,6 +180,64 @@ def mla_quantize_and_rope_for_fp8(
         enable_pdl=is_arch_support_pdl(),
     )
 
+    return q_out, k_nope_out, k_rope_out
+
+
+def mla_split_quantize_and_rope_for_fp8(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split MLA RoPE/FP8 conversion to avoid reprocessing the large q-nope.
+
+    FlashInfer applies RoPE and writes the Q/K RoPE components directly to
+    FP8, preserving the default path's FP32-to-FP8 rounding. A strided Triton
+    kernel writes only the q-nope prefix, while the much smaller k-nope uses a
+    regular converting copy. The returned tensors are byte-identical to
+    :func:`mla_quantize_and_rope_for_fp8`.
+    """
+    import flashinfer.rope
+
+    assert q_nope.shape[-1] == kv_lora_rank
+    assert q_rope.shape[-1] == qk_rope_head_dim
+    attn_dtype = torch.float8_e4m3fn
+    q_len, num_heads = q_rope.shape[:2]
+    q_out = q_rope.new_empty(
+        q_len,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=attn_dtype,
+    )
+    k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
+    k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
+
+    cast_q_nope_to_fp8(q_out, q_nope)
+    q_nope_empty = q_nope[..., :0]
+    k_nope_empty = k_nope[..., :0]
+    flashinfer.rope.rope_quantize_fp8(
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope_empty,
+        k_nope=k_nope_empty,
+        cos_sin_cache=cos_sin_cache,
+        pos_ids=pos_ids,
+        is_neox=is_neox,
+        quantize_dtype=attn_dtype,
+        q_rope_out=q_out[..., kv_lora_rank:],
+        k_rope_out=k_rope_out,
+        q_nope_out=q_out[..., :0],
+        k_nope_out=k_nope_out[..., :0],
+        quant_scale_q=1.0,
+        quant_scale_kv=1.0,
+        enable_pdl=is_arch_support_pdl(),
+    )
+    k_nope_out.copy_(k_nope)
     return q_out, k_nope_out, k_rope_out
 
 

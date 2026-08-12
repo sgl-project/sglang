@@ -31,6 +31,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
+    mla_split_quantize_and_rope_for_fp8,
     q8kv8_topk_length_from_indices,
     seqlens_expand_triton,
 )
@@ -404,6 +405,9 @@ class DeepseekSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self._trtllm_split_rope_quantize = (
+            envs.SGLANG_ENABLE_DSA_TRTLLM_SPLIT_ROPE_QUANTIZE.get()
+        )
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -3149,7 +3153,25 @@ class DeepseekSparseAttnBackend(
                         forward_batch, rope_positions
                     )
 
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+            quantize_and_rope = (
+                mla_split_quantize_and_rope_for_fp8
+                if (
+                    self._trtllm_split_rope_quantize
+                    and is_prefill
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                    and self.device_sm_major == 10
+                    and self.kv_lora_rank == 512
+                    and self.qk_rope_head_dim == 64
+                    # The split is correct for other head counts, but it only
+                    # outperformed the fused path at the measured 64-head
+                    # DP-attention shape on SM100.
+                    and q.shape[1] == 64
+                    and q.shape[-1] == self.kv_lora_rank
+                    and q_rope.shape[-1] == self.qk_rope_head_dim
+                )
+                else mla_quantize_and_rope_for_fp8
+            )
+            q, k, k_rope = quantize_and_rope(
                 q,
                 q_rope,
                 k.squeeze(1),
