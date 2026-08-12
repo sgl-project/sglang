@@ -898,6 +898,10 @@ class GenerateReqInput:
                 else None
             ),
         )
+        # ``parallel_sample_num`` is derived during normalization rather than a
+        # dataclass field. Preserve it on sub-requests so downstream lifecycle
+        # decisions (notably MM embedding-lease ownership) see the parent mode.
+        sub.parallel_sample_num = self.parallel_sample_num
         cache[i] = sub
         return sub
 

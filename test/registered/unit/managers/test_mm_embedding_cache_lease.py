@@ -4,7 +4,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.managers import mm_schedule
-from sglang.srt.managers.io_struct import MMEmbeddingCacheAcquireReqInput
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    MMEmbeddingCacheAcquireReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -141,3 +144,25 @@ def test_continual_session_keeps_features_for_later_turns():
 
     assert _can_omit_mm_features(regular)
     assert not _can_omit_mm_features(continual)
+
+
+def test_batch_subrequest_preserves_embedding_lease_mode():
+    regular = GenerateReqInput(
+        text=["first", "second"],
+        image_data=[[b"first"], [b"second"]],
+        sampling_params=[{}, {}],
+    )
+    regular.normalize_batch_and_arguments()
+
+    assert regular[0].parallel_sample_num == 1
+    assert _can_omit_mm_features(regular[0])
+
+    parallel = GenerateReqInput(
+        text="prompt",
+        image_data=b"image",
+        sampling_params={"n": 2},
+    )
+    parallel.normalize_batch_and_arguments()
+
+    assert parallel[0].parallel_sample_num == 2
+    assert not _can_omit_mm_features(parallel[0])
