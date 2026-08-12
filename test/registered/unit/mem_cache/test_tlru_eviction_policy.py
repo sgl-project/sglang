@@ -16,6 +16,16 @@ import math
 import os
 from dataclasses import dataclass, field
 
+try:
+    from sglang.test.ci.ci_register import register_cpu_ci
+except ImportError:  # standalone run without an sglang install; CI parses the
+    # registration below from the AST, so the stub changes nothing for CI.
+    def register_cpu_ci(**kwargs):
+        pass
+
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _EVICT_POLICY = os.path.normpath(
     os.path.join(_HERE, "../../../../python/sglang/srt/mem_cache/evict_policy.py")
@@ -64,7 +74,9 @@ def chain(node_lens, convo_length=None, t0=0.0):
     for i, n in enumerate(node_lens):
         depth += n
         nodes.append(
-            FakeNode(depth=depth, key_len=n, convo_length=convo, last_access_time=t0 + i)
+            FakeNode(
+                depth=depth, key_len=n, convo_length=convo, last_access_time=t0 + i
+            )
         )
     return nodes
 
@@ -187,5 +199,7 @@ if __name__ == "__main__":
             except AssertionError as e:
                 failures += 1
                 print(f"FAIL {name}: {e}")
-    print("\n" + ("TLRU_TESTS_OK" if not failures else f"TLRU_TESTS_FAILED ({failures})"))
+    print(
+        "\n" + ("TLRU_TESTS_OK" if not failures else f"TLRU_TESTS_FAILED ({failures})")
+    )
     raise SystemExit(1 if failures else 0)
