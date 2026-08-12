@@ -52,15 +52,15 @@ from sglang.multimodal_gen.runtime.vla.parallel import (
     broadcast_tensor_from_rank,
     get_vla_split_group,
 )
-from sglang.multimodal_gen.runtime.vla.prompt_bucketing import (
-    bucket_prompt_tokens,
-    effective_token_length,
-    select_prompt_token_bucket,
-)
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
     VLAPrefixCacheManager,
+)
+from sglang.multimodal_gen.runtime.vla.prompt_bucketing import (
+    bucket_prompt_tokens,
+    effective_token_length,
+    select_prompt_token_bucket,
 )
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
