@@ -21,6 +21,7 @@ from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     mark_fused_gelu_site,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_world_size,
@@ -73,6 +74,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -104,32 +106,7 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
     return padded_len // sp_world_size
 
 
-def _get_qkv_projections(
-    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
-):
-    if attn.use_fused_qkv:
-        img_qkv, _ = attn.to_qkv(hidden_states)
-        img_query, img_key, img_value = [
-            x.contiguous() for x in img_qkv.chunk(3, dim=-1)
-        ]
-    else:
-        img_query, _ = attn.to_q(hidden_states)
-        img_key, _ = attn.to_k(hidden_states)
-        img_value, _ = attn.to_v(hidden_states)
-
-    txt_query = txt_key = txt_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if attn.use_fused_added_qkv:
-            txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            txt_query, txt_key, txt_value = [
-                x.contiguous() for x in txt_qkv.chunk(3, dim=-1)
-            ]
-        else:
-            txt_query, _ = attn.add_q_proj(encoder_hidden_states)
-            txt_key, _ = attn.add_k_proj(encoder_hidden_states)
-            txt_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return img_query, img_key, img_value, txt_query, txt_key, txt_value
+_get_qkv_projections = get_qkv_projections
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -1339,7 +1316,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
-    _fsdp_shard_conditions = QwenImageDitConfig().arch_config._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_transformer_block]
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:

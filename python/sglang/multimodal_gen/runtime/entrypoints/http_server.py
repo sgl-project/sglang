@@ -205,7 +205,7 @@ async def server_info_endpoint(request: Request):
 
     return {
         "model_path": server_args.model_path,
-        "served_model_name": server_args.model_id or server_args.model_path,
+        "served_model_name": server_args.served_model_name,
         "tp_size": server_args.tp_size,
         "dp_size": server_args.dp_size,
         "version": __version__,
