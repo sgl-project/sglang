@@ -143,11 +143,68 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
     def test_prose_with_angle_bracket_is_not_held_back(self):
         """Only a suffix that could still grow into a DSML marker may be withheld.
-        Holding every `<` would strand ordinary prose until end of turn, and no
-        end-of-turn flush exists to release it."""
+        Holding every `<` would keep ordinary prose out of the stream until the
+        turn ended, long after the client should have seen it."""
         normal, _ = self._feed([_weather_call("SF"), "\n\n5 < 6 and a < b."])
 
         self.assertIn("5 < 6 and a < b.", normal)
+
+    def test_parallel_calls_do_not_leak_their_separator(self):
+        """Invokes inside one section are separated by layout, not by content.
+        Collecting a lead for every call must not turn that whitespace into an
+        assistant message -- `detect_and_parse` never surfaces it either."""
+        section = _wrapped(
+            _invoke("get_weather", _param("city", "true", "SF"))
+            + "\n"
+            + _invoke("get_weather", _param("city", "true", "NY"))
+        )
+
+        for size in (None, 1, 5, 17):
+            with self.subTest(chunk_size=size):
+                chunks = (
+                    [section]
+                    if size is None
+                    else [section[i : i + size] for i in range(0, len(section), size)]
+                )
+                normal, calls = self._feed(chunks)
+
+                self.assertEqual(normal, "")
+                self.assertEqual([c.name for c in calls if c.name], ["get_weather"] * 2)
+
+    def test_error_on_a_later_call_does_not_duplicate_its_lead(self):
+        """The lead of the call that failed is still at the head of the buffer the
+        error path dumps verbatim, so it must not also be emitted from the parts
+        collected so far. Only leads whose call completed are gone from it."""
+        detector = DeepSeekV4Detector()
+        text = _weather_call("SF") + "\n\nNow the other one.\n\n" + _weather_call("NY")
+        real = DeepSeekV4Detector._parse_parameters_from_xml
+        seen = []
+
+        def fail_on_second(self, *args, **kwargs):
+            seen.append(1)
+            if len(seen) == 2:
+                raise RuntimeError("boom")
+            return real(self, *args, **kwargs)
+
+        with patch.object(
+            DeepSeekV4Detector, "_parse_parameters_from_xml", fail_on_second
+        ):
+            result = detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(result.normal_text.count("Now the other one."), 1)
+
+    def test_finish_releases_text_held_for_a_marker_that_never_came(self):
+        """Trailing newlines are withheld in case they indent a tag still to come.
+        When the stream ends instead, they were ordinary text all along, and the
+        end-of-turn flush is what owes them to the client."""
+        detector = DeepSeekV4Detector()
+        normal = ""
+        for chunk in [_weather_call("SF"), "\n\nBye.\n\n"]:
+            normal += detector.parse_streaming_increment(chunk, self.tools).normal_text
+        normal += detector.finish(self.tools).normal_text
+
+        self.assertTrue(normal.endswith("Bye.\n\n"), repr(normal))
+        self.assertEqual(detector._buffer, "")
 
     def test_parse_error_neither_swallows_nor_duplicates(self):
         """An unexpected parse error must not empty the turn, and the dropped

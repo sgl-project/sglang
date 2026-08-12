@@ -245,26 +245,22 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         The indent belongs to the tag, not to the prose around it, which is why
         `detect_and_parse` never shows it either. Safe to swallow here only
-        because `_split_flushable` refuses to release a trailing newline once a
-        call has been seen, so an indent is still in the buffer when its tag
-        lands however the chunks fell.
+        because `_split_flushable` refuses to release a trailing newline, so an
+        indent is still in the buffer when its tag lands however the chunks fell.
         """
         for token in (self.eot_token, self.invoke_end_token, self.bot_token):
-            text = re.sub(rf"\n*{re.escape(token)}", "", text)
+            text = re.sub(rf"\s*{re.escape(token)}", "", text)
         return text
 
     def _split_flushable(self, text: str) -> tuple[str, str]:
         """Split `text` into (safe to emit now, hold back for the next chunk).
 
-        Held back: a suffix that is a strict prefix of a real marker, and -- once
-        a call has been seen -- a trailing run of newlines, which may yet turn
-        out to be the indent of a tag rather than prose. Emitting an indent is
-        not something a later chunk can take back, and that is what would make
-        the output depend on where the deltas split.
-
-        The newline hold is deliberately conditional. A turn with no tool call
-        at all never reaches the tag-stripping paths, so holding its trailing
-        newlines would strand them: nothing flushes the buffer at end of turn.
+        Held back: a suffix that is a strict prefix of a real marker, and a
+        trailing run of newlines, which may yet turn out to be the indent of a
+        tag rather than prose. Emitting an indent is not something a later chunk
+        can take back, and that is what would make the output depend on where
+        the deltas split. Whatever is held is released by `finish()` once the
+        stream ends and the marker can no longer arrive.
 
         Nothing else is held: prose that merely contains `<` ("5 < 6") streams
         out immediately.
@@ -278,27 +274,39 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 for marker in self._markers()
             ):
                 hold_from = start
-        if self.current_tool_id != -1:
-            # Whatever is held takes its indent with it, otherwise the newlines
-            # in front of a half-arrived tag go out before the tag is known.
-            hold_from = len(text[:hold_from].rstrip("\n"))
+        # Whatever is held takes its indent with it, otherwise the newlines in
+        # front of a half-arrived tag go out before the tag is known.
+        hold_from = len(text[:hold_from].rstrip())
         return text[:hold_from], text[hold_from:]
 
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        """Release text held for a marker that can no longer arrive.
+
+        `_split_flushable` withholds anything that could still turn out to be a
+        DSML tag. Once the stream is over nothing more is coming, so a held
+        fragment was ordinary text all along and is owed to the client.
+        """
+        held, self._buffer = self._buffer, ""
+        return StreamingParseResult(normal_text=self._strip_section_markers(held))
+
     def _lead_text(
-        self, current_text: str, *, call_start: int, trim_trailing_newlines: bool
+        self, current_text: str, *, call_start: int, is_first_call: bool
     ) -> str:
         """The normal text sitting in front of the call that starts at `call_start`.
 
-        `trim_trailing_newlines` is only for the very first call, where the trim
-        keeps this path agreeing with `detect_and_parse`. Later calls must not
-        trim: the same newlines are emitted untouched when the prose arrives in
-        its own chunk, and the result may not depend on the chunk boundaries.
+        The two trims differ on purpose. The first call keeps `detect_and_parse`'s
+        exact `removesuffix("\\n\\n")` so the streaming and one-shot paths agree on
+        the preamble. Every later call drops all trailing whitespace, because
+        whitespace in front of a call is layout -- the separator between parallel
+        invokes is nothing else -- and because the alternative is not stable: that
+        whitespace lands in this lead or in the preceding flush depending only on
+        where the deltas happened to split.
         """
         bot_pos = current_text.rfind(self.bot_token, 0, call_start)
         if bot_pos != -1:
             call_start = bot_pos
         lead = self._strip_section_markers(current_text[:call_start])
-        return lead.removesuffix("\n\n") if trim_trailing_newlines else lead
+        return lead.removesuffix("\n\n") if is_first_call else lead.rstrip()
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
@@ -334,6 +342,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         all_calls: list[ToolCallItem] = []
         normal_text_parts: list[str] = []
+        # The lead of the call being assembled is still sitting at the head of
+        # current_text; only advancing past a completed call consumes it. The
+        # error path below needs to know, or it re-emits what it dumps verbatim.
+        lead_is_still_in_current_text = False
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -363,13 +375,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 # call: it is only False the first time a call is seen, so an
                 # invoke that spans chunks can't re-emit the same lead.
                 if not self.current_tool_name_sent:
-                    normal_text_parts.append(
-                        self._lead_text(
-                            current_text,
-                            call_start=invoke_match.start(),
-                            trim_trailing_newlines=is_first_call,
-                        )
+                    lead = self._lead_text(
+                        current_text,
+                        call_start=invoke_match.start(),
+                        is_first_call=is_first_call,
                     )
+                    if lead:
+                        normal_text_parts.append(lead)
+                        lead_is_still_in_current_text = True
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -432,6 +445,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Remove the completed tool call from buffer
                     self._buffer = current_text[invoke_match.end() :]
                     current_text = self._buffer  # Update for next iteration
+                    lead_is_still_in_current_text = False
 
                     # Move to next tool call
                     self.current_tool_id += 1
@@ -461,15 +475,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            # Re-emit verbatim rather than swallowing the turn; leads already
-            # collected sit in front of whatever current_text still holds.
+            # Re-emit verbatim rather than swallowing the turn. Leads whose call
+            # completed are gone from current_text and have to be kept; the lead
+            # of the call that failed is still in there and would come out twice.
             # Calls are dropped on purpose: the failure can land between a tool's
             # name and its arguments, and a half-formed call is worse than none.
             self._buffer = ""
-            emitted = "".join(normal_text_parts)
-            if emitted and current_text.startswith(emitted):
-                emitted = ""
-            return StreamingParseResult(normal_text=emitted + current_text)
+            if lead_is_still_in_current_text and normal_text_parts:
+                normal_text_parts.pop()
+            return StreamingParseResult(
+                normal_text="".join(normal_text_parts) + current_text
+            )
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
