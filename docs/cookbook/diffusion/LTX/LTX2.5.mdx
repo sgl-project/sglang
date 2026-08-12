@@ -67,32 +67,41 @@ decoder choice does not change anything upstream of it.
 ### 1.3 Coming from LTX-2 / LTX-2.3
 
 LTX-2.5 reuses the LTX-2.3 audio-video transformer and runs through the same
-`LTX2Pipeline`, so the commands look familiar — but the defaults are different
-enough that copying an LTX-2.3 command will not do what you expect:
+`LTX2Pipeline`, so the commands look familiar. What changes is that LTX-2.5
+ships **two** DiTs and the default is the distilled one, where LTX-2 / 2.3
+default to a full DiT that a distilled LoRA is merged onto per stage.
 
-| | LTX-2 | LTX-2.3 | LTX-2.5 |
-| --- | --- | --- | --- |
-| Default output | 768×512 | 768×512 | **960×544** |
-| Default frames | 121 | 121 | 121 |
-| Denoising | 40 steps | 30 steps | **8 pinned sigmas** |
-| Guidance | CFG 4.0 | CFG 3.0 | **unguided** (1.0) |
-| Text encoder | Gemma 3 | Gemma 3 | **Gemma 4 Unified** |
-| Audio output | 24 kHz | 48 kHz | 48 kHz |
-| Two-stage | dev DiT + distilled LoRA | dev DiT + distilled LoRA | **already-distilled DiT, no LoRA** |
-| HQ pipeline class | — | `LTX2TwoStageHQPipeline` | **none** |
-| CFG parallel | yes | yes | **not applicable** |
+That is the source of most of the surprises: an LTX-2.3 command copied over
+lands on a distilled model that ignores step counts and does not want guidance.
 
-Three consequences worth calling out:
+| | LTX-2 | LTX-2.3 | LTX-2.5 distilled *(default)* | LTX-2.5 dev |
+| --- | --- | --- | --- | --- |
+| Selected by | — | — | *(default)* | `--model-variant dev` |
+| Weights | `transformer/` | `transformer/` | `transformer/` | `transformer_full/` |
+| Default output | 768×512 | 768×512 | **960×544** | **960×544** |
+| Denoising | 40 steps | 30 steps | **8 pinned sigmas** | steps, you choose |
+| `--num-inference-steps` | honoured | honoured | **ignored** | honoured |
+| Guidance | CFG 4.0 | CFG 3.0 | **unguided** (1.0) | CFG, you choose |
+| Dynamic shifting | on | on | **off** | on |
+| Text encoder | Gemma 3 | Gemma 3 | Gemma 4 Unified | Gemma 4 Unified |
+| Audio output | 24 kHz | 48 kHz | 48 kHz | 48 kHz |
+| Two-stage | + distilled LoRA | + distilled LoRA | **no LoRA** | **no LoRA** |
+| HQ pipeline class | — | `LTX2TwoStageHQPipeline` | none | none |
+| CFG parallel | yes | yes | **not applicable** | yes |
 
-- **`--num-inference-steps` is ignored on the distilled path.** The shipped DiT
-  is driven by a fixed sigma schedule; handing it a generic linear schedule of
-  N steps quietly costs quality, so SGLang pins the trained one. Use
-  `--model-variant dev` if you want step-count control.
-- **`--enable-cfg-parallel` buys nothing.** An unguided model has no negative
-  branch to split across GPUs. Use sequence or tensor parallelism instead.
-- **`--ltx2-two-stage-device-mode` and `--distilled-lora-path` do not apply.**
-  Both exist to swap a distilled LoRA between two-stage phases, and LTX-2.5's
-  DiT is already distilled.
+Consequences worth calling out:
+
+- **On the distilled path `--num-inference-steps` is ignored.** That DiT is
+  driven by a fixed sigma schedule; a generic linear schedule of N steps quietly
+  costs quality, so SGLang pins the trained one. Use `--model-variant dev` when
+  you want step-count and guidance control.
+- **`--enable-cfg-parallel` buys nothing on the distilled path**, since an
+  unguided model has no negative branch to split. It does apply to the dev
+  variant. Sequence and tensor parallelism work for both.
+- **`--ltx2-two-stage-device-mode` and `--distilled-lora-path` do not apply to
+  either variant.** Both exist to swap a distilled LoRA between two-stage
+  phases; LTX-2.5 distils the weights themselves instead, so its two-stage
+  recipe is just base stage, x2 latent upsample, refinement.
 
 ## 2. SGLang-diffusion Installation
 
@@ -131,16 +140,14 @@ Choose the pipeline class based on the quality and latency target:
 | One-stage generation | `LTX2Pipeline` | Fastest path. Supports T2V and TI2V, auto-duration and the diffusion decoder. |
 | Two-stage generation | `LTX2TwoStagePipeline` | Half-resolution base stage, x2 latent upsample, then a short refinement. Pass the **final** resolution. |
 
-There is no HQ pipeline class for LTX-2.5, and no `--distilled-lora-path`: the
-shipped DiT is already distilled, so `--ltx2-two-stage-device-mode` (which
-governs swapping a distilled LoRA between stages) does not apply either.
+There is no HQ pipeline class for LTX-2.5, and no `--distilled-lora-path` for
+either weights variant: LTX-2.5 distils the weights themselves rather than
+merging a LoRA per stage, so `--ltx2-two-stage-device-mode` (which governs that
+swap) does not apply either.
 
-Feature compatibility:
-
-| Pipeline class | T2V | TI2V (`--image-path`) | Auto-duration | Diffusion decoder |
-| --- | --- | --- | --- | --- |
-| `LTX2Pipeline` | Yes | Yes | Yes | Yes |
-| `LTX2TwoStagePipeline` | Yes | Yes | Yes | Yes |
+Every feature on this page — text-to-video, image conditioning, auto-duration,
+the diffusion decoder, and either weights variant — works with both pipeline
+classes.
 
 Selecting weights:
 
@@ -157,10 +164,11 @@ Selecting weights:
 | 2 GPUs, large DiT | `--num-gpus 2 --tp-size 2` | Tensor parallel across attention heads. |
 
 <Warning>
-Unlike LTX-2 / LTX-2.3, **CFG parallelism does not apply to LTX-2.5**. The
-distilled DiT runs unguided (`guidance_scale=1.0`), so there is no negative
-branch to split across GPUs and `--enable-cfg-parallel` buys nothing. The
-CFG-parallel presets on the LTX-2 / LTX-2.3 page do not carry over.
+**CFG parallelism does not apply on the default (distilled) path.** That DiT
+runs unguided, so there is no negative branch to split across GPUs and
+`--enable-cfg-parallel` buys nothing — the CFG-parallel presets on the
+LTX-2 / LTX-2.3 page do not carry over. It *is* usable with
+`--model-variant dev`, which runs with guidance.
 </Warning>
 
 ## 4. Model Invocation
