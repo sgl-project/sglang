@@ -129,6 +129,34 @@ def mamba2_config(model_config: ModelConfig):
             )
         return config
 
+    # Pure Mamba-1 (Falcon-Mamba); the flag is set in ModelConfig. Mamba-1 uses
+    # the Mamba2 backend via a full-rank (head_dim==1) state layout.
+    if getattr(config, "_is_pure_falcon_mamba", False):
+        # Mamba2AttnBackend reads mamba_chunk_size; keep the conv window below it.
+        if not hasattr(config, "mamba_chunk_size"):
+            config.mamba_chunk_size = 256
+
+        if not hasattr(config, "mamba2_cache_params"):
+            from sglang.srt.configs.mamba_utils import (
+                Mamba2CacheParams,
+                Mamba2StateShape,
+            )
+            from sglang.srt.runtime_context import get_parallel
+
+            tp_size = get_parallel().tp_size if get_parallel() else 1
+
+            state_shape = Mamba2StateShape.create_mamba1(
+                tp_world_size=tp_size,
+                intermediate_size=config.intermediate_size,
+                state_size=config.state_size,
+                conv_kernel=config.conv_kernel,
+            )
+            config.mamba2_cache_params = Mamba2CacheParams(
+                shape=state_shape,
+                layers=list(range(config.num_hidden_layers)),
+            )
+        return config
+
     return None
 
 
