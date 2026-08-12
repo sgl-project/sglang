@@ -1004,8 +1004,12 @@ class FusedMoE(torch.nn.Module):
             KTEPWrapperMethod,
         ):
             if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
+                gpu_slot = self.quant_method.map_logical_expert_id_for_gpu_load(
+                    expert_id
+                )
+                if gpu_slot < 0:
                     return
+                expert_id = gpu_slot
 
         self._weight_loader_impl(
             param=param,

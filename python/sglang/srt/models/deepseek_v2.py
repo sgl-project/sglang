@@ -104,7 +104,12 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.kt_ep_wrapper import (
+    KT_SHARED_EXPERTS_STREAM,
+    KTEPWrapperMethod,
+    get_kt_shared_experts_stream,
+)
+
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -1063,6 +1068,7 @@ class DeepseekV2MoE(nn.Module):
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
         shared_output = None
+        kt_shared_join = None
         if hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
@@ -1076,11 +1082,39 @@ class DeepseekV2MoE(nn.Module):
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
-                shared_output = self._forward_shared_experts(
-                    hidden_states,
-                    gemm_output_zero_allocator,
-                    pre_quant_input=pre_quant_input,
-                )
+                if (
+                    KT_SHARED_EXPERTS_STREAM
+                    and hidden_states.device.type == "npu"
+                    and hasattr(self, "shared_experts")
+                ):
+                    # Shared experts on a sibling side stream, concurrent with
+                    # gate/topk/experts below — including the KT CPU-MoE
+                    # callback window inside experts(). Events are kept alive
+                    # on self for the lifetime of any captured graph.
+                    main_stream = torch.cuda.current_stream()
+                    shared_stream = get_kt_shared_experts_stream()
+                    fork_ev = torch.cuda.Event()
+                    join_ev = torch.cuda.Event()
+                    if not hasattr(self, "_kt_shared_events"):
+                        self._kt_shared_events = []
+                    self._kt_shared_events.append((fork_ev, join_ev))
+                    fork_ev.record(main_stream)
+                    shared_stream.wait_event(fork_ev)
+                    with torch.cuda.stream(shared_stream):
+                        shared_output = self._forward_shared_experts(
+                            hidden_states,
+                            gemm_output_zero_allocator,
+                            pre_quant_input=pre_quant_input,
+                        )
+                        shared_output.record_stream(shared_stream)
+                    join_ev.record(shared_stream)
+                    kt_shared_join = (join_ev, main_stream)
+                else:
+                    shared_output = self._forward_shared_experts(
+                        hidden_states,
+                        gemm_output_zero_allocator,
+                        pre_quant_input=pre_quant_input,
+                    )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_kwargs = (
@@ -1152,6 +1186,11 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
 
+        if kt_shared_join is not None and shared_output is not None:
+            # KT side-stream: order the fused shared-add below behind the
+            # side-stream compute of shared_output.
+            join_ev, main_stream = kt_shared_join
+            main_stream.wait_event(join_ev)
         if (
             defer_shared
             and hidden_states.shape[0] > 0

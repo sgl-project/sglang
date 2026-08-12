@@ -367,6 +367,18 @@ class Envs:
     # Allocator-history buffer for /start_profile activities=["MEM"]; the
     # default truncates long windows (each entry is one alloc/free event).
     SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
+    # NPU: one-shot torch_npu profiler on a specific decode step (scheduler event loop).
+    SGLANG_NPU_PROFILE_ENABLE = EnvBool(False)
+    SGLANG_NPU_PROFILE_DECODE_TOKEN = EnvInt(2)
+    SGLANG_NPU_PROFILE_DIR = EnvStr("./npu_results_dbg")
+    # ProfilerLevel: 0=light, 1=medium, 2=heavy (Level2 + analyse can block scheduler for a long time).
+    SGLANG_NPU_PROFILE_LEVEL = EnvInt(0)
+    # tensorboard_trace_handler(analyse_flag): True runs CANN offline parse in-process and blocks the server.
+    SGLANG_NPU_PROFILE_ANALYSE = EnvBool(False)
+    # KT + NPUGraph host callbacks deadlock/hang with torch_npu.profiler; force eager decode when profiling.
+    SGLANG_NPU_PROFILE_DISABLE_GRAPH = EnvBool(True)
+    # After the profiled decode step, keep NPUGraph disabled (mixing eager+profiler then graph replay can SIGBUS).
+    SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER = EnvBool(True)
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_TRACE_ASYNC = EnvBool(False)

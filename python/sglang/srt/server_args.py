@@ -3020,6 +3020,16 @@ class ServerArgs:
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         NS("exec.moe"),
     ] = None
+    kt_expert_placement_strategy: A[
+        str,
+        "[ktransformers parameter] GPU expert placement: prefix (0..N-1) or frequency (top-N from activation stats).",
+        NS("exec.moe"),
+    ] = "prefix"
+    kt_activation_freq_path: A[
+        Optional[str],
+        "[ktransformers parameter] Path to activation_freq .pt for frequency placement (shape: num_layers x num_experts).",
+        NS("exec.moe"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Diffusion LLM
