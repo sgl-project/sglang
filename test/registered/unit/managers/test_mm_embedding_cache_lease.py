@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -281,3 +282,7 @@ def test_batch_subrequest_preserves_embedding_lease_mode():
 
     assert parallel[0].parallel_sample_num == 2
     assert not _can_omit_mm_features(parallel[0])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
