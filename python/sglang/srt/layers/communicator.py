@@ -581,10 +581,6 @@ class LayerCommunicator:
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                # A MoE layer that deferred its finalize for the CuTe DSL
-                # backend hands the operands over here. This either folds the
-                # finalize into the collective and returns both outputs, or
-                # materializes it in place and lets the paths below run.
                 fused_finalize = fuse_deferred_moe_finalize(
                     hidden_states,
                     residual,

@@ -25,8 +25,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
-CUTE_DSL_BACKEND = "cute-dsl"
-
 # FlashInfer allreduce fusion: set when flashinfer is available (see block below)
 _flashinfer_comm = None
 _TorchDistBackend = None
@@ -52,7 +50,7 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
 
-    if backend == CUTE_DSL_BACKEND:
+    if backend == "cute-dsl":
         if not is_sm100_supported():
             raise ValueError(
                 "FlashInfer allreduce fusion cute-dsl backend requires a "
@@ -661,15 +659,6 @@ def _cute_dsl_buffer_name(use_attn_tp_group: bool) -> str:
     )
 
 
-def cute_dsl_backend_selected() -> bool:
-    return get_server_args().flashinfer_allreduce_fusion_backend == CUTE_DSL_BACKEND
-
-
-def _classic_backend(backend: Optional[str]) -> Optional[str]:
-    """The backend name for a workspace the CuTe DSL kernels do not serve."""
-    return "mnnvl" if backend == CUTE_DSL_BACKEND else backend
-
-
 def get_cute_dsl_workspace(use_attn_tp_group: bool):
     """The pre-built CuTe DSL workspace for this group, or None.
 
@@ -677,7 +666,7 @@ def get_cute_dsl_workspace(use_attn_tp_group: bool):
     up front (see ``pre_initialize_workspaces``); nothing creates one lazily
     from inside a forward pass.
     """
-    if not cute_dsl_backend_selected():
+    if get_server_args().flashinfer_allreduce_fusion_backend != "cute-dsl":
         return None
     from sglang.srt.runtime_context import get_resources
 
@@ -802,7 +791,10 @@ def ensure_workspace_initialized(
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
     server_args = get_server_args()
-    backend = _classic_backend(resolve_flashinfer_allreduce_fusion_backend(server_args))
+    backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
+    if backend == "cute-dsl":
+        # The CuTe DSL kernels do not serve this workspace.
+        backend = "mnnvl"
     if backend is None:
         return False
 
@@ -980,7 +972,7 @@ def pre_initialize_workspaces(
     if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
         return
 
-    if cute_dsl_backend_selected():
+    if get_server_args().flashinfer_allreduce_fusion_backend == "cute-dsl":
         if top_k is None or rms_eps is None:
             logger.warning(
                 "The cute-dsl allreduce fusion backend needs the model's top_k "

@@ -32,8 +32,6 @@ from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
-BACKEND_NAME = "cute-dsl"
-
 # Warp size and the bf16 elements per 16-byte vector, mirroring the constants
 # the FlashInfer HT device kernel derives its shard split from.
 _WARP_SIZE = 32
@@ -42,8 +40,6 @@ _VEC_BF16 = 8
 # The HT kernel dedicates two warps plus the reduction warps to non-consumer
 # roles, so the consumer count has this much headroom under the 1024 limit.
 _HT_MAX_CONSUMER_THREADS = 1024 - 3 * _WARP_SIZE
-
-_unavailable = False
 
 
 def _import_flashinfer():
@@ -56,26 +52,6 @@ def _import_flashinfer():
     )
 
     return KernelTarget, MNNVLCuteDSLConfig, MRangeDispatch, ProtocolKind, StaticProfile
-
-
-def is_available() -> bool:
-    """Whether the FlashInfer build exposes the CuTe DSL backend."""
-    global _unavailable
-    if _unavailable:
-        return False
-    try:
-        from flashinfer.comm.mnnvl_cutedsl_ar import (  # noqa: F401
-            MNNVLCuteDSLAllReduceFusionWorkspace,
-        )
-
-        _import_flashinfer()
-    except (ImportError, AttributeError) as e:
-        _unavailable = True
-        logger.warning(
-            "FlashInfer MNNVL CuTe DSL allreduce fusion is not available (%s).", e
-        )
-        return False
-    return True
 
 
 def _ht_shard_split(hidden_size: int) -> Optional[tuple[int, int]]:
@@ -303,8 +279,6 @@ def create_workspace(
 ) -> Optional[CuteDSLFusionWorkspace]:
     """Compile the LL/BT/HT kernels for this model. Returns None when the shape
     is out of contract, leaving the caller on its previous backend."""
-    if not is_available():
-        return None
     if dtype != torch.bfloat16:
         logger.warning(
             "MNNVL CuTe DSL allreduce fusion supports bfloat16 only (got %s).", dtype
