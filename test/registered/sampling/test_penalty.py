@@ -216,26 +216,6 @@ class TestPenalty(CustomTestCase):
         }
         self._test_penalty_effect(prompt, baseline_params, penalty_params)
 
-    def test_penalty_edge_cases_negative_penalty_values(self):
-        """Test that negative penalties decrease vocabulary diversity."""
-        prompt = "Write the word 'test' exactly 15 times in a row, separated by spaces."
-        baseline_params = {
-            "frequency_penalty": 0.0,
-            "presence_penalty": 0.0,
-            "repetition_penalty": 1.0,
-        }
-        negative_penalty_params = {
-            "frequency_penalty": -0.5,
-            "presence_penalty": -0.25,
-            "repetition_penalty": 1.0,
-        }
-        self._test_penalty_effect(
-            prompt,
-            baseline_params,
-            negative_penalty_params,
-            expected_reduction=False,
-        )
-
     def test_penalty_edge_cases_extreme_penalty_values(self):
         """Test that extreme penalties strongly increase vocabulary diversity."""
         prompt = (

@@ -184,6 +184,18 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
         pen.apply(logits)
         self.assertAlmostEqual(logits[0, 3].item(), -2.0, places=5)
 
+    def test_negative_penalty_increases_repeated_token_logit(self):
+        """Test that a negative frequency penalty rewards repeated tokens."""
+        _, pen = self._setup([-0.5])
+        pen.cumulate_output_tokens(torch.tensor([4]))
+        pen.cumulate_output_tokens(torch.tensor([4]))
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+
+        self.assertAlmostEqual(logits[0, 4].item(), 1.0, places=5)
+        self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
+
     def test_filter_keeps_subset(self):
         """Test that filter retains only the selected batch indices."""
         orch, pen = self._setup([1.0, 2.0])
@@ -249,6 +261,18 @@ class TestBatchedPresencePenalizer(CustomTestCase):
         pen.apply(logits)
         # scatter_ overwrites (not adds), so penalty should be 1.0, not 2.0
         self.assertAlmostEqual(logits[0, 7].item(), -1.0, places=5)
+
+    def test_negative_penalty_increases_present_token_logit(self):
+        """Test that a negative presence penalty rewards a present token once."""
+        _, pen = self._setup([-0.75])
+        pen.cumulate_output_tokens(torch.tensor([7]))
+        pen.cumulate_output_tokens(torch.tensor([7]))
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+
+        self.assertAlmostEqual(logits[0, 7].item(), 0.75, places=5)
+        self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
 
     def test_filter_keeps_subset(self):
         """Test that filter retains the first request's presence penalty."""
