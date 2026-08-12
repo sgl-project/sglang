@@ -313,13 +313,13 @@ class LTX2PipelineConfig(PipelineConfig):
             self.patch_size,
         )
         latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
-        # Both flattens above are views, so the result carries the permuted
-        # strides: token stride 1 and channel stride S, i.e. column-major. Torch
-        # matmul absorbs that, but fp8's per-token activation quantisation
-        # asserts on a contiguous input, so `--quantization fp8` would fail at
-        # the first patchify projection. Materialise the row-major copy once
-        # here rather than per step inside the denoising loop.
-        return latents.contiguous()
+        # Deliberately left non-contiguous. Both flattens above are views, so
+        # the result keeps the permuted strides -- token stride 1, channel
+        # stride S. Torch matmul absorbs that, and normalising the layout here
+        # changes which GEMM kernel runs, which moves bf16 output enough for
+        # two-stage denoising to land on a visibly different sample. The fp8
+        # path needs a contiguous activation and makes its own copy.
+        return latents
 
     def _infer_video_latent_frames_and_tokens_per_frame(
         self, batch, seq_len: int
