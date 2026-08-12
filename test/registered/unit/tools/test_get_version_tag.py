@@ -86,68 +86,6 @@ class TestGetVersionTag(unittest.TestCase):
         version_describe.assert_not_called()
         print_mock.assert_called_once_with("v0.5.10")
 
-    def test_remote_tag_listing_reads_refs_only_and_drops_peeled_entries(self):
-        ls_remote_output = (
-            "aaa\trefs/tags/v0.5.9\n"
-            "bbb\trefs/tags/v0.5.10\n"
-            "ccc\trefs/heads/main\n"
-        )
-
-        with patch.object(
-            self.version_helper, "run_git", return_value=ls_remote_output
-        ) as run_git:
-            tags = self.version_helper.list_remote_version_tags("origin")
-
-        # --refs is what keeps annotated tags from also yielding `<tag>^{}`, and
-        # ls-remote is what keeps this from transferring objects.
-        run_git.assert_called_once_with(
-            "ls-remote", "--tags", "--refs", "origin", "v*.*.*"
-        )
-        self.assertEqual(tags, ["v0.5.9", "v0.5.10"])
-
-    def test_remote_tags_are_ordered_by_pep440_like_local_tags(self):
-        with patch.object(
-            self.version_helper,
-            "list_remote_version_tags",
-            return_value=["v0.5.10rc0", "v0.5.9", "v0.5.10"],
-        ):
-            self.assertEqual(
-                self.version_helper.get_latest_version_tag("origin"), "v0.5.10"
-            )
-
-    def test_unreachable_remote_falls_back_to_local_tags(self):
-        with (
-            patch.object(
-                self.version_helper, "list_remote_version_tags", return_value=[]
-            ),
-            patch.object(self.version_helper, "run_git", return_value="v0.5.8\nv0.5.9"),
-        ):
-            self.assertEqual(
-                self.version_helper.get_latest_version_tag("origin"), "v0.5.9"
-            )
-
-    def test_local_mode_does_not_consult_any_remote(self):
-        with (
-            patch.object(self.version_helper, "list_remote_version_tags") as remote,
-            patch.object(self.version_helper, "run_git", return_value="v0.5.9"),
-        ):
-            self.assertEqual(self.version_helper.get_latest_version_tag(), "v0.5.9")
-
-        remote.assert_not_called()
-
-    def test_remote_is_rejected_in_describe_mode_which_needs_local_objects(self):
-        with (
-            patch.object(sys, "argv", ["get_version_tag.py", "--remote"]),
-            patch.object(
-                self.version_helper, "get_version_describe"
-            ) as version_describe,
-            self.assertRaises(SystemExit) as raised,
-        ):
-            self.version_helper.main()
-
-        self.assertEqual(raised.exception.code, 2)
-        version_describe.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

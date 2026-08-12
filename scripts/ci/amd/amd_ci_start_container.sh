@@ -4,14 +4,11 @@ set -euo pipefail
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-# Only the tag name feeds the image tag below, so `--remote` (git ls-remote,
-# refs and no objects) is all this needs. Keep it that way: `git fetch --tags
-# origin` here instead pulls every branch and tag object into the shallow CI
-# checkout, which cost up to an hour per job once ~90 nightly jobs started
-# fetching at once, and still left the editable install on a tagless
-# 0.0.0.dev1+g<sha> version because a shallow HEAD cannot describe from a tag.
-# The helper sorts stable/post releases above rc tags.
-VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only --remote || true)
+# Read the tag name off the remote; the helper explains why this must not go
+# back to `git fetch --tags origin`. Nothing later in the job needs tag objects
+# in the checkout: the editable install already resolves to a tagless
+# 0.0.0.dev1+g<sha> either way, because a depth-1 HEAD cannot describe from a tag.
+VERSION_FROM_TAG=$(python3 scripts/ci/amd/amd_ci_latest_release_tag.py || true)
 if [ -n "$VERSION_FROM_TAG" ]; then
   SGLANG_VERSION="$VERSION_FROM_TAG"
   echo "Using SGLang version from git tags: $SGLANG_VERSION"

@@ -4,9 +4,9 @@ set -euo pipefail
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-# Read the tag name off the remote with ls-remote rather than fetching tag
-# objects into the shallow CI checkout; see amd_ci_start_container.sh for why.
-VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only --remote || true)
+# Read the tag name off the remote rather than fetching tag objects into the
+# shallow CI checkout; see amd_ci_latest_release_tag.py for why.
+VERSION_FROM_TAG=$(python3 scripts/ci/amd/amd_ci_latest_release_tag.py || true)
 if [ -n "$VERSION_FROM_TAG" ]; then
   SGLANG_VERSION="$VERSION_FROM_TAG"
   echo "Using SGLang version from git tags: $SGLANG_VERSION"
