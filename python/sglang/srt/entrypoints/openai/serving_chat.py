@@ -73,6 +73,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils import sort_json
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -358,6 +359,22 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
+
+    def _canonicalize_tool_parameters(self, tools: List[Tool]) -> None:
+        """Sort JSON-schema keys in tool parameters so equivalent tools share a prefix.
+
+        Pydantic emits declared fields in class-declaration order, so the
+        free-form ``Function.parameters`` payload is the only part of a tool
+        definition that carries a client's key order into the rendered prompt.
+        Normalizing the tool objects themselves covers every encoding path and
+        keeps the grammar constraint consistent with the prompt.
+        """
+        if not self.tokenizer_manager.server_args.enable_sort_tool_schema_keys:
+            return
+        for tool in tools:
+            parameters = tool.function.parameters
+            if isinstance(parameters, (dict, list)):
+                tool.function.parameters = sort_json(parameters)
 
     def _effective_tools(self, request: ChatCompletionRequest) -> List[Tool]:
         tools = list(request.tools or [])
@@ -1057,6 +1074,7 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_stop = None
         required_parsed_natively = False
         effective_tools = self._effective_tools(request)
+        self._canonicalize_tool_parameters(effective_tools)
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):

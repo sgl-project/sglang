@@ -1348,6 +1348,13 @@ class ServerArgs:
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
         NS("serving"),
     ] = False
+    enable_sort_tool_schema_keys: A[
+        bool,
+        "Recursively sort the JSON schema keys of tool parameters so clients that send "
+        "equivalent tool definitions in a different key order share the same prefix cache. "
+        "Tool parameters are then rendered in sorted rather than client order.",
+        NS("serving"),
+    ] = False
     reasoning_parser: A[Optional[str], NS("serving")] = None
     default_chat_template_kwargs: A[
         Optional[Dict[str, Any]],

@@ -48,6 +48,7 @@ import uuid
 import warnings
 from array import array
 from collections import OrderedDict, defaultdict
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -4291,6 +4292,21 @@ def json_list_type(value):
         raise argparse.ArgumentTypeError(
             f"Invalid JSON list: {value}. Please provide a valid JSON list."
         )
+
+
+def sort_json(value: Any) -> Any:
+    """Recursively sort dict keys for deterministic serialization.
+
+    Keys are coerced to str() before sorting. This is safe for JSON-parsed
+    input where all keys are already strings. Callers passing non-string
+    keys (e.g. int) must ensure no collisions exist after str() coercion,
+    as {1: "x", "1": "y"} would silently collapse to {"1": "y"}.
+    """
+    if isinstance(value, Mapping):
+        return {str(k): sort_json(value[k]) for k in sorted(value, key=str)}
+    if isinstance(value, (list, tuple)):
+        return [sort_json(item) for item in value]
+    return value
 
 
 def get_extend_input_len_swa_limit(

@@ -66,6 +66,7 @@ class _MockTokenizerManager:
             model_path="deepseek-ai/DeepSeek-V4-Flash",
             revision=None,
             enable_cache_report=False,
+            enable_sort_tool_schema_keys=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
             stream_response_default_include_usage=False,
@@ -965,6 +966,119 @@ class ServingChatTestCase(unittest.TestCase):
             "not-json <| kimi_image_placeholder |>",
         )
         self.assertNotIn("image_prompts", kwargs)
+
+    @staticmethod
+    def _unsorted_tool():
+        return {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "zebra": {"type": "string"},
+                        "apple": {"type": "integer"},
+                    },
+                },
+            },
+        }
+
+    def test_canonicalize_tool_parameters_gates_on_server_flag(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather?"}],
+            tools=[self._unsorted_tool()],
+        )
+        tools = self.chat._effective_tools(request)
+
+        self.chat._canonicalize_tool_parameters(tools)
+        self.assertEqual(
+            list(request.tools[0].function.parameters["properties"]),
+            ["zebra", "apple"],
+        )
+
+        self.tm.server_args.enable_sort_tool_schema_keys = True
+        self.chat._canonicalize_tool_parameters(tools)
+        parameters = request.tools[0].function.parameters
+        self.assertEqual(list(parameters), ["properties", "type"])
+        self.assertEqual(list(parameters["properties"]), ["apple", "zebra"])
+
+    def test_sort_tool_schema_keys_canonicalizes_parameters_only(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.server_args.enable_sort_tool_schema_keys = True
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "developer",
+                    "content": "Be helpful",
+                    "tools": [self._unsorted_tool()],
+                },
+                {"role": "user", "content": "Weather?"},
+            ],
+            tools=[self._unsorted_tool()],
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        for tool in (call.args[0][0]["tools"][0], call.kwargs["tools"][0]):
+            # pydantic already emits declared fields in a stable order; only the
+            # free-form parameters schema is re-ordered.
+            self.assertEqual(list(tool.keys()), ["type", "function"])
+            self.assertEqual(
+                list(tool["function"].keys()),
+                ["description", "name", "parameters"],
+            )
+            self.assertEqual(
+                list(tool["function"]["parameters"]["properties"].keys()),
+                ["apple", "zebra"],
+            )
+
+    def test_sort_tool_schema_keys_covers_message_only_tools(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = None
+        self.tm.server_args.enable_sort_tool_schema_keys = True
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "developer",
+                    "content": "Be helpful",
+                    "tools": [self._unsorted_tool()],
+                },
+                {"role": "user", "content": "Weather?"},
+            ],
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(
+            list(messages[0]["tools"][0]["function"]["parameters"]["properties"]),
+            ["apple", "zebra"],
+        )
+
+    def test_sort_tool_schema_keys_disabled_preserves_key_order(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather?"}],
+            tools=[self._unsorted_tool()],
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertEqual(
+            list(call.kwargs["tools"][0]["function"]["parameters"]["properties"]),
+            ["zebra", "apple"],
+        )
 
     def test_message_tools_participate_in_validation_across_encodings(self):
         tool = {
