@@ -10,6 +10,7 @@ from typing import List
 import torch
 
 logger = logging.getLogger(__name__)
+_dll_directory_handles = []
 
 
 def _get_compute_capability():
@@ -214,8 +215,23 @@ def _find_cuda_home():
 
 
 def _preload_cuda_library():
-    """Preload the CUDA runtime library to help avoid 'libcudart.so not found' issues."""
+    """Preload the CUDA runtime library before importing the native extension."""
     cuda_home = Path(_find_cuda_home())
+
+    if os.name == "nt":
+        cuda_bin = cuda_home / "bin"
+        if cuda_bin.is_dir() and hasattr(os, "add_dll_directory"):
+            # Keep the handle alive for as long as the process can import CUDA DLLs.
+            _dll_directory_handles.append(os.add_dll_directory(str(cuda_bin)))
+        for candidate in sorted(cuda_bin.glob("cudart64_*.dll"), reverse=True):
+            try:
+                ctypes.WinDLL(str(candidate))
+                logger.debug(f"Preloaded CUDA runtime under {candidate}")
+                return
+            except OSError as e:
+                logger.debug(f"Failed to load {candidate}: {e}")
+        logger.debug("[sgl_kernel] Could not preload a Windows CUDA runtime DLL")
+        return
 
     candidate_dirs = [
         cuda_home / "lib",

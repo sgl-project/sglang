@@ -288,7 +288,7 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
   const int32_t group_id = tidx >> group_stride_sft;
   const int32_t coalesce_tid = tidx & (coalesce_num - 1);
 
-  typedef int16_t Vec __attribute__((vector_size(16)));
+  using Vec = uint4;
 
   const int32_t stride = gridDim.x * thread_num;
   int32_t idx_base = bidx * thread_num;

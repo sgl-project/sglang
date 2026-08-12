@@ -8,7 +8,14 @@
 #include <vector>
 
 #if !defined(USE_ROCM) && !defined(USE_MUSA)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #define WARP_SIZE 32
 #include "pytorch_extension_utils.h"
 #else
@@ -806,7 +813,20 @@ inline void transfer_kv_page_first_direct_impl(
   }
 
   // Symbol gate: runtime may not expose cudaMemcpyBatchAsync in some environments.
+#if defined(_WIN32)
+  static FARPROC cuda_memcpy_batch_async_sym = []() -> FARPROC {
+    for (const char* dll_name : {"cudart64_13.dll", "cudart64_12.dll"}) {
+      if (HMODULE module = GetModuleHandleA(dll_name)) {
+        if (FARPROC symbol = GetProcAddress(module, "cudaMemcpyBatchAsync")) {
+          return symbol;
+        }
+      }
+    }
+    return nullptr;
+  }();
+#else
   static void* cuda_memcpy_batch_async_sym = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
+#endif
   if (cuda_memcpy_batch_async_sym == nullptr) {
     fallback_to_page_copy();
     return;

@@ -27,20 +27,20 @@ __device__ __forceinline__ T from_acc(opmath_t<T> x) {
 
 template <>
 __device__ __forceinline__ opmath_t<at::Half> to_acc<at::Half>(at::Half x) {
-  return __half2float(__nv_half(x));
+  return __half2float(__ushort_as_half(x.x));
 }
 template <>
 __device__ __forceinline__ at::Half from_acc<at::Half>(opmath_t<at::Half> x) {
-  return __float2half_rn(x);
+  return at::Half(__half_as_ushort(__float2half_rn(x)), at::Half::from_bits());
 }
 
 template <>
 __device__ __forceinline__ opmath_t<at::BFloat16> to_acc<at::BFloat16>(at::BFloat16 x) {
-  return __bfloat162float(__nv_bfloat16(x));
+  return __bfloat162float(__ushort_as_bfloat16(x.x));
 }
 template <>
 __device__ __forceinline__ at::BFloat16 from_acc<at::BFloat16>(opmath_t<at::BFloat16> x) {
-  return __float2bfloat16_rn(x);
+  return at::BFloat16(__bfloat16_as_ushort(__float2bfloat16_rn(x)), at::BFloat16::from_bits());
 }
 
 template <typename T>
