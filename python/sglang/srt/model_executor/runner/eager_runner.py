@@ -255,7 +255,9 @@ class EagerRunner(BaseRunner):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
-            attn_backend.init_forward_metadata(forward_batch)
+            # SSM models have no attention backend.
+            if attn_backend is not None:
+                attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
@@ -318,16 +320,18 @@ class EagerRunner(BaseRunner):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
-            model_runner.attn_backend.prepare_prefill_shared_read_snapshot(
-                forward_batch,
-                num_qo_tokens=len(forward_batch.input_ids),
-            )
-            maybe_publish_prefill_shared_read_done(
-                model_runner,
-                forward_batch,
-                torch.get_device_module(model_runner.device),
-            )
+            # SSM models have no attention backend.
+            if model_runner.attn_backend is not None:
+                model_runner.attn_backend.init_forward_metadata(forward_batch)
+                model_runner.attn_backend.prepare_prefill_shared_read_snapshot(
+                    forward_batch,
+                    num_qo_tokens=len(forward_batch.input_ids),
+                )
+                maybe_publish_prefill_shared_read_done(
+                    model_runner,
+                    forward_batch,
+                    torch.get_device_module(model_runner.device),
+                )
 
         if not cp_v2_active:
             forward_batch.attn_cp_metadata = None
@@ -450,7 +454,9 @@ class EagerRunner(BaseRunner):
         if forward_batch.batch_size > 0:
             if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
+            # SSM models have no attention backend.
+            if model_runner.attn_backend is not None:
+                model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
             model_runner.attn_backend.forward_metadata = None
 

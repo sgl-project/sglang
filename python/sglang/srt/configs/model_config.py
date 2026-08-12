@@ -101,6 +101,7 @@ def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
 class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
+    SSM = auto()  # State Space Models (Mamba, Mamba2)
 
 
 class ModelImpl(str, Enum):
@@ -1171,9 +1172,20 @@ class ModelConfig:
             elif "BaichuanForCausalLM" in self.hf_config.architectures:
                 self.use_alibi = self.hf_config.hidden_size != 4096
 
-            self.attention_arch = AttentionArch.MHA
+            # Mamba2 is a state-space model, not attention.
+            if "Mamba2ForCausalLM" in self.hf_config.architectures:
+                self.attention_arch = AttentionArch.SSM
+                # Cache params are built later in the model runner (needs tp_size).
+                self.hf_text_config.full_attention_layer_ids = []
+                # hybrid_arch.py keys off this flag.
+                self.hf_text_config._is_pure_mamba2 = True
+            else:
+                self.attention_arch = AttentionArch.MHA
 
-        self.num_attention_heads = self.hf_text_config.num_attention_heads
+        # Mamba2 has no num_attention_heads.
+        self.num_attention_heads = getattr(
+            self.hf_text_config, "num_attention_heads", None
+        )
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
         )
@@ -1312,7 +1324,8 @@ class ModelConfig:
 
         # For non-grouped-query attention models, the number of KV heads is
         # equal to the number of attention heads.
-        return self.hf_text_config.num_attention_heads
+        # State-space models (Mamba2) have no KV heads.
+        return getattr(self.hf_text_config, "num_attention_heads", 0)
 
     def get_max_num_attention_heads(self) -> int:
         """Max per-layer query head count; num_attention_heads unless the
