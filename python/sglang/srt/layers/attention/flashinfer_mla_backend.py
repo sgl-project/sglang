@@ -79,6 +79,7 @@ class DecodeMetadata:
 class PrefillMetadata:
     prefill_wrapper: BatchMLAPagedAttentionWrapper
     use_ragged: bool
+    paged_kv_indices_src: Optional[torch.Tensor] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -416,7 +417,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
         elif forward_batch.forward_mode.is_target_verify():
-            self.indices_updater_prefill.update(
+            paged_kv_indices_src = self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
@@ -425,7 +426,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 use_ragged=False,
                 spec_info=forward_batch.spec_info,
             )
-            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify, False)
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrapper_verify, False, paged_kv_indices_src
+            )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
@@ -461,7 +464,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 kv_indptr_cpu = self.fast_plan_kv_indptr_cpu[: bs + 1]
                 kv_len_arr_cpu = self.fast_plan_kv_len_arr_cpu[:bs]
 
-            self.indices_updater_prefill.update(
+            paged_kv_indices_src = self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
@@ -474,7 +477,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 kv_len_arr_cpu=kv_len_arr_cpu,
             )
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrapper_paged, use_ragged
+                self.prefill_wrapper_paged, use_ragged, paged_kv_indices_src
             )
 
     def init_cuda_graph_state(
@@ -581,6 +584,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 qo_indptr_cpu=self.fast_plan_qo_indptr_cpu[: bs + 1],
                 kv_indptr_cpu=self.fast_plan_kv_indptr_cpu[: bs + 1],
                 kv_len_arr_cpu=self.fast_plan_kv_len_arr_cpu[:bs],
+                compact_paged_plan=False,
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -648,13 +652,22 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
+            paged_kv_indices_src = self.forward_metadata.paged_kv_indices_src
             if (
                 forward_batch.attn_dcp_metadata is not None
                 and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
             ):
                 k_buf = forward_batch.attn_dcp_metadata.dcp_kv_buffer.to(q.dtype)
+                ckv_cache = k_buf[:, :, : layer.v_head_dim]
+                kpe_cache = k_buf[:, :, layer.v_head_dim :]
+            elif paged_kv_indices_src is not None:
+                ckv_cache, kpe_cache = self.token_to_kv_pool.get_mla_kv_buffer(
+                    layer, paged_kv_indices_src, dst_dtype=q.dtype
+                )
             else:
                 k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+                ckv_cache = k_buf[:, :, : layer.v_head_dim]
+                kpe_cache = k_buf[:, :, layer.v_head_dim :]
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -665,8 +678,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             o = prefill_wrapper_paged.run(
                 q,
                 q_rope,
-                k_buf[:, :, : layer.v_head_dim],
-                k_buf[:, :, layer.v_head_dim :],
+                ckv_cache,
+                kpe_cache,
                 out=o,
             )
 
@@ -893,6 +906,10 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.data_type = model_runner.dtype
         self.q_data_type = model_runner.dtype
         self.attn_backend = attn_backend
+        self.compact_paged_kv_plan = model_runner.token_to_kv_pool.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -919,7 +936,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         kv_len_arr_cpu: Optional[torch.Tensor] = None,
-    ):
+        compact_paged_plan: bool = True,
+    ) -> Optional[torch.Tensor]:
+        # Returns PrefillMetadata.paged_kv_indices_src. A compacted plan is only
+        # correct if forward_extend gathers off it, so callers that drop the
+        # return value must pass compact_paged_plan=False.
         if use_ragged:
             paged_kernel_lens = prefix_lens
             paged_kernel_lens_sum = paged_kernel_lens.sum().item()
@@ -927,7 +948,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
 
-        self.call_begin_forward(
+        return self.call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrapper_paged,
             req_pool_indices,
@@ -943,6 +964,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             qo_indptr_cpu=qo_indptr_cpu,
             kv_indptr_cpu=kv_indptr_cpu,
             kv_len_arr_cpu=kv_len_arr_cpu,
+            compact_paged_plan=compact_paged_plan,
         )
 
     def call_begin_forward(
@@ -962,9 +984,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         kv_len_arr_cpu: Optional[torch.Tensor] = None,
-    ):
+        compact_paged_plan: bool = True,
+    ) -> Optional[torch.Tensor]:
         bs = len(seq_lens)
         sm_scale = self.scaling
+        kv_indices_pool = None
 
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
@@ -984,6 +1008,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            kv_indices_pool = kv_indices
             # Unified pool: VIRTUAL -> DENSE token ids for the paged wrapper.
             # Prefill is not cuda-graph captured under unified memory, so an eager
             # gather is safe. Dense ids fit int32 (max = full_slots*num_layers ~
@@ -1004,7 +1029,9 @@ class FlashInferMLAIndicesUpdaterPrefill:
                     self.req_to_token,
                 )
             )
+            kv_indices_pool = kv_indices
 
+        paged_kv_indices_src = None
         if use_ragged:
             # ragged prefill
             wrapper_ragged.begin_forward(
@@ -1028,6 +1055,22 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 # built from full seq_lens and don't match, so fall back to GPU.
                 qo_indptr_cpu = kv_indptr_cpu = kv_len_arr_cpu = None
 
+            if (
+                compact_paged_plan
+                and self.compact_paged_kv_plan
+                and kv_indices_pool is not None
+                and self._translate_kv_loc_dense is None
+                and (
+                    attn_dcp_metadata is None or attn_dcp_metadata.dcp_kv_buffer is None
+                )
+            ):
+                paged_kv_indices_src = kv_indices_pool
+                kv_indices = torch.arange(
+                    kv_indices.numel(),
+                    dtype=kv_indices.dtype,
+                    device=kv_indices.device,
+                )
+
             plan_qo_indptr = qo_indptr if qo_indptr_cpu is None else qo_indptr_cpu
             plan_kv_indptr = kv_indptr if kv_indptr_cpu is None else kv_indptr_cpu
             plan_kv_len_arr = (
@@ -1050,6 +1093,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 self.q_data_type,
                 self.data_type,
             )
+
+        return paged_kv_indices_src
 
 
 class FlashInferMLAMultiStepDraftBackend:
