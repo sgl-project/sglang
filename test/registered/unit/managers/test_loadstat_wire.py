@@ -446,10 +446,9 @@ class TestLoadStatIntegration(CustomTestCase):
 
         import zmq
 
-        # Probe a free port and retry: the probe-then-bind window is a TOCTOU
-        # race, and probing "" (all interfaces) matches the wildcard bind ZMQ
-        # does — loopback-free doesn't imply wildcard-free. The publisher
-        # swallows bind errors, so retry while it stays disabled.
+        # Probe on "" (all interfaces) to match ZMQ's wildcard bind, and retry:
+        # probe-then-bind is a TOCTOU race and the publisher swallows bind
+        # errors, so a lost race shows up only as a disabled publisher.
         pub = None
         for _ in range(3):
             with _socket.socket() as probe:
@@ -462,7 +461,6 @@ class TestLoadStatIntegration(CustomTestCase):
             )
             if pub.enable:
                 break
-            pub.close()
         self.assertTrue(pub.enable, "load socket never bound a free port")
         self.addCleanup(pub.close)
 
