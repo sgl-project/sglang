@@ -571,6 +571,10 @@ class Envs:
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
 
+    # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
+    SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+    SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
+
     # MoRI KV Transfer
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
