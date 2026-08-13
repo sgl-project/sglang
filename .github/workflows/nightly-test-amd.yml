@@ -41,7 +41,7 @@ on:
           - nightly-2-gpu-mi35x-glm51-mxfp4
           # 2-GPU DeepSeek-R1-MXFP4 TP2 (MI35x only)
           - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2
-          # 8-GPU GPT-OSS (MI30x + MI35x)
+          # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
           - nightly-accuracy-8-gpu
           - nightly-accuracy-8-gpu-mi35x
           # 8-GPU Grok1-INT4 (MI30x + MI35x)
@@ -469,7 +469,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU GPT-OSS (MI30x + MI35x)
+  # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
   # ==============================================================================
 
   nightly-accuracy-8-gpu:
@@ -1884,7 +1884,7 @@ jobs:
       - nightly-4-gpu
       - nightly-2-gpu-mi35x-glm51-mxfp4
       - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2
-      # 8-GPU GPT-OSS (MI30x + MI35x)
+      # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
       - nightly-accuracy-8-gpu
       - nightly-accuracy-8-gpu-mi35x
       # 8-GPU Grok1-INT4 (MI30x + MI35x)
