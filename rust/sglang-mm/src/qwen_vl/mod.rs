@@ -346,7 +346,7 @@ pub fn mrope_image_only(
 /// [`Output`](crate::driver::Output). Shared by `sglang-server`'s MM worker
 /// and the parity binding so the mapping can't drift; replaced by a generic
 /// named-tensor handoff once a second family needs a different shape.
-pub struct QwenDrain {
+pub struct QwenEncodedResult {
     pub input_ids: Vec<i32>,
     /// All items' `pixel_values`, concatenated in prompt order.
     pub features: Vec<f32>,
@@ -357,18 +357,18 @@ pub struct QwenDrain {
     pub mrope_delta: i64,
 }
 
-pub fn pack_drain(output: crate::driver::Output) -> Result<QwenDrain, String> {
+pub fn pack_result(output: crate::driver::Output) -> Result<QwenEncodedResult, String> {
     use crate::pipeline::PositionOutput;
 
     let PositionOutput::MRope { positions, delta } = output.positions else {
-        return Err("qwen_vl drain: expected M-RoPE positions".into());
+        return Err("qwen_vl pack: expected M-RoPE positions".into());
     };
     let mut features = Vec::new();
     let mut grids = Vec::with_capacity(output.items.len());
     let mut hashes = Vec::with_capacity(output.items.len());
     for item in output.items {
         let TensorData::F32(pixel_values) = item.feature.data else {
-            return Err("qwen_vl drain: expected f32 feature".into());
+            return Err("qwen_vl pack: expected f32 feature".into());
         };
         features.extend(pixel_values);
         let grid = item
@@ -378,11 +378,11 @@ pub fn pack_drain(output: crate::driver::Output) -> Result<QwenDrain, String> {
                 ("image_grid_thw", TensorData::I64(v)) => Some(v),
                 _ => None,
             })
-            .ok_or("qwen_vl drain: missing image_grid_thw")?;
+            .ok_or("qwen_vl pack: missing image_grid_thw")?;
         grids.push([grid[0] as u32, grid[1] as u32, grid[2] as u32]);
         hashes.push(item.hash);
     }
-    Ok(QwenDrain {
+    Ok(QwenEncodedResult {
         input_ids: output.input_ids,
         features,
         grids,
@@ -504,23 +504,27 @@ mod python {
             input_ids,
             images,
         };
-        let drain = py
+        let packed = py
             .detach(move || {
                 let family = crate::registry::pipeline_from_spec(&spec_json)?;
                 let output = crate::driver::process(family.as_ref(), input, |_| {
                     Err("native parity API requires input_ids".into())
                 })?;
-                pack_drain(output)
+                pack_result(output)
             })
             .map_err(PyValueError::new_err)?;
         Ok((
-            drain.input_ids,
-            drain.features.into_pyarray(py),
-            drain.grids.into_iter().map(|[t, h, w]| (t, h, w)).collect(),
-            drain.hashes,
-            drain.offsets,
-            drain.mrope.into_pyarray(py),
-            drain.mrope_delta,
+            packed.input_ids,
+            packed.features.into_pyarray(py),
+            packed
+                .grids
+                .into_iter()
+                .map(|[t, h, w]| (t, h, w))
+                .collect(),
+            packed.hashes,
+            packed.offsets,
+            packed.mrope.into_pyarray(py),
+            packed.mrope_delta,
         ))
     }
 

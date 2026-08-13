@@ -3,7 +3,7 @@
 //! Rust threads drain requests parked in `Encoding` and run the `sglang-mm`
 //! pipeline registered by `Server.start_mm_workers` (decode → preprocess →
 //! placeholder expansion → M-RoPE, GIL-free). Each worker parks the result
-//! buffers in the rid-keyed [`Sidecar`] and returns only the expanded ids;
+//! buffers in the rid-keyed [`MmResultStore`] and returns only the expanded ids;
 //! Python attaches the buffers at drain time (`Server.take_mm`). Inputs the
 //! pipeline cannot serve are rejected to the client — no Python fallback.
 
@@ -136,9 +136,9 @@ fn parse_caller_hash(entry: &str) -> Option<u64> {
 
 /// One parked result: the buffers the drain-time Python adapter needs (the
 /// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`). The qwen
-/// drain shape (`sglang_mm::qwen_vl::pack_drain`); generalizes to a
+/// shape (`sglang_mm::qwen_vl::pack_result`); generalizes to a
 /// named-tensor handoff once a family needs a different one.
-pub struct MmSidecarEntry {
+pub struct MmEncodedEntry {
     pub features: FeatureStore,
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
@@ -162,13 +162,13 @@ pub enum FeatureStore {
 /// strictly before `MmEncoded`, [`take`](Self::take) at the drain,
 /// [`purge`](Self::purge) for requests that die while parked.
 #[derive(Clone, Default)]
-pub struct Sidecar(Arc<Mutex<HashMap<String, MmSidecarEntry>>>);
+pub struct MmResultStore(Arc<Mutex<HashMap<String, MmEncodedEntry>>>);
 
-impl Sidecar {
-    pub fn park(&self, rid: String, entry: MmSidecarEntry) {
+impl MmResultStore {
+    pub fn park(&self, rid: String, entry: MmEncodedEntry) {
         self.0.lock().unwrap().insert(rid, entry);
     }
-    pub fn take(&self, rid: &str) -> Option<MmSidecarEntry> {
+    pub fn take(&self, rid: &str) -> Option<MmEncodedEntry> {
         self.0.lock().unwrap().remove(rid)
     }
     pub fn purge(&self, rid: &str) {
@@ -177,22 +177,22 @@ impl Sidecar {
 }
 
 /// Shared state of the mm path, built once at `start_mm_workers`.
-pub struct Context {
+pub struct MmContext {
     pub family: Box<dyn sglang_mm::pipeline::MmFamilyProcessor>,
     /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
     pub tokenizer: Option<Arc<dyn TextTokenizer>>,
-    pub sidecar: Sidecar,
+    pub results: MmResultStore,
     /// Park feature buffers in POSIX shm. Set by the Python launcher
     /// (`NativeMmHost._use_feature_shm`) exactly when the scheduler broadcasts
     /// across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
 }
 
-impl Context {
+impl MmContext {
     pub fn new(
         spec_json: &str,
         tokenizer: Option<Arc<dyn TextTokenizer>>,
-        sidecar: Sidecar,
+        results: MmResultStore,
     ) -> Result<Self, String> {
         let feature_shm = serde_json::from_str::<serde_json::Value>(spec_json)
             .ok()
@@ -201,7 +201,7 @@ impl Context {
         Ok(Self {
             family: sglang_mm::registry::pipeline_from_spec(spec_json)?,
             tokenizer,
-            sidecar,
+            results,
             feature_shm,
         })
     }
@@ -210,7 +210,7 @@ impl Context {
 /// Run the pipeline for one request. `Ok` returns the final expanded ids, the
 /// buffers already parked; `Err` rejects the request back to the client.
 fn process(
-    ctx: &Context,
+    ctx: &MmContext,
     rid: &crate::ids::Rid,
     mut work: crate::message::MmWorkItem,
 ) -> Result<Vec<i32>, String> {
@@ -222,25 +222,25 @@ fn process(
         })?;
         tokenizer.encode(text).map_err(|error| error.to_string())
     })?;
-    let mut drain = sglang_mm::qwen_vl::pack_drain(output)?;
-    apply_caller_hashes(&mut drain.hashes, &caller_hashes);
+    let mut packed = sglang_mm::qwen_vl::pack_result(output)?;
+    apply_caller_hashes(&mut packed.hashes, &caller_hashes);
     let features = if ctx.feature_shm {
-        park_features_in_shm(&drain.features, &drain.grids)
+        park_features_in_shm(&packed.features, &packed.grids)
     } else {
-        FeatureStore::Inline(drain.features)
+        FeatureStore::Inline(packed.features)
     };
-    ctx.sidecar.park(
+    ctx.results.park(
         rid.as_str().to_owned(),
-        MmSidecarEntry {
+        MmEncodedEntry {
             features,
-            grids: drain.grids,
-            hashes: drain.hashes,
-            offsets: drain.offsets,
-            mrope: drain.mrope,
-            mrope_delta: drain.mrope_delta,
+            grids: packed.grids,
+            hashes: packed.hashes,
+            offsets: packed.offsets,
+            mrope: packed.mrope,
+            mrope_delta: packed.mrope_delta,
         },
     );
-    Ok(drain.input_ids)
+    Ok(packed.input_ids)
 }
 
 /// Split the flat feature buffer per item (`t*h*w` rows per grid) and park each
@@ -278,14 +278,14 @@ fn park_features_in_shm(features: &[f32], grids: &[[u32; 3]]) -> FeatureStore {
 pub struct MmWorker {
     rx: flume::Receiver<MmRequest>,
     tm: flume::Sender<TmEvent>,
-    ctx: Arc<Context>,
+    ctx: Arc<MmContext>,
 }
 
 impl MmWorker {
     pub fn new(
         rx: flume::Receiver<MmRequest>,
         tm: flume::Sender<TmEvent>,
-        ctx: Arc<Context>,
+        ctx: Arc<MmContext>,
     ) -> Self {
         Self { rx, tm, ctx }
     }
