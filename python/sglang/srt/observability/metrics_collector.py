@@ -79,10 +79,13 @@ class SchedulerStats:
     # full_token_usage: full-attention KV cache pool usage (always active).
     # swa_token_usage:  sliding-window attention KV cache pool usage (hybrid SWA models only, e.g. Gemma2).
     # mamba_usage:      Mamba SSM state pool usage (hybrid SSM models only, e.g. Jamba).
+    # kv_cache_usage_perc: max(full, swa) — KV cache pools only, Mamba excluded.
+    #                   Drop-in equivalent of vLLM's gpu_cache_usage_perc.
     token_usage: float = 0.0
     full_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
+    kv_cache_usage_perc: float = 0.0
 
     # Absolute token counts for the full-attention KV cache pool.
     # Invariant: kv_available_tokens + kv_evictable_tokens + kv_used_tokens <= max_total_num_tokens
@@ -327,6 +330,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.mamba_usage = Gauge(
             name="sglang:mamba_usage",
             documentation="The token usage for Mamba layers.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_usage_perc = Gauge(
+            name="sglang:kv_cache_usage_perc",
+            documentation="The KV cache usage (0.0-1.0): max usage across the KV cache pools (full and SWA attention), excluding the Mamba state pool. Equivalent of vLLM's gpu_cache_usage_perc.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1329,6 +1338,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.full_token_usage, stats.full_token_usage)
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
+        self._log_gauge(self.kv_cache_usage_perc, stats.kv_cache_usage_perc)
 
         # Absolute token counts
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
