@@ -312,7 +312,7 @@ def build_rmsnorm_providers(dtype: torch.dtype, batch_size: int, hidden_size: in
         "flashinfer": lambda: flashinfer_norm.rmsnorm(
             x, weight, eps=1e-6, out=flashinfer_out
         ),
-        "jit_rmsnorm": lambda: jit_rmsnorm(x, weight, jit_out, 1e-6),
+        "jit_rmsnorm": lambda: jit_rmsnorm(x, weight, 1e-6, jit_out),
         "quack": lambda: quack_rmsnorm_fwd(x, weight, eps=1e-6),
         "triton_rms_norm_fn": lambda: rms_norm_fn(
             x, weight, bias=None, residual=None, eps=1e-6

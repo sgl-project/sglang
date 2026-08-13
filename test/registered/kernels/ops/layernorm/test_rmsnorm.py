@@ -99,10 +99,7 @@ RMSNORM_CASES = get_ci_test_range(
 )
 
 
-@pytest.mark.parametrize(
-    "batch_size,hidden_size",
-    RMSNORM_CASES,
-)
+@pytest.mark.parametrize("batch_size,hidden_size", RMSNORM_CASES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_rmsnorm(
@@ -127,30 +124,84 @@ def test_rmsnorm(
 
 @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 8192, 8704, 16384])
 def test_rmsnorm_hidden_size_support(hidden_size: int) -> None:
-    from sglang.kernels.ops.layernorm.norm import _is_supported_rmsnorm_hidden_size
+    from sglang.kernels.ops.layernorm.norm import is_jit_rmsnorm_supported
 
-    assert _is_supported_rmsnorm_hidden_size(hidden_size)
+    assert is_jit_rmsnorm_supported(hidden_size)
 
 
-@pytest.mark.parametrize(
-    ("hidden_size", "expected"),
-    [
-        (64, "RMSNormWarpKernel"),
-        (128, "RMSNormWarpKernel"),
-        (256, "RMSNormWarpKernel"),
-        (512, "RMSNormHalfKernel"),
-        (1536, "RMSNormKernel"),
-        (2048, "RMSNormHalfKernel"),
-        (2304, "RMSNormKernel"),  # NOTE: not 512 aligned
-        (8192, "RMSNormHalfKernel"),
-        (8704, "RMSNormHalfKernel"),
-        (16384, "RMSNormHalfKernel"),
-    ],
-)
-def test_rmsnorm_kernel_dispatch(hidden_size: int, expected: str) -> None:
-    from sglang.kernels.ops.layernorm.norm import _rmsnorm_kernel_class
+def _hf_semantics_reference(
+    x: torch.Tensor, w: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """HF LlamaRMSNorm: normalize in fp32, cast to the activation dtype, then
+    multiply the weight in that narrow dtype."""
+    x_fp32 = x.float()
+    normed = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + eps)
+    return w * normed.to(x.dtype)
 
-    assert _rmsnorm_kernel_class(hidden_size) == expected
+
+def _plain_semantics_reference(
+    x: torch.Tensor, w: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """Default semantics: the weight multiply stays in fp32, cast at the end."""
+    x_fp32 = x.float()
+    normed = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + eps)
+    return (normed * w.float()).to(x.dtype)
+
+
+def _assert_picks_reference(out, want, other, label) -> None:
+    """The two semantics differ by at most one ULP and the kernel's reduction
+    order differs from PyTorch's `mean`, so neither reference is bit-exact.
+    Assert the flag moves the output strictly closer to the matching one."""
+    d_want = (out.float() - want).abs().max().item()
+    d_other = (out.float() - other).abs().max().item()
+    assert d_want < d_other, (
+        f"{label}: output is closer to the wrong reference "
+        f"(want={d_want}, other={d_other})"
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_cast_x_before_out_mul_switches_semantics(dtype: torch.dtype) -> None:
+    """`cast_x_before_out_mul` must change the rounding rather than be ignored.
+
+    Regression guard: the flag was accepted and silently dropped, so callers
+    asking for HF semantics got the fp32-multiply rounding instead.
+    """
+    from sglang.kernels.ops.layernorm.norm import rmsnorm
+
+    torch.manual_seed(0)
+    x = torch.randn(64, 4096, device=DEVICE, dtype=dtype)
+    w = torch.randn(4096, device=DEVICE, dtype=dtype)
+    hf = _hf_semantics_reference(x, w, EPS).float()
+    plain = _plain_semantics_reference(x, w, EPS).float()
+    assert (hf - plain).abs().max() > 0, "inputs do not exercise the difference"
+
+    for flag, want, other in ((True, hf, plain), (False, plain, hf)):
+        out = rmsnorm(x, w, EPS, cast_x_before_out_mul=flag)
+        _assert_picks_reference(out, want, other, f"rmsnorm(cast={flag})")
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_fused_add_cast_x_before_out_mul_switches_semantics(
+    dtype: torch.dtype,
+) -> None:
+    """Same guard for the fused-add kernel, which is the path the framework
+    actually routes to when HF semantics are requested."""
+    from sglang.kernels.ops.layernorm.norm import fused_add_rmsnorm
+
+    torch.manual_seed(0)
+    x = torch.randn(64, 4096, device=DEVICE, dtype=dtype)
+    res = torch.randn_like(x)
+    w = torch.randn(4096, device=DEVICE, dtype=dtype)
+    summed = (x.float() + res.float()).to(dtype)
+    hf = _hf_semantics_reference(summed, w, EPS).float()
+    plain = _plain_semantics_reference(summed, w, EPS).float()
+    assert (hf - plain).abs().max() > 0, "inputs do not exercise the difference"
+
+    for flag, want, other in ((True, hf, plain), (False, plain, hf)):
+        xi, ri = x.clone(), res.clone()
+        fused_add_rmsnorm(xi, ri, w, EPS, cast_x_before_out_mul=flag)
+        _assert_picks_reference(xi, want, other, f"fused_add(cast={flag})")
 
 
 if __name__ == "__main__":

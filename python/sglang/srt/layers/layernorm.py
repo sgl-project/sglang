@@ -14,7 +14,7 @@
 """Fused operators for normalization layers."""
 
 import logging
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import Optional, Tuple, Union
 
 import torch
@@ -137,44 +137,14 @@ if _is_hip:
     except ImportError:
         _has_rocm_triton_gemma_rms_norm = False
 
-if _is_cuda:
-    # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
-    # (the transformers backend path) to produce outputs that are numerically identical
-    # to HuggingFace `LlamaRMSNorm`: the cast from fp32 to the activation dtype happens
-    # BEFORE the weight multiply, so the multiply is done in the narrow dtype.
-    _jit_rmsnorm_hf_available = False
-    try:
-        from sglang.kernels.ops.layernorm.rmsnorm_hf import (
-            is_supported_rmsnorm_hf_hidden_size,
-        )
-        from sglang.kernels.ops.layernorm.rmsnorm_hf import (
-            rmsnorm_hf as _jit_rmsnorm_hf,
-        )
-
-        _jit_rmsnorm_hf_available = True
-    except ImportError:
-
-        def is_supported_rmsnorm_hf_hidden_size(d: int) -> bool:
-            return False
-
-        _jit_rmsnorm_hf = None
-
-    from sglang.kernels.ops.layernorm.norm import (
-        fused_add_rmsnorm as _jit_fused_add_rmsnorm,
-    )
-    from sglang.kernels.ops.layernorm.norm import (
-        is_supported_jit_fused_add_rmsnorm_hidden_size,
-    )
-
-
-logger = logging.getLogger(__name__)
-
 
 if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
 _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -429,8 +399,8 @@ class RMSNorm(BaseFusedOp):
         cast_x_before_out_mul: bool = False,
         fp32_residual: bool = False,
         has_weight: bool = True,
-        weight_dtype: Optional = None,
-        override_orig_dtype: Optional = None,
+        weight_dtype: Optional[torch.dtype] = None,
+        override_orig_dtype: Optional[torch.dtype] = None,
         x_pad_to_multiple: int = 0,
         force_native: bool = False,
     ) -> None:
@@ -471,6 +441,14 @@ class RMSNorm(BaseFusedOp):
         if force_native:
             self._forward_method = self.forward_native
 
+    @cached_property
+    def _can_use_cuda_jit(self) -> bool:
+        from sglang.kernels.ops.layernorm.norm import is_jit_rmsnorm_supported
+
+        if not _is_cuda or self.weight.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        return is_jit_rmsnorm_supported(self.hidden_size)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -502,7 +480,7 @@ class RMSNorm(BaseFusedOp):
                 self.weight.data,
                 self.variance_epsilon,
             )
-            if needs_reshape:
+            if original_shape is not None:
                 out = out.reshape(original_shape)
             return out
         # Fuse the downstream FP8 static per-tensor activation quant into the
@@ -534,63 +512,59 @@ class RMSNorm(BaseFusedOp):
                     -1, post_residual_addition.shape[-1]
                 )
 
-        if self.cast_x_before_out_mul and residual is None:
-            # Use HF-semantics kernel (cast to dtype before weight multiply).
-            if (
-                _jit_rmsnorm_hf_available
-                and x.dtype in (torch.float16, torch.bfloat16)
-                and self.weight.data.dtype == x.dtype
-                and is_supported_rmsnorm_hf_hidden_size(x.shape[-1])
-            ):
-                out = _jit_rmsnorm_hf(
-                    x.contiguous(), self.weight.data, self.variance_epsilon
+        input_dtype = x.dtype
+        addition_dtype = (
+            input_dtype
+            if post_residual_addition is None
+            else post_residual_addition.dtype
+        )
+        dtype_compatible = input_dtype == self.weight.dtype == addition_dtype
+
+        can_use_jit = dtype_compatible and self._can_use_cuda_jit
+        can_use_aot = dtype_compatible and not self.cast_x_before_out_mul
+
+        if can_use_jit:
+            from sglang.kernels.ops.layernorm.norm import (
+                fused_add_rmsnorm as _jit_fused_add_rmsnorm,
+            )
+            from sglang.kernels.ops.layernorm.norm import rmsnorm as _jit_rmsnorm
+
+            if residual is None:
+                assert post_residual_addition is None
+                out = _jit_rmsnorm(
+                    x,
+                    self.weight.data,
+                    eps=self.variance_epsilon,
+                    cast_x_before_out_mul=self.cast_x_before_out_mul,
                 )
-            else:
-                # Fallback: pure-Python HF semantics (already implemented in forward_native).
-                out = self.forward_native(x, None, None)
-            result = out
-        elif residual is not None:
-            if self.cast_x_before_out_mul:
-                if (
-                    x.dtype in (torch.float16, torch.bfloat16)
-                    and self.weight.data.dtype == x.dtype
-                    and (
-                        post_residual_addition is None
-                        or post_residual_addition.dtype == x.dtype
-                    )
-                    and is_supported_jit_fused_add_rmsnorm_hidden_size(x.shape[-1])
-                ):
-                    if post_residual_addition is not None:
-                        residual = residual + post_residual_addition
-                    _jit_fused_add_rmsnorm(
-                        x,
-                        residual,
-                        self.weight.data,
-                        self.variance_epsilon,
-                        cast_x_before_out_mul=self.cast_x_before_out_mul,
-                    )
-                    result = x, residual
-                else:
-                    result = self.forward_native(x, residual, post_residual_addition)
-            else:
-                # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition.
-                # but right now we can only have hidden_states+(residual+post_residual_addition).
-                # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition),
-                # we probably need to add another parameter to fused_add_rmsnorm
+            else:  # TODO: fuse this extra addition
                 if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
+                    residual.add_(post_residual_addition)
+                _jit_fused_add_rmsnorm(
+                    x,
+                    residual,
+                    self.weight.data,
+                    eps=self.variance_epsilon,
+                    cast_x_before_out_mul=self.cast_x_before_out_mul,
+                )
+                out = x, residual
+        elif can_use_aot:
+            if residual is None:
+                assert post_residual_addition is None
+                out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            else:
+                if post_residual_addition is not None:
+                    residual.add_(post_residual_addition)
                 fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-                result = x, residual
+                out = x, residual
         else:
-            result = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            out = self.forward_native(x, residual, post_residual_addition)
 
         if needs_reshape:
             if residual is not None:
-                return result[0].reshape(original_shape), result[1].reshape(
-                    residual_shape
-                )
-            return result.reshape(original_shape)
-        return result
+                return out[0].reshape(original_shape), out[1].reshape(residual_shape)
+            return out.reshape(original_shape)
+        return out
 
     def forward_npu(
         self,
