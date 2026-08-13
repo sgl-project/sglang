@@ -348,6 +348,9 @@ class Envs:
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
+    SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
+    SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
+    SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
@@ -670,6 +673,13 @@ class Envs:
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    # Keep K3 shared experts and dense MLPs sharded over attention TP.
+    SGLANG_K3_SHARED_EXPERTS_ATTN_TP = EnvBool(False)
+    SGLANG_K3_DENSE_MLP_ATTN_TP = EnvBool(False)
+    # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
+    SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
+    )
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
@@ -809,7 +819,7 @@ class Envs:
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
 
     # Unified radix cache
-    SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
+    SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
 
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
@@ -1043,7 +1053,7 @@ class Envs:
 
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
-    SGLANG_AUTO_NUMA_BIND = EnvBool(False)
+    SGLANG_AUTO_NUMA_BIND = EnvBool(True)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
     # Metrics
@@ -1286,6 +1296,20 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+
+    # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
+    # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
+    # with a per-query CUSTOM block_table
+    SGLANG_MINIMAX_NPU_PREFILL_FIA = EnvBool(True)
+
+    # MiniMax-M3 NPU sparse INDEXER (decode + verify topk block selection): route
+    # through the native AscendC packed indexer op instead of the Triton indexer.
+    SGLANG_MINIMAX_NPU_NATIVE_INDEXER = EnvBool(False)
+
+    # MiniMax-M3 NPU sparse MAIN-attention (decode-main + verify-main): route the
+    # sparse main attention through the native AscendC sparse-attention op with the
+    # cached block_table override.
+    SGLANG_MINIMAX_NPU_NATIVE_ATTN = EnvBool(False)
 
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
     # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
