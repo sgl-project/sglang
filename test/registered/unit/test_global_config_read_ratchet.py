@@ -100,6 +100,10 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the same dict already carries the live moe_dp_size under 'dp'; this entry "
         "is the configured intent"
     ),
+    ("srt/weight_cache/ipc_loader.py", "configured_attn_cp_size"): (
+        "the cache fingerprint must match the configured CP layout, rather than "
+        "the live topology after model-parallel initialization"
+    ),
     ("srt/models/kimi_k25.py", "configured_tp_size"): (
         "the IPC refcount must match the configured TP consumer count captured "
         "when the tokenizer creates MmItemMemoryPool; a live attention subgroup "
