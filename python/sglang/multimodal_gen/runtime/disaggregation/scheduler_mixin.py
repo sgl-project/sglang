@@ -469,13 +469,9 @@ class SchedulerDisaggMixin:
 
         if self._is_glm_terminal_denoiser():
             self._preallocated_slots = {}
-            max_batch_size = (
-                max(1, sa.batching_max_size) if sa.batching_mode == "dynamic" else 1
-            )
             register_msg = TransferRegisterMsg(
                 role=self._disagg_role.value,
                 work_endpoint=_advertised_pool_work_endpoint(sa),
-                max_batch_size=max_batch_size,
             )
             self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
             self._compute_ready_queue = queue.Queue(maxsize=4)
@@ -485,10 +481,7 @@ class SchedulerDisaggMixin:
                 name="recv-prefetch-glm-terminal-denoiser",
             )
             self._recv_prefetch_thread.start()
-            logger.info(
-                "GLM terminal denoiser registered with max_batch_size=%d",
-                max_batch_size,
-            )
+            logger.info("GLM terminal denoiser registered")
             return
 
         # Pool size: configurable, default 256 MiB
@@ -557,7 +550,6 @@ class SchedulerDisaggMixin:
             pool_size=self._transfer_manager.pool_size,
             work_endpoint=_advertised_pool_work_endpoint(sa),
             preallocated_slots=preallocated_slot_info,
-            max_batch_size=max(1, sa.batching_max_size),
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
         logger.info(

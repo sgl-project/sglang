@@ -61,7 +61,6 @@ class _GlmShardEntry:
     request_id: str
     req: object
     client: _GlmClientEntry
-    batch_size: int
 
 
 @dataclass
@@ -169,7 +168,6 @@ class DiffusionServer:
         self._glm_shard_queue: deque[_GlmShardEntry] = deque()
         self._glm_shards: dict[str, _GlmShardEntry] = {}
         self._glm_shard_workers: dict[str, int] = {}
-        self._glm_worker_batch_sizes = [1] * self._num_denoisers
         self._glm_worker_available = [not glm_ar_fanout] * self._num_denoisers
         self._glm_ar_executor: ThreadPoolExecutor | None = None
         self._glm_ar_future: Future | None = None
@@ -607,9 +605,6 @@ class DiffusionServer:
 
         group_id = f"glm-fanout::{time.monotonic_ns()}"
         output_start = 0
-        sequential_multi_output = (
-            self._server_args.pipeline_config.supports_sequential_multi_output_inference()
-        )
         for client_index, client in enumerate(clients):
             output_count = max(1, int(client.req.num_outputs_per_prompt or 1))
             output_end = output_start + output_count
@@ -634,12 +629,7 @@ class DiffusionServer:
             shard_req.extra["usage_by_output"] = shard_usages
             shard_req.usage = _merge_srt_usages(shard_usages)
             shard_id = shard_req.request_id
-            shard = _GlmShardEntry(
-                shard_id,
-                shard_req,
-                client,
-                1 if sequential_multi_output else output_count,
-            )
+            shard = _GlmShardEntry(shard_id, shard_req, client)
             self._glm_shards[shard_id] = shard
             self._glm_shard_queue.append(shard)
             output_start = output_end
@@ -652,12 +642,7 @@ class DiffusionServer:
         while self._glm_shard_queue:
             shard = self._glm_shard_queue[0]
             available_slots = [
-                (
-                    slots
-                    if self._glm_worker_available[index]
-                    and self._glm_worker_batch_sizes[index] >= shard.batch_size
-                    else 0
-                )
+                slots if self._glm_worker_available[index] else 0
                 for index, slots in enumerate(self._denoiser_free_slots)
             ]
             worker_idx = self._dispatcher.select_denoiser_with_capacity(available_slots)
@@ -1048,9 +1033,6 @@ class DiffusionServer:
         peers[idx] = info
         if role == RoleType.DENOISER and self._glm_ar_fanout:
             self._glm_worker_available[idx] = True
-            self._glm_worker_batch_sizes[idx] = max(
-                1, int(msg.get("max_batch_size", 1))
-            )
 
         logger.info(
             "DiffusionServer transfer: registered %s[%d] work_endpoint=%s "
@@ -1464,7 +1446,6 @@ class DiffusionServer:
                     "glm_ar_queue_depth": len(self._glm_ar_queue),
                     "glm_ar_in_flight": self._glm_ar_future is not None,
                     "glm_shard_queue_depth": len(self._glm_shard_queue),
-                    "glm_worker_batch_sizes": list(self._glm_worker_batch_sizes),
                     "glm_worker_available": list(self._glm_worker_available),
                 }
             )

@@ -13,7 +13,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     SpatialImagePipelineConfig,
     shard_rotary_emb_for_sp,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 
@@ -61,7 +60,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
         return True
 
     def supports_sequential_multi_output_inference(self):
-        return current_platform.is_npu()
+        return True
 
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):
         height = batch.height // self.vae_scale_factor
